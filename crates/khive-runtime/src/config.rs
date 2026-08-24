@@ -316,6 +316,13 @@ pub struct RuntimeConfig {
     /// resolves once to the host's local IANA zone (falling back to UTC when
     /// the host zone cannot be determined) via [`resolve_default_display_timezone`].
     pub display_timezone: chrono_tz::Tz,
+    /// Events-daemon split (ADR-170). `None` = legacy behavior: events persist
+    /// in the main store. `Some` routes event persistence to `events.db` —
+    /// forwarded over the events daemon socket in daemon deployments, opened
+    /// directly in embedded/one-shot contexts. Populated by the transport
+    /// hosts (khive-mcp serve, kkernel exec); tests and in-memory runtimes
+    /// leave it `None`.
+    pub events_split: Option<crate::events_split::EventsSplitConfig>,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -401,6 +408,7 @@ impl Default for RuntimeConfig {
             actor_id,
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             display_timezone: resolve_default_display_timezone(),
+            events_split: None,
         }
     }
 }

@@ -1,0 +1,1312 @@
+//! Events-daemon split (ADR-170): the audit lane leaves the domain store.
+//!
+//! The ADR-133 idempotent audit batch is the measured bulk of event write
+//! volume, and in a single-store deployment its rows queue on the same SQLite
+//! writer lane as domain mutations. This module moves that lane into a
+//! dedicated events daemon that owns `events.db`, reachable over a Unix
+//! socket with the same length-prefixed framing and peer-uid admission the
+//! main daemon socket uses. Plain event appends stay on the domain store —
+//! the legacy `events` table has raw-SQL consumers (schedule provenance, kg
+//! projection guards, graph-query substrate unions) whose correctness
+//! depends on finding those rows there.
+//!
+//! Cooperating pieces:
+//!
+//! - [`run_events_daemon`] — the server loop the `events-daemon` subcommand
+//!   runs: binds the events socket, owns the only resident writer of
+//!   `events.db`, and serves append/read requests through the ordinary
+//!   `SqlEventStore`.
+//! - [`EventsSplitClient`] — one per domain process. Plain appends ride a
+//!   bounded in-memory queue drained by a background forwarder
+//!   (fire-and-forget; overflow or a dead daemon drops the batch, counts it,
+//!   and logs — the loss-tolerant durability class made concrete; unused by
+//!   the default routing until telemetry producers opt in). Idempotent
+//!   audit-batch appends and reads are synchronous framed round-trips with
+//!   bounded timeouts, because their callers are background flushers or query
+//!   paths, never the dispatch hot path.
+//! - [`ForwardingEventStore`] — the lane-side [`EventStore`] over the socket.
+//!   Preflight validation delegates to an in-memory `SqlEventStore`, so the
+//!   ADR-133 audit-batch seam keeps its pre-enqueue shape check without any
+//!   I/O on the dispatch path.
+//! - [`SplitEventStore`] — the per-namespace handle
+//!   [`crate::runtime::KhiveRuntime::events`] returns when the split is
+//!   configured: routes the idempotent lane to the events store, plain
+//!   appends to the legacy store, and merges reads across both.
+//!
+//! Domain availability never depends on events-daemon liveness: every failure
+//! path here degrades (drop + count + log, or a typed storage error for the
+//! synchronous lanes) instead of blocking the caller.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use khive_db::StorageBackend;
+use khive_storage::event::IdempotentEventBatchResult;
+use khive_storage::{
+    BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageError,
+    StorageResult,
+};
+use serde::{Deserialize, Serialize};
+
+use tokio::net::{UnixListener, UnixStream};
+use uuid::Uuid;
+
+use crate::daemon::{read_frame, write_frame};
+
+/// Bump whenever the request or response frame shape changes incompatibly.
+/// The server rejects frames whose version it does not speak, so a skewed
+/// client gets a typed refusal instead of a deserialization panic.
+pub const EVENTS_PROTOCOL_VERSION: u32 = 1;
+
+/// Default bound on the fire-and-forget append queue, in batches. The loss
+/// window on overflow is this depth times the batch size in flight; the value
+/// is deliberately generous because entries are pointers, not rows.
+pub const DEFAULT_APPEND_QUEUE_BATCHES: usize = 4096;
+
+/// Timeout for one synchronous round-trip (idempotent appends, reads).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Reconnect backoff for the background forwarder after a failed connect.
+const FORWARDER_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Default events database file, beside the main database file.
+pub fn events_db_path_beside(main_db: &Path) -> PathBuf {
+    main_db
+        .parent()
+        .map(|dir| dir.join("events.db"))
+        .unwrap_or_else(|| PathBuf::from("events.db"))
+}
+
+/// Events daemon socket path, beside the events database it serves.
+///
+/// Derived from the db path (not a process-global location) so every events
+/// database gets its own daemon and socket: a global socket would route
+/// events from any second database (another seat, a test tempdir) to
+/// whichever daemon happens to own it, persisting them beside the wrong
+/// main store.
+pub fn events_socket_path_beside(events_db: &Path) -> PathBuf {
+    events_db
+        .parent()
+        .map(|dir| dir.join("khive-events.sock"))
+        .unwrap_or_else(|| PathBuf::from("khive-events.sock"))
+}
+
+/// How a runtime reaches event storage when the split is configured.
+#[derive(Debug, Clone)]
+pub struct EventsSplitConfig {
+    /// The events database file. The events daemon is its only writer in
+    /// daemon deployments; embedded mode writes it directly.
+    pub db_path: PathBuf,
+    /// `Some(socket)` = forward appends to the events daemon at this socket
+    /// (daemon deployments). `None` = embedded mode: open `db_path` directly
+    /// in-process (one-shot CLI, tests).
+    pub socket_path: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Process-global handles
+// ---------------------------------------------------------------------------
+//
+// One events-split client (or one direct backend) per process, whatever the
+// number of runtimes and clones — the same shape as the daemon module's other
+// process-global state. Keyed by path so tests exercising two distinct paths
+// in one process stay isolated.
+
+type ClientMap = std::collections::HashMap<PathBuf, Arc<EventsSplitClient>>;
+type BackendMap = std::collections::HashMap<PathBuf, Arc<StorageBackend>>;
+
+fn client_registry() -> &'static std::sync::Mutex<ClientMap> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<ClientMap>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn direct_backend_registry() -> &'static std::sync::Mutex<BackendMap> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<BackendMap>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The process-wide client for `socket_path`, created (and its forwarder
+/// spawned) on first use. Requires a tokio runtime context on first call.
+pub fn client_for(socket_path: &Path) -> crate::error::RuntimeResult<Arc<EventsSplitClient>> {
+    let mut registry = client_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = registry.get(socket_path) {
+        return Ok(Arc::clone(existing));
+    }
+    let client = EventsSplitClient::new(socket_path.to_path_buf())?;
+    registry.insert(socket_path.to_path_buf(), Arc::clone(&client));
+    Ok(client)
+}
+
+/// The process-wide direct (embedded-mode) backend for `db_path`, opened
+/// read-write on first use.
+pub fn direct_backend_for(db_path: &Path) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
+    let mut registry = direct_backend_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = registry.get(db_path) {
+        return Ok(Arc::clone(existing));
+    }
+    let backend = Arc::new(StorageBackend::sqlite(db_path)?);
+    registry.insert(db_path.to_path_buf(), Arc::clone(&backend));
+    Ok(backend)
+}
+
+/// Forwarding metrics for the process-wide client at `socket_path`, if one
+/// exists. `None` means the split never initialized in this process.
+pub fn forwarding_metrics(socket_path: &Path) -> Option<EventsForwardingMetrics> {
+    let registry = client_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.get(socket_path).map(|client| client.metrics())
+}
+
+// ---------------------------------------------------------------------------
+// Wire protocol
+// ---------------------------------------------------------------------------
+
+/// Request frame sent from a domain process to the events daemon.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum EventsRequest {
+    /// Fire-and-forget append lane. The daemon replies with a summary, but the
+    /// forwarder treats a failed reply as a counted drop, never an error to
+    /// the original caller.
+    AppendEvents {
+        protocol_version: u32,
+        namespace: String,
+        events: Vec<Event>,
+    },
+    /// ADR-133 audit-batch lane: real dispositions come back.
+    AppendEventsIdempotent {
+        protocol_version: u32,
+        namespace: String,
+        events: Vec<Event>,
+    },
+    GetEvent {
+        protocol_version: u32,
+        namespace: String,
+        id: Uuid,
+    },
+    QueryEvents {
+        protocol_version: u32,
+        namespace: String,
+        filter: EventFilter,
+        page: PageRequest,
+    },
+    CountEvents {
+        protocol_version: u32,
+        namespace: String,
+        filter: EventFilter,
+    },
+}
+
+impl EventsRequest {
+    fn protocol_version(&self) -> u32 {
+        match self {
+            Self::AppendEvents {
+                protocol_version, ..
+            }
+            | Self::AppendEventsIdempotent {
+                protocol_version, ..
+            }
+            | Self::GetEvent {
+                protocol_version, ..
+            }
+            | Self::QueryEvents {
+                protocol_version, ..
+            }
+            | Self::CountEvents {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
+
+    fn namespace(&self) -> &str {
+        match self {
+            Self::AppendEvents { namespace, .. }
+            | Self::AppendEventsIdempotent { namespace, .. }
+            | Self::GetEvent { namespace, .. }
+            | Self::QueryEvents { namespace, .. }
+            | Self::CountEvents { namespace, .. } => namespace,
+        }
+    }
+}
+
+/// Response frame from the events daemon.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventsResponse {
+    Appended {
+        summary: BatchWriteSummary,
+    },
+    Idempotent {
+        result: IdempotentEventBatchResult,
+    },
+    Event {
+        event: Option<Event>,
+    },
+    Pageful {
+        page: Page<Event>,
+    },
+    Count {
+        count: u64,
+    },
+    /// Typed refusal. `retryable` distinguishes transient daemon-side
+    /// conditions from contract errors (bad frame, version skew).
+    Error {
+        message: String,
+        retryable: bool,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Server side
+// ---------------------------------------------------------------------------
+
+/// Advisory lock guaranteeing at most one events daemon per socket path.
+/// Held for the daemon's lifetime; a second daemon exits instead of stealing
+/// the socket path from the live one.
+pub struct EventsDaemonGuard {
+    _file: std::fs::File,
+}
+
+/// Try to become the events daemon for `socket_path`. `None` = another
+/// events daemon already holds the lock.
+pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemonGuard> {
+    let lock_path = socket_path.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .ok()?;
+    use std::os::fd::AsRawFd;
+    // SAFETY: `fd` is a live descriptor owned by `file` for the duration of
+    // the call; `flock` reads nothing else.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Some(EventsDaemonGuard { _file: file })
+    } else {
+        None
+    }
+}
+
+/// Supervise the events daemon from the main daemon process: probe the
+/// socket periodically and (re)spawn the daemon subcommand when unreachable.
+///
+/// The spawned command contract is fixed here once: the current executable
+/// re-invoked as `events-daemon --db <db> --socket <socket>` — the subcommand
+/// the kernel binary registers for [`run_events_daemon`]. The child holds the
+/// per-socket advisory lock, so a probe/spawn race resolves to one survivor.
+pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
+    const PROBE_INTERVAL: Duration = Duration::from_secs(15);
+    let mut respawns: u64 = 0;
+    loop {
+        let reachable = UnixStream::connect(&socket_path).await.is_ok();
+        if !reachable {
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    let spawned = std::process::Command::new(exe)
+                        .arg("events-daemon")
+                        .arg("--db")
+                        .arg(&db_path)
+                        .arg("--socket")
+                        .arg(&socket_path)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    match spawned {
+                        Ok(child) => {
+                            respawns += 1;
+                            tracing::info!(
+                                pid = child.id(),
+                                respawns,
+                                socket = %socket_path.display(),
+                                "spawned events daemon"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "failed to spawn events daemon");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "cannot resolve current executable for events daemon spawn");
+                }
+            }
+        }
+        tokio::time::sleep(PROBE_INTERVAL).await;
+    }
+}
+
+/// Serve the events daemon loop on `socket_path`, owning `db_path`.
+///
+/// Binds the socket (removing a stale path first), then accepts connections
+/// for the process lifetime. Each connection is served sequentially:
+/// same-uid admission, then a read-frame → dispatch → write-frame loop until
+/// the peer disconnects. All storage goes through `SqlEventStore` on a
+/// backend opened read-write against `db_path`; the events schema is ensured
+/// once at boot.
+pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Result<()> {
+    let Some(_guard) = try_acquire_events_daemon_guard(socket_path) else {
+        tracing::info!(
+            socket = %socket_path.display(),
+            "another events daemon holds the lock; exiting"
+        );
+        return Ok(());
+    };
+    let backend = Arc::new(StorageBackend::sqlite(db_path)?);
+    // Ensure the schema once, loudly, before accepting traffic.
+    backend.events()?;
+
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path)?;
+    }
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let listener = UnixListener::bind(socket_path)?;
+    let daemon_euid = unsafe { libc::geteuid() };
+    tracing::info!(
+        socket = %socket_path.display(),
+        db = %db_path.display(),
+        "events daemon listening"
+    );
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!(error = %error, "events daemon accept failed");
+                continue;
+            }
+        };
+        match crate::daemon::peer_uid(&stream) {
+            Ok(uid) if crate::daemon::uid_is_permitted(uid, daemon_euid) => {}
+            Ok(uid) => {
+                tracing::warn!(peer_uid = uid, "events daemon rejected foreign-uid peer");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "events daemon could not read peer credentials");
+                continue;
+            }
+        }
+        let backend = Arc::clone(&backend);
+        crate::daemon::spawn_tracked_task(async move {
+            serve_events_conn(stream, backend).await;
+        });
+    }
+}
+
+async fn serve_events_conn(mut stream: UnixStream, backend: Arc<StorageBackend>) {
+    loop {
+        let payload = match read_frame(&mut stream).await {
+            Ok(bytes) => bytes,
+            // Includes clean EOF on peer disconnect.
+            Err(_) => return,
+        };
+        let response = match serde_json::from_slice::<EventsRequest>(&payload) {
+            Ok(request) => dispatch_events_request(request, &backend).await,
+            Err(error) => EventsResponse::Error {
+                message: format!("events daemon could not parse request frame: {error}"),
+                retryable: false,
+            },
+        };
+        let bytes = match serde_json::to_vec(&response) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::error!(error = %error, "events daemon response serialization failed");
+                return;
+            }
+        };
+        if write_frame(&mut stream, &bytes).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn dispatch_events_request(
+    request: EventsRequest,
+    backend: &StorageBackend,
+) -> EventsResponse {
+    if request.protocol_version() != EVENTS_PROTOCOL_VERSION {
+        return EventsResponse::Error {
+            message: format!(
+                "events protocol version mismatch: daemon speaks {}, client sent {}",
+                EVENTS_PROTOCOL_VERSION,
+                request.protocol_version()
+            ),
+            retryable: false,
+        };
+    }
+    let store = match backend.events_for_namespace(request.namespace()) {
+        Ok(store) => store,
+        Err(error) => {
+            return EventsResponse::Error {
+                message: format!("events store unavailable: {error}"),
+                retryable: true,
+            };
+        }
+    };
+    match request {
+        EventsRequest::AppendEvents { events, .. } => match store.append_events(events).await {
+            Ok(summary) => EventsResponse::Appended { summary },
+            Err(error) => storage_error_response(&error),
+        },
+        EventsRequest::AppendEventsIdempotent { events, .. } => {
+            match store.append_events_idempotent(events).await {
+                Ok(result) => EventsResponse::Idempotent { result },
+                Err(error) => storage_error_response(&error),
+            }
+        }
+        EventsRequest::GetEvent { id, .. } => match store.get_event(id).await {
+            Ok(event) => EventsResponse::Event { event },
+            Err(error) => storage_error_response(&error),
+        },
+        EventsRequest::QueryEvents { filter, page, .. } => {
+            match store.query_events(filter, page).await {
+                Ok(page) => EventsResponse::Pageful { page },
+                Err(error) => storage_error_response(&error),
+            }
+        }
+        EventsRequest::CountEvents { filter, .. } => match store.count_events(filter).await {
+            Ok(count) => EventsResponse::Count { count },
+            Err(error) => storage_error_response(&error),
+        },
+    }
+}
+
+fn storage_error_response(error: &StorageError) -> EventsResponse {
+    EventsResponse::Error {
+        message: error.to_string(),
+        retryable: matches!(
+            error,
+            StorageError::Pool { .. }
+                | StorageError::Timeout { .. }
+                | StorageError::WriteQueueFull { .. }
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client side
+// ---------------------------------------------------------------------------
+
+/// Counters describing the fire-and-forget lane's degradation. Zero drops is
+/// the healthy state; any non-zero `dropped_batches` means the loss-tolerant
+/// contract was exercised and says so.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct EventsForwardingMetrics {
+    pub forwarded_batches: u64,
+    pub forwarded_events: u64,
+    pub dropped_batches: u64,
+    pub dropped_events: u64,
+}
+
+#[derive(Debug, Default)]
+struct ForwardingCounters {
+    forwarded_batches: AtomicU64,
+    forwarded_events: AtomicU64,
+    dropped_batches: AtomicU64,
+    dropped_events: AtomicU64,
+}
+
+/// One per domain process: the connection to the events daemon plus the
+/// bounded fire-and-forget append queue.
+pub struct EventsSplitClient {
+    socket_path: PathBuf,
+    append_tx: tokio::sync::mpsc::Sender<(String, Vec<Event>)>,
+    counters: Arc<ForwardingCounters>,
+    /// Flipped by the forwarder while the daemon is unreachable so the drop
+    /// log fires once per outage, not once per batch.
+    outage_logged: Arc<AtomicBool>,
+    /// Serializes synchronous round-trips over one persistent connection.
+    request_conn: tokio::sync::Mutex<Option<UnixStream>>,
+    /// In-memory validator backing `preflight_event` without I/O.
+    preflight_store: Arc<dyn EventStore>,
+}
+
+impl std::fmt::Debug for EventsSplitClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventsSplitClient")
+            .field("socket_path", &self.socket_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EventsSplitClient {
+    /// Build the client and spawn its background forwarder.
+    pub fn new(socket_path: PathBuf) -> crate::error::RuntimeResult<Arc<Self>> {
+        Self::new_with_queue_depth(socket_path, DEFAULT_APPEND_QUEUE_BATCHES)
+    }
+
+    /// [`Self::new`] with an explicit fire-and-forget queue bound. Tests use a
+    /// tiny depth to exercise the overflow drop arm deterministically.
+    pub fn new_with_queue_depth(
+        socket_path: PathBuf,
+        queue_depth: usize,
+    ) -> crate::error::RuntimeResult<Arc<Self>> {
+        let preflight_backend = StorageBackend::memory()?;
+        let preflight_store = preflight_backend.events()?;
+        // The in-memory backend must outlive the store handle; the store holds
+        // the pool Arc internally, so dropping the backend wrapper here is fine.
+
+        let (append_tx, append_rx) =
+            tokio::sync::mpsc::channel::<(String, Vec<Event>)>(queue_depth.max(1));
+        let counters = Arc::new(ForwardingCounters::default());
+        let outage_logged = Arc::new(AtomicBool::new(false));
+
+        let client = Arc::new(Self {
+            socket_path: socket_path.clone(),
+            append_tx,
+            counters: Arc::clone(&counters),
+            outage_logged: Arc::clone(&outage_logged),
+            request_conn: tokio::sync::Mutex::new(None),
+            preflight_store,
+        });
+
+        crate::daemon::spawn_tracked_task(run_forwarder(
+            socket_path,
+            append_rx,
+            counters,
+            outage_logged,
+        ));
+        Ok(client)
+    }
+
+    /// Snapshot of the fire-and-forget lane's health.
+    pub fn metrics(&self) -> EventsForwardingMetrics {
+        EventsForwardingMetrics {
+            forwarded_batches: self.counters.forwarded_batches.load(Ordering::Relaxed),
+            forwarded_events: self.counters.forwarded_events.load(Ordering::Relaxed),
+            dropped_batches: self.counters.dropped_batches.load(Ordering::Relaxed),
+            dropped_events: self.counters.dropped_events.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Enqueue a batch on the fire-and-forget lane. Never blocks; a full
+    /// queue is a counted, logged drop.
+    fn enqueue(&self, namespace: &str, events: Vec<Event>) {
+        let count = events.len() as u64;
+        match self.append_tx.try_send((namespace.to_string(), events)) {
+            Ok(()) => {}
+            Err(_) => {
+                self.counters
+                    .dropped_batches
+                    .fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .dropped_events
+                    .fetch_add(count, Ordering::Relaxed);
+                if !self.outage_logged.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        dropped_events = count,
+                        "events append queue full; dropping loss-tolerant events until it drains"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One synchronous framed round-trip with a bounded timeout, reusing (or
+    /// re-establishing) the persistent request connection.
+    async fn round_trip(&self, request: &EventsRequest) -> StorageResult<EventsResponse> {
+        let op = "events daemon round-trip";
+        let payload = serde_json::to_vec(request).map_err(|error| StorageError::Serialization {
+            capability: khive_storage::StorageCapability::Events,
+            message: format!("events request serialization failed: {error}"),
+        })?;
+
+        let mut guard = self.request_conn.lock().await;
+        let attempt = async {
+            if guard.is_none() {
+                *guard = Some(UnixStream::connect(&self.socket_path).await?);
+            }
+            let stream = guard.as_mut().expect("connection populated above");
+            write_frame(stream, &payload).await?;
+            let bytes = read_frame(stream).await?;
+            std::io::Result::Ok(bytes)
+        };
+        let bytes = match tokio::time::timeout(REQUEST_TIMEOUT, attempt).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                // Dead connection: forget it so the next call reconnects.
+                *guard = None;
+                return Err(StorageError::Pool {
+                    operation: op.into(),
+                    message: format!(
+                        "events daemon unreachable at {}: {error}",
+                        self.socket_path.display()
+                    ),
+                });
+            }
+            Err(_elapsed) => {
+                *guard = None;
+                return Err(StorageError::Timeout {
+                    operation: op.into(),
+                });
+            }
+        };
+        drop(guard);
+
+        serde_json::from_slice::<EventsResponse>(&bytes).map_err(|error| {
+            StorageError::Serialization {
+                capability: khive_storage::StorageCapability::Events,
+                message: format!("events response deserialization failed: {error}"),
+            }
+        })
+    }
+}
+
+/// The background fire-and-forget forwarder: drains the bounded queue into
+/// framed appends on its own connection, reconnecting with backoff. A batch
+/// that cannot be delivered is dropped and counted — never retried, never
+/// blocking the queue behind it.
+async fn run_forwarder(
+    socket_path: PathBuf,
+    mut rx: tokio::sync::mpsc::Receiver<(String, Vec<Event>)>,
+    counters: Arc<ForwardingCounters>,
+    outage_logged: Arc<AtomicBool>,
+) {
+    let mut conn: Option<UnixStream> = None;
+    while let Some((namespace, events)) = rx.recv().await {
+        let count = events.len() as u64;
+        let request = EventsRequest::AppendEvents {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace,
+            events,
+        };
+        let payload = match serde_json::to_vec(&request) {
+            Ok(payload) => payload,
+            Err(error) => {
+                counters.dropped_batches.fetch_add(1, Ordering::Relaxed);
+                counters.dropped_events.fetch_add(count, Ordering::Relaxed);
+                tracing::error!(error = %error, "events forwarder serialization failed; batch dropped");
+                continue;
+            }
+        };
+
+        let delivered = deliver_batch(&socket_path, &mut conn, &payload).await;
+        if delivered {
+            counters.forwarded_batches.fetch_add(1, Ordering::Relaxed);
+            counters
+                .forwarded_events
+                .fetch_add(count, Ordering::Relaxed);
+            if outage_logged.swap(false, Ordering::Relaxed) {
+                tracing::info!("events daemon reachable again; forwarding resumed");
+            }
+        } else {
+            counters.dropped_batches.fetch_add(1, Ordering::Relaxed);
+            counters.dropped_events.fetch_add(count, Ordering::Relaxed);
+            if !outage_logged.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    socket = %socket_path.display(),
+                    "events daemon unreachable; dropping loss-tolerant events until it returns"
+                );
+            }
+            tokio::time::sleep(FORWARDER_BACKOFF).await;
+        }
+    }
+}
+
+/// Try to deliver one framed append over the forwarder connection,
+/// (re)connecting at most once. Returns whether the daemon acknowledged.
+async fn deliver_batch(socket_path: &Path, conn: &mut Option<UnixStream>, payload: &[u8]) -> bool {
+    for _attempt in 0..2u8 {
+        if conn.is_none() {
+            match UnixStream::connect(socket_path).await {
+                Ok(stream) => *conn = Some(stream),
+                Err(_) => return false,
+            }
+        }
+        let stream = conn.as_mut().expect("connection populated above");
+        let ok = async {
+            write_frame(stream, payload).await?;
+            let bytes = read_frame(stream).await?;
+            std::io::Result::Ok(bytes)
+        }
+        .await;
+        match ok {
+            Ok(bytes) => {
+                return !matches!(
+                    serde_json::from_slice::<EventsResponse>(&bytes),
+                    Ok(EventsResponse::Error { .. }) | Err(_)
+                );
+            }
+            Err(_) => {
+                // Stale connection (daemon restarted): drop it and retry once
+                // with a fresh connect; a second failure is a real outage.
+                *conn = None;
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// The per-namespace EventStore handle
+// ---------------------------------------------------------------------------
+
+/// [`EventStore`] implementation the runtime hands out when the events split
+/// runs in daemon mode. Appends are fire-and-forget through the client's
+/// bounded queue; the ADR-133 idempotent lane and all reads are synchronous
+/// round-trips to the events daemon.
+#[derive(Debug)]
+pub struct ForwardingEventStore {
+    namespace: String,
+    client: Arc<EventsSplitClient>,
+}
+
+impl ForwardingEventStore {
+    pub fn new(namespace: impl Into<String>, client: Arc<EventsSplitClient>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            client,
+        }
+    }
+
+    fn unexpected(&self, op: &'static str, response: EventsResponse) -> StorageError {
+        match response {
+            EventsResponse::Error { message, retryable } => {
+                if retryable {
+                    StorageError::Pool {
+                        operation: op.into(),
+                        message,
+                    }
+                } else {
+                    StorageError::InvalidInput {
+                        capability: khive_storage::StorageCapability::Events,
+                        operation: op.into(),
+                        message,
+                    }
+                }
+            }
+            other => StorageError::Serialization {
+                capability: khive_storage::StorageCapability::Events,
+                message: format!("events daemon returned mismatched response for {op}: {other:?}"),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl EventStore for ForwardingEventStore {
+    async fn append_event(&self, event: Event) -> StorageResult<()> {
+        self.client.enqueue(&self.namespace, vec![event]);
+        Ok(())
+    }
+
+    async fn append_events(&self, events: Vec<Event>) -> StorageResult<BatchWriteSummary> {
+        let attempted = events.len() as u64;
+        self.client.enqueue(&self.namespace, events);
+        // Fire-and-forget: the hand-off succeeded or was counted as a drop;
+        // either way the caller's contract is "accepted for forwarding".
+        Ok(BatchWriteSummary {
+            attempted,
+            affected: attempted,
+            failed: 0,
+            first_error: String::new(),
+        })
+    }
+
+    async fn get_event(&self, id: Uuid) -> StorageResult<Option<Event>> {
+        let request = EventsRequest::GetEvent {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: self.namespace.clone(),
+            id,
+        };
+        match self.client.round_trip(&request).await? {
+            EventsResponse::Event { event } => Ok(event),
+            other => Err(self.unexpected("get_event", other)),
+        }
+    }
+
+    async fn query_events(
+        &self,
+        filter: EventFilter,
+        page: PageRequest,
+    ) -> StorageResult<Page<Event>> {
+        let request = EventsRequest::QueryEvents {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: self.namespace.clone(),
+            filter,
+            page,
+        };
+        match self.client.round_trip(&request).await? {
+            EventsResponse::Pageful { page } => Ok(page),
+            other => Err(self.unexpected("query_events", other)),
+        }
+    }
+
+    async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
+        let request = EventsRequest::CountEvents {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: self.namespace.clone(),
+            filter,
+        };
+        match self.client.round_trip(&request).await? {
+            EventsResponse::Count { count } => Ok(count),
+            other => Err(self.unexpected("count_events", other)),
+        }
+    }
+
+    fn preflight_event(&self, event: &Event) -> StorageResult<()> {
+        // Same validation code path as the daemon-side store, zero I/O.
+        self.client.preflight_store.preflight_event(event)
+    }
+
+    async fn append_events_idempotent(
+        &self,
+        events: Vec<Event>,
+    ) -> StorageResult<IdempotentEventBatchResult> {
+        let request = EventsRequest::AppendEventsIdempotent {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: self.namespace.clone(),
+            events,
+        };
+        match self.client.round_trip(&request).await? {
+            EventsResponse::Idempotent { result } => Ok(result),
+            other => Err(self.unexpected("append_events_idempotent", other)),
+        }
+    }
+
+    fn supports_idempotent_audit_batch(&self) -> bool {
+        true
+    }
+}
+
+/// The store the runtime hands out when the events split is configured:
+/// routes by APPEND CLASS rather than moving the whole event plane.
+///
+/// - The ADR-133 idempotent audit-batch lane — the measured bulk of event
+///   write volume (verb-dispatch audit plus the config-lock rows that ride
+///   the same flusher) — goes to the events lane (`events.db`, forwarded or
+///   direct).
+/// - Plain appends stay on the legacy store, because the legacy `events`
+///   table has raw-SQL consumers whose correctness depends on finding those
+///   rows there: the schedule drain's creator-provenance fence, the kg
+///   projection worker's guarded event INSERT (transactional with main-db
+///   state), and GraphQuery's cross-substrate UNION. Those events are
+///   low-volume domain facts; the split's contention relief does not need
+///   them moved, and moving them breaks the consumers by construction.
+/// - Reads merge both stores so trait-level consumers
+///   (`brain.event_counts`, event getters) observe one event plane.
+pub struct SplitEventStore {
+    legacy: Arc<dyn EventStore>,
+    lane: Arc<dyn EventStore>,
+}
+
+impl std::fmt::Debug for SplitEventStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitEventStore").finish_non_exhaustive()
+    }
+}
+
+impl SplitEventStore {
+    pub fn new(legacy: Arc<dyn EventStore>, lane: Arc<dyn EventStore>) -> Self {
+        Self { legacy, lane }
+    }
+}
+
+#[async_trait]
+impl EventStore for SplitEventStore {
+    async fn append_event(&self, event: Event) -> StorageResult<()> {
+        self.legacy.append_event(event).await
+    }
+
+    async fn append_events(&self, events: Vec<Event>) -> StorageResult<BatchWriteSummary> {
+        self.legacy.append_events(events).await
+    }
+
+    async fn get_event(&self, id: Uuid) -> StorageResult<Option<Event>> {
+        // Domain events (legacy) are the likelier and cheaper hit; fall back
+        // to the lane for audit-batch rows.
+        if let Some(event) = self.legacy.get_event(id).await? {
+            return Ok(Some(event));
+        }
+        self.lane.get_event(id).await
+    }
+
+    async fn query_events(
+        &self,
+        filter: EventFilter,
+        page: PageRequest,
+    ) -> StorageResult<Page<Event>> {
+        // Offset pagination cannot be split across two stores: fetch each
+        // store's prefix covering the requested window, merge in the stores'
+        // shared order (created_at DESC, id DESC), then window in memory.
+        let prefix = PageRequest {
+            offset: 0,
+            limit: page
+                .offset
+                .saturating_add(u64::from(page.limit))
+                .min(u64::from(u32::MAX)) as u32,
+        };
+        let legacy = self
+            .legacy
+            .query_events(filter.clone(), prefix.clone())
+            .await?;
+        let lane = self.lane.query_events(filter, prefix).await?;
+        let total = match (legacy.total, lane.total) {
+            (Some(a), Some(b)) => Some(a + b),
+            _ => None,
+        };
+        let mut items = legacy.items;
+        items.extend(lane.items);
+        items.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        let items = items
+            .into_iter()
+            .skip(page.offset as usize)
+            .take(page.limit as usize)
+            .collect();
+        Ok(Page { items, total })
+    }
+
+    async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
+        let legacy = self.legacy.count_events(filter.clone()).await?;
+        let lane = self.lane.count_events(filter).await?;
+        Ok(legacy + lane)
+    }
+
+    fn preflight_event(&self, event: &Event) -> StorageResult<()> {
+        // Validation is store-independent; the lane's implementation is the
+        // local zero-I/O validator in forwarding mode.
+        self.lane.preflight_event(event)
+    }
+
+    async fn append_events_idempotent(
+        &self,
+        events: Vec<Event>,
+    ) -> StorageResult<IdempotentEventBatchResult> {
+        self.lane.append_events_idempotent(events).await
+    }
+
+    fn supports_idempotent_audit_batch(&self) -> bool {
+        self.lane.supports_idempotent_audit_batch()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_storage::event::EventAppendDisposition;
+    use khive_types::{EventKind, SubstrateKind};
+
+    fn test_event(namespace: &str) -> Event {
+        Event::new(
+            namespace,
+            "test.verb",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "actor:test",
+        )
+    }
+
+    /// Boot a real events daemon on temp paths, poll until its socket accepts.
+    async fn boot_daemon(dir: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let db = dir.path().join("events.db");
+        let socket = dir.path().join("events.sock");
+        let (db_clone, socket_clone) = (db.clone(), socket.clone());
+        tokio::spawn(async move {
+            let _ = run_events_daemon(&db_clone, &socket_clone).await;
+        });
+        for _ in 0..100 {
+            if UnixStream::connect(&socket).await.is_ok() {
+                return (db, socket);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("events daemon did not come up on {}", socket.display());
+    }
+
+    /// The split store's routing contract: plain appends land ONLY in the
+    /// legacy store (whose raw-SQL consumers depend on finding them there),
+    /// the idempotent audit lane lands ONLY in the events lane, and reads
+    /// merge both sides into one event plane.
+    #[tokio::test]
+    async fn split_store_routes_plain_to_legacy_idempotent_to_lane_and_merges_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy_backend =
+            direct_backend_for(&dir.path().join("legacy.db")).expect("legacy backend");
+        let lane_backend = direct_backend_for(&dir.path().join("lane.db")).expect("lane backend");
+        let legacy = legacy_backend
+            .events_for_namespace("local")
+            .expect("legacy store");
+        let lane = lane_backend
+            .events_for_namespace("local")
+            .expect("lane store");
+        let split = SplitEventStore::new(Arc::clone(&legacy), Arc::clone(&lane));
+
+        let plain = test_event("local");
+        let plain_id = plain.id;
+        split.append_event(plain).await.expect("plain append");
+
+        let audit = test_event("local");
+        let audit_id = audit.id;
+        let result = split
+            .append_events_idempotent(vec![audit])
+            .await
+            .expect("idempotent append");
+        assert_eq!(result.rows, vec![EventAppendDisposition::Inserted]);
+
+        // Routing: each row is in exactly its own side.
+        assert!(legacy
+            .get_event(plain_id)
+            .await
+            .expect("legacy get")
+            .is_some());
+        assert!(lane.get_event(plain_id).await.expect("lane get").is_none());
+        assert!(legacy
+            .get_event(audit_id)
+            .await
+            .expect("legacy get")
+            .is_none());
+        assert!(lane.get_event(audit_id).await.expect("lane get").is_some());
+
+        // Merged reads observe one event plane whichever side holds the row.
+        assert!(split
+            .get_event(plain_id)
+            .await
+            .expect("split get")
+            .is_some());
+        assert!(split
+            .get_event(audit_id)
+            .await
+            .expect("split get")
+            .is_some());
+        assert_eq!(
+            split
+                .count_events(EventFilter::default())
+                .await
+                .expect("split count"),
+            2
+        );
+        let page = split
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("split query");
+        let ids: Vec<Uuid> = page.items.iter().map(|e| e.id).collect();
+        assert!(ids.contains(&plain_id) && ids.contains(&audit_id));
+
+        // Windowing across the merge: page size 1 at offsets 0 and 1 yields
+        // the two rows exactly once each.
+        let mut seen = Vec::new();
+        for offset in 0..2 {
+            let page = split
+                .query_events(EventFilter::default(), PageRequest { offset, limit: 1 })
+                .await
+                .expect("windowed query");
+            assert_eq!(page.items.len(), 1);
+            seen.push(page.items[0].id);
+        }
+        seen.sort();
+        let mut expected = vec![plain_id, audit_id];
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    /// End to end over the real socket: the idempotent lane returns true
+    /// dispositions, and the row is readable back through the same store.
+    #[tokio::test]
+    async fn idempotent_append_round_trips_through_the_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_db, socket) = boot_daemon(&dir).await;
+        let client = EventsSplitClient::new(socket).expect("client");
+        let store = ForwardingEventStore::new("local", client);
+
+        let event = test_event("local");
+        let id = event.id;
+        let result = store
+            .append_events_idempotent(vec![event.clone()])
+            .await
+            .expect("idempotent append over socket");
+        assert_eq!(result.rows, vec![EventAppendDisposition::Inserted]);
+
+        // Retry of the identical row reports AlreadyPresentIdentical — the
+        // daemon ran the real idempotent path, not a blind re-insert.
+        let retry = store
+            .append_events_idempotent(vec![event])
+            .await
+            .expect("idempotent retry");
+        assert_eq!(
+            retry.rows,
+            vec![EventAppendDisposition::AlreadyPresentIdentical]
+        );
+
+        let fetched = store.get_event(id).await.expect("get over socket");
+        assert_eq!(fetched.map(|e| e.id), Some(id));
+        let count = store
+            .count_events(EventFilter::default())
+            .await
+            .expect("count over socket");
+        assert_eq!(count, 1);
+    }
+
+    /// The fire-and-forget lane delivers to the daemon store: enqueue returns
+    /// immediately and the row becomes visible to a subsequent count.
+    #[tokio::test]
+    async fn fire_and_forget_append_lands_in_the_daemon_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_db, socket) = boot_daemon(&dir).await;
+        let client = EventsSplitClient::new(socket).expect("client");
+        let store = ForwardingEventStore::new("local", Arc::clone(&client));
+
+        store
+            .append_event(test_event("local"))
+            .await
+            .expect("append_event is fire-and-forget");
+
+        // Poll for BOTH effects: the row landing daemon-side and the
+        // forwarder's own counter — the row can be visible a beat before the
+        // forwarder task is rescheduled to record the delivery.
+        let mut count = 0;
+        let mut metrics = client.metrics();
+        for _ in 0..100 {
+            count = store
+                .count_events(EventFilter::default())
+                .await
+                .expect("count over socket");
+            metrics = client.metrics();
+            if count == 1 && metrics.forwarded_events >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(count, 1, "forwarded event must land in the daemon store");
+        assert_eq!(metrics.dropped_events, 0);
+        assert!(metrics.forwarded_events >= 1, "delivery must be counted");
+    }
+
+    /// R4 overflow arm: with the daemon dead, appends beyond the queue bound
+    /// are DROPPED and counted while every append still returns Ok — the
+    /// domain path proceeds. The drop counter is the loss-tolerance contract.
+    #[tokio::test]
+    async fn queue_overflow_drops_and_counts_but_never_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dead_socket = dir.path().join("nobody-home.sock");
+        let client = EventsSplitClient::new_with_queue_depth(dead_socket, 2).expect("client");
+        let store = ForwardingEventStore::new("local", Arc::clone(&client));
+
+        for _ in 0..20 {
+            store
+                .append_event(test_event("local"))
+                .await
+                .expect("append_event must not error under overflow");
+        }
+        let metrics = client.metrics();
+        assert!(
+            metrics.dropped_events > 0,
+            "overflow must register in the drop counter, got {metrics:?}"
+        );
+    }
+
+    /// R4 dead-socket arm: synchronous lanes fail with a typed retryable
+    /// storage error (never hang, never a generic panic), and the offline
+    /// preflight validator keeps working with zero I/O.
+    #[tokio::test]
+    async fn dead_socket_reads_fail_typed_and_preflight_stays_local() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dead_socket = dir.path().join("nobody-home.sock");
+        let client = EventsSplitClient::new(dead_socket).expect("client");
+        let store = ForwardingEventStore::new("local", client);
+
+        let error = store
+            .get_event(Uuid::new_v4())
+            .await
+            .expect_err("read against a dead socket must fail");
+        assert!(
+            matches!(error, StorageError::Pool { .. }),
+            "expected the typed unreachable error, got {error:?}"
+        );
+
+        // The audit-batch seam contract: preflight is local and functional
+        // with the daemon down.
+        assert!(store.supports_idempotent_audit_batch());
+        store
+            .preflight_event(&test_event("local"))
+            .expect("offline preflight validates a well-formed event");
+    }
+
+    /// Version-skew arm: a frame carrying an unknown protocol version gets a
+    /// typed non-retryable refusal, not a deserialization failure.
+    #[tokio::test]
+    async fn protocol_version_skew_is_a_typed_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_db, socket) = boot_daemon(&dir).await;
+
+        let mut stream = UnixStream::connect(&socket).await.expect("connect");
+        let request = EventsRequest::CountEvents {
+            protocol_version: EVENTS_PROTOCOL_VERSION + 1,
+            namespace: "local".into(),
+            filter: EventFilter::default(),
+        };
+        let payload = serde_json::to_vec(&request).expect("serialize");
+        write_frame(&mut stream, &payload).await.expect("write");
+        let bytes = read_frame(&mut stream).await.expect("read");
+        let response: EventsResponse = serde_json::from_slice(&bytes).expect("parse");
+        match response {
+            EventsResponse::Error { message, retryable } => {
+                assert!(!retryable, "version skew is not retryable");
+                assert!(message.contains("protocol version"), "message: {message}");
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+    }
+
+    /// The per-socket daemon guard is exclusive while held and reusable after
+    /// release — the mechanism that keeps a supervisor respawn race down to
+    /// one surviving daemon.
+    #[test]
+    fn events_daemon_guard_is_exclusive_then_reusable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("events.sock");
+        let first = try_acquire_events_daemon_guard(&socket).expect("first acquire");
+        assert!(
+            try_acquire_events_daemon_guard(&socket).is_none(),
+            "second acquire must fail while the first guard is held"
+        );
+        drop(first);
+        assert!(
+            try_acquire_events_daemon_guard(&socket).is_some(),
+            "acquire must succeed again after the guard is released"
+        );
+    }
+
+    /// Embedded (direct) mode: the process-global backend writes and reads
+    /// `events.db` without any daemon.
+    #[tokio::test]
+    async fn direct_mode_appends_and_reads_without_a_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("events.db");
+        let backend = direct_backend_for(&db).expect("direct backend");
+        let store = backend.events_for_namespace("local").expect("store");
+        store
+            .append_event(test_event("local"))
+            .await
+            .expect("direct append");
+        let count = store
+            .count_events(EventFilter::default())
+            .await
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+}

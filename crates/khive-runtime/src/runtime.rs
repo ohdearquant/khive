@@ -619,10 +619,40 @@ impl KhiveRuntime {
     }
 
     /// Get an EventStore scoped to the token's namespace.
+    ///
+    /// When the events-daemon split (ADR-170) is configured, the store routes
+    /// by append class: the ADR-133 idempotent audit-batch lane — the
+    /// measured bulk of event write volume — persists to `events.db`
+    /// (forwarded over the events daemon socket in daemon deployments, or
+    /// opened directly in embedded/one-shot contexts), while plain appends
+    /// stay on this runtime's backend, keeping every raw-SQL consumer of the
+    /// legacy `events` table (schedule provenance, kg projection guards,
+    /// GraphQuery's substrate union) correct by construction. Reads merge
+    /// both stores. Unconfigured runtimes (tests, in-memory) keep the legacy
+    /// main-store behavior.
     pub fn events(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn EventStore>> {
-        Ok(self
+        let legacy = self
             .backend
-            .events_for_namespace(token.namespace().as_str())?)
+            .events_for_namespace(token.namespace().as_str())?;
+        match &self.config.events_split {
+            None => Ok(legacy),
+            Some(split) => {
+                let lane: Arc<dyn EventStore> = match &split.socket_path {
+                    Some(socket) => {
+                        let client = crate::events_split::client_for(socket)?;
+                        Arc::new(crate::events_split::ForwardingEventStore::new(
+                            token.namespace().as_str(),
+                            client,
+                        ))
+                    }
+                    None => crate::events_split::direct_backend_for(&split.db_path)?
+                        .events_for_namespace(token.namespace().as_str())?,
+                };
+                Ok(Arc::new(crate::events_split::SplitEventStore::new(
+                    legacy, lane,
+                )))
+            }
+        }
     }
 
     /// Get the raw SQL access capability (for ad-hoc queries).
@@ -1787,6 +1817,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1813,6 +1844,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1837,6 +1869,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("test").unwrap(),
@@ -1865,6 +1898,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1935,6 +1969,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2018,6 +2053,7 @@ mod tests {
             let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
+                events_split: None,
                 db_path: Some(db_path),
                 blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),
@@ -2065,6 +2101,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2232,6 +2269,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2259,6 +2297,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
@@ -2294,6 +2333,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
@@ -2321,6 +2361,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2366,6 +2407,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2398,6 +2440,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: "Asia/Tokyo".parse().unwrap(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2544,6 +2587,7 @@ mod tests {
         RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2623,6 +2667,7 @@ mod tests {
         let main_config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2762,6 +2807,7 @@ mod tests {
             RuntimeConfig {
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
+                events_split: None,
                 db_path: None,
                 blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),

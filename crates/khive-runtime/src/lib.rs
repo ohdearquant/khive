@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod error;
+pub mod events_split;
 pub mod fusion;
 pub mod graph_traversal;
 mod note_store_guard;

@@ -93,6 +93,12 @@ enum Command {
     /// warm Unix-socket server; `--transport` selects a registered transport).
     Mcp(khive_mcp::args::Args),
 
+    /// Serve the dedicated events daemon (ADR-170): the resident writer of
+    /// `events.db`, receiving observational events over its own Unix socket
+    /// so telemetry never queues on the domain store's writer lane. Normally
+    /// spawned and supervised by `kkernel mcp --daemon`, not run by hand.
+    EventsDaemon(EventsDaemonArgs),
+
     /// Inspect registered backends.
     #[command(subcommand)]
     Backend(BackendCommand),
@@ -108,6 +114,21 @@ enum Command {
     /// Validate and ingest a `findings.json` audit sweep into the graph as
     /// `finding` notes (ADR-085 Amendment 3).
     CodeIngest(code_ingest::CodeIngestArgs),
+}
+
+/// Arguments for the dedicated events daemon (ADR-170).
+#[derive(clap::Parser, Debug)]
+struct EventsDaemonArgs {
+    /// Events database file. Defaults to `events.db` beside the resolved main
+    /// database (`--db`/`KHIVE_DB` resolution applies to the MAIN database;
+    /// this flag names the events file itself).
+    #[arg(long)]
+    db: Option<PathBuf>,
+
+    /// Unix socket path to bind. Defaults to `khive-events.sock` beside the
+    /// main daemon socket.
+    #[arg(long)]
+    socket: Option<PathBuf>,
 }
 
 /// Database schema lifecycle subcommands.
@@ -289,6 +310,24 @@ pub async fn cli_main() -> Result<()> {
             }
             result
         }
+        Command::EventsDaemon(a) => {
+            let db = match a.db {
+                Some(db) => db,
+                None => {
+                    let main_db = khive_runtime::resolve_db_anchor(None).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "events-daemon: no main database resolvable to anchor events.db; \
+                             pass --db explicitly"
+                        )
+                    })?;
+                    khive_runtime::events_split::events_db_path_beside(&main_db)
+                }
+            };
+            let socket = a
+                .socket
+                .unwrap_or_else(|| khive_runtime::events_split::events_socket_path_beside(&db));
+            khive_runtime::events_split::run_events_daemon(&db, &socket).await
+        }
         Command::Mcp(a) => {
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
 
@@ -372,6 +411,17 @@ pub async fn cli_main() -> Result<()> {
                             brain_profile: a.brain_profile.clone(),
                         },
                     )?;
+                // ADR-170: this arm is a resident daemon host when `--daemon`
+                // is set — it supervises an events daemon at the derived
+                // socket (`start_daemon_components_if_daemon`), so upgrade
+                // the resolved event plane from direct mode to forwarding.
+                let base_cfg = {
+                    let mut base_cfg = base_cfg;
+                    if a.daemon {
+                        khive_mcp::serve::enable_events_forwarding_for_daemon(&mut base_cfg);
+                    }
+                    base_cfg
+                };
 
                 // #667: acquire the boot/recovery lock before building the
                 // coordinator server — that construction runs migrations and

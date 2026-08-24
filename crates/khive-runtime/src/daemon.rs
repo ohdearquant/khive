@@ -317,7 +317,7 @@ fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> {
 /// `getpeereid(2)` on macOS/BSD, `SO_PEERCRED` on Linux. Both report the peer's
 /// credentials as recorded by the kernel at connect time.
 #[cfg(unix)]
-fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
 
@@ -396,7 +396,7 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 /// multiple uids needs a code change and a gated ADR — which is precisely the
 /// decision that should be impossible to make by accident.
 #[cfg(unix)]
-fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
+pub(crate) fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
     peer == daemon_euid
 }
 
