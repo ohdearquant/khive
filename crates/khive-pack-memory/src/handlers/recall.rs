@@ -326,7 +326,36 @@ impl MemoryPack {
             created_after_us.is_none_or(|after| note.created_at >= after)
                 && created_before_us.is_none_or(|before| note.created_at < before)
         };
-        let mut eligible_count = notes_by_id.values().filter(|n| in_window(n)).count();
+        // ... and only candidates the selected fusion strategy can keep:
+        // KeywordOnly discards vector-leg-only hits at fusion and VectorOnly
+        // discards text-leg-only hits, so counting the hydrated union would
+        // let discarded-leg rows satisfy the break condition and stop
+        // widening with zero survivors even when an in-window match exists
+        // one round deeper.
+        let keyword_only = matches!(&cfg.fuse_strategy, FusionStrategy::KeywordOnly);
+        let vector_only = matches!(&cfg.fuse_strategy, FusionStrategy::VectorOnly);
+        let count_eligible = |cands: &super::common::RecallCandidateSet,
+                              notes: &HashMap<Uuid, khive_storage::note::Note>|
+         -> usize {
+            let kept: Option<HashSet<Uuid>> = if keyword_only {
+                Some(cands.text_hits.iter().map(|h| h.subject_id).collect())
+            } else if vector_only {
+                Some(
+                    cands
+                        .vector_hits_per_model
+                        .iter()
+                        .flat_map(|(_, hits)| hits.iter().map(|h| h.subject_id))
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            notes
+                .iter()
+                .filter(|(id, n)| in_window(n) && kept.as_ref().is_none_or(|k| k.contains(id)))
+                .count()
+        };
+        let mut eligible_count = count_eligible(&candidates, &notes_by_id);
 
         for _round in 1..ann_overfetch_max_rounds {
             if eligible_count >= limit {
@@ -363,7 +392,7 @@ impl MemoryPack {
             .await?;
             (memory_ids, notes_by_id) =
                 self.load_memory_candidate_notes(token, &candidates).await?;
-            eligible_count = notes_by_id.values().filter(|n| in_window(n)).count();
+            eligible_count = count_eligible(&candidates, &notes_by_id);
         }
         let candidate_limit = current_candidate_limit;
 
@@ -563,15 +592,10 @@ impl MemoryPack {
                     continue;
                 }
             }
-            if let Some(after) = created_after_us {
-                if note.created_at < after {
-                    continue;
-                }
-            }
-            if let Some(before) = created_before_us {
-                if note.created_at >= before {
-                    continue;
-                }
+            // Same predicate the widening loop counts with; one definition so
+            // a boundary change cannot drift between the two paths.
+            if !in_window(&note) {
+                continue;
             }
             let salience = note.salience.unwrap_or(if note_memory_type == "semantic" {
                 DEFAULT_SALIENCE_SEMANTIC
@@ -6748,6 +6772,222 @@ mod tests {
             windowed_ids,
             vec![target.id.to_string()],
             "the window must recover the eligible memory via widening"
+        );
+    }
+
+    const STRATEGY_PROBE_QUERY: &str = "widening strategy probe query";
+
+    /// Query and vector decoys share one direction; everything else is
+    /// orthogonal, so decoys are top vector hits while never matching FTS.
+    struct StrategyProbeVecService;
+
+    #[async_trait]
+    impl EmbeddingService for StrategyProbeVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    if t == STRATEGY_PROBE_QUERY || t.starts_with("vector decoy") {
+                        vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                    }
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "strategy-probe-vec"
+        }
+    }
+
+    struct StrategyProbeVecProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for StrategyProbeVecProvider {
+        fn name(&self) -> &str {
+            "strategy-probe-model"
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(StrategyProbeVecService))
+        }
+    }
+
+    /// The widening stop condition must count only candidates the selected
+    /// fusion strategy can keep. Under `keyword_only`, in-window notes found
+    /// only by the vector leg are discarded at fusion; counting the hydrated
+    /// union let them satisfy the break condition, so widening stopped with
+    /// zero keyword survivors and returned a false-empty result even though
+    /// an in-window keyword match existed one widening round deeper.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn keyword_only_widening_ignores_vector_leg_candidates() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(StrategyProbeVecProvider);
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        // 160 out-of-window keyword fillers that out-rank the target on FTS,
+        // so the target sits outside the 150-candidate first fetch and inside
+        // the widened 200 (default candidate_limit 150, max 200).
+        let mut filler_ids = Vec::new();
+        for i in 0..160 {
+            let filler = rt
+                .create_note(
+                    &token,
+                    "memory",
+                    None,
+                    &format!(
+                        "widening strategy probe query filler {i} widening \
+                         strategy probe query widening strategy probe query"
+                    ),
+                    Some(0.7),
+                    None,
+                    vec![],
+                )
+                .await
+                .expect("create filler");
+            filler_ids.push(filler.id);
+        }
+        // The in-window keyword match, reachable only via widening.
+        let target = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "widening strategy probe query sentinel",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create target");
+        // In-window vector-leg-only decoys: top vector hits (same direction
+        // as the query), never FTS hits (no query terms). Enough of them to
+        // satisfy `limit` on their own if the count wrongly includes them.
+        let mut decoy_ids = Vec::new();
+        for name in ["vector decoy alpha", "vector decoy beta"] {
+            let decoy = rt
+                .create_note(&token, "memory", None, name, Some(0.7), None, vec![])
+                .await
+                .expect("create decoy");
+            decoy_ids.push(decoy.id);
+        }
+
+        // Fillers sit before the window bound; target and decoys inside it.
+        let t_in = chrono::Utc::now().timestamp_micros() - 3_600_000_000;
+        let t_old = t_in - 3_600_000_000;
+        {
+            let sql = rt.sql();
+            let mut writer = sql.writer().await.expect("writer");
+            for (id, us) in filler_ids
+                .iter()
+                .map(|id| (*id, t_old))
+                .chain(std::iter::once((target.id, t_in)))
+                .chain(decoy_ids.iter().map(|id| (*id, t_in)))
+            {
+                let changed = writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET created_at = ? WHERE id = ?".to_string(),
+                        params: vec![SqlValue::Integer(us), SqlValue::Text(id.to_string())],
+                        label: Some("test.recall_strategy_widening.set_created_at".to_string()),
+                    })
+                    .await
+                    .expect("set created_at");
+                assert_eq!(changed, 1, "created_at UPDATE must hit exactly one row");
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let recall_ids = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .or_else(|| v.get("results").and_then(|r| r.as_array()))
+                .expect("array-shaped recall response")
+                .iter()
+                .map(|r| r["id"].as_str().expect("result id").to_string())
+                .collect()
+        };
+
+        // Fixture precondition 1: the vector leg is live and the decoys are
+        // its top hits — otherwise the reproduction arm proves nothing.
+        let vector_probe = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": STRATEGY_PROBE_QUERY,
+                    "limit": 2,
+                    "fusion_strategy": "vector_only",
+                }),
+            )
+            .await
+            .expect("vector_only probe recall");
+        let vector_probe_ids = recall_ids(&vector_probe);
+        for decoy in &decoy_ids {
+            assert!(
+                vector_probe_ids.contains(&decoy.to_string()),
+                "fixture precondition: decoys must be vector-reachable, got {vector_probe_ids:?}"
+            );
+        }
+
+        // Fixture precondition 2: without a window the target is crowded out
+        // of keyword_only results by the fillers.
+        let unwindowed = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": STRATEGY_PROBE_QUERY,
+                    "limit": 2,
+                    "fusion_strategy": "keyword_only",
+                }),
+            )
+            .await
+            .expect("unwindowed keyword_only recall");
+        assert!(
+            !recall_ids(&unwindowed).contains(&target.id.to_string()),
+            "fixture precondition: the target must be crowded out without a window"
+        );
+
+        // The reproduction arm: windowed keyword_only recall must widen past
+        // the in-window vector decoys and find the keyword target. Counting
+        // the hydrated union here returned [] (the decoys satisfied the
+        // break condition, then fusion discarded them).
+        let windowed = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": STRATEGY_PROBE_QUERY,
+                    "limit": 2,
+                    "fusion_strategy": "keyword_only",
+                    "created_after": chrono::DateTime::from_timestamp_micros(t_in)
+                        .expect("valid micros")
+                        .to_rfc3339(),
+                }),
+            )
+            .await
+            .expect("windowed keyword_only recall");
+        assert_eq!(
+            recall_ids(&windowed),
+            vec![target.id.to_string()],
+            "keyword_only widening must not stop on vector-leg-only candidates"
         );
     }
 }
