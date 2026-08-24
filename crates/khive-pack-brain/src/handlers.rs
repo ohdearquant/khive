@@ -2889,8 +2889,8 @@ pub(crate) async fn fetch_event_counts_window_exhaustive(
             break;
         }
         if admitted == 0 {
-            let ts = boundary_ts
-                .expect("a zero-admission page implies a prior boundary microsecond");
+            let ts =
+                boundary_ts.expect("a zero-admission page implies a prior boundary microsecond");
             // Drain the cluster at exactly this microsecond with offset
             // pagination: `after`/`before` are both exclusive, so this
             // filter matches `created_at == ts` alone. Ordering within one
@@ -2900,7 +2900,7 @@ pub(crate) async fn fetch_event_counts_window_exhaustive(
             let mut cluster_filter = base_filter.clone();
             cluster_filter.after = Some(ts.saturating_sub(1));
             cluster_filter.before = Some(ts.saturating_add(1));
-            let mut cluster_offset = 0u32;
+            let mut cluster_offset = 0u64;
             loop {
                 let cluster_page = store
                     .query_events(
@@ -2921,7 +2921,7 @@ pub(crate) async fn fetch_event_counts_window_exhaustive(
                 if cluster_len < page_size as u64 {
                     break;
                 }
-                cluster_offset = cluster_offset.saturating_add(page_size);
+                cluster_offset = cluster_offset.saturating_add(u64::from(page_size));
             }
             // Everything at `ts` is collected; resume the keyset walk
             // strictly below the drained microsecond.
