@@ -713,6 +713,22 @@
   font-size: var(--khive-type-lg);
   margin-right: var(--khive-space-3);
 }
+.repo-graph-node.compact-label {
+  align-items: center;
+  aspect-ratio: 1;
+  border-radius: var(--khive-radius-pill);
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+  padding: 4px;
+  text-align: center;
+}
+.repo-graph-node.compact-label > span,
+.repo-graph-node.compact-label > strong { display: none; }
+.repo-graph-node.compact-label > .repo-node-kind-icon {
+  float: none;
+  margin: 0;
+}
 .repo-graph-node .repo-graph-overlay-badge {
   align-items: center;
   background: var(--khive-color-warning-soft);
@@ -893,6 +909,19 @@ button.repo-list-row:hover,
 }
 .repo-bar > span { background: var(--repo-green); display: block; height: 100%; }
 .repo-bar.violet > span { background: var(--repo-violet); }
+.repo-bar-reading {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(80px, 1fr) auto;
+  min-width: 140px;
+}
+.repo-bar-reading > strong {
+  font-size: var(--khive-type-sm);
+  font-variant-numeric: tabular-nums;
+  min-width: 3.5em;
+  text-align: right;
+}
 
 .repo-chart {
   background: var(--khive-color-surface-raised);
@@ -1041,6 +1070,7 @@ button.repo-list-row:hover,
   .repo-graph-toolbar { align-items: flex-start; flex-direction: column; }
   .repo-graph-lens-picker { flex-wrap: wrap; }
   .repo-graph-active-overlay { max-width: calc(100% - 20px); }
+  .repo-graph-node.compact-label { width: 20px !important; }
   .repo-coupling-lens > header { flex-direction: column; }
   .repo-coupling-lens > header p { text-align: left; }
   .repo-coupling-evidence { grid-template-columns: 1fr; }

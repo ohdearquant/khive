@@ -90,6 +90,8 @@ const UI_TREEMAP_LIMIT = 180;
 const UI_RESIDUAL_LIMIT = 80;
 const UI_GRAPH_EDGE_LIMIT = 50;
 const UI_COUPLING_EDGE_LIMIT = 20;
+const DENSE_GRAPH_LABEL_THRESHOLD = 24;
+const COMPACT_GRAPH_NODE_WIDTH = 26;
 
 function derivedDiamondPoints(x: number, y: number): string {
   const r = 1.1;
@@ -536,6 +538,8 @@ function StructureGraph({
     !focusedModuleIds.has(id);
   const isCouplingFocused = (id: string) =>
     lens === "hidden_coupling" && focusedModuleIds?.has(id) === true;
+  const compactGraphLabels =
+    displayedModules.length > DENSE_GRAPH_LABEL_THRESHOLD;
   const inspectCouplingEndpoint = (moduleId: string) => {
     setSelectedId(moduleId);
     onInspectModule(moduleId);
@@ -719,8 +723,9 @@ function StructureGraph({
             </button>
             {displayedPackages.map((item) => {
               const position = positions.get(item.id)!;
+              const compactLabel = compactGraphLabels && selectedId !== item.id;
               return (
-                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("project")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
+                <button aria-label={`${labels.node_types.package}: ${item.name}`} className={`repo-graph-node ${compactLabel ? "compact-label" : ""} ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""}`} data-package-node="" data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${compactLabel ? COMPACT_GRAPH_NODE_WIDTH : nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("project")) }} title={compactLabel ? item.name : undefined} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
                   setSelectedId(item.id);
                   setFocusedPairKey(null);
                 }}>
@@ -732,8 +737,10 @@ function StructureGraph({
             {displayedModules.map((item) => {
               const position = positions.get(item.id)!;
               const couplingCount = couplingNodeCounts.get(item.id);
+              const compactLabel = compactGraphLabels &&
+                selectedId !== item.id && !isCouplingFocused(item.id);
               return (
-                <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""} ${isCouplingFocused(item.id) ? "coupling-focused" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("concept")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
+                <button aria-label={`${labels.node_types.module}: ${item.module_path}`} className={`repo-graph-node ${compactLabel ? "compact-label" : ""} ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""} ${isCouplingFocused(item.id) ? "coupling-focused" : ""}`} data-module-node="" data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${compactLabel ? COMPACT_GRAPH_NODE_WIDTH : nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("concept")) }} title={compactLabel ? item.source_path : undefined} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
                   setSelectedId(item.id);
                   setFocusedPairKey(null);
                 }}>
@@ -1158,7 +1165,7 @@ function HiddenCouplingView({ bundle, moduleById, selectedModuleId, onInspectMod
   return (
     <div className="repo-view-body">
       <section className="repo-card repo-table-wrap">
-        <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.node_types.module}</th><th>{labels.metrics.cochange_count}</th><th>{labels.metrics.support}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.left_module_id}-${row.right_module_id}`}><td><ModuleInspectionControl moduleId={row.left_module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /></td><td><ModuleInspectionControl moduleId={row.right_module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /></td><td>{formatNumber(row.cochange_count)}</td><td><div className="repo-bar violet" aria-label={`${labels.metrics.support} ${formatPercent(row.support)}`}><span style={{ width: `${Math.min(100, row.support * 100)}%` }} /></div></td></tr>)}</tbody></table>
+        <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.node_types.module}</th><th>{labels.metrics.cochange_count}</th><th>{labels.metrics.support}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.left_module_id}-${row.right_module_id}`}><td><ModuleInspectionControl moduleId={row.left_module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /></td><td><ModuleInspectionControl moduleId={row.right_module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /></td><td>{formatNumber(row.cochange_count)}</td><td><div className="repo-bar-reading"><div className="repo-bar violet" aria-label={`${labels.metrics.support} ${formatPercent(row.support)}`}><span style={{ width: `${Math.min(100, row.support * 100)}%` }} /></div><strong data-support-value={row.support}>{formatPercent(row.support)}</strong></div></td></tr>)}</tbody></table>
         {isKnownEmptyRepoPage(analysis.data) && <DataState className="repo-empty" state="empty" title={`No ${bundle.capability.views.hidden_coupling.label.toLocaleLowerCase()} in this bundle`} message="Module pairs with captured co-change signals belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />}
         <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.hidden_coupling.label} labels={labels} />
         <BoundDisclosure page={analysis.data} labels={labels} />

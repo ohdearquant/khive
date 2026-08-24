@@ -987,6 +987,56 @@ describe("repository showcase", () => {
     expect(overcrowded).toEqual([]);
   });
 
+  it("uses compact labels in dense graphs and prints each hidden-coupling support value", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const moduleNodes = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        ".repo-graph-node[data-module-node]",
+      ),
+    );
+    expect(moduleNodes.length).toBeGreaterThan(24);
+    const packageNodes = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        ".repo-graph-node[data-package-node]",
+      ),
+    );
+    expect(packageNodes.length).toBeGreaterThan(1);
+    const compactNodes = [...packageNodes, ...moduleNodes];
+    expect(compactNodes.every((node) => node.classList.contains("compact-label")))
+      .toBe(true);
+    for (const node of compactNodes) {
+      expect(node.style.width).toBe("26px");
+      expect(node).toHaveAccessibleName();
+    }
+
+    await user.click(moduleNodes[0]);
+    expect(moduleNodes[0]).not.toHaveClass("compact-label");
+    expect(Number.parseFloat(moduleNodes[0].style.width)).toBeGreaterThanOrEqual(
+      92,
+    );
+
+    await user.click(
+      container.querySelector('[data-view-id="hidden_coupling"]')!,
+    );
+    const values = Array.from(
+      container.querySelectorAll<HTMLElement>("[data-support-value]"),
+    );
+    expect(values).toHaveLength(
+      Math.min(200, bundle.aggregates.hidden_coupling.data.items.length),
+    );
+    const expected = bundle.aggregates.hidden_coupling.data.items
+      .slice(0, values.length)
+      .map((row) =>
+        new Intl.NumberFormat("en", {
+          style: "percent",
+          maximumFractionDigits: 1,
+        }).format(row.support <= 1 ? row.support : row.support / 100)
+      );
+    expect(values.map((value) => value.textContent)).toEqual(expected);
+  });
+
   it("keeps every structure-graph card footprint inside a 300px mobile stage", () => {
     const stageWidth = 300;
     const { container } = render(<RepoShowcase bundle={golden()} />);
