@@ -656,6 +656,12 @@ fn git_at_slot(repo: &Path, slot: &ValidatedSlot) -> Command {
     }
     #[cfg(not(unix))]
     {
+        // Pathname-bound fallback: non-Unix targets cannot pass a directory
+        // descriptor to git, so `.git` is re-resolved by name here. This
+        // reopens the symlink-swap TOCTOU the Unix descriptor-pin closes — a
+        // `.git` swapped for a symlink after validation redirects git to an
+        // unowned repository. Windows-safe handle-pinning needs platform APIs
+        // untestable on this CI and is tracked in #2149.
         let _ = slot;
         cmd.arg("--git-dir").arg(repo.join(".git"));
     }
@@ -692,7 +698,9 @@ fn revalidate_owned_slot(repo_dir: &Path) -> Result<ValidatedSlot, CacheError> {
 
 /// Non-unix fallback: pathname re-check at the same call site. Weaker than
 /// the fd-bound form — the explicit `--git-dir` layer still prevents upward
-/// discovery, though not a symlink swapped in after this check.
+/// discovery, though not a symlink swapped in after this check. That
+/// pathname-bound TOCTOU is tracked in #2149; the Windows-safe handle-pin
+/// needs platform APIs untestable on this CI.
 #[cfg(not(unix))]
 fn revalidate_owned_slot(repo_dir: &Path) -> Result<ValidatedSlot, CacheError> {
     if !is_owned_entry(repo_dir) {
