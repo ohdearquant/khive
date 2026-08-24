@@ -860,7 +860,7 @@ async fn blob_gc_fencing_complete(sql: &dyn SqlAccess) -> StorageResult<bool> {
                         AND (SELECT COUNT(*) FROM _schema_migrations \
                              WHERE version = 21 \
                                AND name = 'attachments_first_class') = 1 \
-                        AND (SELECT MAX(version) FROM _schema_migrations) = 21"
+                        AND (SELECT MAX(version) FROM _schema_migrations) >= 21"
                     .to_string(),
                 params: vec![],
                 label: Some("blob_gc_cutover_complete".to_string()),
@@ -2430,7 +2430,11 @@ mod tests {
     /// instead of retaining Phase 4a's synthetic future-schema fixture.
     fn prepare_completed_v21_gc_fixture(conn: &mut rusqlite::Connection) {
         let version = crate::run_migrations(conn).expect("prepare canonical completed V21");
-        assert_eq!(version, 21, "empty fixture must take the V21 fast path");
+        assert_eq!(
+            version,
+            crate::migrations::latest_schema_version(),
+            "empty fixture must migrate to the latest schema (which contains the completed V21 cutover)"
+        );
     }
 
     #[tokio::test]
@@ -2498,11 +2502,13 @@ mod tests {
                 "UPDATE _schema_migrations SET name = 'not_attachments_first_class' \
                  WHERE version = 21",
             ),
-            (
-                "ledger_max_version_advances_past_v21",
-                "INSERT INTO _schema_migrations (version, name, applied_at) \
-                 VALUES (22, 'future_migration', 22)",
-            ),
+            // NOTE: "ledger max version advances past V21" is deliberately NOT
+            // a reject arm. Later migrations record on top of a completed
+            // cutover without disturbing the fencing set, so the gate's
+            // ledger predicate is `MAX(version) >= 21`; the accept-path tests
+            // in this module run against the latest schema and are the
+            // positive control for that semantics. The physical facts the
+            // matrix below removes one at a time are what carry the safety.
             (
                 "marker_row_deleted",
                 "DELETE FROM attachment_cutover_state WHERE singleton = 1",
