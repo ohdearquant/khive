@@ -7594,6 +7594,74 @@ async fn heartbeat_success_is_visible_via_health() {
     assert_eq!(ch["consecutive_failures"].as_u64(), Some(0));
 }
 
+/// A supplied heartbeat `at` must resolve to an instant before it is stored:
+/// the staleness reader parses `last_poll_attempt_at` inside an Option chain,
+/// so an unparseable stored value would make staleness silently unknown and
+/// the channel could never read as stale. A date-only value is the realistic
+/// wrong shape; a valid offset-carrying value is preserved verbatim (the
+/// offset records the calendar it was stamped in), and the omitted-`at` path
+/// keeps working — the control arms separating "validates" from "rejects
+/// everything".
+#[tokio::test]
+async fn heartbeat_rejects_an_unparseable_at_and_preserves_a_valid_one() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let base = serde_json::json!({
+        "namespace": "local",
+        "channel_kind": "email",
+        "channel_slug": "recipient@example.com",
+        "outcome": "success",
+    });
+
+    let mut date_only = base.clone();
+    date_only["at"] = serde_json::json!("2026-08-24");
+    let err = registry
+        .dispatch("comm.heartbeat", date_only)
+        .await
+        .expect_err("a date-only `at` must be rejected, not stored");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("at") && msg.contains("2026-08-24"),
+        "the error names the field and the offending value: {msg}"
+    );
+
+    // Checked BEFORE the valid heartbeat: both calls share one channel
+    // identity, so a row leaked by the rejected call would be overwritten
+    // below and invisible to any later count.
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds after the rejected heartbeat");
+    let channels = health["channels"].as_array().expect("channels is array");
+    assert!(
+        channels.is_empty(),
+        "the rejected heartbeat left no row: {channels:?}"
+    );
+
+    let mut with_offset = base.clone();
+    with_offset["at"] = serde_json::json!("2026-08-24T09:15:00-04:00");
+    registry
+        .dispatch("comm.heartbeat", with_offset)
+        .await
+        .expect("a valid offset-carrying `at` is accepted");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channels = health["channels"].as_array().expect("channels is array");
+    assert_eq!(
+        channels.len(),
+        1,
+        "exactly the valid heartbeat's row exists"
+    );
+    assert_eq!(
+        channels[0]["last_poll_attempt_at"].as_str(),
+        Some("2026-08-24T09:15:00-04:00"),
+        "a valid `at` is stored verbatim, offset spelling preserved"
+    );
+}
+
 /// khive #1383: quarantine is a terminal disposition for one message, not a
 /// channel failure. Healthy heartbeat facts therefore stay healthy while the
 /// read surface reports every live parked row, grouped by the exact transport

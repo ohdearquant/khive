@@ -253,16 +253,27 @@ fn thread_id_query_spellings(root: Uuid, selected_raw: Option<&str>) -> Vec<Stri
     spellings
 }
 
+/// Parse a caller-supplied timestamp, rejecting anything that does not
+/// resolve to an instant, with the verb and field named in the error.
+/// Callers own the serialization policy on the parsed value: ingest
+/// re-serializes in UTC, heartbeat preserves the supplied spelling.
+fn parse_supplied_timestamp(
+    verb: &str,
+    field: &str,
+    raw: &str,
+) -> Result<DateTime<chrono::FixedOffset>, RuntimeError> {
+    DateTime::parse_from_rfc3339(raw.trim()).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "{verb}: `{field}` must be a valid RFC 3339 timestamp, got {raw:?}: {error}"
+        ))
+    })
+}
+
 /// Validate an adapter timestamp before it can be certified as a v1 `sent_at`
 /// value, then serialize the instant in one RFC 3339 representation (UTC).
 fn canonicalize_ingest_sent_at(raw: &str) -> Result<String, RuntimeError> {
-    DateTime::parse_from_rfc3339(raw.trim())
+    parse_supplied_timestamp("ingest", "sent_at", raw)
         .map(|timestamp| timestamp.with_timezone(&Utc).to_rfc3339())
-        .map_err(|error| {
-            RuntimeError::InvalidInput(format!(
-                "ingest: `sent_at` must be a valid RFC 3339 timestamp, got {raw:?}: {error}"
-            ))
-        })
 }
 
 /// `send` — create a message note in the caller's namespace (outbound) AND
@@ -2321,7 +2332,18 @@ pub(crate) async fn handle_heartbeat(
         .map_err(|e| RuntimeError::Internal(format!("heartbeat: get_note: {e}")))?;
 
     let now = Utc::now();
-    let at = p.at.clone().unwrap_or_else(|| now.to_rfc3339());
+    // A supplied `at` must resolve to an instant before it is stored: the
+    // staleness reader parses `last_poll_attempt_at` inside an Option chain,
+    // so an unparseable stored value makes staleness silently unknown and the
+    // channel can never read as stale — failing toward looking healthy. Same
+    // rule as ingest's `sent_at` (`canonicalize_ingest_sent_at`).
+    let at = match p.at.as_deref() {
+        Some(raw) => {
+            parse_supplied_timestamp("heartbeat", "at", raw)?;
+            raw.trim().to_string()
+        }
+        None => now.to_rfc3339(),
+    };
 
     // `HeartbeatParams` (khive-pack-comm/src/params.rs) carries no free-form
     // `properties` field — every key assigned below is a fixed literal, so no
