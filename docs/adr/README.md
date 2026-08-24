@@ -186,6 +186,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-167](ADR-167-service-provenance-and-kind-classification.md)        | Service Provenance and Service/Concept Classification                                                      |
 | [ADR-168](ADR-168-event-retention-classes.md)                           | Event Retention Classes and Sealed Archival                                                                |
 | [ADR-169](ADR-169-timezone-correct-timestamps.md)                       | Timezone-Correct Timestamps: Date-Only Values and a Configured Display Timezone                            |
+| [ADR-171](ADR-171-brain-daemon-split.md)                                | Brain daemon — profile state leaves the domain process                                                     |
 
 <!-- END GENERATED ADR CATALOG -->
 
