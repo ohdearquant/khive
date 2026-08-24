@@ -166,6 +166,12 @@ pub struct IngestReport {
     /// `run_ingest` users do not receive a receipt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt_id: Option<String>,
+    /// Caller-supplied `max_items` before verb-level clamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_items_requested: Option<i64>,
+    /// Per-pass item budget after verb-level clamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_items_effective: Option<u64>,
     pub commits_ingested: u64,
     pub commits_skipped_existing: u64,
     pub issues_ingested: u64,

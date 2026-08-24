@@ -119,13 +119,15 @@ impl GitPack {
         // legal budget, not an unrequested 500-item pass. A non-integer
         // value (string, float, bool, array, object) is rejected outright
         // rather than silently defaulted.
-        let max_items = match params.get("max_items") {
-            None | Some(Value::Null) => DEFAULT_MAX_ITEMS,
-            Some(v) => v.as_i64().ok_or_else(|| {
+        let max_items_requested = match params.get("max_items") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.as_i64().ok_or_else(|| {
                 RuntimeError::InvalidInput(format!("max_items must be an integer, got {v:?}"))
-            })?,
-        }
-        .clamp(MIN_MAX_ITEMS, MAX_MAX_ITEMS) as u64;
+            })?),
+        };
+        let max_items = max_items_requested
+            .unwrap_or(DEFAULT_MAX_ITEMS)
+            .clamp(MIN_MAX_ITEMS, MAX_MAX_ITEMS) as u64;
 
         let include = match params.get("include") {
             None | Some(Value::Null) => IngestInclude::default(),
@@ -217,6 +219,15 @@ impl GitPack {
         }
         report.project_id = Some(project_id.to_string());
         report.project_created = project_created;
+        report.max_items_requested = max_items_requested;
+        report.max_items_effective = Some(max_items);
+        if let Some(requested) = max_items_requested {
+            if requested != max_items as i64 {
+                report.warnings.push(format!(
+                    "max_items request {requested} was clamped to {max_items}"
+                ));
+            }
+        }
         if let Some(orphan) = resolution.orphan {
             report.orphaned_corpus_detected = true;
             report.orphaned_project_id = Some(orphan.dead_project_id.to_string());
