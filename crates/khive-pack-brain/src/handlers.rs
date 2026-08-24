@@ -7,6 +7,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{
     micros_to_iso, DispatchHook, EventView, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
     VerbRegistry,
@@ -108,13 +109,13 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "since",
                 param_type: "string",
                 required: true,
-                description: "Window start, ISO-8601/RFC-3339 datetime (e.g. \"2026-07-01T00:00:00Z\"). Inclusive.",
+                description: "Window start, ISO-8601/RFC-3339 datetime (e.g. \"2026-07-01T00:00:00Z\"). Inclusive. A date-only value (\"2026-07-01\") anchors to that day's earliest instant in the configured display timezone.",
             },
             khive_types::ParamDef {
                 name: "until",
                 param_type: "string",
                 required: false,
-                description: "Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.",
+                description: "Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now. A date-only value covers the whole named day: it anchors to the NEXT day's earliest instant in the configured display timezone.",
             },
             khive_types::ParamDef {
                 name: "actor",
@@ -852,9 +853,10 @@ impl BrainPack {
                     .to_string(),
             )
         })?;
-        let since_us = parse_rfc3339_micros("since", since_raw, false)?;
+        let display_tz = self.runtime.config().display_timezone;
+        let since_us = parse_rfc3339_micros("since", since_raw, false, display_tz)?;
         let until_us = match p.until.as_deref() {
-            Some(u) => parse_rfc3339_micros("until", u, true)?,
+            Some(u) => parse_rfc3339_micros("until", u, true, display_tz)?,
             None => Utc::now().timestamp_micros(),
         };
 
@@ -2870,21 +2872,27 @@ pub(crate) async fn fetch_event_counts_window_exhaustive(
 /// naming the offending field/value in the error rather than a bare parse
 /// failure (`brain.event_counts`, ADR-103 Stage 1).
 ///
-/// A bare `YYYY-MM-DD` date (no time-of-day component) is coerced to
-/// midnight UTC rather than rejected — RFC-3339 requires a time component,
-/// but a date-only value is unambiguous and a common caller shorthand; the
-/// alternative is silently returning nothing until the caller happens to
-/// probe the full timestamp form (#984).
+/// A bare `YYYY-MM-DD` date (no time-of-day component) is accepted rather
+/// than rejected — RFC-3339 requires a time component, but a date-only value
+/// is unambiguous and a common caller shorthand; the alternative is silently
+/// returning nothing until the caller happens to probe the full timestamp
+/// form (#984). It anchors to the earliest instant of that calendar date in
+/// `tz`, the configured display timezone (ADR-169 D1) — the same rule
+/// `gtd`'s date-only `due` follows. The earlier form anchored to midnight
+/// UTC, which put the window's edges up to a day off the calendar the caller
+/// was naming.
 ///
 /// `roll_to_next_day` handles the `until` bound: the window is applied as
 /// half-open `[since, until)` (see `EventCounts` handler), so a date-only
-/// `since` correctly means "that day's midnight" but a date-only `until`
-/// must mean "the end of that day" — i.e. the *next* day's midnight —
-/// otherwise the exclusive upper bound drops the entire named day (#994).
+/// `since` correctly means "that day's start" but a date-only `until`
+/// must mean "the end of that day" — i.e. the *next* day's earliest
+/// instant — otherwise the exclusive upper bound drops the entire named
+/// day (#994).
 fn parse_rfc3339_micros(
     field: &'static str,
     value: &str,
     roll_to_next_day: bool,
+    tz: chrono_tz::Tz,
 ) -> Result<i64, RuntimeError> {
     let trimmed = value.trim();
     if let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
@@ -2900,10 +2908,14 @@ fn parse_rfc3339_micros(
         } else {
             date
         };
-        let midnight = date
-            .and_hms_opt(0, 0, 0)
-            .expect("00:00:00 is always a valid time");
-        return Ok(midnight.and_utc().timestamp_micros());
+        return anchor_date_to_earliest_instant(date, tz)
+            .map(|dt| dt.timestamp_micros())
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "invalid `{field}`: {value:?} does not exist in the configured display \
+                     timezone {tz} (no representable instant carries that local date)"
+                ))
+            });
     }
     chrono::DateTime::parse_from_rfc3339(trimmed)
         .map(|dt| dt.with_timezone(&Utc).timestamp_micros())
