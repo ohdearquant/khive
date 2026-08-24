@@ -1,5 +1,6 @@
 import { readOperatorShowcaseAccessToken } from "@/lib/adapters/preferred-showcase-source";
 import {
+  isShowcaseAnalysisId,
   normalizeRepositoryUrl,
   SHOWCASE_REGISTRY,
   type ShowcaseRegistryEntry,
@@ -8,7 +9,6 @@ import {
 export const SHOWCASE_CATALOG_MAX_ENTRIES = 64;
 export const SHOWCASE_CATALOG_MAX_BYTES = 256 * 1024;
 
-const ANALYSIS_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const CATALOG_SCHEMA = "khive.showcase.catalog.v1";
 
 export type ShowcaseAnalysisCatalogEntry = Readonly<{
@@ -75,7 +75,7 @@ export function parseShowcaseAnalysisCatalog(
     const analysisId = Reflect.get(candidate, "analysis_id");
     const canonicalUrl = Reflect.get(candidate, "canonical_url");
     if (
-      typeof analysisId !== "string" || !ANALYSIS_ID.test(analysisId) ||
+      !isShowcaseAnalysisId(analysisId) ||
       typeof canonicalUrl !== "string"
     ) {
       return invalidCatalog();
@@ -182,6 +182,20 @@ export function mergeShowcaseRegistry(
       assetPath: undefined,
       analysisId: entry.analysis_id,
     });
+  }
+  for (const [index, staticEntry] of staticRegistry.entries()) {
+    const entry = merged[index];
+    if (
+      entry &&
+      entry.analysisId === undefined &&
+      isShowcaseAnalysisId(staticEntry.analysisId) &&
+      !entry.aliases.includes(staticEntry.analysisId)
+    ) {
+      merged[index] = {
+        ...entry,
+        aliases: [...entry.aliases, staticEntry.analysisId],
+      };
+    }
   }
   return merged;
 }

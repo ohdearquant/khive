@@ -248,10 +248,11 @@ describe("showcase analysis catalog", () => {
     ]);
   });
 
-  it("removes legacy analysis IDs when the catalog does not configure them", () => {
+  it("turns a cleared static analysis ID into a derived lookup alias", () => {
     expect(mergeShowcaseRegistry([], [staticEntry])).toEqual([
       {
         ...staticEntry,
+        aliases: [...staticEntry.aliases, "legacy-static-id"],
         analysisId: undefined,
       },
     ]);
