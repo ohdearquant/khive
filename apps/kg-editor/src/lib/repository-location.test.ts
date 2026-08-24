@@ -13,6 +13,15 @@ const repository = "https://github.com/ohdearquant/khive";
 const snapshotSha = "0123456789abcdef0123456789abcdef01234567";
 
 describe("repository investigation location", () => {
+  it("accepts a curated repository alias and stores its canonical URL", () => {
+    const parsed = parseRepositoryLocation(
+      new URL("https://example.test/?repo=khive"),
+    );
+
+    expect(parsed.issues).toEqual([]);
+    expect(parsed.location.repository).toBe(repository);
+  });
+
   it.each(REPOSITORY_VIEW_IDS)(
     "round-trips a shareable %s investigation",
     (view: ViewId) => {
