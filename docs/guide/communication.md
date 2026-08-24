@@ -141,7 +141,8 @@ request(ops="comm.read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
 
 `comm.mark_read` requires `ids` with 1-500 full UUIDs or 8-character hex prefixes. It validates
 every target before mutation, deduplicates resolved IDs, and returns ordered results plus
-`requested_count`, `unique_count`, `marked_count`, and `failed_count`. The default
+`requested_count`, `unique_count`, `marked_count`, and `failed_count`. Each item carries
+`status=success|failed`; the aggregate carries `status=success|partial|failed`. The default
 `atomic=false` reuses the best-effort bulk behavior: later storage failures appear in each
 result's `read=false` and `mark_error` without rolling back an earlier success. With
 `atomic=true`, all unique marks are guarded and committed in one transaction; any failed

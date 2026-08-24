@@ -199,7 +199,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.read",
-        description: "Compatibility mark-read verb for one or up to 500 inbound messages; it does not retrieve message content. Mark writes are best-effort: inspect each result's read/mark_error fields and re-issue failures later.",
+        description: "Compatibility mark-read verb for one or up to 500 inbound messages; it does not retrieve message content. Mark writes are best-effort: each result carries status=success|failed, and bulk responses carry status=success|partial|failed.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -219,7 +219,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.mark_read",
-        description: "Mark up to 500 inbound messages as read; use comm.inbox or comm.thread to retrieve content. Defaults to best-effort updates, with atomic=true for all-or-nothing mutation.",
+        description: "Mark up to 500 inbound messages as read; use comm.inbox or comm.thread to retrieve content. Best-effort responses carry status=success|partial|failed; atomic=true provides all-or-nothing mutation.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[

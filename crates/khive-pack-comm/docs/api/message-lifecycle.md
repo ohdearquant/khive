@@ -257,7 +257,8 @@ Exactly one of `id` or `ids` is required. The single-ID form preserves its
 existing response. The bulk form accepts 1-500 IDs, resolves duplicates to one
 update, validates every target before the first mutation, and returns ordered
 per-target `results` with `requested_count`, `unique_count`, `marked_count`, and
-`failed_count`.
+`failed_count`. Each result carries `status=success|failed`; the bulk response
+carries `status=success|partial|failed` from its aggregate counts.
 Validation includes the same namespace, message-kind, direction, addressee, and
 legacy-message rules as the single-ID form. Updates are not a cross-message
 transaction: a validation failure rejects the call before any update, while an
@@ -290,18 +291,18 @@ no-op write no longer fails the whole call. This follows the same
 high-level best-effort principle as `handle_reply`'s fold-in mark, which has
 been best-effort since its introduction. Three outcomes:
 
-- `Ok(true)` — the row was live and updated: `read: true`, `properties` is
-  the patched value (including the new `read: true`).
+- `Ok(true)` — the row was live and updated: `status: "success"`, `read: true`,
+  `properties` is the patched value (including the new `read: true`).
 - `Ok(false)` — no live row currently matches (soft-deleted mid-flight, or an
   eligibility property — namespace, kind, direction, addressee — changed
-  since this handler's prior validation): `read: false`, `mark_error: "no
-  live row updated"`, `properties` is the note's ORIGINAL stored value (a
-  stored SQL-NULL properties column round-trips as JSON `null`, never `{}`)
+  since this handler's prior validation): `status: "failed"`, `read: false`,
+  `mark_error: "no live row updated"`, `properties` is the note's ORIGINAL
+  stored value (a stored SQL-NULL properties column round-trips as JSON `null`, never `{}`)
   — the response never claims a write that did not land.
 - `Err(e)` — the patch failed (writer timeout, pool exhaustion, etc.):
   logged via `tracing::warn!` with the full error detail, then `read:
-  false`, `mark_error` is the error's `Display` string, `properties` is the
-  original stored value (again `null` if that is what was stored).
+  false`, `status: "failed"`, `mark_error` is the error's `Display` string,
+  `properties` is the original stored value (again `null` if that is what was stored).
 
 `id`/`full_id` are returned in all three arms — only the mark degrades, not
 the read. There is no retry loop; a caller polling unread counts simply

@@ -1003,6 +1003,7 @@ async fn mark_read_targets_best_effort(
             Err(error) => results.push(json!({
                 "id": short_id(id),
                 "full_id": id.as_hyphenated().to_string(),
+                "status": "failed",
                 "read": false,
                 "mark_error": error.to_string(),
                 "properties": original_properties,
@@ -1046,6 +1047,7 @@ async fn mark_read_targets_atomic(
         results.push(json!({
             "id": short_id(id),
             "full_id": id.as_hyphenated().to_string(),
+            "status": "success",
             "read": true,
             "properties": properties,
         }));
@@ -1060,8 +1062,16 @@ fn bulk_read_response(requested_count: usize, results: Vec<Value>) -> Value {
         .count();
     let unique_count = results.len();
     let failed_count = unique_count - marked_count;
+    let status = if failed_count == 0 {
+        "success"
+    } else if marked_count == 0 {
+        "failed"
+    } else {
+        "partial"
+    };
     json!({
         "results": results,
+        "status": status,
         "requested_count": requested_count,
         "unique_count": unique_count,
         "marked_count": marked_count,
@@ -1263,12 +1273,14 @@ fn read_response(
         Ok(true) => json!({
             "id": short,
             "full_id": full,
+            "status": "success",
             "read": true,
             "properties": patched_properties,
         }),
         Ok(false) => json!({
             "id": short,
             "full_id": full,
+            "status": "failed",
             "read": false,
             "mark_error": "no live row updated",
             "properties": original_properties,
@@ -1283,6 +1295,7 @@ fn read_response(
             json!({
                 "id": short,
                 "full_id": full,
+                "status": "failed",
                 "read": false,
                 "mark_error": e.to_string(),
                 "properties": original_properties,
@@ -3228,10 +3241,10 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        add_embedding_truncation_warning, build_references_header, channel_stalled,
-        heartbeat_note_id, mark_read_target, message_id_match_candidates, parent_references_chain,
-        parent_wire_message_id, read_response, sanitize_reference_token, send_response_thread_id,
-        validate_read_target, wait_for_inbox_response, wrap_message_id,
+        add_embedding_truncation_warning, build_references_header, bulk_read_response,
+        channel_stalled, heartbeat_note_id, mark_read_target, message_id_match_candidates,
+        parent_references_chain, parent_wire_message_id, read_response, sanitize_reference_token,
+        send_response_thread_id, validate_read_target, wait_for_inbox_response, wrap_message_id,
     };
     use crate::inbox_signal::InboxSignal;
     use khive_storage::note::Note;
@@ -3745,6 +3758,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("success"));
         assert_eq!(resp["read"], json!(true));
         assert_eq!(resp["properties"], patched);
         assert!(
@@ -3766,6 +3780,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(
             resp["mark_error"],
@@ -3791,6 +3806,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(
             resp["properties"],
@@ -3817,6 +3833,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(resp["mark_error"], json!(err_text));
         assert_eq!(
@@ -3840,6 +3857,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(
             resp["properties"],
@@ -3847,6 +3865,23 @@ mod tests {
             "a stored SQL-NULL properties column must round-trip as JSON \
              null, never as {{}}; got {resp}"
         );
+    }
+
+    #[test]
+    fn bulk_read_response_reports_success_partial_and_failed_statuses() {
+        let response = |outcomes: &[bool]| {
+            bulk_read_response(
+                outcomes.len(),
+                outcomes
+                    .iter()
+                    .map(|read| json!({ "read": read }))
+                    .collect(),
+            )
+        };
+
+        assert_eq!(response(&[true, true])["status"], "success");
+        assert_eq!(response(&[true, false])["status"], "partial");
+        assert_eq!(response(&[false, false])["status"], "failed");
     }
 
     // Regression for the bulk-read lost-update: prevalidation (`validate_read_target`)
