@@ -126,6 +126,22 @@ MCP preserves this proof with `code`/`stage` set to
 backoff policy is defined. Other `BEGIN IMMEDIATE` failures retain the generic
 pool error and are not promoted by rendered-message matching.
 
+## Typed storage-admission timeout
+
+`StorageError::AdmissionTimeout { operation, timeout_ms }` means a bounded
+wait for storage admission — a reader/writer handle slot or a pooled reader
+checkout — elapsed before anything was acquired. The operation never started,
+so retrying cannot duplicate a side effect. This is distinct from
+`StorageError::Timeout`, which makes no claim about whether work was in
+flight when the deadline expired; only the admission variant is promoted to
+a structured retryable failure, and only by its typed variant, never by
+rendered-message matching.
+
+MCP emits `code`/`stage` of `storage_admission_timeout` with the failing
+`operation`, the elapsed `timeout_ms`, and `retryable: true`. `capability`,
+`scope`, and `retry_after_ms` are null: the handle-slot and reader-checkout
+budgets are capability-neutral and no separate backoff policy is defined.
+
 ## `is_fts5_syntax_error`
 
 `TextSearch::search` returns the same `Driver` variant for a malformed MATCH

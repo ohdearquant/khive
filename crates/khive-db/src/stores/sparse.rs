@@ -297,9 +297,7 @@ impl SqliteSparseStore {
                     let mut guard = pool
                         .reader_until(|| scope.should_stop())
                         .map_err(|e| map_sqlite_err(e, op))?
-                        .ok_or_else(|| StorageError::Timeout {
-                            operation: op.into(),
-                        })?;
+                        .ok_or_else(|| pool.reader_admission_timeout(op))?;
                     scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
                 },
             )

@@ -1077,6 +1077,16 @@ impl ConnectionPool {
         &self.config
     }
 
+    /// The typed admission failure for a pooled reader checkout that
+    /// exhausted `checkout_timeout`: no reader was acquired, so the
+    /// operation never started and a retry cannot duplicate a side effect.
+    pub(crate) fn reader_admission_timeout(&self, operation: &'static str) -> StorageError {
+        StorageError::AdmissionTimeout {
+            operation: operation.into(),
+            timeout_ms: u64::try_from(self.config.checkout_timeout.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+
     /// Pool-wide permits for file-backed raw-SQL reader opens and active reads.
     pub(crate) fn sql_bridge_reader_slots(&self) -> Arc<Semaphore> {
         Arc::clone(&self.sql_bridge_reader_slots)

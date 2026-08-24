@@ -779,8 +779,9 @@ async fn acquire_handle_slot(
 ) -> Result<OwnedSemaphorePermit, StorageError> {
     tokio::time::timeout(timeout, slots.acquire_owned())
         .await
-        .map_err(|_| StorageError::Timeout {
+        .map_err(|_| StorageError::AdmissionTimeout {
             operation: operation.into(),
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         })?
         .map_err(|error| StorageError::Pool {
             operation: operation.into(),
@@ -1779,9 +1780,7 @@ where
                 .map_err(|error| {
                     StorageError::driver(StorageCapability::Sql, "pool_reader", error)
                 })?
-                .ok_or_else(|| StorageError::Timeout {
-                    operation: operation.into(),
-                })?;
+                .ok_or_else(|| pool.reader_admission_timeout(operation))?;
             scope.with_pooled_reader(&mut guard, |conn| query(scope, conn))
         },
     )
@@ -2533,7 +2532,7 @@ impl khive_storage::SqlAccess for SqlBridge {
             // Contract: this acquire waits on the pool-wide one-permit
             // writer-handle budget — the same permit a live `writer()` handle
             // holds for its lifetime — so it times out with
-            // `StorageError::Timeout` after `checkout_timeout` while a writer
+            // `StorageError::AdmissionTimeout` after `checkout_timeout` while a writer
             // handle is checked out (and a `writer()` call times out while
             // this unit runs). Callers must not hold a boxed writer handle
             // across an `atomic_unit()` call on the same pool; drop the
@@ -2726,7 +2725,7 @@ mod tests {
             .await
             .expect("cancelled reader checkout waited for the five-second pool timeout")
             .expect("checkout task panicked");
-        assert!(matches!(result, Err(StorageError::Timeout { .. })));
+        assert!(matches!(result, Err(StorageError::AdmissionTimeout { .. })));
 
         drop(held_reader);
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -3366,7 +3365,7 @@ mod tests {
         };
         assert!(matches!(
             writer_error,
-            StorageError::Timeout { ref operation }
+            StorageError::AdmissionTimeout { ref operation, .. }
                 if operation.as_ref() == "sql_bridge.writer_handle"
         ));
         drop(writer);
@@ -3449,7 +3448,7 @@ mod tests {
         assert!(
             matches!(
                 &blocked,
-                Err(StorageError::Timeout { operation })
+                Err(StorageError::AdmissionTimeout { operation, .. })
                     if operation.as_ref() == "sql_bridge.reader_operation"
             ),
             "a second logical read must contend with the admitted transaction; got {blocked:?}"
@@ -4816,7 +4815,7 @@ mod tests {
         let contender = bridge.writer().await;
         let retained_slot = matches!(
             &contender,
-            Err(StorageError::Timeout { operation })
+            Err(StorageError::AdmissionTimeout { operation, .. })
                 if operation.as_ref() == "sql_bridge.writer_handle"
         );
         drop(contender);
@@ -5927,7 +5926,7 @@ mod tests {
         assert!(
             matches!(
                 &blocked,
-                Err(StorageError::Timeout { operation })
+                Err(StorageError::AdmissionTimeout { operation, .. })
                     if operation.as_ref() == "sql_bridge.atomic_unit_handle"
             ),
             "atomic_unit must time out on the shared writer permit while a \
@@ -6387,7 +6386,7 @@ mod tests {
         assert!(
             matches!(
                 &starved,
-                Err(StorageError::Timeout { operation })
+                Err(StorageError::AdmissionTimeout { operation, .. })
                     if operation.as_ref() == "sql_bridge.reader_open"
             ),
             "queue-backed read with reader permits saturated must time out \

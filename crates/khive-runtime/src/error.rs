@@ -21,6 +21,12 @@ pub const WRITER_QUEUE_SATURATED_STAGE: &str = "writer_queue_saturated";
 /// queue accepted a request but before its operation closure ran.
 pub const WRITER_TASK_BEGIN_BUSY_STAGE: &str = "writer_task_begin_busy";
 
+/// Stable wire code/stage for a bounded storage-admission wait (a
+/// reader/writer handle slot or a pooled reader checkout) that elapsed
+/// before anything was acquired. The operation never started, so the
+/// failure is safe to retry.
+pub const STORAGE_ADMISSION_TIMEOUT_STAGE: &str = "storage_admission_timeout";
+
 /// Stable ADR-131:251 `scope` discriminator carried on a
 /// [`WRITER_QUEUE_SATURATED_STAGE`] failure — distinguishes write-queue
 /// admission saturation from other `unavailable` failure kinds that share
@@ -29,15 +35,17 @@ pub const WRITER_TASK_BEGIN_BUSY_STAGE: &str = "writer_task_begin_busy";
 /// ADR-131-defined scope and carries `None`).
 pub const WRITER_ADMISSION_SCOPE: &str = "writer_admission";
 
-/// Structured context for a pre-execution write-admission failure: either a
-/// finite-wait pooled writer checkout timeout or a bounded write-queue
-/// enqueue timeout. Both happen before SQLite executes the request, so both
+/// Structured context for a pre-execution admission failure: a finite-wait
+/// pooled writer checkout timeout, a bounded write-queue enqueue timeout, or
+/// a bounded storage-admission wait (reader/writer handle slot or pooled
+/// reader checkout). All happen before SQLite executes the request, so all
 /// are safe to classify as retryable — the request was never accepted, let
 /// alone started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionFailureContext {
-    /// Stable wire stage/code: one of [`WRITER_POOL_CHECKOUT_TIMEOUT_STAGE`]
-    /// or [`WRITER_QUEUE_SATURATED_STAGE`].
+    /// Stable wire stage/code: one of [`WRITER_POOL_CHECKOUT_TIMEOUT_STAGE`],
+    /// [`WRITER_QUEUE_SATURATED_STAGE`], or
+    /// [`STORAGE_ADMISSION_TIMEOUT_STAGE`].
     pub stage: &'static str,
     /// The configured deadline that elapsed.
     pub timeout: Duration,
@@ -575,6 +583,20 @@ impl RuntimeError {
                 retry_after_ms: Some(*timeout_ms),
             });
         }
+        if let Self::Storage(khive_storage::StorageError::AdmissionTimeout {
+            operation,
+            timeout_ms,
+        }) = self
+        {
+            return Some(AdmissionFailureContext {
+                stage: STORAGE_ADMISSION_TIMEOUT_STAGE,
+                timeout: Duration::from_millis(*timeout_ms),
+                capability: None,
+                operation: Some(operation.to_string()),
+                scope: None,
+                retry_after_ms: None,
+            });
+        }
         None
     }
 
@@ -716,5 +738,33 @@ mod channel_ingest_failure_class_tests {
             },
             "a rendered message resembling SecretDetected must remain Unknown unless its typed variant is SecretDetected"
         );
+    }
+
+    #[test]
+    fn storage_admission_timeout_is_a_retryable_admission_failure() {
+        let admission = RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
+            operation: "sql_bridge.reader_open".into(),
+            timeout_ms: 30_000,
+        });
+        let context = admission
+            .admission_failure_context()
+            .expect("a storage admission timeout happens before the operation starts");
+        assert_eq!(context.stage, super::STORAGE_ADMISSION_TIMEOUT_STAGE);
+        assert_eq!(context.timeout, Duration::from_millis(30_000));
+        assert_eq!(context.operation.as_deref(), Some("sql_bridge.reader_open"));
+        assert_eq!(context.scope, None);
+        assert_eq!(context.retry_after_ms, None);
+        assert_eq!(
+            admission.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Retryable { reason: "Storage" }
+        );
+
+        // The general mid-flight timeout stays unclassified: it proves
+        // nothing about whether work was in flight when the deadline expired.
+        let mid_flight = RuntimeError::Storage(khive_storage::StorageError::Timeout {
+            operation: "sql_bridge.reader_open".into(),
+        });
+        assert!(mid_flight.admission_failure_context().is_none());
+        assert!(mid_flight.retryable_failure_context().is_none());
     }
 }

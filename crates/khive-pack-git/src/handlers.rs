@@ -25,6 +25,23 @@ use crate::source::{
 };
 use crate::GitPack;
 
+/// Recover the typed error when a digest ingest/resolution failure chain
+/// carries a storage-class failure (for example a reader admission timeout
+/// under concurrent load), so resource exhaustion is not reported as the
+/// caller's invalid input. Every other failure keeps the established
+/// invalid-input shape.
+fn digest_failure_to_runtime(e: anyhow::Error) -> RuntimeError {
+    let e = match e.downcast::<RuntimeError>() {
+        Ok(rte @ RuntimeError::Storage(_)) => return rte,
+        Ok(other) => return RuntimeError::InvalidInput(other.to_string()),
+        Err(e) => e,
+    };
+    match e.downcast::<khive_storage::StorageError>() {
+        Ok(se) => RuntimeError::Storage(se),
+        Err(e) => RuntimeError::InvalidInput(e.to_string()),
+    }
+}
+
 /// Issue #765 bounded repair policy: at most one refetch, then at most one
 /// reclone. See crates/khive-pack-git/docs/api/handlers.md#remoterecoverystage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +174,7 @@ impl GitPack {
             Some(raw) => {
                 let id = resolve_project_id(self.runtime(), raw)
                     .await
-                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+                    .map_err(digest_failure_to_runtime)?
                     .ok_or_else(|| {
                         RuntimeError::InvalidInput(format!(
                             "project {raw:?} did not resolve to an entity"
@@ -201,7 +218,7 @@ impl GitPack {
                 .await
             }
         }
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        .map_err(digest_failure_to_runtime)?;
 
         if !resolution.slug_duplicates.is_empty() {
             report.warnings.push(format!(
@@ -301,7 +318,7 @@ async fn resolve_or_create_project(
 
     let slug_matches = find_projects_by_slug(runtime, token, &identity)
         .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        .map_err(digest_failure_to_runtime)?;
     if let Some((id, duplicates)) = slug_matches.split_first() {
         let selected = *id;
         // issue #6 item 2: a step-1 slug match used to return immediately
@@ -314,7 +331,7 @@ async fn resolve_or_create_project(
             &mut slug_duplicates,
             find_normalized_noncanonical_matches(runtime, token, &identity)
                 .await
-                .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+                .map_err(digest_failure_to_runtime)?
                 .into_iter()
                 .map(|(candidate, _)| candidate)
                 .filter(|candidate| *candidate != selected),
@@ -329,7 +346,7 @@ async fn resolve_or_create_project(
 
     let exact_matches = find_projects_by_legacy_repo_url(runtime, token, &repo_url)
         .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        .map_err(digest_failure_to_runtime)?;
     if let Some((id, duplicates)) = exact_matches.split_first() {
         let id = *id;
         crate::dispatch_from_token(
@@ -354,7 +371,7 @@ async fn resolve_or_create_project(
             &mut slug_duplicates,
             find_normalized_noncanonical_matches(runtime, token, &identity)
                 .await
-                .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+                .map_err(digest_failure_to_runtime)?
                 .into_iter()
                 .map(|(candidate, _)| candidate)
                 .filter(|candidate| *candidate != id),
@@ -373,7 +390,7 @@ async fn resolve_or_create_project(
     // stale slug instead of excluding the anchor and minting a duplicate.
     let normalized_matches = find_normalized_noncanonical_matches(runtime, token, &identity)
         .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        .map_err(digest_failure_to_runtime)?;
     if let Some(((selected, selected_repo_url), duplicates)) = normalized_matches.split_first() {
         let selected = *selected;
         crate::dispatch_from_token(
@@ -401,7 +418,7 @@ async fn resolve_or_create_project(
 
     let orphan = find_orphaned_anchor(runtime, token, &identity, &repo_url)
         .await
-        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        .map_err(digest_failure_to_runtime)?;
 
     let resp = crate::dispatch_from_token(
         registry,
@@ -451,7 +468,7 @@ async fn find_projects_by_slug(
     identity: &str,
 ) -> anyhow::Result<Vec<Uuid>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
             sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
@@ -466,7 +483,7 @@ async fn find_projects_by_slug(
             label: Some("git_digest_find_projects_by_slug".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
     Ok(rows
         .iter()
         .filter_map(|r| match r.get("id") {
@@ -492,7 +509,7 @@ async fn find_projects_by_legacy_repo_url(
     repo_url: &str,
 ) -> anyhow::Result<Vec<Uuid>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
             sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
@@ -508,7 +525,7 @@ async fn find_projects_by_legacy_repo_url(
             label: Some("git_digest_find_projects_by_legacy_repo_url".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
     Ok(rows
         .iter()
         .filter_map(|r| match r.get("id") {
@@ -530,7 +547,7 @@ async fn find_projects_without_canonical_slug(
     identity: &str,
 ) -> anyhow::Result<Vec<(Uuid, String)>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
             sql: "SELECT id, json_extract(properties,'$.repo_url') AS repo_url \
@@ -548,7 +565,7 @@ async fn find_projects_without_canonical_slug(
             label: Some("git_digest_find_projects_without_canonical_slug".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
     Ok(rows
         .iter()
         .filter_map(|r| {
@@ -577,7 +594,7 @@ async fn find_soft_deleted_projects_without_canonical_slug(
     identity: &str,
 ) -> anyhow::Result<Vec<(Uuid, String, i64)>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
             sql: "SELECT id, deleted_at, json_extract(properties,'$.repo_url') AS repo_url \
@@ -594,7 +611,7 @@ async fn find_soft_deleted_projects_without_canonical_slug(
             label: Some("git_digest_find_soft_deleted_projects_without_canonical_slug".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
     Ok(rows
         .iter()
         .filter_map(|r| {
@@ -694,7 +711,7 @@ async fn find_orphaned_anchor(
     repo_url: &str,
 ) -> anyhow::Result<Option<OrphanSignal>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
             sql: "SELECT id, deleted_at FROM entities WHERE kind='project' AND namespace=?1 \
@@ -710,7 +727,7 @@ async fn find_orphaned_anchor(
             label: Some("git_digest_find_orphaned_anchor".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
     let mut dead_projects: Vec<(Uuid, i64)> = rows
         .iter()
         .filter_map(|r| {
@@ -733,9 +750,7 @@ async fn find_orphaned_anchor(
     // Extend the tombstone scan with the same normalize-and-compare step
     // the live step-2 path already uses, scoped to soft-deleted rows.
     let normalized_tombstones =
-        find_soft_deleted_projects_without_canonical_slug(runtime, token, identity)
-            .await
-            .map_err(|e| anyhow!("{e}"))?;
+        find_soft_deleted_projects_without_canonical_slug(runtime, token, identity).await?;
     let mut already_matched: std::collections::HashSet<Uuid> =
         dead_projects.iter().map(|(id, _)| *id).collect();
     for (id, candidate_repo_url, deleted_at) in normalized_tombstones {
@@ -772,7 +787,7 @@ async fn find_orphaned_anchor(
                 label: Some("git_digest_count_orphaned_notes".into()),
             })
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(anyhow::Error::new)?;
         let annotated_note_count = match count {
             Some(SqlValue::Integer(n)) => n as u64,
             _ => 0,
@@ -2081,6 +2096,53 @@ mod tests {
                 None,
                 "arbitrary malformed value must not become identity evidence: {malformed}"
             );
+        }
+    }
+
+    #[test]
+    fn digest_failure_preserves_storage_class_and_flattens_the_rest() {
+        // A storage-class failure inside the ingest chain (here: a reader
+        // admission timeout under load) must surface typed, not as the
+        // caller's invalid input.
+        let admission = anyhow::Error::new(RuntimeError::Storage(
+            khive_storage::StorageError::AdmissionTimeout {
+                operation: "sql_bridge.reader_open".into(),
+                timeout_ms: 30_000,
+            },
+        ));
+        let recovered = digest_failure_to_runtime(admission);
+        assert!(
+            matches!(
+                &recovered,
+                RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
+                    operation,
+                    timeout_ms: 30_000,
+                }) if operation.as_ref() == "sql_bridge.reader_open"
+            ),
+            "storage-class ingest failure must stay typed; got {recovered:?}"
+        );
+
+        // A bare StorageError (no RuntimeError wrapper) is recovered too.
+        let bare = anyhow::Error::new(khive_storage::StorageError::Timeout {
+            operation: "search".into(),
+        });
+        assert!(matches!(
+            digest_failure_to_runtime(bare),
+            RuntimeError::Storage(khive_storage::StorageError::Timeout { .. })
+        ));
+
+        // Non-storage runtime failures keep the established invalid-input
+        // shape, message intact.
+        let not_found = anyhow::Error::new(RuntimeError::NotFound("proj-x".to_string()));
+        match digest_failure_to_runtime(not_found) {
+            RuntimeError::InvalidInput(msg) => assert!(msg.contains("proj-x"), "{msg}"),
+            other => panic!("non-storage failure must flatten to InvalidInput, got {other:?}"),
+        }
+
+        // Plain anyhow context errors keep the established shape as well.
+        match digest_failure_to_runtime(anyhow!("gh probe failed")) {
+            RuntimeError::InvalidInput(msg) => assert_eq!(msg, "gh probe failed"),
+            other => panic!("untyped failure must flatten to InvalidInput, got {other:?}"),
         }
     }
 }
