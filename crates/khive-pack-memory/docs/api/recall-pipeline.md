@@ -6,6 +6,8 @@
 
 `RecallParams` rejects unknown fields. The required `query` is accompanied by optional limits, memory type, score and salience floors, configuration, fusion strategy, embedding model, score breakdowns, tags, entity names, full-content selection, serving profile, and exact namespace override.
 
+`created_after` and `created_before` bound results to a half-open creation-time window (`created_at >= after`, `created_at < before`), the `brain.event_counts` since/until convention. Each bound must be a full RFC 3339 timestamp with offset; date-only and offset-less forms are rejected rather than anchored, and a window where `created_after` is not earlier than `created_before` is rejected as empty.
+
 An absent namespace uses the dispatch token's visible namespace set and remains byte-identical to the legacy path. An explicit namespace is parsed with `Namespace::parse` and restricts FTS, vector loading, ANN post-filtering, and over-fetch to that exact namespace. Dispatch normally pre-applies this escape to the token; handler-side parsing is defense in depth for direct callers. Invalid namespaces are per-operation errors and are never coerced.
 
 Tag matching reads `properties.tags`; `any` is OR and `all` is AND. A missing or non-array tag property does not match.
@@ -82,7 +84,7 @@ Entity-anchored notes are loaded in one batch and merged with retrieval candidat
 
 ## Hydration, scoring, and response
 
-Candidate UUIDs are hydrated in batches. Deleted notes, non-memory notes, disallowed namespaces, memory-type mismatches, tag mismatches, and values below raw-salience or final-score floors are removed.
+Candidate UUIDs are hydrated in batches. Deleted notes, non-memory notes, disallowed namespaces, memory-type mismatches, tag mismatches, creation instants outside the requested `created_after`/`created_before` window, and values below raw-salience or final-score floors are removed. The handler-level re-gather loop counts only window-eligible candidates when deciding whether to widen, so strong out-of-window rows cannot satisfy the stop condition and starve eligible rows deeper in the corpus.
 
 Recall resolves legacy missing properties at read time: memory type defaults to episodic, and salience and decay factor use the same type-specific defaults as `memory.remember`. Age never goes below zero. Fusion relevance, decayed salience, independent temporal recency, profile weight projection, and the per-entity posterior term feed the final score.
 

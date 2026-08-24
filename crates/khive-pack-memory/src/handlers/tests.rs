@@ -67,6 +67,8 @@ fn effective_config_uses_defaults() {
         entity_names: None,
         full_content: None,
         profile_id: None,
+        created_after: None,
+        created_before: None,
         namespace: None,
     };
     let cfg = p.effective_config(RecallConfig::default());
@@ -94,6 +96,8 @@ fn effective_config_legacy_overrides() {
         entity_names: None,
         full_content: None,
         profile_id: None,
+        created_after: None,
+        created_before: None,
         namespace: None,
     };
     let cfg = p.effective_config(RecallConfig::default());
@@ -123,6 +127,8 @@ fn effective_config_explicit_config_wins() {
         entity_names: None,
         full_content: None,
         profile_id: None,
+        created_after: None,
+        created_before: None,
         namespace: None,
     };
     let cfg = p.effective_config(RecallConfig::default());
@@ -156,6 +162,8 @@ fn test_weighted_strategy_preserves_pack_weights() {
         entity_names: None,
         full_content: None,
         profile_id: None,
+        created_after: None,
+        created_before: None,
         namespace: None,
     };
 
@@ -212,6 +220,8 @@ fn test_weighted_strategy_from_rrf_config_uses_vector_heavy_defaults() {
         entity_names: None,
         full_content: None,
         profile_id: None,
+        created_after: None,
+        created_before: None,
         namespace: None,
     };
 
