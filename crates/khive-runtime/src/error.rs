@@ -743,7 +743,7 @@ mod channel_ingest_failure_class_tests {
     #[test]
     fn storage_admission_timeout_is_a_retryable_admission_failure() {
         let admission = RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
-            operation: "sql_bridge.reader_open".into(),
+            operation: "sql_bridge.writer_handle".into(),
             timeout_ms: 30_000,
         });
         let context = admission
@@ -751,7 +751,10 @@ mod channel_ingest_failure_class_tests {
             .expect("a storage admission timeout happens before the operation starts");
         assert_eq!(context.stage, super::STORAGE_ADMISSION_TIMEOUT_STAGE);
         assert_eq!(context.timeout, Duration::from_millis(30_000));
-        assert_eq!(context.operation.as_deref(), Some("sql_bridge.reader_open"));
+        assert_eq!(
+            context.operation.as_deref(),
+            Some("sql_bridge.writer_handle")
+        );
         assert_eq!(context.scope, None);
         assert_eq!(context.retry_after_ms, None);
         assert_eq!(

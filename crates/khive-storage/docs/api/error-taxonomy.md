@@ -137,6 +137,12 @@ flight when the deadline expired; only the admission variant is promoted to
 a structured retryable failure, and only by its typed variant, never by
 rendered-message matching.
 
+One carve-out: the raw-SQL reader admission paths (`sql_bridge.reader_open`
+and `sql_bridge.reader_operation`) keep returning `StorageError::Timeout` on
+saturation, as the ADR-005 reader-admission amendment requires. The typed
+admission variant covers the writer-handle, atomic-unit, and pooled-reader
+checkout budgets.
+
 MCP emits `code`/`stage` of `storage_admission_timeout` with the failing
 `operation`, the elapsed `timeout_ms`, and `retryable: true`. `capability`,
 `scope`, and `retry_after_ms` are null: the handle-slot and reader-checkout

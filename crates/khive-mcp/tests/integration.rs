@@ -1947,7 +1947,7 @@ impl PackRuntime for ErrorInjectPack {
         if verb == "storage_admission_timeout" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::AdmissionTimeout {
-                    operation: "sql_bridge.reader_open".into(),
+                    operation: "sql_bridge.writer_handle".into(),
                     timeout_ms: 30_000,
                 },
             ));
@@ -2189,11 +2189,11 @@ async fn storage_admission_timeout_survives_storage_runtime_and_mcp_wire() -> an
             "kind": "unavailable",
             "code": "storage_admission_timeout",
             "stage": "storage_admission_timeout",
-            "message": "storage: admission timeout during sql_bridge.reader_open after 30000ms",
+            "message": "storage: admission timeout during sql_bridge.writer_handle after 30000ms",
             "retryable": true,
             "timeout_ms": 30_000,
             "capability": serde_json::Value::Null,
-            "operation": "sql_bridge.reader_open",
+            "operation": "sql_bridge.writer_handle",
             "scope": serde_json::Value::Null,
             "retry_after_ms": serde_json::Value::Null,
         }),

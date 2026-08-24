@@ -2101,12 +2101,12 @@ mod tests {
 
     #[test]
     fn digest_failure_preserves_storage_class_and_flattens_the_rest() {
-        // A storage-class failure inside the ingest chain (here: a reader
-        // admission timeout under load) must surface typed, not as the
-        // caller's invalid input.
+        // A storage-class failure inside the ingest chain (here: a
+        // writer-handle admission timeout under load) must surface typed,
+        // not as the caller's invalid input.
         let admission = anyhow::Error::new(RuntimeError::Storage(
             khive_storage::StorageError::AdmissionTimeout {
-                operation: "sql_bridge.reader_open".into(),
+                operation: "sql_bridge.writer_handle".into(),
                 timeout_ms: 30_000,
             },
         ));
@@ -2117,7 +2117,7 @@ mod tests {
                 RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
                     operation,
                     timeout_ms: 30_000,
-                }) if operation.as_ref() == "sql_bridge.reader_open"
+                }) if operation.as_ref() == "sql_bridge.writer_handle"
             ),
             "storage-class ingest failure must stay typed; got {recovered:?}"
         );
