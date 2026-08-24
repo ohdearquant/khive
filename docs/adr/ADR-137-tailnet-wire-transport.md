@@ -311,12 +311,34 @@ does today and the crate must move to match.
    - **At a server**, inbound `handshake` is admissible. Every other kind is a violation, including
      `handshake_ack`, which travels server-to-client and is therefore also a direction violation at
      a server. The two classifications agree; both are `malformed_frame`.
-   - **At a client**, inbound `handshake_ack` is admissible, and so is a connection-terminal
-     `error`, because that is how the parent's `unsupported_version` rejection arrives: the parent
-     requires the server to answer a handshake either with `handshake_ack` or with
-     `unsupported_version` followed by close, and requires the client to surface that rejection
-     without fallback. A client that classified it `malformed_frame` could not surface it. Every
-     other kind is a violation, including `handshake`, which travels client-to-server.
+   - **At a client with a handshake outstanding** — that is, one that has sent a `handshake` and
+     not yet had it answered — inbound `handshake_ack` is admissible, and so is a
+     connection-terminal `error`, because that is how the parent's `unsupported_version` rejection
+     arrives: the parent requires the server to answer a handshake either with `handshake_ack` or
+     with `unsupported_version` followed by close, and requires the client to surface that
+     rejection without fallback. A client that classified it `malformed_frame` could not surface
+     it. Every other kind is a violation, including `handshake`, which travels client-to-server.
+
+     **Both admissions are answers, so both require a question.** A client with no handshake
+     outstanding — a fresh connection on which it has sent nothing — has neither, and an inbound
+     `handshake_ack` or connection-terminal `error` there is `malformed_frame` like any other
+     unexpected frame. Admitting an unsolicited `handshake_ack` would let a peer establish the
+     connection's version without the client ever having named one, which is the negotiation the
+     parent's first-frame rule exists to force.
+
+     **A `handshake_ack` must also be validated against the handshake it answers**, and a client
+     MUST reject one whose `version` it did not offer. Decision 1 makes this concrete rather than
+     theoretical: version `0` decodes and reaches admission, so "the version field was parseable"
+     is not evidence that it was negotiated. An accepted `handshake_ack` fixes the version the
+     connection speaks; accepting one the client never proposed hands that choice to the peer.
+     The rejection takes this family's classification: a `handshake_ack` whose `version` the
+     client did not offer is `malformed_frame`, connection-terminal, carrying no operation id —
+     an answer naming terms the question never contained is an answer to a question that was
+     not asked, exactly as the unsolicited ack above. It is not `unsupported_version`, which is
+     the server's word for rejecting a client's offer and travels the other direction. The case
+     is a required conformance vector, decoded at the client with a handshake outstanding:
+     version A offered, `handshake_ack` naming version B, asserting `malformed_frame` and
+     permanent termination.
 
    The frames carrying the handshake to completion are necessarily among the frames arriving before
    it completes, so a rule with no exception for them makes the handshake it prescribes
@@ -603,6 +625,22 @@ and a reader who never saw it can tell that the decision above has been touched 
 
    Recorded as a second correction rather than folded into the first because correction 1 was
    published, and a repair that itself needed repair is the more useful thing for a reader to see.
+
+3. **Decision 6, the client-side admission — corrected 2026-08-23.** Correction 2 stated the
+   pre-completion admissible set per receiving role and closed the role-blindness, but it stated
+   the client's half as a property of the frame kind alone: inbound `handshake_ack` is admissible
+   at a client, full stop. It named no precondition on the client's own state and no obligation to
+   check the frame against it, so a conforming client could accept an unsolicited `handshake_ack`
+   on a fresh connection, and could accept one naming a version it never offered. Both let the peer
+   fix the connection's version unilaterally, which is precisely what the parent's requirement that
+   the first application frame be a `handshake` exists to prevent.
+
+   The rule now conditions the client's admissions on having a handshake outstanding, and requires
+   the `handshake_ack` to be validated against it. This is the third correction to one decision, and
+   the shape of the three is worth naming: the original rule forbade the frames that perform the
+   handshake, correction 1 exempted them without regard to role, correction 2 scoped the exemption
+   by role but not by connection state. Each repair was correct about what it fixed and silent
+   about the next dimension.
 
 ## Consequences
 

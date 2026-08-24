@@ -5656,6 +5656,26 @@ pub(crate) mod tests {
         }
     }
 
+    /// One entry in the interleaved submission trace. Typed so assertions
+    /// match on fields instead of parsing a formatted string; both sides of
+    /// the ordering land on ONE vector so their relative order is observable
+    /// rather than assumed.
+    #[derive(Debug, Clone, PartialEq)]
+    enum TraceEntry {
+        /// A handler effect that has committed (nothing downstream undoes it).
+        Effect { name: String },
+        /// An audit row submitted to the event store, carrying exactly the
+        /// fields the obligation test discriminates on.
+        Audit {
+            kind: EventKind,
+            outcome: EventOutcome,
+            verb: String,
+            /// The row's `resource.cost_unit`, `None` when the payload omits
+            /// it (the error path's `base_resource_payload` does).
+            cost_unit: Option<Value>,
+        },
+    }
+
     /// In-memory EventStore for unit tests — avoids file-backed SQLite.
     #[derive(Default, Debug)]
     struct MemoryEventStore {
@@ -5667,11 +5687,65 @@ pub(crate) mod tests {
         /// normally. Lets a test fail a pure-observability row without
         /// also failing the obligation row that shares the same store.
         fail_kind: Option<EventKind>,
+        /// Append-ordered record of what was SUBMITTED to this store,
+        /// written before the injected-failure check so a submission this
+        /// store then rejects is still visible.
+        ///
+        /// `events` alone cannot show that: a rejected append returns before
+        /// the store records anything, so a test reading `events` cannot
+        /// tell a row that failed to commit from a row that was never built.
+        /// Those are different production behaviours and only one of them is
+        /// the audit contract. A test that hands the same vector to its
+        /// handler also gets the ordering between the handler's effect and
+        /// the audit submission, which is the only way to observe that the
+        /// audit row is written after the handler rather than before it.
+        trace: Option<Arc<std::sync::Mutex<Vec<TraceEntry>>>>,
+    }
+
+    impl MemoryEventStore {
+        /// Record a submission attempt. Call before any failure check.
+        ///
+        /// The projection carries the verb and the row's `resource.cost_unit`
+        /// value, not just kind and outcome, and not merely whether the key is
+        /// present.
+        ///
+        /// Presence alone is too weak to pin what it looks like it pins.
+        /// `cost_unit::resource_payload` inserts the key unconditionally, and
+        /// for most verbs `item_count` returns a constant `1` regardless of the
+        /// handler's return value, so a submission built from a static or null
+        /// `ok_val` still carries the key. Presence separates `resource_payload`
+        /// from the error path's `base_resource_payload`, which is a real
+        /// property but a different one.
+        ///
+        /// The value is what sources the return value, and only for a verb whose
+        /// `item_count` reads it. `knowledge.index` is that verb: `item_count`
+        /// takes `result["total"]`, so `cost_unit` is `total + 1` and moves with
+        /// what the handler returned. The fixture below uses that verb for
+        /// exactly this reason.
+        fn trace_submission(&self, events: &[Event]) {
+            if let Some(trace) = &self.trace {
+                let mut trace = trace.lock().expect("trace lock");
+                for event in events {
+                    let cost_unit = event
+                        .payload
+                        .get("resource")
+                        .and_then(|resource| resource.get("cost_unit"))
+                        .cloned();
+                    trace.push(TraceEntry::Audit {
+                        kind: event.kind,
+                        outcome: event.outcome,
+                        verb: event.verb.clone(),
+                        cost_unit,
+                    });
+                }
+            }
+        }
     }
 
     #[async_trait]
     impl EventStore for MemoryEventStore {
         async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
+            self.trace_submission(std::slice::from_ref(&event));
             if self.fail_appends || self.fail_kind == Some(event.kind) {
                 return Err(khive_storage::StorageError::Internal(
                     "injected audit append failure".to_string(),
@@ -5684,6 +5758,7 @@ pub(crate) mod tests {
             &self,
             events: Vec<Event>,
         ) -> khive_storage::StorageResult<BatchWriteSummary> {
+            self.trace_submission(&events);
             let attempted = events.len() as u64;
             let affected = attempted;
             self.events.lock().unwrap().extend(events);
@@ -5728,6 +5803,7 @@ pub(crate) mod tests {
             events: Vec<Event>,
         ) -> khive_storage::StorageResult<khive_storage::event::IdempotentEventBatchResult>
         {
+            self.trace_submission(&events);
             if self.fail_appends
                 || self
                     .fail_kind
@@ -6469,6 +6545,216 @@ pub(crate) mod tests {
             audit_obligation_append_failure_count(),
             before_obligation + 1,
             "the failed obligation append must remain visible to diagnostics"
+        );
+    }
+
+    /// An obligation-bearing audit row is written AFTER the handler returns and FROM the
+    /// handler's own return value. So when that row fails to commit,
+    /// `fold_audit_obligation` turns a would-be success into an error for a dispatch whose
+    /// effect has ALREADY happened and cannot be rolled back by it.
+    ///
+    /// The existing obligation test above proves the flip using `list`, a read, where the
+    /// distinction does not matter. This one pins the part that decides caller behaviour:
+    /// the write landed, and the caller was told it failed. A caller that treats this error
+    /// as "it did not run" and retries therefore applies the effect twice, which is what the
+    /// last assertion covers.
+    ///
+    /// The handler and the event store share one trace vector, so the ordering claim is
+    /// observed rather than assumed. That matters more than it looks: asserting only the
+    /// caller-visible error and the handler's effect would leave this test green against an
+    /// implementation that submits no audit row at all, or that submits one built from the
+    /// error path — both of which contradict the contract while producing exactly the same
+    /// error string.
+    ///
+    /// The outcome alone does not separate those. A row can carry `Success` and still have
+    /// been built without the handler's return value, which is a third implementation and
+    /// also wrong. So the trace records whether the row's resource carries `cost_unit`:
+    /// `resource_payload` derives that key from `ok_val`, and `base_resource_payload`
+    /// documents that it omits it. Asserting the key is what pins result-sourcing; the
+    /// verb is asserted alongside it so a fabricated row for some other verb cannot satisfy
+    /// the same check.
+    ///
+    /// Not pinned here: that the row commits on a SEPARATE writer acquisition from the
+    /// handler's. The store double has no writer to observe, so that half of the mechanism
+    /// needs a different fixture than this one.
+    #[tokio::test]
+    #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
+    // The config ledger is process-global and an event-store dispatch drains its
+    // queue before invoking the pack, so a concurrent config_ledger test can land
+    // a submission ahead of this handler's effect and break the first-entry
+    // assertion below. That group is held for the position assertion, not for the
+    // audit counters the two groups above cover.
+    #[serial(config_ledger)]
+    async fn obligation_failure_reports_a_write_that_already_committed() {
+        /// `total` is what `cost_unit` is computed from, so this number is the
+        /// test's handle on whether the audit row was built from the return
+        /// value. 41 is arbitrary but distinctive: it makes the expected
+        /// `cost_unit` 42 (`base_weight` 1 + `item_count` 41 * `model_count`
+        /// 1), a value no default path produces.
+        const RETURNED_TOTAL: u64 = 41;
+
+        #[derive(Debug)]
+        struct RecordingWritePack {
+            committed: Arc<std::sync::Mutex<Vec<TraceEntry>>>,
+        }
+
+        impl Pack for RecordingWritePack {
+            const NAME: &'static str = "recording_write";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            // `knowledge.index` rather than `create`, and the choice is
+            // load-bearing rather than incidental: it is the one verb whose
+            // `cost_unit` reads the handler's return value (`item_count` takes
+            // `result["total"]`). Under any other verb `item_count` is the
+            // constant `1`, so the recorded `cost_unit` would be the same
+            // whether the row was built from the result or from a static value,
+            // and the assertion below could not tell those apart.
+            const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+                name: "knowledge.index",
+                description: "record one committed write",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            }];
+        }
+
+        #[async_trait]
+        impl PackRuntime for RecordingWritePack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                // Stands in for a committed effect: by the time this returns, the write
+                // is done and nothing downstream can undo it. Pushed onto the SAME
+                // vector the event store traces into, so the relative order of the
+                // effect and the audit submission is observable rather than assumed.
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unnamed")
+                    .to_string();
+                self.committed
+                    .lock()
+                    .expect("committed lock")
+                    .push(TraceEntry::Effect { name: name.clone() });
+                Ok(serde_json::json!({ "created": name, "total": RETURNED_TOTAL }))
+            }
+        }
+
+        let committed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failing_store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            trace: Some(Arc::clone(&committed)),
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(RecordingWritePack {
+            committed: Arc::clone(&committed),
+        });
+        builder.with_event_store(failing_store);
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch("knowledge.index", serde_json::json!({"name": "first"}))
+            .await
+            .expect_err("an obligation commit failure must fail the dispatch");
+        assert!(
+            matches!(&err, RuntimeError::Internal(message)
+                if message.contains("audit obligation commit failed")),
+            "the error must name the obligation failure, since that string is what tells a \
+             caller the effect landed: {err}"
+        );
+
+        // The trace carries both sides, so each of the three claims above is an
+        // assertion rather than a comment. Read as a sequence it says: the handler's
+        // effect committed, and only THEN was an audit row submitted -- a row built
+        // from the successful result, which is what makes it the obligation row and
+        // not an error row.
+        let first_pass = committed.lock().expect("committed lock").clone();
+        let first_effect = TraceEntry::Effect {
+            name: "first".to_string(),
+        };
+        assert_eq!(
+            first_pass.first(),
+            Some(&first_effect),
+            "the handler's effect must land FIRST: an implementation that submitted the \
+             audit row before dispatching would satisfy every other assertion here"
+        );
+        let audit_rows: Vec<&TraceEntry> = first_pass
+            .iter()
+            .filter(|entry| matches!(entry, TraceEntry::Audit { .. }))
+            .collect();
+        assert!(
+            !audit_rows.is_empty(),
+            "an audit row must actually be SUBMITTED; without this assertion the test \
+             passes against an implementation that returns the same error and never \
+             builds a row at all, which is a different defect wearing the same error \
+             string. Trace was {first_pass:?}"
+        );
+        let expected_cost_unit = serde_json::json!(RETURNED_TOTAL + 1);
+        assert!(
+            audit_rows.iter().any(|entry| matches!(
+                entry,
+                TraceEntry::Audit {
+                    outcome: EventOutcome::Success,
+                    verb,
+                    cost_unit: Some(cost_unit),
+                    ..
+                } if verb.as_str() == "knowledge.index" && *cost_unit == expected_cost_unit
+            )),
+            "the submitted row must be the SUCCESS row for THIS verb, carrying a resource \
+             computed FROM the handler's return value. The outcome alone is not enough: an \
+             implementation that stamps Success on a row built without `ok_val` would \
+             satisfy an outcome-only assertion while breaking the contract this test \
+             exists for. The exact value is the discriminator, not the key's presence: \
+             `resource_payload` inserts `cost_unit` unconditionally, so presence survives a \
+             static `ok_val`, while {expected_cost_unit} is reachable only from the \
+             returned `total` of {RETURNED_TOTAL} (`base_weight` 1 + `item_count` \
+             {RETURNED_TOTAL} * `model_count` 1). Substituting a null or static result \
+             collapses it to 1, and the error path's `base_resource_payload` omits the key \
+             entirely (`cost_unit: None` here), so all three implementations are \
+             distinguishable. Trace was {first_pass:?}"
+        );
+        assert_eq!(
+            first_pass
+                .iter()
+                .filter(|entry| **entry == first_effect)
+                .count(),
+            1,
+            "exactly one effect on the first pass"
+        );
+
+        // What a caller does on a failure it believes means "did not run".
+        let _ = registry
+            .dispatch("knowledge.index", serde_json::json!({"name": "first"}))
+            .await
+            .expect_err("the retry fails the same way");
+        assert_eq!(
+            committed
+                .lock()
+                .expect("committed lock")
+                .iter()
+                .filter(|entry| **entry == first_effect)
+                .count(),
+            2,
+            "retrying this error double-writes; a caller must re-derive state instead of \
+             resubmitting"
         );
     }
 
