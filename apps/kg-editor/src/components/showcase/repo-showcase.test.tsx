@@ -405,6 +405,64 @@ describe("repository showcase", () => {
     expect(scrollIntoView).toHaveBeenCalledOnce();
   });
 
+  it("moves focus and scroll position to an analysis selected from the view navigation", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.hidden_coupling.label,
+    }));
+
+    const dashboard = container.querySelector<HTMLElement>(
+      "[data-repository-dashboard]",
+    )!;
+    await waitFor(() => expect(dashboard).toHaveFocus());
+    expect(scrollIntoView).toHaveBeenCalledOnce();
+  });
+
+  it("restores the URL-selected module when returning to the structure graph", async () => {
+    const bundle = golden();
+    const selected = bundle.graph.modules.items.find((module) =>
+      module.source_path.endsWith("khive-db/src/pool.rs")
+    )!;
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const triage = container.querySelector<HTMLElement>(
+      "[data-repository-triage]",
+    )!;
+
+    await user.type(
+      within(triage).getByRole("searchbox", { name: "Find a module or path" }),
+      selected.source_path,
+    );
+    await user.click(within(triage).getByRole("button", {
+      name: `Inspect ${selected.source_path}`,
+    }));
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.hidden_coupling.label,
+    }));
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.structure_graph.label,
+    }));
+
+    expect(new URL(window.location.href).searchParams.get("module")).toBe(
+      selected.source_path,
+    );
+    expect(screen.getByRole("combobox", {
+      name:
+        `${bundle.capability.labels.node_types.package} · ${bundle.capability.views.structure_graph.label}`,
+    })).toHaveValue(selected.package_id);
+    expect(
+      container.querySelector(`[data-node-id="${selected.id}"]`),
+    ).toHaveAttribute("aria-pressed", "true");
+  });
+
   it("renders an unavailable top-level metric as unavailable text, not a fabricated zero", () => {
     const bundle = structuredClone(golden());
     bundle.aggregates.dependency_topology.meta.status = "unavailable";

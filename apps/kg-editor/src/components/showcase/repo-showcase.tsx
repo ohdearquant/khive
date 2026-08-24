@@ -62,10 +62,16 @@ type Icon = typeof Network;
 type ModuleMap = Map<string, RepoModule>;
 type AnalysisWindow =
   RepoBundle["aggregates"]["hidden_coupling"]["meta"]["window"];
+type StructureGraphSelection = Readonly<{
+  subtreeId: string;
+  selectedId: string;
+}>;
 type ViewProps = Readonly<{
   bundle: RepoBundle;
   moduleById: ModuleMap;
   selectedModuleId: string | null;
+  structureGraphSelection: StructureGraphSelection;
+  onStructureGraphSelection: (selection: StructureGraphSelection) => void;
   onInspectModule: (moduleId: string) => void;
   onExploreStructure: () => void;
 }>;
@@ -374,13 +380,14 @@ function StructureGraph({
   bundle,
   moduleById,
   selectedModuleId,
+  structureGraphSelection,
+  onStructureGraphSelection,
   onInspectModule,
 }: ViewProps) {
   const { graph, capability } = bundle;
   const labels = capability.labels;
-  const [subtreeId, setSubtreeId] = useState(graph.repository.id);
+  const { subtreeId, selectedId } = structureGraphSelection;
   const [zoom, setZoom] = useState(1);
-  const [selectedId, setSelectedId] = useState(graph.repository.id);
   const [lens, setLens] = useState<"structure" | "hidden_coupling">(
     "structure",
   );
@@ -536,8 +543,11 @@ function StructureGraph({
     !focusedModuleIds.has(id);
   const isCouplingFocused = (id: string) =>
     lens === "hidden_coupling" && focusedModuleIds?.has(id) === true;
+  const selectGraphNode = (nodeId: string) => {
+    onStructureGraphSelection({ subtreeId, selectedId: nodeId });
+  };
   const inspectCouplingEndpoint = (moduleId: string) => {
-    setSelectedId(moduleId);
+    selectGraphNode(moduleId);
     onInspectModule(moduleId);
   };
 
@@ -551,8 +561,10 @@ function StructureGraph({
               aria-label={`${labels.node_types.package} · ${capability.views.structure_graph.label}`}
               value={subtreeId}
               onChange={(event) => {
-                setSubtreeId(event.target.value);
-                setSelectedId(event.target.value);
+                onStructureGraphSelection({
+                  subtreeId: event.target.value,
+                  selectedId: event.target.value,
+                });
                 setFocusedPairKey(null);
               }}
             >
@@ -710,7 +722,7 @@ function StructureGraph({
               type="button"
               aria-pressed={selectedId === graph.repository.id}
               onClick={() => {
-                setSelectedId(graph.repository.id);
+                selectGraphNode(graph.repository.id);
                 setFocusedPairKey(null);
               }}
             >
@@ -721,7 +733,7 @@ function StructureGraph({
               const position = positions.get(item.id)!;
               return (
                 <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("project")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
-                  setSelectedId(item.id);
+                  selectGraphNode(item.id);
                   setFocusedPairKey(null);
                 }}>
                   <EntityKindMark className="repo-node-kind-icon" kind="project" showLabel={false} />
@@ -734,7 +746,7 @@ function StructureGraph({
               const couplingCount = couplingNodeCounts.get(item.id);
               return (
                 <button className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""} ${isCouplingFocused(item.id) ? "coupling-focused" : ""}`} data-node-id={item.id} style={{ left: `${position.x}%`, top: `${position.y}%`, width: `${nodeWidth(item.id)}px`, ...kindHueStyle(entityLegendFor("concept")) }} type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => {
-                  setSelectedId(item.id);
+                  selectGraphNode(item.id);
                   setFocusedPairKey(null);
                 }}>
                   <EntityKindMark className="repo-node-kind-icon" kind="concept" showLabel={false} />
@@ -1352,6 +1364,8 @@ function ActiveView({
   bundle,
   moduleById,
   selectedModuleId,
+  structureGraphSelection,
+  onStructureGraphSelection,
   onInspectModule,
   onExploreStructure,
 }: ViewProps & { id: ViewId }) {
@@ -1364,6 +1378,8 @@ function ActiveView({
         bundle={bundle}
         moduleById={moduleById}
         selectedModuleId={selectedModuleId}
+        structureGraphSelection={structureGraphSelection}
+        onStructureGraphSelection={onStructureGraphSelection}
         onInspectModule={onInspectModule}
         onExploreStructure={onExploreStructure}
       />
@@ -1393,6 +1409,12 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
   const [selectedModuleId, setSelectedModuleId] = useState<string | null>(
     defaultModuleId,
   );
+  const [structureGraphSelection, setStructureGraphSelection] = useState<
+    StructureGraphSelection
+  >({
+    subtreeId: bundle.graph.repository.id,
+    selectedId: bundle.graph.repository.id,
+  });
   const [unresolvedModule, setUnresolvedModule] = useState<Readonly<{
     path: string;
     reason: string;
@@ -1444,6 +1466,40 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       }
 
       setSelectedModuleId(nextModuleId);
+      const restoredModule = resolvedModuleRestore && nextModuleId
+        ? moduleById.get(nextModuleId) ?? null
+        : null;
+      const rootGraphSelection = {
+        subtreeId: bundle.graph.repository.id,
+        selectedId: bundle.graph.repository.id,
+      };
+      const nextGraphSelection = restoredModule
+        ? {
+            subtreeId: restoredModule.package_id,
+            selectedId: restoredModule.id,
+          }
+        : rootGraphSelection;
+      setStructureGraphSelection((current) => {
+        const currentSelectionIsValid =
+          (current.subtreeId === bundle.graph.repository.id ||
+            bundle.graph.packages.items.some((item) =>
+              item.id === current.subtreeId
+            )) &&
+          (current.selectedId === bundle.graph.repository.id ||
+            bundle.graph.packages.items.some((item) =>
+              item.id === current.selectedId
+            ) || moduleById.has(current.selectedId));
+        if (!restoredModule && !announce && currentSelectionIsValid) {
+          return current;
+        }
+        if (
+          current.subtreeId === nextGraphSelection.subtreeId &&
+          current.selectedId === nextGraphSelection.selectedId
+        ) {
+          return current;
+        }
+        return nextGraphSelection;
+      });
       setUnresolvedModule(nextUnresolved);
       setActiveView(nextView);
       setCopyStatus("");
@@ -1473,8 +1529,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         {
           repository: repository.canonical_url,
           snapshotSha: parsed.location.snapshotSha ?? snapshot.head_sha,
-          modulePath: requestedPath ??
-            (nextModuleId ? moduleById.get(nextModuleId)?.source_path ?? null : null),
+          modulePath: requestedPath,
           view: nextView,
         },
       );
@@ -1493,6 +1548,8 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     return () => window.removeEventListener("popstate", handlePopState);
   }, [
     capability.views,
+    bundle.graph.packages.items,
+    bundle.graph.repository.id,
     defaultModuleId,
     moduleById,
     modulesBySourcePath,
@@ -1540,11 +1597,18 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     );
   }
 
-  function selectModule(moduleId: string) {
-    if (!moduleById.has(moduleId)) return;
+  function selectModule(moduleId: string, alignStructureGraph = true) {
+    const selected = moduleById.get(moduleId);
+    if (!selected) return;
     pushLocation(moduleId, activeView);
     setNavigationStatus("");
     setSelectedModuleId(moduleId);
+    if (alignStructureGraph) {
+      setStructureGraphSelection({
+        subtreeId: selected.package_id,
+        selectedId: selected.id,
+      });
+    }
     setUnresolvedModule(null);
     setLocationNotice(null);
     setCopyStatus("");
@@ -1651,6 +1715,12 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     selectModule(moduleId);
     focusAndScrollInspector();
   }
+
+  function inspectModuleFromGraph(moduleId: string) {
+    if (!moduleById.has(moduleId)) return;
+    selectModule(moduleId, false);
+    focusAndScrollInspector();
+  }
   return (
     <article className="repo-overview" data-head-sha={snapshot.head_sha} data-analysis-source={analysisSource}>
       <header className="repo-overview-heading">
@@ -1707,11 +1777,11 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
           {viewOrder.map((id) => {
             const view = capability.views[id];
             const Icon = viewIcons[id];
-            return <button type="button" data-view-id={id} className={activeView === id ? "active" : ""} aria-current={activeView === id ? "page" : undefined} key={id} onClick={() => selectView(id)}><Icon aria-hidden="true" /><span>{view.label}</span><i className={view.status} aria-hidden="true" />{view.status === "unavailable" && <span className="visually-hidden">{capability.labels.unavailable}</span>}</button>;
+            return <button type="button" data-view-id={id} className={activeView === id ? "active" : ""} aria-current={activeView === id ? "page" : undefined} key={id} onClick={() => openAnalysis(id)}><Icon aria-hidden="true" /><span>{view.label}</span><i className={view.status} aria-hidden="true" />{view.status === "unavailable" && <span className="visually-hidden">{capability.labels.unavailable}</span>}</button>;
           })}
         </nav>
         <section className="repo-view-panel" aria-label={capability.views[activeView].label}>
-          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} selectedModuleId={selectedModuleId} onInspectModule={inspectModule} onExploreStructure={() => selectView("structure_graph")} />
+          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} selectedModuleId={selectedModuleId} structureGraphSelection={structureGraphSelection} onStructureGraphSelection={setStructureGraphSelection} onInspectModule={activeView === "structure_graph" ? inspectModuleFromGraph : inspectModule} onExploreStructure={() => selectView("structure_graph")} />
         </section>
       </div>
     </article>
