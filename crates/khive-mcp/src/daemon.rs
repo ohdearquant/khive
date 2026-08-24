@@ -85,9 +85,9 @@ impl FallbackReason {
         }
     }
 
-    /// Legitimacy tier used by the `KHIVE_DAEMON_STRICT` graduated fail-loud
-    /// policy (SPEC_DRAFT §3 D2). Only `Illegitimate` reasons are elevated by
-    /// strict mode; the other two tiers are always quiet, regardless of mode.
+    /// Legitimacy tier used only by the `KHIVE_DAEMON_STRICT` event-telemetry
+    /// policy (SPEC_DRAFT §3 D2). Only `Illegitimate` reasons are event-elevated;
+    /// the other two tiers stay quiet at event level regardless of mode.
     fn severity(self) -> FallbackSeverity {
         match self {
             // A real misconfiguration: the client and daemon should have
@@ -123,18 +123,23 @@ enum FallbackSeverity {
     Illegitimate,
     /// Historical rollout-transient telemetry tier. These outcomes are now
     /// terminal after a real write, but remain in the closed metrics vocabulary.
-    /// Never elevated, in strict mode or otherwise.
+    /// Never event-elevated, in strict mode or otherwise.
     RolloutTransient,
-    /// No daemon to forward to at all. Never elevated — this is the
-    /// ADR-049-mandated safety net, not a bug.
+    /// No daemon to forward to at all. Never event-elevated — this is the
+    /// ADR-049-mandated safety-net telemetry tier, not a signal that strict
+    /// mode permits local fallback.
     NoDaemon,
 }
 
-/// `KHIVE_DAEMON_STRICT=1` elevates `Illegitimate`-severity fallbacks to an
-/// error-level event (D2-R1, see [`record_fallback`]) and rejects the
-/// request outright instead of completing it locally (#947, see
-/// `fallback_or_reject`). Plain opt-in, default OFF — no hosted-vs-local
-/// auto-detection exists in this codebase. See
+/// `KHIVE_DAEMON_STRICT=1` has two independent effects:
+///
+/// - Behavior: [`fallback_or_reject`] rejects every [`FallbackReason`] instead
+///   of completing the request locally, regardless of severity (#947).
+/// - Telemetry: [`record_fallback`] elevates only `Illegitimate` reasons to an
+///   error-level event with the violation counter (D2-R1); the other severity
+///   tiers remain quiet at event level.
+///
+/// Plain opt-in, default OFF — no hosted-vs-local auto-detection exists. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 fn is_daemon_strict_mode() -> bool {
     env_truthy("KHIVE_DAEMON_STRICT")
