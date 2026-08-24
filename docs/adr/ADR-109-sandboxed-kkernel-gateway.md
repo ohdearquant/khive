@@ -456,17 +456,32 @@ already consults on every verb. All of it reuses shipped machinery:
      runtime-plane exemption, named here so it cannot be read as a hole: it records dispatch
      outcomes and is not reachable as a domain write by any argument the caller controls.
    - **Non-durable telemetry** (in-memory counters, metrics). Out of scope; no durable state.
+   - **Deferred writes belong to the dispatch that scheduled them.** A write scheduled by a
+     dispatch but executed after the response returns — a tracked background task, a
+     post-return continuation — is part of that dispatch's effect closure, and the mode's
+     guarantee covers it. Two enforcement paths exist and both are required. A background
+     path that re-enters verb dispatch (the recall pipeline's serve-ledger record is
+     dispatched as a verb from a tracked background task) passes through the same process
+     gate, so its mutating verb is denied under read-only mode; the scheduling site must
+     treat that denial as the mode operating, not an error to escalate — under read-only
+     mode it skips the scheduling or logs the refusal at debug level. A background path
+     that writes a store directly without re-entering dispatch (the recall-telemetry event
+     append) passes no verb gate, so its write site must itself consult the mode and
+     suppress domain writes; fail-closed, a background store write not classified under the
+     taxonomy above is a domain write and is suppressed.
 
    The **canonical read set** is the in-code closed list this classification produces: exactly
-   the registered verbs whose dispatch closure performs no domain write and requires no
-   suppressed hook beyond the adaptive-scoring class above. The code constant is the normative
-   artifact; the bundled read-only policy's allowlist is generated from it and validated
-   against it, so the two cannot drift. Any verb without a declared effect classification is
-   treated as mutating (fail-closed), so the writer census cannot rot open as the catalog
-   grows — and the classification is verified behaviorally, not by declaration alone: the
-   completeness lint gains a census arm that dispatches every read-classified verb against an
-   instrumented store and asserts zero domain writes (audit-plane appends excepted per the
-   taxonomy above).
+   the registered verbs whose dispatch closure — deferred writes included — performs no
+   domain write and requires no suppressed hook beyond the adaptive-scoring class above. The
+   code constant is the normative artifact; the bundled read-only policy's allowlist is
+   generated from it and validated against it, so the two cannot drift. Any verb without a
+   declared effect classification is treated as mutating (fail-closed), so the writer census
+   cannot rot open as the catalog grows — and the classification is verified behaviorally,
+   not by declaration alone: the completeness lint gains a census arm that dispatches every
+   read-classified verb against an instrumented store, **joins the runtime's tracked
+   background tasks for that dispatch before asserting** (the runtime already tracks them;
+   an assertion that races the background lane would pass vacuously), and asserts zero
+   domain writes (audit-plane appends excepted per the taxonomy above).
 4. **The mode binds to the process boundary it enforces at.** `kkernel mcp` gains a flag that
    sets the process `Gate` to the composite read-only gate instead of `AllowAllGate` for that
    process's lifetime. Binding is local by construction: a read-only process dispatches every
@@ -487,45 +502,55 @@ already consults on every verb. All of it reuses shipped machinery:
    structured refusal is in-scope wire work for this amendment, not an existing property being
    restated. The wire contract is normative:
 
-   **Placement.** The refusal is the per-operation `error` object in the request envelope —
-   the same position where operation failures already carry `code` and `retryable` — so a
-   batch refusing one op reports it beside its siblings' results, and a single-op request
-   carries it as that op's error.
+   **Placement.** The request-DSL envelope's per-operation failure entry is
+   `{ "ok": false, "tool": "<verb>", "error": "<string>", "reason"?: "<string>" }` — the
+   `error` field is a human-readable string by contract, and that contract is unchanged
+   here (no existing client's error handling breaks). The refusal adds one structured
+   sibling field on the same entry, following the envelope's existing pattern of typed
+   fields beside the string (`reason` today): a `refusal` object, present exactly when the
+   process gate denied the operation, absent otherwise. A batch refusing one op reports it
+   beside its siblings' results; a single-op request carries it on that op's entry.
 
-   **Schema.** The refusal error object carries exactly these fields:
+   **Schema.** The `refusal` object carries exactly these fields:
 
    ```json
    {
-     "code": "read_only_refused",
-     "kind": "permission_denied",
+     "class": "read_only" | "policy" | "gate_error",
      "verb": "<the refused verb, as dispatched>",
      "mode": "read_only",
-     "effect": "mutating" | "unclassified",
-     "retryable": false,
-     "message": "<human-readable refusal, non-normative>"
+     "effect": "read" | "mutating" | "unclassified"
    }
    ```
 
-   `code` is the machine-matching key; `effect` reports why the verb failed set membership
-   (`mutating` = classified as a writer, `unclassified` = fail-closed default); `message` is
-   presentation only and carries no contract. Clients match on `code`, never on `message`.
+   `class` is the machine-matching key; `effect` is defined for every class and reports the
+   verb's classification (`read` = in the canonical read set, `mutating` = classified as a
+   writer, `unclassified` = fail-closed default). Clients match on `class`, never on the
+   `error` string, which remains presentation-only.
 
-   **Error mapping.** Three refusal-adjacent conditions map to three distinct wire codes and
-   are never conflated:
+   **Class mapping.** The three deny paths the shipped gate contract actually produces map
+   to the three classes and are never conflated:
 
-   - `PermissionDenied` from the composite gate's membership/policy check →
-     `code: "read_only_refused"`, `retryable: false`. The connection is healthy; the verb is
-     out of contract for this mode.
-   - Gate infrastructure failure (policy engine unavailable, policy failed to load or
-     validate) → `code: "gate_unavailable"`, `kind: "permission_denied"`, `retryable: true`.
-     Fail-closed per the base ADR: the verb is refused, but the client learns the refusal is
-     an infrastructure condition that may clear, not a contract boundary.
-   - Ordinary runtime errors on a permitted read verb keep their existing codes untouched —
-     a read-only connection reports storage timeouts, not-found, and validation errors exactly
-     as an unrestricted one does.
+   - Canonical-set membership failure (the verb is `mutating` or `unclassified`) →
+     `class: "read_only"`. The connection is healthy; the verb is out of contract for this
+     mode. This is the common case and the only class a correctly configured deployment
+     emits.
+   - Policy narrowing (the verb is in the canonical read set — `effect: "read"` — but the
+     installed policy's allowlist excludes it) → `class: "policy"`. Distinguishable from
+     `read_only` so an operator can tell a mode boundary from their own policy choice.
+   - Gate evaluation failure at dispatch → `class: "gate_error"`. Per the authorization-gate
+     ADR's shipped contract, policy-load failures are construction time — a broken policy
+     never reaches dispatch because the process refuses to construct the gate — and
+     dispatch-time evaluation uncertainty is already converted by the Rego gate into an
+     explicit deny with a diagnostic reason; only pre-evaluation failures (gate-request
+     serialization) surface as gate errors, and fail-closed (ADR-129) they deny. This class
+     is therefore rare by construction, and no "retryable infrastructure outage" refusal
+     state exists to represent: there is no `gate_unavailable`.
 
-   A client running against a restricted connection can therefore report the restriction
-   rather than misreading it as khive being down, without string matching.
+   Ordinary runtime errors on a permitted read verb are untouched — no `refusal` field, and
+   a read-only connection reports storage timeouts, not-found, and validation errors exactly
+   as an unrestricted one does. A client running against a restricted connection can
+   therefore report the restriction rather than misreading it as khive being down, without
+   string matching.
 
 ### Honest scope: what this does NOT serve
 
@@ -557,11 +582,16 @@ Concretely, the read-only connection is **not** a containment for a Tier-C untru
   mutating by default, and the mark-read class of incidental writers is classified as mutating
   with a test pinning that classification.
 - The lifecycle census arm of that lint (point 3): every read-classified verb is dispatched
-  against an instrumented store and asserted to perform zero domain writes, with audit-plane
+  against an instrumented store, the runtime's tracked background tasks are joined before
+  asserting, and the dispatch is asserted to perform zero domain writes, with audit-plane
   appends excepted per the write-class taxonomy.
 - Adaptive-hook suppression under read-only mode (point 3): a test that a read verb which
   normally triggers the scoring-fold hook dispatches with the fold skipped, and that the same
   dispatch outside read-only mode still folds.
+- Deferred-write suppression under read-only mode (point 3): the recall pipeline's
+  background lane as the pinned case — a test that under read-only mode the serve-ledger
+  verb dispatch is not escalated as an error and the direct telemetry-event append does not
+  write, with the same recall outside read-only mode writing both.
 - The composite read-only gate (point 2): in-code canonical read-set membership intersected
   with the policy decision, plus a test that a policy hand-crafted with an extra allow branch
   for a mutating verb is still denied by the composite gate.
@@ -573,12 +603,12 @@ Concretely, the read-only connection is **not** a containment for a Tier-C untru
 - The `kkernel mcp` launch flag that installs the composite gate and pins dispatch local
   (point 4): with the flag set, daemon forwarding and daemon auto-spawn are disabled, with a
   test asserting a read-only process never opens the daemon connection path.
-- The structured refusal object on the MCP wire (point 5), carrying the normative schema and
-  error mapping above, with tests that a denied mutating verb returns
-  `code: "read_only_refused"` with the refused verb named (not a generic error string), that
-  an incidental writer such as a mark-read verb is denied, that a gate-infrastructure failure
-  returns `code: "gate_unavailable"` with `retryable: true`, and that an allowed read verb
-  still dispatches with its ordinary result and error codes untouched.
+- The structured `refusal` field on the per-operation envelope entry (point 5), carrying the
+  normative schema and class mapping above with the string `error` field unchanged, with
+  tests that a denied mutating verb returns `class: "read_only"` naming the refused verb,
+  that an incidental writer such as a mark-read verb is denied, that a policy-narrowed read
+  verb returns `class: "policy"` with `effect: "read"`, and that an allowed read verb still
+  dispatches with its ordinary result and errors untouched (no `refusal` field).
 
 ### Consequences of this amendment
 
