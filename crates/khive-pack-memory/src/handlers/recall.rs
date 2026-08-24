@@ -317,8 +317,19 @@ impl MemoryPack {
         let (mut memory_ids, mut notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
 
+        // Widening must count only candidates the created_at window can keep:
+        // the window predicate runs post-fusion, so counting raw candidates
+        // would let strong out-of-window rows satisfy the break condition and
+        // starve eligible ones deeper in the corpus. With no window set this
+        // is exactly the candidate count.
+        let in_window = |note: &khive_storage::note::Note| {
+            created_after_us.is_none_or(|after| note.created_at >= after)
+                && created_before_us.is_none_or(|before| note.created_at < before)
+        };
+        let mut eligible_count = notes_by_id.values().filter(|n| in_window(n)).count();
+
         for _round in 1..ann_overfetch_max_rounds {
-            if memory_ids.len() >= limit {
+            if eligible_count >= limit {
                 break;
             }
             let corpus_exhausted = candidates.text_hits.len() < current_candidate_limit as usize
@@ -352,6 +363,7 @@ impl MemoryPack {
             .await?;
             (memory_ids, notes_by_id) =
                 self.load_memory_candidate_notes(token, &candidates).await?;
+            eligible_count = notes_by_id.values().filter(|n| in_window(n)).count();
         }
         let candidate_limit = current_candidate_limit;
 
@@ -6607,6 +6619,135 @@ mod tests {
         assert!(
             date_err.contains("RFC 3339"),
             "date-only rejection must name RFC 3339, got: {date_err}"
+        );
+    }
+
+    /// The re-gather loop must widen on window-starved candidate sets: with
+    /// more strong out-of-window rows than the initial candidate window, an
+    /// eligible in-window row ranks below the first fetch entirely. Counting
+    /// raw candidates would stop widening immediately and return [] while an
+    /// eligible memory exists; counting window-eligible candidates widens
+    /// until it is found.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_widens_when_out_of_window_candidates_crowd_out_eligible_ones() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        // The default RecallConfig pins candidate_limit at 150 and
+        // max_recall_candidates at 200, so the initial fetch is 150 and one
+        // widening round reaches 200. Seed 160 fillers that out-rank the
+        // target on FTS (query terms repeated, so higher term frequency)
+        // plus one weaker-ranked eligible target: the target sits outside
+        // the 150-candidate first fetch and inside the widened 200.
+        let mut filler_ids = Vec::new();
+        for i in 0..160 {
+            let filler = rt
+                .create_note(
+                    &token,
+                    "memory",
+                    None,
+                    &format!(
+                        "crowdout probe fixture {i} crowdout probe fixture \
+                         crowdout probe fixture"
+                    ),
+                    Some(0.7),
+                    None,
+                    vec![],
+                )
+                .await
+                .expect("create filler");
+            filler_ids.push(filler.id);
+        }
+        let target = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "crowdout probe fixture sentinel",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create target");
+
+        // Fillers sit before the window bound, the target inside it.
+        let t_target = chrono::Utc::now().timestamp_micros() - 3_600_000_000;
+        let t_old = t_target - 3_600_000_000;
+        {
+            let sql = rt.sql();
+            let mut writer = sql.writer().await.expect("writer");
+            for (id, us) in filler_ids
+                .iter()
+                .map(|id| (*id, t_old))
+                .chain(std::iter::once((target.id, t_target)))
+            {
+                let changed = writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET created_at = ? WHERE id = ?".to_string(),
+                        params: vec![SqlValue::Integer(us), SqlValue::Text(id.to_string())],
+                        label: Some("test.recall_crowdout.set_created_at".to_string()),
+                    })
+                    .await
+                    .expect("set created_at");
+                assert_eq!(changed, 1, "created_at UPDATE must hit exactly one row");
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        // Fixture precondition: without a window the target must NOT be in
+        // the un-widened result set — the fillers out-rank it.
+        let unwindowed = registry
+            .dispatch(
+                "memory.recall",
+                json!({ "query": "crowdout probe fixture", "limit": 2 }),
+            )
+            .await
+            .expect("unwindowed recall");
+        let unwindowed_ids: Vec<String> = unwindowed
+            .as_array()
+            .or_else(|| unwindowed.get("results").and_then(|r| r.as_array()))
+            .expect("array-shaped recall response")
+            .iter()
+            .map(|r| r["id"].as_str().expect("result id").to_string())
+            .collect();
+        assert!(
+            !unwindowed_ids.contains(&target.id.to_string()),
+            "fixture precondition: the target must be crowded out without a window"
+        );
+
+        let windowed = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": "crowdout probe fixture",
+                    "limit": 2,
+                    "created_after": chrono::DateTime::from_timestamp_micros(t_target)
+                        .expect("valid micros")
+                        .to_rfc3339(),
+                }),
+            )
+            .await
+            .expect("windowed recall");
+        let windowed_ids: Vec<String> = windowed
+            .as_array()
+            .or_else(|| windowed.get("results").and_then(|r| r.as_array()))
+            .expect("array-shaped recall response")
+            .iter()
+            .map(|r| r["id"].as_str().expect("result id").to_string())
+            .collect();
+        assert_eq!(
+            windowed_ids,
+            vec![target.id.to_string()],
+            "the window must recover the eligible memory via widening"
         );
     }
 }
