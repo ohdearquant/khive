@@ -458,11 +458,14 @@ already consults on every verb. All of it reuses shipped machinery:
      already honors. A recall under read-only mode returns its result without maintaining
      the index.
    - **Audit-plane appends** (the runtime's own record of what was dispatched, permitted, or
-     refused). These are **retained** under read-only mode by contract: a restricted
-     connection whose activity left no audit trail would be less observable than an
-     unrestricted one, which is the wrong direction for a security tier. Audit retention is a
-     runtime-plane exemption, named here so it cannot be read as a hole: it records dispatch
-     outcomes and is not reachable as a domain write by any argument the caller controls.
+     refused). These are runtime-plane, not domain writes: they record dispatch outcomes and
+     are not reachable as a domain write by any argument the caller controls. On a read-only
+     backing store they follow ADR-028 Amendment A2 rule 5 verbatim: the registry omits the
+     `EventStore` rather than attempting a known-failing append, and every successful
+     non-help operation carries the envelope-level advisory
+     `audit_persistence_skipped_read_only`. The observability obligation is discharged by
+     that per-response advisory — the skip is visible to every caller on every operation —
+     not by a write no read-only store can accept.
    - **Non-durable telemetry** (in-memory counters, metrics). Out of scope; no durable state.
    - **Deferred writes belong to the dispatch that scheduled them.** A write scheduled by a
      dispatch but executed after the response returns — a tracked background task, a
@@ -493,15 +496,20 @@ already consults on every verb. All of it reuses shipped machinery:
    domain writes (audit-plane appends excepted per the taxonomy above).
 
    **Synthetic gate-plane operations are enumerated, not defaulted.** The runtime issues
-   gate checks for operations that are not registered verbs — today, the synthetic
-   authorization it performs before attaching its own audit event plumbing. The fail-closed
-   default above governs unclassified _verbs_; a synthetic operation the runtime itself
-   issues is instead explicitly enumerated and classified alongside the verb classification.
-   The audit-attachment authorization classifies as a gate-plane read: it performs no domain
-   write, and denying it would silently detach the audit plane — inverting the
-   audit-retention contract above, and doing so without any refusal a caller would see. An
-   unenumerated synthetic operation remains fail-closed mutating, so the enumeration cannot
-   rot open as new synthetic operations appear.
+   gate checks for operations that are not registered verbs. The fail-closed default above
+   governs unclassified _verbs_; a synthetic operation the runtime itself issues is instead
+   explicitly enumerated and classified alongside the verb classification. Today the sole
+   synthetic string is `"authorize"`, and ADR-129 Amendment 1 already classifies it: a
+   pseudo-verb is checked against the full authority its result grants, which for the
+   token-minting path is **Write** on the primary namespace. This amendment does not
+   reclassify it. Under read-only mode the Write check therefore denies both of its
+   consumers, and both denials are the mode operating correctly: token minting is refused —
+   the honest semantics of a read+write token, the consequence ADR-129 itself names — and
+   the audit-attachment authorization never passes, which detaches nothing, because the
+   registry has already omitted the `EventStore` per the audit taxonomy above and the
+   per-response advisory makes that skip visible to every caller. An unenumerated synthetic
+   operation remains fail-closed mutating, so the enumeration cannot rot open as new
+   synthetic operations appear.
 4. **The mode binds to the process boundary it enforces at.** `kkernel mcp` gains a flag that
    sets the process `Gate` to the composite read-only gate instead of `AllowAllGate` for that
    process's lifetime. Binding is local by construction: a read-only process dispatches every
@@ -522,8 +530,9 @@ already consults on every verb. All of it reuses shipped machinery:
    the store read-only fails; it does not fall back to a writable handle. Read verbs
    tolerate this: a read-only connection performs no domain writes
    (the gate denies mutations before any handler runs, and the adaptive hooks are suppressed
-   per point 3), so local dispatch never contends for the resident daemon's writer lane beyond
-   its own audit-plane appends. Extending gate identity into daemon connection admission
+   per point 3, and audit persistence is skipped with the ADR-028 A2 advisory per the
+   taxonomy above), so local dispatch never contends for the resident daemon's writer lane
+   at all. Extending gate identity into daemon connection admission
    and spawn configuration — so a restricted client could safely attach to a shared daemon —
    is structural-gateway work and stays deferred with the untrusted tier. This is the base
    ADR's A2 (mode-flag) process boundary, **not** A1 — see the honest-scope note below.
