@@ -7,8 +7,10 @@
 
 The brain pack owns recall-weighting state: per-profile posterior state
 (`BrainState`, section posteriors, entity posteriors, implicit mass) held
-in-memory per namespace, persisted to three tables in the main store
-(`brain_event_log`, `brain_profile_snapshots`, `brain_implicit_mass`), with
+in-memory per namespace, persisted to four tables in the main store
+(`brain_event_log`, `brain_profile_snapshots`, `brain_implicit_mass`, and
+`brain_scorer_dedup` — the claim table that makes scorer feedback
+exactly-once, written inside the same fold transaction), with
 folds applied synchronously inside verb dispatch. This couples the domain
 process to profile serving twice over: brain persistence rides the main
 store's single writer lane, and the in-memory posterior state is bound to
@@ -26,7 +28,8 @@ events one:
 
 - **The brain tables are pack-internal at runtime.** A workspace enumeration
   of raw-SQL consumers (`grep -rl` over `brain_event_log`,
-  `brain_profile_snapshots`, `brain_implicit_mass`) finds four files:
+  `brain_profile_snapshots`, `brain_implicit_mass`, `brain_scorer_dedup`)
+  finds four files:
   `khive-pack-brain/src/persist.rs` and `fold_gate.rs` (the runtime
   consumers), `khive-pack-brain/src/tests.rs`, and
   `khive-db/src/migrations_tests.rs` — the last because the tables' DDL
@@ -37,7 +40,14 @@ events one:
   carries a mechanized guard in the shape ADR-170's amendment established:
   a test that reddens if a raw-SQL reference to a brain table ever appears
   outside the brain daemon's own code path, so pack-internality is held by
-  a test, not a survey.
+  a test, not a survey. Enumeration at implementation depth also surfaced
+  what a table-level grep cannot see: the feedback dispatch path commits its
+  public event-plane row in the same transaction as the fold (scorer-dedup
+  claim, implicit-mass gate, brain event append, snapshot upsert). That
+  transaction-level coupling, not table location, is the binding constraint,
+  so implementation lands in this order: decouple the fold from dispatch
+  first (this ADR's point 2 semantics, in-process), relocate brain storage
+  second, move the process boundary to the daemon third.
 - **Consumers reach brain state through verbs, not memory.** The recall path
   loads profile coefficients by dispatching `brain.profile` through the verb
   registry (`khive-pack-memory/src/handlers/recall.rs::load_brain_profile`),
@@ -51,7 +61,7 @@ events one:
 Move brain state into a dedicated brain daemon that owns `brain.db`.
 
 1. **Brain daemon.** A new subcommand of the same binary owns `brain.db`
-   beside the main store (the three brain tables plus its in-memory
+   beside the main store (the four brain tables plus its in-memory
    posterior state), binds `khive-brain.sock` derived beside that file, and
    reuses the ADR-170 socket pattern verbatim: framing, peer-uid admission,
    flock guard, versioned protocol with typed refusals. It is the only
