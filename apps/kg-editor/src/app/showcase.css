@@ -949,7 +949,7 @@ button.repo-list-row:hover,
 .repo-treemap-module strong { font-size: var(--khive-type-md); white-space: nowrap; }
 .repo-treemap-module span { font-size: var(--khive-type-xs); margin-top: 3px; }
 
-.repo-score-grid { display: grid; gap: 10px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.repo-score-grid { align-items: start; display: grid; gap: 10px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .repo-score-card { background: var(--khive-color-surface-overlay); border: 1px solid var(--repo-border); border-radius: var(--khive-radius-lg); min-height: 126px; padding: 13px; }
 .repo-score-card > span { color: var(--repo-muted); display: block; font-size: var(--khive-type-sm); min-height: 19px; }
 .repo-score-value { gap: 7px; margin-top: 10px; }
