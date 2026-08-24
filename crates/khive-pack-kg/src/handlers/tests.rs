@@ -883,6 +883,54 @@ async fn link_invalid_relation_error_suggests_valid_relations() {
     );
 }
 
+#[tokio::test]
+async fn link_invalid_relation_error_attributes_each_resolved_kind_to_short_id() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let source = rt
+        .create_entity(&token, "document", None, "Source", None, None, vec![])
+        .await
+        .expect("create source document");
+    let target = rt
+        .create_entity(&token, "concept", None, "Target", None, None, vec![])
+        .await
+        .expect("create target concept");
+    let source_short: String = source.id.to_string().chars().take(8).collect();
+    let target_short: String = target.id.to_string().chars().take(8).collect();
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("kg registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+
+    let error = pack
+        .handle_link(
+            &token,
+            json!({
+                "source_id": source.id.to_string(),
+                "target_id": target.id.to_string(),
+                "relation": "extends",
+            }),
+            &registry,
+        )
+        .await
+        .expect_err("document->concept extends must be rejected")
+        .to_string();
+
+    assert!(
+        error.contains(&format!("source {source_short} resolved as document")),
+        "source id must be attributed to its resolved kind: {error}"
+    );
+    assert!(
+        error.contains(&format!("target {target_short} resolved as concept")),
+        "target id must be attributed to its resolved kind: {error}"
+    );
+}
+
 fn configured_kg_endpoint_test_surface() -> (
     khive_runtime::KhiveRuntime,
     khive_runtime::NamespaceToken,

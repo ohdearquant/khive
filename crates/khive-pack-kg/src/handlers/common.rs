@@ -503,6 +503,12 @@ pub(crate) async fn enrich_allowlist_error(
             relation.as_str()
         ));
     }
+    let source_short: String = source_id.to_string().chars().take(8).collect();
+    let target_short: String = target_id.to_string().chars().take(8).collect();
+    msg.push_str(&format!(
+        " Endpoint resolution: source {source_short} resolved as {src_kind}; \
+         target {target_short} resolved as {tgt_kind}."
+    ));
     msg
 }
 
