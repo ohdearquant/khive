@@ -253,16 +253,27 @@ fn thread_id_query_spellings(root: Uuid, selected_raw: Option<&str>) -> Vec<Stri
     spellings
 }
 
+/// Parse a caller-supplied timestamp, rejecting anything that does not
+/// resolve to an instant, with the verb and field named in the error.
+/// Callers own the serialization policy on the parsed value: ingest
+/// re-serializes in UTC, heartbeat preserves the supplied spelling.
+fn parse_supplied_timestamp(
+    verb: &str,
+    field: &str,
+    raw: &str,
+) -> Result<DateTime<chrono::FixedOffset>, RuntimeError> {
+    DateTime::parse_from_rfc3339(raw.trim()).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "{verb}: `{field}` must be a valid RFC 3339 timestamp, got {raw:?}: {error}"
+        ))
+    })
+}
+
 /// Validate an adapter timestamp before it can be certified as a v1 `sent_at`
 /// value, then serialize the instant in one RFC 3339 representation (UTC).
 fn canonicalize_ingest_sent_at(raw: &str) -> Result<String, RuntimeError> {
-    DateTime::parse_from_rfc3339(raw.trim())
+    parse_supplied_timestamp("ingest", "sent_at", raw)
         .map(|timestamp| timestamp.with_timezone(&Utc).to_rfc3339())
-        .map_err(|error| {
-            RuntimeError::InvalidInput(format!(
-                "ingest: `sent_at` must be a valid RFC 3339 timestamp, got {raw:?}: {error}"
-            ))
-        })
 }
 
 /// `send` — create a message note in the caller's namespace (outbound) AND
@@ -2328,11 +2339,7 @@ pub(crate) async fn handle_heartbeat(
     // rule as ingest's `sent_at` (`canonicalize_ingest_sent_at`).
     let at = match p.at.as_deref() {
         Some(raw) => {
-            DateTime::parse_from_rfc3339(raw.trim()).map_err(|error| {
-                RuntimeError::InvalidInput(format!(
-                    "heartbeat: `at` must be a valid RFC 3339 timestamp, got {raw:?}: {error}"
-                ))
-            })?;
+            parse_supplied_timestamp("heartbeat", "at", raw)?;
             raw.trim().to_string()
         }
         None => now.to_rfc3339(),

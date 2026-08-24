@@ -7625,6 +7625,19 @@ async fn heartbeat_rejects_an_unparseable_at_and_preserves_a_valid_one() {
         "the error names the field and the offending value: {msg}"
     );
 
+    // Checked BEFORE the valid heartbeat: both calls share one channel
+    // identity, so a row leaked by the rejected call would be overwritten
+    // below and invisible to any later count.
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds after the rejected heartbeat");
+    let channels = health["channels"].as_array().expect("channels is array");
+    assert!(
+        channels.is_empty(),
+        "the rejected heartbeat left no row: {channels:?}"
+    );
+
     let mut with_offset = base.clone();
     with_offset["at"] = serde_json::json!("2026-08-24T09:15:00-04:00");
     registry
@@ -7637,7 +7650,11 @@ async fn heartbeat_rejects_an_unparseable_at_and_preserves_a_valid_one() {
         .await
         .expect("health succeeds");
     let channels = health["channels"].as_array().expect("channels is array");
-    assert_eq!(channels.len(), 1, "the rejected heartbeat left no row");
+    assert_eq!(
+        channels.len(),
+        1,
+        "exactly the valid heartbeat's row exists"
+    );
     assert_eq!(
         channels[0]["last_poll_attempt_at"].as_str(),
         Some("2026-08-24T09:15:00-04:00"),
