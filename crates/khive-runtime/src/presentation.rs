@@ -585,8 +585,9 @@ pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> V
 /// Apply the Agent-mode transform to an arbitrary JSON value.
 ///
 /// `inside_properties` is `true` when recursing inside a `"properties"` object.
-/// Caller-supplied payload timestamps (e.g. `trigger_at`) must not be compacted
-/// because they encode domain semantics the agent may need to round-trip.
+/// Caller-supplied empty strings and payload timestamps (e.g. `trigger_at`)
+/// must not be compacted because they encode domain semantics the agent may
+/// need to round-trip.
 fn transform_agent(
     value: Value,
     preserved_nulls: &HashSet<&str>,
@@ -646,13 +647,14 @@ fn transform_agent(
 ///
 /// Returns `None` if the field should be dropped.
 ///
-/// `inside_properties` suppresses timestamp compaction for caller-submitted
-/// payload values nested under a literal `"properties"` key (e.g. `trigger_at`
-/// as returned by `agenda`/`get`). `payload_timestamps` suppresses compaction
-/// by field name regardless of nesting, covering top-level convenience fields
-/// such as the `trigger_at` returned directly in a `schedule.remind`/
-/// `schedule.schedule` create response (#871). Metadata timestamps at the top
-/// level (`created_at`, `updated_at`) are still compacted.
+/// `inside_properties` preserves empty strings and suppresses timestamp
+/// compaction for caller-submitted payload values nested under a literal
+/// `"properties"` key (e.g. `trigger_at` as returned by `agenda`/`get`).
+/// `payload_timestamps` suppresses compaction by field name regardless of
+/// nesting, covering top-level convenience fields such as the `trigger_at`
+/// returned directly in a `schedule.remind`/`schedule.schedule` create
+/// response (#871). Metadata timestamps at the top level (`created_at`,
+/// `updated_at`) are still compacted.
 #[derive(Clone, Copy)]
 struct AgentFieldContext {
     inside_properties: bool,
@@ -687,8 +689,8 @@ fn transform_field_agent(
         {
             Some(value)
         }
-        // Drop other empty strings, arrays, objects.
-        Value::String(s) if s.is_empty() => None,
+        // Caller-owned property strings are data; drop empty strings elsewhere.
+        Value::String(s) if s.is_empty() && !context.inside_properties => None,
         Value::Array(a) if a.is_empty() => None,
         Value::Object(o) if o.is_empty() => None,
         // Truncate score fields.
