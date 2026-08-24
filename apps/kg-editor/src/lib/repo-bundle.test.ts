@@ -44,13 +44,23 @@ describe("khive.repo.v1 browser contract", () => {
     expect(repoBundleSchema.safeParse(value).success).toBe(false);
   });
 
-  it("rejects duplicate module source paths that cannot form a stable investigation link", () => {
+  it("accepts duplicate module source paths when stable identifiers differ", () => {
     const value = goldenValue() as {
       graph: { modules: { items: Array<{ id: string; source_path: string }> } };
     };
     expect(value.graph.modules.items.length).toBeGreaterThan(1);
     value.graph.modules.items[1].source_path =
       value.graph.modules.items[0].source_path;
+
+    expect(repoBundleSchema.safeParse(value).success).toBe(true);
+  });
+
+  it("rejects duplicate module identifiers", () => {
+    const value = goldenValue() as {
+      graph: { modules: { items: Array<{ id: string }> } };
+    };
+    expect(value.graph.modules.items.length).toBeGreaterThan(1);
+    value.graph.modules.items[1].id = value.graph.modules.items[0].id;
 
     expect(repoBundleSchema.safeParse(value).success).toBe(false);
   });

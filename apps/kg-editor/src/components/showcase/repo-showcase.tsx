@@ -1413,10 +1413,25 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
     function restoreLocation(announce = false) {
       const parsed = parseRepositoryLocation(new URL(window.location.href));
       const requestedPath = parsed.location.modulePath;
+      const requestedModuleId = parsed.location.moduleId;
+      const messages = parsed.issues.map((issue) => issue.message);
       let nextModuleId: string | null = defaultModuleId;
       let nextUnresolved: typeof unresolvedModule = null;
       let resolvedModuleRestore = false;
-      if (requestedPath) {
+      const requestedModule = requestedModuleId
+        ? moduleById.get(requestedModuleId)
+        : null;
+      if (requestedModule) {
+        nextModuleId = requestedModule.id;
+        resolvedModuleRestore = true;
+        if (
+          requestedPath && requestedPath !== requestedModule.source_path
+        ) {
+          messages.push(
+            "The module path did not match the requested module identifier; the link now uses the captured source path.",
+          );
+        }
+      } else if (requestedPath) {
         const matches = modulesBySourcePath.get(requestedPath) ?? [];
         if (matches.length === 1) {
           nextModuleId = matches[0].id;
@@ -1431,8 +1446,12 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
           };
         }
       }
+      if (requestedModuleId && !requestedModule) {
+        messages.push(
+          "The requested module identifier is not present in this bounded snapshot.",
+        );
+      }
       const nextView = parsed.location.view ?? "structure_graph";
-      const messages = parsed.issues.map((issue) => issue.message);
       const staleSnapshot = Boolean(
         parsed.location.snapshotSha &&
           parsed.location.snapshotSha !== snapshot.head_sha,
@@ -1473,8 +1492,11 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
         {
           repository: repository.canonical_url,
           snapshotSha: parsed.location.snapshotSha ?? snapshot.head_sha,
-          modulePath: requestedPath ??
-            (nextModuleId ? moduleById.get(nextModuleId)?.source_path ?? null : null),
+          modulePath: nextUnresolved?.path ??
+            (nextModuleId
+              ? moduleById.get(nextModuleId)?.source_path ?? null
+              : null),
+          moduleId: nextModuleId,
           view: nextView,
         },
       );
@@ -1511,6 +1533,7 @@ export function RepoShowcase({ bundle, analysisSource = "curated-static-fallback
       modulePath: moduleId
         ? moduleById.get(moduleId)?.source_path ?? null
         : missingPath,
+      moduleId,
       view,
     };
   }

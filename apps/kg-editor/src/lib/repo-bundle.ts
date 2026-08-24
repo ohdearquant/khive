@@ -508,7 +508,7 @@ export const repoBundleSchema = z.strictObject({
       context.addIssue({ code: "custom", path: ["graph", key, "items"], message: "symbol-tier collections are typed but empty in khive.repo.v1" });
     }
   }
-  const sourcePaths = new Set<string>();
+  const moduleIds = new Set<string>();
   for (const [index, moduleNode] of bundle.graph.modules.items.entries()) {
     const pathIssue = addressableModulePathIssue(moduleNode.source_path);
     if (pathIssue) {
@@ -518,14 +518,14 @@ export const repoBundleSchema = z.strictObject({
         message: pathIssue,
       });
     }
-    if (sourcePaths.has(moduleNode.source_path)) {
+    if (moduleIds.has(moduleNode.id)) {
       context.addIssue({
         code: "custom",
-        path: ["graph", "modules", "items", index, "source_path"],
-        message: "module source paths must be unique within a repository snapshot",
+        path: ["graph", "modules", "items", index, "id"],
+        message: "module identifiers must be unique within a repository snapshot",
       });
     }
-    sourcePaths.add(moduleNode.source_path);
+    moduleIds.add(moduleNode.id);
   }
   for (const key of [
     "dependency_topology",

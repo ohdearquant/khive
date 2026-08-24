@@ -14,10 +14,17 @@ export const REPOSITORY_VIEW_IDS = [
   "scorecard",
 ] as const satisfies readonly ViewId[];
 
-const LOCATION_PARAMETERS = ["repo", "at", "module", "view"] as const;
+const LOCATION_PARAMETERS = [
+  "repo",
+  "at",
+  "module",
+  "module_id",
+  "view",
+] as const;
 const VIEW_IDS = new Set<string>(REPOSITORY_VIEW_IDS);
 const SNAPSHOT_SHA = /^[0-9a-f]{40}$/;
 const MODULE_PATH_LIMIT = 1_024;
+const MODULE_ID_LIMIT = 1_024;
 
 type LocationParameter = (typeof LOCATION_PARAMETERS)[number];
 
@@ -25,6 +32,7 @@ export type RepositoryLocation = Readonly<{
   repository: string | null;
   snapshotSha: string | null;
   modulePath: string | null;
+  moduleId: string | null;
   view: ViewId | null;
 }>;
 
@@ -125,6 +133,24 @@ function parseModulePath(
   return value;
 }
 
+function parseModuleId(
+  value: string | null,
+  issues: RepositoryLocationIssue[],
+): string | null {
+  if (value == null) return null;
+  if (
+    value.length > MODULE_ID_LIMIT ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    issues.push({
+      parameter: "module_id",
+      message: "The module identifier must be a bounded printable value.",
+    });
+    return null;
+  }
+  return value;
+}
+
 function parseView(
   value: string | null,
   issues: RepositoryLocationIssue[],
@@ -145,6 +171,7 @@ export function parseRepositoryLocation(url: URL): ParsedRepositoryLocation {
   const repository = singleParameter(url, "repo", issues);
   const snapshotSha = singleParameter(url, "at", issues);
   const modulePath = singleParameter(url, "module", issues);
+  const moduleId = singleParameter(url, "module_id", issues);
   const view = singleParameter(url, "view", issues);
 
   return {
@@ -152,6 +179,7 @@ export function parseRepositoryLocation(url: URL): ParsedRepositoryLocation {
       repository: parseRepository(repository, issues),
       snapshotSha: parseSnapshotSha(snapshotSha, issues),
       modulePath: parseModulePath(modulePath, issues),
+      moduleId: parseModuleId(moduleId, issues),
       view: parseView(view, issues),
     },
     issues,
@@ -159,7 +187,7 @@ export function parseRepositoryLocation(url: URL): ParsedRepositoryLocation {
 }
 
 // Investigation URLs are copied to the clipboard and written to browser
-// history, so they carry ONLY the four parameters this app defines. A page
+// history, so they carry ONLY the five parameters this app defines. A page
 // URL that arrived with an unrelated query parameter or fragment — a
 // credential such as ?access_token=..., a fragment-borne secret, a tracker
 // value — is never copied forward: the URL is rebuilt from the origin and
@@ -173,6 +201,7 @@ export function repositoryLocationUrl(
     repo: location.repository ? repositoryOriginAndPathname(location.repository) : null,
     at: location.snapshotSha,
     module: location.modulePath,
+    module_id: location.moduleId,
     view: location.view,
   };
   for (const parameter of LOCATION_PARAMETERS) {
@@ -189,11 +218,11 @@ export function repositoryLocationUrl(
  * fragment of its OWN (deep-link support keeps those in-browser), so this
  * boundary also applies to the parameter VALUES, not just the parameter
  * names: the shared repository value is normalized to origin + pathname,
- * and a module path carrying a URL query or fragment delimiter is omitted
- * entirely rather than encoded into the value, because encoding preserves
- * — not redacts — whatever the delimiter introduced. `at` and `view` need
- * no value boundary: their parse contracts are a 40-hex SHA and a closed
- * id set.
+ * and a module path or identifier carrying a URL query or fragment delimiter
+ * is omitted entirely rather than encoded into the value, because encoding
+ * preserves — not redacts — whatever the delimiter introduced. `at` and
+ * `view` need no value boundary: their parse contracts are a 40-hex SHA and
+ * a closed id set.
  */
 export function investigationShareUrl(
   base: URL,
@@ -207,6 +236,9 @@ export function investigationShareUrl(
   if (location.snapshotSha) url.searchParams.append("at", location.snapshotSha);
   if (location.modulePath && !/[?#]/u.test(location.modulePath)) {
     url.searchParams.append("module", location.modulePath);
+  }
+  if (location.moduleId && !/[?#]/u.test(location.moduleId)) {
+    url.searchParams.append("module_id", location.moduleId);
   }
   if (location.view) url.searchParams.append("view", location.view);
   return url;

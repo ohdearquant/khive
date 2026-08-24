@@ -109,6 +109,9 @@ function replaceRepositoryQuery(
     modulePath: clearInvestigation
       ? null
       : current.searchParams.get("module"),
+    moduleId: clearInvestigation
+      ? null
+      : current.searchParams.get("module_id"),
     view: clearInvestigation
       ? null
       : (current.searchParams.get("view") as RepositoryLocation["view"]),

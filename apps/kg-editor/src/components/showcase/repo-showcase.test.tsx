@@ -37,6 +37,7 @@ describe("repository showcase", () => {
       repository: bundle.meta.repository.canonical_url,
       snapshotSha: bundle.meta.snapshot.head_sha,
       modulePath: pool.source_path,
+      moduleId: null,
       view: "dependency_topology",
     });
     window.history.replaceState(null, "", direct);
@@ -61,6 +62,9 @@ describe("repository showcase", () => {
     });
     expect(breadcrumb).toHaveTextContent(`${bundle.meta.repository.owner}/${bundle.meta.repository.name}`);
     expect(breadcrumb).toHaveTextContent(pool.source_path);
+    expect(new URL(window.location.href).searchParams.get("module_id")).toBe(
+      pool.id,
+    );
 
     const pushState = vi.spyOn(window.history, "pushState");
     const search = screen.getByRole("searchbox", { name: "Find a module or path" });
@@ -74,6 +78,9 @@ describe("repository showcase", () => {
     );
     expect(new URL(window.location.href).searchParams.get("module")).toBe(
       writer.source_path,
+    );
+    expect(new URL(window.location.href).searchParams.get("module_id")).toBe(
+      writer.id,
     );
     expect(pushState).toHaveBeenCalledTimes(1);
 
@@ -126,6 +133,7 @@ describe("repository showcase", () => {
       repository: bundle.meta.repository.canonical_url,
       snapshotSha: bundle.meta.snapshot.head_sha,
       modulePath: "crates/not-captured/src/missing.rs",
+      moduleId: null,
       view: "dependency_topology",
     });
     window.history.replaceState(null, "", unresolvedRestore);
@@ -143,6 +151,56 @@ describe("repository showcase", () => {
     // CPU contention pushed it past the default 5s timeout, so this needs headroom.
   }, 20_000);
 
+  it("round-trips the exact module when source paths are shared", async () => {
+    const bundle = structuredClone(golden());
+    const [first, selected] = bundle.graph.modules.items;
+    expect(first).toBeDefined();
+    expect(selected).toBeDefined();
+    selected.source_path = first.source_path;
+
+    const direct = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: bundle.meta.snapshot.head_sha,
+      modulePath: selected.source_path,
+      moduleId: selected.id,
+      view: "dependency_topology",
+    });
+    expect(direct.searchParams.get("module_id")).toBe(selected.id);
+    window.history.replaceState(null, "", direct);
+
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+    writeText.mockClear();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
+
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 }))
+        .toHaveTextContent(selected.source_path)
+    );
+    expect(inspector.querySelector("header p")).toHaveTextContent(
+      selected.module_path,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Copy investigation link" }),
+    );
+    const copied = new URL(writeText.mock.calls.at(-1)?.[0] as string);
+    expect(copied.searchParams.get("module")).toBe(selected.source_path);
+    expect(copied.searchParams.get("module_id")).toBe(selected.id);
+
+    window.history.replaceState(null, "", copied);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await waitFor(() =>
+      expect(inspector.querySelector("header p")).toHaveTextContent(
+        selected.module_path,
+      )
+    );
+  });
+
   it("keeps stale and missing deep-link evidence explicit and recoverable", async () => {
     const bundle = golden();
     const missingPath = "crates/not-captured/src/missing.rs";
@@ -150,6 +208,7 @@ describe("repository showcase", () => {
       repository: bundle.meta.repository.canonical_url,
       snapshotSha: "0000000000000000000000000000000000000000",
       modulePath: missingPath,
+      moduleId: null,
       view: "scorecard",
     });
     window.history.replaceState(null, "", direct);
@@ -237,6 +296,7 @@ describe("repository showcase", () => {
       repository: bundle.meta.repository.canonical_url,
       snapshotSha: staleSha,
       modulePath: bundle.graph.modules.items[0].source_path,
+      moduleId: bundle.graph.modules.items[0].id,
       view: "scorecard",
     });
     window.history.replaceState(null, "", direct);
@@ -705,6 +765,7 @@ describe("repository showcase", () => {
         repository: bundle.meta.repository.canonical_url,
         snapshotSha: bundle.meta.snapshot.head_sha,
         modulePath: moduleNode.source_path,
+        moduleId: moduleNode.id,
         view: "history_structure_navigation",
       }),
     );
