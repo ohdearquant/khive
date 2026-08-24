@@ -721,7 +721,7 @@ fn find_url_userinfo(text: &str) -> Option<&str> {
             if let Some(colon) = userinfo.find(':') {
                 let user = &userinfo[..colon];
                 let pass = &userinfo[colon + 1..];
-                if !user.is_empty() && !pass.is_empty() && pass.len() >= 4 {
+                if !user.is_empty() && !pass.is_empty() {
                     // Return a slice starting from the scheme.  Walk back from
                     // `at_abs` to the first non-scheme char and resume just past
                     // it.  Use `char_indices` and skip by the separator's full
@@ -2238,6 +2238,35 @@ mod tests {
         let fake = "postgresql://dbuser:S3cr3tP4ss@db.example.com:5432/mydb";
         assert!(scan(fake).is_some(), "URL userinfo must be caught");
         assert_eq!(scan(fake).unwrap().detector, "url-userinfo");
+    }
+
+    #[test]
+    fn blocks_and_masks_url_userinfo_with_short_passwords() {
+        for password in ["a", "ab", "abc"] {
+            let content = format!(
+                "gate backend probe failed: postgres://svc:{password}@internal-host refused"
+            );
+
+            let detected = scan(&content).expect("short URL password must be detected");
+            assert_eq!(detected.detector, "url-userinfo");
+            assert!(
+                check(&content).is_err(),
+                "write gate must block {content:?}"
+            );
+            assert_eq!(
+                bounded_masked_log_text(&content),
+                "gate backend probe failed: ***MASKED*** refused",
+                "log boundary must mask {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_url_without_userinfo() {
+        let content = "gate backend probe failed: postgres://host:8080/path refused";
+
+        assert!(check(content).is_ok(), "host:port is not URL userinfo");
+        assert_eq!(bounded_masked_log_text(content), content);
     }
 
     #[test]
