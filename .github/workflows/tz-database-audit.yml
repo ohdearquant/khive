@@ -31,8 +31,7 @@ on:
       # Source only. The resolver and the sweep both live under src/, so a
       # README, a bench, or a doc change in this crate cannot affect the
       # result and should not pay for the run.
-      - "crates/khive-pack-gtd/src/**"
-      - "crates/khive-pack-gtd/Cargo.toml"
+      - "crates/khive-runtime/src/**"
       - ".github/workflows/tz-database-audit.yml"
 
 # Declared rather than inherited. With no `permissions:` block a workflow gets
@@ -92,4 +91,4 @@ jobs:
           # --ignored, not --include-ignored: this job exists to run exactly the
           # sweep, and including the ordinary tests here would let a failure in
           # one be reported as a failure of the other.
-          cargo test -p khive-pack-gtd --lib tz_database_audit -- --ignored
+          cargo test -p khive-runtime --lib --release tz_database_audit -- --ignored --nocapture

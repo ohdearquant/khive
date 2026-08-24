@@ -1,8 +1,8 @@
 //! Integration tests for `BrainPack` dispatch.
 use super::*;
 use khive_runtime::{
-    DispatchHook, KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeError,
-    VerbRegistryBuilder,
+    DispatchHook, KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeConfig,
+    RuntimeError, VerbRegistryBuilder,
 };
 use khive_types::HandlerDef;
 use serde_json::{json, Value};
@@ -55,6 +55,23 @@ impl PackRuntime for TestConsumerPack {
 
 fn make_pack() -> (BrainPack, KhiveRuntime) {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = BrainPack::new(rt.clone());
+    (pack, rt)
+}
+
+/// Like `make_pack`, with the display timezone pinned so date-only
+/// `since`/`until` anchoring is deterministic regardless of the host zone
+/// (`RuntimeConfig::default()` resolves the machine's own zone).
+fn make_pack_with_tz(tz: &str) -> (BrainPack, KhiveRuntime) {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        display_timezone: tz.parse().expect("known IANA zone"),
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime");
     let pack = BrainPack::new(rt.clone());
     (pack, rt)
 }
@@ -8499,13 +8516,15 @@ mod event_counts_tests {
         }
     }
 
-    /// A date-only `since` (no time-of-day component) is coerced to midnight
-    /// UTC rather than silently resolving to a null result — the bug reported
-    /// in #984, where the RFC-3339 parser rejected the value but the failure
-    /// never surfaced to the caller.
+    /// A date-only `since` (no time-of-day component) is accepted rather than
+    /// silently resolving to a null result (#984), and anchors to the named
+    /// day's earliest instant in the CONFIGURED DISPLAY TIMEZONE (ADR-169 D1)
+    /// — not midnight UTC. New York's 2026-07-07 begins at 04:00Z, so the
+    /// two rules produce different instants and a UTC-anchoring regression
+    /// fails this assert.
     #[tokio::test]
-    async fn date_only_since_is_coerced_to_midnight_utc() {
-        let (pack, rt) = make_pack();
+    async fn date_only_since_anchors_in_the_display_timezone() {
+        let (pack, rt) = make_pack_with_tz("America/New_York");
         let registry = empty_registry();
         let token = rt.authorize(Namespace::local()).unwrap();
 
@@ -8519,78 +8538,153 @@ mod event_counts_tests {
             .await
             .expect("date-only `since` must be accepted, not silently nulled");
 
+        let expected_us = chrono::DateTime::parse_from_rfc3339("2026-07-07T00:00:00-04:00")
+            .unwrap()
+            .timestamp_micros();
         let since = result["since"].as_str().expect("since must be a string");
-        assert!(
-            since.starts_with("2026-07-07T00:00:00"),
-            "date-only `since` must coerce to midnight UTC: {result}"
+        assert_eq!(
+            since,
+            micros_to_iso(expected_us),
+            "date-only `since` must anchor to the day's earliest instant in the \
+             display timezone (04:00Z for New York), not midnight UTC: {result}"
         );
     }
 
-    /// A date-only `until` must include the entire named day, not just its
-    /// midnight instant — the window is half-open `[since, until)`, so a
-    /// date-only `until` has to roll to the *next* day's midnight or the
-    /// whole named day is silently dropped (#994).
+    /// With the display timezone configured as UTC, date-only anchoring is
+    /// exactly the old midnight-UTC behavior — the control arm separating
+    /// "anchors in the configured zone" from "anchors somewhere new".
     #[tokio::test]
-    async fn date_only_until_includes_the_whole_named_day() {
-        let (pack, rt) = make_pack();
+    async fn date_only_since_under_utc_config_is_midnight_utc() {
+        let (pack, rt) = make_pack_with_tz("UTC");
         let registry = empty_registry();
         let token = rt.authorize(Namespace::local()).unwrap();
 
-        let just_before_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 6)
-            .unwrap()
-            .and_hms_opt(23, 59, 59)
-            .unwrap()
-            .and_utc()
-            .timestamp_micros();
-        // Last representable instant of the `until` day = the INCLUDED end of the edge;
-        // paired with `next_midnight` (the first EXCLUDED instant) this pins both sides
-        // of the exclusive upper bound to within one microsecond.
-        let end_of_named_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 7)
-            .unwrap()
-            .and_hms_micro_opt(23, 59, 59, 999_999)
-            .unwrap()
-            .and_utc()
-            .timestamp_micros();
-        let next_midnight = chrono::NaiveDate::from_ymd_opt(2026, 7, 8)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_micros();
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-07-07"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("date-only `since` must be accepted under UTC config");
 
-        seed_event(
-            &rt,
-            &token,
-            "search",
-            EventKind::SearchExecuted,
-            "lambda:a",
-            just_before_day,
-            json!({}),
-        )
-        .await;
-        seed_event(
-            &rt,
-            &token,
-            "search",
-            EventKind::SearchExecuted,
-            "lambda:a",
-            end_of_named_day,
-            json!({}),
-        )
-        .await;
-        // Exactly at the next day's midnight — must still be EXCLUDED.
-        seed_event(
-            &rt,
-            &token,
-            "search",
-            EventKind::SearchExecuted,
-            "lambda:a",
-            next_midnight,
-            json!({}),
-        )
-        .await;
+        let since = result["since"].as_str().expect("since must be a string");
+        assert!(
+            since.starts_with("2026-07-07T00:00:00"),
+            "UTC display timezone anchors date-only `since` at midnight UTC: {result}"
+        );
+    }
 
-        assert_eq!(seeded_count(&rt, &token).await, 3);
+    /// On a zone's spring-forward date local midnight does not exist; the
+    /// anchor must be the least instant carrying the date (Havana jumps
+    /// 00:00 -> 01:00 on 2021-03-14, so the day begins at 01:00 local,
+    /// 05:00Z), never a silent fall-back to UTC midnight and never an error.
+    #[tokio::test]
+    async fn date_only_since_on_a_gap_date_takes_the_least_instant() {
+        let (pack, rt) = make_pack_with_tz("America/Havana");
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2021-03-14"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("a gap date must anchor, not error");
+
+        let boundary_us = chrono::DateTime::parse_from_rfc3339("2021-03-14T01:00:00-04:00")
+            .unwrap()
+            .timestamp_micros();
+        let since = result["since"].as_str().expect("since must be a string");
+        let since_us = chrono::DateTime::parse_from_rfc3339(&since.replace("Z", "+00:00"))
+            .expect("since must parse")
+            .timestamp_micros();
+        // The shared anchor resolves gap dates by bisection at one-second
+        // granularity (see `khive_runtime::time_anchor`), so the result is
+        // within [boundary, boundary + 1s) — never before the boundary
+        // (which would be the previous local date) and never the silent
+        // UTC-midnight (04:00Z) the old rule produced.
+        assert!(
+            (0..1_000_000).contains(&(since_us - boundary_us)),
+            "the gap date anchors at its 01:00-local/05:00Z boundary \
+             (within the 1s bisection granularity): {result}"
+        );
+    }
+
+    /// A date the zone's local calendar skips entirely (Samoa crossed the
+    /// date line over 2011-12-30) has no instant to anchor to: the verb
+    /// rejects it with an error naming the zone, rather than silently
+    /// anchoring somewhere else.
+    #[tokio::test]
+    async fn date_only_since_on_a_skipped_date_is_rejected_naming_the_zone() {
+        let (pack, rt) = make_pack_with_tz("Pacific/Apia");
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2011-12-30"}),
+                &registry,
+                &token,
+            )
+            .await;
+
+        match result {
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("since") && msg.contains("Pacific/Apia"),
+                    "the error must name the field and the zone: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput for a skipped date, got {other:?}"),
+        }
+    }
+
+    /// A date-only `until` must include the entire named day in the display
+    /// timezone, not just its first instant — the window is half-open
+    /// `[since, until)`, so a date-only `until` has to roll to the *next*
+    /// day's earliest instant or the whole named day is silently dropped
+    /// (#994). Pinned to America/New_York: the named day 2026-07-07 spans
+    /// [04:00Z on the 7th, 04:00Z on the 8th), so every edge below sits four
+    /// hours away from where UTC anchoring would put it — a UTC regression
+    /// flips the included/excluded status of the edge events.
+    #[tokio::test]
+    async fn date_only_until_includes_the_whole_named_day() {
+        let (pack, rt) = make_pack_with_tz("America/New_York");
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let us = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("fixture instant")
+                .timestamp_micros()
+        };
+        // The window is [2026-07-06T04:00:00Z, 2026-07-08T04:00:00Z).
+        // Four seeds pin all four edge behaviors:
+        let before_window = us("2026-07-06T03:59:59Z"); // excluded (before since)
+        let at_since = us("2026-07-06T04:00:00Z"); // included (since inclusive)
+        let end_of_named_day = us("2026-07-08T03:59:59.999999Z"); // included edge
+        let next_day_start = us("2026-07-08T04:00:00Z"); // excluded (until exclusive)
+
+        for ts in [before_window, at_since, end_of_named_day, next_day_start] {
+            seed_event(
+                &rt,
+                &token,
+                "search",
+                EventKind::SearchExecuted,
+                "lambda:a",
+                ts,
+                json!({}),
+            )
+            .await;
+        }
+
+        assert_eq!(seeded_count(&rt, &token).await, 4);
 
         let result = pack
             .dispatch(
@@ -8608,7 +8702,8 @@ mod event_counts_tests {
         assert_eq!(
             result["total"],
             json!(2),
-            "date-only `until` must include the whole named day and exclude the next day's midnight: {result}"
+            "the window must include exactly the since edge and the named day's \
+             last instant, excluding the instants at both outer edges: {result}"
         );
     }
 
