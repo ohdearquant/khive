@@ -2870,25 +2870,65 @@ mod tests {
         }
     }
 
-    /// RAII guard restoring `KHIVE_PACKS`, `HOME`, and the working directory
-    /// to their pre-test values on every exit path, including an unwinding
-    /// panic — a bare cleanup call at the end of a test function only runs
-    /// when every earlier statement (setup and assertions alike) succeeds,
-    /// which leaks process-globals to later `#[serial]` tests otherwise.
+    const DAEMON_SPAWN_TEST_ENV_VARS: [&str; 7] = [
+        "KHIVE_EMBEDDING_MODEL",
+        "KHIVE_ADDITIONAL_EMBEDDING_MODELS",
+        "KHIVE_ACTOR",
+        "KHIVE_REQUIRE_ATTRIBUTED_ACTOR",
+        "KHIVE_DB",
+        "KHIVE_PACKS",
+        "HOME",
+    ];
+
     struct EnvAndCwdGuard {
-        original_packs: Option<std::ffi::OsString>,
-        original_home: Option<std::ffi::OsString>,
+        original_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
         original_cwd: std::path::PathBuf,
+    }
+
+    impl EnvAndCwdGuard {
+        fn capture() -> Self {
+            Self {
+                original_env: DAEMON_SPAWN_TEST_ENV_VARS
+                    .into_iter()
+                    .map(|name| (name, std::env::var_os(name)))
+                    .collect(),
+                original_cwd: std::env::current_dir().expect("read cwd"),
+            }
+        }
     }
 
     impl Drop for EnvAndCwdGuard {
         fn drop(&mut self) {
-            match self.original_packs.take() {
-                Some(v) => std::env::set_var("KHIVE_PACKS", v),
-                None => std::env::remove_var("KHIVE_PACKS"),
+            for (name, original) in self.original_env.drain(..) {
+                match original {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
             }
-            restore_home(self.original_home.take());
             let _ = std::env::set_current_dir(&self.original_cwd);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_spawn_env_guard_restores_every_mutated_variable() {
+        let _restore_machine_env = EnvAndCwdGuard::capture();
+        for name in DAEMON_SPAWN_TEST_ENV_VARS {
+            std::env::set_var(name, format!("sentinel-{name}"));
+        }
+
+        {
+            let _guard = EnvAndCwdGuard::capture();
+            for name in DAEMON_SPAWN_TEST_ENV_VARS {
+                std::env::remove_var(name);
+            }
+        }
+
+        for name in DAEMON_SPAWN_TEST_ENV_VARS {
+            assert_eq!(
+                std::env::var(name).as_deref(),
+                Ok(format!("sentinel-{name}").as_str())
+            );
         }
     }
 
@@ -6758,6 +6798,7 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn env_khive_packs_reaches_daemon_spawn_seam() {
+        let _guard = EnvAndCwdGuard::capture();
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -6790,8 +6831,6 @@ path = "{}"
         )
         .await;
 
-        std::env::remove_var("KHIVE_PACKS");
-
         assert!(
             result.is_ok(),
             "forwarded dispatch must succeed: {result:?}"
@@ -6818,10 +6857,6 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn no_env_control_forwards_built_in_default_packs_to_spawn_seam() {
-        let original_cwd = std::env::current_dir().expect("read cwd");
-        let original_packs = std::env::var_os("KHIVE_PACKS");
-        let original_home = std::env::var_os("HOME");
-
         // Declared first so it drops LAST (reverse declaration order):
         // constructing the guard here, before either tempdir is created and
         // before any process-global mutation, means every panic from this
@@ -6832,11 +6867,7 @@ path = "{}"
         // `empty_project_root` is removed while it is still the process cwd
         // (verified empirically below: `TempDir::drop` tolerates removing the
         // current working directory on macOS and ignores its own errors).
-        let _guard = EnvAndCwdGuard {
-            original_packs,
-            original_home,
-            original_cwd,
-        };
+        let _guard = EnvAndCwdGuard::capture();
 
         // Isolate both HOME and cwd: with `db: None` config discovery falls
         // through to tier-2 (`<cwd>/khive.toml`) then tier-4
