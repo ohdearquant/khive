@@ -24,7 +24,14 @@ import {
   TrendingUp,
   Users,
 } from "@/icons";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { DataState } from "@/components/data-state";
 import { RepositoryCommandPalette } from "@/components/showcase/repository-command-palette";
@@ -43,6 +50,10 @@ import { settleGraphLayout } from "@/lib/graph-layout";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import { buildRepositoryBrief } from "@/lib/repository-brief";
 import { buildStructureCouplingLens } from "@/lib/structure-coupling-lens";
+import {
+  buildStructureTreemap,
+  type TreemapRect,
+} from "@/lib/structure-treemap";
 import type {
   RepoBundle,
   RepoModule,
@@ -1171,22 +1182,133 @@ function TreemapView({ bundle, moduleById, selectedModuleId, onInspectModule }: 
   const analysis = bundle.aggregates.structure_treemap;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_TREEMAP_LIMIT);
-  const maxActivity = Math.max(1, ...rows.map((row) => row.recent_commit_count.status === "available" ? row.recent_commit_count.value : 0));
+  const packageById = new Map(
+    bundle.graph.packages.items.map((packageNode) => [
+      packageNode.id,
+      packageNode,
+    ]),
+  );
+  const layout = buildStructureTreemap(rows.map((row) => {
+    const moduleNode = moduleById.get(row.module_id);
+    const packageLabel = packageById.get(row.package_id)?.name ?? row.package_id;
+    return {
+      moduleId: row.module_id,
+      packageId: row.package_id,
+      packageLabel,
+      modulePath: moduleNode?.module_path ?? row.module_id,
+      sourcePath: moduleNode?.source_path ??
+        `${packageLabel}/uncaptured/${row.module_id}`,
+      sourceFileCount: row.source_file_count,
+      recentActivity: row.recent_commit_count.status === "available"
+        ? row.recent_commit_count.value
+        : null,
+    };
+  }));
   return (
     <div className="repo-view-body">
-      <div className="repo-legend"><span><i className="green" />{labels.metrics.source_files}</span><span><i className="red" />{labels.metrics.recent_activity}</span></div>
-      <div className="repo-treemap" role="list" aria-label={bundle.capability.views.structure_treemap.label}>
-        {rows.map((row) => {
-          const activity = row.recent_commit_count.status === "available" ? row.recent_commit_count.value : 0;
-          const span = Math.min(6, Math.max(2, row.source_file_count));
-          const moduleNode = moduleById.get(row.module_id);
-          return <div role="listitem" style={{ gridColumn: `span ${span}` }} key={row.module_id}>{moduleNode ? <button type="button" className={`repo-treemap-module ${activity > maxActivity * 0.55 ? "hot" : ""}`} data-module-id={row.module_id} aria-label={`Inspect ${moduleNode.source_path}`} aria-controls="repository-module-inspector" aria-pressed={selectedModuleId === row.module_id} onClick={() => onInspectModule(row.module_id)}><strong>{moduleNode.module_path}</strong><span>{labels.metrics.source_files}: {row.source_file_count}</span><span>{labels.metrics.recent_activity}: {availabilityText(row.recent_commit_count, labels, formatNumber)}</span></button> : <ModuleInspectionControl moduleId={row.module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} />}</div>;
-        })}
+      <div className="repo-legend">
+        <span><i className="green" />Area: {labels.metrics.recent_activity}</span>
+        <span><i className="violet" />Color: {labels.node_types.package}</span>
+        {layout.areaMetric === "recent_activity_with_source_file_fallback" && (
+          <span>{labels.metrics.source_files} provide unavailable-activity fallback area.</span>
+        )}
+      </div>
+      <div
+        className="repo-treemap"
+        role="list"
+        aria-label={bundle.capability.views.structure_treemap.label}
+        data-structure-treemap
+        data-area-metric={layout.areaMetric}
+      >
+        {layout.packages.map((packageLayout) => (
+          <section
+            className="repo-treemap-package"
+            data-treemap-package={packageLayout.id}
+            data-package-tone={packageLayout.tone}
+            key={packageLayout.id}
+            role="listitem"
+            style={treemapRectStyle(packageLayout.rect)}
+            aria-label={`${labels.node_types.package} ${packageLayout.label}`}
+          >
+            <span className="repo-treemap-package-label">
+              <i aria-hidden="true" />
+              {packageLayout.label}
+            </span>
+            {packageLayout.directories.map((directory) => (
+              <div
+                className="repo-treemap-directory"
+                data-treemap-directory={directory.label}
+                key={directory.id}
+                style={treemapRectStyle(directory.rect)}
+              >
+                <span className="repo-treemap-directory-label">
+                  {directory.label}
+                </span>
+                {directory.modules.map((moduleLayout) => {
+                  const moduleNode = moduleById.get(moduleLayout.moduleId);
+                  if (!moduleNode) {
+                    return (
+                      <div
+                        className="repo-treemap-module missing"
+                        key={moduleLayout.moduleId}
+                        style={treemapRectStyle(moduleLayout.rect)}
+                      >
+                        <ModuleInspectionControl
+                          moduleId={moduleLayout.moduleId}
+                          moduleById={moduleById}
+                          modulePage={bundle.graph.modules}
+                          selectedModuleId={selectedModuleId}
+                          onInspectModule={onInspectModule}
+                        />
+                      </div>
+                    );
+                  }
+                  const activity = moduleLayout.recentActivity === null
+                    ? labels.unavailable
+                    : formatNumber(moduleLayout.recentActivity);
+                  return (
+                    <button
+                      type="button"
+                      className="repo-treemap-module"
+                      data-module-id={moduleLayout.moduleId}
+                      data-treemap-weight={moduleLayout.weight}
+                      key={moduleLayout.moduleId}
+                      style={treemapRectStyle(moduleLayout.rect)}
+                      aria-label={`Inspect ${moduleNode.source_path}`}
+                      aria-controls="repository-module-inspector"
+                      aria-pressed={selectedModuleId === moduleLayout.moduleId}
+                      title={`${moduleNode.source_path} · ${labels.metrics.recent_activity}: ${activity}`}
+                      onClick={() => onInspectModule(moduleLayout.moduleId)}
+                    >
+                      <strong>{moduleLayout.leafLabel}</strong>
+                      <span className="repo-treemap-context">
+                        {moduleLayout.parentLabel}
+                      </span>
+                      <span className="repo-treemap-metric">
+                        {labels.metrics.recent_activity}: {activity}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            ))}
+          </section>
+        ))}
       </div>
       <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.structure_treemap.label} labels={labels} />
       <BoundDisclosure page={analysis.data} labels={labels} />
     </div>
   );
+}
+
+function treemapRectStyle(rect: TreemapRect): CSSProperties {
+  const percent = (value: number) => `${(value * 100).toFixed(6)}%`;
+  return {
+    left: percent(rect.x),
+    top: percent(rect.y),
+    width: percent(rect.width),
+    height: percent(rect.height),
+  };
 }
 
 type CadencePage = RepoBundle["aggregates"]["cadence_timeline"]["commits"];
