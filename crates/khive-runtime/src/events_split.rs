@@ -1522,4 +1522,503 @@ mod tests {
             "a terminated writer must not be reported transient"
         );
     }
+
+    use khive_storage::event::EventAppendDisposition;
+    use khive_types::{EventKind, SubstrateKind};
+
+    fn test_event(namespace: &str) -> Event {
+        Event::new(
+            namespace,
+            "test.verb",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "actor:test",
+        )
+    }
+
+    /// Boot a real events daemon on temp paths, poll until its socket accepts.
+    #[cfg(unix)]
+    async fn boot_daemon(dir: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let db = dir.path().join("events.db");
+        let socket = dir.path().join("events.sock");
+        let (db_clone, socket_clone) = (db.clone(), socket.clone());
+        tokio::spawn(async move {
+            let _ = run_events_daemon(&db_clone, &socket_clone).await;
+        });
+        for _ in 0..100 {
+            if UnixStream::connect(&socket).await.is_ok() {
+                return (db, socket);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("events daemon did not come up on {}", socket.display());
+    }
+
+    /// The split store's routing contract: plain appends land ONLY in the
+    /// legacy store (whose raw-SQL consumers depend on finding them there),
+    /// the idempotent audit lane lands ONLY in the events lane, and reads
+    /// merge both sides into one event plane.
+    #[tokio::test]
+    async fn split_store_routes_plain_to_legacy_idempotent_to_lane_and_merges_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy_backend =
+            direct_backend_for(&dir.path().join("legacy.db")).expect("legacy backend");
+        let lane_backend = direct_backend_for(&dir.path().join("lane.db")).expect("lane backend");
+        let legacy = legacy_backend
+            .events_for_namespace("local")
+            .expect("legacy store");
+        let lane = lane_backend
+            .events_for_namespace("local")
+            .expect("lane store");
+        let split = SplitEventStore::new(Arc::clone(&legacy), Arc::clone(&lane));
+
+        let plain = test_event("local");
+        let plain_id = plain.id;
+        split.append_event(plain).await.expect("plain append");
+
+        let audit = test_event("local");
+        let audit_id = audit.id;
+        let result = split
+            .append_events_idempotent(vec![audit])
+            .await
+            .expect("idempotent append");
+        assert_eq!(result.rows, vec![EventAppendDisposition::Inserted]);
+
+        // Routing: each row is in exactly its own side.
+        assert!(legacy
+            .get_event(plain_id)
+            .await
+            .expect("legacy get")
+            .is_some());
+        assert!(lane.get_event(plain_id).await.expect("lane get").is_none());
+        assert!(legacy
+            .get_event(audit_id)
+            .await
+            .expect("legacy get")
+            .is_none());
+        assert!(lane.get_event(audit_id).await.expect("lane get").is_some());
+
+        // Merged reads observe one event plane whichever side holds the row.
+        assert!(split
+            .get_event(plain_id)
+            .await
+            .expect("split get")
+            .is_some());
+        assert!(split
+            .get_event(audit_id)
+            .await
+            .expect("split get")
+            .is_some());
+        assert_eq!(
+            split
+                .count_events(EventFilter::default())
+                .await
+                .expect("split count"),
+            2
+        );
+        let page = split
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("split query");
+        let ids: Vec<Uuid> = page.items.iter().map(|e| e.id).collect();
+        assert!(ids.contains(&plain_id) && ids.contains(&audit_id));
+
+        // Windowing across the merge: page size 1 at offsets 0 and 1 yields
+        // the two rows exactly once each.
+        let mut seen = Vec::new();
+        for offset in 0..2 {
+            let page = split
+                .query_events(EventFilter::default(), PageRequest { offset, limit: 1 })
+                .await
+                .expect("windowed query");
+            assert_eq!(page.items.len(), 1);
+            seen.push(page.items[0].id);
+        }
+        seen.sort();
+        let mut expected = vec![plain_id, audit_id];
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    /// Mechanized co-residency guard: the amendment's load-bearing claim is
+    /// that every class a raw-SQL consumer of the legacy `events` table
+    /// depends on still LANDS in that table. Two of the three enumerated
+    /// consumers (kg projection guard, graph-query union) fail silently if
+    /// the classification drifts, so the classification is guarded here by
+    /// the consumers' own access pattern — a raw SQL read against the legacy
+    /// backend — rather than by enumeration. Arm 1 reddens if plain appends
+    /// (the provenance/domain class) ever stop reaching the legacy table.
+    /// Arm 2 is the boundary's other face and doubles as the positive
+    /// control for the instrument: the same query DOES find lane-routed rows
+    /// on the lane's own backend, so an empty arm-1 result could not be a
+    /// broken query.
+    #[tokio::test]
+    async fn raw_sql_consumers_of_the_legacy_events_table_still_see_plain_appends() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy_backend =
+            direct_backend_for(&dir.path().join("legacy-guard.db")).expect("legacy backend");
+        let lane_backend =
+            direct_backend_for(&dir.path().join("lane-guard.db")).expect("lane backend");
+        let split = SplitEventStore::new(
+            legacy_backend
+                .events_for_namespace("local")
+                .expect("legacy store"),
+            lane_backend
+                .events_for_namespace("local")
+                .expect("lane store"),
+        );
+
+        // The schedule pack's creator-provenance write is a plain append; the
+        // audit flusher's write is an idempotent batch. Route one of each.
+        let provenance = test_event("local");
+        let provenance_id = provenance.id;
+        split.append_event(provenance).await.expect("plain append");
+        let audit = test_event("local");
+        let audit_id = audit.id;
+        split
+            .append_events_idempotent(vec![audit])
+            .await
+            .expect("idempotent append");
+
+        let count_by_raw_sql = |backend: Arc<StorageBackend>, id: Uuid| async move {
+            let mut reader = backend.sql().reader().await.expect("sql reader");
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: "SELECT actor FROM events WHERE id = ?1".to_string(),
+                    params: vec![SqlValue::Text(id.to_string())],
+                    label: None,
+                })
+                .await
+                .expect("raw events query");
+            rows.len()
+        };
+
+        // Arm 1: the co-residency contract. A raw-SQL consumer of the legacy
+        // table finds the plain-append row there.
+        assert_eq!(
+            count_by_raw_sql(Arc::clone(&legacy_backend), provenance_id).await,
+            1,
+            "plain appends must stay visible to raw-SQL consumers of the legacy events table"
+        );
+        // Arm 2a: the moved class is genuinely gone from the legacy table —
+        // this is the silent-failure face of the boundary, held visible.
+        assert_eq!(
+            count_by_raw_sql(Arc::clone(&legacy_backend), audit_id).await,
+            0,
+            "audit-lane rows must not land in the legacy events table"
+        );
+        // Arm 2b: positive control for the instrument — the identical query
+        // finds the moved row on the lane backend, so arm 2a's zero (and any
+        // future arm-1 zero) is a routing fact, not a dead query.
+        assert_eq!(
+            count_by_raw_sql(Arc::clone(&lane_backend), audit_id).await,
+            1,
+            "the raw query must prove it can find rows where they actually live"
+        );
+    }
+
+    /// End to end over the real socket: the idempotent lane returns true
+    /// dispositions, and the row is readable back through the same store.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idempotent_append_round_trips_through_the_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_db, socket) = boot_daemon(&dir).await;
+        let client = EventsSplitClient::new(socket).expect("client");
+        let store = ForwardingEventStore::new("local", client);
+
+        let event = test_event("local");
+        let id = event.id;
+        let result = store
+            .append_events_idempotent(vec![event.clone()])
+            .await
+            .expect("idempotent append over socket");
+        assert_eq!(result.rows, vec![EventAppendDisposition::Inserted]);
+
+        // Retry of the identical row reports AlreadyPresentIdentical — the
+        // daemon ran the real idempotent path, not a blind re-insert.
+        let retry = store
+            .append_events_idempotent(vec![event])
+            .await
+            .expect("idempotent retry");
+        assert_eq!(
+            retry.rows,
+            vec![EventAppendDisposition::AlreadyPresentIdentical]
+        );
+
+        let fetched = store.get_event(id).await.expect("get over socket");
+        assert_eq!(fetched.map(|e| e.id), Some(id));
+        let count = store
+            .count_events(EventFilter::default())
+            .await
+            .expect("count over socket");
+        assert_eq!(count, 1);
+    }
+
+    /// The fire-and-forget lane delivers to the daemon store: enqueue returns
+    /// immediately and the row becomes visible to a subsequent count.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fire_and_forget_append_lands_in_the_daemon_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_db, socket) = boot_daemon(&dir).await;
+        let client = EventsSplitClient::new(socket).expect("client");
+        let store = ForwardingEventStore::new("local", Arc::clone(&client));
+
+        store
+            .append_event(test_event("local"))
+            .await
+            .expect("append_event is fire-and-forget");
+
+        // Poll for BOTH effects: the row landing daemon-side and the
+        // forwarder's own counter — the row can be visible a beat before the
+        // forwarder task is rescheduled to record the delivery.
+        let mut count = 0;
+        let mut metrics = client.metrics();
+        for _ in 0..100 {
+            count = store
+                .count_events(EventFilter::default())
+                .await
+                .expect("count over socket");
+            metrics = client.metrics();
+            if count == 1 && metrics.forwarded_events >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(count, 1, "forwarded event must land in the daemon store");
+        assert_eq!(metrics.dropped_events, 0);
+        assert!(metrics.forwarded_events >= 1, "delivery must be counted");
+    }
+
+    /// R4 overflow arm: with the daemon dead, appends beyond the queue bound
+    /// are DROPPED and counted while every append still returns Ok — the
+    /// domain path proceeds. The drop counter is the loss-tolerance contract.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queue_overflow_drops_and_counts_but_never_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dead_socket = dir.path().join("nobody-home.sock");
+        let client = EventsSplitClient::new_with_queue_depth(dead_socket, 2).expect("client");
+        let store = ForwardingEventStore::new("local", Arc::clone(&client));
+
+        for _ in 0..20 {
+            store
+                .append_event(test_event("local"))
+                .await
+                .expect("append_event must not error under overflow");
+        }
+        let metrics = client.metrics();
+        assert!(
+            metrics.dropped_events > 0,
+            "overflow must register in the drop counter, got {metrics:?}"
+        );
+    }
+
+    /// R4 dead-socket arm: synchronous lanes fail with a typed retryable
+    /// storage error (never hang, never a generic panic), and the offline
+    /// preflight validator keeps working with zero I/O.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_socket_reads_fail_typed_and_preflight_stays_local() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dead_socket = dir.path().join("nobody-home.sock");
+        let client = EventsSplitClient::new(dead_socket).expect("client");
+        let store = ForwardingEventStore::new("local", client);
+
+        let error = store
+            .get_event(Uuid::new_v4())
+            .await
+            .expect_err("read against a dead socket must fail");
+        assert!(
+            matches!(error, StorageError::Pool { .. }),
+            "expected the typed unreachable error, got {error:?}"
+        );
+
+        // The audit-batch seam contract: preflight is local and functional
+        // with the daemon down.
+        assert!(store.supports_idempotent_audit_batch());
+        store
+            .preflight_event(&test_event("local"))
+            .expect("offline preflight validates a well-formed event");
+    }
+
+    /// Version-skew arm: a frame carrying an unknown protocol version gets a
+    /// typed non-retryable refusal, not a deserialization failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protocol_version_skew_is_a_typed_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_db, socket) = boot_daemon(&dir).await;
+
+        let mut stream = UnixStream::connect(&socket).await.expect("connect");
+        let request = EventsRequest::CountEvents {
+            protocol_version: EVENTS_PROTOCOL_VERSION + 1,
+            namespace: "local".into(),
+            filter: EventFilter::default(),
+        };
+        let payload = serde_json::to_vec(&request).expect("serialize");
+        write_frame(&mut stream, &payload).await.expect("write");
+        let bytes = read_frame(&mut stream).await.expect("read");
+        let response: EventsResponse = serde_json::from_slice(&bytes).expect("parse");
+        match response {
+            EventsResponse::Error { message, retryable } => {
+                assert!(!retryable, "version skew is not retryable");
+                assert!(message.contains("protocol version"), "message: {message}");
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+    }
+
+    /// The per-socket daemon guard is exclusive while held and reusable after
+    /// release — the mechanism that keeps a supervisor respawn race down to
+    /// one surviving daemon.
+    #[cfg(unix)]
+    #[test]
+    fn events_daemon_guard_is_exclusive_then_reusable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("events.sock");
+        let first = try_acquire_events_daemon_guard(&socket).expect("first acquire");
+        assert!(
+            try_acquire_events_daemon_guard(&socket).is_none(),
+            "second acquire must fail while the first guard is held"
+        );
+        drop(first);
+        assert!(
+            try_acquire_events_daemon_guard(&socket).is_some(),
+            "acquire must succeed again after the guard is released"
+        );
+    }
+
+    /// A read-only file-backed runtime with the split configured must never
+    /// create or schema-initialize an events database. Missing events db →
+    /// `events()` serves the legacy store alone and leaves the filesystem
+    /// untouched; a pre-existing events db (minted by an earlier writable
+    /// host) is opened read-only and its rows merge into reads.
+    /// (unix-gated for the sidecar-freeze harness step only.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_runtime_never_creates_an_events_db() {
+        use crate::{KhiveRuntime, Namespace, RuntimeConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main_db = dir.path().join("main.db");
+        // Materialize + migrate the main database with a writable runtime.
+        drop(
+            KhiveRuntime::new(RuntimeConfig {
+                db_path: Some(main_db.clone()),
+                ..RuntimeConfig::no_embeddings()
+            })
+            .expect("create main db"),
+        );
+        let events_db = events_db_path_beside(&main_db);
+        assert!(!events_db.exists(), "precondition: no events db yet");
+
+        // Freeze the WAL sidecars the writable runtime left behind — the
+        // read-only opener refuses a snapshot with a writable -shm.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = main_db.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = main_db.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+
+        let split_config = |db: PathBuf| RuntimeConfig {
+            db_path: Some(main_db.clone()),
+            events_split: Some(EventsSplitConfig {
+                db_path: db,
+                socket_path: None,
+            }),
+            ..RuntimeConfig::no_embeddings()
+        };
+
+        // Arm 1: read-only runtime, no events db on disk. Reads work through
+        // the legacy store and nothing is minted.
+        let ro =
+            KhiveRuntime::new_readonly(split_config(events_db.clone())).expect("read-only runtime");
+        let token = ro.authorize(Namespace::local()).expect("token");
+        let store = ro.events(&token).expect("events store");
+        let count = store
+            .count_events(EventFilter::default())
+            .await
+            .expect("count through legacy-only plane");
+        assert_eq!(count, 0);
+        assert!(
+            !events_db.exists(),
+            "a read-only runtime must not mint the events database"
+        );
+
+        // Arm 2: a writable host mints the events db and lands a lane row;
+        // the read-only runtime then opens it read-only and merges the row.
+        // The writer is scoped (not the process-global registry) and its WAL
+        // sidecars frozen after drop — the read-only opener rightly refuses a
+        // snapshot with a live writer, and that refusal is not this test's
+        // subject.
+        {
+            let lane_backend = StorageBackend::sqlite(&events_db).expect("writable lane");
+            lane_backend
+                .events_for_namespace("local")
+                .expect("lane store")
+                .append_event(test_event("local"))
+                .await
+                .expect("seed lane row");
+        }
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = events_db.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = events_db.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+        let store = ro.events(&token).expect("events store with lane present");
+        let count = store
+            .count_events(EventFilter::default())
+            .await
+            .expect("merged count");
+        assert_eq!(count, 1, "the pre-existing lane row must merge into reads");
+    }
+
+    /// Embedded (direct) mode: the process-global backend writes and reads
+    /// `events.db` without any daemon.
+    #[tokio::test]
+    async fn direct_mode_appends_and_reads_without_a_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("events.db");
+        let backend = direct_backend_for(&db).expect("direct backend");
+        let store = backend.events_for_namespace("local").expect("store");
+        store
+            .append_event(test_event("local"))
+            .await
+            .expect("direct append");
+        let count = store
+            .count_events(EventFilter::default())
+            .await
+            .expect("count");
+        assert_eq!(count, 1);
+    }
 }
