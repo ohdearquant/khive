@@ -1775,12 +1775,29 @@ where
         StorageCapability::Sql,
         operation,
         move |scope| {
-            let mut guard = pool
-                .reader_until(|| scope.should_stop())
-                .map_err(|error| {
-                    StorageError::driver(StorageCapability::Sql, "pool_reader", error)
-                })?
-                .ok_or_else(|| pool.reader_admission_timeout(operation))?;
+            // `reader_until` reports three distinct outcomes that must NOT be
+            // collapsed:
+            //   Ok(Some) -> a reader was checked out.
+            //   Ok(None) -> `should_stop()` fired: the request was cancelled or
+            //     hit its deadline. This is NOT an admission wait, so it must
+            //     not emit the retryable AdmissionTimeout (which would invite an
+            //     immediate retry into a saturated pool). Keep the original
+            //     Timeout classification for the cancellation path.
+            //   Err(..)  -> checkout failed. `classify_reader_checkout_error`
+            //     maps an exhausted `checkout_timeout` (the pool's own
+            //     SQLITE_BUSY) to the retryable AdmissionTimeout and anything
+            //     else to a driver failure. The earlier chain mapped every
+            //     Err to Driver, so a genuine admission expiry never reached
+            //     AdmissionTimeout.
+            let mut guard = match pool.reader_until(|| scope.should_stop()) {
+                Ok(Some(guard)) => guard,
+                Ok(None) => {
+                    return Err(StorageError::Timeout {
+                        operation: operation.into(),
+                    })
+                }
+                Err(error) => return Err(pool.classify_reader_checkout_error(operation, error)),
+            };
             scope.with_pooled_reader(&mut guard, |conn| query(scope, conn))
         },
     )
@@ -2725,7 +2742,10 @@ mod tests {
             .await
             .expect("cancelled reader checkout waited for the five-second pool timeout")
             .expect("checkout task panicked");
-        assert!(matches!(result, Err(StorageError::AdmissionTimeout { .. })));
+        // Cancellation is NOT an admission wait: it must stay the non-admission
+        // Timeout, never the retryable AdmissionTimeout, so a cancelled request
+        // does not signal clients to retry into a saturated pool.
+        assert!(matches!(result, Err(StorageError::Timeout { .. })));
 
         drop(held_reader);
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -2741,6 +2761,58 @@ mod tests {
             value, 0,
             "a DML statement started after its pre-admission checkout was cancelled"
         );
+        assert_eq!(
+            pool.available_readers(),
+            1,
+            "reader checkout leaked a permit"
+        );
+    }
+
+    /// A pooled-reader checkout that exhausts `checkout_timeout` WITHOUT any
+    /// cancellation is a genuine admission wait and must surface as the
+    /// retryable AdmissionTimeout. Before the fix, `reader_until`'s
+    /// pool-exhausted error was mapped to `StorageError::Driver`, so a
+    /// saturated pooled read stayed a non-retryable driver failure and the new
+    /// AdmissionTimeout branch (reachable only for `Ok(None)` cancellation) was
+    /// dead for real timeouts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_reader_checkout_timeout_is_a_retryable_admission_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_reader_admission_timeout.db")),
+            max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(200),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE reader_admission_probe(value INTEGER NOT NULL); \
+                 INSERT INTO reader_admission_probe VALUES (0);",
+            )
+            .unwrap();
+        // Hold the sole pooled reader so the contending checkout cannot succeed
+        // and must run `checkout_timeout` to exhaustion — no cancellation.
+        let held_reader = pool.reader().expect("hold the sole pooled reader");
+
+        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+        let mut contender = bridge.reader().await.unwrap();
+        let blocked = contender
+            .query_row(SqlStatement {
+                sql: "SELECT value FROM reader_admission_probe".into(),
+                params: vec![],
+                label: Some("reader-admission-timeout-probe".into()),
+            })
+            .await;
+        assert!(
+            matches!(blocked, Err(StorageError::AdmissionTimeout { .. })),
+            "an exhausted pooled-reader checkout must be a retryable AdmissionTimeout; got {blocked:?}"
+        );
+
+        drop(held_reader);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         assert_eq!(
             pool.available_readers(),
             1,

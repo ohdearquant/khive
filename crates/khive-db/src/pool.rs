@@ -17,6 +17,7 @@ use crate::error::SqliteError;
 use crate::writer_task::WriterTaskHandle;
 use khive_storage::error::StorageError;
 use khive_storage::tx_registry::{DbIdentity, TxOrigin};
+use khive_storage::StorageCapability;
 
 const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
@@ -1084,6 +1085,34 @@ impl ConnectionPool {
         StorageError::AdmissionTimeout {
             operation: operation.into(),
             timeout_ms: u64::try_from(self.config.checkout_timeout.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Classify an error returned by [`Self::reader_until`] at checkout.
+    ///
+    /// `reader_until` executes no SQL — it only checks out a connection — so
+    /// the only `SQLITE_BUSY` it can produce is [`pool_exhausted_error`],
+    /// raised when `checkout_timeout` elapses with no reader available. That is
+    /// a genuine admission wait that ended before any work began, so it maps to
+    /// the retryable [`StorageError::AdmissionTimeout`]. Every other checkout
+    /// error (e.g. [`Self::ensure_pooled_writer_active`] returning
+    /// `InvalidData` for a retired pooled writer) is an opaque driver failure
+    /// and stays non-retryable. Keeping this beside `pool_exhausted_error` is
+    /// what lets the call site avoid sniffing an error shape it does not own.
+    pub(crate) fn classify_reader_checkout_error(
+        &self,
+        operation: &'static str,
+        error: SqliteError,
+    ) -> StorageError {
+        let is_pool_exhausted = matches!(
+            &error,
+            SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        );
+        if is_pool_exhausted {
+            self.reader_admission_timeout(operation)
+        } else {
+            StorageError::driver(StorageCapability::Sql, "pool_reader", error)
         }
     }
 
