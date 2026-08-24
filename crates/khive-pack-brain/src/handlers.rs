@@ -2843,25 +2843,106 @@ pub(crate) async fn fetch_event_counts_window_exhaustive(
         )));
     }
 
+    // Keyset pagination, not offset pagination: every page is fetched at
+    // offset 0 with the window's upper bound (`before`) walked downward to
+    // just past the oldest row already collected. Offset pagination makes the
+    // store materialize and discard an offset-sized prefix per page — O(N²)
+    // rows over the loop, and quadratically worse against the split event
+    // plane (ADR-170), where each side must produce the full prefix for the
+    // merge. Keyset keeps every page O(page_size) on both stores.
+    //
+    // `before` is exclusive at microsecond granularity and `created_at` is
+    // not unique, so consecutive windows deliberately overlap on the boundary
+    // microsecond (`before = oldest_seen + 1`) and rows already collected at
+    // that timestamp are dropped by id. A page that admits nothing new means
+    // one microsecond holds more rows than a whole page — a real shape, not
+    // a corner case: an idempotent audit batch stamps every row in one
+    // transaction, so bursts routinely share a created_at. That one cluster
+    // is drained with offset pagination scoped to exactly its microsecond
+    // (bounded by the exhaustive cap checked above), then the keyset walk
+    // resumes below it.
     let mut items: Vec<Event> = Vec::new();
-    let mut offset: u64 = 0;
+    let mut filter = base_filter.clone();
+    let mut boundary_ts: Option<i64> = None;
+    let mut boundary_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
     loop {
         let page = store
             .query_events(
-                base_filter.clone(),
+                filter.clone(),
                 PageRequest {
-                    offset,
+                    offset: 0,
                     limit: page_size,
                 },
             )
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
         let page_len = page.items.len() as u64;
-        items.extend(page.items);
+        let mut admitted = 0u64;
+        for event in page.items {
+            if boundary_ts == Some(event.created_at) && boundary_ids.contains(&event.id) {
+                continue;
+            }
+            items.push(event);
+            admitted += 1;
+        }
         if page_len < page_size as u64 {
             break;
         }
-        offset += page_size as u64;
+        if admitted == 0 {
+            let ts = boundary_ts
+                .expect("a zero-admission page implies a prior boundary microsecond");
+            // Drain the cluster at exactly this microsecond with offset
+            // pagination: `after`/`before` are both exclusive, so this
+            // filter matches `created_at == ts` alone. Ordering within one
+            // microsecond is stable for the store's tiebreaker, which makes
+            // offset paging sound here even though it is not across
+            // timestamps.
+            let mut cluster_filter = base_filter.clone();
+            cluster_filter.after = Some(ts.saturating_sub(1));
+            cluster_filter.before = Some(ts.saturating_add(1));
+            let mut cluster_offset = 0u32;
+            loop {
+                let cluster_page = store
+                    .query_events(
+                        cluster_filter.clone(),
+                        PageRequest {
+                            offset: cluster_offset,
+                            limit: page_size,
+                        },
+                    )
+                    .await
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+                let cluster_len = cluster_page.items.len() as u64;
+                for event in cluster_page.items {
+                    if boundary_ids.insert(event.id) {
+                        items.push(event);
+                    }
+                }
+                if cluster_len < page_size as u64 {
+                    break;
+                }
+                cluster_offset = cluster_offset.saturating_add(page_size);
+            }
+            // Everything at `ts` is collected; resume the keyset walk
+            // strictly below the drained microsecond.
+            filter.before = Some(ts);
+            continue;
+        }
+        let oldest = items
+            .last()
+            .expect("admitted > 0 implies items is non-empty")
+            .created_at;
+        boundary_ts = Some(oldest);
+        boundary_ids = items
+            .iter()
+            .rev()
+            .take_while(|e| e.created_at == oldest)
+            .map(|e| e.id)
+            .collect();
+        // Half-open upper bound: `created_at < oldest + 1` re-admits the
+        // boundary microsecond for the id-dedup above without skipping any
+        // row that shares it.
+        filter.before = Some(oldest.saturating_add(1));
     }
 
     let truncated = (items.len() as u64) < window_event_total;
