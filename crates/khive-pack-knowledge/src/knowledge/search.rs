@@ -23,8 +23,8 @@ use super::scoring::{
 };
 use super::util::{
     atom_embed_text, atom_from_row, compose_item_char_cost, deser, domain_from_row,
-    estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_str, sql_err,
-    status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
+    estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_i64, row_str,
+    sql_err, status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
     D_SUGGEST_RERANK_ALPHA, MIN_TERM_LEN,
 };
 use super::vamana;
@@ -1408,6 +1408,63 @@ async fn load_domain_member_token_sizes(
     Ok(sizes)
 }
 
+async fn load_atom_body_line_counts(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    atom_ids: &[String],
+) -> Result<HashMap<String, usize>, RuntimeError> {
+    let mut counts: HashMap<String, usize> = atom_ids.iter().map(|id| (id.clone(), 0)).collect();
+    if atom_ids.is_empty() {
+        return Ok(counts);
+    }
+
+    let placeholders = atom_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(atom_ids.iter().cloned().map(SqlValue::Text));
+
+    let sql = runtime.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|e| sql_err("search body line count reader", e))?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT atom_id, \
+                        SUM(CASE WHEN content = '' THEN 0 \
+                                 ELSE 1 + length(content) \
+                                          - length(replace(content, char(10), '')) \
+                            END) AS body_lines \
+                 FROM knowledge_sections \
+                 WHERE namespace = ?1 AND atom_id IN ({placeholders}) \
+                 GROUP BY atom_id"
+            ),
+            params,
+            label: None,
+        })
+        .await
+        .map_err(|e| sql_err("search body line count query", e))?;
+
+    for row in rows {
+        let Some(atom_id) = row_str(&row, "atom_id") else {
+            continue;
+        };
+        let Some(body_lines) = row_i64(&row, "body_lines") else {
+            continue;
+        };
+        if let Ok(body_lines) = usize::try_from(body_lines) {
+            counts.insert(atom_id, body_lines);
+        }
+    }
+
+    Ok(counts)
+}
+
 async fn rerank_text_items(
     runtime: &KhiveRuntime,
     query: &str,
@@ -1892,14 +1949,33 @@ impl KnowledgeHandlers {
         enforce_min_score_floor(&mut hits, min_score);
         hits.truncate(limit);
 
+        let atom_ids: Vec<String> = hits
+            .iter()
+            .filter(|hit| !hit.is_domain)
+            .map(|hit| hit.id.clone())
+            .collect();
+        let body_line_counts = if lexical_timed_out {
+            None
+        } else {
+            Some(load_atom_body_line_counts(runtime, &ns, &atom_ids).await?)
+        };
+
         let results: Vec<Value> = hits
             .iter()
             .map(|h| {
+                let body_lines = if h.is_domain {
+                    None
+                } else {
+                    body_line_counts
+                        .as_ref()
+                        .and_then(|counts| counts.get(&h.id).copied())
+                };
                 json!({
                     "id": h.id,
                     "slug": h.slug,
                     "name": h.name,
                     "content": h.content,
+                    "body_lines": body_lines,
                     "tags": h.tags,
                     "status": h.status,
                     "finalized": h.finalized,
