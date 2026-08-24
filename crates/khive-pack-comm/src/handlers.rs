@@ -555,7 +555,13 @@ pub(crate) async fn handle_inbox(
 
     if raw_limit == 0 {
         let unread_count = if mailbox == "inbox" {
-            count_unread_messages(runtime, token, &token.actor().id).await?
+            let store = runtime.notes(token)?;
+            count_unread_messages(
+                store.as_ref(),
+                token.namespace().as_str(),
+                &token.actor().id,
+            )
+            .await?
         } else {
             0
         };
@@ -661,6 +667,7 @@ pub(crate) async fn handle_inbox(
         query_inbox_response(
             store,
             namespace,
+            &caller_actor,
             &filter,
             &p,
             before_micros,
@@ -727,6 +734,7 @@ where
 async fn query_inbox_response(
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
+    caller_actor: &str,
     filter: &NoteFilter,
     params: &InboxParams,
     before_micros: Option<i64>,
@@ -801,16 +809,9 @@ async fn query_inbox_response(
         messages.truncate(limit);
     }
     let count = messages.len();
-    // #66: cheap derived stat over the page already fetched above — no extra
-    // DB round-trip. The count is inbox-only: sent rows have no recipient read
-    // state and report zero. For inbox `status="unread"`, this equals `count`;
-    // for `"read"`/`"all"`, it counts unread rows in this page (not a global
-    // total — `comm.unread` is the verb for that).
+    // This is a mailbox-wide signal; page and status filters only shape `messages`.
     let unread_count = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
-        messages
-            .iter()
-            .filter(|m| !m["read"].as_bool().unwrap_or(false))
-            .count()
+        count_unread_messages(store, namespace, caller_actor).await?
     } else {
         0
     };
@@ -852,14 +853,16 @@ pub(crate) async fn handle_unread(
 ) -> Result<Value, RuntimeError> {
     let _: UnreadParams = deser(params)?;
     let caller_actor = token.actor().id.clone();
-    let count = count_unread_messages(runtime, token, &caller_actor).await?;
+    let store = runtime.notes(token)?;
+    let count =
+        count_unread_messages(store.as_ref(), token.namespace().as_str(), &caller_actor).await?;
 
     Ok(json!({ "count": count, "actor": caller_actor }))
 }
 
 async fn count_unread_messages(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
+    store: &dyn khive_storage::NoteStore,
+    namespace: &str,
     caller_actor: &str,
 ) -> Result<u64, RuntimeError> {
     let property_filters = vec![
@@ -888,15 +891,13 @@ async fn count_unread_messages(
         order_by: None,
         ..Default::default()
     };
-    let store = runtime.notes(token)?;
-
     const PAGE_SIZE: u32 = 200;
     let mut count: u64 = 0;
     let mut db_offset: u32 = 0;
     loop {
         let page = store
             .query_notes_filtered(
-                token.namespace().as_str(),
+                namespace,
                 &filter,
                 PageRequest {
                     limit: PAGE_SIZE,

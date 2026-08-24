@@ -10235,6 +10235,35 @@ async fn i66_inbox_response_carries_unread_count() {
     );
 }
 
+#[tokio::test]
+async fn i1931_inbox_unread_count_is_mailbox_wide() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend, "lambda:b");
+
+    for content in ["msg 1", "msg 2", "msg 3"] {
+        registry_a
+            .dispatch(
+                "comm.send",
+                serde_json::json!({ "to": "lambda:b", "content": content }),
+            )
+            .await
+            .expect("send succeeds");
+    }
+
+    for limit in [1, 2] {
+        let inbox = registry_b
+            .dispatch("comm.inbox", serde_json::json!({ "limit": limit }))
+            .await
+            .expect("inbox succeeds");
+        assert_eq!(inbox["count"], limit);
+        assert_eq!(
+            inbox["unread_count"], 3,
+            "unread_count must not be bounded by limit={limit}"
+        );
+    }
+}
+
 /// `limit=0` is the count-only inbox path: it returns no message payloads but still reports the caller's real unread total.
 #[tokio::test]
 async fn i66_inbox_limit_zero_carries_real_unread_count() {
