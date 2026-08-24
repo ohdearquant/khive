@@ -13,7 +13,10 @@ the main store (audit rows one-per-dispatch at ~72% of them, channel-poll lifecy
 config-lock records, embedder lifecycle, phase and checkpoint records, recall/search/
 feedback events) against ~2,540 domain-mutation dispatches in the same window — a
 roughly 30:1 ratio. By dispatch count, ~96% of main-store write traffic is
-observational.
+observational. Producing query:
+`brain.event_counts(since="2026-08-23T12:00:00Z", exhaustive=true)` — an exact,
+non-sampled full-window aggregate (76,624 events); the domain-mutation figure is
+the sum of that call's `counts_by_verb` entries for mutating verbs.
 
 Under load this shows up as `writer_task_begin_busy` refusals (ADR-067 Amendment 4)
 on domain writes: operations that take under 10ms uncontended time out behind
@@ -37,8 +40,10 @@ SQLite file. Observational writes leave the domain store entirely.
 1. **Events daemon.** A new subcommand of the same binary runs an events daemon
    that owns `events.db` beside the main store, writes to it through the existing
    `SqlEventStore`, and binds its own Unix socket using the same framing and
-   peer-uid admission as the existing daemon socket. It is the only writer of
-   `events.db` in daemon deployments.
+   peer-uid admission as the existing daemon socket. It is the only **resident**
+   writer of `events.db`; the sole exception is the daemonless embedded mode of
+   point 4, whose short direct appends SQLite's per-file cross-process exclusion
+   already serializes.
 
 2. **Forwarding event store (writes).** In the domain process, a
    socket-forwarding implementation of `EventStore` replaces the local one for
@@ -71,7 +76,10 @@ SQLite file. Observational writes leave the domain store entirely.
    into windowed event queries; recent-window queries converge on the new store
    immediately, and the orphaned history ages out of query windows. This is
    acceptable for the telemetry durability class and is stated here rather than
-   hidden. A backfill tool can follow if history proves needed.
+   hidden. A backfill tool can follow if history proves needed. Storage tenure
+   of the legacy rows is likewise explicit: they age in place in the main store
+   indefinitely — nothing deletes them as part of this change — until an
+   operator runs a purge or backfill tool, which ships separately if wanted.
 
 ## Consequences
 
