@@ -17,8 +17,23 @@ export interface CliResult {
 export function isolatedTestEnv(
   base: Record<string, string> = Deno.env.toObject(),
 ): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(base)) {
+    // Command-scope config (GIT_CONFIG_COUNT/KEY_*/VALUE_*) bypasses the
+    // global/system file overrides below, and GIT_TEMPLATE_DIR can seed
+    // hooks at `git init` — drop every inherited config-injection variable.
+    if (
+      key === "GIT_CONFIG_COUNT" ||
+      key === "GIT_TEMPLATE_DIR" ||
+      key.startsWith("GIT_CONFIG_KEY_") ||
+      key.startsWith("GIT_CONFIG_VALUE_")
+    ) {
+      continue;
+    }
+    env[key] = value;
+  }
   return {
-    ...base,
+    ...env,
     NO_COLOR: "1",
     GIT_CONFIG_GLOBAL: NULL_DEVICE,
     GIT_CONFIG_SYSTEM: NULL_DEVICE,
