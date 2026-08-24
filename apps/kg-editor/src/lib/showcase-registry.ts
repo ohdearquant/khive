@@ -19,6 +19,7 @@ export const SHOWCASE_REGISTRY: readonly ShowcaseRegistryEntry[] = [
     id: "github.com/ohdearquant/khive",
     canonicalUrl: "https://github.com/ohdearquant/khive",
     aliases: [
+      "khive",
       "https://github.com/ohdearquant/khive",
       "http://github.com/ohdearquant/khive",
       "https://www.github.com/ohdearquant/khive",
@@ -159,6 +160,16 @@ export function resolveShowcaseRepository(
   input: string,
   registry: readonly ShowcaseRegistryEntry[] = SHOWCASE_REGISTRY,
 ): ShowcaseLookup {
+  const candidate = input.trim();
+  for (const entry of registry) {
+    if (!entry.aliases.includes(candidate)) continue;
+
+    const canonical = normalizeRepositoryUrl(entry.canonicalUrl);
+    if (canonical.ok) {
+      return { status: "hit", normalizedUrl: canonical.value, entry };
+    }
+  }
+
   const normalized = normalizeRepositoryUrl(input);
   if (!normalized.ok) return { status: "invalid", reason: normalized.reason };
 

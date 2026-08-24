@@ -1,5 +1,10 @@
 import type { ViewId } from "@/lib/repo-bundle";
-import { normalizeRepositoryUrl } from "@/lib/showcase-registry";
+import {
+  normalizeRepositoryUrl,
+  resolveShowcaseRepository,
+  SHOWCASE_REGISTRY,
+  type ShowcaseRegistryEntry,
+} from "@/lib/showcase-registry";
 
 export const REPOSITORY_VIEW_IDS = [
   "structure_graph",
@@ -87,14 +92,15 @@ function singleParameter(
 function parseRepository(
   value: string | null,
   issues: RepositoryLocationIssue[],
+  registry: readonly ShowcaseRegistryEntry[],
 ): string | null {
   if (value == null) return null;
-  const normalized = normalizeRepositoryUrl(value);
-  if (!normalized.ok) {
-    issues.push({ parameter: "repo", message: normalized.reason });
+  const lookup = resolveShowcaseRepository(value, registry);
+  if (lookup.status === "invalid") {
+    issues.push({ parameter: "repo", message: lookup.reason });
     return null;
   }
-  return normalized.value;
+  return lookup.normalizedUrl;
 }
 
 function parseSnapshotSha(
@@ -140,7 +146,10 @@ function parseView(
   return value as ViewId;
 }
 
-export function parseRepositoryLocation(url: URL): ParsedRepositoryLocation {
+export function parseRepositoryLocation(
+  url: URL,
+  registry: readonly ShowcaseRegistryEntry[] = SHOWCASE_REGISTRY,
+): ParsedRepositoryLocation {
   const issues: RepositoryLocationIssue[] = [];
   const repository = singleParameter(url, "repo", issues);
   const snapshotSha = singleParameter(url, "at", issues);
@@ -149,7 +158,7 @@ export function parseRepositoryLocation(url: URL): ParsedRepositoryLocation {
 
   return {
     location: {
-      repository: parseRepository(repository, issues),
+      repository: parseRepository(repository, issues, registry),
       snapshotSha: parseSnapshotSha(snapshotSha, issues),
       modulePath: parseModulePath(modulePath, issues),
       view: parseView(view, issues),
