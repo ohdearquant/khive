@@ -6,11 +6,23 @@ import { join } from "@std/path";
 import { assertEquals, assertMatch } from "@std/assert";
 
 const CLI_ENTRY = new URL("../main.ts", import.meta.url).pathname;
+const NULL_DEVICE = Deno.build.os === "windows" ? "NUL" : "/dev/null";
 
 export interface CliResult {
   code: number;
   stdout: string;
   stderr: string;
+}
+
+export function isolatedTestEnv(
+  base: Record<string, string> = Deno.env.toObject(),
+): Record<string, string> {
+  return {
+    ...base,
+    NO_COLOR: "1",
+    GIT_CONFIG_GLOBAL: NULL_DEVICE,
+    GIT_CONFIG_SYSTEM: NULL_DEVICE,
+  };
 }
 
 /**
@@ -22,7 +34,7 @@ export async function runCli(args: string[]): Promise<CliResult> {
     args: ["run", "--allow-all", CLI_ENTRY, ...args],
     stdout: "piped",
     stderr: "piped",
-    env: { ...Deno.env.toObject(), NO_COLOR: "1" },
+    env: isolatedTestEnv(),
   });
   const { code, stdout, stderr } = await cmd.output();
   return {
@@ -102,24 +114,28 @@ edge_relations:
  */
 export async function makeTempRepo(): Promise<TempRepo> {
   const root = await Deno.makeTempDir({ prefix: "khive_test_" });
+  const env = isolatedTestEnv();
 
   // Init git repo
   await new Deno.Command("git", {
     args: ["init", root],
     stdout: "null",
     stderr: "null",
+    env,
   }).output();
 
   await new Deno.Command("git", {
     args: ["-C", root, "config", "user.email", "test@test.com"],
     stdout: "null",
     stderr: "null",
+    env,
   }).output();
 
   await new Deno.Command("git", {
     args: ["-C", root, "config", "user.name", "Test"],
     stdout: "null",
     stderr: "null",
+    env,
   }).output();
 
   // Create .khive/kg/ structure
@@ -134,12 +150,14 @@ export async function makeTempRepo(): Promise<TempRepo> {
     args: ["-C", root, "add", "-A"],
     stdout: "null",
     stderr: "null",
+    env,
   }).output();
 
   await new Deno.Command("git", {
     args: ["-C", root, "commit", "-m", "init", "--no-gpg-sign"],
     stdout: "null",
     stderr: "null",
+    env,
   }).output();
 
   return {
@@ -157,7 +175,7 @@ export async function runCliIn(cwd: string, args: string[]): Promise<CliResult> 
     cwd,
     stdout: "piped",
     stderr: "piped",
-    env: { ...Deno.env.toObject(), NO_COLOR: "1" },
+    env: isolatedTestEnv(),
   });
   const { code, stdout, stderr } = await cmd.output();
   return {
