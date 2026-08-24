@@ -484,20 +484,21 @@ const PREFIX_DETECTORS: &[(&str, &str, usize)] = &[
     ("aws-access-key-id", "ASIA", 20),
     // GitHub tokens: personal-access (ghp_), OAuth (gho_), GitHub App
     // user-to-server (ghu_), server-to-server (ghs_), refresh (ghr_), and the
-    // fine-grained PAT (github_pat_). All but github_pat_ share the gh*_ + 36+
-    // base62 shape.
+    // fine-grained PAT (github_pat_). The gh*_ formats carry a 36-character
+    // payload; fine-grained PATs carry an 82-character payload.
     ("github-token", "ghp_", 36),
     ("github-token", "gho_", 36),
     ("github-token", "ghu_", 36),
     ("github-token", "ghs_", 36),
     ("github-token", "ghr_", 36),
-    ("github-token", "github_pat_", 20),
-    // OpenAI
-    ("openai-api-key", "sk-proj-", 40),
-    // NOTE: bare "sk-" also matches Anthropic/Stripe below; put it last so
-    // the more-specific detectors fire first when both would match.
+    ("github-token", "github_pat_", 93),
+    // OpenAI project keys carry at least an 80-character payload.
+    ("openai-api-key", "sk-proj-", 88),
+    // NOTE: bare "sk-" also matches the more-specific prefixes below. Those
+    // prefixes retain ownership of their candidates so the generic fallback
+    // cannot bypass a vendor-specific minimum.
     // Anthropic
-    ("anthropic-api-key", "sk-ant-", 20),
+    ("anthropic-api-key", "sk-ant-", 108),
     // Stripe live keys
     ("stripe-secret-key", "sk_live_", 30),
     ("stripe-restricted-key", "rk_live_", 30),
@@ -540,10 +541,8 @@ fn check_known_patterns(text: &str) -> Option<(&str, &'static str)> {
 
     // --- Bare `sk-` (after all more-specific sk- detectors above) ---
     // Require length ≥ 30 AND exclude known safe scikit/library compound words.
-    if let Some(token) = find_prefix_token(text, "sk-", 30) {
-        if !SK_SAFE_PREFIXES.iter().any(|safe| token.starts_with(safe)) {
-            keep_leftmost(&mut best, Some((token, "openai-api-key")), base);
-        }
+    if let Some(token) = find_bare_sk_token(text) {
+        keep_leftmost(&mut best, Some((token, "openai-api-key")), base);
     }
 
     // --- Fly.io FlyV1 token: "FlyV1 <base64-payload>" ---
@@ -625,6 +624,27 @@ fn find_prefix_token<'a>(text: &'a str, needle: &str, min_len: usize) -> Option<
             }
         }
         start = abs + needle.len().max(1);
+    }
+    None
+}
+
+/// Locate a generic `sk-` token without reclassifying a registered vendor
+/// prefix that did not meet its own minimum length.
+fn find_bare_sk_token(text: &str) -> Option<&str> {
+    let base = text.as_ptr() as usize;
+    let mut from = 0;
+    while from < text.len() {
+        let token = find_prefix_token(&text[from..], "sk-", 30)?;
+        let belongs_to_specific_detector = PREFIX_DETECTORS
+            .iter()
+            .any(|&(_, needle, _)| needle.starts_with("sk-") && token.starts_with(needle));
+        let is_safe_compound = SK_SAFE_PREFIXES.iter().any(|safe| token.starts_with(safe));
+        if !belongs_to_specific_detector && !is_safe_compound {
+            return Some(token);
+        }
+
+        let token_start = token.as_ptr() as usize - base;
+        from = token_start + token.len();
     }
     None
 }
@@ -2041,6 +2061,18 @@ fn build_match(detector: &'static str, candidate: &str) -> SecretMatch {
 mod tests {
     use super::*;
 
+    fn github_fine_grained_pat_fixture() -> String {
+        format!("github_pat_{}", "A".repeat(82))
+    }
+
+    fn openai_project_key_fixture() -> String {
+        format!("sk-proj-{}", "A".repeat(80))
+    }
+
+    fn anthropic_api_key_fixture() -> String {
+        format!("sk-ant-api03-{}AA", "A".repeat(93))
+    }
+
     #[test]
     fn blocks_aws_akia() {
         // FAKE key: prefix is real shape, 16-char suffix invented.
@@ -2079,8 +2111,8 @@ mod tests {
 
     #[test]
     fn blocks_github_pat() {
-        let fake = "github_pat_AAAAAABBBBBBCCCCCC";
-        assert!(scan(fake).is_some(), "github_pat_ must be caught");
+        let fake = github_fine_grained_pat_fixture();
+        assert!(scan(&fake).is_some(), "github_pat_ must be caught");
     }
 
     #[test]
@@ -2091,9 +2123,59 @@ mod tests {
 
     #[test]
     fn blocks_anthropic_sk_ant() {
-        let fake = "sk-ant-api03-AAAAAAAAAAAAAAA";
-        assert!(scan(fake).is_some(), "sk-ant- must be caught");
-        assert_eq!(scan(fake).unwrap().detector, "anthropic-api-key");
+        let fake = anthropic_api_key_fixture();
+        assert!(scan(&fake).is_some(), "sk-ant- must be caught");
+        assert_eq!(scan(&fake).unwrap().detector, "anthropic-api-key");
+    }
+
+    #[test]
+    fn vendor_prefix_minimums_allow_short_documentation_fragments() {
+        let fragments = [
+            "github_pat_[A-Za-z0-9_]{82}".to_owned(),
+            "sk-proj-[A-Za-z0-9_-]{80,}".to_owned(),
+            "sk-ant-api03-[A-Za-z0-9_-]{93}AA".to_owned(),
+            "github_pat_FAKE_CANARY".to_owned(),
+            "sk-ant-api03-FAKE_CANARY".to_owned(),
+            format!("github_pat_{}", "A".repeat(81)),
+            format!("sk-proj-{}", "A".repeat(79)),
+            format!("sk-ant-api03-{}AA", "A".repeat(92)),
+        ];
+
+        for fragment in fragments {
+            assert!(
+                check(&fragment).is_ok(),
+                "short documentation fragment must pass: {fragment}, got {:?}",
+                scan(&fragment)
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_prefix_minimums_keep_plausible_keys_blocked() {
+        let github = github_fine_grained_pat_fixture();
+        let openai = openai_project_key_fixture();
+        let anthropic = anthropic_api_key_fixture();
+
+        for (candidate, detector) in [
+            (github.as_str(), "github-token"),
+            (openai.as_str(), "openai-api-key"),
+            (anthropic.as_str(), "anthropic-api-key"),
+        ] {
+            let matched = scan(candidate).expect("plausible-length vendor key must remain blocked");
+            assert_eq!(matched.detector, detector);
+        }
+    }
+
+    #[test]
+    fn short_specialized_sk_prefix_does_not_hide_later_generic_key() {
+        let short_vendor_fragment = format!("sk-proj-{}", "A".repeat(79));
+        let generic_key = format!("sk-{}", "A1".repeat(20));
+        let content = format!("{short_vendor_fragment} {generic_key}");
+
+        let (matched, detector) =
+            scan_match(&content).expect("later generic sk key must remain detectable");
+        assert_eq!(matched, generic_key);
+        assert_eq!(detector, "openai-api-key");
     }
 
     #[test]
@@ -2133,9 +2215,9 @@ mod tests {
 
     #[test]
     fn prefix_detectors_allow_lowercase_source_filenames() {
-        let filename_body = "provider_integration_monitoring_adapter_configuration.py";
-
         for &(_, needle, min_len) in PREFIX_DETECTORS {
+            let padding_len = min_len.saturating_sub(needle.len() + "provider_.py".len());
+            let filename_body = format!("provider_{}.py", "a".repeat(padding_len));
             let candidate = format!("{needle}{filename_body}");
             assert!(
                 candidate.len() >= min_len,
@@ -2504,12 +2586,12 @@ mod tests {
         // preceding ideograph was not treated as a delimiter.  These credentials
         // must be caught with no nearby ASCII trigger word, on the left side too.
         let cases = [
-            "数据AKIAIOSFODNN7EXAMPLE",             // gitleaks:allow
-            "令牌github_pat_11ABCDEFG0HIJKLMNOPQR", // gitleaks:allow
-            "密钥sk-ant-api03-AAAAAAAAAAAAAAAAAA",  // gitleaks:allow
-            "配置FlyV1 fm2_AAAABBBBCCCCDDDD",       // gitleaks:allow
+            "数据AKIAIOSFODNN7EXAMPLE".to_owned(), // gitleaks:allow
+            format!("令牌{}", github_fine_grained_pat_fixture()),
+            format!("密钥{}", anthropic_api_key_fixture()),
+            "配置FlyV1 fm2_AAAABBBBCCCCDDDD".to_owned(), // gitleaks:allow
         ];
-        for content in cases {
+        for content in &cases {
             assert!(
                 check(content).is_err(),
                 "known-prefix secret glued after CJK must be blocked: {content:?}"
@@ -2606,7 +2688,9 @@ mod tests {
 
     #[test]
     fn check_json_blocks_secret_in_nested_object() {
-        let props = serde_json::json!({ "credentials": { "token": "sk-proj-FAKEKEY00000000000000000000000000000000" } }); // gitleaks:allow
+        let props = serde_json::json!({
+            "credentials": { "token": openai_project_key_fixture() }
+        });
         assert!(
             check_json(&props).is_err(),
             "secret in nested properties object must be blocked"
@@ -2750,9 +2834,9 @@ mod tests {
     #[test]
     fn blocks_openai_sk_proj_not_confused_with_sk_learn() {
         // Real OpenAI key shape must still be caught.
-        let fake = "sk-proj-FAKEKEY00000000000000000000000000000000"; // gitleaks:allow
+        let fake = openai_project_key_fixture();
         assert!(
-            scan(fake).is_some(),
+            scan(&fake).is_some(),
             "sk-proj- key must still be caught after sk-learn exemption"
         );
     }
@@ -3824,11 +3908,11 @@ mod tests {
             "🇺🇸",       // 8-byte emoji flag (two surrogate-like scalars)
         ];
         let secrets = [
-            "AKIAFAKEKEY00000000000000",
-            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "sk-ant-api03-AAAAAAAAAAAAAAA",
-            "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1",
-            "FlyV1 fm2_AAAABBBBCCCCDDDDEEEEFFFF",
+            "AKIAFAKEKEY00000000000000".to_owned(),
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            anthropic_api_key_fixture(),
+            "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1".to_owned(),
+            "FlyV1 fm2_AAAABBBBCCCCDDDDEEEEFFFF".to_owned(),
         ];
         for mb in &multibyte_items {
             for secret in &secrets {
@@ -4113,10 +4197,10 @@ mod tests {
         // These are exactly the detectors the session mirror's previous local
         // regex did NOT cover, which is why it now shares this masker.
         let cases = [
-            "key: sk-proj-FAKEKEY00000000000000000000000000000000", // gitleaks:allow
-            "cred ASIAFAKEKEY00000000000",                          // gitleaks:allow
-            "stripe sk_live_FAKESTRIPE0000000000000",               // gitleaks:allow
-            "db postgresql://dbuser:S3cr3tP4ss@db.example.com/db",  // gitleaks:allow
+            format!("key: {}", openai_project_key_fixture()),
+            "cred ASIAFAKEKEY00000000000".to_owned(), // gitleaks:allow
+            "stripe sk_live_FAKESTRIPE0000000000000".to_owned(), // gitleaks:allow
+            "db postgresql://dbuser:S3cr3tP4ss@db.example.com/db".to_owned(), // gitleaks:allow
         ];
         for c in &cases {
             let masked = mask_secrets(c);
@@ -4129,9 +4213,11 @@ mod tests {
 
     #[test]
     fn mask_secrets_redacts_every_span_and_keeps_prose() {
-        let line =
-            "first sk-ant-api03-AAAAAAAAAAAAAAA then ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end";
-        let masked = mask_secrets(line);
+        let line = format!(
+            "first {} then ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end",
+            anthropic_api_key_fixture()
+        );
+        let masked = mask_secrets(&line);
         assert!(
             !masked.contains("sk-ant-api03") && !masked.contains("ghp_AAAA"),
             "no secret may survive: {masked}"
