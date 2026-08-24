@@ -1088,31 +1088,47 @@ impl ConnectionPool {
         }
     }
 
-    /// Classify an error returned by [`Self::reader_until`] at checkout.
+    /// Resolve a [`Self::reader_until`] outcome into a checked-out guard or
+    /// the canonical refusal. This is the single home of the checkout
+    /// tri-state; call sites must not re-derive any arm of it:
     ///
-    /// `reader_until` executes no SQL — it only checks out a connection — so
-    /// the only `SQLITE_BUSY` it can produce is [`pool_exhausted_error`],
-    /// raised when `checkout_timeout` elapses with no reader available. That is
-    /// a genuine admission wait that ended before any work began, so it maps to
-    /// the retryable [`StorageError::AdmissionTimeout`]. Every other checkout
-    /// error (e.g. [`Self::ensure_pooled_writer_active`] returning
-    /// `InvalidData` for a retired pooled writer) is an opaque driver failure
-    /// and stays non-retryable. Keeping this beside `pool_exhausted_error` is
-    /// what lets the call site avoid sniffing an error shape it does not own.
-    pub(crate) fn classify_reader_checkout_error(
+    /// - `Ok(Some)` — a reader was checked out.
+    /// - `Ok(None)` — `should_stop()` fired: the request was cancelled or hit
+    ///   its deadline before checkout. NOT an admission wait, so it maps to
+    ///   the non-retryable [`StorageError::Timeout`] — emitting the retryable
+    ///   `AdmissionTimeout` here would invite an immediate retry of a request
+    ///   its caller already abandoned, into a possibly saturated pool.
+    /// - `Err` carrying the pool's own `SQLITE_BUSY` — `reader_until` executes
+    ///   no SQL, so the only `SQLITE_BUSY` it can produce is
+    ///   [`pool_exhausted_error`], raised when `checkout_timeout` elapses with
+    ///   no reader available. A genuine admission wait that ended before any
+    ///   work began maps to the retryable [`StorageError::AdmissionTimeout`].
+    /// - any other `Err` (e.g. [`Self::ensure_pooled_writer_active`] returning
+    ///   `InvalidData` for a retired pooled writer) — an opaque driver failure
+    ///   under the caller's capability, non-retryable.
+    pub(crate) fn resolve_reader_checkout<'p>(
         &self,
+        capability: StorageCapability,
         operation: &'static str,
-        error: SqliteError,
-    ) -> StorageError {
-        let is_pool_exhausted = matches!(
-            &error,
-            SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
-                if code.code == rusqlite::ErrorCode::DatabaseBusy
-        );
-        if is_pool_exhausted {
-            self.reader_admission_timeout(operation)
-        } else {
-            StorageError::driver(StorageCapability::Sql, "pool_reader", error)
+        outcome: Result<Option<ReaderGuard<'p>>, SqliteError>,
+    ) -> Result<ReaderGuard<'p>, StorageError> {
+        match outcome {
+            Ok(Some(guard)) => Ok(guard),
+            Ok(None) => Err(StorageError::Timeout {
+                operation: operation.into(),
+            }),
+            Err(error) => {
+                let is_pool_exhausted = matches!(
+                    &error,
+                    SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                        if code.code == rusqlite::ErrorCode::DatabaseBusy
+                );
+                if is_pool_exhausted {
+                    Err(self.reader_admission_timeout(operation))
+                } else {
+                    Err(StorageError::driver(capability, operation, error))
+                }
+            }
         }
     }
 
@@ -3915,5 +3931,69 @@ mod tests {
         let (identity_again, canonical_again) = mint_db_identity(&db_path).unwrap();
         assert_eq!(identity, identity_again);
         assert_eq!(canonical, canonical_again);
+    }
+
+    /// The checkout tri-state, arm by arm, at its single home. Each refusal
+    /// arm asserts the classification it must NOT collapse into, because the
+    /// historical defect was exactly a pairwise swap: cancellation surfaced as
+    /// the retryable `AdmissionTimeout` while genuine pool exhaustion surfaced
+    /// as a non-retryable `Driver` failure.
+    #[test]
+    fn resolve_reader_checkout_maps_each_arm_distinctly() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        let guard = pool
+            .resolve_reader_checkout(
+                StorageCapability::Sql,
+                "arm_checked_out",
+                pool.reader_until(|| false),
+            )
+            .expect("an uncontended checkout must pass the guard through");
+        drop(guard);
+
+        let Err(cancelled) =
+            pool.resolve_reader_checkout(StorageCapability::Sql, "arm_cancelled", Ok(None))
+        else {
+            panic!("a cancelled checkout must be refused");
+        };
+        assert!(
+            matches!(cancelled, StorageError::Timeout { .. }),
+            "cancellation/deadline before checkout must be the non-retryable \
+             Timeout, got {cancelled:?}"
+        );
+
+        let Err(exhausted) = pool.resolve_reader_checkout(
+            StorageCapability::Sql,
+            "arm_exhausted",
+            Err(pool_exhausted_error(Duration::from_millis(5), 1)),
+        ) else {
+            panic!("an exhausted checkout must be refused");
+        };
+        assert!(
+            matches!(exhausted, StorageError::AdmissionTimeout { .. }),
+            "the pool's own SQLITE_BUSY (checkout_timeout exhausted) must be \
+             the retryable AdmissionTimeout, got {exhausted:?}"
+        );
+
+        let Err(opaque) = pool.resolve_reader_checkout(
+            StorageCapability::Entities,
+            "arm_driver",
+            Err(SqliteError::InvalidData("retired pooled writer".into())),
+        ) else {
+            panic!("an opaque checkout error must be refused");
+        };
+        assert!(
+            matches!(
+                &opaque,
+                StorageError::Driver { capability, .. }
+                    if *capability == StorageCapability::Entities
+            ),
+            "any other checkout error must stay a non-retryable Driver failure \
+             under the caller's capability, got {opaque:?}"
+        );
     }
 }

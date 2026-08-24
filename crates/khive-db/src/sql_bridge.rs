@@ -1775,29 +1775,14 @@ where
         StorageCapability::Sql,
         operation,
         move |scope| {
-            // `reader_until` reports three distinct outcomes that must NOT be
-            // collapsed:
-            //   Ok(Some) -> a reader was checked out.
-            //   Ok(None) -> `should_stop()` fired: the request was cancelled or
-            //     hit its deadline. This is NOT an admission wait, so it must
-            //     not emit the retryable AdmissionTimeout (which would invite an
-            //     immediate retry into a saturated pool). Keep the original
-            //     Timeout classification for the cancellation path.
-            //   Err(..)  -> checkout failed. `classify_reader_checkout_error`
-            //     maps an exhausted `checkout_timeout` (the pool's own
-            //     SQLITE_BUSY) to the retryable AdmissionTimeout and anything
-            //     else to a driver failure. The earlier chain mapped every
-            //     Err to Driver, so a genuine admission expiry never reached
-            //     AdmissionTimeout.
-            let mut guard = match pool.reader_until(|| scope.should_stop()) {
-                Ok(Some(guard)) => guard,
-                Ok(None) => {
-                    return Err(StorageError::Timeout {
-                        operation: operation.into(),
-                    })
-                }
-                Err(error) => return Err(pool.classify_reader_checkout_error(operation, error)),
-            };
+            // Checkout tri-state (cancelled -> Timeout, admission expiry ->
+            // retryable AdmissionTimeout, other -> Driver) lives in ONE place:
+            // `ConnectionPool::resolve_reader_checkout`.
+            let mut guard = pool.resolve_reader_checkout(
+                StorageCapability::Sql,
+                operation,
+                pool.reader_until(|| scope.should_stop()),
+            )?;
             scope.with_pooled_reader(&mut guard, |conn| query(scope, conn))
         },
     )
