@@ -1069,9 +1069,32 @@ def test_batch_outcome_status(proc: subprocess.Popen) -> None:
 # ---------------------------------------------------------------------------
 
 def test_home_config_isolation(proc: subprocess.Popen) -> None:
-    """An ambient multi-backend home config must not affect this test server."""
-    stats = _tool(proc, "stats", {})
-    assert isinstance(stats, dict), f"stats returned a non-object: {stats!r}"
+    """An ambient multi-backend home config must not affect this test server.
+
+    The harness points the server at a freshly-minted temp database, so the
+    entity listing must start empty: a server that resolved the ambient home
+    configuration instead would surface that backend's pre-existing rows. The
+    sentinel round-trip then pins the write path to the same store.
+    """
+    before = _tool(proc, "list", {"kind": "entity", "limit": 10})
+    assert before == [], (
+        f"fresh temp database lists pre-existing entities: {before!r}"
+    )
+
+    sentinel = _tool(proc, "create", {
+        "kind": "entity",
+        "entity_kind": "concept",
+        "name": "IsolationSentinel",
+        "description": "Written through the temp-config server",
+    })
+    fetched = _tool(proc, "get", {"id": sentinel["id"]})
+    assert fetched["name"] == "IsolationSentinel", fetched
+
+    listed = _tool(proc, "list", {"kind": "entity", "limit": 10})
+    names = [e.get("name") for e in listed]
+    assert names == ["IsolationSentinel"], (
+        f"sentinel is not the sole visible entity: {names!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
