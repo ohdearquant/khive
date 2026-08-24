@@ -55,6 +55,32 @@ Deno.test("isolated test environment strips command-scope Git configuration", as
   assertEquals(new TextDecoder().decode(sanitized.stdout), "");
 });
 
+Deno.test("isolated test environment strips GIT_CONFIG_PARAMETERS injection", async () => {
+  const hostile = {
+    ...Deno.env.toObject(),
+    GIT_CONFIG_PARAMETERS: "'core.hooksPath=/hostile/hooks'",
+  };
+
+  // Control: the probe must see the injection when nothing sanitizes it.
+  const injected = await new Deno.Command("git", {
+    args: ["config", "--get", "core.hooksPath"],
+    env: hostile,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  assertEquals(injected.code, 0);
+  assertEquals(new TextDecoder().decode(injected.stdout).trim(), "/hostile/hooks");
+
+  const sanitized = await new Deno.Command("git", {
+    args: ["config", "--get", "core.hooksPath"],
+    env: isolatedTestEnv(hostile),
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  assertEquals(sanitized.code, 1);
+  assertEquals(new TextDecoder().decode(sanitized.stdout), "");
+});
+
 Deno.test("isolated test environment drops GIT_TEMPLATE_DIR hook seeding", async () => {
   const root = await Deno.makeTempDir({ prefix: "khive_git_template_" });
   try {

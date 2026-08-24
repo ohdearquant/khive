@@ -19,11 +19,13 @@ export function isolatedTestEnv(
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(base)) {
-    // Command-scope config (GIT_CONFIG_COUNT/KEY_*/VALUE_*) bypasses the
-    // global/system file overrides below, and GIT_TEMPLATE_DIR can seed
-    // hooks at `git init` — drop every inherited config-injection variable.
+    // Command-scope config (GIT_CONFIG_COUNT/KEY_*/VALUE_* and the older
+    // GIT_CONFIG_PARAMETERS list) bypasses the global/system file overrides
+    // below, and GIT_TEMPLATE_DIR can seed hooks at `git init` — drop every
+    // inherited config-injection variable.
     if (
       key === "GIT_CONFIG_COUNT" ||
+      key === "GIT_CONFIG_PARAMETERS" ||
       key === "GIT_TEMPLATE_DIR" ||
       key.startsWith("GIT_CONFIG_KEY_") ||
       key.startsWith("GIT_CONFIG_VALUE_")
