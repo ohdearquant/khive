@@ -52,11 +52,13 @@
 //! can itself kick off a background ANN rebuild once its debounce interval elapses after
 //! seeding — a benign maintenance action that still serves the stale-but-installed graph
 //! on the fast path (not a slow/degraded sample) but does emit `memory.ann_warm` events.
-//! Left unhandled this trips the event-count assertion on a false positive. The harness
-//! closes over this by sleeping past that debounce interval plus one settle recall
-//! (`EPOCH_DEBOUNCE_SETTLE`) after the warm-wait and before opening the timed window, so
-//! any such rebuild fires and completes before counting starts; the ~200-call timed
-//! window itself completes in well under one further debounce interval.
+//! The harness sleeps past that debounce interval and makes one settle recall
+//! (`EPOCH_DEBOUNCE_SETTLE`) before opening the timed window, which makes a due epoch
+//! check enqueue its rebuild before the event-count snapshot. The rebuild is detached:
+//! the settle recall does not await its completion. If it remains in flight and emits
+//! events during the timed window, the event-count assertion rejects that run (a
+//! possible maintenance false positive) rather than silently accepting contaminated
+//! measurements. Rerun after the background work reaches quiescence.
 //!
 //! The residual gap: an exact-fallback on the very last timed sample, with no subsequent
 //! call in the window to reveal the resulting rebuild, would not be caught. Closing that
@@ -93,11 +95,10 @@ const RECALL_ITERS: usize = 200;
 
 /// `khive_pack_memory::ann::maybe_check_durable_epoch`'s debounce interval outside a
 /// `#[cfg(test)]` build (5s). One settle sleep of longer than this, followed by one more
-/// recall, lets any epoch-check due since seeding fire and its background rebuild's
-/// `memory.ann_warm` events land before the timed window opens — otherwise that debounced
-/// check (a background maintenance action against a still-warm, still-fast route; see
-/// `search_loaded_serves_stale_installed_entry_without_rebuild` in `ann.rs`) can fire mid-
-/// timing and trip the event-count assertion below on a false positive.
+/// recall, makes any epoch-check due since seeding enqueue its detached background
+/// rebuild before the timed-window event snapshot. It does not await that rebuild; if
+/// `memory.ann_warm` events land during timing, the event-count assertion below rejects
+/// the run as potentially contaminated.
 const EPOCH_DEBOUNCE_SETTLE: Duration = Duration::from_millis(5_200);
 
 /// Bounded attempts while polling for a stable warm ANN route before timing starts.
@@ -367,11 +368,10 @@ async fn bench_configuration(config: &GateConfig) -> Percentiles {
 
     wait_until_ann_warm(&registry, config.label, config.recall_model).await;
 
-    // Let any durable-epoch debounce check already due from seeding fire and settle
-    // (see EPOCH_DEBOUNCE_SETTLE) before opening the timed window, then confirm one more
-    // clean call — this both consumes the next due check deterministically and re-asserts
-    // the route is still clean after whatever background rebuild that check may have kicked
-    // off.
+    // Let any durable-epoch debounce check already due from seeding fire (see
+    // EPOCH_DEBOUNCE_SETTLE) before opening the timed window, then confirm one more clean
+    // call. That call can enqueue a detached rebuild but cannot await it; the event-count
+    // assertion below rejects the run if that maintenance overlaps the timed window.
     tokio::time::sleep(EPOCH_DEBOUNCE_SETTLE).await;
     let (_us, settle_resp) = recall_once(&registry, config.recall_model).await;
     assert!(
