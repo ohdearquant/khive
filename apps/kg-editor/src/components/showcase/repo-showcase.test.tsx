@@ -782,6 +782,67 @@ describe("repository showcase", () => {
     expect(screen.getByText(/Contract-owned median 4\.0/)).toBeVisible();
   });
 
+  it("renders readable chart scales and keeps hotspot bubbles inside the plot", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(
+      container.querySelector('[data-view-id="hotspot_quadrant"]')!,
+    );
+    const hotspot = container.querySelector<SVGSVGElement>(
+      'svg[data-visualization="hotspot"]',
+    )!;
+    const xTicks = Array.from(
+      hotspot.querySelectorAll<SVGTextElement>('[data-axis-tick="hotspot-x"]'),
+    );
+    const yTicks = Array.from(
+      hotspot.querySelectorAll<SVGTextElement>('[data-axis-tick="hotspot-y"]'),
+    );
+    expect(xTicks.length).toBeGreaterThanOrEqual(2);
+    expect(yTicks.length).toBeGreaterThanOrEqual(2);
+    expect(xTicks[0]).toHaveAttribute("data-axis-value", "0");
+    expect(yTicks[0]).toHaveAttribute("data-axis-value", "0");
+
+    const bubbles = Array.from(
+      hotspot.querySelectorAll<SVGCircleElement>(".repo-chart-dot"),
+    );
+    expect(bubbles.length).toBeGreaterThan(0);
+    for (const bubble of bubbles) {
+      const x = Number(bubble.getAttribute("cx"));
+      const radius = Number(bubble.getAttribute("r"));
+      expect(x - radius).toBeGreaterThanOrEqual(10);
+      expect(x + radius).toBeLessThanOrEqual(100);
+    }
+
+    await user.click(
+      container.querySelector('[data-view-id="cadence_timeline"]')!,
+    );
+    const cadence = container.querySelector<SVGSVGElement>(
+      'svg[data-visualization="cadence"]',
+    )!;
+    const valueTicks = Array.from(
+      cadence.querySelectorAll<SVGTextElement>('[data-axis-tick="cadence-y"]'),
+    );
+    expect(valueTicks.length).toBeGreaterThanOrEqual(2);
+    expect(valueTicks[0]).toHaveAttribute("data-axis-value", "0");
+
+    const weekTicks = Array.from(
+      cadence.querySelectorAll<SVGTextElement>('[data-axis-tick="cadence-week"]'),
+    );
+    const cadenceRows = bundle.aggregates.cadence_timeline.commits.items;
+    expect(weekTicks.length).toBeGreaterThanOrEqual(2);
+    expect(weekTicks[0]).toHaveAttribute(
+      "data-axis-value",
+      cadenceRows[0].week_start,
+    );
+    expect(weekTicks.at(-1)).toHaveAttribute(
+      "data-axis-value",
+      cadenceRows.at(-1)?.week_start,
+    );
+    expect(weekTicks.every((tick) => tick.textContent?.trim())).toBe(true);
+  });
+
   it("surfaces a section's own truncation disclosure", () => {
     const bundle = structuredClone(golden());
     bundle.graph.modules.truncated = true;
