@@ -1566,6 +1566,26 @@ mod tests {
         assert!(out.contains("has_more: true"), "siblings still preserved");
     }
 
+    #[test]
+    fn carriage_return_in_cell_collapses_like_newline() {
+        // Escaping contract pin: cells collapse \r exactly like \n, so a
+        // \r- or \r\n-bearing value cannot smuggle a raw line break into
+        // the table body and forge row structure.
+        let v = json!([
+            {"id": "a", "note": "before\rafter"},
+            {"id": "b", "note": "one\r\ntwo"}
+        ]);
+        let out = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
+        assert!(
+            !out.contains('\r'),
+            "no raw carriage return may survive into rendered output:\n{out:?}"
+        );
+        assert!(
+            out.contains("before after") && out.contains("one  two"),
+            "\\r and \\r\\n collapse to spaces inside cells:\n{out}"
+        );
+    }
+
     /// The hoist never overwrites an existing top-level sibling.
     #[test]
     fn redundancy_drop_hoist_does_not_overwrite_top_level() {
