@@ -41,9 +41,14 @@ TABLE = ROOT / "scripts" / "data" / "adr-137-amendment-1-displacements.json"
 ADR = ROOT / "docs" / "adr" / "ADR-137-tailnet-wire-transport.md"
 
 WORDS = {
-    1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five",
+    0: "None", 1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five",
     6: "Six", 7: "Seven", 8: "Eight", 9: "Nine", 10: "Ten",
 }
+# The example decision spelled out in the generated precedence closing. It is
+# named here rather than inline because the sentence that names it is only true
+# while that decision is actually bounded, and a generated passage must not be
+# able to publish a false sentence about its own membership.
+SPELLED_OUT_EXAMPLE = "10"
 DECISION_HEADING = re.compile(r"^(\d+)\. \*\*(.+?) — (RATIFIED|CHANGED)", re.M)
 
 # A displacement is "bounded" when the parent rule survives and only its scope
@@ -82,7 +87,16 @@ def wrap(text: str, bullet: bool = False) -> str:
 
 
 def english_list(items: list[str]) -> str:
-    """Join as prose: 'a', 'a and b', 'a, b, and c'."""
+    """Join as prose: '', 'a', 'a and b', 'a, b, and c'.
+
+    The empty case returns the empty string rather than raising, but no caller
+    should reach it with a sentence that assumes a name: an empty list has no
+    prose form, only a sentence that does not mention one. Callers branch on
+    emptiness themselves; this guard exists so that a caller which forgets to
+    produces nonsense rather than an IndexError three frames down.
+    """
+    if not items:
+        return ""
     if len(items) == 1:
         return items[0]
     if len(items) == 2:
@@ -183,7 +197,11 @@ def check_scope_kinds(decisions: list[dict]) -> list[str]:
                 f"decision {d['n']}: is {WHOLESALE} but carries a scope_note; a "
                 f"note reads as a bound and this row publishes without one"
             )
-        if note and kind is None:
+        # Only when the row displaces nothing. A displacing row with a note and
+        # no kind is already named by the check above, and the two complaints
+        # describe one defect with one fix; emitting both makes the diagnostic
+        # read as two problems and buries whichever the reader acts on second.
+        if note and kind is None and not d["crate_displaced"]:
             complaints.append(
                 f"decision {d['n']}: has a scope_note but no scope_kind, so it "
                 f"reads as bounded but is excluded from the generated count"
@@ -302,6 +320,12 @@ def check_citations(decisions: list[dict], root: Path) -> tuple[list[str], list[
 
 def precedence_passage(decisions: list[dict]) -> str:
     displacing = [d for d in decisions if d["crate_displaced"]]
+    if not displacing:
+        raise SystemExit(
+            "generator: no decision displaces crate documentation, so the "
+            "precedence passage's premise is false. Rewrite the section by hand; "
+            "this generator only knows the displacing form."
+        )
     numbers = english_list([str(d["n"]) for d in displacing])
 
     lead = (
@@ -341,11 +365,51 @@ def precedence_passage(decisions: list[dict]) -> str:
     # from whether a prose `scope_note` happens to be present — a published
     # count must not move because someone reworded an explanation.
     bounded = [d for d in displacing if d.get("scope_kind") in BOUNDED_KINDS]
+    if not bounded:
+        # Every displacing entry is wholesale. The membership list and the
+        # spelled-out example below both presuppose a member, so this case gets
+        # its own sentence rather than a degenerate rendering of that one.
+        closing = wrap(
+            "None of those entries are bounded: every one of them displaces its crate "
+            "passage wholesale, so there is no surviving parent rule whose scope moved."
+        )
+        return wrap(lead) + "\n\n" + "\n".join(bullets) + "\n\n" + closing
+
+    # The sentence below names one decision as the illustrative case. That is a
+    # claim about membership, so it is checked rather than trusted: if the named
+    # decision stops being bounded, the passage must fail to generate instead of
+    # publishing a sentence that contradicts the list beside it.
+    if SPELLED_OUT_EXAMPLE not in {str(d["n"]) for d in bounded}:
+        raise SystemExit(
+            f"generator: the precedence closing spells out decision "
+            f"{SPELLED_OUT_EXAMPLE}, which is no longer bounded. Pick a different "
+            f"example and rewrite the sentence to match what it displaces; do not "
+            f"just change the number."
+        )
+    # Membership is not the whole claim: the closing characterizes WHAT the
+    # example displaces (the event.payload "data, not grammar" disclaimer), so
+    # that characterization is checked against the data row too.
+    example = next(d for d in bounded if str(d["n"]) == SPELLED_OUT_EXAMPLE)
+    example_quotes = [
+        q for c in example.get("crate_displaced", []) for q in c.get("quotes", [])
+    ]
+    if (
+        "event.payload" not in example.get("subject", "")
+        or "data, not grammar" not in example_quotes
+    ):
+        raise SystemExit(
+            f"generator: the precedence closing describes decision "
+            f"{SPELLED_OUT_EXAMPLE} as displacing the event.payload "
+            f"'data, not grammar' disclaimer, but the data row no longer says "
+            f"that. Rewrite the closing to match what the decision now "
+            f"displaces; do not just keep the prose."
+        )
     bounded_names = "decisions " + english_list([str(d["n"]) for d in bounded])
     closing = wrap(
         f"{WORDS[len(bounded)]} of those entries are bounded rather than wholesale — "
         f"{bounded_names} — and in each case the "
-        f"bound is the substance. Decision 10's is the one worth spelling out, because it "
+        f"bound is the substance. Decision {SPELLED_OUT_EXAMPLE}'s is the one worth spelling out, "
+        f"because it "
         f"displaces a disclaimer rather than a statement: the crate documentation never says a "
         f"non-object payload is acceptable, it says the shape of `event.payload` is not the "
         f"crate's business. That is not a weaker form of the same thing. A document that disclaims "
@@ -359,6 +423,12 @@ def precedence_passage(decisions: list[dict]) -> str:
 
 def fence_passage(decisions: list[dict]) -> str:
     changed = [d for d in decisions if d["label"] == "CHANGED"]
+    if not changed:
+        raise SystemExit(
+            "generator: no decision is marked CHANGED, so the merge-fence "
+            "passage has nothing to fence. Rewrite or drop the section by hand; "
+            "this generator only knows the fencing form."
+        )
     numbers = english_list([str(d["n"]) for d in changed])
     return wrap(
         f"**No first consumer of `khive-wire-protocol` may merge while any decision marked "
