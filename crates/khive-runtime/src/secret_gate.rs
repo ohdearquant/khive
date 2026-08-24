@@ -793,7 +793,7 @@ const TRIGGER_WINDOW: usize = 120;
 /// doubled, SHA-512 hex, etc.) — checked against a whole token, a single
 /// separator-delimited run, and a normalized (separator-stripped)
 /// concatenation of adjacent hex runs/tokens; see
-/// [`contains_normalized_hex_credential`].
+/// [`normalized_hex_credential_span`].
 const HEX_CREDENTIAL_LENGTHS: &[usize] = &[32, 40, 64, 128];
 
 /// Max fragments [`bridge_fragment_chain`] concatenates per credential (fragment-count bound,
@@ -869,8 +869,8 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // Must not provide its own trigger context (e.g. a path slug like
         // `ADR-051-cli-auth-and-kg-git-workflow.md`); see
         // docs/api/secret_gate.md#check_entropy_heuristic--per-token-flagging-sequence.
-        let near_trigger = contains_trigger(&window[..raw_start])
-            || contains_trigger(&window[raw_end..])
+        let near_trigger = contains_trigger(after_last_sentence_boundary(&window[..raw_start]))
+            || contains_trigger(before_first_sentence_boundary(&window[raw_end..]))
             || has_inline_credential_trigger(raw_token);
 
         // Step 1 (see doc: per-token flagging sequence). UUID/content-hash checks fall
@@ -938,7 +938,7 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
                     && is_pure_hex(run)
                     && HEX_CREDENTIAL_LENGTHS.contains(&run.len())
                 {
-                    return Some((token, "hex-credential-token"));
+                    return Some((run, "hex-credential-token"));
                 }
                 if shannon_entropy(run.as_bytes()) >= ENTROPY_THRESHOLD {
                     return Some((token, "high-entropy-token"));
@@ -948,8 +948,10 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             // Step 5 (#1062): concatenate consecutive pure-hex runs (dropping
             // separators) and re-check against HEX_CREDENTIAL_LENGTHS — catches a
             // hex payload split into multiple sub-floor runs. See doc.
-            if !vcs_reference_exempt && contains_normalized_hex_credential(token) {
-                return Some((token, "hex-credential-token"));
+            if !vcs_reference_exempt {
+                if let Some(candidate) = normalized_hex_credential_span(token) {
+                    return Some((candidate, "hex-credential-token"));
+                }
             }
 
             // Step 6 (#1062, Unicode variant): bridge fragments split across non-ASCII
@@ -961,9 +963,15 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             if !vcs_reference_exempt && tokens.len() > 1 {
                 let fragments = bridge_fragment_chain(&tokens, text, idx);
                 if fragments.len() > 1 {
-                    let hex_probe = fragments.join(" ");
-                    if contains_normalized_hex_credential(&hex_probe) {
-                        return Some((token, "hex-credential-token"));
+                    let first = fragments[0];
+                    let last = fragments[fragments.len() - 1];
+                    let chain_start = first.as_ptr() as usize - text.as_ptr() as usize;
+                    let chain_end = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
+                    let search_start = chain_start.max(from);
+                    if let Some(candidate) =
+                        normalized_hex_credential_span(&text[search_start..chain_end])
+                    {
+                        return Some((candidate, "hex-credential-token"));
                     }
                     let concatenated: String = fragments.concat();
                     if concatenated.len() >= MIN_ENTROPY_LEN
@@ -1009,7 +1017,7 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
 
 /// `true` when every byte of `run` is an ASCII hex digit. The
 /// no-minimum-length, no-`0x`-prefix building block for
-/// [`contains_normalized_hex_credential`]'s intra-token run decomposition.
+/// [`normalized_hex_credential_span`]'s intra-token run decomposition.
 /// Unlike [`is_pure_hex`] this has no 8-char floor of its own — a legitimate
 /// credential split across separators can leave a shorter individual run
 /// that still must sum correctly with its neighbors.
@@ -1149,6 +1157,57 @@ enum ClauseValueKind {
     FilePath,
 }
 
+/// End offset of a sentence/paragraph boundary beginning at `index`.
+///
+/// A single newline remains intra-sentence so natural credential assignments
+/// such as `api key:\n<value>` stay protected. Blank lines, clause-ending
+/// punctuation, and a period followed by a non-alphanumeric byte end the
+/// surrounding trigger context. The period rule deliberately keeps `v1.2`
+/// intra-sentence.
+fn sentence_boundary_end_at(bytes: &[u8], index: usize) -> Option<usize> {
+    match bytes.get(index).copied()? {
+        b';' | b'!' | b'?' => Some(index + 1),
+        b'.' if bytes
+            .get(index + 1)
+            .is_some_and(|next| !next.is_ascii_alphanumeric()) =>
+        {
+            Some(index + 1)
+        }
+        b'\n' if bytes.get(index + 1) == Some(&b'\n') => Some(index + 2),
+        b'\r'
+            if bytes
+                .get(index..index + 4)
+                .is_some_and(|window| window == b"\r\n\r\n") =>
+        {
+            Some(index + 4)
+        }
+        _ => None,
+    }
+}
+
+/// Context after the final sentence boundary in `text`.
+fn after_last_sentence_boundary(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    for index in 0..bytes.len() {
+        if let Some(end) = sentence_boundary_end_at(bytes, index) {
+            start = end;
+        }
+    }
+    &text[start..]
+}
+
+/// Context before the first sentence boundary in `text`.
+fn before_first_sentence_boundary(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    for index in 0..bytes.len() {
+        if sentence_boundary_end_at(bytes, index).is_some() {
+            return &text[..index];
+        }
+    }
+    text
+}
+
 /// Sentence/paragraph boundary inside a clause-walk gap. `;`, `!`, `?`, and
 /// blank lines always end the clause. `.` ends it only when it is not
 /// immediately followed by an alphanumeric character: a dot tight between
@@ -1156,16 +1215,8 @@ enum ClauseValueKind {
 /// the end of the gap abuts the next identifier (gaps end where the adjacent
 /// identifier begins) and is likewise intra-token.
 fn gap_has_sentence_boundary(gap: &str) -> bool {
-    if gap.contains("\n\n") || gap.contains("\r\n\r\n") || gap.contains([';', '!', '?']) {
-        return true;
-    }
     let bytes = gap.as_bytes();
-    bytes.iter().enumerate().any(|(i, b)| {
-        *b == b'.'
-            && bytes
-                .get(i + 1)
-                .is_some_and(|next| !next.is_ascii_alphanumeric())
-    })
+    (0..bytes.len()).any(|index| sentence_boundary_end_at(bytes, index).is_some())
 }
 
 /// Version-shaped identifier fragment ("2", "v1", "12") — the pieces a dotted
@@ -1428,9 +1479,9 @@ fn is_line_location_suffix(suffix: &str) -> bool {
         && parts.next().is_none()
 }
 
-/// `true` when concatenating consecutive pure-hex runs in `token` — splitting
-/// on every non-alphanumeric character and dropping the separators
-/// themselves — reaches one of [`HEX_CREDENTIAL_LENGTHS`].
+/// The raw span whose consecutive pure-hex runs — splitting on every
+/// non-alphanumeric character and dropping the separators for length
+/// accounting — reach one of [`HEX_CREDENTIAL_LENGTHS`].
 ///
 /// Closes the separator-dilution bypass (#1062) where a credential-length
 /// hex payload is spread across multiple runs each individually below
@@ -1439,22 +1490,27 @@ fn is_line_location_suffix(suffix: &str) -> bool {
 /// credential-length boundary, but normalize to one 40-char hex sequence.
 /// A non-hex, non-empty run resets the running sum — this only bridges
 /// ADJACENT hex runs, not hex fragments scattered across unrelated filler.
-fn contains_normalized_hex_credential(token: &str) -> bool {
+fn normalized_hex_credential_span(token: &str) -> Option<&str> {
     let mut concatenated_len = 0usize;
+    let mut span_start = 0usize;
     for run in token.split(|c: char| !c.is_ascii_alphanumeric()) {
         if run.is_empty() {
             continue;
         }
         if is_hex_run(run) {
+            let run_start = run.as_ptr() as usize - token.as_ptr() as usize;
+            if concatenated_len == 0 {
+                span_start = run_start;
+            }
             concatenated_len += run.len();
             if HEX_CREDENTIAL_LENGTHS.contains(&concatenated_len) {
-                return true;
+                return Some(&token[span_start..run_start + run.len()]);
             }
         } else {
             concatenated_len = 0;
         }
     }
-    false
+    None
 }
 
 /// `true` when the gap `text[gap_start..gap_end]` between two adjacent
@@ -1550,7 +1606,7 @@ fn probe_bridge_fragment(
 /// document order, for the caller to recombine — any delimiter-only glue
 /// tokens absorbed along the way (#1062) are dropped from the
 /// result entirely, so a caller joining fragments with a space
-/// ([`contains_normalized_hex_credential`]) or concatenating them directly
+/// ([`normalized_hex_credential_span`]) or concatenating them directly
 /// (the generic entropy check) sees only the genuine fragments, exactly as
 /// if the glue were more gap. Extends both directions every iteration so a
 /// credential split with fragments on both sides of the anchor (e.g. the
@@ -2962,6 +3018,33 @@ mod tests {
         assert!(
             scan(&line).is_some(),
             "32-char pure hex near 'api key' must be blocked; got None"
+        );
+    }
+
+    #[test]
+    fn issue_2056_hex_bridge_masks_the_matched_candidate() {
+        let hex32 = "0af7651916cd43dd8448eb211c80319c";
+        let content = format!("api key values verbatim:\n  {hex32}");
+
+        let (candidate, detector) = scan_match(&content).expect("credential must have a span");
+        assert_eq!(detector, "hex-credential-token");
+        assert_eq!(candidate, hex32);
+        assert!(candidate.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let matched = scan(&content).expect("credential-labeled hex must be blocked");
+        assert_eq!(matched.detector, "hex-credential-token");
+        assert_eq!(matched.masked, "0af765...32chars");
+    }
+
+    #[test]
+    fn issue_2056_detector_name_does_not_trigger_across_sentence_boundary() {
+        let content = "The hex-credential-token bucket held 18. Six are two values verbatim:\n\
+                       0af7651916cd43dd8448eb211c80319c -- spec example identifier";
+
+        assert!(
+            check(content).is_ok(),
+            "a detector name in an earlier sentence must not trigger: {:?}",
+            scan(content)
         );
     }
 
@@ -4584,7 +4667,7 @@ mod tests {
         assert!(is_plausible_file_path(tokens[anchor].1));
         let fragments = bridge_fragment_chain(&tokens, content, anchor);
         assert_eq!(fragments.len(), 2);
-        assert!(contains_normalized_hex_credential(&fragments.join(" ")));
+        assert!(normalized_hex_credential_span(&fragments.join(" ")).is_some());
         assert!(
             check(content).is_err(),
             "path-shaped anchor must not bypass fragment reconstruction: got {:?}",

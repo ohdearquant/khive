@@ -162,6 +162,14 @@ this value's label. The other accepted participle residual remains: `api key upd
 near-trigger rule. Ordering remains significant: `updated api key: <hex>` blocks because the walk
 meets the trigger first.
 
+The surrounding `near_trigger` scan still uses the bounded `TRIGGER_WINDOW`, but each side is
+trimmed to the candidate's current sentence before trigger matching. `;`, `!`, `?`, a blank line,
+or a period followed by a non-alphanumeric byte ends that context; a single newline deliberately
+does not, so the common assignment shape `api key:\n<value>` remains blocked. This prevents a
+detector name or other credential vocabulary in an earlier sentence from supplying trigger
+context to an unrelated identifier on a later line. Inline assignment/label checks on the
+candidate itself remain independent of the surrounding window.
+
 Accepted false positives,
 conservative direction: the walk has no grammar — ANY trigger word reachable inside the
 pre-delimiter clause (absent a sentence boundary or verb-position participle) is treated as a
@@ -336,7 +344,10 @@ For each token, in order:
    credential hex payload split into multiple runs each individually below `MIN_ENTROPY_LEN`
    (e.g. two 20-char hex runs joined by `/`). Concatenating consecutive pure-hex runs (dropping
    separators) and re-checking the combined length against `HEX_CREDENTIAL_LENGTHS` closes this
-   without widening the allowlist.
+   without widening the allowlist. `normalized_hex_credential_span` returns the corresponding
+   raw span from the first contributing hex run through the last, so the masked excerpt and
+   redaction are derived from the matched candidate rather than a nearby token used to anchor the
+   reconstruction.
 6. **Multi-fragment bridge (issue #1062, Unicode variant).** A non-ASCII separator (e.g. U+200B)
    is a tokenizer delimiter, so it splits the payload into separate tokens instead of leaving it
    inside one — the concatenation check above never sees the halves together. Bridging only one
@@ -366,11 +377,11 @@ For each token, in order:
    being residual. See the `allows_seven_way_hex_split_beyond_fragment_cap_documented_limitation`
    and `allows_six_way_sub_floor_hex_split_documented_limitation` tests.
 
-   The bridged chain is checked two ways: `contains_normalized_hex_credential` over fragments
-   joined by a plain space (a non-alphanumeric separator, so it accumulates only genuinely
-   adjacent hex runs the same way it does for one token's internal `/`-split runs), and
-   separately the fragments concatenated WITHOUT a separator against the same whole-token entropy
-   decision a single-token high-entropy candidate must clear — this catches a
+   The bridged chain is checked two ways: `normalized_hex_credential_span` over the raw text from
+   the first real fragment through the last (non-alphanumeric gaps separate runs, and a non-hex
+   alphanumeric run resets accumulation), and separately the fragments concatenated WITHOUT a
+   separator against the same whole-token entropy decision a single-token high-entropy candidate
+   must clear — this catches a
    base64/base64url-shaped credential split by the same delimiter mechanism, which isn't pure hex
    so the hex-length check alone misses it. A vcs-exempt anchor skips reconstruction from itself
    (else the chain would re-accumulate the anchor's own legitimate 40-hex and re-flag every
