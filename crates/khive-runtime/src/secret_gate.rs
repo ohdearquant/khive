@@ -196,6 +196,12 @@ fn scan_json_value(value: &serde_json::Value) -> RuntimeResult<()> {
 /// Marker substituted for a detected secret span by [`mask_secrets`].
 const REDACTION_MARKER: &str = "***MASKED***";
 
+/// Maximum cumulative suffix bytes submitted to full-detector sweeps while masking one
+/// input. This permits two full-size passes over the 1 MiB ASCII log-input case; the first
+/// pass is always allowed for larger or multibyte callers. Once exhausted, the remainder
+/// is redacted wholesale.
+const MAX_MASK_SCAN_WORK_BYTES: usize = MAX_LOG_TEXT_MASK_INPUT_CHARS * 2;
+
 /// Return the LEFTMOST secret in `text` as `(matched_slice, detector)`.
 ///
 /// The matched slice borrows from `text`, so the caller can recover its byte
@@ -271,16 +277,49 @@ fn scan(text: &str) -> Option<SecretMatch> {
 /// an allocation. Spans are discovered left to right against the ORIGINAL text,
 /// always evaluating trigger context over the full input — a high-entropy value
 /// whose only trigger word sits to the left of an earlier-redacted secret is
-/// still detected. See `docs/api/secret_gate.md#mask_secrets` for the scan-cursor
-/// mechanics.
+/// still detected. Cumulative suffix-scan work is capped; when dense input
+/// exhausts the cap after a match, that match is extended through the remaining
+/// text so unscanned credentials cannot survive. See
+/// `docs/api/secret_gate.md#mask_secrets` for the scan-cursor mechanics.
 pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
+    let (spans, _scan_work_bytes) = collect_mask_spans(text);
+    if spans.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in spans {
+        // Spans are non-overlapping and ascending (each starts at/after the prior
+        // `end`); `max(cursor)` is a defensive guard, never load-bearing.
+        let start = start.max(cursor);
+        out.push_str(&text[cursor..start]);
+        out.push_str(REDACTION_MARKER);
+        cursor = end.max(cursor);
+    }
+    out.push_str(&text[cursor..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Collect absolute byte spans to redact and report cumulative suffix bytes scanned.
+/// Exhausting the work budget extends the last confirmed secret span through the input tail.
+fn collect_mask_spans(text: &str) -> (Vec<(usize, usize)>, usize) {
     let base = text.as_ptr() as usize;
     // Collect every secret span (absolute byte offsets into `text`) before
     // writing any output, so trigger-context detection always sees the original
     // string rather than the suffix after the previous redaction.
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut from = 0;
+    let mut scan_work_bytes = 0usize;
     while from < text.len() {
+        let suffix_len = text.len() - from;
+        let next_scan_work = scan_work_bytes.saturating_add(suffix_len);
+        if scan_work_bytes > 0 && next_scan_work > MAX_MASK_SCAN_WORK_BYTES {
+            // Every previous sweep ended at a confirmed match; extending that
+            // redaction through the remaining tail is fail-closed.
+            spans.last_mut().expect("a prior scan found a span").1 = text.len();
+            break;
+        }
+        scan_work_bytes = next_scan_work;
         match scan_from(text, from) {
             Some((sub, _detector)) => {
                 let start = sub.as_ptr() as usize - base;
@@ -303,21 +342,7 @@ pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
             None => break,
         }
     }
-    if spans.is_empty() {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for (start, end) in spans {
-        // Spans are non-overlapping and ascending (each starts at/after the prior
-        // `end`); `max(cursor)` is a defensive guard, never load-bearing.
-        let start = start.max(cursor);
-        out.push_str(&text[cursor..start]);
-        out.push_str(REDACTION_MARKER);
-        cursor = end.max(cursor);
-    }
-    out.push_str(&text[cursor..]);
-    std::borrow::Cow::Owned(out)
+    (spans, scan_work_bytes)
 }
 
 /// Maximum characters of raw error text admitted to the masking pass.
@@ -4143,6 +4168,38 @@ mod tests {
         );
         assert!(masked.starts_with("first "), "prose preserved: {masked}");
         assert!(masked.ends_with(" end"), "prose preserved: {masked}");
+    }
+
+    #[test]
+    fn mask_secrets_bounds_suffix_scan_work_on_dense_credentials() {
+        let token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let segment = format!("{token} keep ");
+        let line = segment.repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS / segment.len() + 1);
+        assert!(
+            line.len() >= MAX_LOG_TEXT_MASK_INPUT_CHARS,
+            "fixture must exercise the bounded log input scale"
+        );
+
+        let (spans, scan_work_bytes) = collect_mask_spans(&line);
+        assert!(
+            scan_work_bytes <= MAX_MASK_SCAN_WORK_BYTES,
+            "dense input must stay within the suffix-scan work budget: \
+             {scan_work_bytes} > {MAX_MASK_SCAN_WORK_BYTES}"
+        );
+        assert!(
+            spans.len() < line.matches(token).count(),
+            "fixture must exhaust the work budget before collecting every span"
+        );
+
+        let masked = mask_secrets(&line);
+        assert!(
+            !masked.contains(token),
+            "no credential may survive fail-closed tail redaction: {masked}"
+        );
+        assert!(
+            masked.ends_with(REDACTION_MARKER),
+            "the unscanned tail must be redacted wholesale: {masked}"
+        );
     }
 
     #[test]

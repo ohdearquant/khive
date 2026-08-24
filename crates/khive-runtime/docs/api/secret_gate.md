@@ -263,7 +263,11 @@ evaluates trigger context over the full input. This closes the entropy-context g
 high-entropy value whose only trigger word sits to the left of an earlier-redacted secret is
 still detected, because the trigger window is never sliced away. The known-prefix detectors (real
 API keys: `sk-ant-`, `sk-proj-`, `AKIA`/`ASIA`, GitHub, Stripe, …) are context-free and matched the
-same way.
+same way. Masking limits cumulative suffix bytes submitted to the full detector set to 2 MiB; the
+first sweep is always allowed for larger or multibyte callers. If dense credential-shaped input
+reaches that work budget with text remaining, the last confirmed secret span is extended through
+the rest of the input. This fail-closed tail redaction bounds suffix-scan work without allowing an
+unscanned credential to survive.
 
 ## trigger_words
 
