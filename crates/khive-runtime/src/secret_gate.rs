@@ -705,23 +705,30 @@ fn find_jwt(text: &str) -> Option<&str> {
     None
 }
 
-/// Detect `scheme://user:pass@host` patterns where the `user:pass` portion
-/// contains actual credentials (both user and pass non-empty).
+/// Detect `scheme://user:pass@host` patterns where the userinfo carries an
+/// actual credential: a non-empty password. The username may be empty —
+/// `redis://:secret@host` is a standard empty-user connection string and its
+/// password is no less a credential for the missing username.
 fn find_url_userinfo(text: &str) -> Option<&str> {
     let mut search = text;
     let mut base = 0usize;
     while let Some(at_rel) = search.find("://") {
         let at_abs = base + at_rel;
-        // After `://`, look for `@` before the next `/`, `?`, ` `, or newline.
+        // After `://`, only the authority component may carry userinfo: it
+        // ends at the first `/`, `?`, `#`, space, or newline. An `@` past
+        // that boundary is path/query text (`https://host/a:x@next`), not a
+        // credential.
         let rest_start = at_abs + 3;
         let rest = &text[rest_start..];
-        if let Some(at_pos) = rest.find('@') {
+        let authority_end = rest
+            .find(['/', '?', '#', ' ', '\n', '\r'])
+            .unwrap_or(rest.len());
+        if let Some(at_pos) = rest[..authority_end].rfind('@') {
             let userinfo = &rest[..at_pos];
-            // Must contain a colon and both sides non-empty.
+            // Must contain a colon with a non-empty password after it.
             if let Some(colon) = userinfo.find(':') {
-                let user = &userinfo[..colon];
                 let pass = &userinfo[colon + 1..];
-                if !user.is_empty() && !pass.is_empty() {
+                if !pass.is_empty() {
                     // Return a slice starting from the scheme.  Walk back from
                     // `at_abs` to the first non-scheme char and resume just past
                     // it.  Use `char_indices` and skip by the separator's full
@@ -2267,6 +2274,46 @@ mod tests {
 
         assert!(check(content).is_ok(), "host:port is not URL userinfo");
         assert_eq!(bounded_masked_log_text(content), content);
+    }
+
+    #[test]
+    fn blocks_and_masks_empty_username_url_passwords() {
+        // Standard empty-user connection strings: the password is the
+        // credential whether or not a username precedes the colon.
+        for password in ["a", "ab", "%40", "密码"] {
+            let content =
+                format!("gate backend probe failed: redis://:{password}@internal-host refused");
+
+            let detected = scan(&content).expect("empty-username URL password must be detected");
+            assert_eq!(detected.detector, "url-userinfo");
+            assert!(
+                check(&content).is_err(),
+                "write gate must block {content:?}"
+            );
+            assert_eq!(
+                bounded_masked_log_text(&content),
+                "gate backend probe failed: ***MASKED*** refused",
+                "log boundary must mask {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_colon_at_pairs_outside_the_authority() {
+        // An `@` past the authority boundary is path/query/fragment text,
+        // not userinfo: `host/a:x@next` must not read as user `host/a` with
+        // password `x`.
+        for content in [
+            "see https://host/a:x@next for details",
+            "see https://host?time=12:30@zone for details",
+            "see https://host#frag:1@anchor for details",
+        ] {
+            assert!(
+                check(content).is_ok(),
+                "path/query/fragment `:`+`@` text is not userinfo: {content:?}"
+            );
+            assert_eq!(bounded_masked_log_text(content), content);
+        }
     }
 
     #[test]
