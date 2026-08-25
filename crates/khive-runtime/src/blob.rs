@@ -65,6 +65,26 @@ impl BlobHydrator {
         Arc::clone(&self.raw_store)
     }
 
+    /// Pair a raw store with a budget under an explicitly declared
+    /// blob-runtime mode. `read_only = true` wraps the store so every
+    /// physical mutator refuses while the bounded read surface stays
+    /// available; `false` is [`Self::new`]. Boot paths that decide the blob
+    /// mode from configuration (the blob pack's backend mode, ADR-160 D3)
+    /// construct through this so the decision travels with the hydrator —
+    /// the install seam can then hold hydrator mode against runtime mode
+    /// instead of trusting the caller's pairing.
+    pub fn for_mode(
+        store: Arc<dyn BlobStore>,
+        budget_bytes: u64,
+        read_only: bool,
+    ) -> RuntimeResult<Self> {
+        if read_only {
+            Self::new_read_only(store, budget_bytes)
+        } else {
+            Self::new(store, budget_bytes)
+        }
+    }
+
     /// Pair one store with one aggregate byte budget.
     pub fn new(store: Arc<dyn BlobStore>, budget_bytes: u64) -> RuntimeResult<Self> {
         let raw = Arc::clone(&store);

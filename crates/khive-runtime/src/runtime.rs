@@ -1050,6 +1050,10 @@ impl KhiveRuntime {
         // `BlobHydrator::new` is public, so without it a caller pairs a writable
         // store, installs it here, and `blob_store()` hands mutating pack paths
         // a writable store on a runtime whose declared mode is read-only.
+        // Boot paths installing one hydrator across handles of MIXED modes —
+        // where the blob pack's own backend mode, not each receiving
+        // handle's, governs mutability — go through
+        // [`Self::install_shared_blob_hydrator`] instead.
         if self.is_read_only() && !hydrator.enforces_read_only() {
             return Err(RuntimeError::InvalidInput(
                 "this runtime is read-only: install the raw store with install_blob_store, \
@@ -1057,8 +1061,61 @@ impl KhiveRuntime {
                     .to_string(),
             ));
         }
+        self.install_blob_hydrator_slot(hydrator)
+    }
+
+    /// Install a boot-shared hydrator whose mutability is governed by the
+    /// blob runtime's own mode, not this handle's domain-store mode.
+    ///
+    /// ADR-160 D3 installs one hydrator `Arc` on every runtime handle a boot
+    /// produces, and the documented multi-backend matrix includes a writable
+    /// blob secondary beside a read-only main: there the shared hydrator is
+    /// legitimately writable on a read-only domain handle. The mode decision
+    /// must therefore already be encoded in the hydrator — construct it with
+    /// [`crate::BlobHydrator::for_mode`] from the blob pack's backend mode.
+    /// Direct callers that did not make that configuration decision use
+    /// [`Self::install_blob_hydrator`], which holds hydrator mode against
+    /// this runtime's own.
+    pub fn install_shared_blob_hydrator(
+        &self,
+        hydrator: Arc<crate::blob::BlobHydrator>,
+    ) -> RuntimeResult<()> {
+        if hydrator.budget_bytes() != self.config.blob_hydration_bytes {
+            return Err(RuntimeError::InvalidInput(format!(
+                "blob hydrator budget {} does not match this runtime's resolved budget {}",
+                hydrator.budget_bytes(),
+                self.config.blob_hydration_bytes
+            )));
+        }
+        self.install_blob_hydrator_slot(hydrator)
+    }
+
+    /// Whether `candidate` is the same pairing as the installed `current`:
+    /// the exact `Arc`, or a distinct hydrator allocation over the same raw
+    /// store with the same budget and mode. The latter arises when two
+    /// concurrent first installs each construct a hydrator from one raw
+    /// store — the `OnceLock` loser must read as idempotent, not as a
+    /// conflicting install.
+    fn is_same_blob_pairing(
+        current: &Arc<crate::blob::BlobHydrator>,
+        candidate: &Arc<crate::blob::BlobHydrator>,
+    ) -> bool {
+        Arc::ptr_eq(current, candidate)
+            || (Arc::ptr_eq(&current.raw_store(), &candidate.raw_store())
+                && current.budget_bytes() == candidate.budget_bytes()
+                && current.enforces_read_only() == candidate.enforces_read_only())
+    }
+
+    /// One-shot slot semantics shared by both install seams: first install
+    /// wins, an equivalent pairing is idempotent, a different pairing is
+    /// refused (replacing it would split or reset the aggregate admission
+    /// budget while requests may still hold leases).
+    fn install_blob_hydrator_slot(
+        &self,
+        hydrator: Arc<crate::blob::BlobHydrator>,
+    ) -> RuntimeResult<()> {
         if let Some(current) = self.blob_hydrator.get() {
-            return if Arc::ptr_eq(current, &hydrator) {
+            return if Self::is_same_blob_pairing(current, &hydrator) {
                 Ok(())
             } else {
                 Err(RuntimeError::InvalidInput(
@@ -1075,7 +1132,7 @@ impl KhiveRuntime {
                         "blob hydrator install raced without a visible winner".to_string(),
                     )
                 })?;
-                if Arc::ptr_eq(current, &candidate) {
+                if Self::is_same_blob_pairing(current, &candidate) {
                     Ok(())
                 } else {
                     Err(RuntimeError::InvalidInput(
@@ -2098,8 +2155,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn install_blob_store_on_read_only_runtime_refuses_mutators() {
+    /// Build a migrated database and reopen it read-only, returning the
+    /// tempdir that keeps it alive alongside the runtime.
+    fn make_read_only_runtime() -> (tempfile::TempDir, KhiveRuntime) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read_only_blob_seam.db");
         let config = RuntimeConfig {
@@ -2137,6 +2195,12 @@ mod tests {
         }
         let runtime = KhiveRuntime::new_readonly(config).expect("read-only boot");
         assert!(runtime.is_read_only());
+        (dir, runtime)
+    }
+
+    #[tokio::test]
+    async fn install_blob_store_on_read_only_runtime_refuses_mutators() {
+        let (_dir, runtime) = make_read_only_runtime();
 
         // Control: the raw store IS writable — seed an object through it —
         // so the refusal below can only come from the install-seam wrap.
@@ -2194,6 +2258,85 @@ mod tests {
             err.to_string().contains("read-only"),
             "refusal must name the mode: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn mode_aware_hydrator_constructor_satisfies_read_only_install() {
+        // The boot path constructs its hydrator with `for_mode` from the
+        // blob runtime's configured mode; a read-only construction must pass
+        // the read-only install gate, serve bounded reads, refuse mutation,
+        // and treat a second hydrator allocation over the same raw store as
+        // the same pairing (the concurrent-first-install loser shape).
+        let (_dir, runtime) = make_read_only_runtime();
+        let blob_root = tempfile::tempdir().unwrap();
+        let raw = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+                .expect("fs blob store"),
+        ) as Arc<dyn khive_storage::BlobStore>;
+        let seeded = raw.put(b"seed".to_vec()).await.expect("seed put");
+        let hydrator = Arc::new(
+            crate::BlobHydrator::for_mode(
+                Arc::clone(&raw),
+                crate::DEFAULT_BLOB_HYDRATION_BYTES,
+                true,
+            )
+            .expect("mode-aware read-only construction"),
+        );
+        runtime
+            .install_blob_hydrator(hydrator)
+            .expect("a for_mode(read_only) hydrator must pass the read-only gate");
+        let installed = runtime.blob_store().expect("installed store");
+        assert!(installed.exists(&seeded).await.expect("exists"));
+        installed
+            .put(b"post".to_vec())
+            .await
+            .expect_err("mutation must refuse through the wrapped store");
+
+        // A DISTINCT hydrator allocation over the same raw store, budget,
+        // and mode is the same pairing: installing it must be idempotent,
+        // not a conflicting-install error.
+        let twin = Arc::new(
+            crate::BlobHydrator::for_mode(
+                Arc::clone(&raw),
+                crate::DEFAULT_BLOB_HYDRATION_BYTES,
+                true,
+            )
+            .expect("twin construction"),
+        );
+        runtime
+            .install_blob_hydrator(twin)
+            .expect("an equivalent pairing must read as idempotent");
+    }
+
+    #[tokio::test]
+    async fn shared_install_permits_writable_hydrator_on_read_only_handle() {
+        // The documented multi-backend matrix includes a writable blob
+        // secondary beside a read-only main: boot installs ONE writable
+        // hydrator on every handle, including read-only ones. The plain
+        // seam must still refuse that pairing — only the named shared seam
+        // accepts it, and mutation must then actually work.
+        let (_dir, runtime) = make_read_only_runtime();
+        let blob_root = tempfile::tempdir().unwrap();
+        let raw = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+                .expect("fs blob store"),
+        ) as Arc<dyn khive_storage::BlobStore>;
+        let hydrator = Arc::new(
+            crate::BlobHydrator::for_mode(raw, crate::DEFAULT_BLOB_HYDRATION_BYTES, false)
+                .expect("writable construction"),
+        );
+        runtime
+            .install_blob_hydrator(Arc::clone(&hydrator))
+            .expect_err("the plain seam must refuse a writable hydrator on a read-only handle");
+        runtime
+            .install_shared_blob_hydrator(hydrator)
+            .expect("the shared seam carries the blob runtime's own mode");
+        let installed = runtime.blob_store().expect("installed store");
+        let put = installed
+            .put(b"shared-write".to_vec())
+            .await
+            .expect("the shared writable capability must actually mutate");
+        assert!(installed.exists(&put).await.expect("exists"));
     }
 
     /// A `~/`-prefixed `--db`/`KHIVE_DB` override must resolve, boot, and
