@@ -1547,6 +1547,15 @@ impl std::fmt::Debug for SplitEventStore {
 }
 
 impl SplitEventStore {
+    /// Bound on `offset + limit` for a merged `query_events` window. Offset
+    /// pagination over two stores materializes the whole prefix in memory
+    /// (see `query_events`), so an unbounded offset would let a single
+    /// request buffer both stores wholesale. The bound comfortably admits
+    /// the largest legitimate bounded window in the tree
+    /// (`brain.event_counts`' 50k page); deep walks page with a `before`
+    /// cursor at `offset: 0`, which never grows the materialized prefix.
+    pub const MAX_MERGED_WINDOW_ROWS: u64 = 100_000;
+
     pub fn new(legacy: Arc<dyn EventStore>, lane: Arc<dyn EventStore>) -> Self {
         Self { legacy, lane }
     }
@@ -1583,15 +1592,28 @@ impl EventStore for SplitEventStore {
         // floor for offset semantics over two sources, since the split point
         // is unknowable without both prefixes. The sort below is a single
         // merge pass in practice (std's stable sort is adaptive on the
-        // concatenation of two sorted runs). Deep-offset callers wanting
-        // better pay for cursor pagination, tracked with the split's other
-        // deferred work.
+        // concatenation of two sorted runs). That materialization is why the
+        // window is bounded below: without a bound, one authenticated
+        // request with a pathological offset would make both stores buffer
+        // and sort every matching row. Deep walks page with a `before`
+        // cursor (strict `created_at <` bound in `EventFilter`) at
+        // `offset: 0`, which stays inside the bound at any depth.
+        let window = page.offset.saturating_add(u64::from(page.limit));
+        if window > Self::MAX_MERGED_WINDOW_ROWS {
+            return Err(StorageError::InvalidInput {
+                capability: khive_storage::StorageCapability::Events,
+                operation: "query_events".into(),
+                message: format!(
+                    "offset+limit ({window}) exceeds the merged event plane's window bound \
+                     of {}; page deep windows with a `before` cursor at offset 0, or narrow \
+                     the filter",
+                    Self::MAX_MERGED_WINDOW_ROWS
+                ),
+            });
+        }
         let prefix = PageRequest {
             offset: 0,
-            limit: page
-                .offset
-                .saturating_add(u64::from(page.limit))
-                .min(u64::from(u32::MAX)) as u32,
+            limit: window.min(u64::from(u32::MAX)) as u32,
         };
         let legacy = self
             .legacy
@@ -1633,11 +1655,99 @@ impl EventStore for SplitEventStore {
         &self,
         events: Vec<Event>,
     ) -> StorageResult<IdempotentEventBatchResult> {
-        self.lane.append_events_idempotent(events).await
+        // A retried batch may have landed — fully or partially — on the
+        // legacy store before the split cutover, and merged reads stay
+        // duplicate-free only while an id lives in exactly one store. Probe
+        // the legacy store for the batch's ids and route resident rows back
+        // through the legacy store's own idempotent machinery, which compares
+        // every persisted column without re-inserting; only genuinely new
+        // rows reach the lane. Without the probe, a legacy-resident id would
+        // be inserted a second time into the lane and every merged query and
+        // count would double-count it.
+        if events.is_empty() {
+            return self.lane.append_events_idempotent(events).await;
+        }
+        let ids: Vec<Uuid> = events.iter().map(|event| event.id).collect();
+        let probe_limit = u32::try_from(ids.len()).map_err(|_| StorageError::InvalidInput {
+            capability: khive_storage::StorageCapability::Events,
+            operation: "append_events_idempotent".into(),
+            message: format!(
+                "batch of {} rows exceeds the legacy probe window",
+                ids.len()
+            ),
+        })?;
+        let existing = self
+            .legacy
+            .query_events(
+                EventFilter {
+                    ids,
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: probe_limit,
+                },
+            )
+            .await?;
+        let legacy_resident: std::collections::HashSet<Uuid> =
+            existing.items.iter().map(|event| event.id).collect();
+        if legacy_resident.is_empty() {
+            return self.lane.append_events_idempotent(events).await;
+        }
+        let mut legacy_rows = Vec::new();
+        let mut lane_rows = Vec::new();
+        let mut routed_to_legacy = Vec::with_capacity(events.len());
+        for event in events {
+            if legacy_resident.contains(&event.id) {
+                routed_to_legacy.push(true);
+                legacy_rows.push(event);
+            } else {
+                routed_to_legacy.push(false);
+                lane_rows.push(event);
+            }
+        }
+        let legacy_expected = legacy_rows.len();
+        let lane_expected = lane_rows.len();
+        let legacy_result = self.legacy.append_events_idempotent(legacy_rows).await?;
+        let lane_result = if lane_expected == 0 {
+            IdempotentEventBatchResult { rows: Vec::new() }
+        } else {
+            self.lane.append_events_idempotent(lane_rows).await?
+        };
+        if legacy_result.rows.len() != legacy_expected || lane_result.rows.len() != lane_expected {
+            return Err(StorageError::Driver {
+                capability: khive_storage::StorageCapability::Events,
+                operation: "append_events_idempotent".into(),
+                source: format!(
+                    "idempotent sub-batch result length mismatch: legacy {}/{}, lane {}/{}",
+                    legacy_result.rows.len(),
+                    legacy_expected,
+                    lane_result.rows.len(),
+                    lane_expected
+                )
+                .into(),
+            });
+        }
+        let mut legacy_iter = legacy_result.rows.into_iter();
+        let mut lane_iter = lane_result.rows.into_iter();
+        let rows = routed_to_legacy
+            .into_iter()
+            .map(|to_legacy| {
+                if to_legacy {
+                    legacy_iter.next().expect("length checked above")
+                } else {
+                    lane_iter.next().expect("length checked above")
+                }
+            })
+            .collect();
+        Ok(IdempotentEventBatchResult { rows })
     }
 
     fn supports_idempotent_audit_batch(&self) -> bool {
-        self.lane.supports_idempotent_audit_batch()
+        // The legacy-resident probe above routes retried rows through the
+        // legacy store's idempotent path, so the split supports the audit
+        // batch only when BOTH stores do.
+        self.lane.supports_idempotent_audit_batch() && self.legacy.supports_idempotent_audit_batch()
     }
 }
 
@@ -1782,6 +1892,125 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn split_retry_event(verb: &str) -> Event {
+        Event::new(
+            "test",
+            verb,
+            khive_types::EventKind::RecallExecuted,
+            khive_types::SubstrateKind::Note,
+            "agent:test",
+        )
+    }
+
+    fn store_pair(dir: &Path) -> (Arc<dyn EventStore>, Arc<dyn EventStore>) {
+        let legacy = direct_backend_for(&dir.join("legacy.db"))
+            .expect("legacy backend")
+            .events_for_namespace("test")
+            .expect("legacy store");
+        let lane = direct_backend_for(&dir.join("lane.db"))
+            .expect("lane backend")
+            .events_for_namespace("test")
+            .expect("lane store");
+        (legacy, lane)
+    }
+
+    /// A retried audit batch whose first attempt landed on the legacy store
+    /// before the cutover must be answered by the legacy store's comparison,
+    /// never re-inserted into the lane — otherwise merged reads and counts
+    /// double-count the id.
+    #[tokio::test]
+    async fn idempotent_retry_of_legacy_resident_rows_does_not_duplicate() {
+        use khive_storage::event::EventAppendDisposition;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (legacy, lane) = store_pair(dir.path());
+
+        let resident = split_retry_event("recall");
+        legacy
+            .append_events_idempotent(vec![resident.clone()])
+            .await
+            .expect("pre-cutover landing");
+
+        let split = SplitEventStore::new(Arc::clone(&legacy), Arc::clone(&lane));
+        let fresh = split_retry_event("search");
+        let result = split
+            .append_events_idempotent(vec![resident.clone(), fresh.clone()])
+            .await
+            .expect("mixed retry batch");
+        assert_eq!(
+            result.rows,
+            vec![
+                EventAppendDisposition::AlreadyPresentIdentical,
+                EventAppendDisposition::Inserted,
+            ],
+            "input order must be preserved across the two sub-batches"
+        );
+        assert_eq!(
+            lane.count_events(EventFilter::default()).await.unwrap(),
+            1,
+            "the legacy-resident row must not reach the lane"
+        );
+        assert_eq!(
+            split.count_events(EventFilter::default()).await.unwrap(),
+            2,
+            "merged count must not double-count the retried id"
+        );
+
+        // A conflicting retry of the resident row reports the conflict from
+        // the legacy comparison and inserts nowhere.
+        let mut mutated = resident.clone();
+        mutated.verb = "other".to_string();
+        let conflict = split
+            .append_events_idempotent(vec![mutated])
+            .await
+            .expect("conflicting retry");
+        assert_eq!(
+            conflict.rows,
+            vec![EventAppendDisposition::IdentityConflict]
+        );
+        assert_eq!(split.count_events(EventFilter::default()).await.unwrap(), 2);
+    }
+
+    /// The merged plane refuses to materialize an unbounded offset prefix;
+    /// the refusal names the cursor remedy, and the bound itself is usable.
+    #[tokio::test]
+    async fn merged_offset_window_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (legacy, lane) = store_pair(dir.path());
+        let split = SplitEventStore::new(legacy, lane);
+
+        let err = split
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: SplitEventStore::MAX_MERGED_WINDOW_ROWS,
+                    limit: 1,
+                },
+            )
+            .await
+            .expect_err("a window past the bound must be refused");
+        assert!(
+            matches!(err, StorageError::InvalidInput { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("before"),
+            "the refusal must name the cursor remedy: {err}"
+        );
+
+        let at_bound = split
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: SplitEventStore::MAX_MERGED_WINDOW_ROWS - 1,
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("a window at the bound is admitted");
+        assert!(at_bound.items.is_empty());
     }
 
     #[cfg(unix)]

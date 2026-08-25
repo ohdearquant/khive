@@ -619,15 +619,109 @@ impl KhiveRuntime {
     }
 
     /// Get an EventStore scoped to the token's namespace.
+    ///
+    /// When the events-daemon split (ADR-170) is configured, the store routes
+    /// by append class: the ADR-133 idempotent audit-batch lane — the
+    /// measured bulk of event write volume — persists to the events database
+    /// (forwarded over the events daemon socket in daemon deployments, or
+    /// opened directly in embedded/one-shot contexts), while plain appends
+    /// stay on this runtime's backend, keeping every raw-SQL consumer of the
+    /// legacy `events` table (schedule provenance, kg projection guards,
+    /// GraphQuery's substrate union) correct by construction. Reads merge
+    /// both stores. Unconfigured runtimes (tests, in-memory) keep the legacy
+    /// main-store behavior.
     pub fn events(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn EventStore>> {
-        Ok(self
+        let legacy = self
             .backend
-            .events_for_namespace(token.namespace().as_str())?)
+            .events_for_namespace(token.namespace().as_str())?;
+        match &self.config.events_split {
+            None => Ok(legacy),
+            Some(split) => {
+                // Read-only is decided before the transport question: a
+                // read-only runtime must neither create nor schema-initialize
+                // an events database, and it must not forward writes to the
+                // events daemon either — a socket in the config describes the
+                // deployment, not this process's authority. Serve merged
+                // reads from a read-only open of the sidecar when it exists
+                // (the storage-layer read-only binding refuses any write that
+                // slips through), and the legacy store alone otherwise: no
+                // sidecar on disk means no lane rows exist, so minting the
+                // file just to read nothing from it would be a write in
+                // disguise.
+                if self.backend.is_read_only() {
+                    if !split.db_path.exists() {
+                        return Ok(legacy);
+                    }
+                    let lane = crate::events_split::direct_backend_read_only_for(&split.db_path)?
+                        .events_for_namespace(token.namespace().as_str())?;
+                    return Ok(Arc::new(crate::events_split::SplitEventStore::new(
+                        legacy, lane,
+                    )));
+                }
+                let lane: Arc<dyn EventStore> = match &split.socket_path {
+                    #[cfg(unix)]
+                    Some(socket) => {
+                        let client = crate::events_split::client_for(socket)?;
+                        Arc::new(crate::events_split::ForwardingEventStore::new(
+                            token.namespace().as_str(),
+                            client,
+                        ))
+                    }
+                    #[cfg(not(unix))]
+                    Some(_socket) => {
+                        return Err(RuntimeError::InvalidInput(
+                            "events-daemon socket forwarding requires a Unix platform; \
+                             configure the events split in direct mode here"
+                                .to_string(),
+                        ));
+                    }
+                    None => crate::events_split::direct_backend_for(&split.db_path)?
+                        .events_for_namespace(token.namespace().as_str())?,
+                };
+                Ok(Arc::new(crate::events_split::SplitEventStore::new(
+                    legacy, lane,
+                )))
+            }
+        }
     }
 
     /// Get the raw SQL access capability (for ad-hoc queries).
     pub fn sql(&self) -> Arc<dyn SqlAccess> {
         self.backend.sql()
+    }
+
+    /// SQL access to the events-split sidecar database for read purposes,
+    /// when the split (ADR-170) is configured and the sidecar exists on
+    /// disk. `None` means every event row lives in the legacy `events`
+    /// table, so a raw-SQL consumer needs no second lookup. Consumers that
+    /// resolve an event by id or hex prefix against `self.sql()` must also
+    /// consult this store on a miss: the audit-batch lane's rows live only
+    /// in the sidecar.
+    ///
+    /// A writable runtime opens the sidecar through the ordinary writable
+    /// binding: WAL supports one-writer-many-readers, and the read-only
+    /// binding's frozen-snapshot guard refuses any sidecar with a live
+    /// writer's `-shm` beside it — exactly the live-deployment case these
+    /// reads exist for. A read-only runtime keeps the read-only open (it
+    /// must neither create nor schema-initialize a sidecar), which serves
+    /// genuinely frozen snapshots and refuses live ones, matching the
+    /// read-only arm of `events()`. Never creates a sidecar as a side
+    /// effect of a read.
+    pub fn events_sidecar_sql_read_only(&self) -> RuntimeResult<Option<Arc<dyn SqlAccess>>> {
+        match &self.config.events_split {
+            None => Ok(None),
+            Some(split) => {
+                if !split.db_path.exists() {
+                    return Ok(None);
+                }
+                let backend = if self.backend.is_read_only() {
+                    crate::events_split::direct_backend_read_only_for(&split.db_path)?
+                } else {
+                    crate::events_split::direct_backend_for(&split.db_path)?
+                };
+                Ok(Some(backend.sql()))
+            }
+        }
     }
 
     /// Get a VectorStore for the configured embedding model, scoped to the token's namespace.
@@ -1787,6 +1881,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1807,12 +1902,77 @@ mod tests {
         assert_eq!(data_dir, dir.path());
     }
 
+    /// A sidecar-only event must resolve through the public hex-prefix path:
+    /// the main-store scan cannot see lane rows, so `resolve_prefix_inner`
+    /// carries a sidecar arm. The pre-insert assert is the control — the
+    /// prefix misses until the lane row exists, so a pass cannot come from
+    /// the legacy scan.
+    #[tokio::test]
+    async fn resolve_prefix_finds_sidecar_only_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("main.db.events.db");
+        let config = RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
+            events_split: Some(crate::events_split::EventsSplitConfig {
+                db_path: sidecar_path.clone(),
+                socket_path: None,
+            }),
+            db_path: Some(dir.path().join("main.db")),
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        };
+        let rt = KhiveRuntime::new(config).expect("file runtime");
+
+        let event = khive_storage::Event::new(
+            "local",
+            "memory.recall",
+            khive_types::EventKind::RecallExecuted,
+            khive_types::SubstrateKind::Note,
+            "agent:test",
+        );
+        let event_id = event.id;
+        let prefix = event_id.to_string()[..8].to_string();
+
+        assert_eq!(
+            rt.resolve_prefix_unfiltered(&prefix)
+                .await
+                .expect("pre-insert resolve"),
+            None,
+            "control: prefix must miss before the lane row exists"
+        );
+
+        let lane = crate::events_split::direct_backend_for(&sidecar_path)
+            .expect("lane backend")
+            .events_for_namespace("local")
+            .expect("lane store");
+        lane.append_event(event).await.expect("lane append");
+
+        assert_eq!(
+            rt.resolve_prefix_unfiltered(&prefix)
+                .await
+                .expect("post-insert resolve"),
+            Some(event_id),
+            "a sidecar-only event id must resolve by hex prefix"
+        );
+    }
+
     #[test]
     fn backend_data_dir_returns_none_for_from_backend_with_memory() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1837,6 +1997,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("test").unwrap(),
@@ -1865,6 +2026,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1935,6 +2097,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2018,6 +2181,7 @@ mod tests {
             let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
+                events_split: None,
                 db_path: Some(db_path),
                 blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),
@@ -2065,6 +2229,7 @@ mod tests {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2232,6 +2397,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2259,6 +2425,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
@@ -2294,6 +2461,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
@@ -2321,6 +2489,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2366,6 +2535,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2398,6 +2568,7 @@ mod tests {
         let base = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: "Asia/Tokyo".parse().unwrap(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2544,6 +2715,7 @@ mod tests {
         RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2623,6 +2795,7 @@ mod tests {
         let main_config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2762,6 +2935,7 @@ mod tests {
             RuntimeConfig {
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
+                events_split: None,
                 db_path: None,
                 blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),
