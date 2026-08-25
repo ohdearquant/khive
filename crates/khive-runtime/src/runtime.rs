@@ -690,6 +690,27 @@ impl KhiveRuntime {
         self.backend.sql()
     }
 
+    /// Read-only SQL access to the events-split sidecar database, when the
+    /// split (ADR-170) is configured and the sidecar exists on disk. `None`
+    /// means every event row lives in the legacy `events` table, so a
+    /// raw-SQL consumer needs no second lookup. Consumers that resolve an
+    /// event by id against `self.sql()` must also consult this store on a
+    /// miss: the audit-batch lane's rows live only in the sidecar. The open
+    /// is read-only and never creates or schema-initializes a sidecar as a
+    /// side effect of a read.
+    pub fn events_sidecar_sql_read_only(&self) -> RuntimeResult<Option<Arc<dyn SqlAccess>>> {
+        match &self.config.events_split {
+            None => Ok(None),
+            Some(split) => {
+                if !split.db_path.exists() {
+                    return Ok(None);
+                }
+                let backend = crate::events_split::direct_backend_read_only_for(&split.db_path)?;
+                Ok(Some(backend.sql()))
+            }
+        }
+    }
+
     /// Get a VectorStore for the configured embedding model, scoped to the token's namespace.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is set.

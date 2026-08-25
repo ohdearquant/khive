@@ -7,6 +7,16 @@ import {
 } from "@/lib/showcase-registry";
 
 describe("showcase registry", () => {
+  it("resolves a curated analysis id before URL validation", () => {
+    const result = resolveShowcaseRepository("khive");
+
+    expect(result.status).toBe("hit");
+    if (result.status === "hit") {
+      expect(result.entry.id).toBe("github.com/ohdearquant/khive");
+      expect(result.normalizedUrl).toBe("https://github.com/ohdearquant/khive");
+    }
+  });
+
   it.each([
     "https://github.com/ohdearquant/khive",
     "https://github.com/ohdearquant/khive/",

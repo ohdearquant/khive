@@ -2843,106 +2843,76 @@ pub(crate) async fn fetch_event_counts_window_exhaustive(
         )));
     }
 
-    // Keyset pagination, not offset pagination: every page is fetched at
-    // offset 0 with the window's upper bound (`before`) walked downward to
-    // just past the oldest row already collected. Offset pagination makes the
-    // store materialize and discard an offset-sized prefix per page — O(N²)
-    // rows over the loop, and quadratically worse against the split event
-    // plane (ADR-170), where each side must produce the full prefix for the
-    // merge. Keyset keeps every page O(page_size) on both stores.
+    // Walk the window with a descending `before` cursor instead of a growing
+    // offset. Every query runs at `offset: 0`, so page k never re-skips
+    // pages 1..k — the walk is linear over the window on a single-store
+    // backend, and on the merged events-split store it stays inside that
+    // store's bounded materialization window at any depth (a growing offset
+    // there would materialize an ever-larger two-store prefix per page,
+    // quadratic in total, and eventually hit the merged window bound).
     //
-    // `before` is exclusive at microsecond granularity and `created_at` is
-    // not unique, so consecutive windows deliberately overlap on the boundary
-    // microsecond (`before = oldest_seen + 1`) and rows already collected at
-    // that timestamp are dropped by id. A page that admits nothing new means
-    // one microsecond holds more rows than a whole page — a real shape, not
-    // a corner case: an idempotent audit batch stamps every row in one
-    // transaction, so bursts routinely share a created_at. That one cluster
-    // is drained with offset pagination scoped to exactly its microsecond
-    // (bounded by the exhaustive cap checked above), then the keyset walk
-    // resumes below it.
+    // `before` is a strict `created_at <` bound, so stepping the cursor to
+    // the last row's timestamp would drop rows sharing that microsecond
+    // beyond the page edge. Step to `last.created_at + 1` instead — which
+    // re-admits the boundary microsecond — and drop the re-read rows by id.
+    // Aggregation is order-independent, so delivery order across pages does
+    // not matter; each row must simply arrive exactly once.
     let mut items: Vec<Event> = Vec::new();
-    let mut filter = base_filter.clone();
-    let mut boundary_ts: Option<i64> = None;
+    let mut cursor: Option<i64> = base_filter.before;
+    let mut boundary_at: Option<i64> = None;
     let mut boundary_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    let mut fetch_limit = page_size.max(1);
     loop {
+        let mut filter = base_filter.clone();
+        filter.before = cursor;
         let page = store
             .query_events(
-                filter.clone(),
+                filter,
                 PageRequest {
                     offset: 0,
-                    limit: page_size,
+                    limit: fetch_limit,
                 },
             )
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        let page_len = page.items.len() as u64;
-        let mut admitted = 0u64;
-        for event in page.items {
-            if boundary_ts == Some(event.created_at) && boundary_ids.contains(&event.id) {
-                continue;
+        let fetched = page.items.len() as u64;
+        let fresh: Vec<Event> = page
+            .items
+            .into_iter()
+            .filter(|event| !boundary_ids.contains(&event.id))
+            .collect();
+        if fresh.is_empty() {
+            if fetched < u64::from(fetch_limit) {
+                // The store returned everything under the cursor and all of
+                // it was already collected: the window is exhausted.
+                break;
             }
-            items.push(event);
-            admitted += 1;
-        }
-        if page_len < page_size as u64 {
-            break;
-        }
-        if admitted == 0 {
-            let ts =
-                boundary_ts.expect("a zero-admission page implies a prior boundary microsecond");
-            // Drain the cluster at exactly this microsecond with offset
-            // pagination: `after`/`before` are both exclusive, so this
-            // filter matches `created_at == ts` alone. Ordering within one
-            // microsecond is stable for the store's tiebreaker, which makes
-            // offset paging sound here even though it is not across
-            // timestamps.
-            let mut cluster_filter = base_filter.clone();
-            cluster_filter.after = Some(ts.saturating_sub(1));
-            cluster_filter.before = Some(ts.saturating_add(1));
-            let mut cluster_offset = 0u64;
-            loop {
-                let cluster_page = store
-                    .query_events(
-                        cluster_filter.clone(),
-                        PageRequest {
-                            offset: cluster_offset,
-                            limit: page_size,
-                        },
-                    )
-                    .await
-                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-                let cluster_len = cluster_page.items.len() as u64;
-                for event in cluster_page.items {
-                    if boundary_ids.insert(event.id) {
-                        items.push(event);
-                    }
-                }
-                if cluster_len < page_size as u64 {
-                    break;
-                }
-                cluster_offset = cluster_offset.saturating_add(u64::from(page_size));
-            }
-            // Everything at `ts` is collected; resume the keyset walk
-            // strictly below the drained microsecond.
-            filter.before = Some(ts);
+            // A full page of already-collected boundary rows: the tie run at
+            // this microsecond is wider than the page. Widen and re-read.
+            fetch_limit = fetch_limit.saturating_mul(2);
             continue;
         }
-        let oldest = items
+        // Pages come back created_at DESC, so the last fresh row carries the
+        // new boundary microsecond.
+        let boundary = fresh
             .last()
-            .expect("admitted > 0 implies items is non-empty")
-            .created_at;
-        boundary_ts = Some(oldest);
-        boundary_ids = items
-            .iter()
-            .rev()
-            .take_while(|e| e.created_at == oldest)
-            .map(|e| e.id)
-            .collect();
-        // Half-open upper bound: `created_at < oldest + 1` re-admits the
-        // boundary microsecond for the id-dedup above without skipping any
-        // row that shares it.
-        filter.before = Some(oldest.saturating_add(1));
+            .map(|event| event.created_at)
+            .expect("fresh is non-empty");
+        if boundary_at != Some(boundary) {
+            boundary_ids.clear();
+            boundary_at = Some(boundary);
+        }
+        boundary_ids.extend(
+            fresh
+                .iter()
+                .filter(|event| event.created_at == boundary)
+                .map(|event| event.id),
+        );
+        items.extend(fresh);
+        cursor = Some(boundary.saturating_add(1));
+        if fetched < u64::from(fetch_limit) {
+            break;
+        }
     }
 
     let truncated = (items.len() as u64) < window_event_total;
