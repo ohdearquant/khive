@@ -36,9 +36,39 @@ pub struct BlobHydrator {
     /// downcast hook, so the wrapper cannot be recognized after the fact —
     /// the guarantee has to travel with the hydrator that made it.
     read_only: bool,
+    /// True only for hydrators built by
+    /// [`Self::resolve_for_governing_backend`], whose mode was derived from a
+    /// governing backend's own access mode rather than declared by the
+    /// caller. The shared install seam accepts only governed hydrators, so a
+    /// hand-paired writable hydrator cannot ride it onto a read-only
+    /// runtime.
+    governed: bool,
     admission: Arc<tokio::sync::Semaphore>,
     budget_bytes: u64,
 }
+
+/// Error from [`BlobHydrator::resolve_for_governing_backend`], split so boot
+/// can distinguish store resolution failures (which fall back to "no blob
+/// configured" when `[storage.blob]` is absent) from budget pairing failures
+/// (always fatal).
+#[derive(Debug)]
+pub enum GovernedBlobError {
+    /// The configured store could not be resolved for the governing mode.
+    Resolve(SqliteError),
+    /// The resolved store could not be paired with the hydration budget.
+    Construct(RuntimeError),
+}
+
+impl std::fmt::Display for GovernedBlobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resolve(error) => write!(f, "blob store resolution: {error}"),
+            Self::Construct(error) => write!(f, "blob hydrator construction: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GovernedBlobError {}
 
 impl BlobHydrator {
     /// Pair the raw store with a budget, refusing every physical mutator:
@@ -85,6 +115,39 @@ impl BlobHydrator {
         }
     }
 
+    /// Resolve the configured store and pair it with the budget under the
+    /// mode of the backend that GOVERNS blob mutability — the backend the
+    /// blob pack maps to (ADR-160 D3), which on single-backend boots is the
+    /// runtime's own backend.
+    ///
+    /// The mode is derived here from `governing_backend`'s own access mode,
+    /// never accepted as a caller-declared flag, and the hydrator is stamped
+    /// as governed. [`crate::KhiveRuntime::install_shared_blob_hydrator`]
+    /// accepts only governed hydrators: a caller wanting a writable shared
+    /// hydrator must actually hold a writable governing backend, which is
+    /// the sanctioned mixed-mode topology rather than a bypass of a
+    /// read-only handle's guarantee.
+    pub fn resolve_for_governing_backend(
+        cfg: &KhiveConfig,
+        resolve_backend: &StorageBackend,
+        governing_backend: &StorageBackend,
+        budget_bytes: u64,
+    ) -> Result<Self, GovernedBlobError> {
+        let read_only = governing_backend.is_read_only();
+        let store = resolve_blob_store_for_mode(cfg, resolve_backend, read_only)
+            .map_err(GovernedBlobError::Resolve)?;
+        let mut hydrator =
+            Self::for_mode(store, budget_bytes, read_only).map_err(GovernedBlobError::Construct)?;
+        hydrator.governed = true;
+        Ok(hydrator)
+    }
+
+    /// Whether this hydrator's mode was derived from a governing backend
+    /// (see [`Self::resolve_for_governing_backend`]).
+    pub(crate) fn is_governed(&self) -> bool {
+        self.governed
+    }
+
     /// Pair one store with one aggregate byte budget.
     pub fn new(store: Arc<dyn BlobStore>, budget_bytes: u64) -> RuntimeResult<Self> {
         let raw = Arc::clone(&store);
@@ -117,6 +180,7 @@ impl BlobHydrator {
             store,
             raw_store,
             read_only: false,
+            governed: false,
             admission: Arc::new(tokio::sync::Semaphore::new(permits)),
             budget_bytes,
         })

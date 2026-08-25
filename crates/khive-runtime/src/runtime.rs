@@ -1071,15 +1071,27 @@ impl KhiveRuntime {
     /// produces, and the documented multi-backend matrix includes a writable
     /// blob secondary beside a read-only main: there the shared hydrator is
     /// legitimately writable on a read-only domain handle. The mode decision
-    /// must therefore already be encoded in the hydrator — construct it with
-    /// [`crate::BlobHydrator::for_mode`] from the blob pack's backend mode.
-    /// Direct callers that did not make that configuration decision use
+    /// must therefore already be encoded in the hydrator, and it must have
+    /// been DERIVED, not declared: only hydrators built through
+    /// [`crate::BlobHydrator::resolve_for_governing_backend`] — whose mode
+    /// comes from the governing backend's own access mode — are accepted
+    /// here. A hand-paired hydrator (`BlobHydrator::new` / `for_mode`) is
+    /// refused so a safe downstream caller cannot use this seam to put a
+    /// writable store on a read-only runtime; such callers use
     /// [`Self::install_blob_hydrator`], which holds hydrator mode against
     /// this runtime's own.
     pub fn install_shared_blob_hydrator(
         &self,
         hydrator: Arc<crate::blob::BlobHydrator>,
     ) -> RuntimeResult<()> {
+        if !hydrator.is_governed() {
+            return Err(RuntimeError::InvalidInput(
+                "the shared install seam accepts only hydrators whose mode was derived from a \
+                 governing backend (BlobHydrator::resolve_for_governing_backend); use \
+                 install_blob_hydrator for a hand-paired hydrator"
+                    .to_string(),
+            ));
+        }
         if hydrator.budget_bytes() != self.config.blob_hydration_bytes {
             return Err(RuntimeError::InvalidInput(format!(
                 "blob hydrator budget {} does not match this runtime's resolved budget {}",
@@ -2309,33 +2321,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_install_permits_writable_hydrator_on_read_only_handle() {
+    async fn shared_install_permits_governed_writable_hydrator_on_read_only_handle() {
         // The documented multi-backend matrix includes a writable blob
         // secondary beside a read-only main: boot installs ONE writable
         // hydrator on every handle, including read-only ones. The plain
-        // seam must still refuse that pairing — only the named shared seam
-        // accepts it, and mutation must then actually work.
+        // seam must still refuse that pairing, and the shared seam accepts
+        // it ONLY when the hydrator's mode was derived from a governing
+        // backend — a hand-paired writable hydrator is refused too, so a
+        // safe downstream caller cannot use the shared seam to defeat a
+        // read-only handle's guarantee.
         let (_dir, runtime) = make_read_only_runtime();
         let blob_root = tempfile::tempdir().unwrap();
         let raw = Arc::new(
             khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
                 .expect("fs blob store"),
         ) as Arc<dyn khive_storage::BlobStore>;
-        let hydrator = Arc::new(
+        let hand_paired = Arc::new(
             crate::BlobHydrator::for_mode(raw, crate::DEFAULT_BLOB_HYDRATION_BYTES, false)
                 .expect("writable construction"),
         );
         runtime
-            .install_blob_hydrator(Arc::clone(&hydrator))
+            .install_blob_hydrator(Arc::clone(&hand_paired))
             .expect_err("the plain seam must refuse a writable hydrator on a read-only handle");
         runtime
-            .install_shared_blob_hydrator(hydrator)
-            .expect("the shared seam carries the blob runtime's own mode");
+            .install_shared_blob_hydrator(hand_paired)
+            .expect_err("the shared seam must refuse a hand-paired (ungoverned) hydrator");
+
+        // The sanctioned path: a WRITABLE governing backend (the blob pack's
+        // backend in the mixed-mode topology) derives a governed writable
+        // hydrator, and the shared seam installs it on the read-only handle.
+        let governing = khive_db::StorageBackend::memory().expect("memory backend");
+        let cfg = crate::KhiveConfig {
+            storage: crate::engine_config::StorageSectionConfig {
+                blob: Some(crate::engine_config::BlobConfig::Fs {
+                    root: Some(blob_root.path().to_string_lossy().into_owned()),
+                    floor_bytes: Some(0),
+                }),
+            },
+            ..crate::KhiveConfig::default()
+        };
+        let governed = Arc::new(
+            crate::BlobHydrator::resolve_for_governing_backend(
+                &cfg,
+                &governing,
+                &governing,
+                crate::DEFAULT_BLOB_HYDRATION_BYTES,
+            )
+            .expect("governed construction"),
+        );
+        runtime
+            .install_shared_blob_hydrator(governed)
+            .expect("the shared seam accepts a governed hydrator");
         let installed = runtime.blob_store().expect("installed store");
         let put = installed
             .put(b"shared-write".to_vec())
             .await
-            .expect("the shared writable capability must actually mutate");
+            .expect("the governed writable capability must actually mutate");
         assert!(installed.exists(&put).await.expect("exists"));
     }
 

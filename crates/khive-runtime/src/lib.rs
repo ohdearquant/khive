@@ -57,7 +57,7 @@ pub use atomic_runner::{
     CommittedPostCommitEffects,
 };
 pub use blob::{
-    resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, VerifiedBlob,
+    resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, GovernedBlobError, VerifiedBlob,
     DEFAULT_BLOB_HYDRATION_BYTES,
 };
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
