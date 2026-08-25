@@ -128,6 +128,12 @@ const MAX_INFLIGHT_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(unix)]
 const MAX_CACHED_NAMESPACE_STORES: usize = 1024;
 
+/// Symlink-chain hop ceiling for events-path resolution. Matches the bound
+/// the daemon's socket-path traversal guard enforces, which is itself the
+/// kernel's total-links ceiling on Linux (40): both resolvers must agree,
+/// or a chain one accepts derives a different identity than the other.
+const EVENTS_SYMLINK_HOP_BOUND: u32 = 40;
+
 /// Default events database file, beside the main database file.
 ///
 /// The name is derived from the main database's full file name (`khive.db` →
@@ -173,7 +179,11 @@ pub fn events_db_path_beside(main_db: &Path) -> PathBuf {
 /// which `open()` will refuse anyway.
 fn resolve_dangling_final_component(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
-    for _ in 0..32 {
+    // Same hop bound as the daemon's socket-path traversal guard (and the
+    // kernel's own total-links ceiling on Linux, 40): a chain the kernel
+    // would resolve must derive the target's sidecar, or a 33-hop alias
+    // opens fine yet splits its audit records from the target spelling.
+    for _ in 0..EVENTS_SYMLINK_HOP_BOUND {
         match std::fs::read_link(&current) {
             Ok(target) => {
                 current = if target.is_absolute() {
@@ -301,6 +311,20 @@ fn direct_backend(
     }
     refuse_events_db_symlinks(db_path)
         .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
+    #[cfg(unix)]
+    if !read_only {
+        if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    // Directory trust comes after creation (a fresh parent in a trusted
+    // ancestor must be statable) and before any open: SQLite's open is
+    // path-based, so the only defense against a component swapped between
+    // validation and open is that no untrusted local user can write the
+    // directories the path traverses.
+    #[cfg(unix)]
+    ensure_events_db_parent_trusted(db_path)
+        .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     // Embedded writable mode holds the events database to the daemon's own
     // contract: owner-only from the first byte, never at the process umask,
     // and — because event rows carry the same audit payloads either way — a
@@ -309,9 +333,6 @@ fn direct_backend(
     #[cfg(unix)]
     if !read_only {
         use std::os::unix::fs::OpenOptionsExt;
-        if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -571,6 +592,26 @@ fn refuse_events_db_symlinks(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Require the directory holding the events database to be trusted before
+/// anything opens a path inside it. The symlink pre-checks and the fd-pinned
+/// chmod close the races they can see, but SQLite's own open is path-based
+/// and cannot be inode-pinned from here — so the remaining defense is the
+/// same one the daemon socket uses: no untrusted local user may be able to
+/// write (or swap components of) the directory the path traverses. Delegates
+/// to the socket-path walk, which validates every ancestor the kernel will
+/// visit, with the same ownership and sticky-bit rules.
+#[cfg(unix)]
+fn ensure_events_db_parent_trusted(db_path: &Path) -> anyhow::Result<()> {
+    let parent = absolutize(db_path);
+    let parent = parent.parent().filter(|p| !p.as_os_str().is_empty());
+    match parent {
+        Some(dir) => crate::daemon::ensure_socket_dir_is_trusted(dir).map_err(|e| {
+            anyhow::anyhow!("refusing to serve events from an untrusted directory: {e}")
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Create the events database file owner-only if it does not exist yet.
 /// The 0600 socket and peer-uid admission bound who can *talk to* the
 /// daemon; they bound nothing if the database file itself is readable by
@@ -583,6 +624,9 @@ fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // After creation so a fresh parent can be validated; a directory this
+    // process just created in a trusted ancestor passes by construction.
+    ensure_events_db_parent_trusted(db_path)?;
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -604,7 +648,7 @@ fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
 /// keep its database owner-only must not serve it.
 #[cfg(unix)]
 fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut targets = vec![db_path.to_path_buf()];
     for suffix in ["-wal", "-shm"] {
         let mut name = db_path.as_os_str().to_os_string();
@@ -612,16 +656,35 @@ fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
         targets.push(PathBuf::from(name));
     }
     for path in targets {
-        if !path.exists() {
-            continue;
-        }
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to serve events: cannot chmod 0600 {}: {e}. The events database \
-                 and its sidecars must be owner-only.",
-                path.display()
-            )
-        })?;
+        // Pin the inode before touching it: `O_NOFOLLOW` makes the open
+        // itself refuse a symlink at the final component, and the chmod is
+        // then issued on the returned handle (fchmod), so no path re-lookup
+        // exists between validation and the permission change for a swapped
+        // entry to exploit. A path-based lstat-then-chmod pair here would
+        // re-open the exact race it is defending against.
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                anyhow::bail!(
+                    "refusing to serve events: cannot open {} without following symlinks: \
+                     {e}. The events database and its sidecars must be regular files.",
+                    path.display()
+                )
+            }
+        };
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "refusing to serve events: cannot chmod 0600 {}: {e}. The events \
+                     database and its sidecars must be owner-only.",
+                    path.display()
+                )
+            })?;
     }
     Ok(())
 }
@@ -1934,6 +1997,87 @@ mod tests {
         let regular = dir.path().join("plain.db.events.db");
         direct_backend_for(&regular).expect("regular sidecar path must open");
         assert!(regular.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_symlink_chains_within_the_kernel_bound_derive_the_target_sidecar() {
+        // Linux resolves up to 40 links per lookup; a 35-hop dangling chain
+        // therefore opens fine, so it must ALSO derive the target's sidecar
+        // — a resolver stopping short would split audit records between the
+        // alias and target spellings of one database.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        let mut prev = real.clone();
+        for i in 0..35 {
+            let link = dir.path().join(format!("hop{i}.db"));
+            std::os::unix::fs::symlink(&prev, &link).unwrap();
+            prev = link;
+        }
+        assert_eq!(
+            events_db_path_beside(&prev),
+            events_db_path_beside(&real),
+            "a 35-hop dangling chain must derive the target's sidecar"
+        );
+        // Control: an unrelated dangling path still derives its own name.
+        assert_ne!(
+            events_db_path_beside(&dir.path().join("unrelated.db")),
+            events_db_path_beside(&real)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_parent_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        // SQLite's open is path-based: the only sound defense against a
+        // component swapped after validation is refusing directories other
+        // local users can write. A group/other-writable parent is refused
+        // before any open; an owner-only parent proceeds.
+        let dir = tempfile::tempdir().unwrap();
+        let open_dir = dir.path().join("shared");
+        std::fs::create_dir(&open_dir).unwrap();
+        std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = direct_backend_for(&open_dir.join("khive.db.events.db"));
+        match refused {
+            Ok(_) => panic!("a world-writable events directory must be refused"),
+            Err(e) => assert!(
+                e.to_string().contains("untrusted directory"),
+                "refusal must name the directory trust rule: {e}"
+            ),
+        }
+        // Control: an owner-only sibling directory passes the same gate.
+        let safe_dir = dir.path().join("owned");
+        std::fs::create_dir(&safe_dir).unwrap();
+        std::fs::set_permissions(&safe_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        direct_backend_for(&safe_dir.join("khive.db.events.db"))
+            .expect("an owner-only events directory must open");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_refuses_a_sidecar_symlink_at_use_time() {
+        use std::os::unix::fs::PermissionsExt;
+        // The hardening step must be coupled to its validation: it opens
+        // each target with O_NOFOLLOW and chmods the returned handle, so a
+        // symlink present AT USE TIME is refused by the open itself — no
+        // lstat-then-chmod window — and the link's target keeps its mode.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"v").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let db = dir.path().join("db.events.db");
+        std::fs::write(&db, b"").unwrap();
+        let mut wal = db.as_os_str().to_os_string();
+        wal.push("-wal");
+        std::os::unix::fs::symlink(&victim, PathBuf::from(&wal)).unwrap();
+        let result = harden_events_db_sidecars(&db);
+        assert!(
+            result.is_err(),
+            "a symlinked -wal must be refused at hardening time"
+        );
+        let mode = victim.metadata().unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o644, "the link's target must keep its mode");
     }
 
     #[cfg(unix)]
