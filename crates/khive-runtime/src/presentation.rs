@@ -600,7 +600,11 @@ fn transform_agent(
             let preserve_list_envelope = is_stable_list_envelope(&map);
             let mut out = Map::new();
             for (k, v) in map {
-                let child_inside_properties = inside_properties || k == "properties";
+                // ADR-045 Amendment 3 scopes the empty-string carve-out to
+                // strings nested under an object-valued `properties`; a
+                // scalar or array `properties` value gets no carve-out.
+                let child_inside_properties =
+                    inside_properties || (k == "properties" && v.is_object());
                 let transformed = transform_field_agent(
                     &k,
                     v,
@@ -942,6 +946,19 @@ mod tests {
         assert_eq!(out["properties"]["nested"]["deep"], json!(""));
         // Control: outside `properties` the empty-string drop still applies.
         assert!(out.get("summary").is_none());
+    }
+
+    #[test]
+    fn agent_drops_scalar_empty_properties_value() {
+        // The carve-out applies only to strings nested under an object-valued
+        // `properties`; a scalar `properties: ""` is the field's own value,
+        // not a caller-written key under it, and drops like any empty string.
+        let v = json!({
+            "id": "a1b2c3d4",
+            "properties": "",
+        });
+        let out = agent(v);
+        assert!(out.get("properties").is_none());
     }
 
     #[test]
