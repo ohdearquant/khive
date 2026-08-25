@@ -126,17 +126,22 @@ const MAX_CACHED_NAMESPACE_STORES: usize = 1024;
 /// `khive.db.events.db`), never from its stem and never a fixed name in the
 /// parent directory: two independent databases that happen to share a
 /// directory (`a.db`, `b.db`) — or a stem (`a.db`, `a.sqlite`) — must each
-/// get their own event plane, not silently share one. The parent directory
-/// is canonicalized when it resolves, so path aliases of one database
-/// (relative spellings, symlinked directories) map to one sidecar instead of
-/// minting a distinct events database per spelling.
+/// get their own event plane, not silently share one. The whole path is
+/// canonicalized when the database file exists — final-component symlink
+/// aliases of one database must derive the same sidecar and socket as the
+/// target spelling, because backend identity already treats those aliases as
+/// one database. When the file does not exist yet, the parent directory alone
+/// is canonicalized when it resolves, so path aliases of a fresh database
+/// (relative spellings, symlinked directories) still map to one sidecar
+/// instead of minting a distinct events database per spelling.
 pub fn events_db_path_beside(main_db: &Path) -> PathBuf {
-    let mut name = main_db
+    let resolved = std::fs::canonicalize(main_db).unwrap_or_else(|_| main_db.to_path_buf());
+    let mut name = resolved
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_else(|| std::ffi::OsString::from("khive.db"));
     name.push(".events.db");
-    let path = match main_db.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+    let path = match resolved.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         Some(dir) => std::fs::canonicalize(dir)
             .unwrap_or_else(|_| dir.to_path_buf())
             .join(&name),
@@ -1746,6 +1751,35 @@ mod tests {
             events_db_path_beside(&alias.join("khive.db")),
             "a symlinked spelling of one directory must not mint a second sidecar"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_component_aliases_of_one_database_share_one_sidecar() {
+        // Backend identity canonicalizes the whole database path, so a
+        // final-component symlink alias is the same database; its sidecar
+        // and socket must be the same too, or a process opening one spelling
+        // writes event rows a process opening the other never reads.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        std::fs::write(&real, b"").unwrap();
+        let alias = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let real_sidecar = events_db_path_beside(&real);
+        let alias_sidecar = events_db_path_beside(&alias);
+        assert_eq!(
+            real_sidecar, alias_sidecar,
+            "a symlink alias of one database file must not mint a second event store"
+        );
+        assert_eq!(
+            events_socket_path_beside(&real_sidecar),
+            events_socket_path_beside(&alias_sidecar),
+        );
+        // Control: a genuinely distinct database in the same directory keeps
+        // its own sidecar — resolution must not collapse different files.
+        let other = dir.path().join("other.db");
+        std::fs::write(&other, b"").unwrap();
+        assert_ne!(events_db_path_beside(&other), real_sidecar);
     }
 
     #[test]
