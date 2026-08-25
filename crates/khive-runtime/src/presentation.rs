@@ -687,6 +687,12 @@ fn transform_field_agent(
         {
             Some(value)
         }
+        // Preserve empty strings under a record's `properties` object: those
+        // keys exist only because a caller wrote them, so `""` there is data
+        // (set-to-empty vs absent, ADR-045 Amendment 3, issue #1995). Empty
+        // arrays and objects under `properties` are still dropped per the
+        // amendment's scope note.
+        Value::String(s) if s.is_empty() && context.inside_properties => Some(value),
         // Drop other empty strings, arrays, objects.
         Value::String(s) if s.is_empty() => None,
         Value::Array(a) if a.is_empty() => None,
@@ -918,6 +924,38 @@ mod tests {
 
     fn agent(v: Value) -> Value {
         present(v, PresentationMode::Agent, NOW)
+    }
+
+    #[test]
+    fn agent_preserves_empty_string_under_properties() {
+        // ADR-045 Amendment 3 (issue #1995): a key under `properties` exists
+        // only because a caller wrote it, so `""` there distinguishes
+        // set-to-empty from absent and must survive Agent mode — at any
+        // nesting depth under `properties`.
+        let v = json!({
+            "id": "a1b2c3d4",
+            "summary": "",
+            "properties": {"k": "", "nested": {"deep": ""}},
+        });
+        let out = agent(v);
+        assert_eq!(out["properties"]["k"], json!(""));
+        assert_eq!(out["properties"]["nested"]["deep"], json!(""));
+        // Control: outside `properties` the empty-string drop still applies.
+        assert!(out.get("summary").is_none());
+    }
+
+    #[test]
+    fn agent_still_drops_empty_containers_under_properties() {
+        // The amendment's scope note keeps the container drop: empty arrays
+        // and objects under `properties` are not carved out.
+        let v = json!({
+            "id": "a1b2c3d4",
+            "properties": {"tags": [], "meta": {}, "kept": "x"},
+        });
+        let out = agent(v);
+        assert!(out["properties"].get("tags").is_none());
+        assert!(out["properties"].get("meta").is_none());
+        assert_eq!(out["properties"]["kept"], json!("x"));
     }
 
     #[test]
