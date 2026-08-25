@@ -403,7 +403,13 @@ pub enum EventsResponse {
     /// non-writer storage errors). No second spelling exists: within one
     /// protocol version every storage-class Error frame carries this field,
     /// and cross-version frames never reach this mapping because
-    /// `dispatch_events_request` refuses a mismatched version outright.
+    /// `dispatch_events_request` refuses a mismatched version outright —
+    /// a refusal that happens BEFORE any write executes, so no retryable
+    /// writer state can exist to lose. That guarantee is why
+    /// [`EVENTS_PROTOCOL_VERSION`] must be bumped with any change to this
+    /// field's shape: two shapes sharing one version would make this exact
+    /// sentence false (v2 exists because v1 briefly had a second spelling
+    /// on unreleased development heads).
     Error {
         message: String,
         retryable: bool,
@@ -1374,7 +1380,10 @@ impl ForwardingEventStore {
                     // the retry contract on the client side of the socket.
                     // The field is the single carrier: cross-version frames
                     // never reach this mapping (the daemon refuses a
-                    // mismatched protocol version before dispatch).
+                    // mismatched protocol version before dispatch, and the
+                    // refusal precedes any write, so a version-skewed peer
+                    // has no writer state to lose — the guarantee that
+                    // obligates a version bump on any field-shape change).
                     StorageError::WriterTaskTerminated {
                         request_state: state.into(),
                     }
@@ -1934,6 +1943,36 @@ mod tests {
             .await
             .expect("a window at the bound is admitted");
         assert!(at_bound.items.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stateless_non_retryable_error_maps_terminal_not_writer_terminated() {
+        // The terminal arm of the client mapping, pinned deliberately: an
+        // Error frame with `retryable: false` and NO `writer_task_state` is
+        // a non-writer failure (parse error, version refusal) and must map
+        // to terminal `InvalidInput` — never to `WriterTaskTerminated`
+        // (there is no state to reconstruct) and never to the retryable
+        // `Pool` arm (retrying a version refusal cannot succeed).
+        let client = EventsSplitClient::new(std::path::PathBuf::from("/tmp/never-bound.sock"))
+            .expect("client builds");
+        let store = ForwardingEventStore::new("test", client);
+        let bytes = br#"{"kind":"error","message":"refused","retryable":false}"#;
+        let parsed: EventsResponse = serde_json::from_slice(bytes).expect("frame parses");
+        assert!(matches!(
+            store.unexpected("append", parsed),
+            StorageError::InvalidInput { .. }
+        ));
+        // Control: the same non-retryable frame WITH a writer state must
+        // take the reconstruction arm instead — proving the terminal arm
+        // above is selected by the field's absence, not by `retryable`.
+        let with_state = br#"{"kind":"error","message":"died","retryable":false,"writer_task_state":"side_effects_unknown"}"#;
+        let parsed: EventsResponse =
+            serde_json::from_slice(with_state).expect("stateful frame parses");
+        assert!(matches!(
+            store.unexpected("append", parsed),
+            StorageError::WriterTaskTerminated { .. }
+        ));
     }
 
     #[cfg(unix)]
