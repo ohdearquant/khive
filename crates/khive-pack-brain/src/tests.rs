@@ -7942,6 +7942,116 @@ mod event_counts_tests {
         assert!(!truncated);
     }
 
+    /// Build `count` events sharing one `created_at` for bulk seeding.
+    fn tied_events(namespace: &str, created_at: i64, count: usize) -> Vec<Event> {
+        (0..count)
+            .map(|_| {
+                let mut event = Event::new(
+                    namespace,
+                    "recall",
+                    EventKind::RecallExecuted,
+                    SubstrateKind::Note,
+                    "lambda:a",
+                );
+                event.created_at = created_at;
+                event
+            })
+            .collect()
+    }
+
+    /// A timestamp tie that EXACTLY fills a transport-cap page is pageable:
+    /// once the at-the-cap page comes back all-duplicates, the walk proves
+    /// the tie complete against `count_events` and steps the strict bound to
+    /// the boundary itself, reaching the older rows instead of failing. A
+    /// tie WIDER than the cap must still return the typed dense-tie error.
+    #[tokio::test]
+    async fn exact_cap_timestamp_tie_pages_past_while_wider_tie_errors() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let store = rt.events(&token).expect("event store");
+        let cap = usize::try_from(crate::handlers::TRANSPORT_PAGE_ROWS).unwrap();
+
+        let mut batch = tied_events(token.namespace().as_str(), 5_000_000, cap);
+        batch.extend(tied_events(token.namespace().as_str(), 1_000_000, 1));
+        store.append_events(batch).await.expect("seed cap tie");
+
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let items = crate::handlers::collect_events_cursor_walk(
+            store.as_ref(),
+            &base_filter,
+            crate::handlers::TRANSPORT_PAGE_ROWS,
+            (cap as u64) + 1,
+        )
+        .await
+        .expect("an exactly-cap tie must page past, not error");
+        assert_eq!(items.len(), cap + 1, "the older row must be reached");
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            items.iter().map(|event| event.id).collect();
+        assert_eq!(distinct.len(), cap + 1, "no row may be double-counted");
+
+        // One more row at the tied microsecond pushes the run past the cap:
+        // the walk must now fail with the typed dense-tie error, not loop.
+        store
+            .append_events(tied_events(token.namespace().as_str(), 5_000_000, 1))
+            .await
+            .expect("seed over-cap tie");
+        let err = crate::handlers::collect_events_cursor_walk(
+            store.as_ref(),
+            &base_filter,
+            crate::handlers::TRANSPORT_PAGE_ROWS,
+            (cap as u64) + 2,
+        )
+        .await
+        .expect_err("a tie wider than the cap is unpageable");
+        assert!(
+            err.to_string().contains("share one created_at microsecond"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Rows at `created_at == i64::MAX` admit no exclusive bound above them:
+    /// the cursor must not saturate past them (which would silently skip the
+    /// uncollected remainder of the group) — the walk re-reads, dedups, and
+    /// still reaches every row exactly once, including the older rows.
+    #[tokio::test]
+    async fn max_timestamp_group_is_fully_collected_not_skipped() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let store = rt.events(&token).expect("event store");
+
+        let mut batch = tied_events(token.namespace().as_str(), i64::MAX, 5);
+        batch.extend(tied_events(token.namespace().as_str(), 1_000_000, 2));
+        store.append_events(batch).await.expect("seed max group");
+
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let items = crate::handlers::collect_events_cursor_walk(
+            store.as_ref(),
+            &base_filter,
+            /* page_size = */ 4,
+            /* max_rows = */ 100,
+        )
+        .await
+        .expect("the max-timestamp group must be pageable");
+        assert_eq!(items.len(), 7, "all seven rows must arrive");
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            items.iter().map(|event| event.id).collect();
+        assert_eq!(distinct.len(), 7, "no row may be double-counted");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|event| event.created_at == i64::MAX)
+                .count(),
+            5,
+            "every max-timestamp row must be collected, none skipped"
+        );
+    }
+
     /// The public handler must still identify a successful exhaustive response
     /// as exact; pagination mechanics are covered separately with injected limits.
     #[tokio::test]

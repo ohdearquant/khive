@@ -2736,7 +2736,7 @@ impl BrainPack {
 /// split store's merged read forwards `offset + limit` as one daemon page —
 /// so windows wider than the cap are collected by cursor-walking in pages of
 /// at most this many rows at `offset: 0`, never by one wide request.
-const TRANSPORT_PAGE_ROWS: u32 = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS;
+pub(crate) const TRANSPORT_PAGE_ROWS: u32 = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS;
 
 pub(crate) async fn fetch_event_counts_window(
     store: &dyn khive_storage::event::EventStore,
@@ -2818,7 +2818,7 @@ pub(crate) async fn fetch_event_counts_window(
 /// row must simply arrive exactly once. A timestamp tie run wider than the
 /// transport cap cannot be paged past (widening the page is refused by the
 /// daemon) and is reported as a typed error rather than looping.
-async fn collect_events_cursor_walk(
+pub(crate) async fn collect_events_cursor_walk(
     store: &dyn khive_storage::event::EventStore,
     base_filter: &EventFilter,
     page_size: u32,
@@ -2855,10 +2855,35 @@ async fn collect_events_cursor_walk(
                 break;
             }
             // A full page of already-collected boundary rows: the tie run at
-            // this microsecond is wider than the page. Widen and re-read —
-            // but only up to the transport cap, past which the daemon
-            // refuses the request and the strict cursor cannot advance.
+            // this microsecond fills the page. Widen and re-read — but only
+            // up to the transport cap, past which the daemon refuses the
+            // request.
             if fetch_limit >= TRANSPORT_PAGE_ROWS {
+                // At the cap, distinguish a tie run that exactly fills the
+                // page (fully collected, pageable by stepping the strict
+                // bound to the boundary itself) from one wider than the cap
+                // (genuinely unpageable with a timestamp cursor). Every
+                // collected row is >= the boundary microsecond, so equality
+                // of the at-or-above count with the collected count proves
+                // the run is complete.
+                let boundary = boundary_at.ok_or_else(|| {
+                    RuntimeError::Internal(
+                        "event cursor walk saw duplicate rows before any boundary".to_string(),
+                    )
+                })?;
+                let mut ge_boundary = base_filter.clone();
+                // `after` is a strict `created_at >` bound, so at-or-above
+                // the boundary is `> boundary - 1`. At `i64::MIN` every row
+                // already satisfies at-or-above; keep the base bound.
+                ge_boundary.after = boundary.checked_sub(1).or(base_filter.after);
+                let ge_total = store
+                    .count_events(ge_boundary)
+                    .await
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+                if ge_total == items.len() as u64 {
+                    cursor = Some(boundary);
+                    continue;
+                }
                 return Err(RuntimeError::InvalidInput(format!(
                     "brain.event_counts cannot page this window: more than {fetch_limit} \
                      events share one created_at microsecond, which exceeds the event \
@@ -2886,7 +2911,15 @@ async fn collect_events_cursor_walk(
                 .map(|event| event.id),
         );
         items.extend(fresh);
-        cursor = Some(boundary.saturating_add(1));
+        // `i64::MAX` admits no exclusive bound above it: keep the cursor as
+        // is and re-read — dedup drops the re-admitted rows, and the
+        // at-the-cap completeness check above advances past the boundary (or
+        // reports the dense tie) once a page comes back all-duplicates.
+        cursor = if boundary == i64::MAX {
+            cursor
+        } else {
+            Some(boundary + 1)
+        };
         if fetched < u64::from(fetch_limit) {
             break;
         }
