@@ -1,27 +1,24 @@
-//! ADR-116 gate condition 2: p95 baseline for `memory.recall` on the warm ANN path.
+//! Warm ANN p95 baseline and regression gate for `memory.recall`.
 //!
-//! ADR-116 (PR #1080, in review) defines the warm-hit generation-read gate against a
-//! **file-backed WAL SQLite database with warm page cache "at one and three models"** —
-//! that is the number of embedding models a single `memory.recall` call *queries* (M in
-//! "returning M two-column/one-row records for M queried models"), not the total number
-//! of models registered on the runtime. This harness measures exactly those two gate
-//! configurations, each against its own runtime and database, plus one clearly-labeled
-//! beyond-gate four-model fan-out row kept for context:
+//! The regression gate compares the warm-hit path against a **file-backed WAL SQLite
+//! database with a warm page cache at one and three queried models**. The model count is
+//! the number of embedding models a single `memory.recall` call queries, not the total
+//! registered on the runtime. This harness measures those two configurations, each
+//! against its own runtime and database, plus a clearly labeled four-model fan-out row
+//! for context:
 //!
 //! - **one-model**: one embedding model registered, `memory.recall` queries it explicitly
 //!   (M=1 queried).
 //! - **three-model**: three embedding models registered, `memory.recall` called with no
-//!   `embedding_model` so it fans out to all three (M=3 queried) — this is the ADR-116
-//!   multi-model gate case.
+//!   `embedding_model` so it fans out to all three (M=3 queried).
 //! - **four-model fan-out (beyond gate)**: four embedding models registered (matches the
-//!   corpus this repo actually runs), `memory.recall` fans out to all four. ADR-116 does
-//!   not gate M=4; this row is informational only and must never be read as a "primary"
-//!   or single-model baseline.
+//!   corpus this repo actually runs), `memory.recall` fans out to all four. This row is
+//!   informational only and must never be read as a "primary" or single-model baseline.
 //!
-//! ADR-116 is Proposed, not yet implemented: this harness establishes the pre-change
-//! baseline. Once the durable per-model generation read lands, rerun this bench and diff
-//! against the recorded baseline to confirm the added generation check stays inside the
-//! gate.
+//! Compare a warm-route change against the matching M=1 or M=3 baseline. Added latency
+//! must remain at or below both 1.0ms absolute p95 and 5% of that baseline. ADR-107
+//! governs the memory ANN lifecycle behavior that keeps an installed warm index serving
+//! while freshness maintenance runs in the background.
 //!
 //! ## Warm-route assertion
 //!
@@ -51,15 +48,15 @@
 //! zero-event-count window strong (though not airtight) evidence that none of the timed
 //! samples took the exact-fallback path either.
 //!
-//! One wrinkle: a per-model durable-epoch debounce check (`maybe_check_durable_epoch`,
-//! independent of ADR-116) can itself kick off a background ANN rebuild once its debounce
-//! interval elapses after seeding — a benign maintenance action that still serves the
-//! stale-but-installed graph on the fast path (not a slow/degraded sample) but does emit
-//! `memory.ann_warm` events. Left unhandled this trips the event-count assertion on a false
-//! positive. The harness closes over this by sleeping past that debounce interval plus one
-//! settle recall (`EPOCH_DEBOUNCE_SETTLE`) after the warm-wait and before opening the timed
-//! window, so any such rebuild fires and completes before counting starts; the ~200-call
-//! timed window itself completes in well under one further debounce interval.
+//! One wrinkle: a per-model durable-epoch debounce check (`maybe_check_durable_epoch`)
+//! can itself kick off a background ANN rebuild once its debounce interval elapses after
+//! seeding — a benign maintenance action that still serves the stale-but-installed graph
+//! on the fast path (not a slow/degraded sample) but does emit `memory.ann_warm` events.
+//! Left unhandled this trips the event-count assertion on a false positive. The harness
+//! closes over this by sleeping past that debounce interval plus one settle recall
+//! (`EPOCH_DEBOUNCE_SETTLE`) after the warm-wait and before opening the timed window, so
+//! any such rebuild fires and completes before counting starts; the ~200-call timed
+//! window itself completes in well under one further debounce interval.
 //!
 //! The residual gap: an exact-fallback on the very last timed sample, with no subsequent
 //! call in the window to reveal the resulting rebuild, would not be caught. Closing that
@@ -134,7 +131,7 @@ const CONTENT_PHRASES: &[&str] = &[
 
 const RECALL_QUERY: &str = "recall scoring fusion vector search memory decay";
 
-/// One ADR-116 gate configuration: which models are registered on the runtime, and how
+/// One gate configuration: which models are registered on the runtime, and how
 /// `memory.recall` is called against them (explicit single model vs. fan-out `None`).
 struct GateConfig {
     label: &'static str,
@@ -151,21 +148,21 @@ fn gate_configs() -> Vec<GateConfig> {
             primary: PRIMARY_MODEL,
             additional: &[],
             recall_model: Some(PRIMARY_MODEL),
-            gate_note: "ADR-116 gate case M=1 queried",
+            gate_note: "baseline case M=1 queried",
         },
         GateConfig {
             label: "three-model fan-out",
             primary: PRIMARY_MODEL,
             additional: &RETIRED_MODELS[0..2],
             recall_model: None,
-            gate_note: "ADR-116 gate case M=3 queried",
+            gate_note: "baseline case M=3 queried",
         },
         GateConfig {
             label: "four-model fan-out (beyond gate, informational)",
             primary: PRIMARY_MODEL,
             additional: &RETIRED_MODELS,
             recall_model: None,
-            gate_note: "M=4 queried — ADR-116 gates only M=1 and M=3; not a primary-only baseline",
+            gate_note: "M=4 queried — contextual fan-out, not a primary-only baseline",
         },
     ]
 }
@@ -417,8 +414,8 @@ async fn main() {
     let configs = gate_configs();
 
     eprintln!(
-        "ADR-116 (PR #1080, in review) gate condition 2 — memory.recall p95 baseline, \
-         warm ANN path, {} configuration(s)",
+        "memory.recall p95 baseline and regression gate — warm ANN path, \
+         {} configuration(s)",
         configs.len()
     );
 
@@ -429,7 +426,7 @@ async fn main() {
     }
 
     println!("{}", "=".repeat(96));
-    println!("ADR-116 (PR #1080, in review) GATE — memory.recall p95 baseline (file-backed WAL, warm ANN)");
+    println!("memory.recall p95 regression gate — file-backed WAL, warm ANN path");
     println!("{}", "=".repeat(96));
     println!(
         "{:<45} {:>8} {:>8} {:>8} {:>6}  note",
@@ -444,9 +441,8 @@ async fn main() {
     }
     println!("{}", "=".repeat(96));
     println!(
-        "gate reference (ADR-116 §Warm hit, PR #1080): the added per-model durable generation \
-         check must cost at most 1.0ms absolute p95 and at most 5% of the matching M=1 or M=3 \
-         baseline's warm memory.recall p95 above. The M=4 row is beyond the gate's stated \
-         configurations and is informational only."
+        "warm-route gate: a change must add at most 1.0ms absolute p95 and at most 5% of \
+         the matching M=1 or M=3 baseline's warm memory.recall p95 above. The M=4 row is \
+         contextual and is not part of the gate."
     );
 }

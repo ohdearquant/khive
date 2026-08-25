@@ -215,13 +215,11 @@ fn wal_sidecar_path(db_path: &Path) -> PathBuf {
 /// WAL-pin attribution: who currently holds the database open, and how
 /// complete that answer is.
 ///
-/// Field names and shape mirror the reference diagnostics surface this was
-/// ported from, so external consumers parsing this payload keep working.
-/// This tree's `khive-db` lacks a read-only sidecar enumeration primitive
-/// (see the module docs), so the sidecar-derived fields below are always
-/// empty here. `status`, `status_reasons`, and the tagged `census` field are
-/// the authoritative completeness contract. The older sibling booleans and
-/// PID arrays remain as a compatibility projection.
+/// `status`, `status_reasons`, and the tagged `census` field are the
+/// authoritative wire contract. The older sibling booleans and PID arrays
+/// remain available to Rust callers but are not serialized. This tree's
+/// `khive-db` lacks a read-only sidecar enumeration primitive (see the module
+/// docs), so the sidecar-derived fields below are always empty here.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WalPinAttribution {
     /// Authoritative quality of the complete attribution answer.
@@ -235,9 +233,13 @@ pub struct WalPinAttribution {
     pub available: bool,
     pub unavailable_reason: Option<String>,
     /// OS-derived census of every PID holding the DB file open.
+    #[serde(skip_serializing)]
     pub census_holder_pids: Vec<u32>,
+    #[serde(skip_serializing)]
     pub census_uninspectable_pids: Vec<u32>,
+    #[serde(skip_serializing)]
     pub census_truncated: bool,
+    #[serde(skip_serializing)]
     pub census_is_complete: bool,
     /// Always empty in this port — see the module docs.
     pub reporting: Vec<WalPinHolder>,
@@ -1512,6 +1514,36 @@ mod tests {
             json.get("sidecar_entries_cleanup_would_reap").is_none(),
             "a skipped enumeration must omit sidecar_entries_cleanup_would_reap, not fabricate 0"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_pin_census_serializes_only_under_the_nested_carrier() {
+        let pin = wal_pin_attribution_from_census(crate::walpin::CensusResult {
+            holders: std::collections::HashSet::from([41, 7]),
+            uninspectable_pids: vec![99],
+            truncated: true,
+        });
+
+        let json = serde_json::to_value(pin).expect("attribution serializes");
+        assert_eq!(json["census"]["holder_pids"], serde_json::json!([7, 41]));
+        assert_eq!(
+            json["census"]["uninspectable_pids"],
+            serde_json::json!([99])
+        );
+        assert_eq!(json["census"]["truncated"], true);
+
+        for duplicate in [
+            "census_holder_pids",
+            "census_uninspectable_pids",
+            "census_truncated",
+            "census_is_complete",
+        ] {
+            assert!(
+                json.get(duplicate).is_none(),
+                "wal_pin.{duplicate} must not duplicate wal_pin.census: {json}"
+            );
+        }
     }
 
     /// A missing configured path must never be created by a diagnostic

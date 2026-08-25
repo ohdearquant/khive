@@ -1750,8 +1750,7 @@ function DependencyTopology({
             <div className="repo-list-row" key={cycle.id}>
               <GitFork aria-hidden="true" />
               <div>
-                <strong>{cycle.id}</strong>
-                <span className="repo-cycle-members">
+                <span className="repo-cycle-members repo-cycle-label">
                   SCC members:{" "}
                   {cycle.module_ids.map((id, index) => (
                     <span key={id}>
@@ -1767,6 +1766,9 @@ function DependencyTopology({
                     </span>
                   ))}
                 </span>
+                <code className="repo-analysis-id" title={cycle.id}>
+                  {cycle.id}
+                </code>
               </div>
             </div>
           ))}
