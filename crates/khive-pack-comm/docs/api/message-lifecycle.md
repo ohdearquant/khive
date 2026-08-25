@@ -178,9 +178,11 @@ exact recipient filter for the sent box. Read `status` and sender filters are
 inbox-only and are rejected with `box="sent"`, while `to_actor` is rejected for
 the default inbox, so a misplaced filter cannot silently return the wrong box.
 The existing envelope remains stable. For the default inbox, `unread_count` is
-the caller's mailbox-wide unread total — independent of the page window and of
-`status` and sender filters, computed as a single count query per request. It
-is zero for the sent box because outbound rows have no recipient read state.
+the caller's mailbox-wide unread count — independent of the page window and of
+`status` and sender filters, computed by one bounded scan per request whose
+work is capped regardless of backlog size; the value saturates at 1,000, so
+1,000 means "at least 1,000". It is zero for the sent box because outbound
+rows have no recipient read state.
 
 Every caller is filtered by `to_actor = caller OR to_actor IS NULL`. A
 configured actor therefore sees messages addressed to that actor plus legacy

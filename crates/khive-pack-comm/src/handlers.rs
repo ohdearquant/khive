@@ -883,49 +883,22 @@ async fn count_unread_messages(
         order_by: None,
         ..Default::default()
     };
-    // `query_notes_filtered` computes `Page::total` with a same-snapshot
-    // `COUNT(*)` on every call, so a limit-0 page returns the filtered total
-    // without hydrating any rows — one count query regardless of mailbox size.
-    let page = store
-        .query_notes_filtered(
-            namespace,
-            &filter,
-            PageRequest {
-                limit: 0,
-                offset: 0,
-            },
-        )
+    // A bounded fetch, not an aggregate: `query_notes_filtered_bounded`
+    // reads at most cap + 1 rows and runs no `COUNT(*)`, so the worst-case
+    // work per call is fixed by the cap and independent of backlog size. An
+    // exact count here would pay backlog-proportional work on every poll —
+    // the unread badge needs fidelity near zero, not at pathological backlog
+    // sizes, so a backlog at or past the cap reports the cap itself
+    // (documented as "at least this many").
+    let rows = store
+        .query_notes_filtered_bounded(namespace, &filter, UNREAD_COUNT_SCAN_CAP)
         .await?;
-    if let Some(total) = page.total {
-        return Ok(total);
-    }
-
-    // A store that omits `total` still gets a correct (if heavier) answer:
-    // page through and sum lengths.
-    const PAGE_SIZE: u32 = 200;
-    let mut count: u64 = 0;
-    let mut db_offset: u32 = 0;
-    loop {
-        let page = store
-            .query_notes_filtered(
-                namespace,
-                &filter,
-                PageRequest {
-                    limit: PAGE_SIZE,
-                    offset: db_offset.into(),
-                },
-            )
-            .await?;
-        let fetched = page.items.len() as u32;
-        count += u64::from(fetched);
-        if fetched < PAGE_SIZE {
-            break;
-        }
-        db_offset += PAGE_SIZE;
-    }
-
-    Ok(count)
+    Ok(rows.len().min(UNREAD_COUNT_SCAN_CAP as usize) as u64)
 }
+
+/// Upper bound on the unread-count scan (`count_unread_messages`). At or
+/// past this backlog the reported `unread_count` saturates at the bound.
+const UNREAD_COUNT_SCAN_CAP: u32 = 1_000;
 
 /// `read` — mark a message as read.
 pub(crate) async fn handle_read(
