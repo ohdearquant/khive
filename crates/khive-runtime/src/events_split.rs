@@ -134,6 +134,19 @@ const MAX_CACHED_NAMESPACE_STORES: usize = 1024;
 /// or a chain one accepts derives a different identity than the other.
 const EVENTS_SYMLINK_HOP_BOUND: u32 = 40;
 
+/// Cap on `QueryEvents` page size, in rows. The wire `PageRequest.limit` is
+/// client-supplied `u32`, and the daemon materializes the full page as a
+/// `Vec<Event>` and serializes it into one response frame — so an unbounded
+/// limit is attacker-controlled memory and serialization work in a process
+/// that lives for months. Over-cap requests get a typed refusal naming the
+/// cap, never a silently clamped page: a caller that asked for more rows
+/// than it got would otherwise read the short page as the end of the data.
+/// The split client's merged read requests a prefix of `offset + limit`
+/// rows, so this cap also bounds the deep-offset window a socket client can
+/// demand in one request.
+#[cfg(unix)]
+const MAX_QUERY_EVENTS_PAGE_ROWS: u32 = 4096;
+
 /// Default events database file, beside the main database file.
 ///
 /// The name is derived from the main database's full file name (`khive.db` →
@@ -524,8 +537,13 @@ pub struct EventsDaemonGuard {
     _file: std::fs::File,
 }
 
-/// Try to become the events daemon for `socket_path`. `None` = another
-/// events daemon already holds the lock.
+/// Try to become the events daemon for `socket_path`. `None` = the lock
+/// could not be safely acquired — either another events daemon holds it, or
+/// a hardening step refused (symlinked lock entry, failed chmod). Both mean
+/// the caller must not serve; callers that need the socket directory
+/// validated must run `ensure_socket_dir_is_trusted` on the parent BEFORE
+/// calling this, so no lock-path operation happens in an untrusted
+/// directory.
 #[cfg(unix)]
 pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemonGuard> {
     let lock_path = socket_path.with_extension("lock");
@@ -533,20 +551,26 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
         std::fs::create_dir_all(parent).ok()?;
     }
     use std::os::unix::fs::OpenOptionsExt;
+    // `O_NOFOLLOW` pins the open to the final component: a symlink planted
+    // at the lock name is refused instead of redirecting the open (and the
+    // chmod below) to an attacker-selected target.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&lock_path)
         .ok()?;
     // `mode` applies only at creation; tighten a pre-existing lock file too.
-    // Best-effort: the file carries no data (it exists to be flocked), so a
-    // failed chmod is not grounds to refuse the lock.
-    let _ = std::fs::set_permissions(
-        &lock_path,
+    // Descriptor-based (`fchmod` on the handle just opened), never a second
+    // path lookup — and fail closed: with the inode pinned, a failed chmod
+    // is abnormal, and serving behind a lock file another user can open is
+    // exactly what the hardening exists to refuse.
+    file.set_permissions(
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-    );
+    )
+    .ok()?;
     use std::os::fd::AsRawFd;
     // SAFETY: `fd` is a live descriptor owned by `file` for the duration of
     // the call; `flock` reads nothing else.
@@ -815,10 +839,17 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     // relative; anchor them before anything derives a parent from them.
     let db_path = &absolutize(db_path);
     let socket_path = &absolutize(socket_path);
+    // Directory trust comes FIRST: the lock guard below opens and chmods a
+    // path in this directory, and validating only before the later bind
+    // would let those operations run in a directory another user controls.
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        crate::daemon::ensure_socket_dir_is_trusted(parent)?;
+    }
     let Some(_guard) = try_acquire_events_daemon_guard(socket_path) else {
         tracing::info!(
             socket = %socket_path.display(),
-            "another events daemon holds the lock; exiting"
+            "events daemon lock unavailable (held by another daemon, or hardening refused); exiting"
         );
         return Ok(());
     };
@@ -830,10 +861,6 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     // creation; tighten any that already exist from before the hardening.
     harden_events_db_sidecars(db_path)?;
 
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-        crate::daemon::ensure_socket_dir_is_trusted(parent)?;
-    }
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
     }
@@ -1110,6 +1137,17 @@ async fn dispatch_events_request(
             Err(error) => storage_error_response(&error),
         },
         EventsRequest::QueryEvents { filter, page, .. } => {
+            if page.limit > MAX_QUERY_EVENTS_PAGE_ROWS {
+                return EventsResponse::Error {
+                    message: format!(
+                        "events query page limit {} exceeds the daemon cap of {} rows; \
+                         request narrower pages",
+                        page.limit, MAX_QUERY_EVENTS_PAGE_ROWS
+                    ),
+                    retryable: false,
+                    writer_task_state: None,
+                };
+            }
             match store.query_events(filter, page).await {
                 Ok(page) => EventsResponse::Pageful { page },
                 Err(error) => storage_error_response(&error),
@@ -2082,6 +2120,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn lock_symlink_is_refused_and_target_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        // The daemon lock open is pinned with O_NOFOLLOW and chmods its own
+        // handle: a symlink planted at the lock name must refuse the guard,
+        // and the link's target must keep its inode content and mode. A
+        // plain lock in the same directory must still acquire — the control
+        // that proves the refusal is the symlink, not a broken guard.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"v").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let socket = dir.path().join("events.sock");
+        std::os::unix::fs::symlink(&victim, socket.with_extension("lock")).unwrap();
+        assert!(
+            try_acquire_events_daemon_guard(&socket).is_none(),
+            "a symlinked lock entry must refuse the guard"
+        );
+        let mode = victim.metadata().unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o644, "the symlink's target must keep its mode");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"v");
+        let clean = dir.path().join("clean.sock");
+        assert!(
+            try_acquire_events_daemon_guard(&clean).is_some(),
+            "a plain lock path in the same directory must still acquire"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn planted_wal_symlink_is_refused_before_open() {
         // SQLite creates `-wal` without O_EXCL, so a planted `-wal` symlink
         // would redirect WAL writes; admission checks the sidecar suffixes
@@ -2115,6 +2182,50 @@ mod tests {
         let path = events_db_path_beside(Path::new("khive.db"));
         assert!(path.is_absolute(), "got relative {path:?}");
         assert!(path.ends_with("khive.db.events.db"), "got {path:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn over_cap_query_page_limit_is_refused_before_materialization() {
+        // `PageRequest.limit` arrives client-controlled off the wire; the
+        // daemon must refuse an over-cap page with a typed, actionable error
+        // instead of materializing and serializing it — and must never
+        // silently clamp, or the short page reads as end-of-data.
+        let backend = Arc::new(StorageBackend::memory().unwrap());
+        let stores: NamespaceStores =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let request = |limit: u32| EventsRequest::QueryEvents {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: "local".to_string(),
+            filter: EventFilter::default(),
+            page: PageRequest { offset: 0, limit },
+        };
+        let refused =
+            dispatch_events_request(request(MAX_QUERY_EVENTS_PAGE_ROWS + 1), &backend, &stores)
+                .await;
+        match refused {
+            EventsResponse::Error {
+                message,
+                retryable,
+                writer_task_state,
+            } => {
+                assert!(
+                    message.contains(&MAX_QUERY_EVENTS_PAGE_ROWS.to_string()),
+                    "refusal must name the cap: {message}"
+                );
+                assert!(!retryable, "an over-cap page is not transient");
+                assert!(writer_task_state.is_none());
+            }
+            other => panic!("over-cap query must be refused, got {other:?}"),
+        }
+        // Control: a request AT the cap passes admission and reaches the
+        // store — an empty page, not a refusal.
+        let at_cap =
+            dispatch_events_request(request(MAX_QUERY_EVENTS_PAGE_ROWS), &backend, &stores).await;
+        assert!(
+            matches!(at_cap, EventsResponse::Pageful { .. }),
+            "at-cap query must reach the store, got {at_cap:?}"
+        );
     }
 
     #[cfg(unix)]

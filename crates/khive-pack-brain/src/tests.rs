@@ -7857,6 +7857,91 @@ mod event_counts_tests {
         assert!(!truncated);
     }
 
+    /// A page holding MORE than one timestamp group must not cycle: the
+    /// cursor steps to `oldest-in-page + 1` and the strict `created_at <`
+    /// bound excludes every newer group already emitted, so the walk is
+    /// monotone. Three timestamp groups with a page edge inside a group
+    /// exercise the mixed-page shape directly: page one carries two groups
+    /// (2×T3, 2×T2), the boundary set tracks only T2, and the next page must
+    /// deliver the remaining T2 row and the T1 group exactly once each.
+    #[tokio::test]
+    async fn exhaustive_fetch_terminates_across_multiple_timestamp_groups_per_page() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // Three groups, newest first in delivery order: 2 @ T3, 3 @ T2,
+        // 2 @ T1, with page_size 4 splitting the T2 group across pages.
+        for _ in 0..2 {
+            seed_event(
+                &rt,
+                &token,
+                "recall",
+                EventKind::RecallExecuted,
+                "lambda:a",
+                9_000_000,
+                json!({}),
+            )
+            .await;
+        }
+        for _ in 0..3 {
+            seed_event(
+                &rt,
+                &token,
+                "search",
+                EventKind::SearchExecuted,
+                "lambda:a",
+                5_000_000,
+                json!({}),
+            )
+            .await;
+        }
+        for _ in 0..2 {
+            seed_event(
+                &rt,
+                &token,
+                "recall",
+                EventKind::RecallExecuted,
+                "lambda:a",
+                1_000_000,
+                json!({}),
+            )
+            .await;
+        }
+
+        let store = rt.events(&token).expect("event store");
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let (items, window_event_total, truncated) =
+            crate::handlers::fetch_event_counts_window_exhaustive(
+                store.as_ref(),
+                &base_filter,
+                /* page_size = */ 4,
+                /* max_events = */ 20,
+            )
+            .await
+            .expect("multi-group exhaustive fetch must terminate and succeed");
+
+        assert_eq!(window_event_total, 7);
+        assert_eq!(items.len(), 7, "every group must be reached exactly once");
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            items.iter().map(|event| event.id).collect();
+        assert_eq!(distinct.len(), 7, "no row may be double-counted");
+        let mut counts_by_ts = std::collections::BTreeMap::new();
+        for event in &items {
+            *counts_by_ts.entry(event.created_at).or_insert(0_u64) += 1;
+        }
+        assert_eq!(counts_by_ts.get(&9_000_000), Some(&2));
+        assert_eq!(counts_by_ts.get(&5_000_000), Some(&3));
+        assert_eq!(
+            counts_by_ts.get(&1_000_000),
+            Some(&2),
+            "the oldest group must be reached"
+        );
+        assert!(!truncated);
+    }
+
     /// The public handler must still identify a successful exhaustive response
     /// as exact; pagination mechanics are covered separately with injected limits.
     #[tokio::test]
