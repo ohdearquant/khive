@@ -862,6 +862,18 @@ async fn blob_gc_fencing_complete(sql: &dyn SqlAccess) -> StorageResult<bool> {
     // keeps accepting later versions on top of a completed cutover: that is
     // the normal serving course, and the exact-epoch rule is scoped to
     // destructive GC admission.
+    //
+    // "Exact completed V21 epoch" means the WHOLE canonical ledger, not a
+    // V21 terminal row: `version` is the table's PRIMARY KEY, so
+    // COUNT(*) = 21 ∧ MIN = 1 ∧ MAX = 21 holds if and only if the ledger is
+    // exactly the contiguous set {1..21}. A ledger that merely retains a V21
+    // row at MAX(version) = 21 while earlier rows are missing is an
+    // incomplete migration history whose physical schema this gate never
+    // validated — it must fail closed, same as ahead-of-V21. Name-level
+    // canonicality of the below-terminal rows stays boot's job
+    // (`validate_applied_migration_ledger`); this predicate enforces the
+    // structural contiguity a destructive sweep's admission rests on, plus
+    // the named V21 row itself.
     let complete = required_nonnegative_count(
         reader
             .query_scalar(SqlStatement {
@@ -872,6 +884,8 @@ async fn blob_gc_fencing_complete(sql: &dyn SqlAccess) -> StorageResult<bool> {
                         AND (SELECT COUNT(*) FROM _schema_migrations \
                              WHERE version = ?1 \
                                AND name = 'attachments_first_class') = 1 \
+                        AND (SELECT COUNT(*) FROM _schema_migrations) = ?1 \
+                        AND (SELECT MIN(version) FROM _schema_migrations) = 1 \
                         AND (SELECT MAX(version) FROM _schema_migrations) = ?1"
                     .to_string(),
                 params: vec![SqlValue::Integer(i64::from(
@@ -2444,10 +2458,16 @@ mod tests {
     /// instead of retaining Phase 4a's synthetic future-schema fixture.
     fn prepare_completed_v21_gc_fixture(conn: &mut rusqlite::Connection) {
         let version = crate::run_migrations(conn).expect("prepare canonical completed V21");
+        // Pinned to the V21 epoch, NOT to the moving latest version: the GC
+        // gate admits exactly V21, so the day a V22 migration lands this
+        // assert fails LOUDLY here — telling that migration's author to give
+        // these tests a fixture built explicitly through V21 — instead of
+        // silently handing every GC test a ledger the gate rejects.
         assert_eq!(
             version,
-            crate::migrations::latest_schema_version(),
-            "empty fixture must migrate to the latest schema (which contains the completed V21 cutover)"
+            crate::migrations::ATTACHMENT_CUTOVER_VERSION,
+            "GC-gate fixtures need a completed-V21 ledger; a later migration chain \
+             must provide a pinned through-V21 fixture builder for these tests"
         );
     }
 
@@ -2516,16 +2536,19 @@ mod tests {
                 "UPDATE _schema_migrations SET name = 'not_attachments_first_class' \
                  WHERE version = 21",
             ),
-            // NOTE: the ledger predicate is `MAX(version) BETWEEN 21 AND
-            // latest_schema_version()`. Migrations THIS binary applied on top
-            // of the completed cutover keep the gate open (the accept-path
-            // tests in this module run against the latest schema and are the
-            // positive control), while a ledger ahead of the binary's own
-            // terminal version is a different schema epoch and rejects —
-            // covered by `gate_rejects_ledger_ahead_of_binary_latest`, which
-            // ADDS a fact rather than removing one and so lives outside this
-            // matrix. The physical facts the matrix below removes one at a
-            // time are what carry the rest of the safety.
+            // NOTE: the ledger predicate requires the exact contiguous
+            // canonical ledger {1..21} — the named V21 row, COUNT(*) = 21,
+            // MIN(version) = 1, MAX(version) = 21 (version is the PRIMARY
+            // KEY, so together these pin the set exactly). Anything else —
+            // rows missing below V21, or any row above it — is a schema
+            // epoch this gate never validated and fails closed. The
+            // ahead-of-V21 arm ADDS a fact rather than removing one and so
+            // lives outside this matrix, in
+            // `gate_rejects_ledger_ahead_of_binary_latest`.
+            (
+                "below_v21_ledger_rows_deleted",
+                "DELETE FROM _schema_migrations WHERE version < 21",
+            ),
             (
                 "marker_row_deleted",
                 "DELETE FROM attachment_cutover_state WHERE singleton = 1",
@@ -2663,11 +2686,16 @@ mod tests {
     /// only for the EXACT completed V21 epoch, so anything ahead fails
     /// closed. This is the arm the removal matrix above cannot host (it ADDS
     /// a ledger fact), and it separates the exact-epoch predicate from the
-    /// fail-open `>= 21`: under `>= 21` this fixture passes the gate. While
-    /// the binary's terminal version IS 21, this fixture cannot distinguish
-    /// `= 21` from the former `BETWEEN 21 AND terminal` — both refuse a V22
-    /// row — so the exact-epoch property is enforced by the predicate's
-    /// text; the first appended migration makes the distinction observable.
+    /// fail-open `>= 21`: under `>= 21` this fixture passes the gate. The
+    /// appended row is shaped exactly like a row `run_migrations` records —
+    /// canonical name style, real timestamp — because "a migration this same
+    /// binary applied on top" is the case the exact-epoch rule exists for.
+    /// While the binary's terminal version IS 21, this fixture cannot
+    /// distinguish `= 21` from the former `BETWEEN 21 AND terminal` — both
+    /// refuse a V22 row — so the exact-epoch property is enforced by the
+    /// predicate's text and by the contiguity clause the removal matrix
+    /// binds (`below_v21_ledger_rows_deleted`); the first appended migration
+    /// makes the ahead distinction observable.
     #[tokio::test]
     async fn gate_rejects_ledger_ahead_of_binary_latest() {
         let dir = tempfile::tempdir().unwrap();
@@ -2691,7 +2719,7 @@ mod tests {
                 .conn()
                 .execute(
                     "INSERT INTO _schema_migrations (version, name, applied_at) \
-                     VALUES (?1, 'future_epoch', 0)",
+                     VALUES (?1, 'post_cutover_feature', unixepoch())",
                     [i64::from(crate::migrations::latest_schema_version()) + 1],
                 )
                 .unwrap();
@@ -2701,6 +2729,61 @@ mod tests {
                 .await
                 .unwrap(),
             "a ledger ahead of the binary's latest schema version must fail closed"
+        );
+    }
+
+    /// An incomplete migration history must fail closed even when its
+    /// terminal row looks right: delete every ledger row below V21 while
+    /// keeping the V21 row, so the named-row check AND `MAX(version) = 21`
+    /// both still hold. A predicate reading only those two facts admits this
+    /// ledger; only the contiguity clause (COUNT/MIN/MAX over the
+    /// PRIMARY-KEY `version` column) rejects it, so removing that clause
+    /// turns this test red.
+    #[tokio::test]
+    async fn gate_rejects_incomplete_ledger_behind_v21() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+        assert!(
+            blob_gc_fencing_complete(backend.sql().as_ref())
+                .await
+                .unwrap(),
+            "control: the untouched completed fixture must pass"
+        );
+
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("DELETE FROM _schema_migrations WHERE version < 21")
+                .unwrap();
+            // The facts the old predicate read are still intact.
+            let (v21_named, max_version): (i64, i64) = writer
+                .conn()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM _schema_migrations \
+                             WHERE version = 21 AND name = 'attachments_first_class'), \
+                            (SELECT MAX(version) FROM _schema_migrations)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (v21_named, max_version),
+                (1, 21),
+                "fixture must keep the named V21 row and MAX(version) = 21 so the \
+                 rejection can only come from the contiguity clause"
+            );
+        }
+        assert!(
+            !blob_gc_fencing_complete(backend.sql().as_ref())
+                .await
+                .unwrap(),
+            "an incomplete ledger behind V21 must fail closed despite a valid terminal row"
         );
     }
 
