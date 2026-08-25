@@ -128,6 +128,19 @@ const MAX_INFLIGHT_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(unix)]
 const MAX_CACHED_NAMESPACE_STORES: usize = 1024;
 
+/// Cap on `QueryEvents` page size, in rows. The wire `PageRequest.limit` is
+/// client-supplied `u32`, and the daemon materializes the full page as a
+/// `Vec<Event>` and serializes it into one response frame — so an unbounded
+/// limit is attacker-controlled memory and serialization work in a process
+/// that lives for months. Over-cap requests get a typed refusal naming the
+/// cap, never a silently clamped page: a caller that asked for more rows
+/// than it got would otherwise read the short page as the end of the data.
+/// The split client's merged read requests a prefix of `offset + limit`
+/// rows, so this cap also bounds the deep-offset window a socket client can
+/// demand in one request.
+#[cfg(unix)]
+const MAX_QUERY_EVENTS_PAGE_ROWS: u32 = 4096;
+
 /// Default events database file, beside the main database file.
 ///
 /// The name is derived from the main database's full file name (`khive.db` →
@@ -972,6 +985,17 @@ async fn dispatch_events_request(
             Err(error) => storage_error_response(&error),
         },
         EventsRequest::QueryEvents { filter, page, .. } => {
+            if page.limit > MAX_QUERY_EVENTS_PAGE_ROWS {
+                return EventsResponse::Error {
+                    message: format!(
+                        "events query page limit {} exceeds the daemon cap of {} rows; \
+                         request narrower pages",
+                        page.limit, MAX_QUERY_EVENTS_PAGE_ROWS
+                    ),
+                    retryable: false,
+                    writer_task_state: None,
+                };
+            }
             match store.query_events(filter, page).await {
                 Ok(page) => EventsResponse::Pageful { page },
                 Err(error) => storage_error_response(&error),
@@ -1670,6 +1694,50 @@ mod tests {
         let path = events_db_path_beside(Path::new("khive.db"));
         assert!(path.is_absolute(), "got relative {path:?}");
         assert!(path.ends_with("khive.db.events.db"), "got {path:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn over_cap_query_page_limit_is_refused_before_materialization() {
+        // `PageRequest.limit` arrives client-controlled off the wire; the
+        // daemon must refuse an over-cap page with a typed, actionable error
+        // instead of materializing and serializing it — and must never
+        // silently clamp, or the short page reads as end-of-data.
+        let backend = Arc::new(StorageBackend::memory().unwrap());
+        let stores: NamespaceStores =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let request = |limit: u32| EventsRequest::QueryEvents {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: "local".to_string(),
+            filter: EventFilter::default(),
+            page: PageRequest { offset: 0, limit },
+        };
+        let refused =
+            dispatch_events_request(request(MAX_QUERY_EVENTS_PAGE_ROWS + 1), &backend, &stores)
+                .await;
+        match refused {
+            EventsResponse::Error {
+                message,
+                retryable,
+                writer_task_state,
+            } => {
+                assert!(
+                    message.contains(&MAX_QUERY_EVENTS_PAGE_ROWS.to_string()),
+                    "refusal must name the cap: {message}"
+                );
+                assert!(!retryable, "an over-cap page is not transient");
+                assert!(writer_task_state.is_none());
+            }
+            other => panic!("over-cap query must be refused, got {other:?}"),
+        }
+        // Control: a request AT the cap passes admission and reaches the
+        // store — an empty page, not a refusal.
+        let at_cap =
+            dispatch_events_request(request(MAX_QUERY_EVENTS_PAGE_ROWS), &backend, &stores).await;
+        assert!(
+            matches!(at_cap, EventsResponse::Pageful { .. }),
+            "at-cap query must reach the store, got {at_cap:?}"
+        );
     }
 
     #[cfg(unix)]
