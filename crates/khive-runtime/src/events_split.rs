@@ -98,12 +98,27 @@ pub fn events_db_path_beside(main_db: &Path) -> PathBuf {
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_else(|| std::ffi::OsString::from("khive.db"));
     name.push(".events.db");
-    match main_db.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+    let path = match main_db.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         Some(dir) => std::fs::canonicalize(dir)
             .unwrap_or_else(|_| dir.to_path_buf())
             .join(&name),
         None => PathBuf::from(name),
+    };
+    absolutize(&path)
+}
+
+/// Anchor a relative path to the current working directory. A bare relative
+/// spelling (`khive.db`) yields `Some("")` from `Path::parent`, and every
+/// consumer downstream — lock-file parenting, socket-directory trust
+/// validation, the daemon spawn contract — needs a real directory to stat,
+/// not an empty string. Absolute paths pass through untouched.
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
     }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Events daemon socket path, beside the events database it serves.
@@ -199,6 +214,23 @@ fn direct_backend(
     let key = (db_path.to_path_buf(), read_only);
     if let Some(existing) = registry.get(&key) {
         return Ok(Arc::clone(existing));
+    }
+    // Embedded writable mode creates the events database like the daemon
+    // does: owner-only from the first byte, never at the process umask.
+    // Best-effort here (unlike the daemon's fail-closed boot): an existing
+    // file's mode is the deployment's business, and a create race just means
+    // SQLite finds the file already present.
+    #[cfg(unix)]
+    if !read_only {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(db_path);
     }
     let backend = Arc::new(if read_only {
         StorageBackend::sqlite_read_only(db_path)?
@@ -312,9 +344,18 @@ pub enum EventsResponse {
     },
     /// Typed refusal. `retryable` distinguishes transient daemon-side
     /// conditions from contract errors (bad frame, version skew).
+    /// `side_effects_unknown` preserves the one ADR-133 disposition the
+    /// retryable bit cannot carry: the daemon-side writer terminated at a
+    /// point where the batch may or may not have committed. Callers deciding
+    /// double-send safety key on that state, so it crosses the wire as its
+    /// own field instead of being flattened into a generic refusal.
+    /// `#[serde(default)]` keeps the frame readable from a daemon one
+    /// protocol build older.
     Error {
         message: String,
         retryable: bool,
+        #[serde(default)]
+        side_effects_unknown: bool,
     },
 }
 
@@ -338,12 +379,21 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
+    use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(0o600)
         .open(&lock_path)
         .ok()?;
+    // `mode` applies only at creation; tighten a pre-existing lock file too.
+    // Best-effort: the file carries no data (it exists to be flocked), so a
+    // failed chmod is not grounds to refuse the lock.
+    let _ = std::fs::set_permissions(
+        &lock_path,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    );
     use std::os::fd::AsRawFd;
     // SAFETY: `fd` is a live descriptor owned by `file` for the duration of
     // the call; `flock` reads nothing else.
@@ -353,6 +403,60 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
     } else {
         None
     }
+}
+
+/// Create the events database file owner-only if it does not exist yet.
+/// The 0600 socket and peer-uid admission bound who can *talk to* the
+/// daemon; they bound nothing if the database file itself is readable by
+/// other local users, so the daemon creates it 0600 before SQLite ever
+/// opens it (SQLite would otherwise create it at the process umask).
+#[cfg(unix)]
+fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(db_path)
+    {
+        // A zero-byte file is a valid empty SQLite database.
+        Ok(_created) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "refusing to serve events: cannot create {} owner-only: {e}",
+            db_path.display()
+        )),
+    }
+}
+
+/// Tighten the events database and its SQLite sidecars to owner-only.
+/// Fail closed, same contract as the socket chmod: a daemon that cannot
+/// keep its database owner-only must not serve it.
+#[cfg(unix)]
+fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut targets = vec![db_path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        targets.push(PathBuf::from(name));
+    }
+    for path in targets {
+        if !path.exists() {
+            continue;
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to serve events: cannot chmod 0600 {}: {e}. The events database \
+                 and its sidecars must be owner-only.",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Supervise the events daemon from the main daemon process: probe the
@@ -477,6 +581,10 @@ pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
 /// user's hands.
 #[cfg(unix)]
 pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Result<()> {
+    // The subcommand's `--db`/`--socket` arrive from argv and may be
+    // relative; anchor them before anything derives a parent from them.
+    let db_path = &absolutize(db_path);
+    let socket_path = &absolutize(socket_path);
     let Some(_guard) = try_acquire_events_daemon_guard(socket_path) else {
         tracing::info!(
             socket = %socket_path.display(),
@@ -484,9 +592,13 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
         );
         return Ok(());
     };
+    ensure_events_db_owner_only(db_path)?;
     let backend = Arc::new(StorageBackend::sqlite(db_path)?);
     // Ensure the schema once, loudly, before accepting traffic.
     backend.events()?;
+    // The `-wal`/`-shm` sidecars inherit the database file's mode at
+    // creation; tighten any that already exist from before the hardening.
+    harden_events_db_sidecars(db_path)?;
 
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -514,6 +626,12 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
         }
     }
     let daemon_euid = unsafe { libc::geteuid() };
+    // Per-namespace store cache: `events_for_namespace` takes a writer-lane
+    // checkout and re-runs the schema DDL on every call, so paying it once
+    // per namespace instead of once per request keeps the writer lane for
+    // actual writes. Namespace cardinality is small and stores are cheap
+    // pool handles, so the map never needs eviction.
+    let stores: NamespaceStores = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     tracing::info!(
         socket = %socket_path.display(),
         db = %db_path.display(),
@@ -540,14 +658,46 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
             }
         }
         let backend = Arc::clone(&backend);
+        let stores = Arc::clone(&stores);
         crate::daemon::spawn_tracked_task(async move {
-            serve_events_conn(stream, backend).await;
+            serve_events_conn(stream, backend, stores).await;
         });
     }
 }
 
 #[cfg(unix)]
-async fn serve_events_conn(mut stream: UnixStream, backend: Arc<StorageBackend>) {
+type NamespaceStores =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<dyn EventStore>>>>;
+
+/// The cached per-namespace store, constructing (and caching) it on first
+/// use. Construction failures are not cached — the next request retries.
+#[cfg(unix)]
+fn namespace_store(
+    backend: &StorageBackend,
+    stores: &NamespaceStores,
+    namespace: &str,
+) -> Result<Arc<dyn EventStore>, khive_db::SqliteError> {
+    if let Some(store) = stores
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(namespace)
+    {
+        return Ok(Arc::clone(store));
+    }
+    let store = backend.events_for_namespace(namespace)?;
+    stores
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(namespace.to_string(), Arc::clone(&store));
+    Ok(store)
+}
+
+#[cfg(unix)]
+async fn serve_events_conn(
+    mut stream: UnixStream,
+    backend: Arc<StorageBackend>,
+    stores: NamespaceStores,
+) {
     loop {
         let payload = match read_frame(&mut stream).await {
             Ok(bytes) => bytes,
@@ -555,10 +705,11 @@ async fn serve_events_conn(mut stream: UnixStream, backend: Arc<StorageBackend>)
             Err(_) => return,
         };
         let response = match serde_json::from_slice::<EventsRequest>(&payload) {
-            Ok(request) => dispatch_events_request(request, &backend).await,
+            Ok(request) => dispatch_events_request(request, &backend, &stores).await,
             Err(error) => EventsResponse::Error {
                 message: format!("events daemon could not parse request frame: {error}"),
                 retryable: false,
+                side_effects_unknown: false,
             },
         };
         let bytes = match serde_json::to_vec(&response) {
@@ -578,6 +729,7 @@ async fn serve_events_conn(mut stream: UnixStream, backend: Arc<StorageBackend>)
 async fn dispatch_events_request(
     request: EventsRequest,
     backend: &StorageBackend,
+    stores: &NamespaceStores,
 ) -> EventsResponse {
     if request.protocol_version() != EVENTS_PROTOCOL_VERSION {
         return EventsResponse::Error {
@@ -587,14 +739,16 @@ async fn dispatch_events_request(
                 request.protocol_version()
             ),
             retryable: false,
+            side_effects_unknown: false,
         };
     }
-    let store = match backend.events_for_namespace(request.namespace()) {
+    let store = match namespace_store(backend, stores, request.namespace()) {
         Ok(store) => store,
         Err(error) => {
             return EventsResponse::Error {
                 message: format!("events store unavailable: {error}"),
                 retryable: true,
+                side_effects_unknown: false,
             };
         }
     };
@@ -635,6 +789,12 @@ fn storage_error_response(error: &StorageError) -> EventsResponse {
         // transient writer contention (`WriterTaskBusy`, `Transaction`) into
         // a terminal error on the client side of the socket.
         retryable: error.is_retryable(),
+        side_effects_unknown: matches!(
+            error,
+            StorageError::WriterTaskTerminated {
+                request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+            }
+        ),
     }
 }
 
@@ -844,8 +1004,21 @@ async fn run_forwarder(
     counters: Arc<ForwardingCounters>,
     outage_logged: Arc<AtomicBool>,
 ) {
+    // The client lives in a process-global registry, so its sender is never
+    // dropped and `rx.recv()` alone would keep this tracked task alive
+    // through daemon shutdown, forcing `drain()` to its full timeout.
+    // Observe the shutdown token directly: queued batches at shutdown are a
+    // counted drop, exactly the lane's loss-tolerant contract.
+    let shutdown = crate::daemon::daemon_shutdown_token();
     let mut conn: Option<UnixStream> = None;
-    while let Some((namespace, events)) = rx.recv().await {
+    loop {
+        let (namespace, events) = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            received = rx.recv() => match received {
+                Some(batch) => batch,
+                None => break,
+            },
+        };
         let count = events.len() as u64;
         let request = EventsRequest::AppendEvents {
             protocol_version: EVENTS_PROTOCOL_VERSION,
@@ -880,7 +1053,10 @@ async fn run_forwarder(
                     "events daemon unreachable; dropping loss-tolerant events until it returns"
                 );
             }
-            tokio::time::sleep(FORWARDER_BACKOFF).await;
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(FORWARDER_BACKOFF) => {}
+            }
         }
     }
 }
@@ -948,8 +1124,21 @@ impl ForwardingEventStore {
 
     fn unexpected(&self, op: &'static str, response: EventsResponse) -> StorageError {
         match response {
-            EventsResponse::Error { message, retryable } => {
-                if retryable {
+            EventsResponse::Error {
+                message,
+                retryable,
+                side_effects_unknown,
+            } => {
+                if side_effects_unknown {
+                    // Reconstruct the one variant whose identity is
+                    // load-bearing across the socket: ADR-133 callers key
+                    // double-send decisions on `SideEffectsUnknown`, and the
+                    // idempotent lane's retry classifier admits it where a
+                    // generic refusal would read terminal.
+                    StorageError::WriterTaskTerminated {
+                        request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                    }
+                } else if retryable {
                     StorageError::Pool {
                         operation: op.into(),
                         message,
@@ -1117,6 +1306,13 @@ impl EventStore for SplitEventStore {
         // Offset pagination cannot be split across two stores: fetch each
         // store's prefix covering the requested window, merge in the stores'
         // shared order (created_at DESC, id DESC), then window in memory.
+        // Cost is O(offset + limit) rows materialized from each store — the
+        // floor for offset semantics over two sources, since the split point
+        // is unknowable without both prefixes. The sort below is a single
+        // merge pass in practice (std's stable sort is adaptive on the
+        // concatenation of two sorted runs). Deep-offset callers wanting
+        // better pay for cursor pagination, tracked with the split's other
+        // deferred work.
         let prefix = PageRequest {
             offset: 0,
             limit: page
@@ -1215,6 +1411,85 @@ mod tests {
         let db = events_db_path_beside(Path::new("/data/khive.db"));
         let socket = events_socket_path_beside(&db);
         assert!(socket.ends_with("khive.db.events.sock"), "got {socket:?}");
+    }
+
+    #[test]
+    fn bare_relative_main_db_yields_an_absolute_sidecar() {
+        // A bare file name has `Some("")` for a parent; every downstream
+        // consumer (lock parenting, socket-dir trust validation) needs a
+        // real directory, so the sidecar path must come back anchored.
+        let path = events_db_path_beside(Path::new("khive.db"));
+        assert!(path.is_absolute(), "got relative {path:?}");
+        assert!(path.ends_with("khive.db.events.db"), "got {path:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn side_effects_unknown_crosses_the_wire() {
+        let response = storage_error_response(&StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        });
+        assert!(
+            matches!(
+                response,
+                EventsResponse::Error {
+                    side_effects_unknown: true,
+                    ..
+                }
+            ),
+            "an unknown-commit-state termination must be marked on the wire"
+        );
+        // Any other refusal must NOT carry the marker.
+        let busy = storage_error_response(&StorageError::WriterTaskBusy { timeout_ms: 5 });
+        assert!(matches!(
+            busy,
+            EventsResponse::Error {
+                side_effects_unknown: false,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_reconstructs_side_effects_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let client =
+            EventsSplitClient::new(dir.path().join("never-bound.sock")).expect("client builds");
+        let store = ForwardingEventStore::new("test", client);
+        let err = store.unexpected(
+            "append_events_idempotent",
+            EventsResponse::Error {
+                message: "writer terminated mid-flush".into(),
+                retryable: false,
+                side_effects_unknown: true,
+            },
+        );
+        assert!(
+            matches!(
+                err,
+                StorageError::WriterTaskTerminated {
+                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn error_frames_from_an_older_daemon_still_parse() {
+        // A daemon built before `side_effects_unknown` emits Error frames
+        // without the field; the client must read them as `false`, not fail.
+        let bytes = br#"{"kind":"error","message":"boom","retryable":true}"#;
+        let parsed: EventsResponse = serde_json::from_slice(bytes).expect("older frame parses");
+        assert!(matches!(
+            parsed,
+            EventsResponse::Error {
+                retryable: true,
+                side_effects_unknown: false,
+                ..
+            }
+        ));
     }
 
     #[cfg(unix)]
