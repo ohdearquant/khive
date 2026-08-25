@@ -143,7 +143,14 @@ const MAX_CACHED_NAMESPACE_STORES: usize = 1024;
 /// (relative spellings, symlinked directories) still map to one sidecar
 /// instead of minting a distinct events database per spelling.
 pub fn events_db_path_beside(main_db: &Path) -> PathBuf {
-    let resolved = std::fs::canonicalize(main_db).unwrap_or_else(|_| main_db.to_path_buf());
+    // When the database file does not exist yet, the path can still be a
+    // symlink — a dangling alias whose target the first open will create.
+    // `canonicalize` refuses dangling links, so resolve final-component
+    // links by hand on that arm: alias-first and target-first cold starts
+    // must derive the same sidecar, or the first process to open each
+    // spelling writes audit records the other never reads.
+    let resolved = std::fs::canonicalize(main_db)
+        .unwrap_or_else(|_| resolve_dangling_final_component(main_db));
     let mut name = resolved
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
@@ -156,6 +163,32 @@ pub fn events_db_path_beside(main_db: &Path) -> PathBuf {
         None => PathBuf::from(name),
     };
     absolutize(&path)
+}
+
+/// Follow final-component symlinks whose eventual target need not exist.
+/// The identity being recovered is the target's NAME — the file the first
+/// open through the alias will actually create — so a chain of links is
+/// walked (relative targets anchored at each link's parent) up to the same
+/// bound kernels use; a cycle or over-long chain stops at the last spelling,
+/// which `open()` will refuse anyway.
+fn resolve_dangling_final_component(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..32 {
+        match std::fs::read_link(&current) {
+            Ok(target) => {
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    match current.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+                        Some(dir) => dir.join(target),
+                        None => target,
+                    }
+                };
+            }
+            Err(_) => break,
+        }
+    }
+    current
 }
 
 /// Anchor a relative path to the current working directory. A bare relative
@@ -1797,6 +1830,36 @@ mod tests {
         let other = dir.path().join("other.db");
         std::fs::write(&other, b"").unwrap();
         assert_ne!(events_db_path_beside(&other), real_sidecar);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_alias_derives_the_target_sidecar_on_cold_start() {
+        // Event-path derivation runs before backend creation, so the alias
+        // can be consulted while its target does not exist yet — the first
+        // open through the alias is what creates the target. A dangling
+        // link must therefore already derive the TARGET's sidecar, or an
+        // alias-first cold start and a later target-spelled process split
+        // the event store between them.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        let alias = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        // Neither real.db nor its sidecar exists at this point.
+        assert_eq!(
+            events_db_path_beside(&alias),
+            events_db_path_beside(&real),
+            "a dangling alias must derive the same sidecar its target will use"
+        );
+        // Chain: a link to a link resolves all the way down.
+        let chain = dir.path().join("chain.db");
+        std::os::unix::fs::symlink(&alias, &chain).unwrap();
+        assert_eq!(events_db_path_beside(&chain), events_db_path_beside(&real));
+        // Control: a distinct nonexistent file still gets its own sidecar.
+        assert_ne!(
+            events_db_path_beside(&dir.path().join("unrelated.db")),
+            events_db_path_beside(&real)
+        );
     }
 
     #[test]
