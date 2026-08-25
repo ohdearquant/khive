@@ -299,6 +299,8 @@ fn direct_backend(
     if let Some(existing) = registry.get(&key) {
         return Ok(Arc::clone(existing));
     }
+    refuse_events_db_symlinks(db_path)
+        .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     // Embedded writable mode holds the events database to the daemon's own
     // contract: owner-only from the first byte, never at the process umask,
     // and — because event rows carry the same audit payloads either way — a
@@ -535,6 +537,40 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
     }
 }
 
+/// Refuse to serve an events database whose path — or whose `-wal`/`-shm`
+/// sidecar path — is a pre-existing symlink. These paths are derived, never
+/// user-chosen (`events_db_path_beside` canonicalizes the main database
+/// spelling first), so a link here is a planted redirect, not an alias:
+/// permission hardening and SQLite would otherwise follow it and tighten or
+/// write event rows through to whatever file the link's author chose
+/// (CWE-59). Runs before any open on both the embedded and daemon arms; a
+/// link planted after admission is bounded by the daemon's trusted-directory
+/// contract on the socket parent.
+fn refuse_events_db_symlinks(db_path: &Path) -> anyhow::Result<()> {
+    let mut targets = vec![db_path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        targets.push(PathBuf::from(name));
+    }
+    for path in targets {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
+                "refusing to serve events: {} is a symlink; the events database and its \
+                 sidecars must be regular files",
+                path.display()
+            ),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!(
+                "refusing to serve events: cannot inspect {}: {e}",
+                path.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// Create the events database file owner-only if it does not exist yet.
 /// The 0600 socket and peer-uid admission bound who can *talk to* the
 /// daemon; they bound nothing if the database file itself is readable by
@@ -543,6 +579,7 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
 #[cfg(unix)]
 fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
+    refuse_events_db_symlinks(db_path)?;
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1859,6 +1896,63 @@ mod tests {
         assert_ne!(
             events_db_path_beside(&dir.path().join("unrelated.db")),
             events_db_path_beside(&real)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planted_symlink_at_the_sidecar_path_is_refused() {
+        // The sidecar path is derived, never user-chosen, so a pre-existing
+        // symlink there is a planted redirect: following it would tighten
+        // permissions on and write event rows into the link's target.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"victim-bytes").unwrap();
+        let mode_before = victim.metadata().unwrap().permissions();
+        let sidecar = dir.path().join("khive.db.events.db");
+        std::os::unix::fs::symlink(&victim, &sidecar).unwrap();
+        let err = match direct_backend_for(&sidecar) {
+            Ok(_) => panic!("a planted symlink at the sidecar path must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        // The link's target is untouched: content intact, mode not tightened.
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-bytes");
+        assert_eq!(victim.metadata().unwrap().permissions(), mode_before);
+        // A dangling link is refused too, and nothing is created at its
+        // target — without the refusal, the open itself would mint the
+        // redirect target.
+        let ghost_target = dir.path().join("ghost.db");
+        let dangling = dir.path().join("other.db.events.db");
+        std::os::unix::fs::symlink(&ghost_target, &dangling).unwrap();
+        assert!(direct_backend_for(&dangling).is_err());
+        assert!(
+            !ghost_target.exists(),
+            "refusal must not create the redirect target"
+        );
+        // Control: a regular path proceeds and the backend opens.
+        let regular = dir.path().join("plain.db.events.db");
+        direct_backend_for(&regular).expect("regular sidecar path must open");
+        assert!(regular.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planted_wal_symlink_is_refused_before_open() {
+        // SQLite creates `-wal` without O_EXCL, so a planted `-wal` symlink
+        // would redirect WAL writes; admission checks the sidecar suffixes
+        // before the database is ever created or opened.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"w").unwrap();
+        let sidecar = dir.path().join("db.events.db");
+        let mut wal = sidecar.as_os_str().to_os_string();
+        wal.push("-wal");
+        std::os::unix::fs::symlink(&victim, PathBuf::from(&wal)).unwrap();
+        assert!(direct_backend_for(&sidecar).is_err());
+        assert!(
+            !sidecar.exists(),
+            "refusal must precede creation of the events database"
         );
     }
 
