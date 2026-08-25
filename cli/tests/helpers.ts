@@ -51,6 +51,9 @@ export async function runCli(args: string[]): Promise<CliResult> {
     args: ["run", "--allow-all", CLI_ENTRY, ...args],
     stdout: "piped",
     stderr: "piped",
+    // clearEnv keeps Deno from merging the parent environment back in —
+    // without it, inherited GIT_CONFIG_PARAMETERS survives the sanitized map.
+    clearEnv: true,
     env: isolatedTestEnv(),
   });
   const { code, stdout, stderr } = await cmd.output();
@@ -138,6 +141,7 @@ export async function makeTempRepo(): Promise<TempRepo> {
     args: ["init", root],
     stdout: "null",
     stderr: "null",
+    clearEnv: true,
     env,
   }).output();
 
@@ -145,6 +149,7 @@ export async function makeTempRepo(): Promise<TempRepo> {
     args: ["-C", root, "config", "user.email", "test@test.com"],
     stdout: "null",
     stderr: "null",
+    clearEnv: true,
     env,
   }).output();
 
@@ -152,6 +157,7 @@ export async function makeTempRepo(): Promise<TempRepo> {
     args: ["-C", root, "config", "user.name", "Test"],
     stdout: "null",
     stderr: "null",
+    clearEnv: true,
     env,
   }).output();
 
@@ -167,6 +173,7 @@ export async function makeTempRepo(): Promise<TempRepo> {
     args: ["-C", root, "add", "-A"],
     stdout: "null",
     stderr: "null",
+    clearEnv: true,
     env,
   }).output();
 
@@ -174,6 +181,7 @@ export async function makeTempRepo(): Promise<TempRepo> {
     args: ["-C", root, "commit", "-m", "init", "--no-gpg-sign"],
     stdout: "null",
     stderr: "null",
+    clearEnv: true,
     env,
   }).output();
 
@@ -192,6 +200,7 @@ export async function runCliIn(cwd: string, args: string[]): Promise<CliResult> 
     cwd,
     stdout: "piped",
     stderr: "piped",
+    clearEnv: true,
     env: isolatedTestEnv(),
   });
   const { code, stdout, stderr } = await cmd.output();

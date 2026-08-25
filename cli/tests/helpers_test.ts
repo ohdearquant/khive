@@ -47,6 +47,9 @@ Deno.test("isolated test environment strips command-scope Git configuration", as
 
   const sanitized = await new Deno.Command("git", {
     args: ["config", "--get", "core.hooksPath"],
+    // clearEnv: without it Deno merges the parent environment back in, and a
+    // hostile variable inherited by the test process defeats the sanitized map.
+    clearEnv: true,
     env: isolatedTestEnv(hostile),
     stdout: "piped",
     stderr: "piped",
@@ -73,6 +76,9 @@ Deno.test("isolated test environment strips GIT_CONFIG_PARAMETERS injection", as
 
   const sanitized = await new Deno.Command("git", {
     args: ["config", "--get", "core.hooksPath"],
+    // clearEnv: without it Deno merges the parent environment back in, and a
+    // hostile variable inherited by the test process defeats the sanitized map.
+    clearEnv: true,
     env: isolatedTestEnv(hostile),
     stdout: "piped",
     stderr: "piped",
@@ -109,6 +115,7 @@ Deno.test("isolated test environment drops GIT_TEMPLATE_DIR hook seeding", async
     const cleanRepo = join(root, "clean");
     await new Deno.Command("git", {
       args: ["init", cleanRepo],
+      clearEnv: true,
       env: isolatedTestEnv(hostile),
       stdout: "null",
       stderr: "null",
