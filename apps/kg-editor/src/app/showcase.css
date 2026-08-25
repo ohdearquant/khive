@@ -879,6 +879,8 @@ button.repo-list-row:hover,
 .repo-module-action.compact > span { color: inherit; display: inline; font-size: inherit; }
 .repo-cycle-members { overflow: visible !important; text-overflow: clip !important; white-space: normal !important; }
 .repo-cycle-members > span { display: inline !important; overflow: visible !important; white-space: normal !important; }
+.repo-cycle-label { color: var(--repo-navy) !important; font-size: var(--khive-type-md) !important; margin-top: 0 !important; }
+.repo-analysis-id { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .repo-module-reference-missing { color: var(--khive-color-warning); display: inline; font-size: var(--khive-type-xs); overflow-wrap: anywhere; }
 .repo-inline-state { align-items: flex-start; color: var(--amber); display: inline-flex; font-size: var(--khive-type-xs); gap: 4px; margin-top: 4px; }
 .repo-inline-state > svg { flex: 0 0 auto; height: 10px; margin-top: 1px; width: 10px; }
