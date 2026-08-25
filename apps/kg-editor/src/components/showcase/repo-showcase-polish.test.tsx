@@ -95,6 +95,79 @@ describe("repository showcase polish", () => {
     ).toBeVisible();
   });
 
+  it("withholds the ownership tier when the hotspot analysis is unavailable", async () => {
+    const raw = JSON.parse(readFileSync(goldenPath, "utf8"));
+    // An unavailable analysis can still ship a schema-valid data page;
+    // filtering against it would turn unknown coverage into a false zero
+    // presented as a definitive tier.
+    raw.aggregates.hotspot_quadrant.meta.status = "unavailable";
+    raw.aggregates.hotspot_quadrant.meta.unavailable_reason =
+      "hotspot analysis inputs missing from this export";
+    // The capability view mirrors the aggregate status (schema cross-refine).
+    raw.capability.views.hotspot_quadrant.status = "unavailable";
+    raw.capability.views.hotspot_quadrant.unavailable_reason =
+      "hotspot analysis inputs missing from this export";
+    const bundle = parseRepoBundle(raw);
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(container.querySelector('[data-view-id="scorecard"]')!);
+
+    const warningCard = screen
+      .getByText(bundle.capability.labels.metrics.ownership_warnings)
+      .closest("article")!;
+    expect(warningCard).not.toHaveTextContent("High churn · high fan-in tier");
+    // The unfiltered warning count still renders (658 in the golden bundle).
+    expect(within(warningCard).getByText("658")).toBeVisible();
+  });
+
+  it("reports the declared total, not the partial floor, for an incomplete ownership page", async () => {
+    const raw = JSON.parse(readFileSync(goldenPath, "utf8"));
+    const field = raw.aggregates.scorecard.fields.find(
+      (candidate: { key: string }) => candidate.key === "ownership_warnings",
+    );
+    // Cursor-bearing page carrying only part of the ID list: the floor is
+    // not the count, but the exporter's declared total still is.
+    field.value.value.value.items = field.value.value.value.items.slice(0, 100);
+    field.value.value.value.next_cursor = "ownership-cursor-1";
+    const bundle = parseRepoBundle(raw);
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(container.querySelector('[data-view-id="scorecard"]')!);
+
+    const warningCard = screen
+      .getByText(bundle.capability.labels.metrics.ownership_warnings)
+      .closest("article")!;
+    expect(warningCard).not.toHaveTextContent("High churn · high fan-in tier");
+    expect(within(warningCard).getByText("658")).toBeVisible();
+    expect(within(warningCard).queryByText("100")).toBeNull();
+  });
+
+  it("marks the count as a floor when an incomplete ownership page has no declared total", async () => {
+    const raw = JSON.parse(readFileSync(goldenPath, "utf8"));
+    const field = raw.aggregates.scorecard.fields.find(
+      (candidate: { key: string }) => candidate.key === "ownership_warnings",
+    );
+    field.value.value.value.items = field.value.value.value.items.slice(0, 100);
+    field.value.value.value.next_cursor = "ownership-cursor-1";
+    field.value.value.value.total_count = {
+      status: "unavailable",
+      reason: "total not exported",
+    };
+    const bundle = parseRepoBundle(raw);
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(container.querySelector('[data-view-id="scorecard"]')!);
+
+    const warningCard = screen
+      .getByText(bundle.capability.labels.metrics.ownership_warnings)
+      .closest("article")!;
+    expect(warningCard).not.toHaveTextContent("High churn · high fan-in tier");
+    expect(within(warningCard).getByText("100+")).toBeVisible();
+  });
+
   it("sorts dependency rows before the display cap and distinguishes the API bar header", async () => {
     const bundle = golden();
     const user = userEvent.setup();

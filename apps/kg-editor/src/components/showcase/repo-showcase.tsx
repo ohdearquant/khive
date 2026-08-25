@@ -1228,6 +1228,12 @@ function HistoryFacet({
       : !value && parentPage.disclosure.status === "unavailable"
         ? parentPage.disclosure.reason
         : null;
+  // One shared recovery affordance for every empty/incomplete branch below,
+  // so the label and handler cannot drift apart across branches.
+  const exploreStructureAction = {
+    label: "Explore repository structure",
+    onClick: onExploreStructure,
+  };
 
   return (
     <section className="repo-card">
@@ -1247,10 +1253,7 @@ function HistoryFacet({
           state="empty"
           title={`No ${label}`}
           message={`${label} captured for the selected module belong here.`}
-          action={{
-            label: "Explore repository structure",
-            onClick: onExploreStructure,
-          }}
+          action={exploreStructureAction}
         />
       ) : rows.length > 0 ? (
         <div className="repo-list">
@@ -1273,25 +1276,20 @@ function HistoryFacet({
           state="empty"
           title={`No ${label} navigation captured`}
           message={`The selected module has no captured ${label.toLocaleLowerCase()} links in this bundle.`}
-          action={{
-            label: "Explore repository structure",
-            onClick: onExploreStructure,
-          }}
+          action={exploreStructureAction}
         />
       ) : (
         // A zero-row slice of an incomplete or cursor-bearing page is
         // unknown, not empty: the missing rows may hold exactly this
         // module's links, so the definitive empty state above is reserved
-        // for complete pages.
+        // for complete pages. The truncated variant is deliberately
+        // non-interactive (no recovery action) per the DataState contract.
         <DataState
           className="repo-empty compact"
           state="truncated"
           title={`${label} capture incomplete`}
-          message={`This bundle's ${label.toLocaleLowerCase()} page is incomplete, so rows for the selected module may exist beyond what was captured.`}
-          action={{
-            label: "Explore repository structure",
-            onClick: onExploreStructure,
-          }}
+          shown={rows.length}
+          reason={`This bundle's ${label.toLocaleLowerCase()} page is incomplete, so rows for the selected module may exist beyond what was captured.`}
         />
       )}
       {page && (
@@ -2538,7 +2536,7 @@ function scoreLabel(
 function scoreValue(
   field: RepoBundle["aggregates"]["scorecard"]["fields"][number],
   labels: Labels,
-  moduleIds: readonly string[] | null,
+  moduleIds: Readonly<{ items: readonly string[]; tier: string | null }> | null,
 ): string {
   if (field.value.status === "unavailable") return labels.unavailable;
   const value = field.value.value;
@@ -2551,7 +2549,20 @@ function scoreValue(
   }
   if (value.value_kind === "ratio") return formatPercent(value.value);
   if (value.value_kind === "module_ids") {
-    return formatNumber(moduleIds?.length ?? value.value.items.length);
+    const page = value.value;
+    // A tier claim only exists over definitive inputs (see
+    // scorecardModuleIds), so its filtered length is a real count.
+    if (moduleIds?.tier != null) return formatNumber(moduleIds.items.length);
+    if (isCompleteRepoPage(page)) {
+      return formatNumber(moduleIds?.items.length ?? page.items.length);
+    }
+    if (page.disclosure.status === "unavailable") return labels.unavailable;
+    // Incomplete page: the item list is a floor, not a count. The declared
+    // total is still definitive when the exporter recorded one; otherwise
+    // say "N+" rather than presenting the floor as exact.
+    return page.total_count.status === "available"
+      ? formatNumber(page.total_count.value)
+      : `${formatNumber(page.items.length)}+`;
   }
   return value.value;
 }
@@ -2566,16 +2577,29 @@ function scorecardModuleIds(
   ) {
     return null;
   }
-  const items = field.value.value.value.items;
+  const page = field.value.value.value;
+  const items = page.items;
   if (field.key !== "ownership_warnings") {
     return { items, tier: null };
   }
-  // The tier filter is definitive only over a complete hotspot page: a
-  // truncated or cursor-bearing page can be missing exactly the modules the
-  // filter selects, turning unknown coverage into a false zero presented as
-  // a definitive tier. Fall back to the unfiltered warning list with no
-  // tier claim.
-  if (!isCompleteRepoPage(bundle.aggregates.hotspot_quadrant.data)) {
+  // The tier filter is definitive only when EVERY input is definitive:
+  // - the hotspot analysis must be AVAILABLE — an unavailable analysis can
+  //   still ship a schema-valid, complete-but-empty data page, and filtering
+  //   against that empty set turns unknown coverage into a false zero
+  //   presented as a definitive tier;
+  // - the hotspot page must be complete — a truncated or cursor-bearing
+  //   page can be missing exactly the modules the filter selects;
+  // - the ownership-warning page itself must be complete — intersecting a
+  //   partial ID list renders a definitive-looking tier count over unknown
+  //   membership.
+  // Anything less falls back to the unfiltered warning list with no tier
+  // claim (and scoreValue then refuses to present its length as exact).
+  const hotspot = bundle.aggregates.hotspot_quadrant;
+  if (
+    hotspot.meta.status !== "available" ||
+    !isCompleteRepoPage(hotspot.data) ||
+    !isCompleteRepoPage(page)
+  ) {
     return { items, tier: null };
   }
   const highImpactIds = new Set(
@@ -2603,7 +2627,7 @@ function ScorecardView({
       <div className="repo-score-grid">
         {fields.map((field) => {
           const moduleIds = scorecardModuleIds(bundle, field);
-          const value = scoreValue(field, labels, moduleIds?.items ?? null);
+          const value = scoreValue(field, labels, moduleIds);
           const unavailable = field.value.status === "unavailable";
           const modulePage =
             field.value.status === "available" &&
