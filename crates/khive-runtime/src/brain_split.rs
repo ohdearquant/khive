@@ -1,17 +1,18 @@
 //! Brain-state decomposition configuration (ADR-171).
 //!
-//! Phase 1 decouples the durable feedback fold from verb dispatch: with the
-//! split configured, feedback verbs commit only their public event-plane row
-//! and an asynchronous worker in the brain pack folds from a durable cursor.
-//! Later phases add the separate `brain.db` store and the brain daemon; this
-//! config grows their fields (database path, socket) when they land.
+//! Forward-deployed seam for the fold-decoupling worker: when that worker
+//! lands, `Some` on [`crate::RuntimeConfig::brain_split`] will route feedback
+//! through the event plane, folded asynchronously from the durable
+//! `brain_fold_cursor` (V22). Later phases grow this struct with the
+//! separate `brain.db` store and brain-daemon fields (database path, socket).
 
-/// `None` on [`crate::RuntimeConfig::brain_split`] = legacy behavior: the
-/// feedback fold runs synchronously inside verb dispatch, in the same
-/// transaction as the public event append. `Some` = the decoupled fold.
+/// Configuration for the decoupled brain fold (ADR-171).
 ///
-/// Populated by the transport hosts' config resolver (with the
-/// `KHIVE_BRAIN_SPLIT=0` environment kill-switch restoring legacy behavior);
-/// tests and in-memory runtimes leave it `None`.
+/// In this tree the field is a forward-deployed marker: nothing populates it
+/// and populating it changes no behavior yet — the feedback fold still runs
+/// synchronously inside verb dispatch. The fold worker that consumes it is
+/// the next change in the series; until then the only live consumer is the
+/// daemon configuration fingerprint, which already distinguishes `Some` from
+/// `None` so a warm daemon can never straddle the two once the worker lands.
 #[derive(Debug, Clone, Default)]
 pub struct BrainSplitConfig {}

@@ -641,7 +641,18 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         .map(encode_backend_topology)
         .unwrap_or_default();
 
-    format!("{base}{topology}")
+    // Fold the brain-split mode when configured (ADR-171): a runtime folding
+    // feedback asynchronously and one folding synchronously must never share
+    // a warm daemon. Skipped when `None` — the universal state until the
+    // fold worker lands — preserving byte-identity with the pre-change
+    // fingerprint, exactly like the topology component above.
+    let brain_split = config
+        .brain_split
+        .as_ref()
+        .map(|cfg| format!(";brain_split={cfg:?}"))
+        .unwrap_or_default();
+
+    format!("{base}{topology}{brain_split}")
 }
 
 /// Reserved syntax in the legacy topology spelling.
@@ -4063,6 +4074,29 @@ mod tests {
             compute_config_id_with_ann_fresh_tail(&config, None, true),
             compute_config_id_with_ann_fresh_tail(&config, None, false),
             "opposite fresh-tail policies must not share one warm daemon"
+        );
+    }
+
+    /// A runtime folding feedback asynchronously (ADR-171 split) and one
+    /// folding synchronously must never share a warm daemon; and because the
+    /// component is skipped when `None`, every existing daemon identity is
+    /// byte-preserved until the fold worker lands.
+    #[test]
+    fn config_id_separates_brain_split_from_legacy_fold() {
+        let base = RuntimeConfig::no_embeddings();
+        let split = RuntimeConfig {
+            brain_split: Some(khive_runtime::brain_split::BrainSplitConfig::default()),
+            ..base.clone()
+        };
+        let legacy_id = compute_config_id_with_runtime_policies(&base, None, true, false);
+        assert_ne!(
+            compute_config_id_with_runtime_policies(&split, None, true, false),
+            legacy_id,
+            "split and legacy fold semantics must not share one warm daemon"
+        );
+        assert!(
+            !legacy_id.contains("brain_split"),
+            "None must contribute no component, preserving pre-change identities"
         );
     }
 

@@ -316,12 +316,12 @@ pub struct RuntimeConfig {
     /// resolves once to the host's local IANA zone (falling back to UTC when
     /// the host zone cannot be determined) via [`resolve_default_display_timezone`].
     pub display_timezone: chrono_tz::Tz,
-    /// Brain fold decoupling (ADR-171 phase 1). `None` = legacy behavior:
-    /// the feedback fold runs synchronously inside verb dispatch. `Some`
-    /// routes feedback through the event plane, folded asynchronously by the
-    /// brain pack's fold worker under a durable cursor. Populated by the
-    /// transport hosts' resolver (kill-switch `KHIVE_BRAIN_SPLIT=0`); tests
-    /// and in-memory runtimes leave it `None`.
+    /// Brain fold decoupling (ADR-171 phase 1) — forward-deployed seam.
+    /// Nothing populates this field yet and `Some` changes no behavior in
+    /// this tree: the feedback fold still runs synchronously inside verb
+    /// dispatch. The asynchronous fold worker that consumes it is the next
+    /// change in the series; the daemon configuration fingerprint already
+    /// separates `Some` from `None` (see `compute_config_id`).
     pub brain_split: Option<crate::brain_split::BrainSplitConfig>,
 }
 
