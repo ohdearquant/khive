@@ -1602,7 +1602,7 @@ mod tests {
         ));
     }
 
-    fn test_event(verb: &str) -> Event {
+    fn split_retry_event(verb: &str) -> Event {
         Event::new(
             "test",
             verb,
@@ -1635,14 +1635,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (legacy, lane) = store_pair(dir.path());
 
-        let resident = test_event("recall");
+        let resident = split_retry_event("recall");
         legacy
             .append_events_idempotent(vec![resident.clone()])
             .await
             .expect("pre-cutover landing");
 
         let split = SplitEventStore::new(Arc::clone(&legacy), Arc::clone(&lane));
-        let fresh = test_event("search");
+        let fresh = split_retry_event("search");
         let result = split
             .append_events_idempotent(vec![resident.clone(), fresh.clone()])
             .await
