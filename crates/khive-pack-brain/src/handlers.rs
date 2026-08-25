@@ -90,8 +90,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             total_cost_unit_page_scoped) instead of being returned under its normal name. \
             window_event_total always carries the true count regardless. \
             `kind`/`actor` filters are applied in SQL before the internal window cap \
-            — `window_event_total` reflects the exact filtered total even when \
-            truncated=true. For an exact per-actor count of a specific low-frequency kind, pass \
+            — `window_event_total` reflects the filtered total as counted at its own read \
+            instant (an independent read from the returned rows) even when \
+            truncated=true. For a per-actor count of a specific low-frequency kind, pass \
             `kind=` explicitly rather than reading it out of an unfiltered call's \
             counts_by_kind/counts_by_actor breakdown, which is capped over the mixed-kind \
             window and can undercount a low-frequency kind relative to noisier ones. The \
@@ -139,8 +140,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "boolean",
                 required: false,
                 description: "When true, paginate through every matching event instead of a \
-                    single bounded page, returning an exact (non-sampled) full-window \
-                    aggregate in one call. Higher cost than the default bounded page \
+                    single bounded page, returning a non-sampled full-window aggregate \
+                    over a best-effort live view in one call (rows appended while the \
+                    call paginates may be included or excluded). Higher cost than the default bounded page \
                     (internally issues multiple storage queries); intended for coverage-panel \
                     / audit-style queries over large windows. Windows above the 2,000,000-event \
                     exhaustive limit are rejected; narrow since/until or add filters. Default \
@@ -840,8 +842,9 @@ impl BrainPack {
             until: Option<String>,
             // #21: opt into full-window aggregation (paginates through every
             // matching event instead of a single bounded page) so a coverage
-            // panel gets exact per-verb/kind/actor counts in one call, without
-            // stitching sampled windows client-side. Default false — the
+            // panel gets non-sampled per-verb/kind/actor counts in one call,
+            // without stitching sampled windows client-side. The window is a
+            // best-effort live view, not a snapshot (see the walk's docs). Default false — the
             // bounded page is cheaper and sufficient for most callers.
             exhaustive: Option<bool>,
         }
@@ -2823,10 +2826,14 @@ pub(crate) async fn fetch_event_counts_window(
 ///
 /// Read consistency: the walk issues independent page (and, at the cap,
 /// count) reads against a live event plane with no snapshot spanning them.
-/// The result is a point-in-time view — a row appended concurrently with
-/// the walk may be excluded (never duplicated, and never an error), exactly
-/// as it would be by a single bounded read that predated it. Callers
-/// needing a closed population bound the window with `until` in the past.
+/// The result is a best-effort live-window view, not a snapshot — a row
+/// appended concurrently with the walk may be excluded or included
+/// depending on where the cursor stands when it lands (never duplicated,
+/// and never an error), and a total observed by an independent
+/// `count_events` read can differ from the collected rows. Callers needing
+/// a closed population bound the window with `until` in the past, which is
+/// closed only insofar as the event plane appends rows stamped at append
+/// time rather than backdated.
 pub(crate) async fn collect_events_cursor_walk(
     store: &dyn khive_storage::event::EventStore,
     base_filter: &EventFilter,
