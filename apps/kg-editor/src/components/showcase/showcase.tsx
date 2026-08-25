@@ -181,7 +181,7 @@ export function Showcase() {
         message: catalogResult.message,
       });
 
-      const parsed = parseRepositoryLocation(originalLocation);
+      const parsed = parseRepositoryLocation(originalLocation, registry);
       const repositoryIssue = parsed.issues.find((issue) =>
         issue.parameter === "repo"
       );
