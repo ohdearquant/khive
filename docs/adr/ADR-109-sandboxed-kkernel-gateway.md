@@ -502,14 +502,26 @@ already consults on every verb. All of it reuses shipped machinery:
    synthetic string is `"authorize"`, and ADR-129 Amendment 1 already classifies it: a
    pseudo-verb is checked against the full authority its result grants, which for the
    token-minting path is **Write** on the primary namespace. This amendment does not
-   reclassify it. Under read-only mode the Write check therefore denies both of its
-   consumers, and both denials are the mode operating correctly: token minting is refused —
-   the honest semantics of a read+write token, the consequence ADR-129 itself names — and
-   the audit-attachment authorization never passes, which detaches nothing, because the
-   registry has already omitted the `EventStore` per the audit taxonomy above and the
-   per-response advisory makes that skip visible to every caller. An unenumerated synthetic
-   operation remains fail-closed mutating, so the enumeration cannot rot open as new
-   synthetic operations appear.
+   reclassify it. The composite read-only gate nevertheless carries an explicit enumerated
+   admission for `"authorize"`: token minting is permitted under read-only mode. That is a
+   mode-local admission decision, not a reclassification, and it is safe for three reasons,
+   each a property of the boundary the mode binds to (point 4). A `NamespaceToken` is a
+   process-internal object — it is not serializable, and its sealed constructor prevents
+   construction outside the authorization path — so the authority it nominally grants
+   cannot leave the read-only process. Every verb dispatched inside that process passes
+   the same composite gate, so no mutating verb can be exercised through a minted token.
+   And a write that bypasses verb dispatch — a runtime-API call made by code holding the
+   token — is refused by the read-only backing store; on that path the storage-layer
+   binding, not a mint refusal, is the enforcement, and it holds whether or not a token
+   exists. Denying the mint would add no enforcement to any of these paths while breaking
+   an admitted read verb: coordinator-backed `search` fans out by minting a per-backend
+   token for each backend runtime (`authorize_with_visibility`, which issues this same
+   `"authorize"` gate check), so a mint denial fails every coordinator-backed search. The
+   audit-attachment authorization passes under the same admission and attaches nothing,
+   because the registry has already omitted the `EventStore` per the audit taxonomy above
+   and the per-response advisory makes that skip visible to every caller. An unenumerated
+   synthetic operation remains fail-closed mutating, so the enumeration cannot rot open as
+   new synthetic operations appear.
 4. **The mode binds to the process boundary it enforces at.** `kkernel mcp` gains a flag that
    sets the process `Gate` to the composite read-only gate instead of `AllowAllGate` for that
    process's lifetime. Binding is local by construction: a read-only process dispatches every
@@ -666,9 +678,13 @@ Concretely, the read-only connection is **not** a containment for a Tier-C untru
   triggered from the read path — with a test that a recall under read-only mode returns its
   result while performing no persistent index write, and the same recall outside read-only
   mode still maintains the index.
-- The synthetic-operation enumeration (point 3): a test that the audit-attachment
-  authorization is permitted under read-only mode and audit appends survive, and that an
-  unenumerated synthetic operation is denied.
+- The synthetic-operation enumeration (point 3): a test that the enumerated `"authorize"`
+  admission holds under read-only mode — coordinator-backed `search` returns results, no
+  audit append is attempted because the registry omits the `EventStore`, and every
+  successful non-help operation carries the `audit_persistence_skipped_read_only`
+  advisory; a test that a write attempted through a minted token is refused at the
+  storage layer (the backstop the admission relies on); and a test that an unenumerated
+  synthetic operation is denied.
 - The structured `refusal` field on the per-operation envelope entry (point 5), carrying the
   normative schema and class mapping above with the `error` field untouched in both its
   existing shapes, with tests that a denied mutating verb returns `class: "read_only"`
