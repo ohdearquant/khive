@@ -60,15 +60,28 @@ that stay put.
 1. **Events daemon.** A new subcommand of the same binary runs an events daemon
    that owns the events database (`<main-file-name>.events.db`, e.g.
    `khive.db.events.db`, derived from the main database's full file name with
-   its parent directory canonicalized when it exists — a stem-derived name
-   would silently share one sidecar between `a.db` and `a.sqlite`, and an
-   uncanonicalized path would mint distinct sidecars for aliases of one
-   database), writes to it through the existing
+   the path canonicalized when it exists — **including the final component**:
+   a stem-derived name would silently share one sidecar between `a.db` and
+   `a.sqlite`, an uncanonicalized parent would mint distinct sidecars for
+   aliases of one database, and an unresolved final-component symlink would
+   let a link in an attacker-writable directory relocate the predictable
+   sidecar and socket paths beside a file the attacker controls. Derivation
+   therefore resolves the configured database path fully before deriving
+   either name), writes to it through the existing
    `SqlEventStore`, and binds its own Unix socket using the same framing and
-   peer-uid admission as the existing daemon socket. It is the only **resident**
-   writer of that file; the sole exception is the daemonless embedded mode of
-   point 4, whose short direct appends SQLite's per-file cross-process exclusion
-   already serializes.
+   peer-uid admission as the existing daemon socket. The socket boundary is
+   fail-closed on both ends, with the same controls the domain daemon
+   enforces (`crates/khive-runtime/src/daemon.rs`): the bind side vets the
+   socket's parent directory with the directory trust predicate (owned by
+   the daemon's euid or root, not writable by group or other, swap-resistance
+   checked, unreadable metadata fails closed) and asserts mode `0600` on the
+   bound socket; the connect side applies the same directory predicate to
+   the path before connecting, refusing directories that fail it, since
+   peer-uid admission authenticates the client to the server but nothing
+   otherwise authenticates a pre-bound listener to the client. It is the only
+   **resident** writer of that file; the sole exception is the daemonless
+   embedded mode of point 4, whose short direct appends SQLite's per-file
+   cross-process exclusion already serializes.
 
 2. **Split event store (writes).** In the domain process, the `EventStore`
    the runtime hands out routes by append class. The idempotent audit-batch
@@ -91,16 +104,28 @@ that stay put.
    stated here because an unstated retry policy is either a silent drop or an
    unbounded buffer. On a failed round-trip the audit flusher retries a
    generation up to its configured attempt cap with a short backoff
-   (defaults: 3 attempts, 20ms), then fails that generation terminally — its
-   rows are dropped with a terminal reason surfaced to submitters, not
-   retried forever. The flusher's pending buffer is hard-capped
-   (default 4096 rows); at the cap new submissions are refused with an
-   explicit admission-exhausted outcome rather than growing without bound.
-   So during an events-daemon outage the loss is: in-flight generations after
-   retry exhaustion, plus refused admissions at the cap — the same
-   loss-tolerant durability class as the fire-and-forget queue, reached by a
-   different mechanism — and the supervisor's respawn probe bounds how long
-   an outage lasts.
+   (defaults: 3 attempts, 20ms), then fails that generation terminally — the
+   terminal reason is surfaced to submitters, not retried forever. The
+   flusher's pending buffer is hard-capped (default 4096 rows); at the cap
+   new submissions are refused with an explicit admission-exhausted outcome
+   rather than growing without bound.
+
+   **A surfaced terminal failure fails the submitting operation — the audit
+   lane is not loss-tolerant for obligation-bearing rows.** The batch this
+   lane carries includes records existing contracts require to be committed
+   before an operation reports success (dispatch outcomes, authorization
+   denials, accounting rows). The mechanism that holds that contract today
+   is unchanged by this ADR: the dispatch path folds the audit obligation's
+   outcome into the verb result (`fold_audit_obligation`,
+   `crates/khive-runtime/src/pack.rs` — a successful operation with a failed
+   audit outcome returns the audit error), exactly as a writer-lane
+   admission-exhausted refusal fails the verb on the single-store layout
+   today. So during an events-daemon outage the observable behavior is loud
+   refusal of the affected operations, never a success report whose audit
+   row silently vanished; the loss-tolerant drop class in this design covers
+   only the fire-and-forget telemetry queue above, whose producers opted
+   into it explicitly. The supervisor's respawn probe bounds how long an
+   outage — and therefore the refusal window — lasts.
 
 3. **Reads.** Trait-level reads (`query_events`, `count_events`, `get_event`)
    merge both stores, so consumers on the trait observe one event plane
@@ -108,7 +133,23 @@ that stay put.
    the stores' shared order before applying the requested window. The lane
    side of a read is a framed round-trip in daemon deployments and a direct
    open in embedded mode. Raw-SQL readers of the legacy `events` table keep
-   reading exactly the rows that never moved.
+   reading exactly the rows that never moved. Two consumer classes sit
+   outside the trait and get an explicit contract each:
+   - _By-id event fetch._ The user-facing `get` path resolves an event id
+     against the legacy store first and falls back to the sidecar on a miss,
+     so a moved audit row remains fetchable by id. This is a requirement of
+     the cutover, not an optimization — without it, ids returned by merged
+     listings would dangle for the get path.
+   - _Graph addressability._ Event rows reachable as graph-query endpoints
+     or usable as annotation targets are exactly the classes this routing
+     keeps in the domain store — that co-residency is the routing's own
+     selection criterion. Post-cutover audit-lane rows are **not**
+     graph-addressable: the graph compiler's cross-substrate union and the
+     guarded endpoint checks read the main `events` table only, and this
+     ADR accepts that for the audit class rather than extending graph SQL
+     across two files. An attempt to use a sidecar-resident event as an
+     edge endpoint or annotation target fails the existing endpoint
+     existence check — a loud refusal, not a silent dangling edge.
 
 4. **Embedded mode.** One-shot CLI and test contexts without a daemon use the
    in-process `SqlEventStore` against the events database directly for the lane side.
@@ -122,9 +163,12 @@ that stay put.
    whichever daemon owned it.
 
 5. **Lifecycle.** The domain daemon spawns and supervises the events daemon at
-   startup. If the events daemon dies, the domain daemon keeps serving, drops
-   events loudly (counter + log), and attempts respawn with backoff. Domain
-   availability never depends on events-daemon liveness.
+   startup. If the events daemon dies, the domain daemon keeps serving:
+   fire-and-forget telemetry drops loudly (counter + log), audit-obligated
+   operations refuse loudly per point 2, and the supervisor attempts respawn
+   with backoff. Domain availability never depends on events-daemon liveness;
+   audit-obligated verbs share the outage window as refusals, which is the
+   durability contract holding, not an availability dependency being added.
 
 6. **Cutover.** New audit-lane rows go to the events database from the first boot of
    this code; the plain-append classes keep writing the domain store, so
@@ -141,6 +185,17 @@ that stay put.
    (~55,000 rows/day historically) the accumulated legacy audit tonnage is a
    material share of main-store size, and reclaiming it is the second half
    of this ADR's contention-and-size argument.
+
+7. **Backup and restore.** The sidecar is part of the store, not a cache: any
+   backup or restore scheme that covers the main database must include the
+   events database beside it, and the two are captured and restored as a
+   pair. A restore that resurrects only the main file silently amputates
+   post-cutover audit history from the merged event plane, so tooling that
+   snapshots `<main-file-name>` must snapshot `<main-file-name>.events.db`
+   whenever it exists, and portability/operations documentation is updated
+   with the pair rule in the same change that ships the sidecar. Restoring a
+   backup taken before the sidecar existed is well-formed — the daemon
+   creates an empty sidecar on boot and merged reads simply see no lane rows.
 
 ## Consequences
 
@@ -159,10 +214,13 @@ that stay put.
 
 **Negative / accepted.**
 
-- A new loss mode exists by design: events dropped under overflow or during an
-  events-daemon outage are gone. The degradation counter and log line are the
-  mandatory visibility for it; the counter is surfaced through the existing
-  diagnostics surface so a silent-drop deployment is observable.
+- A new loss mode exists by design for the fire-and-forget telemetry class:
+  events dropped under queue overflow or during an events-daemon outage are
+  gone. The degradation counter and log line are the mandatory visibility for
+  it; the counter is surfaced through the existing diagnostics surface so a
+  silent-drop deployment is observable. The synchronous audit lane shares the
+  outage window but not the loss mode — its cost is loud operation refusals
+  (point 2), never silently missing rows behind a success report.
 - Pre-cutover event history is invisible to windowed queries against the new
   store.
 - The binary grows a subcommand and the deployment grows a supervised child
