@@ -122,7 +122,10 @@ Move brain state into a dedicated brain daemon that owns `brain.db`.
    posterior update happens when the tail reaches the row. Within one
    store, insertion order gives the ordering that matters: a recall's serve
    event lands before any feedback that cites it, so ledger materialization
-   (point 4) precedes the feedback fold that resolves against it. No
+   (point 4) precedes the feedback fold that resolves against it. That
+   ordering is guaranteed by point 4's synchronous append, not assumed: a
+   feedback event can only be submitted after the recall response, and the
+   response is only sent after the serve event's row is committed. No
    cross-store fold ordering is claimed; posterior accumulation is
    evidence-summing and tolerates cross-store interleave.
 
@@ -140,18 +143,38 @@ Move brain state into a dedicated brain daemon that owns `brain.db`.
      `RecallHit`/`RecallMiss` signal from the durable row that it yields
      from the synthetic event; `served_by_profile_id` and
      `serve_attribution` already ride the durable payload.
+   - The event carries a stable serve identity and an exact serve time.
+     The event's own `id` doubles as the **serve id**, and the payload
+     gains `served_at` — the microsecond timestamp captured at the recall
+     response boundary, the same value the retiring `brain.record_serve`
+     dispatch hands the ledger today. Today neither rides the durable
+     payload (the event's `created_at` is stamped at append time, which is
+     not the serve time), so a fold-side materialization would have to
+     invent the ledger's key column; with both stamped producer-side,
+     re-folding the same event reproduces byte-identical ledger-key
+     columns.
+   - The durable append moves out of the detached background task
+     (`track_background_task` in `khive-pack-memory/src/handlers/recall.rs`)
+     into the recall dispatch itself, committing before the recall
+     response returns. This is what makes point 3's insertion-order claim
+     true rather than probabilistic: left detached, a fast caller's
+     feedback row can land before its own serve row.
    - The synthetic in-process hook is deleted in the same change, so each
      recall produces exactly one fold input, not two.
    - The serve ledger becomes fold-side output: the daemon materializes
      `brain_serve_ledger` rows from the `RecallExecuted` events it tails
-     (the payload carries every column the current `brain.record_serve`
-     write derives), and the `brain.record_serve` verb is retired at
-     cutover. The ledger's existing UNIQUE key
+     (the payload now carries every column the current `brain.record_serve`
+     write derives, including `served_at` verbatim — never a fold-time
+     clock read), stamps each row with the originating event id as its
+     serve id, and the `brain.record_serve` verb is retired at cutover.
+     The ledger's existing UNIQUE key
      (`namespace, target_id, query_class, served_at`) makes
-     materialization idempotent under re-fold. Feedback attribution,
-     scorer-dedup resolution, and grade backfill — the ledger's only
-     runtime readers — already execute inside the brain pack and move with
-     it; their read of the ledger stays a local read inside the daemon.
+     materialization idempotent under re-fold, and the serve id gives
+     feedback attribution an exact join key where today it resolves by
+     column proximity. Feedback attribution, scorer-dedup resolution, and
+     grade backfill — the ledger's only runtime readers — already execute
+     inside the brain pack and move with it; their read of the ledger
+     stays a local read inside the daemon.
 
 5. **Coefficient queries serve the existing projection.** The brain verbs
    (`brain.profile` and the other profile lifecycle/read verbs) are served
@@ -173,13 +196,28 @@ Move brain state into a dedicated brain daemon that owns `brain.db`.
    rowid is an authoritative insertion-order high-water mark that
    timestamps are not: a delayed transaction lands with a _later_ rowid
    even when its `created_at` is older, so a rowid cursor cannot skip it.
-   The protocol:
+   One property the rowid does **not** have is durability across
+   maintenance: an implicit rowid (no `INTEGER PRIMARY KEY` alias) is
+   renumbered by `VACUUM`, and the store supports operator-issued
+   top-level `VACUUM` through the writer lane
+   (`khive-db/src/writer_task.rs`). A bare rowid cursor would silently
+   skip or re-fold rows after routine maintenance, so the cursor carries
+   a stability witness. The protocol:
    - The brain daemon keeps **one cursor per source store** in `brain.db`
-     — the last folded rowid, deliberately not a merged cursor, because
-     the two writers share no ordering. Purges of already-folded rows are
-     harmless to the cursor; rowid reuse would require deleting the
-     newest row, which the append-only event plane and tenure-based purge
-     policy (oldest-first) do not do.
+     — the last folded rowid **paired with that row's `id`** (the `TEXT`
+     primary key, which is immutable and unique where the rowid is not),
+     deliberately not a merged cursor, because the two writers share no
+     ordering. Purges of already-folded rows are harmless to the cursor.
+   - On each tail open the daemon validates the witness: the row at the
+     cursor rowid must carry the cursor id. On mismatch (`VACUUM`
+     renumbered) it rebases by resolving the stored id's current rowid
+     and resumes past it. If the id is absent entirely (tenure-purged),
+     it resumes from the oldest remaining row — rewind, never skip:
+     re-folding tolerant evidence-summing classes is recoverable noise,
+     while a silent gap is unmeasurable loss, and the exactly-once
+     classes are claim-guarded either way (below). Every rebase
+     increments a counter and logs the resume bound, so maintenance-driven
+     rewinds are visible rather than absorbed.
    - The fold of a batch of rows and the cursor advance commit in **one
      `brain.db` transaction**. A crash before commit re-reads the same
      rows from the (unchanged) source store; a crash after commit resumes
@@ -201,16 +239,33 @@ Move brain state into a dedicated brain daemon that owns `brain.db`.
    brain tables in new main stores, and existing main-store copies age in
    place under the same tenure language as ADR-170's legacy rows, covered
    by the same operator purge tool.
-   - _Cutover fence._ The producer-side recall-event change (point 4)
-     lands first. Cutover then stops in-process folding, snapshots state,
-     and records each source store's `MAX(rowid)` **while folding is
-     stopped** — an exact fence, since legacy folds run synchronously
-     inside dispatch. On first boot the brain daemon imports the
-     main-store snapshots and initializes each per-store cursor from the
-     recorded fence, then replays newer rows. Because the fence postdates
-     the producer change, every replayed recall row carries `target_id`;
-     pre-change history is covered by the imported snapshots and is never
-     replayed.
+   - _Cutover fence — under writer quiescence._ The producer-side
+     recall-event change (point 4) lands first. Cutover then holds each
+     source store's writer lane (a top-level hold through the same
+     single-writer queue that serializes `VACUUM`), and **while the lane
+     is held**: stops in-process folding, snapshots state, and records
+     that store's `MAX(rowid)` as the fence. The hold is what makes the
+     fence exact — folding stopped is not enough, because appends
+     continue: a row landing between fold-stop and fence capture would
+     sit below the fence unfolded, unreplayable by construction. With the
+     lane held, folded-set and fence are captured against the same frozen
+     store. On first boot the brain daemon imports the hand-off payload
+     below and initializes each per-store cursor from the recorded fence,
+     then replays newer rows. Because the fence postdates the producer
+     change, every replayed recall row carries `target_id`; pre-change
+     history is covered by the imported state and is never replayed.
+   - _Hand-off payload — all five tables, both directions._ "State" in
+     this fence discipline means the five brain tables enumerated in
+     Context, never profile snapshots alone: `brain_profile_snapshots`,
+     `brain_event_log`, `brain_implicit_mass`, `brain_scorer_dedup`
+     (without the claim rows, a post-cutover rewind could re-apply scorer
+     feedback that exactly-once had already claimed), and
+     `brain_serve_ledger` including its grade columns (feedback
+     attribution and grade backfill must keep resolving against
+     pre-cutover serves). Each direction bulk-copies the five tables at
+     its fence and verifies per-table row-count equality between source
+     and destination before the new mode serves; a mismatch aborts the
+     mode switch rather than serving from a partial import.
    - _Cutover test arm._ Fold a known event sequence with a mid-sequence
      snapshot-and-restart and require the resulting posterior to equal the
      uninterrupted single-pass fold of the same sequence; redden on
@@ -222,10 +277,13 @@ Move brain state into a dedicated brain daemon that owns `brain.db`.
      compatibility bundle (`CREATE TABLE IF NOT EXISTS`, as the DDL
      already is) that the legacy activation path applies to the main store
      on boot. State follows the same fence discipline in reverse:
-     activation with a `brain.db` present imports the daemon's snapshots
-     and records the fence at which in-process folding resumes; a later
-     return to daemon mode re-imports from the main store at a fence
-     recorded the same way. Either direction is a snapshot-plus-fence
+     activation with a `brain.db` present imports the full five-table
+     hand-off payload from `brain.db` into the main store (the
+     compatibility DDL has just ensured the destination tables exist) and
+     records the fence — under the same writer-lane hold — at which
+     in-process folding resumes; a later return to daemon mode re-imports
+     the five tables from the main store at a fence recorded the same
+     way. Either direction is the same quiesced five-table-plus-fence
      hand-off, so the mode switch is symmetric and repeatable, and the
      fallback works on a store initialized at any point in the sequence.
 
@@ -285,6 +343,12 @@ Move brain state into a dedicated brain daemon that owns `brain.db`.
 - A coefficient round-trip is added to profile-stamped recalls; bounded by
   the socket timeout and removed entirely by the fail-soft path when the
   daemon is down.
+- The durable recall event append moves onto the recall dispatch path (it
+  is a detached background write today), adding one domain-store write
+  before the response returns. That write is the price of the
+  serve-before-feedback ordering guarantee point 3 rests on; it rides the
+  same writer lane the dispatch already used for synchronous folds, which
+  this ADR is simultaneously vacating.
 - One more supervised child process and one more database file.
 
 ## Alternatives considered
