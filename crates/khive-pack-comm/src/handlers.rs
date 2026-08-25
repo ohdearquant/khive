@@ -838,14 +838,6 @@ async fn query_inbox_response(
 
 /// `unread` — count-only view of the caller's unread inbound messages (#66):
 /// same filter stack as `inbox(status="unread")`.
-///
-/// `NoteStore` has no filtered `COUNT(*)` projection (only `count_notes`,
-/// which counts a whole namespace/kind with no property filter) — adding one
-/// is an OSS `khive-storage` change, out of scope here. This pages through
-/// `query_notes_filtered` the same way `handle_inbox`'s `#493` from_actor/
-/// from_prefix path already does, summing page lengths instead of fetching a
-/// bounded `limit` of full payloads — heavier than a real `COUNT(*)` but
-/// correct, and consistent with the pagination style already in this file.
 pub(crate) async fn handle_unread(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -891,6 +883,25 @@ async fn count_unread_messages(
         order_by: None,
         ..Default::default()
     };
+    // `query_notes_filtered` computes `Page::total` with a same-snapshot
+    // `COUNT(*)` on every call, so a limit-0 page returns the filtered total
+    // without hydrating any rows — one count query regardless of mailbox size.
+    let page = store
+        .query_notes_filtered(
+            namespace,
+            &filter,
+            PageRequest {
+                limit: 0,
+                offset: 0,
+            },
+        )
+        .await?;
+    if let Some(total) = page.total {
+        return Ok(total);
+    }
+
+    // A store that omits `total` still gets a correct (if heavier) answer:
+    // page through and sum lengths.
     const PAGE_SIZE: u32 = 200;
     let mut count: u64 = 0;
     let mut db_offset: u32 = 0;

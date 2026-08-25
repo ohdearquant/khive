@@ -1395,7 +1395,10 @@ request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 
 List and page through the caller's filtered inbound messages (default) or sent
 history (`box="sent"`).
-The response keeps the inbox envelope; `unread_count` is zero for sent rows.
+The response keeps the inbox envelope. `unread_count` is the mailbox-wide
+unread total for the caller — independent of the page window and of `status`
+and sender filters, computed as a single count query — and is zero for sent
+rows.
 With `wait_ms`, an initially empty fully filtered page waits for a newly
 committed matching message and otherwise returns at the deadline.
 
