@@ -12247,6 +12247,14 @@ async fn stats_reports_edges_by_relation() {
         .dispatch("stats", json!({}))
         .await
         .expect("stats must succeed");
+    assert_eq!(
+        result.get("count_scope"),
+        Some(&json!({
+            "namespaces": "caller_visible",
+            "rows": "live_only",
+        })),
+        "stats must disclose that its counts cover live rows in caller-visible namespaces"
+    );
     let by_relation = result
         .get("edges_by_relation")
         .and_then(Value::as_object)

@@ -340,7 +340,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Assertive: returns aggregate substrate counts (#280)
     HandlerDef {
         name: "stats",
-        description: "Return aggregate KG substrate counts (entities, edges, notes), plus an \
+        description: "Return aggregate KG substrate counts (entities, edges, notes). Counts cover \
+                      live rows across caller-visible namespaces; count_scope repeats this scope \
+                      in the response. Includes an \
                       edges_by_relation breakdown (relation name -> count) so full-graph audits \
                       know the true per-relation population before sampling.",
         visibility: Visibility::Verb,
@@ -1035,6 +1037,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                       counters (present once a runtime audit-batch control is wired; \
                       unavailable with a reason otherwise), build identity, duplicate edge-ID \
                       and list-ledger counts, \
+                      graph_edges_rows across all namespaces including soft-deleted rows, and \
+                      graph_edges_seq_rows across the insertion ledger, whose rows survive hard deletion. \
+                      graph_edges_seq_minus_graph_edges and graph_edges_seq_relationship make the \
+                      expected non-negative ledger delta explicit; a negative delta is unexpected. \
                       ADR-091 checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
                       WAL-pin holder census. The \
@@ -1159,6 +1165,29 @@ mod tests {
             .iter()
             .find(|h| h.name == name)
             .unwrap_or_else(|| panic!("handler {name:?} not found in KG_HANDLERS"))
+    }
+
+    #[test]
+    fn count_verb_help_explains_edge_count_scopes_and_ledger_delta() {
+        let stats = find_handler("stats");
+        assert!(
+            stats.description.contains("caller-visible namespaces")
+                && stats.description.contains("live rows"),
+            "stats help must disclose its namespace and deletion scope"
+        );
+
+        let diagnostics = find_handler("db_diagnostics");
+        for required in [
+            "all namespaces",
+            "soft-deleted rows",
+            "hard deletion",
+            "graph_edges_seq_minus_graph_edges",
+        ] {
+            assert!(
+                diagnostics.description.contains(required),
+                "db_diagnostics help must explain {required:?}"
+            );
+        }
     }
 
     /// Regression for #899: `create.entity_kind`/`list.entity_kind` help text must list
