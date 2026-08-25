@@ -1870,7 +1870,9 @@ mod tests {
         let bytes = read_frame(&mut stream).await.expect("read");
         let response: EventsResponse = serde_json::from_slice(&bytes).expect("parse");
         match response {
-            EventsResponse::Error { message, retryable } => {
+            EventsResponse::Error {
+                message, retryable, ..
+            } => {
                 assert!(!retryable, "version skew is not retryable");
                 assert!(message.contains("protocol version"), "message: {message}");
             }
