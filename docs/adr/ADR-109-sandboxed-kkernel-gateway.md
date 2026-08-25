@@ -504,16 +504,28 @@ already consults on every verb. All of it reuses shipped machinery:
    token-minting path is **Write** on the primary namespace. This amendment does not
    reclassify it. The composite read-only gate nevertheless carries an explicit enumerated
    admission for `"authorize"`: token minting is permitted under read-only mode. That is a
-   mode-local admission decision, not a reclassification, and it is safe for three reasons,
-   each a property of the boundary the mode binds to (point 4). A `NamespaceToken` is a
-   process-internal object — it is not serializable, and its sealed constructor prevents
-   construction outside the authorization path — so the authority it nominally grants
-   cannot leave the read-only process. Every verb dispatched inside that process passes
-   the same composite gate, so no mutating verb can be exercised through a minted token.
-   And a write that bypasses verb dispatch — a runtime-API call made by code holding the
-   token — is refused by the read-only backing store; on that path the storage-layer
+   mode-local admission decision, not a reclassification, and its safety rests on the
+   boundary the mode binds to (point 4), stated honestly: token provenance is NOT part of
+   the defense. A `NamespaceToken` is not serializable, so the authority it nominally
+   grants cannot leave the read-only process — but inside the process it is an ordinary
+   derivable object (the public `NamespaceToken::with_namespace` mints a token for an
+   arbitrary namespace from any existing token, with no gate check), so the mode must hold
+   against ANY token existing in-process, however obtained. It does, on two layers. Every
+   verb dispatched inside the process passes the same composite gate, so no mutating verb
+   can be exercised through any token. And a write that bypasses verb dispatch — a
+   runtime-API call made by code holding a token — is refused by the storage layer,
+   because point 4 binds EVERY process-owned store read-only; on that path the storage
    binding, not a mint refusal, is the enforcement, and it holds whether or not a token
-   exists. Denying the mint would add no enforcement to any of these paths while breaking
+   exists. Two conditions ride the admission. First, it does not waive ADR-129
+   Amendment 1's read-scope verification: minting a token whose visibility set widens
+   beyond the primary namespace requires the gate to verify Read authority on the primary
+   AND on each extra namespace, and an implementation that presents only the primary to
+   the gate does not satisfy this amendment. The shipped `authorize_with_visibility` does
+   exactly that today; that is a conformance defect against ADR-129 independent of this
+   mode, tracked separately, and this admission does not paper over it. Second, the
+   admission is valid only in a process whose every store is bound read-only per point 4;
+   in a mixed topology it does not apply, and point 4 makes such a launch refuse to
+   start. Denying the mint would add no enforcement to any of these paths while breaking
    an admitted read verb: coordinator-backed `search` fans out by minting a per-backend
    token for each backend runtime (`authorize_with_visibility`, which issues this same
    `"authorize"` gate check), so a mint denial fails every coordinator-backed search. The
@@ -536,10 +548,14 @@ already consults on every verb. All of it reuses shipped machinery:
    starts — and the invariant is stated generally so it survives new components: a read-only
    process admits no component that writes a store outside verb dispatch; a component that
    cannot demonstrate that is not started in this mode. The mode also binds the **storage
-   layer**, not the gate alone: the flag opens the backing store read-only, so store-layer
-   maintenance that no verb gate can see (the index-maintenance class in point 3) is
-   suppressed by the same guard the storage engine already honors. A launch that cannot open
-   the store read-only fails; it does not fall back to a writable handle. Read verbs
+   layer**, not the gate alone, and it binds ALL of it: the flag opens every process-owned
+   store read-only — the main backing store, every secondary/namespace backend the process
+   constructs, and the blob store — so store-layer maintenance that no verb gate can see
+   (the index-maintenance class in point 3) is suppressed by the same guard the storage
+   engine already honors, and no runtime-API write path lands on a writable store. A mixed
+   topology — any process-owned store writable while the mode is on — is a launch error,
+   refused before any component starts, exactly as daemon mode is. A launch that cannot
+   open a store read-only fails; it does not fall back to a writable handle. Read verbs
    tolerate this: a read-only connection performs no domain writes
    (the gate denies mutations before any handler runs, and the adaptive hooks are suppressed
    per point 3, and audit persistence is skipped with the ADR-028 A2 advisory per the
@@ -670,9 +686,13 @@ Concretely, the read-only connection is **not** a containment for a Tier-C untru
 - The daemon-mode rejection (point 4): `--read-only` combined with `--daemon` is a launch
   error, with an end-to-end test asserting the process exits before any component starts —
   no scheduler, no store handle, no partial startup.
-- The storage-layer binding (point 4): the flag opens the backing store read-only, with a
-  test that a launch which cannot open the store read-only fails rather than falling back
-  to a writable handle.
+- The storage-layer binding (point 4): the flag opens every process-owned store read-only
+  — main backing store, secondary/namespace backends, blob store — with a test that a
+  launch which cannot open a store read-only fails rather than falling back to a writable
+  handle, a test that a mixed topology (any process-owned store writable) is refused at
+  launch, and direct-runtime mutation coverage: a write attempted through a minted token
+  via the runtime API — bypassing verb dispatch — is refused at the storage layer for
+  EACH process-owned store class (backend SQL write, secondary-backend write, blob put).
 - Store-maintenance suppression under the storage binding (points 3-4): index-maintenance
   writes that no verb gate can see — the ANN rebuild/watermark/compaction lifecycle
   triggered from the read path — with a test that a recall under read-only mode returns its
@@ -682,9 +702,11 @@ Concretely, the read-only connection is **not** a containment for a Tier-C untru
   admission holds under read-only mode — coordinator-backed `search` returns results, no
   audit append is attempted because the registry omits the `EventStore`, and every
   successful non-help operation carries the `audit_persistence_skipped_read_only`
-  advisory; a test that a write attempted through a minted token is refused at the
-  storage layer (the backstop the admission relies on); and a test that an unenumerated
-  synthetic operation is denied.
+  advisory; a test that minting with an `extra_visible` namespace the principal lacks
+  Read authority on is denied (the ADR-129 read-scope condition the admission carries);
+  and a test that an unenumerated synthetic operation is denied. The token-mediated
+  write-refusal arms live under the storage-layer binding criterion above, per store
+  class.
 - The structured `refusal` field on the per-operation envelope entry (point 5), carrying the
   normative schema and class mapping above with the `error` field untouched in both its
   existing shapes, with tests that a denied mutating verb returns `class: "read_only"`
