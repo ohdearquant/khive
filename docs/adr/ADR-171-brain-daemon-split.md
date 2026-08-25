@@ -110,7 +110,11 @@ Move brain state into a dedicated brain daemon that owns `brain.db`.
    are plain-append classes and land in the **domain store's** `events`
    table (they must — serve/selection events are reachable as graph-query
    endpoints there, one of the co-residency consumers ADR-170's amendment
-   enumerates), while the audit lane lands in `events.db`. The brain daemon
+   enumerates), while the audit lane lands in `events.db`. The `events.db`
+   cursor is not defensive: the dispatch-audit rows the interpreter folds as
+   note-access and search signals (the `get`/`remember`/`search` arms of
+   `interpret`) travel the idempotent audit batch that ADR-170 routes to the
+   sidecar, so both files carry live fold-input classes. The brain daemon
    tails **both files, each under its own cursor** (point 6). No new
    streaming protocol and no producer-side coupling: a row is folded
    whether the brain daemon was up when it landed or not. All folds are
