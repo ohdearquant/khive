@@ -2730,6 +2730,14 @@ impl BrainPack {
 /// Returns the concatenated items, the true total matching the filter (exact,
 /// via `Page::total`'s unbounded `COUNT(*)` — see `khive-db`'s `query_events`),
 /// and whether either half was truncated against its own `page_limit`.
+/// Transport-safe per-request page bound for every event read this module
+/// issues. The events-split daemon refuses `QueryEvents` pages above its cap
+/// (`khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS`), and the
+/// split store's merged read forwards `offset + limit` as one daemon page —
+/// so windows wider than the cap are collected by cursor-walking in pages of
+/// at most this many rows at `offset: 0`, never by one wide request.
+const TRANSPORT_PAGE_ROWS: u32 = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS;
+
 pub(crate) async fn fetch_event_counts_window(
     store: &dyn khive_storage::event::EventStore,
     base_filter: &EventFilter,
@@ -2737,19 +2745,19 @@ pub(crate) async fn fetch_event_counts_window(
     page_limit: u32,
 ) -> Result<(Vec<Event>, u64, bool), RuntimeError> {
     if !unfiltered {
-        let page = store
-            .query_events(
-                base_filter.clone(),
-                PageRequest {
-                    offset: 0,
-                    limit: page_limit,
-                },
-            )
+        let window_event_total = store
+            .count_events(base_filter.clone())
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        let window_event_total = page.total.unwrap_or(page.items.len() as u64);
-        let truncated = window_event_total > page.items.len() as u64;
-        return Ok((page.items, window_event_total, truncated));
+        let items = collect_events_cursor_walk(
+            store,
+            base_filter,
+            TRANSPORT_PAGE_ROWS,
+            u64::from(page_limit),
+        )
+        .await?;
+        let truncated = window_event_total > items.len() as u64;
+        return Ok((items, window_event_total, truncated));
     }
 
     let non_audit_kinds: Vec<khive_types::EventKind> = khive_types::EventKind::ALL
@@ -2766,37 +2774,128 @@ pub(crate) async fn fetch_event_counts_window(
         ..base_filter.clone()
     };
 
-    let audit_page = store
-        .query_events(
-            audit_filter,
-            PageRequest {
-                offset: 0,
-                limit: page_limit,
-            },
-        )
+    let audit_total = store
+        .count_events(audit_filter.clone())
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-    let non_audit_page = store
-        .query_events(
-            non_audit_filter,
-            PageRequest {
-                offset: 0,
-                limit: page_limit,
-            },
-        )
+    let non_audit_total = store
+        .count_events(non_audit_filter.clone())
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+    let audit_items = collect_events_cursor_walk(
+        store,
+        &audit_filter,
+        TRANSPORT_PAGE_ROWS,
+        u64::from(page_limit),
+    )
+    .await?;
+    let non_audit_items = collect_events_cursor_walk(
+        store,
+        &non_audit_filter,
+        TRANSPORT_PAGE_ROWS,
+        u64::from(page_limit),
+    )
+    .await?;
 
-    let audit_total = audit_page.total.unwrap_or(audit_page.items.len() as u64);
-    let non_audit_total = non_audit_page
-        .total
-        .unwrap_or(non_audit_page.items.len() as u64);
-    let truncated = audit_total > audit_page.items.len() as u64
-        || non_audit_total > non_audit_page.items.len() as u64;
+    let truncated =
+        audit_total > audit_items.len() as u64 || non_audit_total > non_audit_items.len() as u64;
     let window_event_total = audit_total + non_audit_total;
-    let mut items = audit_page.items;
-    items.extend(non_audit_page.items);
+    let mut items = audit_items;
+    items.extend(non_audit_items);
     Ok((items, window_event_total, truncated))
+}
+
+/// Collect up to `max_rows` events for `base_filter` by walking a strict
+/// descending `before` cursor at `offset: 0`, requesting at most
+/// [`TRANSPORT_PAGE_ROWS`] rows per query so no request exceeds the
+/// events-daemon page cap.
+///
+/// `before` is a strict `created_at <` bound, so stepping the cursor to the
+/// last row's timestamp would drop rows sharing that microsecond beyond the
+/// page edge. Step to `last.created_at + 1` instead — which re-admits the
+/// boundary microsecond — and drop the re-read rows by id. Aggregation is
+/// order-independent, so delivery order across pages does not matter; each
+/// row must simply arrive exactly once. A timestamp tie run wider than the
+/// transport cap cannot be paged past (widening the page is refused by the
+/// daemon) and is reported as a typed error rather than looping.
+async fn collect_events_cursor_walk(
+    store: &dyn khive_storage::event::EventStore,
+    base_filter: &EventFilter,
+    page_size: u32,
+    max_rows: u64,
+) -> Result<Vec<Event>, RuntimeError> {
+    let mut items: Vec<Event> = Vec::new();
+    let mut cursor: Option<i64> = base_filter.before;
+    let mut boundary_at: Option<i64> = None;
+    let mut boundary_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    let mut fetch_limit = page_size.clamp(1, TRANSPORT_PAGE_ROWS);
+    while (items.len() as u64) < max_rows {
+        let mut filter = base_filter.clone();
+        filter.before = cursor;
+        let page = store
+            .query_events(
+                filter,
+                PageRequest {
+                    offset: 0,
+                    limit: fetch_limit,
+                },
+            )
+            .await
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let fetched = page.items.len() as u64;
+        let fresh: Vec<Event> = page
+            .items
+            .into_iter()
+            .filter(|event| !boundary_ids.contains(&event.id))
+            .collect();
+        if fresh.is_empty() {
+            if fetched < u64::from(fetch_limit) {
+                // The store returned everything under the cursor and all of
+                // it was already collected: the window is exhausted.
+                break;
+            }
+            // A full page of already-collected boundary rows: the tie run at
+            // this microsecond is wider than the page. Widen and re-read —
+            // but only up to the transport cap, past which the daemon
+            // refuses the request and the strict cursor cannot advance.
+            if fetch_limit >= TRANSPORT_PAGE_ROWS {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "brain.event_counts cannot page this window: more than {fetch_limit} \
+                     events share one created_at microsecond, which exceeds the event \
+                     transport's page cap; narrow `since`/`until` or add filters (`actor` \
+                     or `kind`)"
+                )));
+            }
+            fetch_limit = fetch_limit.saturating_mul(2).min(TRANSPORT_PAGE_ROWS);
+            continue;
+        }
+        // Pages come back created_at DESC, so the last fresh row carries the
+        // new boundary microsecond.
+        let boundary = fresh
+            .last()
+            .map(|event| event.created_at)
+            .expect("fresh is non-empty");
+        if boundary_at != Some(boundary) {
+            boundary_ids.clear();
+            boundary_at = Some(boundary);
+        }
+        boundary_ids.extend(
+            fresh
+                .iter()
+                .filter(|event| event.created_at == boundary)
+                .map(|event| event.id),
+        );
+        items.extend(fresh);
+        cursor = Some(boundary.saturating_add(1));
+        if fetched < u64::from(fetch_limit) {
+            break;
+        }
+    }
+    // A page may carry the collection past `max_rows`; the bound is a row
+    // budget, so surplus rows from the final page are dropped rather than
+    // returned over-budget.
+    items.truncate(usize::try_from(max_rows).unwrap_or(usize::MAX));
+    Ok(items)
 }
 
 /// #21: full-window aggregation for `brain.event_counts(exhaustive=true)`.
@@ -2844,76 +2943,13 @@ pub(crate) async fn fetch_event_counts_window_exhaustive(
     }
 
     // Walk the window with a descending `before` cursor instead of a growing
-    // offset. Every query runs at `offset: 0`, so page k never re-skips
-    // pages 1..k — the walk is linear over the window on a single-store
-    // backend, and on the merged events-split store it stays inside that
-    // store's bounded materialization window at any depth (a growing offset
-    // there would materialize an ever-larger two-store prefix per page,
-    // quadratic in total, and eventually hit the merged window bound).
-    //
-    // `before` is a strict `created_at <` bound, so stepping the cursor to
-    // the last row's timestamp would drop rows sharing that microsecond
-    // beyond the page edge. Step to `last.created_at + 1` instead — which
-    // re-admits the boundary microsecond — and drop the re-read rows by id.
-    // Aggregation is order-independent, so delivery order across pages does
-    // not matter; each row must simply arrive exactly once.
-    let mut items: Vec<Event> = Vec::new();
-    let mut cursor: Option<i64> = base_filter.before;
-    let mut boundary_at: Option<i64> = None;
-    let mut boundary_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-    let mut fetch_limit = page_size.max(1);
-    loop {
-        let mut filter = base_filter.clone();
-        filter.before = cursor;
-        let page = store
-            .query_events(
-                filter,
-                PageRequest {
-                    offset: 0,
-                    limit: fetch_limit,
-                },
-            )
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        let fetched = page.items.len() as u64;
-        let fresh: Vec<Event> = page
-            .items
-            .into_iter()
-            .filter(|event| !boundary_ids.contains(&event.id))
-            .collect();
-        if fresh.is_empty() {
-            if fetched < u64::from(fetch_limit) {
-                // The store returned everything under the cursor and all of
-                // it was already collected: the window is exhausted.
-                break;
-            }
-            // A full page of already-collected boundary rows: the tie run at
-            // this microsecond is wider than the page. Widen and re-read.
-            fetch_limit = fetch_limit.saturating_mul(2);
-            continue;
-        }
-        // Pages come back created_at DESC, so the last fresh row carries the
-        // new boundary microsecond.
-        let boundary = fresh
-            .last()
-            .map(|event| event.created_at)
-            .expect("fresh is non-empty");
-        if boundary_at != Some(boundary) {
-            boundary_ids.clear();
-            boundary_at = Some(boundary);
-        }
-        boundary_ids.extend(
-            fresh
-                .iter()
-                .filter(|event| event.created_at == boundary)
-                .map(|event| event.id),
-        );
-        items.extend(fresh);
-        cursor = Some(boundary.saturating_add(1));
-        if fetched < u64::from(fetch_limit) {
-            break;
-        }
-    }
+    // offset (see `collect_events_cursor_walk`): every query runs at
+    // `offset: 0` in transport-cap-sized pages, so the walk is linear on a
+    // single-store backend and stays inside the merged events-split store's
+    // bounded materialization window — and under the events daemon's
+    // per-request page cap — at any depth. The count check above already
+    // bounds the window, so the walk runs to exhaustion.
+    let items = collect_events_cursor_walk(store, base_filter, page_size, max_events).await?;
 
     let truncated = (items.len() as u64) < window_event_total;
     Ok((items, window_event_total, truncated))

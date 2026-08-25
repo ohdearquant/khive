@@ -144,8 +144,12 @@ const EVENTS_SYMLINK_HOP_BOUND: u32 = 40;
 /// The split client's merged read requests a prefix of `offset + limit`
 /// rows, so this cap also bounds the deep-offset window a socket client can
 /// demand in one request.
-#[cfg(unix)]
-const MAX_QUERY_EVENTS_PAGE_ROWS: u32 = 4096;
+///
+/// Public (and defined on every platform) because in-tree consumers that
+/// read events through a possibly-split store must size their page requests
+/// under it — a deep read is a `before`-cursor walk at `offset: 0` in pages
+/// of at most this many rows, never one wide page.
+pub const MAX_QUERY_EVENTS_PAGE_ROWS: u32 = 4096;
 
 /// Default events database file, beside the main database file.
 ///
