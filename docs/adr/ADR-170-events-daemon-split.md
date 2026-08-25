@@ -140,16 +140,23 @@ that stay put.
      so a moved audit row remains fetchable by id. This is a requirement of
      the cutover, not an optimization — without it, ids returned by merged
      listings would dangle for the get path.
-   - _Graph addressability._ Event rows reachable as graph-query endpoints
-     or usable as annotation targets are exactly the classes this routing
-     keeps in the domain store — that co-residency is the routing's own
-     selection criterion. Post-cutover audit-lane rows are **not**
-     graph-addressable: the graph compiler's cross-substrate union and the
-     guarded endpoint checks read the main `events` table only, and this
-     ADR accepts that for the audit class rather than extending graph SQL
-     across two files. An attempt to use a sidecar-resident event as an
-     edge endpoint or annotation target fails the existing endpoint
-     existence check — a loud refusal, not a silent dangling edge.
+   - _Graph addressability._ Two contracts with different mechanics, kept
+     separate. The **annotation contract** (ADR-002: an `annotates` target
+     may be any existing UUID, events included) is preserved across the
+     split: the guarded endpoint existence check for annotation targets is
+     a point lookup by id, so it resolves through the same legacy-first,
+     sidecar-fallback path the by-id fetch above already requires — a
+     moved audit row remains a valid `annotates` target, and an id naming
+     no row in either store still fails the check loudly. What narrows is
+     **graph-query reachability**, which the ADR-002 relation contract
+     does not promise: the graph compiler's cross-substrate union reads
+     the main `events` table only, so post-cutover audit-lane rows do not
+     appear as traversal endpoints, and this ADR accepts that for the
+     audit class rather than extending compiled graph SQL across two
+     files. The classes that are traversal-reachable today are exactly
+     the plain-append classes this routing keeps in the domain store, so
+     the narrowing is confined to rows no compiled query could
+     select for the domain-store plane anyway once they move.
 
 4. **Embedded mode.** One-shot CLI and test contexts without a daemon use the
    in-process `SqlEventStore` against the events database directly for the lane side.
