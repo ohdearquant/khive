@@ -258,6 +258,15 @@ pub fn resolve_blob_store_for_mode(
     Ok(Arc::new(ReadOnlyBlobStore { inner }))
 }
 
+/// Wrap an arbitrary store so every physical mutator is refused while the
+/// bounded read surface stays available. Used by the runtime's install seam
+/// to hold the read-only invariant for stores installed after boot; wrapping
+/// an already-wrapped store is harmless (reads delegate, mutators refuse at
+/// the outer layer).
+pub(crate) fn wrap_read_only(inner: Arc<dyn BlobStore>) -> Arc<dyn BlobStore> {
+    Arc::new(ReadOnlyBlobStore { inner })
+}
+
 #[derive(Debug)]
 struct ReadOnlyBlobStore {
     inner: Arc<dyn BlobStore>,

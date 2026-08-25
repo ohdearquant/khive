@@ -943,6 +943,52 @@ impl KhiveRuntime {
                         );
                     }
                 }
+                // The primary check authorizes writes to `primary` only. Each
+                // extra namespace grants read visibility, so each one takes
+                // its own gate check before it may enter the minted set — a
+                // token must never carry visibility the gate was not asked
+                // about. Any deny or gate error refuses the whole mint,
+                // naming the offending namespace (fail-closed).
+                for extra in &extra_visible {
+                    let extra_req = GateRequest::new(
+                        actor.clone(),
+                        extra.clone(),
+                        "authorize",
+                        serde_json::Value::Null,
+                    );
+                    match self.config.gate.check(&extra_req) {
+                        Ok(ref extra_decision) if extra_decision.is_allow() => {}
+                        Ok(khive_gate::GateDecision::Deny { reason }) => {
+                            return Err(crate::RuntimeError::PermissionDenied {
+                                verb: "authorize".to_string(),
+                                reason: format!(
+                                    "visibility namespace {:?} denied: {reason}",
+                                    extra.as_str()
+                                ),
+                            });
+                        }
+                        Ok(_) => {
+                            return Err(crate::RuntimeError::PermissionDenied {
+                                verb: "authorize".to_string(),
+                                reason: format!(
+                                    "visibility namespace {:?} denied by gate",
+                                    extra.as_str()
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                namespace = %extra.as_str(),
+                                error = %crate::secret_gate::bounded_masked_log_text(&e.to_string()),
+                                "authorize_with_visibility: extra-namespace gate check failed (fail-closed)"
+                            );
+                            return Err(crate::RuntimeError::Internal(format!(
+                                "gate error: {}",
+                                e.wire_reason()
+                            )));
+                        }
+                    }
+                }
                 Ok(NamespaceToken::mint_with_visibility(
                     primary,
                     extra_visible,
@@ -1044,6 +1090,16 @@ impl KhiveRuntime {
                 return Ok(());
             }
         }
+        // A read-only runtime holds its mode at this seam, not only during
+        // boot resolution: an arbitrary store installed after launch is
+        // wrapped so every physical mutator refuses while the bounded read
+        // surface stays available. Without this, post-boot installation is a
+        // writable bypass of the runtime's declared mode.
+        let store = if self.is_read_only() {
+            crate::blob::wrap_read_only(store)
+        } else {
+            store
+        };
         let hydrator = Arc::new(crate::blob::BlobHydrator::new(
             store,
             self.config.blob_hydration_bytes,
@@ -1973,6 +2029,132 @@ mod tests {
             khive_db::pool::WriterAcquisitionSnapshot::default(),
             "explicit read-only construction must validate through a reader without ever \
              acquiring the writer"
+        );
+    }
+
+    /// Denies exactly one namespace; every other request is allowed. Lets the
+    /// tests below prove a refusal comes from the per-extra visibility check
+    /// rather than from the primary authorization.
+    #[derive(Debug)]
+    struct DenyNamespaceGate {
+        deny: &'static str,
+    }
+
+    impl khive_gate::Gate for DenyNamespaceGate {
+        fn check(
+            &self,
+            req: &khive_gate::GateRequest,
+        ) -> Result<khive_gate::GateDecision, khive_gate::GateError> {
+            if req.namespace.as_str() == self.deny {
+                Ok(khive_gate::GateDecision::Deny {
+                    reason: "namespace denied by policy".to_string(),
+                })
+            } else {
+                Ok(khive_gate::GateDecision::allow())
+            }
+        }
+    }
+
+    #[test]
+    fn authorize_with_visibility_gate_checks_every_extra_namespace() {
+        let config = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            gate: Arc::new(DenyNamespaceGate {
+                deny: "lambda:secret",
+            }),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let rt = KhiveRuntime::new(config).expect("memory runtime");
+        let primary = Namespace::parse("lambda:caller").expect("primary");
+        let denied = Namespace::parse("lambda:secret").expect("denied");
+        let allowed = Namespace::parse("lambda:open").expect("allowed");
+
+        // Control: the same mint without the denied namespace succeeds, so
+        // the refusal below can only come from the per-extra check.
+        rt.authorize_with_visibility(primary.clone(), vec![allowed.clone()])
+            .expect("mint with only allowed extras");
+
+        let err = rt
+            .authorize_with_visibility(primary, vec![allowed, denied])
+            .expect_err("a denied extra namespace must refuse the whole mint");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lambda:secret"),
+            "refusal must name the offending namespace: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_blob_store_on_read_only_runtime_refuses_mutators() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read_only_blob_seam.db");
+        let config = RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
+            db_path: Some(path.clone()),
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        };
+        KhiveRuntime::new(config.clone()).expect("create migrated database");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut name = path.file_name().expect("db file name").to_os_string();
+                name.push(suffix);
+                let sidecar = path.parent().expect("db parent dir").join(name);
+                if sidecar.exists() {
+                    let mut permissions = std::fs::metadata(&sidecar)
+                        .expect("sidecar metadata")
+                        .permissions();
+                    permissions.set_mode(0o444);
+                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
+                }
+            }
+        }
+        let runtime = KhiveRuntime::new_readonly(config).expect("read-only boot");
+        assert!(runtime.is_read_only());
+
+        // Control: the raw store IS writable — seed an object through it —
+        // so the refusal below can only come from the install-seam wrap.
+        use khive_storage::BlobStore as _;
+        let blob_root = tempfile::tempdir().unwrap();
+        let writable = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+                .expect("fs blob store"),
+        );
+        let seeded = writable
+            .put(b"seed".to_vec())
+            .await
+            .expect("seed put through the raw store");
+        runtime
+            .install_blob_store(writable)
+            .expect("read-only install wraps rather than refusing");
+
+        let installed = runtime.blob_store().expect("installed store");
+        assert!(
+            installed.exists(&seeded).await.expect("exists"),
+            "bounded read surface must stay available"
+        );
+        let err = installed
+            .put(b"post-boot".to_vec())
+            .await
+            .expect_err("put must refuse on a read-only runtime");
+        assert!(
+            err.to_string().contains("read-only"),
+            "refusal must name the mode: {err}"
         );
     }
 
