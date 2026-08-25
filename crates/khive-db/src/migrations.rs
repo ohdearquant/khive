@@ -1007,10 +1007,7 @@ pub fn inspect_schema_is_current(path: &std::path::Path) -> Result<u32, SqliteEr
 /// exact match performs no writes.
 pub fn validate_schema_is_current(conn: &Connection) -> Result<u32, SqliteError> {
     let current_version = read_schema_version(conn)?;
-    let latest_version = MIGRATIONS
-        .last()
-        .map(|migration| migration.version)
-        .unwrap_or(0);
+    let latest_version = latest_schema_version();
 
     if current_version < latest_version {
         return Err(SqliteError::InvalidData(format!(
@@ -1206,7 +1203,7 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     // pre-consolidation V2..V22 ledger — or was written by a newer build. Either
     // way the baseline schema would be silently skipped, leaving the process on a
     // stale schema. Fail loudly instead of corrupting silently.
-    let latest_version = MIGRATIONS.last().map(|m| m.version).unwrap_or(0);
+    let latest_version = latest_schema_version();
     if current_version > latest_version {
         return Err(SqliteError::InvalidData(format!(
             "database schema version {current_version} is ahead of the latest known migration \

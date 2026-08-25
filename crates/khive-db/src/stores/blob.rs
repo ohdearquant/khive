@@ -850,11 +850,18 @@ async fn blob_gc_fencing_complete(sql: &dyn SqlAccess) -> StorageResult<bool> {
         return Ok(false);
     }
 
-    // The ledger ceiling is this build's own terminal version: migrations this
-    // binary applied on top of the completed cutover keep the gate open, while
-    // a ledger AHEAD of the binary belongs to a schema epoch whose
-    // attachment/liveness semantics this build never validated — ADR-160
-    // requires that epoch to fail closed before destructive GC.
+    // The sweep is admitted only for the EXACT completed V21 epoch
+    // (ADR-160 Phase 4a: "report-only and destructive sweeps only for an
+    // exact completed V21 epoch … ahead-of-V21 epochs return typed
+    // Unsupported"). A ledger above V21 — whether ahead of this binary or a
+    // migration this same binary applied — belongs to a schema epoch whose
+    // attachment/liveness semantics this gate never validated, so it fails
+    // closed; the author of a future migration extends the gate in the same
+    // change that proves the new epoch's liveness set, never by default.
+    // General schema validation (`attachment_cutover_status`) deliberately
+    // keeps accepting later versions on top of a completed cutover: that is
+    // the normal serving course, and the exact-epoch rule is scoped to
+    // destructive GC admission.
     let complete = required_nonnegative_count(
         reader
             .query_scalar(SqlStatement {
@@ -863,13 +870,12 @@ async fn blob_gc_fencing_complete(sql: &dyn SqlAccess) -> StorageResult<bool> {
                         AND cutover.state = 'complete' \
                         AND cutover.completed_at IS NOT NULL \
                         AND (SELECT COUNT(*) FROM _schema_migrations \
-                             WHERE version = 21 \
+                             WHERE version = ?1 \
                                AND name = 'attachments_first_class') = 1 \
-                        AND (SELECT MAX(version) FROM _schema_migrations) \
-                            BETWEEN 21 AND ?1"
+                        AND (SELECT MAX(version) FROM _schema_migrations) = ?1"
                     .to_string(),
                 params: vec![SqlValue::Integer(i64::from(
-                    crate::migrations::latest_schema_version(),
+                    crate::migrations::ATTACHMENT_CUTOVER_VERSION,
                 ))],
                 label: Some("blob_gc_cutover_complete".to_string()),
             })
@@ -2652,12 +2658,16 @@ mod tests {
         }
     }
 
-    /// A ledger whose MAX(version) is ahead of this binary's own migration
-    /// chain belongs to a schema epoch this build never validated; ADR-160
-    /// requires destructive GC to fail closed against it. This is the arm the
-    /// removal matrix above cannot host (it ADDS a ledger fact), and it is
-    /// what separates `BETWEEN 21 AND latest` from the fail-open `>= 21`:
-    /// under `>= 21` this fixture passes the gate.
+    /// A ledger whose MAX(version) is above the V21 epoch belongs to a
+    /// schema epoch this gate never validated; ADR-160 admits destructive GC
+    /// only for the EXACT completed V21 epoch, so anything ahead fails
+    /// closed. This is the arm the removal matrix above cannot host (it ADDS
+    /// a ledger fact), and it separates the exact-epoch predicate from the
+    /// fail-open `>= 21`: under `>= 21` this fixture passes the gate. While
+    /// the binary's terminal version IS 21, this fixture cannot distinguish
+    /// `= 21` from the former `BETWEEN 21 AND terminal` — both refuse a V22
+    /// row — so the exact-epoch property is enforced by the predicate's
+    /// text; the first appended migration makes the distinction observable.
     #[tokio::test]
     async fn gate_rejects_ledger_ahead_of_binary_latest() {
         let dir = tempfile::tempdir().unwrap();
