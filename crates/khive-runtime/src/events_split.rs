@@ -101,6 +101,18 @@ const MAX_EVENTS_CONNECTIONS: usize = 128;
 #[cfg(unix)]
 const CONN_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Aggregate cap on request-frame bytes buffered across all served
+/// connections at once. The per-frame cap bounds one buffer and the
+/// connection cap bounds the task count, but their product is the real
+/// allocation exposure (128 connections × 8 MiB declared frames ≈ 1 GiB).
+/// Body buffers are admitted against this shared byte budget before they are
+/// allocated; a connection whose frame cannot be admitted waits inside its
+/// own I/O deadline, so exhaustion degrades into per-connection timeouts,
+/// never into daemon memory growth. Must be at least `MAX_FRAME_BYTES`, or a
+/// maximum-size frame could never be admitted.
+#[cfg(unix)]
+const MAX_INFLIGHT_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+
 /// Cap on the per-namespace store cache. Stores are cheap pool handles, but
 /// the namespace string is client-supplied, so an unbounded map is
 /// attacker-controlled memory growth. Beyond the cap, stores are built
@@ -372,20 +384,21 @@ pub enum EventsResponse {
     },
     /// Typed refusal. `retryable` distinguishes transient daemon-side
     /// conditions from contract errors (bad frame, version skew).
-    /// `writer_task_state` preserves the ADR-133 dispositions the retryable
-    /// bit cannot carry: the daemon-side writer terminated in a state the
-    /// audit-batch retry classifier keys on per-variant — `NotStarted` and
-    /// `TransactionRolledBack` are safe replays, `SideEffectsUnknown` gates
-    /// double-send decisions. Flattening any of them into a generic refusal
-    /// turns a mandated retry into a terminal failure on the client side.
-    /// `side_effects_unknown` is the older single-state spelling, kept so
-    /// frames from a daemon one protocol build older still carry that one
-    /// state; `#[serde(default)]` keeps both directions skew-tolerant.
+    /// `writer_task_state` is the single carrier of the ADR-133 dispositions
+    /// the retryable bit cannot express: the daemon-side writer terminated
+    /// in a state the audit-batch retry classifier keys on per-variant —
+    /// `NotStarted` and `TransactionRolledBack` are safe replays,
+    /// `SideEffectsUnknown` gates double-send decisions. Flattening any of
+    /// them into a generic refusal turns a mandated retry into a terminal
+    /// failure on the client side. `None` means the error is not a
+    /// writer-task termination at all (parse errors, version refusals,
+    /// non-writer storage errors). No second spelling exists: within one
+    /// protocol version every storage-class Error frame carries this field,
+    /// and cross-version frames never reach this mapping because
+    /// `dispatch_events_request` refuses a mismatched version outright.
     Error {
         message: String,
         retryable: bool,
-        #[serde(default)]
-        side_effects_unknown: bool,
         #[serde(default)]
         writer_task_state: Option<WireWriterTaskState>,
     },
@@ -698,6 +711,7 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     // bounded (`MAX_CACHED_NAMESPACE_STORES`) rather than trusted small.
     let stores: NamespaceStores = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_EVENTS_CONNECTIONS));
+    let frame_budget = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_REQUEST_BYTES));
     tracing::info!(
         socket = %socket_path.display(),
         db = %db_path.display(),
@@ -737,11 +751,46 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
         };
         let backend = Arc::clone(&backend);
         let stores = Arc::clone(&stores);
+        let frame_budget = Arc::clone(&frame_budget);
         crate::daemon::spawn_tracked_task(async move {
-            serve_events_conn(stream, backend, stores).await;
+            serve_events_conn(stream, backend, stores, frame_budget).await;
             drop(permit);
         });
     }
+}
+
+/// Read one length-prefixed request frame, admitting the body buffer against
+/// the shared byte budget before allocating it. The returned permit holds
+/// the admitted bytes for as long as the buffer may be alive — the caller
+/// drops it after the response is written. The per-frame cap is checked
+/// before admission, so a single frame is always satisfiable against the
+/// full budget (`MAX_INFLIGHT_REQUEST_BYTES >= MAX_FRAME_BYTES`) and a
+/// waiter can never deadlock on an impossible request.
+#[cfg(unix)]
+async fn read_frame_budgeted(
+    stream: &mut UnixStream,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> std::io::Result<(Vec<u8>, tokio::sync::OwnedSemaphorePermit)> {
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > crate::daemon::MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "daemon frame of {len} bytes exceeds {} cap",
+                crate::daemon::MAX_FRAME_BYTES
+            ),
+        ));
+    }
+    let permit = Arc::clone(budget)
+        .acquire_many_owned(len as u32)
+        .await
+        .map_err(|_| std::io::Error::other("frame budget closed"))?;
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    Ok((buf, permit))
 }
 
 #[cfg(unix)]
@@ -753,10 +802,12 @@ type NamespaceStores =
 ///
 /// The cache key is the trimmed namespace, matching the backend's own
 /// normalization, so spellings that resolve to one store share one handle.
-/// The map is bounded: at `MAX_CACHED_NAMESPACE_STORES` entries a new
-/// namespace gets an uncached per-request store instead of growing the map —
-/// the namespace string is client-supplied, and an unbounded cache would be
-/// attacker-controlled memory in a process that lives for months.
+/// The map is bounded: at `MAX_CACHED_NAMESPACE_STORES` entries an arbitrary
+/// existing entry is evicted to admit the new namespace, so the map never
+/// grows past the cap and no namespace is permanently condemned to
+/// per-request store rebuilds. Keys reaching this cache have already passed
+/// `Namespace` validation at dispatch (charset + length bound), so cap ×
+/// bounded key is the worst-case retained memory.
 #[cfg(unix)]
 fn namespace_store(
     backend: &StorageBackend,
@@ -785,9 +836,19 @@ fn namespace_store_with_cap(
     let mut map = stores
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if map.len() < cap || map.contains_key(key) {
-        map.insert(key.to_string(), Arc::clone(&store));
+    if map.len() >= cap && !map.contains_key(key) {
+        // At the cap, evict an arbitrary entry instead of refusing
+        // admission: stores are cheap pool handles, so eviction costs one
+        // rebuild on the victim's next request, while refusing admission
+        // would make every request beyond the cap rebuild its store and
+        // rerun schema init on the SQLite writer forever. Keys are
+        // validated `Namespace` values (bounded length), so the map's
+        // worst-case memory is cap × small key + cap handles.
+        if let Some(victim) = map.keys().next().cloned() {
+            map.remove(&victim);
+        }
     }
+    map.insert(key.to_string(), Arc::clone(&store));
     Ok(store)
 }
 
@@ -796,13 +857,21 @@ async fn serve_events_conn(
     mut stream: UnixStream,
     backend: Arc<StorageBackend>,
     stores: NamespaceStores,
+    frame_budget: Arc<tokio::sync::Semaphore>,
 ) {
     loop {
-        // Deadline on the whole frame read: a peer that opens a connection
-        // and stalls — before or mid-frame — is closed instead of holding
-        // this task and its descriptor indefinitely.
-        let payload = match tokio::time::timeout(CONN_IO_TIMEOUT, read_frame(&mut stream)).await {
-            Ok(Ok(bytes)) => bytes,
+        // Deadline on the whole frame read — budget admission included: a
+        // peer that opens a connection and stalls, or that cannot be
+        // admitted because other connections hold the byte budget, is
+        // closed instead of holding this task and its descriptor
+        // indefinitely.
+        let (payload, budget_permit) = match tokio::time::timeout(
+            CONN_IO_TIMEOUT,
+            read_frame_budgeted(&mut stream, &frame_budget),
+        )
+        .await
+        {
+            Ok(Ok(pair)) => pair,
             // Includes clean EOF on peer disconnect, and the expired deadline.
             Ok(Err(_)) | Err(_) => return,
         };
@@ -811,7 +880,6 @@ async fn serve_events_conn(
             Err(error) => EventsResponse::Error {
                 message: format!("events daemon could not parse request frame: {error}"),
                 retryable: false,
-                side_effects_unknown: false,
                 writer_task_state: None,
             },
         };
@@ -828,6 +896,10 @@ async fn serve_events_conn(
             Ok(Ok(())) => {}
             Ok(Err(_)) | Err(_) => return,
         }
+        // The request buffer is long dropped; release its byte budget only
+        // now, after the whole request lifecycle, so admission tracks live
+        // work rather than just live buffers.
+        drop(budget_permit);
     }
 }
 
@@ -845,7 +917,18 @@ async fn dispatch_events_request(
                 request.protocol_version()
             ),
             retryable: false,
-            side_effects_unknown: false,
+            writer_task_state: None,
+        };
+    }
+    // The wire namespace is an unrestricted client-supplied String until this
+    // point. Validate it as a real `Namespace` (charset plus the 256-byte
+    // length bound) before it can become a cache key, a store, or a database
+    // row — without this, near-frame-sized strings are attacker-controlled
+    // retained memory in a process that lives for months.
+    if let Err(error) = khive_types::Namespace::parse(request.namespace().trim()) {
+        return EventsResponse::Error {
+            message: format!("events request namespace rejected: {error}"),
+            retryable: false,
             writer_task_state: None,
         };
     }
@@ -855,7 +938,6 @@ async fn dispatch_events_request(
             return EventsResponse::Error {
                 message: format!("events store unavailable: {error}"),
                 retryable: true,
-                side_effects_unknown: false,
                 writer_task_state: None,
             };
         }
@@ -908,10 +990,6 @@ fn storage_error_response(error: &StorageError) -> EventsResponse {
         // transient writer contention (`WriterTaskBusy`, `Transaction`) into
         // a terminal error on the client side of the socket.
         retryable: error.is_retryable(),
-        side_effects_unknown: matches!(
-            writer_task_state,
-            Some(WireWriterTaskState::SideEffectsUnknown)
-        ),
         writer_task_state,
     }
 }
@@ -1277,7 +1355,6 @@ impl ForwardingEventStore {
             EventsResponse::Error {
                 message,
                 retryable,
-                side_effects_unknown,
                 writer_task_state,
             } => {
                 if let Some(state) = writer_task_state {
@@ -1287,14 +1364,11 @@ impl ForwardingEventStore {
                     // `SideEffectsUnknown` gates double-send decisions), so
                     // flattening any of them into a generic refusal breaks
                     // the retry contract on the client side of the socket.
+                    // The field is the single carrier: cross-version frames
+                    // never reach this mapping (the daemon refuses a
+                    // mismatched protocol version before dispatch).
                     StorageError::WriterTaskTerminated {
                         request_state: state.into(),
-                    }
-                } else if side_effects_unknown {
-                    // Frame from a daemon one protocol build older, which
-                    // spelled only this one state.
-                    StorageError::WriterTaskTerminated {
-                        request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
                     }
                 } else if retryable {
                     StorageError::Pool {
@@ -1583,7 +1657,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn side_effects_unknown_crosses_the_wire() {
+    fn side_effects_unknown_state_crosses_the_wire_as_writer_task_state() {
         let response = storage_error_response(&StorageError::WriterTaskTerminated {
             request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
         });
@@ -1591,63 +1665,35 @@ mod tests {
             matches!(
                 response,
                 EventsResponse::Error {
-                    side_effects_unknown: true,
+                    writer_task_state: Some(WireWriterTaskState::SideEffectsUnknown),
                     ..
                 }
             ),
-            "an unknown-commit-state termination must be marked on the wire"
+            "an unknown-commit-state termination must carry its state on the wire"
         );
-        // Any other refusal must NOT carry the marker.
+        // Any other refusal must NOT carry a writer state.
         let busy = storage_error_response(&StorageError::WriterTaskBusy { timeout_ms: 5 });
         assert!(matches!(
             busy,
             EventsResponse::Error {
-                side_effects_unknown: false,
+                writer_task_state: None,
                 ..
             }
         ));
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn client_reconstructs_side_effects_unknown() {
-        let dir = tempfile::tempdir().unwrap();
-        let client =
-            EventsSplitClient::new(dir.path().join("never-bound.sock")).expect("client builds");
-        let store = ForwardingEventStore::new("test", client);
-        // Older-daemon frame shape: only the single-state marker, no
-        // `writer_task_state` field. The client must still reconstruct it.
-        let err = store.unexpected(
-            "append_events_idempotent",
-            EventsResponse::Error {
-                message: "writer terminated mid-flush".into(),
-                retryable: false,
-                side_effects_unknown: true,
-                writer_task_state: None,
-            },
-        );
-        assert!(
-            matches!(
-                err,
-                StorageError::WriterTaskTerminated {
-                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
     #[test]
-    fn error_frames_from_an_older_daemon_still_parse() {
-        // A daemon built before `side_effects_unknown` emits Error frames
-        // without the field; the client must read them as `false`, not fail.
+    fn error_frames_without_writer_state_still_parse() {
+        // `writer_task_state` is `#[serde(default)]`: an Error frame for a
+        // non-writer failure (parse error, version refusal) omits it and the
+        // client must read `None`, not fail the parse.
         let bytes = br#"{"kind":"error","message":"boom","retryable":true}"#;
-        let parsed: EventsResponse = serde_json::from_slice(bytes).expect("older frame parses");
+        let parsed: EventsResponse = serde_json::from_slice(bytes).expect("stateless frame parses");
         assert!(matches!(
             parsed,
             EventsResponse::Error {
                 retryable: true,
-                side_effects_unknown: false,
+                writer_task_state: None,
                 ..
             }
         ));
@@ -1731,17 +1777,117 @@ mod tests {
         let backend = StorageBackend::memory().unwrap();
         let stores: NamespaceStores =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        // cap=1: the first namespace caches, the second still gets a working
-        // store but must not grow the map.
+        // cap=1: the first namespace caches; the second evicts it and takes
+        // the slot — bounded, and never condemned to per-request rebuilds.
         namespace_store_with_cap(&backend, &stores, "alpha", 1).expect("first store");
-        namespace_store_with_cap(&backend, &stores, "beta", 1).expect("uncached store still works");
-        let len = stores.lock().unwrap().len();
-        assert_eq!(len, 1, "cache must not grow past its cap");
+        namespace_store_with_cap(&backend, &stores, "beta", 1).expect("second store evicts");
+        {
+            let map = stores.lock().unwrap();
+            assert_eq!(map.len(), 1, "cache must not grow past its cap");
+            assert!(
+                map.contains_key("beta"),
+                "the newest namespace must be admitted at the cap"
+            );
+        }
         // Trimmed spelling of a cached namespace hits the same entry rather
         // than minting a duplicate handle (the backend trims namespaces).
-        namespace_store_with_cap(&backend, &stores, "  alpha  ", 1).expect("trimmed spelling");
-        let len = stores.lock().unwrap().len();
-        assert_eq!(len, 1, "spellings of one namespace must share one entry");
+        namespace_store_with_cap(&backend, &stores, "beta", 1).expect("cached beta");
+        namespace_store_with_cap(&backend, &stores, "  beta  ", 1).expect("trimmed spelling");
+        {
+            let map = stores.lock().unwrap();
+            assert_eq!(
+                map.len(),
+                1,
+                "spellings of one namespace must share one entry"
+            );
+            assert!(map.contains_key("beta"), "trimmed key is the cache key");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frame_budget_admits_before_allocating_and_releases_after() {
+        let (mut client, mut server) = UnixStream::pair().expect("socketpair");
+        let budget = Arc::new(tokio::sync::Semaphore::new(1024));
+        let payload = vec![7u8; 100];
+        write_frame(&mut client, &payload).await.expect("write");
+        let (bytes, permit) = read_frame_budgeted(&mut server, &budget)
+            .await
+            .expect("budgeted read");
+        assert_eq!(bytes, payload);
+        // The permit holds exactly the frame's bytes against the budget…
+        assert_eq!(budget.available_permits(), 1024 - 100);
+        // …and releases them when the request lifecycle ends.
+        drop(permit);
+        assert_eq!(budget.available_permits(), 1024);
+        // A frame past the per-frame cap is refused before admission: the
+        // budget is untouched, so an oversized declaration cannot starve it.
+        let mut oversized = Vec::from(((crate::daemon::MAX_FRAME_BYTES + 1) as u32).to_be_bytes());
+        oversized.extend_from_slice(&[0u8; 8]);
+        use tokio::io::AsyncWriteExt;
+        client.write_all(&oversized).await.expect("raw prefix");
+        let err = read_frame_budgeted(&mut server, &budget)
+            .await
+            .expect_err("oversized declaration must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            budget.available_permits(),
+            1024,
+            "refusal must not consume budget"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_rejects_invalid_wire_namespace() {
+        let backend = Arc::new(StorageBackend::memory().unwrap());
+        let stores: NamespaceStores =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // An attacker-shaped namespace: far past the 256-byte Namespace
+        // bound. Must be refused as a typed non-retryable error before it
+        // can become a cache key or a store.
+        let huge = "n".repeat(64 * 1024);
+        let response = dispatch_events_request(
+            EventsRequest::CountEvents {
+                protocol_version: EVENTS_PROTOCOL_VERSION,
+                namespace: huge,
+                filter: Default::default(),
+            },
+            &backend,
+            &stores,
+        )
+        .await;
+        assert!(
+            matches!(
+                &response,
+                EventsResponse::Error {
+                    retryable: false,
+                    writer_task_state: None,
+                    ..
+                }
+            ),
+            "oversized namespace must be a typed refusal, got {response:?}"
+        );
+        assert_eq!(
+            stores.lock().unwrap().len(),
+            0,
+            "a rejected namespace must never enter the cache"
+        );
+        // Control: a valid namespace on the same dispatch path succeeds.
+        let ok = dispatch_events_request(
+            EventsRequest::CountEvents {
+                protocol_version: EVENTS_PROTOCOL_VERSION,
+                namespace: "local".to_string(),
+                filter: Default::default(),
+            },
+            &backend,
+            &stores,
+        )
+        .await;
+        assert!(
+            matches!(ok, EventsResponse::Count { .. }),
+            "valid namespace must dispatch, got {ok:?}"
+        );
     }
 
     #[cfg(unix)]
