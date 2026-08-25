@@ -635,14 +635,18 @@ write as a deletion (issue #1995).
 `properties` object are preserved; the empty-string drop continues to apply
 everywhere else.** The token-economy rationale is unaffected — these keys
 appear only when a caller wrote them, so nothing machine-generated is
-reintroduced.
+reintroduced. This amendment changes the normative rule; the
+presentation-layer implementation change is tracked by issue #1995 and lands
+separately, citing this amendment.
 
 Scope note, stated rather than implied: empty arrays and empty objects under
 `properties` are still dropped. They have the same set-versus-absent
 ambiguity in principle; a caller that needs to distinguish those cases reads
-`format=json` or `presentation=verbose`, which remain lossless. Extending the
-carve-out to container values is a separate decision that amends this
-paragraph.
+`presentation=verbose`, which remains lossless. `format` alone does not
+restore them: the presentation transform runs before format rendering, so
+`format=json` under the default Agent presentation serializes the
+already-transformed value. Extending the carve-out to container values is a
+separate decision that amends this paragraph.
 
 ## References
 
