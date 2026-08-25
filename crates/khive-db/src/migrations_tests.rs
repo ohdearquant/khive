@@ -889,12 +889,13 @@ fn v4_creates_consolidated_fts_tables() {
 }
 
 #[test]
-fn rejects_pre_consolidation_ledger() {
+fn rejects_ledger_ahead_of_binary_latest() {
     let mut conn = open_memory();
     // Simulate a database whose recorded version is ahead of everything this
-    // build knows — the pre-consolidation ledger shape, or a newer build's.
-    // Computed from the live chain so the fixture stays ahead when a real
-    // migration lands on the number a literal would have pinned.
+    // build knows — a newer build's ledger (historically, the
+    // pre-consolidation shape). Computed from the live chain so the fixture
+    // stays ahead when a real migration lands on the number a literal would
+    // have pinned.
     conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
     conn.execute(
         "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, 'legacy', 0)",

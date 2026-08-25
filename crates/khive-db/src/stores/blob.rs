@@ -850,6 +850,11 @@ async fn blob_gc_fencing_complete(sql: &dyn SqlAccess) -> StorageResult<bool> {
         return Ok(false);
     }
 
+    // The ledger ceiling is this build's own terminal version: migrations this
+    // binary applied on top of the completed cutover keep the gate open, while
+    // a ledger AHEAD of the binary belongs to a schema epoch whose
+    // attachment/liveness semantics this build never validated — ADR-160
+    // requires that epoch to fail closed before destructive GC.
     let complete = required_nonnegative_count(
         reader
             .query_scalar(SqlStatement {
@@ -860,9 +865,12 @@ async fn blob_gc_fencing_complete(sql: &dyn SqlAccess) -> StorageResult<bool> {
                         AND (SELECT COUNT(*) FROM _schema_migrations \
                              WHERE version = 21 \
                                AND name = 'attachments_first_class') = 1 \
-                        AND (SELECT MAX(version) FROM _schema_migrations) >= 21"
+                        AND (SELECT MAX(version) FROM _schema_migrations) \
+                            BETWEEN 21 AND ?1"
                     .to_string(),
-                params: vec![],
+                params: vec![SqlValue::Integer(i64::from(
+                    crate::migrations::latest_schema_version(),
+                ))],
                 label: Some("blob_gc_cutover_complete".to_string()),
             })
             .await?,
@@ -2502,13 +2510,16 @@ mod tests {
                 "UPDATE _schema_migrations SET name = 'not_attachments_first_class' \
                  WHERE version = 21",
             ),
-            // NOTE: "ledger max version advances past V21" is deliberately NOT
-            // a reject arm. Later migrations record on top of a completed
-            // cutover without disturbing the fencing set, so the gate's
-            // ledger predicate is `MAX(version) >= 21`; the accept-path tests
-            // in this module run against the latest schema and are the
-            // positive control for that semantics. The physical facts the
-            // matrix below removes one at a time are what carry the safety.
+            // NOTE: the ledger predicate is `MAX(version) BETWEEN 21 AND
+            // latest_schema_version()`. Migrations THIS binary applied on top
+            // of the completed cutover keep the gate open (the accept-path
+            // tests in this module run against the latest schema and are the
+            // positive control), while a ledger ahead of the binary's own
+            // terminal version is a different schema epoch and rejects —
+            // covered by `gate_rejects_ledger_ahead_of_binary_latest`, which
+            // ADDS a fact rather than removing one and so lives outside this
+            // matrix. The physical facts the matrix below removes one at a
+            // time are what carry the rest of the safety.
             (
                 "marker_row_deleted",
                 "DELETE FROM attachment_cutover_state WHERE singleton = 1",
@@ -2639,6 +2650,48 @@ mod tests {
                 "case {case}: refusal must leave no fence-probe attachment residue"
             );
         }
+    }
+
+    /// A ledger whose MAX(version) is ahead of this binary's own migration
+    /// chain belongs to a schema epoch this build never validated; ADR-160
+    /// requires destructive GC to fail closed against it. This is the arm the
+    /// removal matrix above cannot host (it ADDS a ledger fact), and it is
+    /// what separates `BETWEEN 21 AND latest` from the fail-open `>= 21`:
+    /// under `>= 21` this fixture passes the gate.
+    #[tokio::test]
+    async fn gate_rejects_ledger_ahead_of_binary_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+            // Positive control: the untouched fixture passes.
+        }
+        assert!(
+            blob_gc_fencing_complete(backend.sql().as_ref())
+                .await
+                .unwrap(),
+            "control: completed fixture at the binary's latest version must pass"
+        );
+
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO _schema_migrations (version, name, applied_at) \
+                     VALUES (?1, 'future_epoch', 0)",
+                    [i64::from(crate::migrations::latest_schema_version()) + 1],
+                )
+                .unwrap();
+        }
+        assert!(
+            !blob_gc_fencing_complete(backend.sql().as_ref())
+                .await
+                .unwrap(),
+            "a ledger ahead of the binary's latest schema version must fail closed"
+        );
     }
 
     /// A read failure while evaluating the completed-marker/ledger predicate
