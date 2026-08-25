@@ -20,6 +20,8 @@ This public helper checks a runtime `serde_json::Value`, including handler resul
 
 ## `DslError`
 
+Absolute parser locations are zero-based UTF-8 byte offsets into the input after outer whitespace trimming. Display messages label these locations as `byte`; they are not Unicode character indices.
+
 | Variant                  | Condition                                                            |
 | ------------------------ | -------------------------------------------------------------------- |
 | `Empty`                  | no input after trimming                                              |
@@ -32,7 +34,8 @@ This public helper checks a runtime `serde_json::Value`, including handler resul
 | `DuplicateArg`           | one operation repeats an argument name                               |
 | `InvalidValue`           | function-form value cannot be decoded or reference syntax is invalid; an unquoted bareword names the quoting fix (and the corrected call, when the argument or key is known) |
 | `InvalidJson`            | JSON form is malformed or has the wrong shape                        |
-| `UnclosedString`         | quoted string has no terminator                                      |
+| `UnclosedString`         | quoted string has no terminator; retains its opening byte offset     |
+| `UnclosedCall`           | function call has no closing `)`; retains its opening byte offset    |
 | `UnclosedBracket`        | array, object, or parenthesis has no matching close                  |
 | `PrevRefOutsideChain`    | function-form `$prev` appears in single/parallel mode                |
 | `PrevRefInJsonForm`      | JSON string contains a `$prev` reference                             |

@@ -144,7 +144,7 @@ fn unterminated_multiline_string_rejected() {
     // closing quote is still required somewhere in the input.
     let src = "gtd.assign(title=\"line one\nline two)";
     let err = parse_request(src).unwrap_err();
-    assert!(matches!(err, DslError::UnclosedString));
+    assert!(matches!(err, DslError::UnclosedString { .. }));
 }
 
 #[test]
@@ -343,18 +343,18 @@ fn bareword_value_in_array_element_has_no_reconstruction_to_guess() {
 }
 
 #[test]
-fn invalid_value_position_and_message_no_longer_disagree() {
+fn invalid_value_byte_and_message_no_longer_disagree() {
     // Before this fix, a non-bareword invalid value (e.g. `1.2.3`) leaked
     // serde_json's own "at line 1 column N" — always relative to that
     // single value's isolated slice, so it disagreed with the DSL-absolute
-    // "at position N" this crate reports for the same failure. The
+    // "at byte N" this crate reports for the same failure. The
     // descriptive part of the message stays; the contradicting position
     // clause must be gone.
     let err = parse_request("get(id=1.2.3)").unwrap_err();
     assert!(matches!(err, DslError::InvalidValue { .. }));
     let msg = err.to_string();
     assert!(
-        msg.starts_with("at position 7:"),
+        msg.starts_with("at byte 7:"),
         "expected the DSL-absolute position, got: {msg}"
     );
     assert!(
@@ -649,13 +649,56 @@ fn unknown_token_after_op_rejected() {
 fn unclosed_paren_rejected() {
     let err = parse_request(r#"gtd.assign(title="a""#).unwrap_err();
     // The string is closed; the args list isn't.
-    assert!(matches!(err, DslError::UnexpectedEof { .. }));
+    assert!(matches!(err, DslError::UnclosedCall { .. }));
+}
+
+#[test]
+fn unclosed_call_reports_its_opening_byte_after_long_input() {
+    let padding = "x".repeat(1_024);
+    let src = format!(r#"comm.send(to="x", content="{padding}""#);
+    let opening = src.find('(').expect("call opening delimiter");
+
+    let message = parse_request(&src).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        format!("unclosed call starting at byte {opening}; expected ')'"),
+    );
 }
 
 #[test]
 fn unterminated_string_rejected() {
     let err = parse_request(r#"gtd.assign(title="oops)"#).unwrap_err();
-    assert!(matches!(err, DslError::UnclosedString));
+    assert!(matches!(err, DslError::UnclosedString { .. }));
+}
+
+#[test]
+fn unterminated_string_reports_its_opening_byte_after_long_input() {
+    let padding = "x".repeat(1_024);
+    let src = format!(r#"comm.send(to="x", content="{padding}"#);
+    let opening = src.rfind('"').expect("string opening delimiter");
+
+    let message = parse_request(&src).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        format!("unterminated string literal starting at byte {opening}"),
+    );
+}
+
+#[test]
+fn positioned_error_labels_utf8_byte_offset() {
+    let src = r#"comm.send(to="x", content="→→→") garbage"#;
+    let garbage_byte = src.find("garbage").expect("trailing token");
+    assert_ne!(
+        garbage_byte,
+        src[..garbage_byte].chars().count(),
+        "multibyte precondition"
+    );
+
+    let message = parse_request(src).unwrap_err().to_string();
+    assert!(
+        message.starts_with(&format!("at byte {garbage_byte}:")),
+        "position basis must be explicit: {message}"
+    );
 }
 
 #[test]

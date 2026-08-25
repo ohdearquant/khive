@@ -114,6 +114,7 @@ impl<'a> Parser<'a> {
                 return Err(DslError::UnsupportedVerbNesting { pos: self.pos });
             }
         }
+        let call_start = self.pos;
         self.expect_char('(')?;
         self.skip_ws();
         let mut args: std::collections::BTreeMap<String, ArgValue> =
@@ -121,6 +122,9 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(')') {
             self.advance(1);
             return Ok(ParsedOp { tool, args });
+        }
+        if self.eof() {
+            return Err(DslError::UnclosedCall { start: call_start });
         }
         loop {
             let name = self.parse_identifier()?;
@@ -148,7 +152,7 @@ impl<'a> Parser<'a> {
                         expected: "',' or ')'",
                     });
                 }
-                None => return Err(DslError::UnexpectedEof { expected: "')'" }),
+                None => return Err(DslError::UnclosedCall { start: call_start }),
             }
         }
     }
@@ -410,7 +414,7 @@ impl<'a> Parser<'a> {
                     // `e.to_string()` carries its own "at line L column C",
                     // always relative to `trimmed` (this one value's own
                     // slice, always line 1) rather than the DSL input as a
-                    // whole — pairing it verbatim with the `at position
+                    // whole — pairing it verbatim with the `at byte
                     // {start}` this crate reports for the same failure would
                     // state two different, disagreeing locations for one
                     // problem. Keep the descriptive prefix, drop the
@@ -672,7 +676,7 @@ fn bareword_hint_message(bareword: &str, hint: Option<&str>) -> String {
 /// clause. That clause is always relative to the isolated substring
 /// `serde_json` parsed (one value's slice, or a quoted string's decoded
 /// body) rather than the overall DSL input, so it disagrees with the
-/// `at position {pos}` this crate reports for the same failure whenever the
+/// `at byte {pos}` this crate reports for the same failure whenever the
 /// value does not start at byte 0. The descriptive prefix (`expected
 /// value`, `trailing characters`, `control character ... found while
 /// parsing a string`, ...) stays meaningful on its own and is kept.
