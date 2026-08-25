@@ -82,6 +82,32 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const FORWARDER_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Cap on concurrently served daemon connections. Admission control, not a
+/// correctness bound: every permitted-uid process on the machine shares the
+/// daemon, and without a cap each accepted connection holds a task and a file
+/// descriptor for as long as the peer keeps the socket open — a stalled or
+/// hostile same-uid peer could exhaust both. Excess connects are dropped
+/// (peer sees EOF) and retried by the clients' own reconnect paths.
+#[cfg(unix)]
+const MAX_EVENTS_CONNECTIONS: usize = 128;
+
+/// Per-frame I/O deadline on a served connection: the longest the daemon
+/// waits for one request frame to finish arriving, or one response frame to
+/// finish sending. A peer that sends a partial frame and stalls is closed
+/// instead of holding its task and descriptor forever. Idle well-behaved
+/// clients are closed too — that is fine by construction: round-trips open a
+/// fresh connection per call, and the forwarder's delivery path retries once
+/// on a stale connection.
+#[cfg(unix)]
+const CONN_IO_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Cap on the per-namespace store cache. Stores are cheap pool handles, but
+/// the namespace string is client-supplied, so an unbounded map is
+/// attacker-controlled memory growth. Beyond the cap, stores are built
+/// per-request instead of cached — slower, never wrong.
+#[cfg(unix)]
+const MAX_CACHED_NAMESPACE_STORES: usize = 1024;
+
 /// Default events database file, beside the main database file.
 ///
 /// The name is derived from the main database's full file name (`khive.db` →
@@ -215,11 +241,11 @@ fn direct_backend(
     if let Some(existing) = registry.get(&key) {
         return Ok(Arc::clone(existing));
     }
-    // Embedded writable mode creates the events database like the daemon
-    // does: owner-only from the first byte, never at the process umask.
-    // Best-effort here (unlike the daemon's fail-closed boot): an existing
-    // file's mode is the deployment's business, and a create race just means
-    // SQLite finds the file already present.
+    // Embedded writable mode holds the events database to the daemon's own
+    // contract: owner-only from the first byte, never at the process umask,
+    // and — because event rows carry the same audit payloads either way — a
+    // pre-existing database or -wal/-shm sidecar is tightened to 0600 too,
+    // fail-closed. A create race just means SQLite finds the file present.
     #[cfg(unix)]
     if !read_only {
         use std::os::unix::fs::OpenOptionsExt;
@@ -231,6 +257,8 @@ fn direct_backend(
             .create_new(true)
             .mode(0o600)
             .open(db_path);
+        harden_events_db_sidecars(db_path)
+            .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     }
     let backend = Arc::new(if read_only {
         StorageBackend::sqlite_read_only(db_path)?
@@ -344,19 +372,56 @@ pub enum EventsResponse {
     },
     /// Typed refusal. `retryable` distinguishes transient daemon-side
     /// conditions from contract errors (bad frame, version skew).
-    /// `side_effects_unknown` preserves the one ADR-133 disposition the
-    /// retryable bit cannot carry: the daemon-side writer terminated at a
-    /// point where the batch may or may not have committed. Callers deciding
-    /// double-send safety key on that state, so it crosses the wire as its
-    /// own field instead of being flattened into a generic refusal.
-    /// `#[serde(default)]` keeps the frame readable from a daemon one
-    /// protocol build older.
+    /// `writer_task_state` preserves the ADR-133 dispositions the retryable
+    /// bit cannot carry: the daemon-side writer terminated in a state the
+    /// audit-batch retry classifier keys on per-variant — `NotStarted` and
+    /// `TransactionRolledBack` are safe replays, `SideEffectsUnknown` gates
+    /// double-send decisions. Flattening any of them into a generic refusal
+    /// turns a mandated retry into a terminal failure on the client side.
+    /// `side_effects_unknown` is the older single-state spelling, kept so
+    /// frames from a daemon one protocol build older still carry that one
+    /// state; `#[serde(default)]` keeps both directions skew-tolerant.
     Error {
         message: String,
         retryable: bool,
         #[serde(default)]
         side_effects_unknown: bool,
+        #[serde(default)]
+        writer_task_state: Option<WireWriterTaskState>,
     },
+}
+
+/// Wire mirror of [`khive_storage::WriterTaskRequestState`]. A separate type
+/// because the storage enum is not serializable and the wire shape must stay
+/// under this module's protocol-version control, not the storage crate's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireWriterTaskState {
+    NotStarted,
+    TransactionRolledBack,
+    SideEffectsUnknown,
+}
+
+impl From<khive_storage::WriterTaskRequestState> for WireWriterTaskState {
+    fn from(state: khive_storage::WriterTaskRequestState) -> Self {
+        use khive_storage::WriterTaskRequestState as S;
+        match state {
+            S::NotStarted => Self::NotStarted,
+            S::TransactionRolledBack => Self::TransactionRolledBack,
+            S::SideEffectsUnknown => Self::SideEffectsUnknown,
+        }
+    }
+}
+
+impl From<WireWriterTaskState> for khive_storage::WriterTaskRequestState {
+    fn from(state: WireWriterTaskState) -> Self {
+        use khive_storage::WriterTaskRequestState as S;
+        match state {
+            WireWriterTaskState::NotStarted => S::NotStarted,
+            WireWriterTaskState::TransactionRolledBack => S::TransactionRolledBack,
+            WireWriterTaskState::SideEffectsUnknown => S::SideEffectsUnknown,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -629,9 +694,10 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     // Per-namespace store cache: `events_for_namespace` takes a writer-lane
     // checkout and re-runs the schema DDL on every call, so paying it once
     // per namespace instead of once per request keeps the writer lane for
-    // actual writes. Namespace cardinality is small and stores are cheap
-    // pool handles, so the map never needs eviction.
+    // actual writes. The namespace is client-supplied, so the cache is
+    // bounded (`MAX_CACHED_NAMESPACE_STORES`) rather than trusted small.
     let stores: NamespaceStores = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_EVENTS_CONNECTIONS));
     tracing::info!(
         socket = %socket_path.display(),
         db = %db_path.display(),
@@ -657,10 +723,23 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
                 continue;
             }
         }
+        let permit = match Arc::clone(&connections).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // At the cap: drop the stream (peer sees EOF and retries via
+                // its own reconnect path) instead of queueing unbounded work.
+                tracing::warn!(
+                    cap = MAX_EVENTS_CONNECTIONS,
+                    "events daemon at connection cap; dropping new connection"
+                );
+                continue;
+            }
+        };
         let backend = Arc::clone(&backend);
         let stores = Arc::clone(&stores);
         crate::daemon::spawn_tracked_task(async move {
             serve_events_conn(stream, backend, stores).await;
+            drop(permit);
         });
     }
 }
@@ -671,24 +750,44 @@ type NamespaceStores =
 
 /// The cached per-namespace store, constructing (and caching) it on first
 /// use. Construction failures are not cached — the next request retries.
+///
+/// The cache key is the trimmed namespace, matching the backend's own
+/// normalization, so spellings that resolve to one store share one handle.
+/// The map is bounded: at `MAX_CACHED_NAMESPACE_STORES` entries a new
+/// namespace gets an uncached per-request store instead of growing the map —
+/// the namespace string is client-supplied, and an unbounded cache would be
+/// attacker-controlled memory in a process that lives for months.
 #[cfg(unix)]
 fn namespace_store(
     backend: &StorageBackend,
     stores: &NamespaceStores,
     namespace: &str,
 ) -> Result<Arc<dyn EventStore>, khive_db::SqliteError> {
+    namespace_store_with_cap(backend, stores, namespace, MAX_CACHED_NAMESPACE_STORES)
+}
+
+#[cfg(unix)]
+fn namespace_store_with_cap(
+    backend: &StorageBackend,
+    stores: &NamespaceStores,
+    namespace: &str,
+    cap: usize,
+) -> Result<Arc<dyn EventStore>, khive_db::SqliteError> {
+    let key = namespace.trim();
     if let Some(store) = stores
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(namespace)
+        .get(key)
     {
         return Ok(Arc::clone(store));
     }
     let store = backend.events_for_namespace(namespace)?;
-    stores
+    let mut map = stores
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(namespace.to_string(), Arc::clone(&store));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if map.len() < cap || map.contains_key(key) {
+        map.insert(key.to_string(), Arc::clone(&store));
+    }
     Ok(store)
 }
 
@@ -699,10 +798,13 @@ async fn serve_events_conn(
     stores: NamespaceStores,
 ) {
     loop {
-        let payload = match read_frame(&mut stream).await {
-            Ok(bytes) => bytes,
-            // Includes clean EOF on peer disconnect.
-            Err(_) => return,
+        // Deadline on the whole frame read: a peer that opens a connection
+        // and stalls — before or mid-frame — is closed instead of holding
+        // this task and its descriptor indefinitely.
+        let payload = match tokio::time::timeout(CONN_IO_TIMEOUT, read_frame(&mut stream)).await {
+            Ok(Ok(bytes)) => bytes,
+            // Includes clean EOF on peer disconnect, and the expired deadline.
+            Ok(Err(_)) | Err(_) => return,
         };
         let response = match serde_json::from_slice::<EventsRequest>(&payload) {
             Ok(request) => dispatch_events_request(request, &backend, &stores).await,
@@ -710,6 +812,7 @@ async fn serve_events_conn(
                 message: format!("events daemon could not parse request frame: {error}"),
                 retryable: false,
                 side_effects_unknown: false,
+                writer_task_state: None,
             },
         };
         let bytes = match serde_json::to_vec(&response) {
@@ -719,8 +822,11 @@ async fn serve_events_conn(
                 return;
             }
         };
-        if write_frame(&mut stream, &bytes).await.is_err() {
-            return;
+        // Same deadline on the response write: a peer that stops reading
+        // would otherwise park this task in a full socket buffer.
+        match tokio::time::timeout(CONN_IO_TIMEOUT, write_frame(&mut stream, &bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => return,
         }
     }
 }
@@ -740,6 +846,7 @@ async fn dispatch_events_request(
             ),
             retryable: false,
             side_effects_unknown: false,
+            writer_task_state: None,
         };
     }
     let store = match namespace_store(backend, stores, request.namespace()) {
@@ -749,6 +856,7 @@ async fn dispatch_events_request(
                 message: format!("events store unavailable: {error}"),
                 retryable: true,
                 side_effects_unknown: false,
+                writer_task_state: None,
             };
         }
     };
@@ -782,6 +890,17 @@ async fn dispatch_events_request(
 
 #[cfg(unix)]
 fn storage_error_response(error: &StorageError) -> EventsResponse {
+    // Writer-task terminations carry their request state verbatim: the
+    // ADR-133 retry classifier decides per-variant (`NotStarted` and
+    // `TransactionRolledBack` are mandated retries), so the state must
+    // survive the socket even though `is_retryable()` reports the family
+    // non-transient.
+    let writer_task_state = match error {
+        StorageError::WriterTaskTerminated { request_state } => {
+            Some(WireWriterTaskState::from(*request_state))
+        }
+        _ => None,
+    };
     EventsResponse::Error {
         message: error.to_string(),
         // Defer to the storage layer's own transience classifier rather than
@@ -790,11 +909,10 @@ fn storage_error_response(error: &StorageError) -> EventsResponse {
         // a terminal error on the client side of the socket.
         retryable: error.is_retryable(),
         side_effects_unknown: matches!(
-            error,
-            StorageError::WriterTaskTerminated {
-                request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-            }
+            writer_task_state,
+            Some(WireWriterTaskState::SideEffectsUnknown)
         ),
+        writer_task_state,
     }
 }
 
@@ -889,6 +1007,17 @@ impl EventsSplitClient {
         socket_path: PathBuf,
         queue_depth: usize,
     ) -> crate::error::RuntimeResult<Arc<Self>> {
+        Self::new_with_queue_depth_and_delivery_timeout(socket_path, queue_depth, REQUEST_TIMEOUT)
+    }
+
+    /// [`Self::new_with_queue_depth`] with an explicit per-batch delivery
+    /// timeout, so tests can prove the forwarder abandons a hung peer without
+    /// waiting out the production clock.
+    fn new_with_queue_depth_and_delivery_timeout(
+        socket_path: PathBuf,
+        queue_depth: usize,
+        delivery_timeout: Duration,
+    ) -> crate::error::RuntimeResult<Arc<Self>> {
         let preflight_backend = StorageBackend::memory()?;
         let preflight_store = preflight_backend.events()?;
         // The in-memory backend must outlive the store handle; the store holds
@@ -912,6 +1041,7 @@ impl EventsSplitClient {
             append_rx,
             counters,
             outage_logged,
+            delivery_timeout,
         ));
         Ok(client)
     }
@@ -1003,6 +1133,7 @@ async fn run_forwarder(
     mut rx: tokio::sync::mpsc::Receiver<(String, Vec<Event>)>,
     counters: Arc<ForwardingCounters>,
     outage_logged: Arc<AtomicBool>,
+    delivery_timeout: Duration,
 ) {
     // The client lives in a process-global registry, so its sender is never
     // dropped and `rx.recv()` alone would keep this tracked task alive
@@ -1035,7 +1166,26 @@ async fn run_forwarder(
             }
         };
 
-        let delivered = deliver_batch(&socket_path, &mut conn, &payload).await;
+        // The delivery itself must stay both cancellable and bounded: a
+        // connected but non-responding daemon would otherwise park this
+        // tracked task inside write_frame/read_frame, beyond the reach of the
+        // recv-side shutdown select — and daemon drain would wait its full
+        // timeout on it. Shutdown mid-delivery abandons the batch (the
+        // lane's loss-tolerant contract); a timeout poisons the connection,
+        // since the peer may answer the abandoned frame later.
+        let delivered = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            outcome = tokio::time::timeout(
+                delivery_timeout,
+                deliver_batch(&socket_path, &mut conn, &payload),
+            ) => match outcome {
+                Ok(delivered) => delivered,
+                Err(_elapsed) => {
+                    conn = None;
+                    false
+                }
+            },
+        };
         if delivered {
             counters.forwarded_batches.fetch_add(1, Ordering::Relaxed);
             counters
@@ -1128,13 +1278,21 @@ impl ForwardingEventStore {
                 message,
                 retryable,
                 side_effects_unknown,
+                writer_task_state,
             } => {
-                if side_effects_unknown {
-                    // Reconstruct the one variant whose identity is
-                    // load-bearing across the socket: ADR-133 callers key
-                    // double-send decisions on `SideEffectsUnknown`, and the
-                    // idempotent lane's retry classifier admits it where a
-                    // generic refusal would read terminal.
+                if let Some(state) = writer_task_state {
+                    // Reconstruct the exact writer-task variant: the ADR-133
+                    // retry classifier decides per-state (`NotStarted` and
+                    // `TransactionRolledBack` are mandated retries,
+                    // `SideEffectsUnknown` gates double-send decisions), so
+                    // flattening any of them into a generic refusal breaks
+                    // the retry contract on the client side of the socket.
+                    StorageError::WriterTaskTerminated {
+                        request_state: state.into(),
+                    }
+                } else if side_effects_unknown {
+                    // Frame from a daemon one protocol build older, which
+                    // spelled only this one state.
                     StorageError::WriterTaskTerminated {
                         request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
                     }
@@ -1457,12 +1615,15 @@ mod tests {
         let client =
             EventsSplitClient::new(dir.path().join("never-bound.sock")).expect("client builds");
         let store = ForwardingEventStore::new("test", client);
+        // Older-daemon frame shape: only the single-state marker, no
+        // `writer_task_state` field. The client must still reconstruct it.
         let err = store.unexpected(
             "append_events_idempotent",
             EventsResponse::Error {
                 message: "writer terminated mid-flush".into(),
                 retryable: false,
                 side_effects_unknown: true,
+                writer_task_state: None,
             },
         );
         assert!(
@@ -1490,6 +1651,143 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_task_states_cross_the_wire_verbatim() {
+        // The ADR-133 retry classifier decides per-state, so every
+        // WriterTaskTerminated state must survive server → wire → client
+        // reconstruction exactly. Before this field existed, NotStarted and
+        // TransactionRolledBack crossed as a generic non-retryable refusal
+        // and came back as terminal InvalidInput — a broken retry contract.
+        use khive_storage::WriterTaskRequestState as S;
+        let dir = tempfile::tempdir().unwrap();
+        let client =
+            EventsSplitClient::new(dir.path().join("never-bound.sock")).expect("client builds");
+        let store = ForwardingEventStore::new("test", client);
+        for state in [
+            S::NotStarted,
+            S::TransactionRolledBack,
+            S::SideEffectsUnknown,
+        ] {
+            let response = storage_error_response(&StorageError::WriterTaskTerminated {
+                request_state: state,
+            });
+            // Round-trip through serde like the socket does.
+            let bytes = serde_json::to_vec(&response).unwrap();
+            let parsed: EventsResponse = serde_json::from_slice(&bytes).unwrap();
+            let err = store.unexpected("append_events_idempotent", parsed);
+            assert!(
+                matches!(
+                    err,
+                    StorageError::WriterTaskTerminated { request_state } if request_state == state
+                ),
+                "state {state:?} did not survive the socket: got {err:?}"
+            );
+        }
+        // Control: a non-writer-task refusal must NOT carry the field.
+        let busy = storage_error_response(&StorageError::WriterTaskBusy { timeout_ms: 5 });
+        assert!(matches!(
+            busy,
+            EventsResponse::Error {
+                writer_task_state: None,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_backend_hardens_preexisting_db_and_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pre-existing.events.db");
+        let wal = dir.path().join("pre-existing.events.db-wal");
+        std::fs::write(&db, b"").unwrap();
+        std::fs::write(&wal, b"").unwrap();
+        for path in [&db, &wal] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        // Control: the loose mode is really in place before the open.
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        direct_backend_for(&db).expect("writable open succeeds");
+        for path in [&db, &wal] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "pre-existing {} must be tightened to owner-only",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_store_cache_is_bounded_and_trim_normalized() {
+        let backend = StorageBackend::memory().unwrap();
+        let stores: NamespaceStores =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // cap=1: the first namespace caches, the second still gets a working
+        // store but must not grow the map.
+        namespace_store_with_cap(&backend, &stores, "alpha", 1).expect("first store");
+        namespace_store_with_cap(&backend, &stores, "beta", 1).expect("uncached store still works");
+        let len = stores.lock().unwrap().len();
+        assert_eq!(len, 1, "cache must not grow past its cap");
+        // Trimmed spelling of a cached namespace hits the same entry rather
+        // than minting a duplicate handle (the backend trims namespaces).
+        namespace_store_with_cap(&backend, &stores, "  alpha  ", 1).expect("trimmed spelling");
+        let len = stores.lock().unwrap().len();
+        assert_eq!(len, 1, "spellings of one namespace must share one entry");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forwarder_abandons_hung_delivery() {
+        // A daemon that accepts the connection and then never responds must
+        // not park the forwarder forever: the delivery deadline fires, the
+        // batch is dropped and counted, and the task stays live.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hung.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Accept and hold connections open without ever reading or replying.
+        let _server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    held.push(stream);
+                }
+            }
+        });
+        let client = EventsSplitClient::new_with_queue_depth_and_delivery_timeout(
+            socket.clone(),
+            4,
+            Duration::from_millis(100),
+        )
+        .expect("client builds");
+        let event = Event::new(
+            "test",
+            "noop",
+            khive_types::EventKind::Audit,
+            khive_types::SubstrateKind::Event,
+            "tester",
+        );
+        client.enqueue("test", vec![event]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if client.metrics().dropped_batches >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "forwarder never abandoned the hung delivery: {:?}",
+                client.metrics()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[cfg(unix)]
