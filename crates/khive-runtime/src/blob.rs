@@ -26,13 +26,56 @@ pub const DEFAULT_BLOB_HYDRATION_BYTES: u64 = 4 * khive_storage::MAX_BLOB_WHOLE_
 #[derive(Debug)]
 pub struct BlobHydrator {
     store: Arc<dyn BlobStore>,
+    /// The store as handed in by the caller, before any read-only wrapping.
+    /// Kept so the install seam can recognize a reinstall of the same raw
+    /// store by pointer identity even when `store` is a wrapper around it.
+    raw_store: Arc<dyn BlobStore>,
+    /// True only for hydrators built through [`Self::new_read_only`], whose
+    /// mutators are refused by construction. The runtime's install seam
+    /// requires this on read-only runtimes: `dyn BlobStore` carries no
+    /// downcast hook, so the wrapper cannot be recognized after the fact —
+    /// the guarantee has to travel with the hydrator that made it.
+    read_only: bool,
     admission: Arc<tokio::sync::Semaphore>,
     budget_bytes: u64,
 }
 
 impl BlobHydrator {
+    /// Pair the raw store with a budget, refusing every physical mutator:
+    /// the store is wrapped so `put`/`delete`/sweeps error while the bounded
+    /// read surface stays available. This is the only constructor a
+    /// read-only runtime's install seam accepts.
+    pub(crate) fn new_read_only(
+        store: Arc<dyn BlobStore>,
+        budget_bytes: u64,
+    ) -> RuntimeResult<Self> {
+        let mut hydrator =
+            Self::new_inner(wrap_read_only(Arc::clone(&store)), store, budget_bytes)?;
+        hydrator.read_only = true;
+        Ok(hydrator)
+    }
+
+    /// Whether this hydrator refuses mutation by construction.
+    pub(crate) fn enforces_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// The store exactly as the caller handed it in, before any wrapping.
+    pub(crate) fn raw_store(&self) -> Arc<dyn BlobStore> {
+        Arc::clone(&self.raw_store)
+    }
+
     /// Pair one store with one aggregate byte budget.
     pub fn new(store: Arc<dyn BlobStore>, budget_bytes: u64) -> RuntimeResult<Self> {
+        let raw = Arc::clone(&store);
+        Self::new_inner(store, raw, budget_bytes)
+    }
+
+    fn new_inner(
+        store: Arc<dyn BlobStore>,
+        raw_store: Arc<dyn BlobStore>,
+        budget_bytes: u64,
+    ) -> RuntimeResult<Self> {
         if budget_bytes < khive_storage::MAX_BLOB_WHOLE_BYTES {
             return Err(RuntimeError::InvalidInput(format!(
                 "blob hydration budget must be at least {} bytes, got {budget_bytes}",
@@ -52,6 +95,8 @@ impl BlobHydrator {
         }
         Ok(Self {
             store,
+            raw_store,
+            read_only: false,
             admission: Arc::new(tokio::sync::Semaphore::new(permits)),
             budget_bytes,
         })

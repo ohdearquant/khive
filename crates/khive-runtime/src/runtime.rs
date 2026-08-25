@@ -1046,6 +1046,17 @@ impl KhiveRuntime {
                 self.config.blob_hydration_bytes
             )));
         }
+        // The mode gate must sit on THIS seam, not only on `install_blob_store`:
+        // `BlobHydrator::new` is public, so without it a caller pairs a writable
+        // store, installs it here, and `blob_store()` hands mutating pack paths
+        // a writable store on a runtime whose declared mode is read-only.
+        if self.is_read_only() && !hydrator.enforces_read_only() {
+            return Err(RuntimeError::InvalidInput(
+                "this runtime is read-only: install the raw store with install_blob_store, \
+                 which wraps it so every physical mutator refuses"
+                    .to_string(),
+            ));
+        }
         if let Some(current) = self.blob_hydrator.get() {
             return if Arc::ptr_eq(current, &hydrator) {
                 Ok(())
@@ -1085,8 +1096,12 @@ impl KhiveRuntime {
         store: Arc<dyn khive_storage::BlobStore>,
     ) -> RuntimeResult<()> {
         if let Some(current) = self.blob_hydrator.get() {
+            // Reinstalling the same raw store is idempotent in BOTH modes:
+            // on a read-only runtime the installed hydrator wraps the raw
+            // store, so identity is checked against the raw handle the
+            // hydrator remembers, not only the (possibly wrapped) paired one.
             let current_store = current.store();
-            if Arc::ptr_eq(&current_store, &store) {
+            if Arc::ptr_eq(&current_store, &store) || Arc::ptr_eq(&current.raw_store(), &store) {
                 return Ok(());
             }
         }
@@ -1095,16 +1110,12 @@ impl KhiveRuntime {
         // wrapped so every physical mutator refuses while the bounded read
         // surface stays available. Without this, post-boot installation is a
         // writable bypass of the runtime's declared mode.
-        let store = if self.is_read_only() {
-            crate::blob::wrap_read_only(store)
+        let hydrator = if self.is_read_only() {
+            crate::blob::BlobHydrator::new_read_only(store, self.config.blob_hydration_bytes)?
         } else {
-            store
+            crate::blob::BlobHydrator::new(store, self.config.blob_hydration_bytes)?
         };
-        let hydrator = Arc::new(crate::blob::BlobHydrator::new(
-            store,
-            self.config.blob_hydration_bytes,
-        )?);
-        self.install_blob_hydrator(hydrator)
+        self.install_blob_hydrator(Arc::new(hydrator))
     }
 
     /// Return the installed shared blob hydrator, if boot configured one.
@@ -2140,7 +2151,7 @@ mod tests {
             .await
             .expect("seed put through the raw store");
         runtime
-            .install_blob_store(writable)
+            .install_blob_store(writable.clone())
             .expect("read-only install wraps rather than refusing");
 
         let installed = runtime.blob_store().expect("installed store");
@@ -2152,6 +2163,33 @@ mod tests {
             .put(b"post-boot".to_vec())
             .await
             .expect_err("put must refuse on a read-only runtime");
+        assert!(
+            err.to_string().contains("read-only"),
+            "refusal must name the mode: {err}"
+        );
+
+        // Reinstalling the SAME raw store stays idempotent even though the
+        // installed hydrator holds a wrapper around it: identity is checked
+        // against the raw handle the hydrator remembers.
+        runtime
+            .install_blob_store(writable.clone())
+            .expect("reinstalling the same raw store must be idempotent");
+
+        // The hydrator seam holds the mode too: pairing a writable store
+        // with `BlobHydrator::new` and installing it directly must refuse,
+        // or it is a public bypass of everything above.
+        let bypass_root = tempfile::tempdir().unwrap();
+        let bypass_store = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(bypass_root.path().to_path_buf(), 0)
+                .expect("fs blob store"),
+        );
+        let writable_hydrator = Arc::new(
+            crate::BlobHydrator::new(bypass_store, crate::DEFAULT_BLOB_HYDRATION_BYTES)
+                .expect("construct writable hydrator"),
+        );
+        let err = runtime
+            .install_blob_hydrator(writable_hydrator)
+            .expect_err("a writable hydrator must be refused on a read-only runtime");
         assert!(
             err.to_string().contains("read-only"),
             "refusal must name the mode: {err}"
