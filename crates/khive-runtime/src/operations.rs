@@ -4307,6 +4307,48 @@ impl KhiveRuntime {
             }
         }
 
+        // Sidecar-resident event rows (events-split lane) are invisible to the
+        // main-store scan above; a prefix naming one must still resolve, and a
+        // prefix colliding across the two files must still read as ambiguous,
+        // so the sidecar scan merges into the same `matches`/`seen` set.
+        if matches.len() <= 1 {
+            if let Some(sidecar_sql) = self.events_sidecar_sql_read_only()? {
+                let mut params = vec![SqlValue::Text(pattern.clone())];
+                if let Some(ns) = namespaces {
+                    params.extend(ns.iter().map(|n| SqlValue::Text(n.clone())));
+                }
+                let sql = SqlStatement {
+                    sql: format!(
+                        "SELECT id FROM events WHERE id LIKE ?1{ns_clause} LIMIT 2",
+                        ns_clause = ns_clause.as_deref().unwrap_or("")
+                    ),
+                    params,
+                    label: Some("resolve_prefix.events_sidecar".into()),
+                };
+                let mut sidecar_reader =
+                    sidecar_sql.reader().await.map_err(RuntimeError::Storage)?;
+                match sidecar_reader.query_all(sql).await {
+                    Ok(rows) => {
+                        for row in rows {
+                            if let Some(col) = row.columns.first() {
+                                if let SqlValue::Text(s) = &col.value {
+                                    if seen.insert(s.clone()) {
+                                        matches.push(s.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !msg.contains("no such table") {
+                            return Err(RuntimeError::Storage(e));
+                        }
+                    }
+                }
+            }
+        }
+
         match matches.len() {
             0 => Ok(None),
             1 => {

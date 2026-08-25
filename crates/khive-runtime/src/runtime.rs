@@ -690,14 +690,23 @@ impl KhiveRuntime {
         self.backend.sql()
     }
 
-    /// Read-only SQL access to the events-split sidecar database, when the
-    /// split (ADR-170) is configured and the sidecar exists on disk. `None`
-    /// means every event row lives in the legacy `events` table, so a
-    /// raw-SQL consumer needs no second lookup. Consumers that resolve an
-    /// event by id against `self.sql()` must also consult this store on a
-    /// miss: the audit-batch lane's rows live only in the sidecar. The open
-    /// is read-only and never creates or schema-initializes a sidecar as a
-    /// side effect of a read.
+    /// SQL access to the events-split sidecar database for read purposes,
+    /// when the split (ADR-170) is configured and the sidecar exists on
+    /// disk. `None` means every event row lives in the legacy `events`
+    /// table, so a raw-SQL consumer needs no second lookup. Consumers that
+    /// resolve an event by id or hex prefix against `self.sql()` must also
+    /// consult this store on a miss: the audit-batch lane's rows live only
+    /// in the sidecar.
+    ///
+    /// A writable runtime opens the sidecar through the ordinary writable
+    /// binding: WAL supports one-writer-many-readers, and the read-only
+    /// binding's frozen-snapshot guard refuses any sidecar with a live
+    /// writer's `-shm` beside it — exactly the live-deployment case these
+    /// reads exist for. A read-only runtime keeps the read-only open (it
+    /// must neither create nor schema-initialize a sidecar), which serves
+    /// genuinely frozen snapshots and refuses live ones, matching the
+    /// read-only arm of `events()`. Never creates a sidecar as a side
+    /// effect of a read.
     pub fn events_sidecar_sql_read_only(&self) -> RuntimeResult<Option<Arc<dyn SqlAccess>>> {
         match &self.config.events_split {
             None => Ok(None),
@@ -705,7 +714,11 @@ impl KhiveRuntime {
                 if !split.db_path.exists() {
                     return Ok(None);
                 }
-                let backend = crate::events_split::direct_backend_read_only_for(&split.db_path)?;
+                let backend = if self.backend.is_read_only() {
+                    crate::events_split::direct_backend_read_only_for(&split.db_path)?
+                } else {
+                    crate::events_split::direct_backend_for(&split.db_path)?
+                };
                 Ok(Some(backend.sql()))
             }
         }
@@ -1887,6 +1900,70 @@ mod tests {
             .backend_data_dir()
             .expect("file backend must return Some");
         assert_eq!(data_dir, dir.path());
+    }
+
+    /// A sidecar-only event must resolve through the public hex-prefix path:
+    /// the main-store scan cannot see lane rows, so `resolve_prefix_inner`
+    /// carries a sidecar arm. The pre-insert assert is the control — the
+    /// prefix misses until the lane row exists, so a pass cannot come from
+    /// the legacy scan.
+    #[tokio::test]
+    async fn resolve_prefix_finds_sidecar_only_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("main.db.events.db");
+        let config = RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
+            events_split: Some(crate::events_split::EventsSplitConfig {
+                db_path: sidecar_path.clone(),
+                socket_path: None,
+            }),
+            db_path: Some(dir.path().join("main.db")),
+            blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        };
+        let rt = KhiveRuntime::new(config).expect("file runtime");
+
+        let event = khive_storage::Event::new(
+            "local",
+            "memory.recall",
+            khive_types::EventKind::RecallExecuted,
+            khive_types::SubstrateKind::Note,
+            "agent:test",
+        );
+        let event_id = event.id;
+        let prefix = event_id.to_string()[..8].to_string();
+
+        assert_eq!(
+            rt.resolve_prefix_unfiltered(&prefix)
+                .await
+                .expect("pre-insert resolve"),
+            None,
+            "control: prefix must miss before the lane row exists"
+        );
+
+        let lane = crate::events_split::direct_backend_for(&sidecar_path)
+            .expect("lane backend")
+            .events_for_namespace("local")
+            .expect("lane store");
+        lane.append_event(event).await.expect("lane append");
+
+        assert_eq!(
+            rt.resolve_prefix_unfiltered(&prefix)
+                .await
+                .expect("post-insert resolve"),
+            Some(event_id),
+            "a sidecar-only event id must resolve by hex prefix"
+        );
     }
 
     #[test]
