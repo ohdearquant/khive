@@ -769,8 +769,19 @@ fn build_note_filter_where(
             FilterOp::EqOrMissing => {
                 let expr = json_extract_expr(&pf.json_path);
                 params.push(sql_value_param(&pf.value)?);
+                // `ifnull(expr, '')` collapses the missing case into the
+                // empty string so the whole match-or-missing disjunction
+                // becomes IN ranges over ONE indexable expression: the
+                // recipient-scoped unread-probe index
+                // (`idx_notes_unread_probe_recipient`) carries this exact
+                // expression as a key column, so recipient scoping happens
+                // inside the index instead of row-by-row across every
+                // actor's unread rows. Collapsing empty into missing is
+                // deliberate and matches every consumer's read model: actor
+                // labels are validated non-empty at write time, and gtd
+                // already renders an empty `priority` as the default.
                 conditions.push(format!(
-                    "({expr} = ?{n} OR {expr} IS NULL)",
+                    "ifnull({expr}, '') IN (?{n}, '')",
                     n = params.len()
                 ));
             }
@@ -791,7 +802,7 @@ fn build_note_filter_where(
             FilterOp::JsonTypeNeMissing => {
                 let type_expr = json_type_expr(&pf.json_path);
                 // Inlined as a validated literal, NOT a parameter: the
-                // partial unread index (`idx_notes_unread_probe`) carries
+                // partial unread index (`idx_notes_unread_probe_recipient`) carries
                 // this exact predicate in its WHERE clause, and SQLite can
                 // only prove a query implies an index predicate when the
                 // compared value is known at plan time — a bound parameter

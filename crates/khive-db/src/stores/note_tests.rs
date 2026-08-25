@@ -2084,7 +2084,7 @@ fn transactional_write_refreshes_writer_task_after_construction_outside_runtime(
 // -- unread-probe partial index tests --
 
 /// The comm unread probe (badge count + inbox unread listing) must be served
-/// by `idx_notes_unread_probe`, so its work scales with the unread set, not
+/// by `idx_notes_unread_probe_recipient`, so its work scales with the unread set, not
 /// total mailbox size. That only holds because `JsonTypeNeMissing` inlines
 /// its json_type value as a validated literal: the control below proves the
 /// same predicate with a bound parameter is NOT served by the index (the
@@ -2168,7 +2168,7 @@ async fn unread_probe_query_uses_partial_index() {
     };
     let indexed_plan = plan(&sql, &params);
     assert!(
-        indexed_plan.contains("idx_notes_unread_probe"),
+        indexed_plan.contains("idx_notes_unread_probe_recipient"),
         "unread probe must be served by the partial index, got plan:\n{indexed_plan}"
     );
 
@@ -2181,12 +2181,128 @@ async fn unread_probe_query_uses_partial_index() {
     // a literal is provable at prepare time everywhere.)
     reader
         .conn()
-        .execute_batch("DROP INDEX idx_notes_unread_probe")
+        .execute_batch("DROP INDEX idx_notes_unread_probe_recipient")
         .unwrap();
     let control_plan = plan(&sql, &params);
     assert!(
-        !control_plan.contains("idx_notes_unread_probe"),
+        !control_plan.contains("idx_notes_unread_probe_recipient"),
         "control: dropped index must vanish from the plan, got:\n{control_plan}"
+    );
+}
+
+/// The unread probe's work must scale with the CALLER's unread set, not
+/// with other recipients' backlog: the recipient key column on
+/// `idx_notes_unread_probe_recipient` (the exact `ifnull(...)` expression
+/// EqOrMissing generates) lets the planner exclude other actors' rows
+/// inside the index. Grow an irrelevant recipient's unread backlog 10x and
+/// assert the probe's VM step count stays flat — a recipient-blind scan
+/// (the shape this test pins against) grows those steps roughly 10x.
+#[tokio::test]
+async fn unread_probe_work_is_bounded_by_callers_own_unread_rows() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+    use rusqlite::StatementStatus;
+
+    let pool = setup_pool();
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
+
+    for i in 0..5 {
+        let mine = make_note_with_props(
+            "default",
+            "message",
+            &format!("mine {i}"),
+            serde_json::json!({"direction": "inbound", "to_actor": "actor:a"}),
+        );
+        store.upsert_note(mine).await.unwrap();
+    }
+    let seed_other = |n: usize| {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        // Strictly NEWER than everything already present: the worst case for
+        // the probe is the caller's unread sitting under a mountain of newer
+        // irrelevant rows, so a created_at DESC scan must wade through all of
+        // them before reaching the caller. (An earlier draft stamped scenery
+        // with second-truncated timestamps, which made the caller's
+        // microsecond-stamped rows the NEWEST — every plan then found them
+        // in a handful of steps and the recipient-blind mutant stayed green.)
+        let base: i64 = conn
+            .query_row("SELECT ifnull(max(created_at), 0) FROM notes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..n {
+            let stamp = base + 1 + i as i64;
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', 'inbound', 'to_actor', 'actor:z'), \
+                         ?3, ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("other {i}"),
+                    stamp
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    };
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrMissing,
+                value: SqlValue::Text("actor:a".to_string()),
+            },
+        ],
+        order_by: None,
+        ..Default::default()
+    };
+    let (where_sql, params) = build_note_filter_where("default", &filter).unwrap();
+    let sql = format!("SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT 2");
+    let measure = || -> (usize, i32) {
+        let reader = pool.reader().unwrap();
+        let mut stmt = reader.conn().prepare(&sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows: Vec<String> = stmt
+            .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        (rows.len(), stmt.get_status(StatementStatus::VmStep))
+    };
+
+    seed_other(200);
+    let (rows_small, steps_small) = measure();
+    assert_eq!(rows_small, 2, "probe must still see the caller's rows");
+    assert!(
+        steps_small > 0,
+        "instrument control: VM steps must register"
+    );
+
+    seed_other(1_800); // total irrelevant backlog: 2_000 (10x)
+    let (rows_large, steps_large) = measure();
+    assert_eq!(rows_large, 2, "probe must still see the caller's rows");
+    assert!(
+        steps_large < steps_small.saturating_mul(3),
+        "unread probe scanned other recipients' backlog: \
+         {steps_small} VM steps at 200 irrelevant rows vs {steps_large} at 2000 \
+         (a recipient-scoped probe stays flat; a blind scan grows ~10x)"
     );
 }
 

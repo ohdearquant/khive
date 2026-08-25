@@ -28,10 +28,17 @@ CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
 -- unread listing). Its WHERE clause is the exact predicate the
 -- JsonTypeNeMissing filter op generates (with the json_type value inlined
 -- as a literal -- a bound parameter cannot prove implication at plan time),
--- so the planner serves unread scans from only the unread rows: work is
--- proportional to min(unread, scan cap), never to total mailbox size.
-CREATE INDEX IF NOT EXISTS idx_notes_unread_probe
-    ON notes(namespace, kind, created_at DESC)
+-- and its third key column is the exact `ifnull(...)` expression the
+-- EqOrMissing filter op generates for the recipient, so the planner serves
+-- unread scans from only the caller's own unread rows (plus legacy
+-- recipient-less rows): work is proportional to the caller's unread set,
+-- never to other actors' backlog and never to total mailbox size. The
+-- superseded recipient-blind shape is dropped by name (a no-op once gone).
+DROP INDEX IF EXISTS idx_notes_unread_probe;
+CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient
+    ON notes(namespace, kind,
+             ifnull(json_extract(properties, '$.to_actor'), ''),
+             created_at DESC, id ASC)
     WHERE (json_type(properties, '$.read') IS NULL
            OR json_type(properties, '$.read') != 'true')
       AND deleted_at IS NULL;
