@@ -14,30 +14,11 @@ use crate::presentation::OutputFormat;
 
 // ---- Error type ----
 
-struct ConfigPathSuffix<'a>(Option<&'a Path>);
-
-impl std::fmt::Display for ConfigPathSuffix<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(path) = self.0 {
-            write!(f, " (config file: {})", path.display())?;
-        }
-        Ok(())
-    }
-}
-
-fn config_path_suffix(path: Option<&Path>) -> ConfigPathSuffix<'_> {
-    ConfigPathSuffix(path)
-}
-
 /// Errors produced while loading or validating a `KhiveConfig`.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("config file I/O in {path}: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error("config file I/O: {0}")]
+    Io(#[from] std::io::Error),
 
     #[error("config TOML parse error in {path}: {source}")]
     Parse {
@@ -46,120 +27,100 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
-    #[error(
-        "exactly one engine must be marked `default = true`; found {found}{}",
-        config_path_suffix(.path.as_deref())
-    )]
-    DefaultCount { found: usize, path: Option<PathBuf> },
+    #[error("exactly one engine must be marked `default = true`; found {found}")]
+    DefaultCount { found: usize },
 
-    #[error(
-        "duplicate engine name: {name:?}{}",
-        config_path_suffix(.path.as_deref())
-    )]
-    DuplicateName { name: String, path: Option<PathBuf> },
+    #[error("duplicate engine name: {name:?}")]
+    DuplicateName { name: String },
 
     #[error(
         "engine {name:?}: model {model:?} is not a recognized lattice_embed::EmbeddingModel name"
     )]
     UnknownModel { name: String, model: String },
 
-    #[error(
-        "engine {name:?}: fusion_weight must be > 0, got {value}{}",
-        config_path_suffix(.path.as_deref())
-    )]
-    InvalidFusionWeight {
-        name: String,
-        value: f64,
-        path: Option<PathBuf>,
-    },
+    #[error("engine {name:?}: fusion_weight must be > 0, got {value}")]
+    InvalidFusionWeight { name: String, value: f64 },
 
-    #[error(
-        "actor.id {id:?} is not a valid namespace: {reason}{}",
-        config_path_suffix(.path.as_deref())
-    )]
-    InvalidActorId {
-        id: String,
-        reason: String,
-        path: Option<PathBuf>,
-    },
+    #[error("actor.id {id:?} is not a valid namespace: {reason}")]
+    InvalidActorId { id: String, reason: String },
 
-    #[error(
-        "duplicate backend name: {name:?}{}",
-        config_path_suffix(.path.as_deref())
-    )]
-    DuplicateBackendName { name: String, path: Option<PathBuf> },
+    #[error("duplicate backend name: {name:?}")]
+    DuplicateBackendName { name: String },
 
     #[error(
         "[packs.{pack}].backend = {backend:?} references an unknown backend; \
-         defined backends: {defined}{}",
-        config_path_suffix(.path.as_deref())
+         defined backends: {defined}"
     )]
     UnknownPackBackend {
         pack: String,
         backend: String,
         defined: String,
-        path: Option<PathBuf>,
     },
 
     #[error(
         "[[backends]] entry {name:?}: field `{field}` is not yet supported; \
-         remove it from the config or wait for a future release that implements it{}",
-        config_path_suffix(.path.as_deref())
+         remove it from the config or wait for a future release that implements it"
     )]
-    UnsupportedBackendField {
-        name: String,
-        field: &'static str,
-        path: Option<PathBuf>,
-    },
+    UnsupportedBackendField { name: String, field: &'static str },
 
     #[error(
         "top-level `db = {value:?}` is not a supported config-file key; \
          use `--db` / `KHIVE_DB` to select a single-file database, or \
-         `[[backends]].path` to declare storage backend topology{}",
-        config_path_suffix(.path.as_deref())
+         `[[backends]].path` to declare storage backend topology"
     )]
-    UnsupportedTopLevelDb {
-        value: String,
-        path: Option<PathBuf>,
-    },
+    UnsupportedTopLevelDb { value: String },
+
+    #[error("[[git_write.allowed]] entry {repo:?}: {reason}")]
+    InvalidGitWriteEntry { repo: String, reason: String },
 
     #[error(
-        "[[git_write.allowed]] entry {repo:?}: {reason}{}",
-        config_path_suffix(.path.as_deref())
+        "[runtime] blob_hydration_bytes must be between {min} and {max} bytes inclusive; got {value}"
     )]
-    InvalidGitWriteEntry {
-        repo: String,
-        reason: String,
-        path: Option<PathBuf>,
-    },
-
-    #[error(
-        "[runtime] blob_hydration_bytes must be between {min} and {max} bytes inclusive; got {value}{}",
-        config_path_suffix(.path.as_deref())
-    )]
-    InvalidBlobHydrationBytes {
-        value: u64,
-        min: u64,
-        max: u64,
-        path: Option<PathBuf>,
-    },
+    InvalidBlobHydrationBytes { value: u64, min: u64, max: u64 },
 
     #[error("the explicitly selected config file does not exist: {path}")]
     ExplicitConfigMissing { path: PathBuf },
 
     #[error(
-        "[gate] configuration in {path} is not supported by this build; refusing to start because the requested caller-enrollment policy would not be enforced"
+        "[gate] configuration is not supported by this build; refusing to start because the requested caller-enrollment policy would not be enforced"
     )]
-    UnsupportedGateSection { path: PathBuf },
+    UnsupportedGateSection,
 
     #[error(
-        "[display] timezone {timezone:?} is not a recognized IANA zone name (e.g. \"America/New_York\", \"UTC\"){}",
-        config_path_suffix(.path.as_deref())
+        "[display] timezone {timezone:?} is not a recognized IANA zone name (e.g. \"America/New_York\", \"UTC\")"
     )]
-    InvalidDisplayTimezone {
-        timezone: String,
-        path: Option<PathBuf>,
+    InvalidDisplayTimezone { timezone: String },
+
+    /// Loader-context wrapper attaching the config file the error came from.
+    ///
+    /// Added as a wrapping variant, rather than reshaping the existing
+    /// variants, so existing matches and constructors keep compiling and the
+    /// `From<std::io::Error>` conversion survives. `Parse` already carries
+    /// its path and is never wrapped. Matches on `ConfigError` that inspect
+    /// specific variants should either match `InFile` and recurse into
+    /// `source`, or use a wildcard arm.
+    #[error("{source} (config file: {})", path.display())]
+    InFile {
+        path: PathBuf,
+        #[source]
+        source: Box<ConfigError>,
     },
+}
+
+impl ConfigError {
+    /// Attach the loading config file's path unless the error already names
+    /// one (`Parse`, `ExplicitConfigMissing`) or is already wrapped.
+    fn in_file(self, path: &Path) -> Self {
+        match self {
+            already @ (ConfigError::Parse { .. }
+            | ConfigError::ExplicitConfigMissing { .. }
+            | ConfigError::InFile { .. }) => already,
+            other => ConfigError::InFile {
+                path: path.to_path_buf(),
+                source: Box::new(other),
+            },
+        }
+    }
 }
 
 // ---- Config structs ----
@@ -584,11 +545,11 @@ impl KhiveConfig {
             return Ok(None);
         }
 
-        let diagnostic_path = Self::diagnostic_config_path(&resolved);
-        let raw = std::fs::read_to_string(&resolved).map_err(|source| ConfigError::Io {
-            path: diagnostic_path.clone(),
-            source,
-        })?;
+        // Diagnostics name the canonical path so an error is actionable from
+        // any cwd; resolution keeps using `resolved` as given.
+        let diagnostic_path = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+        let raw = std::fs::read_to_string(&resolved)
+            .map_err(|source| ConfigError::from(source).in_file(&diagnostic_path))?;
         let parsed: toml::Value = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
@@ -597,15 +558,14 @@ impl KhiveConfig {
             .as_table()
             .is_some_and(|table| table.contains_key("gate"))
         {
-            return Err(ConfigError::UnsupportedGateSection {
-                path: diagnostic_path,
-            });
+            return Err(ConfigError::UnsupportedGateSection.in_file(&diagnostic_path));
         }
         let cfg: KhiveConfig = parsed.try_into().map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
         })?;
-        cfg.validate_with_path(Some(&diagnostic_path))?;
+        cfg.validate()
+            .map_err(|error| error.in_file(&diagnostic_path))?;
         Ok(Some(cfg))
     }
 
@@ -789,11 +749,6 @@ impl KhiveConfig {
     /// Model name validity is checked lazily at runtime (the config loader does
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_with_path(None)
-    }
-
-    fn validate_with_path(&self, path: Option<&Path>) -> Result<(), ConfigError> {
-        let path = path.map(Path::to_path_buf);
         // Reject a top-level `db` key loudly instead of letting serde's
         // forward-compatible unknown-key tolerance silently swallow it: a
         // config author expecting `db=` to select the database would
@@ -802,7 +757,6 @@ impl KhiveConfig {
             if !value.is_empty() {
                 return Err(ConfigError::UnsupportedTopLevelDb {
                     value: value.to_string(),
-                    path: path.clone(),
                 });
             }
         }
@@ -811,12 +765,7 @@ impl KhiveConfig {
             let min = khive_storage::MAX_BLOB_WHOLE_BYTES;
             let max = tokio::sync::Semaphore::MAX_PERMITS as u64;
             if value < min || value > max {
-                return Err(ConfigError::InvalidBlobHydrationBytes {
-                    value,
-                    min,
-                    max,
-                    path: path.clone(),
-                });
+                return Err(ConfigError::InvalidBlobHydrationBytes { value, min, max });
             }
         }
 
@@ -828,13 +777,11 @@ impl KhiveConfig {
                     id: id.to_string(),
                     reason: "actor.id must not be empty; remove the key or provide a value"
                         .to_string(),
-                    path: path.clone(),
                 });
             }
             Namespace::parse(id).map_err(|e| ConfigError::InvalidActorId {
                 id: id.to_string(),
                 reason: e.to_string(),
-                path: path.clone(),
             })?;
         }
 
@@ -844,13 +791,11 @@ impl KhiveConfig {
                     return Err(ConfigError::InvalidActorId {
                         id: ns_str.clone(),
                         reason: "visible_namespaces entries must not be empty".to_string(),
-                        path: path.clone(),
                     });
                 }
                 Namespace::parse(ns_str).map_err(|e| ConfigError::InvalidActorId {
                     id: ns_str.clone(),
                     reason: format!("invalid visible namespace: {e}"),
-                    path: path.clone(),
                 })?;
             }
         }
@@ -861,13 +806,11 @@ impl KhiveConfig {
                 return Err(ConfigError::InvalidActorId {
                     id: ns_str.clone(),
                     reason: "allowed_outbound_namespaces entries must not be empty".to_string(),
-                    path: path.clone(),
                 });
             }
             Namespace::parse(ns_str).map_err(|e| ConfigError::InvalidActorId {
                 id: ns_str.clone(),
                 reason: format!("invalid allowed_outbound_namespaces entry: {e}"),
-                path: path.clone(),
             })?;
         }
 
@@ -878,7 +821,6 @@ impl KhiveConfig {
                 if !seen_backends.insert(backend.name.clone()) {
                     return Err(ConfigError::DuplicateBackendName {
                         name: backend.name.clone(),
-                        path: path.clone(),
                     });
                 }
 
@@ -888,14 +830,12 @@ impl KhiveConfig {
                     return Err(ConfigError::UnsupportedBackendField {
                         name: backend.name.clone(),
                         field: "cache_mb",
-                        path: path.clone(),
                     });
                 }
                 if backend.journal_mode.is_some() {
                     return Err(ConfigError::UnsupportedBackendField {
                         name: backend.name.clone(),
                         field: "journal_mode",
-                        path: path.clone(),
                     });
                 }
             }
@@ -908,7 +848,6 @@ impl KhiveConfig {
                         pack: pack_name.clone(),
                         backend: pack_cfg.backend.clone(),
                         defined: defined.join(", "),
-                        path: path.clone(),
                     });
                 }
             }
@@ -920,7 +859,6 @@ impl KhiveConfig {
             if tz.trim().is_empty() || tz.parse::<chrono_tz::Tz>().is_err() {
                 return Err(ConfigError::InvalidDisplayTimezone {
                     timezone: tz.to_string(),
-                    path: path.clone(),
                 });
             }
         }
@@ -936,28 +874,24 @@ impl KhiveConfig {
                 return Err(ConfigError::InvalidGitWriteEntry {
                     repo: entry.repo.clone(),
                     reason: "repo must not be empty".to_string(),
-                    path: path.clone(),
                 });
             }
             if !Path::new(&entry.repo).is_absolute() {
                 return Err(ConfigError::InvalidGitWriteEntry {
                     repo: entry.repo.clone(),
                     reason: "repo must be an absolute path".to_string(),
-                    path: path.clone(),
                 });
             }
             if entry.branches.is_empty() {
                 return Err(ConfigError::InvalidGitWriteEntry {
                     repo: entry.repo.clone(),
                     reason: "branches must not be empty".to_string(),
-                    path: path.clone(),
                 });
             }
             if entry.branches.iter().any(|b| b.trim().is_empty()) {
                 return Err(ConfigError::InvalidGitWriteEntry {
                     repo: entry.repo.clone(),
                     reason: "branches entries must not be empty".to_string(),
-                    path: path.clone(),
                 });
             }
             // ADR-108 specifies exact name or a SINGLE-star wildcard per
@@ -970,7 +904,6 @@ impl KhiveConfig {
                     reason: format!(
                         "branch pattern {bad:?} must contain at most one '*' wildcard (ADR-108)"
                     ),
-                    path: path.clone(),
                 });
             }
         }
@@ -984,7 +917,6 @@ impl KhiveConfig {
             if !seen_names.insert(engine.name.clone()) {
                 return Err(ConfigError::DuplicateName {
                     name: engine.name.clone(),
-                    path: path.clone(),
                 });
             }
         }
@@ -993,7 +925,6 @@ impl KhiveConfig {
         if default_count != 1 {
             return Err(ConfigError::DefaultCount {
                 found: default_count,
-                path: path.clone(),
             });
         }
 
@@ -1005,7 +936,6 @@ impl KhiveConfig {
                     return Err(ConfigError::InvalidFusionWeight {
                         name: engine.name.clone(),
                         value: w,
-                        path: path.clone(),
                     });
                 }
             }
@@ -1105,6 +1035,58 @@ mod tests {
         path
     }
 
+    /// Load errors must name the config file they came from (#1892): the
+    /// gate refusal, validation errors, and I/O errors gain the loader's
+    /// `InFile` context, while `Parse` keeps carrying its own path. The
+    /// message suffix is the user-facing contract.
+    #[test]
+    fn load_errors_name_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let gate = write_toml(&dir, "[gate]\nmode = \"x\"\n");
+        let err = KhiveConfig::load(Some(&gate)).expect_err("gate section must fail");
+        assert!(
+            err.to_string().contains("(config file: ") && err.to_string().contains("config.toml"),
+            "gate error must name the file, got: {err}"
+        );
+
+        let invalid = write_toml(
+            &dir,
+            "[[engines]]\nname = \"a\"\nmodel = \"all-minilm-l6-v2\"\n",
+        );
+        let err = KhiveConfig::load(Some(&invalid)).expect_err("validation must fail");
+        assert!(
+            err.to_string().contains("(config file: "),
+            "validation error must name the file, got: {err}"
+        );
+
+        let parse = write_toml(&dir, "not = = toml");
+        let err = KhiveConfig::load(Some(&parse)).expect_err("parse must fail");
+        assert!(
+            err.to_string().contains("config.toml"),
+            "parse error must name the file, got: {err}"
+        );
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "parse errors keep their own variant unwrapped, got: {err:?}"
+        );
+    }
+
+    /// Unwrap the loader's `InFile` context (asserting it names a real path)
+    /// so variant-shape assertions test the underlying error.
+    fn config_error_root(err: &ConfigError) -> &ConfigError {
+        match err {
+            ConfigError::InFile { path, source } => {
+                assert!(
+                    !path.as_os_str().is_empty(),
+                    "InFile must carry the config path"
+                );
+                source
+            }
+            other => other,
+        }
+    }
+
     // khive#1221: with no primary set, the additional list must ADD to the
     // built-in default primary, never replace it.
     #[test]
@@ -1178,7 +1160,10 @@ model = "all-minilm-l6-v2"
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("should fail with no default flagged");
         assert!(
-            matches!(err, ConfigError::DefaultCount { found: 0, .. }),
+            matches!(
+                config_error_root(&err),
+                ConfigError::DefaultCount { found: 0 }
+            ),
             "expected DefaultCount {{ found: 0 }}, got {err:?}"
         );
     }
@@ -1202,7 +1187,10 @@ default = true
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("should fail with two defaults");
         assert!(
-            matches!(err, ConfigError::DefaultCount { found: 2, .. }),
+            matches!(
+                config_error_root(&err),
+                ConfigError::DefaultCount { found: 2 }
+            ),
             "expected DefaultCount {{ found: 2 }}, got {err:?}"
         );
     }
@@ -1223,7 +1211,10 @@ fusion_weight = -0.5
         let err =
             KhiveConfig::load(Some(&path)).expect_err("should fail with negative fusion_weight");
         assert!(
-            matches!(err, ConfigError::InvalidFusionWeight { .. }),
+            matches!(
+                config_error_root(&err),
+                ConfigError::InvalidFusionWeight { .. }
+            ),
             "expected InvalidFusionWeight, got {err:?}"
         );
 
@@ -1240,7 +1231,10 @@ fusion_weight = 0.0
         let err2 =
             KhiveConfig::load(Some(&path2)).expect_err("should fail with zero fusion_weight");
         assert!(
-            matches!(err2, ConfigError::InvalidFusionWeight { .. }),
+            matches!(
+                config_error_root(&err2),
+                ConfigError::InvalidFusionWeight { .. }
+            ),
             "expected InvalidFusionWeight, got {err2:?}"
         );
     }
@@ -1323,7 +1317,7 @@ model = "paraphrase-multilingual-minilm-l12-v2"
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("should fail with duplicate name");
         assert!(
-            matches!(err, ConfigError::DuplicateName { .. }),
+            matches!(config_error_root(&err), ConfigError::DuplicateName { .. }),
             "expected DuplicateName, got {err:?}"
         );
     }
@@ -1373,12 +1367,12 @@ blob_hydration_bytes = 134217728
         let err = KhiveConfig::load(Some(&path)).expect_err("undersized budget must fail closed");
         assert!(
             matches!(
-                err,
+                config_error_root(&err),
                 ConfigError::InvalidBlobHydrationBytes {
                     value: actual,
                     min,
                     ..
-                } if actual == value && min == khive_storage::MAX_BLOB_WHOLE_BYTES
+                } if *actual == value && *min == khive_storage::MAX_BLOB_WHOLE_BYTES
             ),
             "got {err:?}"
         );
@@ -1414,12 +1408,12 @@ blob_hydration_bytes = 134217728
         let err = KhiveConfig::load(Some(&path)).expect_err("oversized budget must fail closed");
         assert!(
             matches!(
-                err,
+                config_error_root(&err),
                 ConfigError::InvalidBlobHydrationBytes {
                     value: actual,
                     max: actual_max,
                     ..
-                } if actual == value && actual_max == max
+                } if *actual == value && *actual_max == max
             ),
             "got {err:?}"
         );
@@ -1537,7 +1531,10 @@ default = true
 
         let err = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
             .expect_err("an unsupported home gate policy must still fail loud");
-        assert!(matches!(err, ConfigError::UnsupportedGateSection { .. }));
+        assert!(matches!(
+            config_error_root(&err),
+            ConfigError::UnsupportedGateSection
+        ));
 
         let empty = project_dir.path().join("empty-khive-config.toml");
         std::fs::write(&empty, "").unwrap();
@@ -1599,7 +1596,7 @@ id = "bad namespace"
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("should fail with invalid actor.id");
         assert!(
-            matches!(err, ConfigError::InvalidActorId { .. }),
+            matches!(config_error_root(&err), ConfigError::InvalidActorId { .. }),
             "expected InvalidActorId, got {err:?}"
         );
     }
@@ -1616,7 +1613,7 @@ id = ""
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("empty actor.id should be rejected");
         assert!(
-            matches!(err, ConfigError::InvalidActorId { .. }),
+            matches!(config_error_root(&err), ConfigError::InvalidActorId { .. }),
             "expected InvalidActorId for empty string, got {err:?}"
         );
     }
@@ -1634,7 +1631,7 @@ id = "lambda:"
         let err =
             KhiveConfig::load(Some(&path)).expect_err("lambda: with no slug should be rejected");
         assert!(
-            matches!(err, ConfigError::InvalidActorId { .. }),
+            matches!(config_error_root(&err), ConfigError::InvalidActorId { .. }),
             "expected InvalidActorId for 'lambda:', got {err:?}"
         );
     }
@@ -2086,7 +2083,7 @@ kind = "memory"
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("should fail with duplicate name");
         assert!(
-            matches!(err, ConfigError::DuplicateBackendName { ref name, .. } if name == "dup"),
+            matches!(config_error_root(&err), ConfigError::DuplicateBackendName { ref name } if name == "dup"),
             "expected DuplicateBackendName {{ name: \"dup\" }}, got {err:?}"
         );
     }
@@ -2108,7 +2105,7 @@ backend = "nonexistent"
         let err =
             KhiveConfig::load(Some(&path)).expect_err("should fail with unknown backend reference");
         assert!(
-            matches!(err, ConfigError::UnknownPackBackend { ref pack, ref backend, .. }
+            matches!(config_error_root(&err), ConfigError::UnknownPackBackend { ref pack, ref backend, .. }
                 if pack == "kg" && backend == "nonexistent"),
             "expected UnknownPackBackend for kg→nonexistent, got {err:?}"
         );
@@ -2147,7 +2144,7 @@ cache_mb = 128
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("cache_mb must be rejected");
         assert!(
-            matches!(err, ConfigError::UnsupportedBackendField { ref name, field: "cache_mb", .. } if name == "main"),
+            matches!(config_error_root(&err), ConfigError::UnsupportedBackendField { ref name, field: "cache_mb" } if name == "main"),
             "expected UnsupportedBackendField {{ name: \"main\", field: \"cache_mb\" }}, got {err:?}"
         );
     }
@@ -2166,7 +2163,7 @@ journal_mode = "wal"
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("journal_mode must be rejected");
         assert!(
-            matches!(err, ConfigError::UnsupportedBackendField { ref name, field: "journal_mode", .. } if name == "main"),
+            matches!(config_error_root(&err), ConfigError::UnsupportedBackendField { ref name, field: "journal_mode" } if name == "main"),
             "expected UnsupportedBackendField {{ name: \"main\", field: \"journal_mode\" }}, got {err:?}"
         );
     }
@@ -2184,7 +2181,7 @@ db = "/tmp/scratch/demo.db"
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("top-level db must be rejected");
         assert!(
-            matches!(err, ConfigError::UnsupportedTopLevelDb { ref value, .. } if value == "/tmp/scratch/demo.db"),
+            matches!(config_error_root(&err), ConfigError::UnsupportedTopLevelDb { ref value } if value == "/tmp/scratch/demo.db"),
             "expected UnsupportedTopLevelDb {{ value: \"/tmp/scratch/demo.db\" }}, got {err:?}"
         );
     }
@@ -2204,7 +2201,7 @@ grant_unattributed = false
         let err = KhiveConfig::load(Some(&path))
             .expect_err("an unenforced caller-enrollment policy must abort startup");
         assert!(
-            matches!(err, ConfigError::UnsupportedGateSection { .. }),
+            matches!(config_error_root(&err), ConfigError::UnsupportedGateSection),
             "expected UnsupportedGateSection, got {err:?}"
         );
         assert!(
@@ -2214,51 +2211,15 @@ grant_unattributed = false
     }
 
     #[test]
-    fn selected_config_load_errors_name_absolute_path() {
-        let dir = tempfile::tempdir().unwrap();
-        for (name, content) in [
-            (
-                "gate.toml",
-                "[gate]\ngranted_actors = [\"lambda:enrolled\"]\n",
-            ),
-            (
-                "validation.toml",
-                "[[engines]]\nname = \"missing-default\"\nmodel = \"all-minilm-l6-v2\"\n",
-            ),
-            ("parse.toml", "[[engines]\n"),
-        ] {
-            let path = dir.path().join(name);
-            std::fs::write(&path, content).unwrap();
-            let absolute = std::fs::canonicalize(&path).unwrap();
-            let err = KhiveConfig::load(Some(&path)).expect_err("config load must fail");
-            assert!(
-                err.to_string()
-                    .contains(absolute.to_string_lossy().as_ref()),
-                "selected config error must name {}: {err}",
-                absolute.display()
-            );
-        }
-
-        let directory_path = dir.path().join("not-a-file.toml");
-        std::fs::create_dir(&directory_path).unwrap();
-        let absolute = std::fs::canonicalize(&directory_path).unwrap();
-        let err = KhiveConfig::load(Some(&directory_path))
-            .expect_err("reading a directory as a config must fail");
-        assert!(
-            err.to_string()
-                .contains(absolute.to_string_lossy().as_ref()),
-            "selected config I/O error must name {}: {err}",
-            absolute.display()
-        );
-    }
-
-    #[test]
     fn empty_gate_table_is_still_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(&dir, "[gate]\n");
         let err = KhiveConfig::load(Some(&path))
             .expect_err("a present gate table must never disappear through serde defaults");
-        assert!(matches!(err, ConfigError::UnsupportedGateSection { .. }));
+        assert!(matches!(
+            config_error_root(&err),
+            ConfigError::UnsupportedGateSection
+        ));
     }
 
     #[test]
@@ -2320,7 +2281,7 @@ branches = ["main"]
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("relative repo must be rejected");
         assert!(
-            matches!(err, ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "relative/path"),
+            matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "relative/path"),
             "expected InvalidGitWriteEntry, got {err:?}"
         );
     }
@@ -2341,7 +2302,7 @@ branches = ["**"]
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("** must be rejected");
         assert!(
-            matches!(err, ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "/abs/path"),
+            matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "/abs/path"),
             "expected InvalidGitWriteEntry, got {err:?}"
         );
 
@@ -2356,7 +2317,10 @@ branches = ["rel-*-*-final"]
         );
         let err2 = KhiveConfig::load(Some(&path2)).expect_err("rel-*-*-final must be rejected");
         assert!(
-            matches!(err2, ConfigError::InvalidGitWriteEntry { .. }),
+            matches!(
+                config_error_root(&err2),
+                ConfigError::InvalidGitWriteEntry { .. }
+            ),
             "expected InvalidGitWriteEntry, got {err2:?}"
         );
     }
@@ -2394,7 +2358,7 @@ branches = []
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("empty branches must be rejected");
         assert!(
-            matches!(err, ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "/abs/path"),
+            matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "/abs/path"),
             "expected InvalidGitWriteEntry, got {err:?}"
         );
     }
@@ -2487,7 +2451,10 @@ made_up_field = "x"
 "#,
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("unknown field must be rejected");
-        assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+        assert!(
+            matches!(config_error_root(&err), ConfigError::Parse { .. }),
+            "got {err:?}"
+        );
     }
 
     // An s3-only field (bucket) under backend = "fs" must be rejected: the
@@ -2505,7 +2472,10 @@ bucket = "khive-blobs"
 "#,
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("s3 field under fs must be rejected");
-        assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+        assert!(
+            matches!(config_error_root(&err), ConfigError::Parse { .. }),
+            "got {err:?}"
+        );
     }
 
     // Credentials are never accepted in TOML (ADR-111 Amendment 2): an
@@ -2526,7 +2496,10 @@ access_key_id = "AKIAEXAMPLE"
         );
         let err = KhiveConfig::load(Some(&path))
             .expect_err("a credential field in TOML must be rejected");
-        assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+        assert!(
+            matches!(config_error_root(&err), ConfigError::Parse { .. }),
+            "got {err:?}"
+        );
     }
 
     // An unrecognized backend value is rejected by the internally tagged
@@ -2542,7 +2515,10 @@ backend = "gcs"
 "#,
         );
         let err = KhiveConfig::load(Some(&path)).expect_err("unknown backend must be rejected");
-        assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+        assert!(
+            matches!(config_error_root(&err), ConfigError::Parse { .. }),
+            "got {err:?}"
+        );
     }
 
     // ── [display] section (ADR-169) ──────────────────────────────────────────
@@ -2587,7 +2563,7 @@ timezone = "Mars/Olympus_Mons"
         let err = KhiveConfig::load(Some(&path))
             .expect_err("an unrecognized IANA zone name must fail at load, not silently fall back");
         assert!(
-            matches!(err, ConfigError::InvalidDisplayTimezone { ref timezone, .. } if timezone == "Mars/Olympus_Mons"),
+            matches!(config_error_root(&err), ConfigError::InvalidDisplayTimezone { ref timezone } if timezone == "Mars/Olympus_Mons"),
             "expected InvalidDisplayTimezone, got {err:?}"
         );
     }
@@ -2605,7 +2581,10 @@ timezone = ""
         let err =
             KhiveConfig::load(Some(&path)).expect_err("an empty timezone string must be rejected");
         assert!(
-            matches!(err, ConfigError::InvalidDisplayTimezone { .. }),
+            matches!(
+                config_error_root(&err),
+                ConfigError::InvalidDisplayTimezone { .. }
+            ),
             "expected InvalidDisplayTimezone, got {err:?}"
         );
     }

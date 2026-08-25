@@ -981,9 +981,13 @@ mod resolve_project_actor_id_tests {
         let path = write_toml(&dir, "[actor]\nid = \"\"\n");
 
         let err = resolve_project_actor_id(Some(&path)).expect_err("invalid actor.id must error");
+        let root = match &err {
+            crate::engine_config::ConfigError::InFile { source, .. } => source.as_ref(),
+            other => other,
+        };
         assert!(
             matches!(
-                err,
+                root,
                 crate::engine_config::ConfigError::InvalidActorId { .. }
             ),
             "expected InvalidActorId, got {err:?}"
