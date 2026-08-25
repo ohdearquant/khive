@@ -97,9 +97,11 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             window and can undercount a low-frequency kind relative to noisier ones. The \
             unfiltered default view (no `kind`) segregates the high-volume `audit` kind from \
             the shared truncation budget so it cannot crowd other kinds out of counts_by_kind. \
-            Pass exhaustive=true for an exact, non-sampled full-window aggregate (paginates \
+            Pass exhaustive=true for a non-sampled full-window aggregate (paginates \
             internally; still one call) instead of a single bounded page — higher cost, use \
-            for coverage-panel/audit-style queries. Exhaustive windows matching more than \
+            for coverage-panel/audit-style queries. Aggregation is a point-in-time view of \
+            the live event plane: rows appended while the call paginates may be excluded; \
+            bound `until` in the past for a closed population. Exhaustive windows matching more than \
             2,000,000 events are rejected rather than returned as partial aggregates; narrow \
             since/until or add actor/kind filters.",
         visibility: khive_types::Visibility::Verb,
@@ -2818,6 +2820,13 @@ pub(crate) async fn fetch_event_counts_window(
 /// row must simply arrive exactly once. A timestamp tie run wider than the
 /// transport cap cannot be paged past (widening the page is refused by the
 /// daemon) and is reported as a typed error rather than looping.
+///
+/// Read consistency: the walk issues independent page (and, at the cap,
+/// count) reads against a live event plane with no snapshot spanning them.
+/// The result is a point-in-time view — a row appended concurrently with
+/// the walk may be excluded (never duplicated, and never an error), exactly
+/// as it would be by a single bounded read that predated it. Callers
+/// needing a closed population bound the window with `until` in the past.
 pub(crate) async fn collect_events_cursor_walk(
     store: &dyn khive_storage::event::EventStore,
     base_filter: &EventFilter,

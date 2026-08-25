@@ -8012,6 +8012,107 @@ mod event_counts_tests {
         );
     }
 
+    /// Delegating store that appends one prepared row to the inner store
+    /// immediately AFTER serving a `count_events` call, reproducing a
+    /// concurrent boundary-timestamp append landing between the walk's
+    /// completeness count and its next page query.
+    struct AppendAfterCountStore {
+        inner: std::sync::Arc<dyn khive_storage::event::EventStore>,
+        pending: tokio::sync::Mutex<Option<Event>>,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::event::EventStore for AppendAfterCountStore {
+        async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
+            self.inner.append_event(event).await
+        }
+        async fn append_events(
+            &self,
+            events: Vec<Event>,
+        ) -> khive_storage::StorageResult<khive_storage::BatchWriteSummary> {
+            self.inner.append_events(events).await
+        }
+        async fn get_event(&self, id: uuid::Uuid) -> khive_storage::StorageResult<Option<Event>> {
+            self.inner.get_event(id).await
+        }
+        async fn query_events(
+            &self,
+            filter: EventFilter,
+            page: khive_storage::PageRequest,
+        ) -> khive_storage::StorageResult<khive_storage::Page<Event>> {
+            self.inner.query_events(filter, page).await
+        }
+        async fn count_events(&self, filter: EventFilter) -> khive_storage::StorageResult<u64> {
+            let count = self.inner.count_events(filter).await?;
+            if let Some(event) = self.pending.lock().await.take() {
+                self.inner.append_event(event).await?;
+            }
+            Ok(count)
+        }
+    }
+
+    /// The walk's at-cap completeness proof and its next page query are
+    /// independent reads of a live plane: a boundary-timestamp row appended
+    /// between them is a point-in-time exclusion, never an error and never a
+    /// duplicate. This pins the documented read-consistency contract.
+    #[tokio::test]
+    async fn concurrent_boundary_append_between_count_and_next_page_is_excluded_cleanly() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let store = rt.events(&token).expect("event store");
+        let cap = usize::try_from(crate::handlers::TRANSPORT_PAGE_ROWS).unwrap();
+
+        let mut batch = tied_events(token.namespace().as_str(), 5_000_000, cap);
+        batch.extend(tied_events(token.namespace().as_str(), 1_000_000, 1));
+        store.append_events(batch).await.expect("seed cap tie");
+        let racer = tied_events(token.namespace().as_str(), 5_000_000, 1)
+            .pop()
+            .expect("one racer event");
+        let racer_id = racer.id;
+
+        let wrapped = AppendAfterCountStore {
+            inner: store.clone(),
+            pending: tokio::sync::Mutex::new(Some(racer)),
+        };
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let items = crate::handlers::collect_events_cursor_walk(
+            &wrapped,
+            &base_filter,
+            crate::handlers::TRANSPORT_PAGE_ROWS,
+            (cap as u64) + 2,
+        )
+        .await
+        .expect("a concurrent boundary append must not error the walk");
+        assert_eq!(
+            items.len(),
+            cap + 1,
+            "the point-in-time view holds the pre-append population"
+        );
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            items.iter().map(|event| event.id).collect();
+        assert_eq!(distinct.len(), cap + 1, "no row may be double-counted");
+        assert!(
+            !distinct.contains(&racer_id),
+            "the racing row is excluded from this walk's view, not half-included"
+        );
+        assert!(
+            wrapped.pending.lock().await.is_none(),
+            "the completeness count must have fired and injected the racing append; \
+             otherwise this test exercised nothing"
+        );
+        assert!(
+            store
+                .get_event(racer_id)
+                .await
+                .expect("racer lookup")
+                .is_some(),
+            "the racing row must actually be in the store"
+        );
+    }
+
     /// Rows at `created_at == i64::MAX` admit no exclusive bound above them:
     /// the cursor must not saturate past them (which would silently skip the
     /// uncollected remainder of the group) — the walk re-reads, dedups, and
