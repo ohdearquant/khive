@@ -352,13 +352,13 @@ const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
 /// password long enough still crosses the cut before its terminating `@`
 /// ever appears; `redact_crossing_boundary_url_userinfo` closes that gap
 /// by redacting the unterminated opening directly, so no credential prefix
-/// survives regardless of secret length. Control (`Cc`) and format
-/// (`Cf`) Unicode codepoints in the masked text are then escaped: a log line
-/// is plain text read by tooling outside this process, and an embedded CR/LF
-/// or bidi/format override could forge or visually disguise part of the
-/// record. The result is bounded again for the emitted record. A truncation
-/// in either the masking pass or the output pass appends `…` so the record
-/// declares its own incompleteness.
+/// survives regardless of secret length. Control (`Cc`), format (`Cf`), line
+/// separator (`Zl`), and paragraph separator (`Zp`) Unicode codepoints in the
+/// masked text are then escaped: a log line is plain text read by tooling
+/// outside this process, and an embedded line break or bidi/format override
+/// could forge or visually disguise part of the record. The result is bounded
+/// again for the emitted record. A truncation in either the masking pass or the
+/// output pass appends `…` so the record declares its own incompleteness.
 pub fn bounded_masked_log_text(text: &str) -> String {
     let mask_input_truncated = text.chars().nth(MAX_LOG_TEXT_MASK_INPUT_CHARS).is_some();
     let bounded_input: std::borrow::Cow<'_, str> = if mask_input_truncated {
@@ -431,7 +431,8 @@ fn redact_crossing_boundary_url_userinfo(text: &str) -> std::borrow::Cow<'_, str
     std::borrow::Cow::Borrowed(text)
 }
 
-/// `true` for a Unicode control (`Cc`) or format (`Cf`) codepoint, tab excepted.
+/// `true` for a Unicode control (`Cc`), format (`Cf`), line separator (`Zl`), or
+/// paragraph separator (`Zp`) codepoint, tab excepted.
 ///
 /// Classification is by Unicode general category rather than an ASCII byte range so that
 /// multi-byte control/format characters (bidi overrides, zero-width joiners, line/paragraph
@@ -446,6 +447,8 @@ fn is_log_unsafe_char(c: char) -> bool {
         unicode_general_category::get_general_category(c),
         unicode_general_category::GeneralCategory::Control
             | unicode_general_category::GeneralCategory::Format
+            | unicode_general_category::GeneralCategory::LineSeparator
+            | unicode_general_category::GeneralCategory::ParagraphSeparator
     )
 }
 
@@ -4070,7 +4073,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_masked_log_text_neutralizes_control_and_format_chars() {
+    fn bounded_masked_log_text_neutralizes_ascii_control_chars() {
         let raw = "line one\r\ninjected: \u{1b}[31mFAKE ALERT\u{1b}[0m line two";
         let rendered = bounded_masked_log_text(raw);
         assert!(
@@ -4088,12 +4091,31 @@ mod tests {
     }
 
     #[test]
-    fn bounded_masked_log_text_keeps_accented_and_cjk_text_unchanged() {
-        let raw = "café résumé 日本語のテキスト 数据库连接管理";
+    fn bounded_masked_log_text_neutralizes_each_unsafe_unicode_category() {
+        let cases = [
+            ("Cc", '\u{1b}', "\\u{001b}"),
+            ("Cf", '\u{202e}', "\\u{202e}"),
+            ("Zl", '\u{2028}', "\\u{2028}"),
+            ("Zp", '\u{2029}', "\\u{2029}"),
+        ];
+
+        for (category, unsafe_char, escaped) in cases {
+            let raw = format!("before{unsafe_char}after");
+            assert_eq!(
+                bounded_masked_log_text(&raw),
+                format!("before{escaped}after"),
+                "Unicode category {category} must be neutralized"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_masked_log_text_keeps_space_separators_tabs_accented_and_cjk_text() {
+        let raw = "ordinary whitespace\tcafé résumé 日本語のテキスト\u{3000}数据库连接管理";
         assert_eq!(
             bounded_masked_log_text(raw),
             raw,
-            "accented and CJK prose must pass through unmodified"
+            "ordinary whitespace, Zs separators, accented text, and CJK prose must pass through unmodified"
         );
     }
 
