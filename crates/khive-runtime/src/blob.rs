@@ -123,10 +123,20 @@ impl BlobHydrator {
     /// The mode is derived here from `governing_backend`'s own access mode,
     /// never accepted as a caller-declared flag, and the hydrator is stamped
     /// as governed. [`crate::KhiveRuntime::install_shared_blob_hydrator`]
-    /// accepts only governed hydrators: a caller wanting a writable shared
-    /// hydrator must actually hold a writable governing backend, which is
-    /// the sanctioned mixed-mode topology rather than a bypass of a
-    /// read-only handle's guarantee.
+    /// accepts only governed hydrators.
+    ///
+    /// Trust model (explicit policy): which backend governs blob mutability
+    /// is a deployment-topology assertion made by the host that wires boot
+    /// (the blob pack's backend, ADR-160 D3), and this seam takes the
+    /// caller's word for it. What the derivation defends against is the
+    /// ACCIDENTAL mode mismatch — a hand-paired writable hydrator drifting
+    /// onto a read-only handle through the shared seam. It does not defend
+    /// against an in-process caller who deliberately misdeclares the
+    /// governing backend, because no runtime seam can: any such caller can
+    /// already open the configured blob root directly (the same config and
+    /// store constructors are public) and mutate it without touching a
+    /// runtime handle. Read-only runtime handles are a wrong-wiring guard,
+    /// not an in-process sandbox.
     pub fn resolve_for_governing_backend(
         cfg: &KhiveConfig,
         resolve_backend: &StorageBackend,

@@ -3571,12 +3571,21 @@ async fn prepare_core_schema_for_boot(
 /// application-assisted V21 attachment cutover. Production host boot should use
 /// [`build_single_backend_runtime`], [`build_server`], or the async multi-backend
 /// builders instead. Calling this helper is sound only when `backend` is the
-/// runtime's backend and its attachment-cutover status is already `Complete`.
+/// runtime's backend and its attachment-cutover status is already `Complete`;
+/// the same-backend precondition is now enforced by identity rather than
+/// documented, since the resolved mode derives from `backend` and a mismatch
+/// would silently resolve the wrong store mode for the receiving runtime.
 pub fn install_resolved_blob_store(
     rt: &KhiveRuntime,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
 ) -> anyhow::Result<Option<Arc<BlobHydrator>>> {
+    if !std::ptr::eq(rt.backend(), backend) {
+        anyhow::bail!(
+            "install_resolved_blob_store requires the runtime's own backend: the supplied \
+             backend reference is not the runtime's"
+        );
+    }
     let hydrator = resolve_blob_hydrator_for_boot(rt.config(), khive_cfg, backend, backend)?;
     if let Some(hydrator) = hydrator.as_ref() {
         rt.install_blob_hydrator(Arc::clone(hydrator))?;

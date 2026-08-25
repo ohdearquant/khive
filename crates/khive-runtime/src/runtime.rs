@@ -1080,6 +1080,12 @@ impl KhiveRuntime {
     /// writable store on a read-only runtime; such callers use
     /// [`Self::install_blob_hydrator`], which holds hydrator mode against
     /// this runtime's own.
+    ///
+    /// This gate is a wrong-wiring guard, not an in-process sandbox: which
+    /// backend governs is the boot host's topology assertion, and a caller
+    /// who deliberately selects an unrelated writable backend as governing
+    /// is outside what any runtime seam can enforce (see the trust-model
+    /// note on [`crate::BlobHydrator::resolve_for_governing_backend`]).
     pub fn install_shared_blob_hydrator(
         &self,
         hydrator: Arc<crate::blob::BlobHydrator>,
