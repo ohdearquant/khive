@@ -63,7 +63,15 @@ use crate::daemon::{read_frame, write_frame};
 /// Bump whenever the request or response frame shape changes incompatibly.
 /// The server rejects frames whose version it does not speak, so a skewed
 /// client gets a typed refusal instead of a deserialization panic.
-pub const EVENTS_PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 is the first version any release ships: version 1 carried a
+/// `side_effects_unknown` error field that was replaced by the
+/// `writer_task_state` carrier before this module reached any released ref,
+/// so v1 speakers existed only on unreleased development heads. The bump
+/// exists so that even such a process gets the version refusal above rather
+/// than having its retryable writer states silently mapped to terminal
+/// `InvalidInput`.
+pub const EVENTS_PROTOCOL_VERSION: u32 = 2;
 
 /// Default bound on the fire-and-forget append queue, in batches. The loss
 /// window on overflow is this depth times the batch size in flight; the value
