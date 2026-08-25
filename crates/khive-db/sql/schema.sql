@@ -226,6 +226,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique_triple ON graph_edges(n
 CREATE INDEX IF NOT EXISTS idx_notes_namespace ON notes(namespace);
 CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(namespace, kind);
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
+-- Kept in sync with notes-ddl.sql (see the rationale there): partial
+-- unread-probe index whose WHERE clause byte-matches the inlined
+-- JsonTypeNeMissing predicate.
+CREATE INDEX IF NOT EXISTS idx_notes_unread_probe
+    ON notes(namespace, kind, created_at DESC)
+    WHERE (json_type(properties, '$.read') IS NULL
+           OR json_type(properties, '$.read') != 'true')
+      AND deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_events_namespace ON events(namespace);
 CREATE INDEX IF NOT EXISTS idx_events_verb ON events(verb);

@@ -694,6 +694,24 @@ fn json_type_expr(path: &str) -> String {
     format!("json_type(properties, '{path}')")
 }
 
+/// Validate a value destined for inline comparison against `json_type()`.
+/// The only admissible values are SQLite's own json_type result strings —
+/// a closed vocabulary — so a validated value can be inlined into SQL text
+/// without any injection surface. Anything else is a caller bug, rejected
+/// rather than parameterized.
+fn json_type_literal(value: &SqlValue) -> Result<&str, rusqlite::Error> {
+    const JSON_TYPES: [&str; 8] = [
+        "true", "false", "integer", "real", "text", "array", "object", "null",
+    ];
+    match value {
+        SqlValue::Text(s) if JSON_TYPES.contains(&s.as_str()) => Ok(s.as_str()),
+        other => Err(rusqlite::Error::InvalidParameterName(format!(
+            "json_type comparison value must be one of SQLite's json_type strings \
+             ({JSON_TYPES:?}), got {other:?}"
+        ))),
+    }
+}
+
 fn sql_value_param(value: &SqlValue) -> Result<Box<dyn rusqlite::types::ToSql>, rusqlite::Error> {
     Ok(match value {
         SqlValue::Null => Box::new(Option::<String>::None),
@@ -772,9 +790,19 @@ fn build_note_filter_where(
             }
             FilterOp::JsonTypeNeMissing => {
                 let type_expr = json_type_expr(&pf.json_path);
-                params.push(sql_value_param(&pf.value)?);
-                let n = params.len();
-                conditions.push(format!("({type_expr} IS NULL OR {type_expr} != ?{n})"));
+                // Inlined as a validated literal, NOT a parameter: the
+                // partial unread index (`idx_notes_unread_probe`) carries
+                // this exact predicate in its WHERE clause, and SQLite can
+                // only prove a query implies an index predicate when the
+                // compared value is known at plan time — a bound parameter
+                // defeats the index and the scan degrades to
+                // mailbox-proportional work. The value domain is SQLite's
+                // closed json_type vocabulary, so inlining is injection-safe
+                // by construction.
+                let literal = json_type_literal(&pf.value)?;
+                conditions.push(format!(
+                    "({type_expr} IS NULL OR {type_expr} != '{literal}')"
+                ));
             }
             FilterOp::In(values) => {
                 let expr = json_extract_expr(&pf.json_path);

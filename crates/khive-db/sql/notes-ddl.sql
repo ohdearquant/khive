@@ -24,6 +24,18 @@ CREATE INDEX IF NOT EXISTS idx_notes_namespace ON notes(namespace);
 CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(namespace, kind);
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
 
+-- Partial index for the unread-message probe (comm unread badge + inbox
+-- unread listing). Its WHERE clause is the exact predicate the
+-- JsonTypeNeMissing filter op generates (with the json_type value inlined
+-- as a literal -- a bound parameter cannot prove implication at plan time),
+-- so the planner serves unread scans from only the unread rows: work is
+-- proportional to min(unread, scan cap), never to total mailbox size.
+CREATE INDEX IF NOT EXISTS idx_notes_unread_probe
+    ON notes(namespace, kind, created_at DESC)
+    WHERE (json_type(properties, '$.read') IS NULL
+           OR json_type(properties, '$.read') != 'true')
+      AND deleted_at IS NULL;
+
 -- Durable, non-reusing sequence for notes (khive #827). Kept in sync with
 -- `sql/007-notes-seq.sql` (the versioned-migration copy) — see that file for
 -- the full rationale. Duplicated here, belt-and-suspenders style, because
