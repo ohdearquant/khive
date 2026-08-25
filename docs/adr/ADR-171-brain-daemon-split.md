@@ -176,8 +176,9 @@ analysis, not this ADR, decides the next slice.
   co-residency analysis)
 - ADR-104 (posterior serving: multiplier clamp, reprojection weight)
 - ADR-133 (durable audit batching — the events-lane producer)
-- `crates/khive-pack-brain/src/persist.rs` (state persistence, the three
-  tables)
-- `crates/khive-pack-brain/src/fold_gate.rs` (implicit-mass fold gate)
+- `crates/khive-pack-brain/src/persist.rs` (state persistence:
+  `brain_event_log`, `brain_profile_snapshots`)
+- `crates/khive-pack-brain/src/fold_gate.rs` (implicit-mass fold gate:
+  `brain_implicit_mass`, `brain_scorer_dedup`)
 - `crates/khive-pack-memory/src/handlers/recall.rs` (`load_brain_profile` —
   the verb-level coefficient seam)
