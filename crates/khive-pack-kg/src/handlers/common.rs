@@ -537,8 +537,10 @@ pub(crate) async fn enrich_bulk_atomic_allowlist_error(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     specs: &[khive_runtime::operations::LinkSpec],
+    entry_indices: &[usize],
 ) -> String {
-    for (idx, spec) in specs.iter().enumerate() {
+    for (pos, spec) in specs.iter().enumerate() {
+        let idx = entry_indices.get(pos).copied().unwrap_or(pos);
         let Ok(src) = runtime.get_entity(token, spec.source_id).await else {
             continue;
         };

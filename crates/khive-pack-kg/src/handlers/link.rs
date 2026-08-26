@@ -30,9 +30,13 @@ impl KgPack {
             let atomic = p.atomic.unwrap_or(true);
             if atomic {
                 let mut specs = Vec::with_capacity(attempted);
+                // Caller entry index per spec: duplicate-skips shift spec
+                // positions, so error attribution must map back to the
+                // caller's entry list.
+                let mut entry_indices = Vec::with_capacity(attempted);
                 let mut seen = std::collections::HashSet::new();
                 let mut skipped = 0usize;
-                for entry in entries {
+                for (idx, entry) in entries.into_iter().enumerate() {
                     let source =
                         resolve_uuid_unfiltered(&entry.source_id, &self.runtime, token).await?;
                     let target =
@@ -54,6 +58,7 @@ impl KgPack {
                     }
                     let weight = validate_weight(entry.weight)?;
                     let metadata = merge_entry_metadata(entry.metadata, entry.dependency_kind)?;
+                    entry_indices.push(idx);
                     specs.push(LinkSpec {
                         namespace: Some(token.namespace().as_str().to_owned()),
                         source_id: source,
@@ -71,9 +76,14 @@ impl KgPack {
                     Err(RuntimeError::InvalidInput(ref msg))
                         if msg.contains("not in the base endpoint allowlist") =>
                     {
-                        let enriched =
-                            enrich_bulk_atomic_allowlist_error(msg, &self.runtime, token, &specs)
-                                .await;
+                        let enriched = enrich_bulk_atomic_allowlist_error(
+                            msg,
+                            &self.runtime,
+                            token,
+                            &specs,
+                            &entry_indices,
+                        )
+                        .await;
                         return Err(RuntimeError::InvalidInput(enriched));
                     }
                     Err(e) => return Err(e),

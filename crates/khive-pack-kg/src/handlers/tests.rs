@@ -1032,9 +1032,16 @@ async fn bulk_link_errors_receive_endpoint_attribution_in_both_modes() {
     let registry = builder.build().expect("kg registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
 
-    // Entry 0 is legal, entry 1 is the allowlist rejection — proving the
-    // attribution names the offending entry, not just the first one.
+    // Entry 0 is legal, entry 1 is a duplicate of entry 0 (skipped by dedup,
+    // shifting spec positions off caller indices), entry 2 is the allowlist
+    // rejection — proving the attribution names the CALLER's entry index,
+    // not the post-dedup spec position.
     let links = json!([
+        {
+            "source_id": concept_a.id.to_string(),
+            "target_id": concept_b.id.to_string(),
+            "relation": "extends",
+        },
         {
             "source_id": concept_a.id.to_string(),
             "target_id": concept_b.id.to_string(),
@@ -1053,8 +1060,8 @@ async fn bulk_link_errors_receive_endpoint_attribution_in_both_modes() {
         .expect_err("atomic bulk with an illegal entry must be rejected")
         .to_string();
     assert!(
-        atomic_err.contains("entry 1:"),
-        "atomic error must name the offending entry index: {atomic_err}"
+        atomic_err.contains("entry 2:"),
+        "atomic error must name the caller's entry index across dedup skips: {atomic_err}"
     );
     assert!(
         atomic_err.contains(&format!("source {doc_short} resolved as document")),
@@ -1074,8 +1081,8 @@ async fn bulk_link_errors_receive_endpoint_attribution_in_both_modes() {
         .as_str()
         .expect("error string");
     assert_eq!(
-        non_atomic["errors"][0]["index"], 1,
-        "non-atomic error must keep the entry index"
+        non_atomic["errors"][0]["index"], 2,
+        "non-atomic error must keep the caller's entry index"
     );
     assert!(
         entry_err.contains(&format!("source {doc_short} resolved as document")),
