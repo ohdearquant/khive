@@ -340,7 +340,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Assertive: returns aggregate substrate counts (#280)
     HandlerDef {
         name: "stats",
-        description: "Return aggregate KG substrate counts (entities, edges, notes), plus an \
+        description: "Return aggregate KG substrate counts (entities, edges, notes). Counts cover \
+                      live rows across caller-visible namespaces; count_scope repeats this scope \
+                      in the response. Includes an \
                       edges_by_relation breakdown (relation name -> count) so full-graph audits \
                       know the true per-relation population before sampling.",
         visibility: Visibility::Verb,
@@ -351,7 +353,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     HandlerDef {
         name: "update",
         description: "Patch entity, note, or edge fields. Accepted fields depend on substrate: \
-                       entities accept name/description/properties/tags; notes accept \
+                       entities accept name/description/properties/tags/entity_type; notes accept \
                        name/content/salience/decay_factor/properties; edges accept relation/weight/properties.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
@@ -423,6 +425,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "array of string",
                 required: false,
                 description: "Replace tag list.",
+            },
+            ParamDef {
+                name: "entity_type",
+                param_type: "string",
+                required: false,
+                description: "Registered entity type to set (entities only). The value is validated against the entity kind's closed vocabulary and reindexed.",
             },
         ],
     },
@@ -577,6 +585,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "array",
                 required: false,
                 description: "Filter to records with any listed tag (kind=\"entity\" or kind=\"note\", OR semantics, case-insensitive). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level via EntityFilter; note tags: Rust-level in the alive-set loop). For notes, tags are read from `properties[\"tags\"]` (there is no separate tag column on notes). E.g. [\"rust\", \"ml\"]. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
+            },
+            ParamDef {
+                name: "source",
+                param_type: "string",
+                required: false,
+                description: "Filter by exact retrieval source: text | vector | both. Applied before the caller limit inside a bounded candidate window; both means the final hit received both text and vector contributions.",
             },
             ParamDef {
                 name: "min_score",
@@ -1035,6 +1049,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                       counters (present once a runtime audit-batch control is wired; \
                       unavailable with a reason otherwise), build identity, duplicate edge-ID \
                       and list-ledger counts, \
+                      graph_edges_rows across all namespaces including soft-deleted rows, and \
+                      graph_edges_seq_rows across the insertion ledger, whose rows survive hard deletion. \
+                      graph_edges_seq_minus_graph_edges and graph_edges_seq_relationship make the \
+                      expected non-negative ledger delta explicit; a negative delta is unexpected \
+                      unless the report also flags the pre-V14 duplicate-edge state, which is \
+                      classified as ledger_behind_pre_v14_duplicate_edge_state. \
                       ADR-091 checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
                       WAL-pin holder census. The \
@@ -1159,6 +1179,29 @@ mod tests {
             .iter()
             .find(|h| h.name == name)
             .unwrap_or_else(|| panic!("handler {name:?} not found in KG_HANDLERS"))
+    }
+
+    #[test]
+    fn count_verb_help_explains_edge_count_scopes_and_ledger_delta() {
+        let stats = find_handler("stats");
+        assert!(
+            stats.description.contains("caller-visible namespaces")
+                && stats.description.contains("live rows"),
+            "stats help must disclose its namespace and deletion scope"
+        );
+
+        let diagnostics = find_handler("db_diagnostics");
+        for required in [
+            "all namespaces",
+            "soft-deleted rows",
+            "hard deletion",
+            "graph_edges_seq_minus_graph_edges",
+        ] {
+            assert!(
+                diagnostics.description.contains(required),
+                "db_diagnostics help must explain {required:?}"
+            );
+        }
     }
 
     /// Regression for #899: `create.entity_kind`/`list.entity_kind` help text must list

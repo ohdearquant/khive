@@ -2413,6 +2413,7 @@ fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
     let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
         db_path: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
@@ -7798,6 +7799,62 @@ mod event_counts_tests {
         assert!(!truncated);
         assert_eq!(counts_by_verb.get("recall"), Some(&7));
         assert_eq!(counts_by_verb.get("search"), Some(&3));
+    }
+
+    /// The exhaustive walk pages with a strict `before` cursor; rows sharing
+    /// one `created_at` microsecond across a page edge must arrive exactly
+    /// once — neither dropped by the strict bound nor double-counted by the
+    /// boundary re-read.
+    #[tokio::test]
+    async fn exhaustive_fetch_survives_timestamp_ties_across_page_edges() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // A tie run wider than the page size, plus one older row below it.
+        for _ in 0..9 {
+            seed_event(
+                &rt,
+                &token,
+                "recall",
+                EventKind::RecallExecuted,
+                "lambda:a",
+                5_000_000,
+                json!({}),
+            )
+            .await;
+        }
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let store = rt.events(&token).expect("event store");
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let (items, window_event_total, truncated) =
+            crate::handlers::fetch_event_counts_window_exhaustive(
+                store.as_ref(),
+                &base_filter,
+                /* page_size = */ 4,
+                /* max_events = */ 20,
+            )
+            .await
+            .expect("tie-heavy exhaustive fetch must succeed");
+
+        assert_eq!(window_event_total, 10);
+        assert_eq!(items.len(), 10, "each tied row must arrive exactly once");
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            items.iter().map(|event| event.id).collect();
+        assert_eq!(distinct.len(), 10, "no row may be double-counted");
+        assert!(!truncated);
     }
 
     /// The public handler must still identify a successful exhaustive response

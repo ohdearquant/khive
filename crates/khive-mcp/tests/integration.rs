@@ -1889,6 +1889,13 @@ impl khive_types::Pack for ErrorInjectPack {
             category: VerbCategory::Assertive,
             params: &[],
         },
+        HandlerDef {
+            name: "storage_admission_timeout",
+            description: "returns a typed storage-admission timeout error",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
     ];
 }
 
@@ -1935,6 +1942,14 @@ impl PackRuntime for ErrorInjectPack {
         if verb == "writer_task_busy" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 },
+            ));
+        }
+        if verb == "storage_admission_timeout" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::AdmissionTimeout {
+                    operation: "sql_bridge.writer_handle".into(),
+                    timeout_ms: 30_000,
+                },
             ));
         }
         let err = KhiveError::unavailable("downstream service offline")
@@ -2146,6 +2161,43 @@ async fn writer_task_busy_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
             "retry_after_ms": serde_json::Value::Null,
         }),
         "BEGIN contention must remain distinguishable and safely retryable"
+    );
+
+    Ok(())
+}
+
+/// A bounded storage-admission wait (reader/writer handle slot or pooled
+/// reader checkout) that elapsed acquired nothing and started nothing, so it
+/// must cross the MCP boundary as a retryable `unavailable` — never as the
+/// caller's invalid input.
+#[tokio::test]
+async fn storage_admission_timeout_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "storage_admission_timeout()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "storage_admission_timeout",
+            "stage": "storage_admission_timeout",
+            "message": "storage: admission timeout during sql_bridge.writer_handle after 30000ms",
+            "retryable": true,
+            "timeout_ms": 30_000,
+            "capability": serde_json::Value::Null,
+            "operation": "sql_bridge.writer_handle",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
+        }),
+        "an admission deadline that expired before acquisition must stay a retryable resource failure on the wire"
     );
 
     Ok(())
@@ -4174,8 +4226,12 @@ fn actor_invalid_config_id_fails_at_load() {
     .unwrap();
 
     let err = KhiveConfig::load(Some(&path)).expect_err("invalid actor.id must fail at load");
+    let root = match &err {
+        ConfigError::InFile { source, .. } => source.as_ref(),
+        other => other,
+    };
     assert!(
-        matches!(err, ConfigError::InvalidActorId { .. }),
+        matches!(root, ConfigError::InvalidActorId { .. }),
         "expected ConfigError::InvalidActorId, got {err:?}"
     );
 }
@@ -4195,8 +4251,12 @@ fn actor_empty_string_id_fails_at_load() {
     .unwrap();
 
     let err = KhiveConfig::load(Some(&path)).expect_err("empty actor.id must fail at load");
+    let root = match &err {
+        ConfigError::InFile { source, .. } => source.as_ref(),
+        other => other,
+    };
     assert!(
-        matches!(err, ConfigError::InvalidActorId { .. }),
+        matches!(root, ConfigError::InvalidActorId { .. }),
         "expected ConfigError::InvalidActorId for empty string, got {err:?}"
     );
 }
