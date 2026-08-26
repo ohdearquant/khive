@@ -1979,6 +1979,49 @@ fn pid_can_name_incumbent(pid: u32, current_pid: u32, allow_same_process_incumbe
     allow_same_process_incumbent || pid != current_pid
 }
 
+/// Bounded timeout for the protocol-identity probe used by duplicate-daemon
+/// detection. Short enough that a hung or foreign listener does not stall
+/// startup; long enough for a live khived under normal load to answer a
+/// `probe_only` frame.
+#[cfg(unix)]
+const DUPLICATE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether the listener at `sock` actually speaks the khived wire protocol.
+///
+/// A live PID plus an accepting Unix socket is not proof of khived: any
+/// unrelated process that happens to have bound the same path also answers
+/// `connect()`. This sends a bounded `probe_only` frame (the same identity
+/// probe the client-side recovery path uses) and requires a well-formed
+/// [`DaemonResponseFrame`] back. Any frame that parses — even one reporting
+/// `version_mismatch` or `config_mismatch` — proves the peer speaks this
+/// protocol and is therefore a real khived instance that must not be treated
+/// as stale. A connect that succeeds but never answers, times out, or
+/// answers with non-protocol bytes is not khived and falls through to the
+/// stale-socket recovery path instead.
+#[cfg(unix)]
+async fn socket_speaks_khived_protocol(sock: &std::path::Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(sock).await else {
+        return false;
+    };
+    let probe = DaemonRequestFrame {
+        probe_only: true,
+        protocol_version: PROTOCOL_VERSION,
+        ..Default::default()
+    };
+    let Ok(payload) = serde_json::to_vec(&probe) else {
+        return false;
+    };
+    tokio::time::timeout(DUPLICATE_PROBE_TIMEOUT, async {
+        write_frame(&mut stream, &payload).await.ok()?;
+        let raw = read_frame(&mut stream).await.ok()?;
+        serde_json::from_slice::<DaemonResponseFrame>(&raw).ok()
+    })
+    .await
+    .ok()
+    .flatten()
+    .is_some()
+}
+
 /// Check whether `pid_file`/`sock` already name a live, responsive daemon and,
 /// if not, remove the stale rendezvous files so the caller may bind fresh.
 ///
@@ -1998,7 +2041,7 @@ async fn cleanup_stale_daemon(
             if pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
                 && is_process_running(pid)
                 && sock.exists()
-                && UnixStream::connect(sock).await.is_ok()
+                && socket_speaks_khived_protocol(sock).await
             {
                 return Some(pid);
             }
@@ -2058,7 +2101,7 @@ async fn pid_file_names_a_reachable_daemon(
     pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
         && is_process_running(pid)
         && sock.exists()
-        && UnixStream::connect(sock).await.is_ok()
+        && socket_speaks_khived_protocol(sock).await
 }
 
 #[cfg(unix)]
@@ -2988,6 +3031,74 @@ mod tests {
         let raw = read_frame(&mut client).await.expect("read response frame");
         handle.await.expect("handle_conn task panicked");
         serde_json::from_slice(&raw).expect("decode response frame")
+    }
+
+    /// #2230 review (Medium): duplicate-daemon detection must not treat any
+    /// accepting Unix listener as khived. A real khived (`handle_conn` behind
+    /// a bound socket) must still be recognized by the protocol probe.
+    #[tokio::test]
+    async fn socket_speaks_khived_protocol_accepts_a_real_khived() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = dir.path().join("real.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind real listener");
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "probe-test".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+            dispatch_err: None,
+        };
+        let accept_task = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                handle_conn(stream, dispatcher).await;
+            }
+        });
+
+        assert!(
+            socket_speaks_khived_protocol(&sock_path).await,
+            "a real khived answering the probe_only frame must be recognized"
+        );
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), accept_task).await;
+    }
+
+    /// #2230 review (Medium): a listener that accepts a connection but never
+    /// answers with a well-formed daemon response — e.g. an unrelated process
+    /// that happens to have bound the same socket path — must not be
+    /// classified as khived, and the probe must not hang past its own
+    /// bounded timeout.
+    #[tokio::test]
+    async fn socket_speaks_khived_protocol_rejects_a_non_protocol_listener() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = dir.path().join("fake.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind fake listener");
+        let held = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let held_for_task = held.clone();
+        let accept_task = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                // Accept but never write anything back — the connection stays
+                // open exactly like a foreign process that speaks a different
+                // (or no) protocol on this socket.
+                held_for_task.lock().await.push(stream);
+            }
+        });
+
+        let before = tokio::time::Instant::now();
+        let speaks = socket_speaks_khived_protocol(&sock_path).await;
+        let elapsed = before.elapsed();
+
+        assert!(
+            !speaks,
+            "a listener that accepts but never answers the probe frame must not be treated as khived"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the probe must be bounded by its own timeout, not hang indefinitely; took {elapsed:?}"
+        );
+
+        accept_task.abort();
+        let _ = accept_task.await;
+        drop(held);
     }
 
     #[tokio::test]

@@ -6,6 +6,8 @@
 //! before serving, so the serve path never hard-codes a transport enum.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -33,15 +35,26 @@ use crate::server::KhiveMcpServer;
 /// `None`, which cancels `root` and lets rmcp's normal graceful-close path
 /// tear the session down — the same clean-exit path that already releases
 /// pooled resources on a real disconnect.
+///
+/// Wire-idle is not session-idle: rmcp keeps racing `transport.receive()`
+/// while each admitted request runs in its own task, so a handler that
+/// outlasts `idle_timeout` (slow verb, large batch) must not have its
+/// session torn down out from under it. `in_flight` counts JSON-RPC
+/// `Request` messages this transport has handed to rmcp minus the
+/// `Response`/`Error` messages it has sent back for them; the idle branch
+/// only treats a quiet window as EOF when that count is zero, i.e. nothing
+/// admitted is still awaiting its response.
 pub(crate) struct CancelOnEofTransport<T> {
     inner: T,
     root: tokio_util::sync::CancellationToken,
     idle_timeout: Option<std::time::Duration>,
+    in_flight: Arc<AtomicI64>,
 }
 
 impl<T> CancelOnEofTransport<T> {
     /// `idle_timeout`: a `receive()` call that yields no message within this
-    /// window is treated as EOF (see the type doc). `None` disables it.
+    /// window is treated as EOF (see the type doc), but only when no
+    /// admitted request is still awaiting its response. `None` disables it.
     pub(crate) fn with_idle_timeout(
         inner: T,
         root: tokio_util::sync::CancellationToken,
@@ -51,6 +64,7 @@ impl<T> CancelOnEofTransport<T> {
             inner,
             root,
             idle_timeout,
+            in_flight: Arc::new(AtomicI64::new(0)),
         }
     }
 }
@@ -65,6 +79,12 @@ where
         &mut self,
         item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        if matches!(
+            item,
+            rmcp::model::JsonRpcMessage::Response(_) | rmcp::model::JsonRpcMessage::Error(_)
+        ) {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
         self.inner.send(item)
     }
 
@@ -72,30 +92,44 @@ where
         &mut self,
     ) -> impl std::future::Future<Output = Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>>>
            + Send {
-        let receive = self.inner.receive();
         let root = self.root.clone();
         let idle_timeout = self.idle_timeout;
+        let in_flight = self.in_flight.clone();
         async move {
-            let message = match idle_timeout {
-                Some(timeout) => {
-                    tokio::select! {
-                        message = receive => message,
-                        () = tokio::time::sleep(timeout) => {
-                            tracing::info!(
-                                idle_timeout_secs = timeout.as_secs(),
-                                "stdio bridge idle timeout elapsed with no request; \
-                                 closing this session to release its pooled resources"
-                            );
-                            None
+            loop {
+                let message = match idle_timeout {
+                    Some(timeout) => {
+                        tokio::select! {
+                            message = self.inner.receive() => message,
+                            () = tokio::time::sleep(timeout) => {
+                                if in_flight.load(Ordering::Acquire) > 0 {
+                                    tracing::debug!(
+                                        idle_timeout_secs = timeout.as_secs(),
+                                        "stdio bridge idle timeout elapsed but an admitted \
+                                         request is still awaiting its response; deferring \
+                                         session close"
+                                    );
+                                    continue;
+                                }
+                                tracing::info!(
+                                    idle_timeout_secs = timeout.as_secs(),
+                                    "stdio bridge idle timeout elapsed with no request; \
+                                     closing this session to release its pooled resources"
+                                );
+                                None
+                            }
                         }
                     }
+                    None => self.inner.receive().await,
+                };
+                if let Some(rmcp::model::JsonRpcMessage::Request(_)) = &message {
+                    in_flight.fetch_add(1, Ordering::AcqRel);
                 }
-                None => receive.await,
-            };
-            if message.is_none() {
-                root.cancel();
+                if message.is_none() {
+                    root.cancel();
+                }
+                return message;
             }
-            message
         }
     }
 

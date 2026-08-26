@@ -7417,6 +7417,23 @@ mod request_read_cancellation_tests {
         drop(client_io);
     }
 
+    /// Completes every `tools/call` immediately — unlike [`EofProbeServer`],
+    /// which blocks its handler on cancellation. Used where a test needs
+    /// requests to actually finish (dropping the transport's in-flight
+    /// count back to zero) rather than staying admitted forever.
+    #[derive(Clone)]
+    struct QuickProbeServer;
+
+    impl rmcp::ServerHandler for QuickProbeServer {
+        async fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResult, McpError> {
+            Ok(rmcp::model::CallToolResult::success(Vec::new()))
+        }
+    }
+
     /// #1921 acceptance: a live client with traffic inside every idle window
     /// must never be reaped, even once total elapsed time exceeds the
     /// timeout many times over.
@@ -7425,21 +7442,17 @@ mod request_read_cancellation_tests {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use tokio::io::AsyncWriteExt;
 
-        let started = Arc::new(tokio::sync::Notify::new());
-        let cancelled = Arc::new(tokio::sync::Notify::new());
-        let probe = EofProbeServer {
-            started: started.clone(),
-            cancelled: cancelled.clone(),
-        };
+        let probe = QuickProbeServer;
         let root = tokio_util::sync::CancellationToken::new();
         let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
         let (read, write) = tokio::io::split(server_io);
+        let idle_timeout = Duration::from_millis(150);
         let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(read, write),
             root.clone(),
-            Some(Duration::from_millis(150)),
+            Some(idle_timeout),
         );
-        let _running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
         // Five requests spaced well inside the 150ms idle window, totaling
         // ~200ms — more than the timeout itself, but never a single gap that
@@ -7462,7 +7475,111 @@ mod request_read_cancellation_tests {
             !root.is_cancelled(),
             "intermittent traffic inside every idle window must never trip the idle timeout"
         );
+
+        // Real oracle (#2230 review, Low): prove the timeout is actually
+        // armed on this exact transport/config rather than merely assumed.
+        // If the mechanism were silently disabled or ignored, `root` would
+        // never be cancelled here and this test would time out instead of
+        // passing — a stronger guard than the traffic-keeps-it-alive
+        // assertion above, which a disabled timeout would also satisfy.
+        tokio::time::timeout(idle_timeout * 6, running.waiting())
+            .await
+            .expect(
+                "idle timeout never fired once traffic stopped — the timeout \
+                 mechanism is not armed",
+            )
+            .expect("rmcp service task panicked");
+        assert!(
+            root.is_cancelled(),
+            "idle timeout must fire once traffic genuinely stops, proving it \
+             is armed for this test"
+        );
         drop(client_io);
+    }
+
+    #[derive(Clone)]
+    struct SlowProbeServer {
+        started: Arc<tokio::sync::Notify>,
+        delay: Duration,
+    }
+
+    impl rmcp::ServerHandler for SlowProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let started = self.started.clone();
+            let delay = self.delay;
+            async move {
+                started.notify_one();
+                tokio::time::sleep(delay).await;
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// High-severity regression (#2230 review): rmcp keeps racing
+    /// `transport.receive()` while an admitted request runs in its own task,
+    /// so a handler that outlives the idle window must still complete and
+    /// return its response rather than being cancelled by the next
+    /// `receive()` timing out.
+    #[tokio::test]
+    async fn stdio_idle_timeout_does_not_cancel_an_admitted_long_running_request() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler_delay = Duration::from_millis(300);
+        let idle_timeout = Duration::from_millis(50);
+        let probe = SlowProbeServer {
+            started: started.clone(),
+            delay: handler_delay,
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            Some(idle_timeout),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (mut client_read, mut client_write) = tokio::io::split(client_io);
+
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write one real JSON-RPC tool request");
+
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("rmcp never admitted the request handler");
+
+        // The handler keeps running well past several idle windows while the
+        // wire itself sends nothing further — this must not be reaped.
+        tokio::time::sleep(idle_timeout * 4).await;
+        assert!(
+            !root.is_cancelled(),
+            "an admitted in-flight request must not be cancelled by the wire-idle timeout"
+        );
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), client_read.read(&mut buf))
+            .await
+            .expect("the long-running handler never produced its response")
+            .expect("read error on the client side of the duplex pipe");
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("\"id\":1"),
+            "expected a JSON-RPC response for request id=1, got: {response}"
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
     }
 
     #[tokio::test]
