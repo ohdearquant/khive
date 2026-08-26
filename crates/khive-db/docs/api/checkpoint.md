@@ -127,9 +127,30 @@ below→above crossing (same debounce idiom as the WAL-pressure ladder — a
 sustained stale span logs once per rung, not once per tick), also re-arming
 both rungs if the oldest entry's identity changes between ticks so a
 departed span's latched state cannot suppress its replacement. This is
-visibility, not reclamation: nothing here force-closes a stale span,
-matching the ADR's own accepted gap for a transaction "held idle across an
-await with no further calls."
+visibility, not reclamation: nothing in `TxAgeSweepState` force-closes a
+stale span, matching the ADR's own accepted gap for a transaction "held idle
+across an await with no further calls."
+
+**The cooperative stale-op guard does exist for one span shape (#1846).**
+`sql_bridge.rs`'s cached-reader explicit read transaction (the `BEGIN
+DEFERRED`-then-reuse path used by multi-call GQL/SPARQL cursors and any
+caller-issued `BEGIN`) reads `PoolConfig::read_tx_max_age` — the same
+`KHIVE_TX_MAX_AGE_SECS` value this sweep uses — on every reuse of the handle.
+Once the admitted transaction's age reaches that bound, the next call is
+refused, the transaction is rolled back, and the connection is returned to
+the pool ready for a fresh snapshot; the refusal is `StorageError::Transaction`
+(`is_retryable() == true`) and is counted in
+`checkpoint::read_tx_max_age_evictions()` (surfaced as
+`checkpoint_counters.read_tx_max_age_evictions` in `db_diagnostics`). This
+bounds how long a periodically-reused reader (a long-lived MCP session that
+keeps calling in) can keep extending its pin, closing the #1812/#1876 gap for
+that case. It does **not** cover a transaction abandoned mid-flight with no
+further calls at all: `rusqlite::Connection` is thread-owned and not `Sync`,
+and a genuinely idle connection has no in-flight statement for
+`sqlite3_interrupt` to act on, so reaching *that* connection from outside
+would need a live, forcibly-interruptible handle registry the pool does not
+keep today. That remains open design work, not something this change
+attempts.
 
 ## Metrics read-surface (load/perf harness)
 

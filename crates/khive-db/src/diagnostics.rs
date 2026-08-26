@@ -134,6 +134,10 @@ pub struct CheckpointCounters {
     pub checkpoint_lifecycle_append_attempts: u64,
     pub checkpoint_lifecycle_append_failures: u64,
     pub checkpoint_lifecycle_enqueue_drops: u64,
+    /// Cached-reader read transactions rolled back on reuse for exceeding
+    /// `read_tx_max_age` (#1846) — the count of WAL snapshots actually
+    /// released by that bound, not merely logged as stale.
+    pub read_tx_max_age_evictions: u64,
 }
 
 /// Snapshot the process-global ADR-091 counters.
@@ -152,6 +156,7 @@ pub fn checkpoint_counters() -> CheckpointCounters {
         checkpoint_lifecycle_append_attempts: checkpoint::checkpoint_lifecycle_append_attempts(),
         checkpoint_lifecycle_append_failures: checkpoint::checkpoint_lifecycle_append_failures(),
         checkpoint_lifecycle_enqueue_drops: checkpoint::checkpoint_lifecycle_enqueue_drops(),
+        read_tx_max_age_evictions: checkpoint::read_tx_max_age_evictions(),
     }
 }
 
@@ -1296,6 +1301,7 @@ mod tests {
             "checkpoint_lifecycle_append_attempts",
             "checkpoint_lifecycle_append_failures",
             "checkpoint_lifecycle_enqueue_drops",
+            "read_tx_max_age_evictions",
         ] {
             assert!(counters.get(key).is_some(), "counter {key} must be present");
         }
@@ -1430,6 +1436,7 @@ mod tests {
             checkpoint_lifecycle_append_attempts: 0,
             checkpoint_lifecycle_append_failures: 0,
             checkpoint_lifecycle_enqueue_drops: 0,
+            read_tx_max_age_evictions: 0,
         };
         let json = serde_json::to_value(counters).expect("serializes");
         assert!(json["last_observed_wal_pages"].is_null());
