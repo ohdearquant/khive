@@ -998,6 +998,21 @@ button.repo-list-row:hover,
   position: absolute;
   text-align: left;
 }
+/* Activity coloring (field-level join available): intensity 0..1 scales a
+   warm tone over the neutral surface; modules without the join keep the
+   package tone above. */
+.repo-treemap-module[data-activity-colored] {
+  background: color-mix(
+    in srgb,
+    var(--khive-color-warning) calc(8% + var(--treemap-activity, 0) * 58%),
+    var(--khive-color-surface-overlay)
+  );
+  border-color: color-mix(
+    in srgb,
+    var(--khive-color-warning) calc(20% + var(--treemap-activity, 0) * 56%),
+    var(--khive-color-border)
+  );
+}
 .repo-treemap-module:hover,
 .repo-treemap-module[aria-pressed="true"] {
   background: color-mix(in srgb, var(--repo-treemap-tone) 28%, var(--khive-color-surface-overlay));

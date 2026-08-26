@@ -21,6 +21,9 @@ export type StructureTreemapModule = Readonly<{
   leafLabel: string;
   parentLabel: string;
   recentActivity: number | null;
+  /** Recent activity normalized to [0, 1] against the layout's maximum, or
+   * null when the activity join is unavailable for this module. */
+  activityIntensity: number | null;
   sourceFileCount: number;
   weight: number;
   rect: TreemapRect;
@@ -44,7 +47,10 @@ export type StructureTreemapPackage = Readonly<{
 }>;
 
 export type StructureTreemapLayout = Readonly<{
-  areaMetric: "recent_activity" | "recent_activity_with_source_file_fallback";
+  areaMetric: "source_file_count";
+  /** Whether recent-activity color intensities are available on every
+   * module, only some, or none (the structure-only treemap still renders). */
+  activityColoring: "full" | "partial" | "unavailable";
   packages: readonly StructureTreemapPackage[];
 }>;
 
@@ -55,6 +61,16 @@ type Weighted<T> = Readonly<{
 }>;
 
 const UNIT_RECT: TreemapRect = { x: 0, y: 0, width: 1, height: 1 };
+// Overlay labels sit at the top of each package section and directory tile;
+// laying children into a top-inset body rectangle keeps the first tiles from
+// being covered by those labels.
+const PACKAGE_BODY_RECT: TreemapRect = { x: 0, y: 0.1, width: 1, height: 0.9 };
+const DIRECTORY_BODY_RECT: TreemapRect = {
+  x: 0,
+  y: 0.16,
+  width: 1,
+  height: 0.84,
+};
 const PACKAGE_TONE_COUNT = 9;
 
 function compareText(left: string, right: string): number {
@@ -127,8 +143,12 @@ function leafLabel(modulePath: string): string {
   return segments.at(-1) || modulePath;
 }
 
+// Area is structural: contained source-file count from the manifest tier.
+// Recent activity never sizes tiles; it is exposed as a normalized color
+// intensity instead. A zero-file module keeps a one-unit minimum area so it
+// remains a visible, clickable hit target (deliberate minimum-area policy).
 function moduleWeight(input: StructureTreemapInput): number {
-  const measure = input.recentActivity ?? input.sourceFileCount;
+  const measure = input.sourceFileCount;
   return Math.max(1, Number.isFinite(measure) ? measure : 1);
 }
 
@@ -168,10 +188,22 @@ export function buildStructureTreemap(
     value: entry,
   })));
 
+  const activityValues = input
+    .map((row) => row.recentActivity)
+    .filter((value): value is number => value !== null);
+  const maxActivity = activityValues.reduce(
+    (max, value) => Math.max(max, value),
+    0,
+  );
+  const activityColoring = activityValues.length === 0
+    ? "unavailable" as const
+    : activityValues.length === input.length
+      ? "full" as const
+      : "partial" as const;
+
   return {
-    areaMetric: input.every((row) => row.recentActivity !== null)
-      ? "recent_activity"
-      : "recent_activity_with_source_file_fallback",
+    areaMetric: "source_file_count",
+    activityColoring,
     packages: packageRects.map(({ value: packageEntry, rect: packageRect }) => {
       const directoryInputs = new Map<string, StructureTreemapInput[]>();
       for (const row of packageEntry.rows) {
@@ -188,11 +220,14 @@ export function buildStructureTreemap(
           weight: rows.reduce((total, row) => total + moduleWeight(row), 0),
         }))
         .sort((left, right) => compareText(left.label, right.label));
-      const directoryRects = layoutWeighted(directories.map((entry) => ({
-        key: entry.id,
-        weight: entry.weight,
-        value: entry,
-      })));
+      const directoryRects = layoutWeighted(
+        directories.map((entry) => ({
+          key: entry.id,
+          weight: entry.weight,
+          value: entry,
+        })),
+        PACKAGE_BODY_RECT,
+      );
 
       return {
         id: packageEntry.id,
@@ -208,11 +243,14 @@ export function buildStructureTreemap(
             compareText(left.sourcePath, right.sourcePath) ||
             compareText(left.moduleId, right.moduleId)
           );
-          const moduleRects = layoutWeighted(modules.map((row) => ({
-            key: row.moduleId,
-            weight: moduleWeight(row),
-            value: row,
-          })));
+          const moduleRects = layoutWeighted(
+            modules.map((row) => ({
+              key: row.moduleId,
+              weight: moduleWeight(row),
+              value: row,
+            })),
+            DIRECTORY_BODY_RECT,
+          );
           return {
             id: directory.id,
             label: directory.label,
@@ -224,6 +262,11 @@ export function buildStructureTreemap(
               leafLabel: leafLabel(row.modulePath),
               parentLabel: `${packageEntry.label} · ${directory.label}`,
               recentActivity: row.recentActivity,
+              activityIntensity: row.recentActivity === null
+                ? null
+                : maxActivity > 0
+                  ? row.recentActivity / maxActivity
+                  : 0,
               sourceFileCount: row.sourceFileCount,
               weight,
               rect,

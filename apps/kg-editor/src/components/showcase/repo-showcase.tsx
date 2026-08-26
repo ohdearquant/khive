@@ -1207,10 +1207,14 @@ function TreemapView({ bundle, moduleById, selectedModuleId, onInspectModule }: 
   return (
     <div className="repo-view-body">
       <div className="repo-legend">
-        <span><i className="green" />Area: {labels.metrics.recent_activity}</span>
-        <span><i className="violet" />Color: {labels.node_types.package}</span>
-        {layout.areaMetric === "recent_activity_with_source_file_fallback" && (
-          <span>{labels.metrics.source_files} provide unavailable-activity fallback area.</span>
+        <span><i className="green" />Area: {labels.metrics.source_files}</span>
+        <span><i className="violet" />
+          Color: {layout.activityColoring === "unavailable"
+            ? labels.node_types.package
+            : labels.metrics.recent_activity}
+        </span>
+        {layout.activityColoring === "partial" && (
+          <span>Modules without recent-activity data keep the package tone.</span>
         )}
       </div>
       <div
@@ -1272,12 +1276,18 @@ function TreemapView({ bundle, moduleById, selectedModuleId, onInspectModule }: 
                       className="repo-treemap-module"
                       data-module-id={moduleLayout.moduleId}
                       data-treemap-weight={moduleLayout.weight}
+                      data-activity-colored={moduleLayout.activityIntensity !== null || undefined}
                       key={moduleLayout.moduleId}
-                      style={treemapRectStyle(moduleLayout.rect)}
+                      style={{
+                        ...treemapRectStyle(moduleLayout.rect),
+                        ...(moduleLayout.activityIntensity !== null
+                          ? { "--treemap-activity": String(moduleLayout.activityIntensity) }
+                          : {}),
+                      } as CSSProperties}
                       aria-label={`Inspect ${moduleNode.source_path}`}
                       aria-controls="repository-module-inspector"
                       aria-pressed={selectedModuleId === moduleLayout.moduleId}
-                      title={`${moduleNode.source_path} · ${labels.metrics.recent_activity}: ${activity}`}
+                      title={`${moduleNode.source_path} · ${labels.metrics.source_files}: ${formatNumber(moduleLayout.sourceFileCount)} · ${labels.metrics.recent_activity}: ${activity}`}
                       onClick={() => onInspectModule(moduleLayout.moduleId)}
                     >
                       <strong>{moduleLayout.leafLabel}</strong>

@@ -16,7 +16,7 @@ function golden(): RepoBundle {
   return parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
 }
 
-it("renders a nested activity-area treemap with disambiguated leaf labels", async () => {
+it("renders a nested structure-area treemap with disambiguated leaf labels", async () => {
   const bundle = golden();
   const user = userEvent.setup();
   const { container } = render(<RepoShowcase bundle={bundle} />);
@@ -28,7 +28,7 @@ it("renders a nested activity-area treemap with disambiguated leaf labels", asyn
   const treemap = container.querySelector<HTMLElement>(
     "[data-structure-treemap]",
   )!;
-  expect(treemap).toHaveAttribute("data-area-metric", "recent_activity");
+  expect(treemap).toHaveAttribute("data-area-metric", "source_file_count");
   expect(treemap.querySelectorAll("[data-treemap-package]").length)
     .toBeGreaterThan(1);
   expect(treemap.querySelectorAll("[data-treemap-directory]").length)

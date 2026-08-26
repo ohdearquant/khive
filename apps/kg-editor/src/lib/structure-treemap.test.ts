@@ -12,7 +12,7 @@ const input: StructureTreemapInput[] = [
     packageLabel: "alpha",
     modulePath: "pack",
     sourcePath: "crates/alpha/src/pack.rs",
-    sourceFileCount: 1,
+    sourceFileCount: 4,
     recentActivity: 9,
   },
   {
@@ -21,7 +21,7 @@ const input: StructureTreemapInput[] = [
     packageLabel: "beta",
     modulePath: "pack",
     sourcePath: "crates/beta/src/pack.rs",
-    sourceFileCount: 1,
+    sourceFileCount: 2,
     recentActivity: 3,
   },
   {
@@ -67,10 +67,11 @@ function globalModuleArea(
 }
 
 describe("structure treemap layout", () => {
-  it("nests modules by package and directory with activity-proportional area", () => {
+  it("nests modules by package and directory sized by source-file count", () => {
     const layout = buildStructureTreemap(input);
 
-    expect(layout.areaMetric).toBe("recent_activity");
+    expect(layout.areaMetric).toBe("source_file_count");
+    expect(layout.activityColoring).toBe("full");
     expect(layout.packages.map((entry) => entry.label)).toEqual([
       "alpha",
       "beta",
@@ -79,10 +80,68 @@ describe("structure treemap layout", () => {
       "src",
       "tests",
     ]);
-    expect(globalModuleArea(layout, "module-alpha-pack")).toBeCloseTo(9 / 14, 8);
-    expect(globalModuleArea(layout, "module-beta-pack")).toBeCloseTo(3 / 14, 8);
-    expect(globalModuleArea(layout, "module-alpha-integration")).toBeCloseTo(1 / 14, 8);
-    expect(globalModuleArea(layout, "module-alpha-smoke")).toBeCloseTo(1 / 14, 8);
+    // Package share x directory share within the 0.9-high package body x
+    // module share within the 0.84-high directory body (top space is
+    // reserved for the overlay labels).
+    expect(globalModuleArea(layout, "module-alpha-pack"))
+      .toBeCloseTo((6 / 8) * 0.9 * (4 / 6) * 0.84, 8);
+    expect(globalModuleArea(layout, "module-beta-pack"))
+      .toBeCloseTo((2 / 8) * 0.9 * 0.84, 8);
+    expect(globalModuleArea(layout, "module-alpha-integration"))
+      .toBeCloseTo((6 / 8) * 0.9 * (2 / 6) * 0.84 * 0.5, 8);
+    expect(globalModuleArea(layout, "module-alpha-smoke"))
+      .toBeCloseTo((6 / 8) * 0.9 * (2 / 6) * 0.84 * 0.5, 8);
+  });
+
+  it("normalizes activity into color intensity and never into area", () => {
+    const layout = buildStructureTreemap(input);
+    const byId = new Map(
+      layout.packages.flatMap((packageLayout) =>
+        packageLayout.directories.flatMap((directory) =>
+          directory.modules.map((module) => [module.moduleId, module] as const)
+        )
+      ),
+    );
+
+    expect(byId.get("module-alpha-pack")?.activityIntensity).toBeCloseTo(1, 8);
+    expect(byId.get("module-beta-pack")?.activityIntensity).toBeCloseTo(3 / 9, 8);
+    expect(byId.get("module-alpha-integration")?.activityIntensity)
+      .toBeCloseTo(1 / 9, 8);
+  });
+
+  it("keeps zero-file and activity-unavailable modules visible without inventing area", () => {
+    const rows: StructureTreemapInput[] = [
+      {
+        moduleId: "module-zero",
+        packageId: "package-solo",
+        packageLabel: "solo",
+        modulePath: "zero",
+        sourcePath: "crates/solo/src/zero.rs",
+        sourceFileCount: 0,
+        recentActivity: null,
+      },
+      {
+        moduleId: "module-one",
+        packageId: "package-solo",
+        packageLabel: "solo",
+        modulePath: "one",
+        sourcePath: "crates/solo/src/one.rs",
+        sourceFileCount: 3,
+        recentActivity: 5,
+      },
+    ];
+    const layout = buildStructureTreemap(rows);
+
+    expect(layout.activityColoring).toBe("partial");
+    const modules = layout.packages[0]!.directories[0]!.modules;
+    const zero = modules.find((module) => module.moduleId === "module-zero")!;
+    const one = modules.find((module) => module.moduleId === "module-one")!;
+    // Deliberate minimum-area policy: a zero-file module keeps one weight
+    // unit as a clickable hit target.
+    expect(zero.weight).toBe(1);
+    expect(one.weight).toBe(3);
+    expect(zero.activityIntensity).toBeNull();
+    expect(one.activityIntensity).toBeCloseTo(1, 8);
   });
 
   it("adds package and directory context to duplicate leaf labels", () => {
