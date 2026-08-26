@@ -671,15 +671,30 @@ conclude no typed conflict is produced.
 
 ### Scope
 
-This change covers these six production-graph sites:
+This change covers these eight production-graph sites:
 
 1. Runtime entity curation (`crates/khive-runtime/src/curation.rs:853-928`).
 2. Runtime non-symmetric edge curation (`crates/khive-runtime/src/operations.rs:5662-5816`).
-3. Atomic entity plans (`crates/khive-runtime/src/atomic_prepare.rs:804-892`).
-4. Atomic non-symmetric edge plans (`crates/khive-runtime/src/atomic_prepare.rs:863-1050`).
-5. `comm.heartbeat` channel-health persistence (`crates/khive-pack-comm/src/handlers.rs:2321-2411`;
+3. Runtime symmetric edge curation (`crates/khive-runtime/src/operations.rs:5559-5639,5747-5771`),
+   which replaces both directed rows in place.
+4. Atomic entity plans (`crates/khive-runtime/src/atomic_prepare.rs:804-892`).
+5. Atomic non-symmetric edge plans (`crates/khive-runtime/src/atomic_prepare.rs:863-1050`).
+6. Atomic symmetric edge plans (`crates/khive-runtime/src/atomic_prepare.rs:1000-1040`).
+7. `comm.heartbeat` channel-health persistence (`crates/khive-pack-comm/src/handlers.rs:2321-2411`;
    dispatch at `crates/khive-pack-comm/src/pack.rs:291-292`).
-6. Normal scheduled-event finalization (`crates/khive-mcp/src/pending_events.rs:1113-1128,2149-2213`).
+8. Scheduled-event finalization (`crates/khive-mcp/src/pending_events.rs:1113-1128,2149-2213`),
+   covering every finalization branch rather than the normal dispatch path alone.
+
+Sites 3 and 6 are the symmetric edge paths. They are in scope because they replace rows through the
+same unguarded full-row statement (`crates/khive-db/src/stores/graph.rs:303-306`, whose `WHERE`
+clause pins only namespace and id) as the non-symmetric paths. Excluding them would leave the
+contract stated here true of one edge path and false of the other, which is not a contract.
+
+Site 8 covers all six finalization branches, not only the normal one. The pre-action, error, missed
+and non-action branches finalize on claim identity alone; the guard stated here binds the serialized
+properties snapshot as well, because a claim token is an ownership fence and not a content fence, so
+a property writer landing between claim and finalization is otherwise overwritten while the
+finalizer reports success.
 
 The 19 code-map sites in `khive-pack-code` are not covered by this amendment. They are tracked
 separately in public issue #2231.
