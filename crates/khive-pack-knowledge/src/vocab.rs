@@ -232,7 +232,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.search",
-        description: "TF-IDF ranked search over the atom teaching corpus ONLY — knowledge graph entities and notes are a disjoint corpus and are never returned here; use the kg pack's `search` verb for those. Embedding rerank applies by default when an embedder is configured. Draft and deprecated atoms are excluded by default; pass include_drafts=true to include drafts (deprecated remain excluded). Scores are squash-normalized to [0,1); absolute score is not a presence signal — use result rank for presence/coverage checks. Atom results include `body_lines`, the aggregate line count of their stored sections (0 for a sectionless atom); domain results and deadline-degraded rows report null.",
+        description: "TF-IDF ranked search over the atom teaching corpus ONLY — knowledge graph entities and notes are a disjoint corpus and are never returned here; use the kg pack's `search` verb for those. Embedding rerank applies by default when an embedder is configured. Draft and deprecated atoms are excluded by default; pass include_drafts=true to include drafts (deprecated remain excluded). Scores are squash-normalized to [0,1); absolute score is not a presence signal — use result rank for presence/coverage checks. Atom results include `body_lines`, the aggregate line count of their stored sections (str::lines() semantics: a terminal newline adds no line, blank interior lines count; 0 for a sectionless atom); domain results and deadline-degraded rows report null, the latter alongside a `degraded` flag.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

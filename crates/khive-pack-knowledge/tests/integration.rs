@@ -2304,6 +2304,12 @@ async fn search_body_lines_distinguishes_filled_atom_from_stub() {
                     "name": "Body Lines Stub",
                     "content": "coveragebodysignal stub description covering concepts techniques algorithms implementations applications use cases design patterns retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline",
                     "finalized": true
+                },
+                {
+                    "slug": "body-lines-newline",
+                    "name": "Body Lines Newline",
+                    "content": "coveragebodysignal newline convention atom covering terminal newline and blank interior line counting for the aggregate body size signal across stored sections in search results",
+                    "finalized": true
                 }
             ]
         }),
@@ -2329,6 +2335,21 @@ async fn search_body_lines_distinguishes_filled_atom_from_stub() {
     )
     .await
     .expect("add filled atom sections");
+
+    f.dispatch(
+        "knowledge.edit",
+        json!({
+            "id": "body-lines-newline",
+            "sections": [
+                {
+                    "section_type": "overview",
+                    "content": "First convention line before a deliberately blank interior line in this section.\n\nThird visible line ends the section with a terminal newline that must not count.\n"
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("add newline-convention atom section");
 
     let response = f
         .dispatch(
@@ -2356,6 +2377,17 @@ async fn search_body_lines_distinguishes_filled_atom_from_stub() {
         stub["body_lines"].as_u64(),
         Some(0),
         "sectionless atom must expose a zero body line count: {stub}"
+    );
+
+    let newline = results
+        .iter()
+        .find(|result| result["slug"] == "body-lines-newline")
+        .expect("newline-convention atom result");
+    assert_eq!(
+        newline["body_lines"].as_u64(),
+        Some(3),
+        "str::lines() convention: a terminal newline adds no line and a blank \
+         interior line counts (line, blank, line = 3): {newline}"
     );
 }
 
