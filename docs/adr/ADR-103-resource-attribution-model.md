@@ -126,8 +126,11 @@ A fifth value requires an ADR amendment, matching how the existing closed taxono
 
 ### (b) A `cost` sub-schema as payload enrichment of the existing audit row — no new row
 
-Every dispatch already produces one `EventKind::Audit` row. This design adds a `resource`
-object to that row's existing JSON `payload`, with no new row and no migration:
+Every dispatch already produces one `EventKind::Audit` row. (Amendment 3 narrows this for one
+bounded case — transient audit-lane admission pressure on a fixed, named set of read verbs — where
+the row may be dropped best-effort instead of committing; see that amendment for the exact scope.)
+This design adds a `resource` object to that row's existing JSON `payload`, with no new row and no
+migration:
 
 ```jsonc
 // events.payload for the existing per-dispatch EventKind::Audit row, gains:
@@ -601,18 +604,25 @@ Adding fields is non-breaking" (`crates/khive-gate/src/audit.rs:10-11`). `resour
 `cost_unit` within it, is exactly this kind of additive field: no schema migration, no
 change to any existing field's meaning.
 
-**Absence has exactly two meanings.** An audit row with no `resource.cost_unit` field is
-one of:
+**Absence has exactly three meanings** (the third added by Amendment 3). An audit row with no
+`resource.cost_unit` field is one of:
 
 1. A pre-amendment event, written before a producer emitted this field.
 2. A dispatch that errored. The deferred audit path persists an `Error`-outcome row
    (`crates/khive-runtime/src/pack.rs:1260-1274`) with no successful handler `Value` to
    read `item_count` from, so `resource.cost_unit` is omitted rather than computed for
    any failed or incomplete dispatch.
+3. A successful dispatch of one of Amendment 3's named read verbs whose audit row was dropped
+   best-effort under transient audit-lane admission pressure. Unlike (1) and (2), the caller
+   received a successful result — see Amendment 3 for the exact scope and the counters that make
+   this case distinguishable from the other two.
 
 Because this amendment keeps Decision (b)'s every-dispatch scope, there is no third
 "verb not yet covered" case: every dispatch that resolves `Ok` gets a `resource.cost_unit`
-value, embedding-bearing or not. A missing value is never inferred, defaulted to zero, or
+value, embedding-bearing or not — except the bounded admission-pressure case Amendment 3 adds for
+a fixed, named set of read verbs, where the row (and the `resource.cost_unit` value it would have
+carried) may be absent because it was dropped best-effort, not because the verb is uncovered. A
+missing value outside that named case is never inferred, defaulted to zero, or
 backfilled after the fact. This mirrors the absence-is-exclusion convention
 `counts_by_work_class` already applies to `work_class`: a row with no `work_class` is
 skipped, not counted into a default bucket.
@@ -911,19 +921,34 @@ dispatch. The caller still receives the read's successful result.
 
 **Consequence, stated precisely:** `brain.event_counts`'s `total_cost_unit` and
 `cost_unit_by_verb` aggregation (Amendment 1) undercount those eleven verbs by the `cost_unit` of
-every row dropped this way. The loss is:
+every row dropped this way — but the two terminal reasons above are not the same fact, and
+conflating them into one counter would report a number no operator could act on:
+
+- **`QueueAdmissionExhausted`** never enqueued the row: it is a confirmed, terminal accounting
+  loss. It will never commit.
+- **`AdmissionDeadlineExpired`** already enqueued the row before the caller's wait elapsed: the
+  generation driver still commits or terminally fails it independently of the caller's timeout, so
+  at the moment the dispatch returns, whether that row eventually contributes to
+  `brain.event_counts` is unresolved, not known-lost. A count of these rows is an upper bound on
+  the eventual undercount, not the undercount itself.
+
+The loss is:
 
 - **Bounded to the allowlisted verb set.** No other Assertive handler, and no write of any kind,
   is affected — see "What does not change" below.
 - **Bounded to transient audit-lane admission pressure**, not persistent store failure. A
   persistent commit failure for one of these rows is unaffected by this amendment and is handled
   exactly as any other row of its class.
-- **Counted and exported**, not silent. Every drop increments a dedicated process-wide counter
-  (`AUDIT_ADMISSION_DEGRADED_OBLIGATIONS` in `crates/khive-runtime/src/pack.rs`) that is threaded
-  through `VerbRegistry::audit_batch_metrics()` into
-  `khive_db::diagnostics::WriterContentionDiagnostics::audit_admission_degraded_obligations`,
-  visible on the `db_diagnostics` verb — an operator can read the undercount directly instead of
-  inferring it from a cost-total discrepancy.
+- **Counted and exported on two disjoint counters, not silent and not conflated.** Every
+  `QueueAdmissionExhausted` drop increments a dedicated process-wide counter
+  (`AUDIT_ADMISSION_REFUSED_OBLIGATIONS` in `crates/khive-runtime/src/pack.rs`); every
+  `AdmissionDeadlineExpired` drop increments a separate one
+  (`AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS`). Both are threaded through
+  `VerbRegistry::audit_batch_metrics()` into
+  `khive_db::diagnostics::WriterContentionDiagnostics::audit_admission_refused_obligations` and
+  `audit_admission_unresolved_obligations` respectively, visible on the `db_diagnostics` verb — an
+  operator can read the confirmed loss and the unresolved upper bound separately, instead of a
+  single number that cannot distinguish an eventual undercount of zero from one of N.
 
 ### What does not change
 
