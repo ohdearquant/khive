@@ -886,19 +886,22 @@ describe("repository showcase", () => {
     expect(container.querySelector('svg[data-visualization="cadence"]')).toBeNull();
   });
 
-  it("falls back to the raw week value for schema-shaped but invalid dates", async () => {
-    const bundle = structuredClone(golden());
-    bundle.aggregates.cadence_timeline.commits.items[0].week_start = "2026-99-99";
-    const user = userEvent.setup();
-    const { container } = render(<RepoShowcase bundle={bundle} />);
+  it.each(["2026-99-99", "2026-02-30"])(
+    "falls back to the raw week value for schema-shaped but invalid date %s",
+    async (weekStart) => {
+      const bundle = structuredClone(golden());
+      bundle.aggregates.cadence_timeline.commits.items[0].week_start = weekStart;
+      const user = userEvent.setup();
+      const { container } = render(<RepoShowcase bundle={bundle} />);
 
-    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
-    const firstTick = container.querySelector<SVGTextElement>(
-      '[data-axis-tick="cadence-week"]',
-    );
-    expect(firstTick).toHaveAttribute("data-axis-value", "2026-99-99");
-    expect(firstTick?.textContent).toBe("2026-99-99");
-  });
+      await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+      const firstTick = container.querySelector<SVGTextElement>(
+        '[data-axis-tick="cadence-week"]',
+      );
+      expect(firstTick).toHaveAttribute("data-axis-value", weekStart);
+      expect(firstTick?.textContent).toBe(weekStart);
+    },
+  );
 
   it("surfaces a section's own truncation disclosure", () => {
     const bundle = structuredClone(golden());

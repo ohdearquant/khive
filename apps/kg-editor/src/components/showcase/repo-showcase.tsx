@@ -110,10 +110,15 @@ function formatDate(value: string): string {
 
 function formatWeekTick(value: string): string {
   const parsed = new Date(`${value}T00:00:00Z`);
-  if (Number.isNaN(parsed.getTime())) {
-    // The schema constrains week_start by regex shape only, so a
-    // non-calendar date can arrive here; show the raw value instead of
-    // letting Intl throw on an Invalid Date.
+  // The schema constrains week_start by regex shape only, so a
+  // non-calendar date can arrive here. Date parsing either yields an
+  // Invalid Date (Intl would throw) or silently normalizes an impossible
+  // day (2026-02-30 becomes another date), so require an exact round
+  // trip and otherwise show the raw value.
+  if (
+    Number.isNaN(parsed.getTime()) ||
+    parsed.toISOString().slice(0, 10) !== value
+  ) {
     return value;
   }
   return new Intl.DateTimeFormat("en", {
