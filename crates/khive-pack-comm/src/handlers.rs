@@ -2405,10 +2405,37 @@ pub(crate) async fn handle_heartbeat(
         deleted_at: None,
     };
 
-    store
-        .upsert_note(note)
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("heartbeat: upsert_note: {e}")))?;
+    // Guard the read-modify-write: `props` above was carried forward from
+    // `existing`, so a concurrent heartbeat that committed after that read
+    // (e.g. flipping `consecutive_failures`/`last_error`) must not be
+    // silently discarded by this write. A brand-new channel (`existing ==
+    // None`) has no prior state to lose, so it inserts unguarded — the same
+    // shape `replace_note_if_unchanged` uses for every other guarded note
+    // update (khive-runtime's `update_note_from_snapshot_with_embedding_report`).
+    match existing {
+        Some(snapshot) => {
+            let persisted = store
+                .replace_note_if_unchanged(note, snapshot.updated_at, snapshot.deleted_at)
+                .await
+                .map_err(|e| {
+                    RuntimeError::Internal(format!("heartbeat: replace_note_if_unchanged: {e}"))
+                })?;
+            if !persisted {
+                return Err(RuntimeError::Khive(khive_types::KhiveError::conflict(
+                    format!(
+                        "heartbeat: channel {}:{} changed concurrently after it was read; retry",
+                        p.channel_kind, p.channel_slug
+                    ),
+                )));
+            }
+        }
+        None => {
+            store
+                .upsert_note(note)
+                .await
+                .map_err(|e| RuntimeError::Internal(format!("heartbeat: upsert_note: {e}")))?;
+        }
+    }
 
     Ok(json!({
         "ok": true,
@@ -3388,6 +3415,125 @@ mod tests {
             signal.snapshot(),
             generation_after_commit,
             "a deduplicated ingest must not publish a wake"
+        );
+    }
+
+    /// Regression for the heartbeat lost-update race (khive #1753). Two
+    /// readers observe the SAME existing heartbeat row (deterministic: this
+    /// test is the only writer, so two sequential `get_note` calls before
+    /// either write are guaranteed to see one shared revision — no barrier
+    /// needed to force it). Each derives an independent poll outcome from
+    /// that snapshot, mirroring exactly what `handle_heartbeat` builds for a
+    /// "failure" vs. a "success" report, then the two writes commit through
+    /// the SAME `NoteStore::replace_note_if_unchanged` call `handle_heartbeat`
+    /// now uses. Before that guard, `handle_heartbeat` called
+    /// `store.upsert_note` unconditionally, so B's write would also succeed
+    /// and A's `consecutive_failures`/`last_error` update would be silently
+    /// discarded. This reddens if the write in `handle_heartbeat`'s `Some(snapshot)`
+    /// branch reverts to an unconditional `upsert_note`: the second
+    /// `replace_note_if_unchanged` call below would then need to be an
+    /// `upsert_note` too, which always returns `()`/succeeds, so the
+    /// `!... .unwrap()` assertion would fail to compile-flag the regression
+    /// and the final `consecutive_failures`/`last_failure_at` assertions
+    /// would observe B's fields instead of A's.
+    #[tokio::test]
+    async fn concurrent_heartbeats_from_one_revision_only_one_survives() {
+        let runtime = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+        let token = runtime
+            .authorize(khive_runtime::Namespace::parse("local").unwrap())
+            .expect("authorize");
+
+        super::handle_heartbeat(
+            &runtime,
+            &token,
+            json!({
+                "channel_kind": "email",
+                "channel_slug": "race@example.com",
+                "poll_interval_secs": 5,
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("seed heartbeat");
+
+        let store = runtime.notes(&token).expect("note store");
+        let id = super::heartbeat_note_id("local", "email", "race@example.com");
+        let snapshot_for_a = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("seeded heartbeat row");
+        let snapshot_for_b = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("seeded heartbeat row");
+        assert_eq!(
+            snapshot_for_a.updated_at, snapshot_for_b.updated_at,
+            "both readers must observe the same pre-write revision for this to be a real race"
+        );
+
+        // Writer A: a "failure" report built from the shared snapshot —
+        // mirrors handle_heartbeat's failure branch exactly.
+        let mut note_a = snapshot_for_a.clone();
+        let mut props_a = note_a.properties.clone().unwrap_or_else(|| json!({}));
+        props_a["last_failure_at"] = json!("2026-08-26T00:00:00Z");
+        props_a["consecutive_failures"] = json!(1);
+        props_a["last_error"] =
+            json!({"class": "timeout", "message": "boom", "at": "2026-08-26T00:00:00Z"});
+        note_a.properties = Some(props_a);
+        note_a.updated_at = snapshot_for_a.updated_at + 1;
+
+        // Writer B: a "success" report ALSO derived from the SAME stale
+        // snapshot — as if B's own internal `get_note` raced A's.
+        let mut note_b = snapshot_for_b.clone();
+        let mut props_b = note_b.properties.clone().unwrap_or_else(|| json!({}));
+        props_b["last_success_at"] = json!("2026-08-26T00:00:01Z");
+        props_b["consecutive_failures"] = json!(0);
+        note_b.properties = Some(props_b);
+        note_b.updated_at = snapshot_for_b.updated_at + 1;
+
+        assert!(
+            store
+                .replace_note_if_unchanged(
+                    note_a,
+                    snapshot_for_a.updated_at,
+                    snapshot_for_a.deleted_at
+                )
+                .await
+                .expect("writer A CAS query"),
+            "the first committer from a shared revision must win"
+        );
+        assert!(
+            !store
+                .replace_note_if_unchanged(
+                    note_b,
+                    snapshot_for_b.updated_at,
+                    snapshot_for_b.deleted_at
+                )
+                .await
+                .expect("writer B CAS query"),
+            "the second committer from the SAME stale revision must be refused, not merged"
+        );
+
+        let final_note = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("heartbeat row still exists");
+        let final_props = final_note.properties.expect("heartbeat properties");
+        assert_eq!(
+            final_props["consecutive_failures"],
+            json!(1),
+            "writer A's failure count must survive: {final_props:?}"
+        );
+        assert_eq!(
+            final_props["last_failure_at"],
+            json!("2026-08-26T00:00:00Z")
+        );
+        assert!(
+            final_props.get("last_success_at") != Some(&json!("2026-08-26T00:00:01Z")),
+            "writer B's success timestamp must not be silently merged into the persisted row: {final_props:?}"
         );
     }
 
