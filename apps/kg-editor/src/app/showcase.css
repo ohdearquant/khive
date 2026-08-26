@@ -725,10 +725,15 @@
 }
 .repo-graph-node.compact-label > span,
 .repo-graph-node.compact-label > strong { display: none; }
+/* Compact mode drops only the TEXT labels: the kind icon stays as the
+   node's visible identity and the coupling badge keeps its count. Both
+   are spans, so they must win over the hiding rule above. */
 .repo-graph-node.compact-label > .repo-node-kind-icon {
+  display: inline-flex;
   float: none;
   margin: 0;
 }
+.repo-graph-node.compact-label > .repo-graph-overlay-badge { display: inline-flex; }
 .repo-graph-node .repo-graph-overlay-badge {
   align-items: center;
   background: var(--khive-color-warning-soft);

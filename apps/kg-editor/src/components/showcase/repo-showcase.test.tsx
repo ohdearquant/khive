@@ -1009,6 +1009,9 @@ describe("repository showcase", () => {
     for (const node of compactNodes) {
       expect(node.style.width).toBe("26px");
       expect(node).toHaveAccessibleName();
+      // Compact mode hides only the text labels; the kind icon must stay
+      // in the markup as the node's remaining visible identity.
+      expect(node.querySelector(".repo-node-kind-icon")).not.toBeNull();
     }
 
     await user.click(moduleNodes[0]);
