@@ -26,8 +26,10 @@ The adapter requires `KHIVE_TELEGRAM_BOT_TOKEN` and a numeric
 ## Invariants
 
 - V1 is a single-maintainer channel. Inbound updates from any other chat id and updates without
-  text are dropped without creating an envelope. Outbound addresses other than the configured
-  `telegram:<maintainer_slug>` are logged and dropped, never redirected to the maintainer.
+  text are dropped without creating an envelope. Outbound delivery accepts the configured
+  maintainer address in two spellings — `telegram:<maintainer_slug>` or the bare
+  `<maintainer_slug>` (the kind prefix is stripped when present, not required) — and every other
+  address is logged and dropped, never redirected to the maintainer.
 - Bot tokens must not appear in diagnostics. `TelegramChannelConfig` has a manual `Debug`
   implementation that masks the token, and connector errors remove request URLs containing it.
 - `poll` uses Telegram's offset watermark and ignores its timestamp argument. A fetched batch only

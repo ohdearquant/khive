@@ -43,7 +43,9 @@ data and are not part of that field grammar.
   only client-to-server kinds; duplicate handshakes and server-only inbound frames close the gate.
   `HandshakeGate` is deliberately not `Clone`, so its per-connection state cannot move backward.
 - Connection-terminal errors carry no operation id. Request-terminal errors carry the id they
-  terminate. The rule is enforced on encode and on every `Frame` decode path.
+  terminate. The rule is enforced on encode and, for recognized (closed-set) codes, on every
+  `Frame` decode path. An unknown code's scope is unknowable in this protocol version, so
+  unknown codes bypass scope validation on decode.
 - An unrecognized wire error code decodes as `internal` while retaining the raw code for
   diagnostics. That fallback frame cannot be re-encoded because doing so would discard the newer
   code; a transparent relay must retain raw bytes instead.
