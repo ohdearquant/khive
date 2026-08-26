@@ -102,8 +102,21 @@ pub enum AuditTerminalReason {
     PreflightRejected,
     /// The batch is `Closing` or `Closed`; new admission is refused.
     AdmissionClosed,
-    /// `AuditBatchConfig::max_pending_rows` was reached.
+    /// `AuditBatchConfig::max_pending_rows` was reached before this row was
+    /// enqueued. The row was never counted as submitted and never shared a
+    /// generation with anyone — safe to retry, and doing so applies the
+    /// obligation at most once.
     QueueAdmissionExhausted,
+    /// The row was already enqueued (counted in `submitted_rows`,
+    /// `state.pending`) when this caller's `AuditBatchConfig::admission_deadline`
+    /// elapsed waiting for its generation's outcome. Unlike
+    /// [`Self::QueueAdmissionExhausted`], the row was not refused: it stays
+    /// queued and is drained and committed (or terminally failed) by the
+    /// generation driver independently of this caller's timeout, so the
+    /// caller cannot tell from this reason alone whether the row eventually
+    /// committed. Retrying is only safe for an idempotent caller — the prior
+    /// submission may still land.
+    AdmissionDeadlineExpired,
     /// A row shared this generation's id with a previously stored row whose
     /// columns or observation projection did not match exactly.
     IdentityConflict,
@@ -669,7 +682,13 @@ impl AuditBatchControl for AuditBatch {
         match tokio::time::timeout(self.config.admission_deadline, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_recv_error)) => Err(AuditTerminalReason::DriverJoinLost),
-            Err(_elapsed) => Err(AuditTerminalReason::QueueAdmissionExhausted),
+            // The row was already pushed onto `state.pending` above (and
+            // `submitted_rows` incremented) before this wait began — this is
+            // a deadline elapsing on an enqueued row, not a queue-full
+            // refusal, so it gets its own terminal reason (khive#2117,
+            // khive#2208). The row is left in place for the driver to drain;
+            // this arm performs no removal.
+            Err(_elapsed) => Err(AuditTerminalReason::AdmissionDeadlineExpired),
         }
     }
 
