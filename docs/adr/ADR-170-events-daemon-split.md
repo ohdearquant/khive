@@ -278,12 +278,15 @@ flatly refused by this daemon.
 this by walking a strict descending `created_at` cursor in
 transport-cap-sized pages (`TRANSPORT_PAGE_ROWS`, bound to
 `MAX_QUERY_EVENTS_PAGE_ROWS`), deduplicating same-microsecond ties by event id
-at each page boundary, instead of issuing one wide read — the same technique
-this ADR's split store already uses internally to keep merged reads inside the
-cap. `khive-pack-moodboard`'s `moodboard.train_preference` judgment-snapshot
-read applies the identical pattern for the same reason. Both apply uniformly,
-whether or not the runtime is actually configured for split/daemon mode, so
-neither pack's read behavior depends on that deployment detail.
+at each page boundary, instead of issuing one wide read. `khive-pack-moodboard`'s
+`moodboard.train_preference` judgment-snapshot read applies the identical
+cursor technique for the same reason. This ADR's split store does not use that
+technique itself: `SplitEventStore::query_events` fetches each backing store's
+matching prefix, merges and sorts them, then applies the requested window — a
+prefix-merge read with no cursor loop of its own. Both consumer-side walks
+apply uniformly, whether or not the runtime is actually configured for
+split/daemon mode, so neither pack's read behavior depends on that deployment
+detail.
 
 The tradeoff this walk accepts: the exact/full-window aggregation
 `brain.event_counts` documented before this change assumed one atomic
