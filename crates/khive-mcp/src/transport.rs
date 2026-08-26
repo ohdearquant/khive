@@ -11,7 +11,10 @@ use async_trait::async_trait;
 
 use crate::server::KhiveMcpServer;
 
-/// Cancels rmcp's root service token before reporting transport EOF.
+/// Cancels rmcp's root service token before reporting transport EOF — and,
+/// with an idle timeout configured, before reporting a synthetic EOF when no
+/// message has arrived within that window even though the pipe itself stays
+/// open (#1921).
 ///
 /// rmcp otherwise classifies EOF as a graceful close and drains in-flight
 /// handlers for five seconds without cancelling their per-request child
@@ -20,14 +23,35 @@ use crate::server::KhiveMcpServer;
 /// begins. Send and close remain transparent, allowing this wrapper to sit
 /// outside the Unix post-flush self-heal transport without changing its flush
 /// ordering.
+///
+/// An abandoned stdio bridge — a client whose pipe never closes but which
+/// has stopped sending requests — is otherwise indistinguishable from a live
+/// one: nothing reaps it, so it holds its reader-pool admission and DB
+/// connection for as long as the parent process happens to stay alive
+/// (observed up to tens of hours in production). Idle timeout treats "no
+/// request for `idle_timeout`" the same as real EOF: `receive()` yields
+/// `None`, which cancels `root` and lets rmcp's normal graceful-close path
+/// tear the session down — the same clean-exit path that already releases
+/// pooled resources on a real disconnect.
 pub(crate) struct CancelOnEofTransport<T> {
     inner: T,
     root: tokio_util::sync::CancellationToken,
+    idle_timeout: Option<std::time::Duration>,
 }
 
 impl<T> CancelOnEofTransport<T> {
-    pub(crate) fn new(inner: T, root: tokio_util::sync::CancellationToken) -> Self {
-        Self { inner, root }
+    /// `idle_timeout`: a `receive()` call that yields no message within this
+    /// window is treated as EOF (see the type doc). `None` disables it.
+    pub(crate) fn with_idle_timeout(
+        inner: T,
+        root: tokio_util::sync::CancellationToken,
+        idle_timeout: Option<std::time::Duration>,
+    ) -> Self {
+        Self {
+            inner,
+            root,
+            idle_timeout,
+        }
     }
 }
 
@@ -50,8 +74,24 @@ where
            + Send {
         let receive = self.inner.receive();
         let root = self.root.clone();
+        let idle_timeout = self.idle_timeout;
         async move {
-            let message = receive.await;
+            let message = match idle_timeout {
+                Some(timeout) => {
+                    tokio::select! {
+                        message = receive => message,
+                        () = tokio::time::sleep(timeout) => {
+                            tracing::info!(
+                                idle_timeout_secs = timeout.as_secs(),
+                                "stdio bridge idle timeout elapsed with no request; \
+                                 closing this session to release its pooled resources"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => receive.await,
+            };
             if message.is_none() {
                 root.cancel();
             }

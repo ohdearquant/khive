@@ -995,6 +995,32 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
     }
 }
 
+/// Idle timeout for a stdio bridge session (#1921): no request for this long
+/// and the session closes (see [`crate::transport::CancelOnEofTransport`]),
+/// releasing its reader-pool admission and DB connection — a client that
+/// comes back simply respawns the bridge, seamlessly from its perspective.
+///
+/// Overridable via `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`; `0` disables it (an
+/// explicit opt-out, e.g. for a debugger holding a session open on purpose).
+/// An unparsable value falls back to the default rather than panicking or
+/// disabling the timeout outright, matching this codebase's other
+/// `_from_env` helpers. Default: 3600s (60 minutes) — generous enough that
+/// ordinary gaps between requests in a live session never trip it, short
+/// enough that an abandoned bridge does not pin a reader-pool slot / WAL
+/// connection for hours or days (#1921, #1836).
+fn stdio_bridge_idle_timeout_from_env() -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 3600;
+    let secs = std::env::var("KHIVE_BRIDGE_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
 impl KhiveMcpServer {
     /// Build a server from `runtime.config().packs`. Errors if any pack is unknown or missing deps.
     ///
@@ -1389,13 +1415,15 @@ impl KhiveMcpServer {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
         let root = tokio_util::sync::CancellationToken::new();
+        let idle_timeout = stdio_bridge_idle_timeout_from_env();
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
-            crate::transport::CancelOnEofTransport::new(
+            crate::transport::CancelOnEofTransport::with_idle_timeout(
                 crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
                     read, write,
                 )),
                 root,
+                idle_timeout,
             )
         };
 
@@ -1434,9 +1462,10 @@ impl KhiveMcpServer {
 
         let root = tokio_util::sync::CancellationToken::new();
         let (read, write) = stdio();
-        let transport = crate::transport::CancelOnEofTransport::new(
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(read, write),
             root.clone(),
+            stdio_bridge_idle_timeout_from_env(),
         );
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
@@ -7306,9 +7335,10 @@ mod request_read_cancellation_tests {
         let root = tokio_util::sync::CancellationToken::new();
         let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
         let (read, write) = tokio::io::split(server_io);
-        let transport = crate::transport::CancelOnEofTransport::new(
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(read, write),
             root.clone(),
+            None,
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7342,6 +7372,97 @@ mod request_read_cancellation_tests {
             ),
             "unexpected rmcp quit reason after EOF: {reason:?}"
         );
+    }
+
+    /// #1921: an idle stdio bridge — pipe still open, no request sent — must
+    /// be reaped the same way a real EOF is, not held open indefinitely.
+    #[tokio::test]
+    async fn stdio_idle_timeout_cancels_root_without_eof() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let probe = EofProbeServer {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            Some(Duration::from_millis(50)),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        // Deliberately never write anything and never drop `client_io`: the
+        // pipe stays open exactly like an abandoned bridge's client — this
+        // must still be reaped once the idle timeout elapses.
+        let reason = tokio::time::timeout(Duration::from_secs(2), running.waiting())
+            .await
+            .expect("idle timeout never closed the session")
+            .expect("rmcp service task panicked");
+        assert!(
+            root.is_cancelled(),
+            "idle timeout must cancel the exact root token passed into rmcp"
+        );
+        assert!(
+            matches!(
+                reason,
+                rmcp::service::QuitReason::Closed | rmcp::service::QuitReason::Cancelled
+            ),
+            "unexpected rmcp quit reason after idle timeout: {reason:?}"
+        );
+        drop(client_io);
+    }
+
+    /// #1921 acceptance: a live client with traffic inside every idle window
+    /// must never be reaped, even once total elapsed time exceeds the
+    /// timeout many times over.
+    #[tokio::test]
+    async fn stdio_idle_timeout_does_not_reap_client_with_intermittent_traffic() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let probe = EofProbeServer {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            Some(Duration::from_millis(150)),
+        );
+        let _running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        // Five requests spaced well inside the 150ms idle window, totaling
+        // ~200ms — more than the timeout itself, but never a single gap that
+        // exceeds it.
+        for id in 1..=5u32 {
+            client_io
+                .write_all(
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\
+                         \"params\":{{\"name\":\"probe\",\"arguments\":{{}}}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        assert!(
+            !root.is_cancelled(),
+            "intermittent traffic inside every idle window must never trip the idle timeout"
+        );
+        drop(client_io);
     }
 
     #[tokio::test]
