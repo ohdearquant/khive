@@ -1324,12 +1324,14 @@ impl VerbRegistry {
     /// see flush failures and pure-observability degradation instead of the
     /// permanently-unavailable placeholder a bare `KhiveRuntime` reports.
     ///
-    /// `admission_degraded_obligations` is sourced separately from
-    /// [`audit_admission_degraded_obligation_count`] rather than from
-    /// `batch.health_metrics()`: it counts a decision made in
+    /// `admission_refused_obligations` and `admission_unresolved_obligations`
+    /// are sourced separately from [`audit_admission_refused_obligation_count`]
+    /// and [`audit_admission_unresolved_obligation_count`] rather than from
+    /// `batch.health_metrics()`: they count a decision made in
     /// `append_audit_event_best_effort` (ADR-103 Amendment 3 / ADR-133
-    /// Amendment 1), not a property of the batch itself, so it is process-wide
-    /// like the rest of this struct's fields rather than per-`AuditBatch`.
+    /// Amendment 1), not a property of the batch itself, so they are
+    /// process-wide like the rest of this struct's fields rather than
+    /// per-`AuditBatch`.
     pub fn audit_batch_metrics(&self) -> Option<khive_db::diagnostics::RuntimeAuditBatchMetrics> {
         self.audit_batch.as_ref().map(|batch| {
             let m = batch.health_metrics();
@@ -1337,7 +1339,8 @@ impl VerbRegistry {
                 flush_failures: m.flush_failures,
                 degraded_rows: m.degraded_rows,
                 degraded: m.degraded,
-                admission_degraded_obligations: audit_admission_degraded_obligation_count(),
+                admission_refused_obligations: audit_admission_refused_obligation_count(),
+                admission_unresolved_obligations: audit_admission_unresolved_obligation_count(),
             }
         })
     }
@@ -3414,10 +3417,11 @@ pub(crate) fn audit_obligation_append_failure_count() -> u64 {
     AUDIT_OBLIGATION_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Process-wide count of `DispatchObligation` rows whose commit was skipped
-/// under transient audit-lane admission pressure for an
+/// Process-wide count of `DispatchObligation` rows **refused before they
+/// could be enqueued** (`AuditTerminalReason::QueueAdmissionExhausted`) for an
 /// [`VerbRegistry::admission_degrade_safe`] verb (khive#2147/khive#2217).
-/// Deliberately its own counter, disjoint from both
+/// This is a confirmed, terminal accounting loss: the row never shared a
+/// generation with anyone and will never commit. Disjoint from both
 /// [`AUDIT_APPEND_FAILURES`] and [`AUDIT_OBLIGATION_APPEND_FAILURES`]: this
 /// case is neither. It is not [`AUDIT_APPEND_FAILURES`] — that counter's own
 /// contract (`khive-db`'s `WriterContentionDiagnostics::audit_append_failures`
@@ -3428,21 +3432,44 @@ pub(crate) fn audit_obligation_append_failure_count() -> u64 {
 /// [`AUDIT_OBLIGATION_APPEND_FAILURES`] either — that counter's contract is
 /// "most call sites fold this failure into the dispatch's own error", which
 /// is exactly the propagation this admission-degrade path exists to avoid.
+/// Also disjoint from [`AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS`] — that
+/// counter's row was enqueued and may still commit; this one's was not.
 /// Read in production by [`VerbRegistry::audit_batch_metrics`], which feeds
-/// it into `khive_db::diagnostics::RuntimeAuditBatchMetrics::admission_degraded_obligations`
+/// it into `khive_db::diagnostics::RuntimeAuditBatchMetrics::admission_refused_obligations`
 /// and from there into the `db_diagnostics` verb's
-/// `writer_contention.audit_admission_degraded_obligations` field (ADR-103
+/// `writer_contention.audit_admission_refused_obligations` field (ADR-103
 /// Amendment 3) — an operator can read this counter without a test-only
 /// feature gate. The mechanism tests also read it directly, including the
 /// admission-pressure regression tests in `tests/read_verb_admission_exhaustion.rs`,
 /// which (like `khive-runtime/src/audit_batch.rs`'s own `test_internals`
 /// module) need it as `pub`, not `pub(crate)`, since they compile as a
 /// separate external binary outside this crate.
-static AUDIT_ADMISSION_DEGRADED_OBLIGATIONS: std::sync::atomic::AtomicU64 =
+static AUDIT_ADMISSION_REFUSED_OBLIGATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-pub fn audit_admission_degraded_obligation_count() -> u64 {
-    AUDIT_ADMISSION_DEGRADED_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed)
+pub fn audit_admission_refused_obligation_count() -> u64 {
+    AUDIT_ADMISSION_REFUSED_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide count of `DispatchObligation` rows that were **already
+/// enqueued but had not resolved by the time the caller's admission wait
+/// deadline elapsed** (`AuditTerminalReason::AdmissionDeadlineExpired`) for an
+/// [`VerbRegistry::admission_degrade_safe`] verb (khive#2147/khive#2217).
+/// Unlike [`AUDIT_ADMISSION_REFUSED_OBLIGATIONS`], a row counted here is not
+/// a confirmed loss: per `AuditTerminalReason::AdmissionDeadlineExpired`'s own
+/// doc, the row may still be committed (or terminally failed) by the
+/// generation driver independently of the caller's timeout, so this counter
+/// is an upper bound on the eventual undercount, not the undercount itself.
+/// Read in production by [`VerbRegistry::audit_batch_metrics`], which feeds
+/// it into `khive_db::diagnostics::RuntimeAuditBatchMetrics::admission_unresolved_obligations`
+/// and from there into the `db_diagnostics` verb's
+/// `writer_contention.audit_admission_unresolved_obligations` field (ADR-103
+/// Amendment 3).
+static AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn audit_admission_unresolved_obligation_count() -> u64 {
+    AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 const GIT_DIGEST_RECEIPT_FAILURE: &str =
@@ -3621,9 +3648,11 @@ async fn persist_git_digest_receipt(
 ///
 /// Every failure — obligation or observability — increments one of the
 /// process-wide diagnostics counters above; the one exception is the
-/// admission-degrade case below, which increments its own dedicated
-/// [`AUDIT_ADMISSION_DEGRADED_OBLIGATIONS`] counter instead — it is neither
-/// a swallowed observability failure nor a propagated obligation failure.
+/// admission-degrade case below, which increments one of its own dedicated
+/// [`AUDIT_ADMISSION_REFUSED_OBLIGATIONS`] /
+/// [`AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS`] counters instead — it is
+/// neither a swallowed observability failure nor a propagated obligation
+/// failure.
 ///
 /// `is_read_only_verb` (khive#2147/khive#2217) narrows that obligation for
 /// one specific case: a `DispatchSucceeded`/`DispatchFailed` row for a verb
@@ -3671,21 +3700,42 @@ async fn append_audit_event_best_effort(
                 // obligation the read never needed as strictly as a write does.
                 // Any other reason (a definite store/durability failure) still
                 // fails the dispatch for reads exactly as it does for writes.
-                let admission_pressure = matches!(
-                    reason,
-                    AuditTerminalReason::QueueAdmissionExhausted
-                        | AuditTerminalReason::AdmissionDeadlineExpired
-                );
-                if is_read_only_verb && admission_pressure {
-                    AUDIT_ADMISSION_DEGRADED_OBLIGATIONS
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!(
-                        verb,
-                        reason = ?reason,
-                        "read verb's audit obligation degraded under audit-lane admission \
-                         pressure; dispatch still reports its own result (non-fatal)"
-                    );
-                    return Ok(());
+                //
+                // The two admission-pressure reasons are not the same fact and
+                // are counted on separate counters: `QueueAdmissionExhausted`
+                // never enqueued, so it is a confirmed terminal loss, while
+                // `AdmissionDeadlineExpired` was already enqueued and may still
+                // commit later — see `AuditTerminalReason::AdmissionDeadlineExpired`'s
+                // own doc.
+                if is_read_only_verb {
+                    match reason {
+                        AuditTerminalReason::QueueAdmissionExhausted => {
+                            AUDIT_ADMISSION_REFUSED_OBLIGATIONS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                verb,
+                                reason = ?reason,
+                                "read verb's audit obligation row was refused before \
+                                 enqueue under audit-lane admission pressure; dispatch \
+                                 still reports its own result (non-fatal)"
+                            );
+                            return Ok(());
+                        }
+                        AuditTerminalReason::AdmissionDeadlineExpired => {
+                            AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                verb,
+                                reason = ?reason,
+                                "read verb's audit obligation row was still enqueued and \
+                                 unresolved when the caller's admission wait deadline \
+                                 elapsed; it may still commit. Dispatch still reports its \
+                                 own result (non-fatal)"
+                            );
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
                 }
                 AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(
@@ -7269,6 +7319,22 @@ pub(crate) mod tests {
         assert!(bare_report
             .writer_contention
             .audit_degraded_unavailable_reason
+            .is_some());
+        assert!(bare_report
+            .writer_contention
+            .audit_admission_refused_obligations
+            .is_none());
+        assert!(bare_report
+            .writer_contention
+            .audit_admission_refused_obligations_unavailable_reason
+            .is_some());
+        assert!(bare_report
+            .writer_contention
+            .audit_admission_unresolved_obligations
+            .is_none());
+        assert!(bare_report
+            .writer_contention
+            .audit_admission_unresolved_obligations_unavailable_reason
             .is_some());
     }
 

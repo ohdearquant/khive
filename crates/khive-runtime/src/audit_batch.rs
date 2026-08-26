@@ -118,7 +118,12 @@ pub enum AuditTerminalReason {
     /// caller cannot tell from this reason alone whether the row eventually
     /// committed, or even which of those two states it was in when the
     /// deadline elapsed. Retrying is only safe for an idempotent caller —
-    /// the prior submission may still land.
+    /// the prior submission may still land. When this reason degrades an
+    /// admission-degrade-safe read's own audit obligation, it is counted
+    /// separately from [`Self::QueueAdmissionExhausted`] — see
+    /// `pack::audit_admission_unresolved_obligation_count` — precisely
+    /// because a row counted here may still commit, unlike one refused
+    /// before enqueue.
     AdmissionDeadlineExpired,
     /// A row shared this generation's id with a previously stored row whose
     /// columns or observation projection did not match exactly.
@@ -164,9 +169,10 @@ pub enum AuditCommitOutcome {
 
 /// Production-visible snapshot of [`AuditBatch::health_metrics`]. See there
 /// for field semantics. `khive_db::diagnostics::RuntimeAuditBatchMetrics` carries
-/// these three fields plus `admission_degraded_obligations`, which is sourced
-/// from a process-wide counter outside `AuditBatch` rather than from this
-/// struct — see `VerbRegistry::audit_batch_metrics`.
+/// these three fields plus `admission_refused_obligations` and
+/// `admission_unresolved_obligations`, which are sourced from process-wide
+/// counters outside `AuditBatch` rather than from this struct — see
+/// `VerbRegistry::audit_batch_metrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditBatchHealthMetrics {
     pub flush_failures: u64,

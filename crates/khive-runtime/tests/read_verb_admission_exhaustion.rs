@@ -26,10 +26,11 @@ use khive_runtime::audit_batch::{
     fault_injection, AuditBatchConfig, AuditBatchControl, AuditProducer, PreparedAuditRow,
 };
 use khive_runtime::pack::{
-    audit_admission_degraded_obligation_count, HandlerDef, PackRuntime, VerbRegistryBuilder,
+    audit_admission_refused_obligation_count, audit_admission_unresolved_obligation_count,
+    HandlerDef, PackRuntime, VerbRegistryBuilder,
 };
 use khive_runtime::runtime::NamespaceToken;
-use khive_runtime::RuntimeError;
+use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::types::{BatchWriteSummary, Page, PageRequest};
 use khive_storage::{Event, EventFilter, EventStore, StorageResult};
 use khive_types::pack::{Pack, Visibility};
@@ -249,8 +250,11 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
     // The read must still succeed: its own audit row is refused on
     // admission (immediate `QueueAdmissionExhausted`, no wait), but that
     // failure degrades to best-effort instead of discarding the read's
-    // already-computed result.
-    let before_degraded = audit_admission_degraded_obligation_count();
+    // already-computed result. A queue refusal is a confirmed, terminal
+    // loss — the row never enqueued — so it counts on the "refused" counter,
+    // not the "unresolved" one used by the deadline-expiry test below.
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
     let result = registry
         .dispatch("list", Value::Null)
         .await
@@ -260,25 +264,52 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
         serde_json::json!({ "pack": "alpha", "verb": "list" })
     );
     assert_eq!(
-        audit_admission_degraded_obligation_count(),
-        before_degraded + 1,
+        audit_admission_refused_obligation_count(),
+        before_refused + 1,
         "a queue-refusal degrade must count on its own dedicated counter, not \
          AUDIT_APPEND_FAILURES or AUDIT_OBLIGATION_APPEND_FAILURES"
+    );
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved,
+        "a queue refusal must never be counted on the deadline-expiry counter"
     );
     // The raw process-wide counter is an internal detail; what an operator
     // actually reads is `db_diagnostics`, fed by `VerbRegistry::audit_batch_metrics()`
     // (ADR-103 Amendment 3 / ADR-133 Amendment 1). Prove the threading, not
     // just the counter increment: this assertion reddens if
-    // `RuntimeAuditBatchMetrics::admission_degraded_obligations` regresses to
+    // `RuntimeAuditBatchMetrics::admission_refused_obligations` regresses to
     // a hardcoded 0 or is dropped from the struct.
+    let metrics = registry
+        .audit_batch_metrics()
+        .expect("event store configured, so the batch seam is too");
     assert_eq!(
-        registry
-            .audit_batch_metrics()
-            .expect("event store configured, so the batch seam is too")
-            .admission_degraded_obligations,
-        audit_admission_degraded_obligation_count(),
-        "VerbRegistry::audit_batch_metrics() must surface the same admission-degraded count \
+        metrics.admission_refused_obligations,
+        audit_admission_refused_obligation_count(),
+        "VerbRegistry::audit_batch_metrics() must surface the same admission-refused count \
          the production db_diagnostics verb reports"
+    );
+
+    // Drive the SAME production path the `db_diagnostics` verb handler uses
+    // (`crates/khive-pack-kg/src/handlers/db_diagnostics.rs` calls exactly
+    // this `KhiveRuntime` method with exactly this `registry.audit_batch_metrics()`
+    // value) so this assertion reddens if that forwarding is ever dropped in
+    // favor of passing `None`.
+    let rt = KhiveRuntime::memory().expect("memory runtime should create");
+    let report = rt
+        .db_diagnostics_with_audit_metrics(Some(metrics))
+        .await
+        .expect("diagnostics succeed");
+    assert_eq!(
+        report.writer_contention.audit_admission_refused_obligations,
+        Some(audit_admission_refused_obligation_count()),
+        "the real db_diagnostics handler path must surface the refused-obligation count"
+    );
+    assert_eq!(
+        report
+            .writer_contention
+            .audit_admission_unresolved_obligations,
+        Some(audit_admission_unresolved_obligation_count()),
     );
 
     drop(occupant);
@@ -340,8 +371,11 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
     // (the queue has room, so this is not `QueueAdmissionExhausted`) and
     // waits out its 30ms `admission_deadline` — `AdmissionDeadlineExpired`.
     // That failure must still degrade to best-effort: the dispatch reports
-    // its own already-computed result rather than discarding it.
-    let before_degraded = audit_admission_degraded_obligation_count();
+    // its own already-computed result rather than discarding it. Unlike a
+    // queue refusal, the row was already enqueued and may still commit, so
+    // this must count on the "unresolved" counter, not "refused".
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
     let result = registry
         .dispatch("list", Value::Null)
         .await
@@ -351,10 +385,34 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
         serde_json::json!({ "pack": "alpha", "verb": "list" })
     );
     assert_eq!(
-        audit_admission_degraded_obligation_count(),
-        before_degraded + 1,
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved + 1,
         "a deadline-expiry degrade must count on its own dedicated counter too, not just \
          the queue-refusal arm"
+    );
+    assert_eq!(
+        audit_admission_refused_obligation_count(),
+        before_refused,
+        "a deadline expiry must never be counted on the queue-refusal counter"
+    );
+
+    // Drive the same production forwarding path as the queue-refusal test
+    // above: this reddens if `db_diagnostics_with_audit_metrics` stops
+    // forwarding the unresolved count into `writer_contention`.
+    let metrics = registry
+        .audit_batch_metrics()
+        .expect("event store configured, so the batch seam is too");
+    let rt = KhiveRuntime::memory().expect("memory runtime should create");
+    let report = rt
+        .db_diagnostics_with_audit_metrics(Some(metrics))
+        .await
+        .expect("diagnostics succeed");
+    assert_eq!(
+        report
+            .writer_contention
+            .audit_admission_unresolved_obligations,
+        Some(audit_admission_unresolved_obligation_count()),
+        "the real db_diagnostics handler path must surface the unresolved-obligation count"
     );
 
     drop(occupant);
