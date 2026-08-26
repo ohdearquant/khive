@@ -104,6 +104,73 @@ pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
     }
 }
 
+/// Full-entity compare-and-swap update used after caller-side normalization
+/// was derived from a read snapshot. Unlike [`entity_upsert_statement`], this
+/// never inserts and cannot overwrite a row whose revision or deletion
+/// marker moved after the snapshot was read. The replacement revision must
+/// also be strictly greater than the persisted snapshot revision; equality
+/// is a refused CAS, never a successful write with an unchanged concurrency
+/// token. Mirrors `note_replace_if_unchanged_statement`
+/// (`crates/khive-db/src/stores/note.rs`).
+pub fn entity_replace_if_unchanged_statement(
+    entity: &Entity,
+    expected_updated_at: i64,
+    expected_deleted_at: Option<i64>,
+) -> SqlStatement {
+    let properties_str = entity
+        .properties
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let tags_str = serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
+    SqlStatement {
+        sql: "UPDATE entities SET \
+                namespace = ?1, kind = ?2, entity_type = ?3, name = ?4, description = ?5, \
+                properties = ?6, tags = ?7, updated_at = ?8, deleted_at = ?9, \
+                merged_into = ?10, merge_event_id = ?11 \
+              WHERE id = ?12 AND updated_at = ?13 AND deleted_at IS ?14 \
+                AND ?8 > updated_at"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(entity.namespace.clone()),
+            SqlValue::Text(entity.kind.clone()),
+            match &entity.entity_type {
+                Some(t) => SqlValue::Text(t.clone()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(entity.name.clone()),
+            match &entity.description {
+                Some(d) => SqlValue::Text(d.clone()),
+                None => SqlValue::Null,
+            },
+            match properties_str {
+                Some(p) => SqlValue::Text(p),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(tags_str),
+            SqlValue::Integer(entity.updated_at),
+            match entity.deleted_at {
+                Some(d) => SqlValue::Integer(d),
+                None => SqlValue::Null,
+            },
+            match entity.merged_into {
+                Some(u) => SqlValue::Text(u.to_string()),
+                None => SqlValue::Null,
+            },
+            match entity.merge_event_id {
+                Some(u) => SqlValue::Text(u.to_string()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(entity.id.to_string()),
+            SqlValue::Integer(expected_updated_at),
+            match expected_deleted_at {
+                Some(value) => SqlValue::Integer(value),
+                None => SqlValue::Null,
+            },
+        ],
+        label: Some("entity-replace-if-unchanged".to_string()),
+    }
+}
+
 /// The exact soft-delete `UPDATE` this store's `delete_entity(Soft)` issues.
 pub fn entity_soft_delete_statement(id: Uuid, deleted_at: i64) -> SqlStatement {
     SqlStatement {
@@ -719,6 +786,25 @@ impl EntityStore for SqlEntityStore {
                 return Err(e);
             }
             Ok(summary)
+        })
+        .await
+    }
+
+    async fn replace_entity_if_unchanged(
+        &self,
+        entity: Entity,
+        expected_updated_at: i64,
+        expected_deleted_at: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        let statement = entity_replace_if_unchanged_statement(
+            &entity,
+            expected_updated_at,
+            expected_deleted_at,
+        );
+        self.with_writer("replace_entity_if_unchanged", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }

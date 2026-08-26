@@ -127,6 +127,64 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
     }
 }
 
+/// Full-edge compare-and-swap update used after caller-side normalization
+/// was derived from a read snapshot. Unlike [`edge_upsert_statement`], this
+/// never inserts and cannot overwrite a row whose revision or deletion
+/// marker moved after the snapshot was read. The replacement revision must
+/// also be strictly greater than the persisted snapshot revision; equality
+/// is a refused CAS, never a successful write with an unchanged concurrency
+/// token. Mirrors `note_replace_if_unchanged_statement`
+/// (`crates/khive-db/src/stores/note.rs`). `created_at` is deliberately
+/// excluded from the `SET` list, matching the note/entity siblings — a
+/// replacement never rewrites the row's original creation time.
+pub fn edge_replace_if_unchanged_statement(
+    edge: &Edge,
+    expected_updated_at: DateTime<Utc>,
+    expected_deleted_at: Option<DateTime<Utc>>,
+) -> SqlStatement {
+    let (source_id, target_id) =
+        canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+    let metadata_str = edge
+        .metadata
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    SqlStatement {
+        sql: "UPDATE graph_edges SET \
+                namespace = ?1, source_id = ?2, target_id = ?3, relation = ?4, weight = ?5, \
+                updated_at = ?6, deleted_at = ?7, metadata = ?8, target_backend = ?9 \
+              WHERE id = ?10 AND updated_at = ?11 AND deleted_at IS ?12 \
+                AND ?6 > updated_at"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(edge.namespace.clone()),
+            SqlValue::Text(source_id.to_string()),
+            SqlValue::Text(target_id.to_string()),
+            SqlValue::Text(edge.relation.to_string()),
+            SqlValue::Float(edge.weight),
+            SqlValue::Integer(edge.updated_at.timestamp_micros()),
+            match edge.deleted_at {
+                Some(t) => SqlValue::Integer(t.timestamp_micros()),
+                None => SqlValue::Null,
+            },
+            match metadata_str {
+                Some(m) => SqlValue::Text(m),
+                None => SqlValue::Null,
+            },
+            match &edge.target_backend {
+                Some(b) => SqlValue::Text(b.clone()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(Uuid::from(edge.id).to_string()),
+            SqlValue::Integer(expected_updated_at.timestamp_micros()),
+            match expected_deleted_at {
+                Some(value) => SqlValue::Integer(value.timestamp_micros()),
+                None => SqlValue::Null,
+            },
+        ],
+        label: Some("edge-replace-if-unchanged".to_string()),
+    }
+}
+
 /// The atomic `link` op's variant of [`edge_upsert_statement`] (ADR-099
 /// §B3). Shares the SAME
 /// `EDGE_NATURAL_KEY_CONFLICT_SET` conflict-arm text — the two builders
@@ -1363,6 +1421,22 @@ impl GraphStore for SqlGraphStore {
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn replace_edge_if_unchanged(
+        &self,
+        edge: Edge,
+        expected_updated_at: DateTime<Utc>,
+        expected_deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, StorageError> {
+        let statement =
+            edge_replace_if_unchanged_statement(&edge, expected_updated_at, expected_deleted_at);
+        self.with_writer("replace_edge_if_unchanged", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }
