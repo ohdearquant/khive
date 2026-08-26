@@ -1037,24 +1037,36 @@ fn stdio_bridge_idle_timeout_from_env() -> Option<std::time::Duration> {
 /// (an in-flight response always defers idle-close) and the session would
 /// never be reaped.
 ///
-/// Overridable via `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`; `0` disables it
-/// (an explicit opt-out, matching `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS=0`). An
-/// unparsable value falls back to the default. Default: 300s (5 minutes) —
+/// Overridable via `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`, accepted range
+/// 1..=u64::MAX seconds. Unlike `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`, this bound
+/// cannot be disabled: `0` is a startup error naming the variable, the
+/// rejected value, and the accepted range, rather than a silent opt-out — a
+/// configuration that restores an unbounded pending write restores the
+/// defect this deadline exists to close (see the type doc above). An
+/// unparsable value falls back to the default rather than erroring, matching
+/// this codebase's other `_from_env` helpers. Default: 300s (5 minutes) —
 /// long enough that legitimately slow verbs and ordinary reader backpressure
 /// never trip it, short enough that a peer that has genuinely stopped
 /// reading does not pin the session's reader-pool admission / DB connection
 /// indefinitely.
-fn stdio_bridge_response_deadline_from_env() -> Option<std::time::Duration> {
+fn stdio_bridge_response_deadline_from_env() -> anyhow::Result<std::time::Duration> {
     const DEFAULT_SECS: u64 = 300;
-    let secs = std::env::var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_SECS);
+    let secs = match std::env::var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => secs,
+            Err(_) => DEFAULT_SECS,
+        },
+        Err(_) => DEFAULT_SECS,
+    };
     if secs == 0 {
-        None
-    } else {
-        Some(std::time::Duration::from_secs(secs))
+        anyhow::bail!(
+            "KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 is not accepted: the response-delivery \
+             deadline cannot be disabled (a disabled deadline lets a peer that stops reading \
+             pin the bridge's response write forever). Set it to a positive number of seconds \
+             (accepted range: 1..=u64::MAX, default {DEFAULT_SECS})."
+        );
     }
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 impl KhiveMcpServer {
@@ -1452,7 +1464,7 @@ impl KhiveMcpServer {
 
         let root = tokio_util::sync::CancellationToken::new();
         let idle_timeout = stdio_bridge_idle_timeout_from_env();
-        let response_deadline = stdio_bridge_response_deadline_from_env();
+        let response_deadline = stdio_bridge_response_deadline_from_env()?;
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
             crate::transport::CancelOnEofTransport::with_idle_timeout(
@@ -1461,7 +1473,7 @@ impl KhiveMcpServer {
                 )),
                 root,
                 idle_timeout,
-                response_deadline,
+                Some(response_deadline),
             )
         };
 
@@ -1500,11 +1512,12 @@ impl KhiveMcpServer {
 
         let root = tokio_util::sync::CancellationToken::new();
         let (read, write) = stdio();
+        let response_deadline = stdio_bridge_response_deadline_from_env()?;
         let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(read, write),
             root.clone(),
             stdio_bridge_idle_timeout_from_env(),
-            stdio_bridge_response_deadline_from_env(),
+            Some(response_deadline),
         );
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
@@ -7955,5 +7968,39 @@ mod request_read_cancellation_tests {
                 );
             }
         }
+    }
+
+    // ── KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 must not disable the bound ──
+
+    /// #2230: the response-delivery deadline used to treat `0` as "disable
+    /// the bound", mirroring `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS=0`. Unlike the
+    /// idle timeout, an unbounded response-delivery deadline restores the
+    /// exact defect this deadline exists to close (a peer that admits a
+    /// request and stops reading pins the bridge's response write forever)
+    /// — so `0` is now a hard startup error instead of a supported opt-out.
+    #[test]
+    #[serial_test::serial]
+    fn response_deadline_from_env_rejects_zero() {
+        std::env::set_var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS", "0");
+        let result = stdio_bridge_response_deadline_from_env();
+        std::env::remove_var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS");
+
+        let error = result.expect_err(
+            "KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 must be rejected, not silently accepted \
+             as \"disable the bound\"",
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS"),
+            "error must name the offending variable: {rendered}"
+        );
+        assert!(
+            rendered.contains("=0"),
+            "error must name the rejected value: {rendered}"
+        );
+        assert!(
+            rendered.contains("1..=u64::MAX"),
+            "error must state the accepted range: {rendered}"
+        );
     }
 }
