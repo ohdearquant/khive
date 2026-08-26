@@ -2616,27 +2616,27 @@ async fn prepare_configured_storage_topology(
         // selection required for verified migration must fail without leaving
         // a new incomplete marker. The blob pack's backend mode governs
         // read-only wrapping during serving boot.
-        let blob_runtime_read_only = if base_config.packs.iter().any(|pack| pack == "blob") {
+        let blob_governing_backend = if base_config.packs.iter().any(|pack| pack == "blob") {
             match khive_cfg.packs.get("blob") {
                 Some(pack) => backends
                     .get(pack.backend.as_str())
+                    .cloned()
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "[packs.blob].backend = {:?} references an unknown backend",
                             pack.backend
                         )
-                    })?
-                    .is_read_only(),
-                None => main_backend.is_read_only(),
+                    })?,
+                None => main_backend.clone(),
             }
         } else {
-            main_backend.is_read_only()
+            main_backend.clone()
         };
         resolve_blob_hydrator_for_boot(
             &base_config,
             khive_cfg,
             main_backend.as_ref(),
-            blob_runtime_read_only,
+            blob_governing_backend.as_ref(),
         )?
     } else {
         None
@@ -2708,9 +2708,14 @@ async fn build_registry_for_multi_backend_inner(
     // hydrator `Arc` on every runtime handle this boot produces. `core()`
     // clones share each runtime's one-shot slot, so they see this same pair.
     if let Some(hydrator) = shared_hydrator {
-        default_runtime.install_blob_hydrator(Arc::clone(&hydrator))?;
+        // The shared install: the hydrator's mode was decided above from the
+        // blob pack's backend, and the receiving handles legitimately mix
+        // modes (a writable blob secondary beside a read-only main is a
+        // documented topology), so each handle's own domain-store mode must
+        // not gate this install.
+        default_runtime.install_shared_blob_hydrator(Arc::clone(&hydrator))?;
         for rt in per_pack_runtimes_local.values() {
-            rt.install_blob_hydrator(Arc::clone(&hydrator))?;
+            rt.install_shared_blob_hydrator(Arc::clone(&hydrator))?;
         }
     }
 
@@ -3453,14 +3458,25 @@ fn resolve_blob_hydrator_for_boot(
     config: &RuntimeConfig,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
-    read_only: bool,
+    governing_backend: &StorageBackend,
 ) -> anyhow::Result<Option<Arc<BlobHydrator>>> {
-    match khive_runtime::resolve_blob_store_for_mode(khive_cfg, backend, read_only) {
-        Ok(store) => Ok(Some(Arc::new(BlobHydrator::new(
-            store,
-            config.blob_hydration_bytes,
-        )?))),
-        Err(error) if khive_cfg.storage.blob.is_none() => {
+    // Resolution and construction are fused inside the runtime so the mode
+    // is DERIVED from the governing backend's own access mode (the backend
+    // the blob pack maps to, ADR-160 D3) rather than declared here, and the
+    // hydrator comes back stamped as governed — the only kind the shared
+    // install seam accepts. Read-only derivation opens an existing root and
+    // never creates one; the extra wrap over an already-wrapped store is
+    // documented harmless (reads delegate, mutators refuse).
+    match BlobHydrator::resolve_for_governing_backend(
+        khive_cfg,
+        backend,
+        governing_backend,
+        config.blob_hydration_bytes,
+    ) {
+        Ok(hydrator) => Ok(Some(Arc::new(hydrator))),
+        Err(khive_runtime::GovernedBlobError::Resolve(error))
+            if khive_cfg.storage.blob.is_none() =>
+        {
             tracing::debug!(
                 error = %error,
                 "no usable BlobStore for this backend and no [storage.blob] configured; \
@@ -3486,12 +3502,8 @@ pub async fn build_single_backend_runtime(
     let backend = Arc::new(open_single_backend(&config)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
-    let hydrator = resolve_blob_hydrator_for_boot(
-        &config,
-        khive_cfg,
-        backend.as_ref(),
-        backend.is_read_only(),
-    )?;
+    let hydrator =
+        resolve_blob_hydrator_for_boot(&config, khive_cfg, backend.as_ref(), backend.as_ref())?;
     crate::attachment_cutover::coordinate_attachment_cutover(
         Arc::clone(&backend),
         hydrator.clone(),
@@ -3533,7 +3545,7 @@ async fn prepare_single_backend_for_schema_admin(
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator = if schema_admin_requires_blob_hydrator(Arc::clone(&backend)).await? {
-        resolve_blob_hydrator_for_boot(config, khive_cfg, backend.as_ref(), backend.is_read_only())?
+        resolve_blob_hydrator_for_boot(config, khive_cfg, backend.as_ref(), backend.as_ref())?
     } else {
         None
     };
@@ -3559,14 +3571,22 @@ async fn prepare_core_schema_for_boot(
 /// application-assisted V21 attachment cutover. Production host boot should use
 /// [`build_single_backend_runtime`], [`build_server`], or the async multi-backend
 /// builders instead. Calling this helper is sound only when `backend` is the
-/// runtime's backend and its attachment-cutover status is already `Complete`.
+/// runtime's backend and its attachment-cutover status is already `Complete`;
+/// the same-backend precondition is now enforced by identity rather than
+/// documented, since the resolved mode derives from `backend` and a mismatch
+/// would silently resolve the wrong store mode for the receiving runtime.
 pub fn install_resolved_blob_store(
     rt: &KhiveRuntime,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
 ) -> anyhow::Result<Option<Arc<BlobHydrator>>> {
-    let hydrator =
-        resolve_blob_hydrator_for_boot(rt.config(), khive_cfg, backend, rt.is_read_only())?;
+    if !std::ptr::eq(rt.backend(), backend) {
+        anyhow::bail!(
+            "install_resolved_blob_store requires the runtime's own backend: the supplied \
+             backend reference is not the runtime's"
+        );
+    }
+    let hydrator = resolve_blob_hydrator_for_boot(rt.config(), khive_cfg, backend, backend)?;
     if let Some(hydrator) = hydrator.as_ref() {
         rt.install_blob_hydrator(Arc::clone(hydrator))?;
     }
@@ -6113,6 +6133,64 @@ region = "us-east-1"
             debug.contains("S3BlobStore"),
             "expected the installed store to be an S3BlobStore, got: {debug}"
         );
+    }
+
+    /// A read-only runtime resolving an EXISTING blob root must be able to
+    /// install it for bounded reads: the boot helper's hydrator carries its
+    /// mode from construction, so the runtime's read-only install seam
+    /// accepts it, serves reads, and refuses mutation. Without the
+    /// mode-aware construction, the install refuses the hydrator the boot
+    /// just resolved and a read-only snapshot cannot serve blobs at all.
+    #[tokio::test]
+    #[serial]
+    async fn install_resolved_blob_store_read_only_runtime_gets_bounded_reads() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        use khive_storage::BlobStore as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let main_path = dir.path().join("snapshot.db");
+        prepare_current_snapshot_source(&main_path);
+
+        // Seed an existing root while writable; the read-only boot below
+        // must open it without creating anything.
+        let blob_root = dir.path().join("blobs");
+        let seeded = {
+            let seed_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_root.clone(), 0).expect("seed store");
+            seed_store.put(b"seed".to_vec()).await.expect("seed put")
+        };
+
+        let khive_cfg = KhiveConfig {
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::Fs {
+                    root: Some(blob_root.display().to_string()),
+                    floor_bytes: Some(0),
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let backend =
+            Arc::new(StorageBackend::sqlite_read_only(&main_path).expect("read-only backend"));
+        assert!(backend.is_read_only());
+        let runtime = khive_runtime::KhiveRuntime::from_backend(
+            Arc::clone(&backend),
+            base_runtime_config_for_multi_backend(),
+        );
+        assert!(runtime.is_read_only());
+
+        let _hydrator = install_resolved_blob_store(&runtime, &khive_cfg, backend.as_ref())
+            .expect("a read-only runtime must install its resolved existing root")
+            .expect("the configured root resolves to a store");
+
+        let installed = runtime.blob_store().expect("installed store");
+        assert!(
+            installed.exists(&seeded).await.expect("exists"),
+            "bounded reads must be served from the existing root"
+        );
+        let err = installed
+            .put(b"post".to_vec())
+            .await
+            .expect_err("mutation must refuse on the read-only snapshot");
+        assert!(err.to_string().contains("read-only"), "{err}");
     }
 
     /// Positive counterpart to `multi_backend_boot_wires_configured_s3_blob_store`:

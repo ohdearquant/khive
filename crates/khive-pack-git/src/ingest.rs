@@ -713,7 +713,7 @@ async fn resolve_id(
     runtime
         .resolve_prefix_unfiltered(raw)
         .await
-        .map_err(|e| anyhow!("{e}"))
+        .map_err(anyhow::Error::new)
 }
 
 /// Resolve `raw` (a full UUID or an 8+ hex prefix) to an existing `project`
@@ -727,7 +727,7 @@ pub async fn resolve_project_id(runtime: &KhiveRuntime, raw: &str) -> Result<Opt
     runtime
         .resolve_prefix_unfiltered(raw)
         .await
-        .map_err(|e| anyhow!("{e}"))
+        .map_err(anyhow::Error::new)
 }
 
 /// Find an existing `issue` or `pull_request` note by `properties.number`
@@ -996,7 +996,7 @@ async fn find_commit_by_sha(
     sha: &str,
 ) -> Result<Option<Uuid>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_row(SqlStatement {
             sql: "SELECT id FROM notes WHERE kind='commit' AND namespace=?1 \
@@ -1009,7 +1009,7 @@ async fn find_commit_by_sha(
             label: Some("git_ingest_find_commit_by_sha".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
     Ok(row.and_then(|r| row_uuid(&r)))
 }
 
@@ -1024,7 +1024,7 @@ async fn find_by_number(
     number: u64,
 ) -> Result<Option<Uuid>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_row(SqlStatement {
             sql: "SELECT id FROM notes WHERE kind=?1 AND namespace=?2 \
@@ -1040,7 +1040,7 @@ async fn find_by_number(
             label: Some("git_ingest_find_by_number".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
     Ok(row.and_then(|r| row_uuid(&r)))
 }
 
@@ -1083,7 +1083,7 @@ async fn find_document_for_path(
     let namespace = token.namespace().as_str().to_string();
     let like_pattern = format!("%{}", escape_like(path));
 
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_row(SqlStatement {
             sql: "SELECT id FROM entities WHERE kind='document' AND namespace=?1 \
@@ -1103,7 +1103,7 @@ async fn find_document_for_path(
             label: Some("git_ingest_find_document_for_path".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
     Ok(row.and_then(|r| row_uuid(&r)))
 }
 
@@ -1117,7 +1117,7 @@ async fn load_code_modules_by_snapshot_path(
     source_revision: &str,
 ) -> Result<HashMap<String, Option<Uuid>>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
             sql: "SELECT id, json_extract(properties,'$.source_path') AS source_path \
@@ -1134,7 +1134,7 @@ async fn load_code_modules_by_snapshot_path(
             label: Some("git_ingest_load_code_modules_by_snapshot_path".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
 
     let mut modules: HashMap<String, Option<Uuid>> = HashMap::new();
     for row in rows {
@@ -1161,7 +1161,7 @@ async fn read_cursor(
     kind: &str,
 ) -> Result<Option<String>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_row(SqlStatement {
             sql: "SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind=?2"
@@ -1173,7 +1173,7 @@ async fn read_cursor(
             label: Some("git_ingest_read_cursor".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
     Ok(row.and_then(|r| match r.get("cursor_value") {
         Some(SqlValue::Text(s)) => Some(s.clone()),
         _ => None,
@@ -1190,7 +1190,7 @@ async fn write_cursor(
     value: &str,
 ) -> Result<()> {
     let sql = runtime.sql();
-    let mut w = sql.writer().await.map_err(|e| anyhow!("{e}"))?;
+    let mut w = sql.writer().await.map_err(anyhow::Error::new)?;
     w.execute(SqlStatement {
         sql: "INSERT INTO git_mirror_cursor(project_id, kind, cursor_value, updated_at) \
               VALUES(?1, ?2, ?3, ?4) \
@@ -1207,7 +1207,7 @@ async fn write_cursor(
         label: Some("git_ingest_write_cursor".into()),
     })
     .await
-    .map_err(|e| anyhow!("{e}"))?;
+    .map_err(anyhow::Error::new)?;
     Ok(())
 }
 
@@ -2123,7 +2123,7 @@ async fn count_commit_notes_for_project(
     project_id: Uuid,
 ) -> Result<u64> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_scalar(SqlStatement {
             sql: "SELECT COUNT(*) FROM notes n \
@@ -2138,7 +2138,7 @@ async fn count_commit_notes_for_project(
             label: Some("git_ingest_count_commit_notes".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(anyhow::Error::new)?;
     match row {
         Some(SqlValue::Integer(n)) => Ok(n as u64),
         _ => Ok(0),
