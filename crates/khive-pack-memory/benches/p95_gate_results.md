@@ -36,8 +36,11 @@ performance-gate contract is the self-contained threshold and methodology in
   is asserted clean (non-degraded, non-empty); the ANN-warm event count is snapshotted
   immediately before and after the 200-call window and asserted unchanged. The harness
   panics immediately if either check fails. The settle call can enqueue but does not
-  await a detached rebuild; if that work overlaps timing, the event-count check rejects
-  the run as potentially contaminated and it must be repeated after quiescence.
+  await a detached rebuild; if that work overlaps timing and its `memory.ann_warm`
+  events persist, the event-count check rejects the run as potentially contaminated
+  and it must be repeated after quiescence. Event emission is best-effort (a missing
+  event store, serialization failure, or append failure only logs a warning), so an
+  overlap whose events fail to persist is an evidence gap this check cannot see.
 - Machine: Apple M2 Max, macOS 27.0, arm64.
 - Commit: 7b55beea3 (branch `p95-bench-harness`, the harness code measured below).
 

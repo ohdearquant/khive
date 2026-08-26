@@ -55,10 +55,13 @@
 //! The harness sleeps past that debounce interval and makes one settle recall
 //! (`EPOCH_DEBOUNCE_SETTLE`) before opening the timed window, which makes a due epoch
 //! check enqueue its rebuild before the event-count snapshot. The rebuild is detached:
-//! the settle recall does not await its completion. If it remains in flight and emits
-//! events during the timed window, the event-count assertion rejects that run (a
-//! possible maintenance false positive) rather than silently accepting contaminated
-//! measurements. Rerun after the background work reaches quiescence.
+//! the settle recall does not await its completion. If it remains in flight and its
+//! `memory.ann_warm` events persist during the timed window, the event-count assertion
+//! rejects that run (a possible maintenance false positive) rather than silently
+//! accepting contaminated measurements. Rerun after the background work reaches
+//! quiescence. Emission is best-effort (`emit_ann_warm_phase_event` warns and returns
+//! on a missing event store, serialization failure, or append failure), so an overlap
+//! whose events fail to persist evades this check — an accepted evidence gap.
 //!
 //! The residual gap: an exact-fallback on the very last timed sample, with no subsequent
 //! call in the window to reveal the resulting rebuild, would not be caught. Closing that
