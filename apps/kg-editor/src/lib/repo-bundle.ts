@@ -569,28 +569,46 @@ export type RepoPage<T> = {
 export type RepoModule = RepoBundle["graph"]["modules"]["items"][number];
 
 // Bundles may carry duplicate source paths (IDs disambiguate), so accessible
-// names for module controls append a short module-ID suffix — but only for
-// the colliding paths, keeping unique-path labels stable. The duplicate set
-// is derived once per module map and cached by map identity.
-const duplicateSourcePathCache = new WeakMap<object, Set<string>>();
+// names for module controls append a module-ID suffix — but only for the
+// colliding paths, keeping unique-path labels stable. The suffix length grows
+// per colliding group until every member's suffix is distinct (full-ID
+// uniqueness is schema-enforced, so a distinguishing length always exists).
+// The id → suffix map is derived once per module map and cached by map
+// identity.
+const disambiguationSuffixCache = new WeakMap<object, Map<string, string>>();
+
+function disambiguationSuffixes(
+  moduleById: ReadonlyMap<string, Pick<RepoModule, "id" | "source_path">>,
+): Map<string, string> {
+  const cached = disambiguationSuffixCache.get(moduleById);
+  if (cached) return cached;
+  const idsByPath = new Map<string, string[]>();
+  for (const entry of moduleById.values()) {
+    const group = idsByPath.get(entry.source_path);
+    if (group) group.push(entry.id);
+    else idsByPath.set(entry.source_path, [entry.id]);
+  }
+  const suffixes = new Map<string, string>();
+  for (const group of idsByPath.values()) {
+    if (group.length < 2) continue;
+    const maxLength = Math.max(...group.map((id) => id.length));
+    let length = 8;
+    for (; length < maxLength; length += 1) {
+      if (new Set(group.map((id) => id.slice(-length))).size === group.length) break;
+    }
+    for (const id of group) suffixes.set(id, id.slice(-length));
+  }
+  disambiguationSuffixCache.set(moduleById, suffixes);
+  return suffixes;
+}
 
 export function moduleInspectLabel(
   moduleById: ReadonlyMap<string, Pick<RepoModule, "id" | "source_path">>,
   moduleNode: Pick<RepoModule, "id" | "source_path">,
 ): string {
-  let duplicated = duplicateSourcePathCache.get(moduleById);
-  if (!duplicated) {
-    duplicated = new Set<string>();
-    const seen = new Set<string>();
-    for (const entry of moduleById.values()) {
-      if (seen.has(entry.source_path)) duplicated.add(entry.source_path);
-      else seen.add(entry.source_path);
-    }
-    duplicateSourcePathCache.set(moduleById, duplicated);
-  }
+  const suffix = disambiguationSuffixes(moduleById).get(moduleNode.id);
   const base = `Inspect ${moduleNode.source_path}`;
-  if (!duplicated.has(moduleNode.source_path)) return base;
-  return `${base} (${moduleNode.id.slice(-8)})`;
+  return suffix === undefined ? base : `${base} (${suffix})`;
 }
 export type RepoCommit = RepoBundle["graph"]["commits"]["items"][number];
 export type ViewId = keyof RepoBundle["capability"]["views"];

@@ -92,6 +92,24 @@ describe("khive.repo.v1 browser contract", () => {
     expect(moduleInspectLabel(byId, modules[2])).toBe("Inspect crates/c.rs");
   });
 
+  it("widens the suffix until colliding last-eight-character ids are distinct", () => {
+    const modules = [
+      { id: "khive:module:sha256:aaaa0000deadbeef", source_path: "crates/a.rs" },
+      { id: "khive:module:sha256:bbbb0000deadbeef", source_path: "crates/a.rs" },
+      { id: "khive:module:sha256:cccc3333", source_path: "crates/c.rs" },
+    ];
+    const byId = new Map(modules.map((module) => [module.id, module]));
+
+    const labels = [
+      moduleInspectLabel(byId, modules[0]),
+      moduleInspectLabel(byId, modules[1]),
+    ];
+    expect(new Set(labels).size).toBe(2);
+    expect(labels[0]).toBe("Inspect crates/a.rs (a0000deadbeef)");
+    expect(labels[1]).toBe("Inspect crates/a.rs (b0000deadbeef)");
+    expect(moduleInspectLabel(byId, modules[2])).toBe("Inspect crates/c.rs");
+  });
+
   it("rejects duplicate module identifiers", () => {
     const value = goldenValue() as {
       graph: { modules: { items: Array<{ id: string }> } };
