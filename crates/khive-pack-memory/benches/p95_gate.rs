@@ -41,8 +41,9 @@
 //! `KhiveRuntime::events`, a `pub` accessor returning `khive_storage::EventStore`
 //! (`count_events`/`query_events` are both `pub` trait methods). This harness uses that:
 //! it snapshots the `memory.ann_warm` event count immediately before the timed loop and
-//! again immediately after, and asserts the count is unchanged. No ANN rebuild happens
-//! without one of these events, and the internal sqlite-vec exact-fallback path (taken
+//! again immediately after, and asserts the count is unchanged. Every ANN rebuild
+//! attempts one of these events (emission is best-effort — see the wrinkle below),
+//! and the internal sqlite-vec exact-fallback path (taken
 //! only after an ANN search error) clears the model's cached graph as a side effect, so
 //! the *next* recall for that model would trigger exactly such a rebuild — making a
 //! zero-event-count window strong (though not airtight) evidence that none of the timed
@@ -59,9 +60,13 @@
 //! `memory.ann_warm` events persist during the timed window, the event-count assertion
 //! rejects that run (a possible maintenance false positive) rather than silently
 //! accepting contaminated measurements. Rerun after the background work reaches
-//! quiescence. Emission is best-effort (`emit_ann_warm_phase_event` warns and returns
-//! on a missing event store, serialization failure, or append failure), so an overlap
-//! whose events fail to persist evades this check — an accepted evidence gap.
+//! quiescence. Emission is best-effort, per arm of `emit_ann_warm_phase_event`: a
+//! missing event store returns without logging (this harness's count oracle itself
+//! requires the store, so that arm aborts the run rather than passing it), a
+//! serialization failure logs a warning and returns, and an `append_event` failure
+//! logs a warning while the rebuild completes without a persisted event. An overlap
+//! whose events fail to persist therefore evades this check — an accepted evidence
+//! gap, limited to failures that leave the count oracle usable.
 //!
 //! The residual gap: an exact-fallback on the very last timed sample, with no subsequent
 //! call in the window to reveal the resulting rebuild, would not be caught. Closing that
@@ -100,8 +105,9 @@ const RECALL_ITERS: usize = 200;
 /// `#[cfg(test)]` build (5s). One settle sleep of longer than this, followed by one more
 /// recall, makes any epoch-check due since seeding enqueue its detached background
 /// rebuild before the timed-window event snapshot. It does not await that rebuild; if
-/// `memory.ann_warm` events land during timing, the event-count assertion below rejects
-/// the run as potentially contaminated.
+/// `memory.ann_warm` events persist during timing, the event-count assertion below
+/// rejects the run as potentially contaminated (emission is best-effort; see the
+/// module docs for the evidence gap).
 const EPOCH_DEBOUNCE_SETTLE: Duration = Duration::from_millis(5_200);
 
 /// Bounded attempts while polling for a stable warm ANN route before timing starts.
@@ -374,7 +380,8 @@ async fn bench_configuration(config: &GateConfig) -> Percentiles {
     // Let any durable-epoch debounce check already due from seeding fire (see
     // EPOCH_DEBOUNCE_SETTLE) before opening the timed window, then confirm one more clean
     // call. That call can enqueue a detached rebuild but cannot await it; the event-count
-    // assertion below rejects the run if that maintenance overlaps the timed window.
+    // assertion below rejects the run if that maintenance persists `memory.ann_warm`
+    // events inside the timed window (emission is best-effort; see the module docs).
     tokio::time::sleep(EPOCH_DEBOUNCE_SETTLE).await;
     let (_us, settle_resp) = recall_once(&registry, config.recall_model).await;
     assert!(

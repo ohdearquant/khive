@@ -38,9 +38,13 @@ performance-gate contract is the self-contained threshold and methodology in
   panics immediately if either check fails. The settle call can enqueue but does not
   await a detached rebuild; if that work overlaps timing and its `memory.ann_warm`
   events persist, the event-count check rejects the run as potentially contaminated
-  and it must be repeated after quiescence. Event emission is best-effort (a missing
-  event store, serialization failure, or append failure only logs a warning), so an
-  overlap whose events fail to persist is an evidence gap this check cannot see.
+  and it must be repeated after quiescence. Event emission is best-effort, per arm: a
+  missing event store returns without logging (the harness's own count oracle requires
+  the store, so that arm aborts the run rather than passing it), a serialization
+  failure logs a warning and returns, and an append failure logs a warning while the
+  rebuild completes without a persisted event. An overlap whose events fail to persist
+  is therefore an evidence gap this check cannot see, limited to failures that leave
+  the count oracle usable.
 - Machine: Apple M2 Max, macOS 27.0, arm64.
 - Commit: 7b55beea3 (branch `p95-bench-harness`, the harness code measured below).
 
@@ -55,8 +59,9 @@ That marker does not cover the internal sqlite-vec exact-fallback path (taken on
 an ANN search error), which returns valid, non-degraded results. To positively assert
 against that path too, the harness uses a second, independent signal: `memory.ann_warm`
 phase-started/completed events, recorded through `KhiveRuntime::events` (a `pub` accessor
-returning `khive_storage::EventStore`; `count_events` is a `pub` trait method). No ANN
-rebuild happens without one of these events, and the sqlite-vec fallback clears the
+returning `khive_storage::EventStore`; `count_events` is a `pub` trait method). Every ANN
+rebuild attempts one of these events (emission is best-effort; see the caveat in the
+methodology note above), and the sqlite-vec fallback clears the
 model's cached graph as a side effect — the _next_ recall for that model would trigger
 exactly such a rebuild. The harness snapshots this event count immediately before and
 after the 200-call timed window and asserts it is unchanged, which is strong (though not
