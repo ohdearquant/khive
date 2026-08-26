@@ -3134,7 +3134,7 @@ mod tests {
         drop(held);
     }
 
-    /// #2230 review round 2 (Medium): a well-formed [`DaemonResponseFrame`]
+    /// Regression (#2230): a well-formed [`DaemonResponseFrame`]
     /// that is not the unambiguous probe-ack sentinel — e.g. one reporting a
     /// `config_mismatch` for a *different* config_id, exactly what a live
     /// khived serving another store would send back — must not be treated as

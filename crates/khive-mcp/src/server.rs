@@ -7586,7 +7586,7 @@ mod request_read_cancellation_tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
     }
 
-    /// #2230 review round 2 (Medium): a request must stay "in flight" — and
+    /// Regression (#2230): a request must stay "in flight" — and
     /// therefore protected from the idle-close branch — until its response
     /// has actually *finished writing*, not merely been handed to
     /// `inner.send`. rmcp spawns the response send and the framed write
@@ -7668,7 +7668,7 @@ mod request_read_cancellation_tests {
         }
     }
 
-    /// #2230 review round 2 (Medium): while an admitted request is still
+    /// Regression (#2230): while an admitted request is still
     /// running, deferring the idle close must not discard a second request
     /// that arrives fragmented across the deferred window. Before the fix,
     /// each deferral called `self.inner.receive()` fresh; rmcp's line-buffered
