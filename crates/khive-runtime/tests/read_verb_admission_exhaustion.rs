@@ -107,6 +107,53 @@ impl EventStore for MemoryEventStore {
     }
 }
 
+/// Minimal pack exercising one allowlisted read (`get`, `Assertive`) whose
+/// dispatch always fails — used to prove a FAILED allowlisted read never
+/// takes the admission-degrade path (khive#2228 M1): only a *successful*
+/// dispatch of an allowlisted read may degrade its audit obligation, never a
+/// `DispatchFailed` one.
+struct BetaPack;
+
+impl Pack for BetaPack {
+    const NAME: &'static str = "beta";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+        name: "get",
+        description: "get a widget (always fails, for regression coverage)",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    }];
+}
+
+#[async_trait]
+impl PackRuntime for BetaPack {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+    fn note_kinds(&self) -> &'static [&'static str] {
+        Self::NOTE_KINDS
+    }
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        Self::ENTITY_KINDS
+    }
+    fn handlers(&self) -> &'static [HandlerDef] {
+        Self::HANDLERS
+    }
+    async fn dispatch(
+        &self,
+        _verb: &str,
+        _params: Value,
+        _registry: &khive_runtime::pack::VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::NotFound(
+            "widget intentionally missing for test".into(),
+        ))
+    }
+}
+
 /// Minimal pack exercising one read (`list`, `Assertive`) and one write
 /// (`create`, `Commissive`) verb, neither doing any real domain work.
 struct AlphaPack;
@@ -413,6 +460,160 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
             .audit_admission_unresolved_obligations,
         Some(audit_admission_unresolved_obligation_count()),
         "the real db_diagnostics handler path must surface the unresolved-obligation count"
+    );
+
+    drop(occupant);
+}
+
+/// khive#2228 M1: a FAILED dispatch of an allowlisted read verb must stay on
+/// the strict obligation path even when the audit lane is under the exact
+/// same `QueueAdmissionExhausted` pressure that degrades a *successful*
+/// allowlisted read's obligation in
+/// `read_verb_dispatch_survives_audit_lane_admission_exhaustion` above. The
+/// dispatch itself still surfaces its original handler error (unrelated to
+/// audit accounting), but the admission-degrade counters must not move for
+/// this row — a `DispatchFailed` producer is never admission-degrade
+/// eligible, no matter what `VerbRegistry::admission_degrade_safe` says
+/// about the verb name alone.
+#[serial]
+#[tokio::test]
+async fn failed_allowlisted_read_does_not_degrade_on_admission_exhaustion() {
+    let store = Arc::new(MemoryEventStore::default());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(BetaPack);
+    builder.with_event_store(store);
+    builder.with_audit_batch_config(AuditBatchConfig {
+        max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("registry builds");
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("event store configured, so the batch seam is too");
+
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let occupant_batch = audit_batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.occupant"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snap = audit_batch.test_snapshot();
+        snap.pending_rows == 0 && snap.in_flight_generation.is_some()
+    })
+    .await;
+
+    let filler_batch = audit_batch.clone();
+    let filler = tokio::spawn(async move {
+        filler_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.filler"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        audit_batch.test_snapshot().pending_rows == 1
+    })
+    .await;
+
+    // The audit lane is now saturated. `get` is on `ADMISSION_DEGRADE_SAFE_VERBS`
+    // and registered `Assertive`, so `admission_degrade_safe("get")` is true —
+    // but BetaPack's handler always returns `Err`, so the producer is
+    // `DispatchFailed`. That must stay obligation-bearing: the dispatch fails
+    // with its own handler error (via `fold_audit_obligation`/the direct
+    // handler error path), and the admission-degrade counters must not move.
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
+    let err = registry
+        .dispatch("get", Value::Null)
+        .await
+        .expect_err("a failed allowlisted read must still surface its handler error");
+    assert!(
+        err.to_string().contains("widget intentionally missing"),
+        "the original handler error must be preserved, not replaced by an audit error: {err}"
+    );
+    assert_eq!(
+        audit_admission_refused_obligation_count(),
+        before_refused,
+        "a DispatchFailed row must never be counted on the admission-degrade \
+         refused counter, even for an allowlisted verb name"
+    );
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved,
+        "a DispatchFailed row must never be counted on the admission-degrade \
+         unresolved counter, even for an allowlisted verb name"
+    );
+
+    drop(occupant);
+    drop(filler);
+}
+
+/// khive#2228 M1: the `AdmissionDeadlineExpired` counterpart of
+/// `failed_allowlisted_read_does_not_degrade_on_admission_exhaustion` above —
+/// a FAILED allowlisted read's own audit row enqueues and then times out
+/// waiting on its admission deadline, rather than being refused before
+/// enqueue. That must also stay obligation-bearing: no admission-degrade
+/// counter may move for a `DispatchFailed` producer.
+#[serial]
+#[tokio::test]
+async fn failed_allowlisted_read_does_not_degrade_on_admission_deadline_expiry() {
+    let store = Arc::new(MemoryEventStore::default());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(BetaPack);
+    builder.with_event_store(store);
+    builder.with_audit_batch_config(AuditBatchConfig {
+        max_pending_rows: std::num::NonZeroUsize::new(4).unwrap(),
+        admission_deadline: std::time::Duration::from_millis(30),
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("registry builds");
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("event store configured, so the batch seam is too");
+
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let occupant_batch = audit_batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.occupant"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snap = audit_batch.test_snapshot();
+        snap.pending_rows == 0 && snap.in_flight_generation.is_some()
+    })
+    .await;
+
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
+    let err = registry
+        .dispatch("get", Value::Null)
+        .await
+        .expect_err("a failed allowlisted read must still surface its handler error");
+    assert!(
+        err.to_string().contains("widget intentionally missing"),
+        "the original handler error must be preserved, not replaced by an audit error: {err}"
+    );
+    assert_eq!(
+        audit_admission_refused_obligation_count(),
+        before_refused,
+        "a DispatchFailed row must never be counted on the admission-degrade \
+         refused counter, even for an allowlisted verb name"
+    );
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved,
+        "a DispatchFailed row must never be counted on the admission-degrade \
+         unresolved counter, even for an allowlisted verb name"
     );
 
     drop(occupant);

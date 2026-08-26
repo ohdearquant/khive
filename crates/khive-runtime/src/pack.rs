@@ -3654,16 +3654,19 @@ async fn persist_git_digest_receipt(
 /// neither a swallowed observability failure nor a propagated obligation
 /// failure.
 ///
-/// `is_read_only_verb` (khive#2147/khive#2217) narrows that obligation for
-/// one specific case: a `DispatchSucceeded`/`DispatchFailed` row for a verb
-/// that [`VerbRegistry::admission_degrade_safe`] has explicitly opted in
-/// (Assertive alone is not a sufficient signal — see that method's doc)
-/// performs no domain write, so this row's own admission being transiently
-/// refused or timed out (`AuditTerminalReason::QueueAdmissionExhausted` /
-/// `AdmissionDeadlineExpired`) degrades to best-effort instead of failing the
-/// dispatch — the caller-visible read result is preserved. Every other
-/// obligation failure, and every failure for a non-opted-in verb, is
-/// unaffected.
+/// `degrade_allowlisted` (khive#2147/khive#2217) narrows that obligation for
+/// one specific case: a *successful* dispatch (`AuditProducer::DispatchSucceeded`)
+/// for a verb that [`VerbRegistry::admission_degrade_safe`] has explicitly
+/// opted in (Assertive alone is not a sufficient signal — see that method's
+/// doc) performs no domain write, so this row's own admission being
+/// transiently refused or timed out (`AuditTerminalReason::QueueAdmissionExhausted`
+/// / `AdmissionDeadlineExpired`) degrades to best-effort instead of failing
+/// the dispatch — the caller-visible read result is preserved. This function
+/// derives eligibility from `producer` itself rather than trusting the
+/// caller's `degrade_allowlisted` answer in isolation, so a `DispatchFailed`
+/// row can never take the degrade path no matter what a caller passes: every
+/// failed dispatch, every write verb, every gate-denial/unknown-verb/git.digest
+/// row stays strictly obligation-bearing.
 ///
 /// When the registry has an audit-batch seam configured (it is whenever
 /// `store` is), the row routes through
@@ -3678,13 +3681,15 @@ async fn append_audit_event_best_effort(
     event: Event,
     verb: &str,
     producer: crate::audit_batch::AuditProducer,
-    is_read_only_verb: bool,
+    degrade_allowlisted: bool,
 ) -> Result<(), RuntimeError> {
     use crate::audit_batch::{
-        classify, AuditBatchControl, AuditProductionClass, AuditTerminalReason,
+        classify, AuditBatchControl, AuditProducer, AuditProductionClass, AuditTerminalReason,
     };
 
     let is_obligation = classify(producer) == AuditProductionClass::DispatchObligation;
+    let admission_degrade_eligible =
+        degrade_allowlisted && producer == AuditProducer::DispatchSucceeded;
 
     if let Some(audit_batch) = audit_batch {
         if let Err(reason) = audit_batch
@@ -3707,7 +3712,7 @@ async fn append_audit_event_best_effort(
                 // `AdmissionDeadlineExpired` was already enqueued and may still
                 // commit later — see `AuditTerminalReason::AdmissionDeadlineExpired`'s
                 // own doc.
-                if is_read_only_verb {
+                if admission_degrade_eligible {
                     match reason {
                         AuditTerminalReason::QueueAdmissionExhausted => {
                             AUDIT_ADMISSION_REFUSED_OBLIGATIONS
