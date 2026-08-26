@@ -312,6 +312,8 @@ pub(super) fn decode_embedding(blob: &[u8]) -> Vec<f32> {
     if !blob.len().is_multiple_of(4) {
         return Vec::new();
     }
+    // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     blob.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
