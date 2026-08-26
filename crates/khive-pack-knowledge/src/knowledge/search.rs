@@ -2813,17 +2813,26 @@ mod tests {
         );
     }
 
-    /// Companion to the boundary test above: prove the wall-clock SQLite
-    /// cancellation path end to end. The statement is structurally slow (a
-    /// 1000^3 cross join — billions of row operations on any machine), so a
-    /// short real deadline reliably expires while the read is IN FLIGHT
-    /// inside SQLite, exercising deadline capture, the progress-handler
-    /// interrupt, cleanup, and the typed timeout — none of which the
-    /// paused-clock test can reach. A single statement crossing its deadline
-    /// yields an all-or-nothing `StorageError::Timeout`, the pre-fix
-    /// OR-joined query's failure mode.
+    /// Companion to the boundary test above: prove that a wall-clock
+    /// deadline expiring during this pack's read path surfaces the typed
+    /// `StorageError::Timeout` — never an untyped error — end to end through
+    /// the runtime's reader surface. The statement is structurally slow (a
+    /// 1000^3 cross join — billions of row operations on any machine), so
+    /// the deadline expires long before it could complete.
+    ///
+    /// Scope: which arm of the deadline machinery fires is scheduling-
+    /// dependent — the deadline can latch at reader checkout, at read
+    /// registration, or mid-statement via the progress handler — and every
+    /// arm must yield the same typed timeout, which is exactly this test's
+    /// assertion. The mid-statement arm specifically (progress-handler
+    /// interrupt of an executing statement, proven by a probe that counts
+    /// progress callbacks) is deterministically covered where the mechanism
+    /// lives: `request_deadline_interrupts_statement_without_outer_timeout`
+    /// in `crates/khive-db/src/sql_bridge.rs`, whose probe assertion fails
+    /// if SQLite work never started. This test does not re-prove the
+    /// in-flight arm; it pins the pack-visible contract over all arms.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn in_flight_read_surfaces_typed_timeout_under_wall_clock_deadline() {
+    async fn wall_clock_deadline_on_pack_read_path_surfaces_typed_timeout() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
         let deadline = std::time::Duration::from_millis(50);
         let result = khive_storage::scope_request_read_deadline(deadline, async {
@@ -2837,15 +2846,15 @@ mod tests {
                           FROM numbers AS a CROSS JOIN numbers AS b CROSS JOIN numbers AS c"
                         .into(),
                     params: vec![],
-                    label: Some("knowledge-in-flight-deadline-probe".into()),
+                    label: Some("knowledge-deadline-probe".into()),
                 })
                 .await
         })
         .await;
         assert!(
             matches!(result, Err(khive_storage::StorageError::Timeout { .. })),
-            "an in-flight read crossing the wall-clock deadline must surface \
-             the typed timeout after interrupt cleanup; got {result:?}"
+            "a read crossing the wall-clock deadline must surface the typed \
+             timeout whichever deadline arm fires; got {result:?}"
         );
     }
 
