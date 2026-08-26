@@ -511,7 +511,9 @@ pub struct EntityDraft {
 
 /// Structured patch for modifying an existing entity via a proposal.
 ///
-/// Absent fields mean "leave unchanged". Setting `description` to `null` clears it.
+/// Absent fields mean "leave unchanged". Setting `description` or
+/// `entity_type` to `null` explicitly clears it; a string `entity_type` sets
+/// it, validated against the kind's registered vocabulary at apply time.
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProposalEntityPatch {
@@ -592,7 +594,8 @@ pub enum ProposalChangeset {
     AddEntity {
         entity: EntityDraft,
     },
-    /// Modify an existing entity's properties / tags / description.
+    /// Modify an existing entity's properties / tags / description / entity
+    /// type (absent = unchanged, null = clear, string = set-and-validate).
     UpdateEntity {
         id: Id128,
         patch: ProposalEntityPatch,
