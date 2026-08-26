@@ -154,6 +154,28 @@ pub enum StorageError {
         max_age_secs: u64,
     },
 
+    /// A cached read-only handle's admitted transaction pinned a WAL
+    /// snapshot past `read_tx_max_age`, and the proactive rollback used to
+    /// end the eviction (#1846) did not restore autocommit, or the rollback
+    /// itself failed. The connection is discarded either way rather than
+    /// returned to the pool. The age check that triggered this still ran
+    /// before any read on the connection, so — exactly like
+    /// [`StorageError::ReadTransactionAgeEvicted`] — retrying the caller's
+    /// operation on a fresh connection is always safe; this variant exists
+    /// only to keep that guarantee distinguishable from a clean eviction in
+    /// the rendered message and to keep [`StorageError::Transaction`] (whose
+    /// other cases are not uniformly safe to retry) out of this path.
+    #[error(
+        "cached read-only transaction exceeded the maximum read-transaction age \
+         ({max_age_secs}s) during {operation} but could not be cleanly rolled back \
+         ({message}); the connection was discarded, retry to open a fresh read snapshot"
+    )]
+    ReadTransactionAgeEvictionCleanupFailed {
+        operation: Cow<'static, str>,
+        max_age_secs: u64,
+        message: String,
+    },
+
     #[error("serialization failure in {capability:?}: {message}")]
     Serialization {
         capability: StorageCapability,
@@ -264,6 +286,7 @@ impl StorageError {
             | Self::AdmissionTimeout { .. }
             | Self::Transaction { .. }
             | Self::ReadTransactionAgeEvicted { .. }
+            | Self::ReadTransactionAgeEvictionCleanupFailed { .. }
             | Self::WriteQueueFull { .. }
             | Self::WriterTaskBusy { .. }
             | Self::WriterTaskTerminated { .. }
@@ -281,6 +304,7 @@ impl StorageError {
                 | Self::AdmissionTimeout { .. }
                 | Self::Transaction { .. }
                 | Self::ReadTransactionAgeEvicted { .. }
+                | Self::ReadTransactionAgeEvictionCleanupFailed { .. }
                 | Self::WriteQueueFull { .. }
                 | Self::WriterTaskBusy { .. }
         )

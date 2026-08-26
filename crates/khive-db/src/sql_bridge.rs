@@ -1092,21 +1092,18 @@ where
                     }
                     Ok(()) => {
                         restore_handle = false;
-                        Err(StorageError::Transaction {
+                        Err(StorageError::ReadTransactionAgeEvictionCleanupFailed {
                             operation: operation.into(),
-                            message: "expired read transaction rollback did not restore \
-                                  autocommit; the connection was discarded"
-                                .into(),
+                            max_age_secs: read_tx_max_age.as_secs(),
+                            message: "rollback did not restore autocommit".into(),
                         })
                     }
                     Err(error) => {
                         restore_handle = false;
-                        Err(StorageError::Transaction {
+                        Err(StorageError::ReadTransactionAgeEvictionCleanupFailed {
                             operation: operation.into(),
-                            message: format!(
-                                "failed to roll back an expired read transaction ({error}); \
-                                 the connection was discarded"
-                            ),
+                            max_age_secs: read_tx_max_age.as_secs(),
+                            message: format!("rollback failed: {error}"),
                         })
                     }
                 }
@@ -4038,6 +4035,22 @@ mod tests {
             "an evicted-transaction error must be retryable so the caller can open a fresh \
              snapshot: {error}"
         );
+        match &error {
+            StorageError::ReadTransactionAgeEvicted {
+                operation,
+                max_age_secs,
+            } => {
+                assert_eq!(operation.as_ref(), "query_all");
+                assert_eq!(
+                    *max_age_secs, 0,
+                    "a 20ms read_tx_max_age truncates to 0 whole seconds"
+                );
+            }
+            other => panic!(
+                "a clean age-triggered rollback must surface the dedicated \
+                 ReadTransactionAgeEvicted variant, not a generic classification: {other:?}"
+            ),
+        }
         assert_eq!(
             crate::checkpoint::read_tx_max_age_evictions(),
             evictions_before + 1,
@@ -4150,10 +4163,29 @@ mod tests {
             "even a failed cleanup rollback must remain classified retryable so callers open a \
              fresh handle: {error}"
         );
-        assert!(
-            error.to_string().contains("failed to roll back"),
-            "the failure must be attributable to the denied ROLLBACK, not silent success: {error}"
-        );
+        match &error {
+            StorageError::ReadTransactionAgeEvictionCleanupFailed {
+                operation,
+                max_age_secs,
+                message,
+            } => {
+                assert_eq!(operation.as_ref(), "query_all");
+                assert_eq!(
+                    *max_age_secs, 0,
+                    "a 20ms read_tx_max_age truncates to 0 whole seconds"
+                );
+                assert!(
+                    message.contains("rollback failed"),
+                    "the failure must be attributable to the denied ROLLBACK, not silent \
+                     success: {message}"
+                );
+            }
+            other => panic!(
+                "a denied cleanup rollback must surface the dedicated \
+                 ReadTransactionAgeEvictionCleanupFailed variant, not a generic Transaction \
+                 error the caller cannot machine-detect: {other:?}"
+            ),
+        }
         assert_eq!(
             crate::checkpoint::read_tx_max_age_evictions(),
             evictions_before + 1,
