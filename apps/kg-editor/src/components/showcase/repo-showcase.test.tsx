@@ -433,6 +433,33 @@ describe("repository showcase", () => {
     expect(screen.getByRole("navigation", { name: bundle.capability.labels.product })).toBeVisible();
   });
 
+  it("keeps the cycle identifier secondary to member paths in triage", () => {
+    const bundle = golden();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    const card = container.querySelector<HTMLElement>(
+      '[data-signal-kind="dependency_cycle"]',
+    )!;
+    const heading = card.querySelector("h4")!;
+    const summary = card.querySelector("p")!;
+    const identifier = card.querySelector<HTMLElement>("code[title]")!;
+    const cycle = bundle.aggregates.dependency_topology.cycles.items.find(
+      (item) => item.id === identifier.title,
+    )!;
+    const firstMember = bundle.graph.modules.items.find((module) =>
+      module.id === cycle.module_ids[0]
+    )!;
+
+    expect(heading).not.toHaveTextContent(cycle.id);
+    expect(summary).toHaveTextContent(firstMember.source_path);
+    expect(identifier.tagName).toBe("CODE");
+    expect(identifier).toHaveTextContent(cycle.id);
+    expect(
+      summary.compareDocumentPosition(identifier)
+        & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+  });
+
   it("keeps module search bounded and gives an empty result one recovery action", async () => {
     const user = userEvent.setup();
     const { container } = render(<RepoShowcase bundle={golden()} />);
@@ -556,14 +583,27 @@ describe("repository showcase", () => {
   it("renders strongly connected components as membership, not a directed path", async () => {
     const bundle = golden();
     const cycle = bundle.aggregates.dependency_topology.cycles.items[0];
+    const firstMember = bundle.graph.modules.items.find((module) =>
+      module.id === cycle.module_ids[0]
+    )!;
     const user = userEvent.setup();
     const { container } = render(<RepoShowcase bundle={bundle} />);
 
     await user.click(screen.getByRole("button", { name: bundle.capability.views.dependency_topology.label }));
 
-    const cycleRow = screen.getByText(cycle.id).closest(".repo-list-row")!;
+    const panel = container.querySelector<HTMLElement>(".repo-view-panel")!;
+    const identifier = within(panel).getByTitle(cycle.id);
+    const cycleRow = identifier.closest(".repo-list-row")!;
+    const memberControl = within(cycleRow as HTMLElement).getByRole("button", {
+      name: `Inspect ${firstMember.source_path}`,
+    });
     expect(cycleRow).toHaveTextContent("SCC members:");
     expect(cycleRow).not.toHaveTextContent("→");
+    expect(identifier).toHaveClass("repo-analysis-id");
+    expect(
+      memberControl.compareDocumentPosition(identifier)
+        & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
     expect(container.querySelector("[data-repository-dashboard]")).toBeVisible();
   });
 

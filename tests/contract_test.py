@@ -87,7 +87,16 @@ def _send(proc: subprocess.Popen, method: str, params: Any = None) -> None:
 def _recv(proc: subprocess.Popen) -> dict:
     line = proc.stdout.readline()
     if not line:
-        raise RuntimeError("MCP server closed stdout unexpectedly")
+        message = "MCP server closed stdout unexpectedly"
+        try:
+            proc.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            pass
+        if proc.poll() is not None and proc.stderr is not None:
+            stderr = proc.stderr.read().decode(errors="replace").strip()
+            if stderr:
+                message = f"{message}\nstderr:\n{stderr}"
+        raise RuntimeError(message)
     return json.loads(line)
 
 
@@ -200,9 +209,13 @@ def _tool_expect_error(proc: subprocess.Popen, name: str, args: dict) -> str:
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
-def _start_server(db_path: str) -> subprocess.Popen:
+def _start_server(db_path: str, config_path: str) -> subprocess.Popen:
     """Spawn a fresh `kkernel mcp` process backed by a temp SQLite file."""
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    env = {
+        **os.environ,
+        "KHIVE_CONFIG": config_path,
+        "KHIVE_NO_DAEMON": "1",
+    }
     proc = subprocess.Popen(
         [BINARY, "mcp", "--db", db_path, "--no-embed", "--log", "error"],
         stdin=subprocess.PIPE,
@@ -241,9 +254,11 @@ _results: list[tuple[str, bool, str]] = []
 
 def _run_test(name: str, fn) -> None:
     """Execute a test function; record pass/fail."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = f.name
-    proc = _start_server(db_path)
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as db_file:
+        db_path = db_file.name
+    with tempfile.NamedTemporaryFile(suffix=".toml", delete=False) as config_file:
+        config_path = config_file.name
+    proc = _start_server(db_path, config_path)
     try:
         fn(proc)
         _results.append((name, True, ""))
@@ -255,10 +270,11 @@ def _run_test(name: str, fn) -> None:
         print(f"         {exc}")
     finally:
         _stop_server(proc)
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass
+        for path in (db_path, config_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1049,6 +1065,39 @@ def test_batch_outcome_status(proc: subprocess.Popen) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Harness contract — ambient home config isolation
+# ---------------------------------------------------------------------------
+
+def test_home_config_isolation(proc: subprocess.Popen) -> None:
+    """An ambient multi-backend home config must not affect this test server.
+
+    The harness points the server at a freshly-minted temp database, so the
+    entity listing must start empty: a server that resolved the ambient home
+    configuration instead would surface that backend's pre-existing rows. The
+    sentinel round-trip then pins the write path to the same store.
+    """
+    before = _tool(proc, "list", {"kind": "entity", "limit": 10})
+    assert before == [], (
+        f"fresh temp database lists pre-existing entities: {before!r}"
+    )
+
+    sentinel = _tool(proc, "create", {
+        "kind": "entity",
+        "entity_kind": "concept",
+        "name": "IsolationSentinel",
+        "description": "Written through the temp-config server",
+    })
+    fetched = _tool(proc, "get", {"id": sentinel["id"]})
+    assert fetched["name"] == "IsolationSentinel", fetched
+
+    listed = _tool(proc, "list", {"kind": "entity", "limit": 10})
+    names = [e.get("name") for e in listed]
+    assert names == ["IsolationSentinel"], (
+        f"sentinel is not the sole visible entity: {names!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1072,6 +1121,32 @@ def main() -> int:
         ("epistemic_edge_endpoints", test_epistemic_edge_endpoints),
         ("batch_outcome_status", test_batch_outcome_status),
     ]
+
+    with tempfile.TemporaryDirectory(prefix="khive-contract-home-") as home:
+        config_dir = os.path.join(home, ".khive")
+        os.makedirs(config_dir)
+        config_path = os.path.join(config_dir, "config.toml")
+        with open(config_path, "w", encoding="utf-8") as config:
+            config.write(
+                "[[backends]]\n"
+                'name = "main"\n'
+                'kind = "sqlite"\n'
+                f"path = {json.dumps(os.path.join(home, 'main.db'))}\n\n"
+                "[[backends]]\n"
+                'name = "sessions"\n'
+                'kind = "sqlite"\n'
+                f"path = {json.dumps(os.path.join(home, 'sessions.db'))}\n"
+            )
+
+        previous_home = os.environ.get("HOME")
+        os.environ["HOME"] = home
+        try:
+            _run_test("home_config_isolation", test_home_config_isolation)
+        finally:
+            if previous_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous_home
 
     for name, fn in tests:
         _run_test(name, fn)

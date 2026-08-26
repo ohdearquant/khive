@@ -2843,25 +2843,76 @@ pub(crate) async fn fetch_event_counts_window_exhaustive(
         )));
     }
 
+    // Walk the window with a descending `before` cursor instead of a growing
+    // offset. Every query runs at `offset: 0`, so page k never re-skips
+    // pages 1..k — the walk is linear over the window on a single-store
+    // backend, and on the merged events-split store it stays inside that
+    // store's bounded materialization window at any depth (a growing offset
+    // there would materialize an ever-larger two-store prefix per page,
+    // quadratic in total, and eventually hit the merged window bound).
+    //
+    // `before` is a strict `created_at <` bound, so stepping the cursor to
+    // the last row's timestamp would drop rows sharing that microsecond
+    // beyond the page edge. Step to `last.created_at + 1` instead — which
+    // re-admits the boundary microsecond — and drop the re-read rows by id.
+    // Aggregation is order-independent, so delivery order across pages does
+    // not matter; each row must simply arrive exactly once.
     let mut items: Vec<Event> = Vec::new();
-    let mut offset: u64 = 0;
+    let mut cursor: Option<i64> = base_filter.before;
+    let mut boundary_at: Option<i64> = None;
+    let mut boundary_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    let mut fetch_limit = page_size.max(1);
     loop {
+        let mut filter = base_filter.clone();
+        filter.before = cursor;
         let page = store
             .query_events(
-                base_filter.clone(),
+                filter,
                 PageRequest {
-                    offset,
-                    limit: page_size,
+                    offset: 0,
+                    limit: fetch_limit,
                 },
             )
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        let page_len = page.items.len() as u64;
-        items.extend(page.items);
-        if page_len < page_size as u64 {
+        let fetched = page.items.len() as u64;
+        let fresh: Vec<Event> = page
+            .items
+            .into_iter()
+            .filter(|event| !boundary_ids.contains(&event.id))
+            .collect();
+        if fresh.is_empty() {
+            if fetched < u64::from(fetch_limit) {
+                // The store returned everything under the cursor and all of
+                // it was already collected: the window is exhausted.
+                break;
+            }
+            // A full page of already-collected boundary rows: the tie run at
+            // this microsecond is wider than the page. Widen and re-read.
+            fetch_limit = fetch_limit.saturating_mul(2);
+            continue;
+        }
+        // Pages come back created_at DESC, so the last fresh row carries the
+        // new boundary microsecond.
+        let boundary = fresh
+            .last()
+            .map(|event| event.created_at)
+            .expect("fresh is non-empty");
+        if boundary_at != Some(boundary) {
+            boundary_ids.clear();
+            boundary_at = Some(boundary);
+        }
+        boundary_ids.extend(
+            fresh
+                .iter()
+                .filter(|event| event.created_at == boundary)
+                .map(|event| event.id),
+        );
+        items.extend(fresh);
+        cursor = Some(boundary.saturating_add(1));
+        if fetched < u64::from(fetch_limit) {
             break;
         }
-        offset += page_size as u64;
     }
 
     let truncated = (items.len() as u64) < window_event_total;

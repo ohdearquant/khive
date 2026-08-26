@@ -447,6 +447,14 @@ export function RepositoryTriage({
                     </div>
                     <h4>{signal.title}</h4>
                     <p>{signal.summary}</p>
+                    {signal.analysisId && (
+                      <code
+                        className={styles.analysisId}
+                        title={signal.analysisId}
+                      >
+                        {signal.analysisId}
+                      </code>
+                    )}
                     <strong className={styles.why}>
                       {signal.whyItMatters}
                     </strong>
@@ -683,8 +691,7 @@ export function RepositoryTriage({
                     <h4>{bundle.capability.views.dependency_topology.label}</h4>
                     <ul>
                       {selectedInsight.topology.cycles.map((cycle) => (
-                        <li key={cycle.id}>
-                          <code>{cycle.id}</code>
+                        <li className={styles.cycleItem} key={cycle.id}>
                           <span className={styles.memberLinks}>
                             SCC members: {cycle.modules.map((module, index) => (
                               <span key={module.id}>
@@ -699,6 +706,12 @@ export function RepositoryTriage({
                               </span>
                             ))}
                           </span>
+                          <code
+                            className={styles.cycleIdentifier}
+                            title={cycle.id}
+                          >
+                            {cycle.id}
+                          </code>
                         </li>
                       ))}
                     </ul>
