@@ -36,8 +36,10 @@ use test_harness::{
 
 // ── local-dispatch fallback telemetry ─────────────────────────────────────────
 //
-// Every path below that returns `None` (or is matched as a fallback outcome)
+// Each recordable fallback path below (the paths through `fallback_or_reject`)
 // means the caller silently dispatches locally instead of via the warm daemon.
+// Intentional local bypasses such as the `KHIVE_NO_DAEMON` opt-out are outside
+// this telemetry set by design.
 // A silent fallback is the bug this instrumentation exists to surface: it must
 // always be loud (a structured fallback event — WARN, or ERROR for
 // strict-mode illegitimate reasons) and counted. These are process-global
