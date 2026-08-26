@@ -1002,7 +1002,8 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
 /// This closes only a genuinely idle session: an admitted request with a
 /// response still being written — running long, or delivered slowly to a
 /// backpressured reader — defers the close rather than being cancelled out
-/// from under it.
+/// from under it, up to the separate response-delivery bound documented on
+/// [`stdio_bridge_response_deadline_from_env`].
 ///
 /// Overridable via `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`; `0` disables it (an
 /// explicit opt-out, e.g. for a debugger holding a session open on purpose).
@@ -1015,6 +1016,37 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
 fn stdio_bridge_idle_timeout_from_env() -> Option<std::time::Duration> {
     const DEFAULT_SECS: u64 = 3600;
     let secs = std::env::var("KHIVE_BRIDGE_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// Response-delivery deadline for a stdio bridge session: the longest a
+/// single response write may stay pending before it is abandoned (see
+/// [`crate::transport::CancelOnEofTransport::send`]) and this session is
+/// closed. Independent of the idle timeout above — it bounds an admitted
+/// request's response write directly, rather than the gap between
+/// requests. Without this bound, a peer that admits a request and then
+/// stops reading its response — while leaving the pipe itself open — keeps
+/// that write pending forever, so the idle timeout would defer indefinitely
+/// (an in-flight response always defers idle-close) and the session would
+/// never be reaped.
+///
+/// Overridable via `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`; `0` disables it
+/// (an explicit opt-out, matching `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS=0`). An
+/// unparsable value falls back to the default. Default: 300s (5 minutes) —
+/// long enough that legitimately slow verbs and ordinary reader backpressure
+/// never trip it, short enough that a peer that has genuinely stopped
+/// reading does not pin the session's reader-pool admission / DB connection
+/// indefinitely.
+fn stdio_bridge_response_deadline_from_env() -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 300;
+    let secs = std::env::var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_SECS);
@@ -1420,6 +1452,7 @@ impl KhiveMcpServer {
 
         let root = tokio_util::sync::CancellationToken::new();
         let idle_timeout = stdio_bridge_idle_timeout_from_env();
+        let response_deadline = stdio_bridge_response_deadline_from_env();
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
             crate::transport::CancelOnEofTransport::with_idle_timeout(
@@ -1428,6 +1461,7 @@ impl KhiveMcpServer {
                 )),
                 root,
                 idle_timeout,
+                response_deadline,
             )
         };
 
@@ -1470,6 +1504,7 @@ impl KhiveMcpServer {
             AsyncRwTransport::new_server(read, write),
             root.clone(),
             stdio_bridge_idle_timeout_from_env(),
+            stdio_bridge_response_deadline_from_env(),
         );
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
@@ -7343,6 +7378,7 @@ mod request_read_cancellation_tests {
             AsyncRwTransport::new_server(read, write),
             root.clone(),
             None,
+            None,
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7397,6 +7433,7 @@ mod request_read_cancellation_tests {
             AsyncRwTransport::new_server(read, write),
             root.clone(),
             Some(Duration::from_millis(50)),
+            None,
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7455,6 +7492,7 @@ mod request_read_cancellation_tests {
             AsyncRwTransport::new_server(read, write),
             root.clone(),
             Some(idle_timeout),
+            None,
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7548,6 +7586,7 @@ mod request_read_cancellation_tests {
             AsyncRwTransport::new_server(server_read, server_write),
             root.clone(),
             Some(idle_timeout),
+            None,
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
         let (mut client_read, mut client_write) = tokio::io::split(client_io);
@@ -7614,6 +7653,7 @@ mod request_read_cancellation_tests {
             AsyncRwTransport::new_server(server_read, server_write),
             root.clone(),
             Some(idle_timeout),
+            None,
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7636,6 +7676,80 @@ mod request_read_cancellation_tests {
 
         drop(client_io);
         let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression (#2230): a response write that never resolves — a peer
+    /// that admits a request, then never reads its response and never
+    /// disconnects — must itself be bounded by `response_deadline`, not
+    /// merely deferred by the idle-close check forever. This is the
+    /// assertion that reddens if the response-delivery deadline is removed
+    /// (passed as `None`): `root` would then never be cancelled and the
+    /// poll loop below would exhaust its bound without ever observing
+    /// cancellation.
+    #[tokio::test]
+    async fn stdio_idle_timeout_reaps_a_peer_that_stops_reading_its_response() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let probe = QuickProbeServer;
+        let root = tokio_util::sync::CancellationToken::new();
+        // Same 8-byte-buffer trick as the test above: the response cannot
+        // fully land without the reader draining it. Unlike that test, this
+        // one never reads from `client_io` and never drops it — the pipe
+        // stays open exactly like a peer that admitted a request and then
+        // simply stopped reading.
+        let (server_io, mut client_io) = tokio::io::duplex(8);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let response_deadline = Duration::from_millis(150);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            Some(response_deadline),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        client_io
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write one real JSON-RPC tool request");
+
+        // The core claim: root cancellation — the actual reaping signal —
+        // must land within `response_deadline` of admission, not merely
+        // "eventually". Polled rather than slept for the full bound so this
+        // resolves as soon as it happens and reddens immediately (via the
+        // assertion below) if the response-delivery deadline stops firing.
+        let bound = response_deadline + Duration::from_millis(500);
+        let poll_deadline = tokio::time::Instant::now() + bound;
+        while !root.is_cancelled() && tokio::time::Instant::now() < poll_deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "the response-delivery deadline must cancel the root token within {bound:?} of \
+             admission — a peer that admits a request and stops reading its response must not \
+             pin the session"
+        );
+
+        // The abandoned write is dropped (not merely deferred) on timeout,
+        // which releases rmcp's internal transport-write lock — so the
+        // post-cancellation drain's `close()` is not itself blocked on that
+        // same stuck write, and `waiting()` resolves promptly rather than
+        // riding out rmcp's multi-second drain window.
+        let reason = tokio::time::timeout(Duration::from_secs(2), running.waiting())
+            .await
+            .expect("rmcp never finished closing after the response-delivery deadline")
+            .expect("rmcp service task panicked");
+        assert!(
+            matches!(
+                reason,
+                rmcp::service::QuitReason::Closed | rmcp::service::QuitReason::Cancelled
+            ),
+            "unexpected rmcp quit reason after the response-delivery deadline: {reason:?}"
+        );
+        drop(client_io);
     }
 
     /// Distinguishes handler behavior by tool name: `"slow"` blocks for
@@ -7695,6 +7809,7 @@ mod request_read_cancellation_tests {
             AsyncRwTransport::new_server(server_read, server_write),
             root.clone(),
             Some(idle_timeout),
+            None,
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
         let (mut client_read, mut client_write) = tokio::io::split(client_io);

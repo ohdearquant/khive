@@ -2003,23 +2003,29 @@ const DUPLICATE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 /// A live PID plus an accepting Unix socket is not proof of khived: any
 /// unrelated process that happens to have bound the same path also answers
 /// `connect()`. Nor is any well-formed [`DaemonResponseFrame`] proof: a
-/// `config_mismatch`/`version_mismatch` response, or a legacy pre-probe
-/// daemon that falls through to normal dispatch on the empty `ops` string,
-/// both deserialize cleanly without being the unambiguous "yes, alive and
-/// identity-matching" answer this check needs. This sends a bounded
-/// `probe_only` frame (the same identity probe the client-side recovery path
-/// uses, `crates/khive-mcp/src/daemon.rs::probe_daemon_identity`) carrying
-/// this process's own `config_id`, and requires the exact probe-ack sentinel
-/// (`ok=true, result=None, error=None`) plus matching protocol version and
-/// `served_config_id` back — mirroring the client probe's `is_probe_ack`
-/// check so both sides of the protocol agree on what "alive" means. Connect,
-/// write, and read are all inside the one bounded timeout: `UnixStream::connect`
+/// `config_mismatch`/`version_mismatch` response, a `metrics_only` snapshot
+/// response, or a legacy pre-probe daemon that falls through to normal
+/// dispatch on the empty `ops` string, all deserialize cleanly without being
+/// the unambiguous "yes, alive and identity-matching" answer this check
+/// needs — the daemon's `metrics_only` arm in particular echoes the same
+/// `ok=true, result=None, error=None`, all-mismatch-flags-false, matching
+/// protocol version and `served_config_id` shape as the probe-ack arm, and
+/// is distinguished only by carrying `metrics: Some(...)`. This sends a
+/// bounded `probe_only` frame (the same identity probe the client-side
+/// recovery path uses, `crates/khive-mcp/src/daemon.rs::probe_daemon_identity`)
+/// carrying this process's own `config_id`, and requires the exact
+/// probe-branch shape back: `ok=true`, `result=None`, `error=None`,
+/// `metrics=None`, `request_id=None` (this probe frame never sets one), no
+/// mismatch flags, matching protocol version, and matching
+/// `served_config_id` — mirroring the client probe's `is_probe_ack` check so
+/// both sides of the protocol agree on what "alive" means. Connect, write,
+/// and read are all inside the one bounded timeout: `UnixStream::connect`
 /// itself awaits write readiness, so a listener with a saturated accept
 /// backlog could otherwise hold this call open past the advertised bound.
 /// A connect that succeeds but never answers, times out, or answers with
-/// non-protocol bytes, a mismatched identity, or a non-ack response is not
-/// treated as the same khived and falls through to the stale-socket recovery
-/// path instead.
+/// non-protocol bytes, a mismatched identity, a `metrics_only` snapshot, or
+/// any other non-probe-shaped response is not treated as the same khived
+/// and falls through to the stale-socket recovery path instead.
 #[cfg(unix)]
 async fn socket_speaks_khived_protocol(sock: &std::path::Path, expected_config_id: &str) -> bool {
     let probe = DaemonRequestFrame {
@@ -2044,7 +2050,11 @@ async fn socket_speaks_khived_protocol(sock: &std::path::Path, expected_config_i
     let Some(resp) = response else {
         return false;
     };
-    let is_probe_ack = resp.ok && resp.result.is_none() && resp.error.is_none();
+    let is_probe_ack = resp.ok
+        && resp.result.is_none()
+        && resp.error.is_none()
+        && resp.metrics.is_none()
+        && resp.request_id.is_none();
     is_probe_ack
         && !resp.version_mismatch
         && !resp.namespace_mismatch
@@ -3173,6 +3183,52 @@ mod tests {
             !speaks,
             "a well-formed but non-ack / identity-mismatched response must not be treated as \
              the same live khived"
+        );
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), accept_task).await;
+    }
+
+    /// Regression (#2230): the daemon's `metrics_only` arm answers with
+    /// `ok=true, result=None, error=None`, every mismatch flag false, the
+    /// current protocol version, and a matching `served_config_id` — the
+    /// exact same shape the probe-ack arm produces, differing only in
+    /// carrying `metrics: Some(...)`. A well-formed metrics snapshot
+    /// response must not be misread as a probe acknowledgement; otherwise a
+    /// client whose only interaction with the socket happened to be a
+    /// metrics poll would be classified as the same live, identity-matching
+    /// khived.
+    #[tokio::test]
+    async fn socket_speaks_khived_protocol_rejects_a_metrics_only_response() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = dir.path().join("metrics-only.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind fake listener");
+        let accept_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _raw = read_frame(&mut stream).await.expect("read probe frame");
+                let resp = DaemonResponseFrame {
+                    ok: true,
+                    result: None,
+                    error: None,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: Some("expected-config".to_string()),
+                    version_mismatch: false,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    metrics: Some(MetricsSnapshot::default()),
+                    request_id: None,
+                };
+                let payload = serde_json::to_vec(&resp).expect("encode response");
+                write_frame(&mut stream, &payload)
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        let speaks = socket_speaks_khived_protocol(&sock_path, "expected-config").await;
+        assert!(
+            !speaks,
+            "an otherwise-matching response carrying a metrics snapshot must not be treated as \
+             a probe acknowledgement"
         );
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), accept_task).await;

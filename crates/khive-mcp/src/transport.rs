@@ -51,10 +51,26 @@ use crate::server::KhiveMcpServer;
 /// another, it is no longer pending) — the broken transport will surface
 /// through `receive()` returning `None` on its own, so this counter must
 /// not be the thing that gets stuck open forever on a write error.
+///
+/// A response write that never resolves — a peer that admits a request,
+/// then stops reading its response while keeping the pipe open — would
+/// otherwise pin this session (and its reader-pool admission / DB
+/// connection) forever: `in_flight` would never return to zero, so the idle
+/// check above would defer indefinitely. `response_deadline` bounds the
+/// write itself (see [`Self::send`]) rather than the idle check: rmcp's
+/// underlying `AsyncRwTransport` serializes writes through a
+/// `tokio::sync::Mutex` held across the pending write's `.await`, so a
+/// write that never resolves also blocks any later `close()` on the same
+/// transport — merely cancelling the root token would not free that lock.
+/// Timing out the write future instead *drops* it, which releases the
+/// mutex guard the same way any other future cancellation would, so a
+/// subsequent `close()` (part of rmcp's normal post-cancellation drain)
+/// can still proceed.
 pub(crate) struct CancelOnEofTransport<T> {
     inner: T,
     root: tokio_util::sync::CancellationToken,
     idle_timeout: Option<std::time::Duration>,
+    response_deadline: Option<std::time::Duration>,
     in_flight: Arc<AtomicI64>,
 }
 
@@ -62,15 +78,23 @@ impl<T> CancelOnEofTransport<T> {
     /// `idle_timeout`: a `receive()` call that yields no message within this
     /// window is treated as EOF (see the type doc), but only when no
     /// admitted request is still awaiting its response. `None` disables it.
+    ///
+    /// `response_deadline`: the longest a single response write may stay
+    /// pending before it is abandoned (see [`Self::send`]) — independent of
+    /// `idle_timeout`, and meaningful whether or not an idle timeout is
+    /// configured. `None` disables the bound (a response write waits
+    /// unbounded, matching this transport's pre-existing behavior).
     pub(crate) fn with_idle_timeout(
         inner: T,
         root: tokio_util::sync::CancellationToken,
         idle_timeout: Option<std::time::Duration>,
+        response_deadline: Option<std::time::Duration>,
     ) -> Self {
         Self {
             inner,
             root,
             idle_timeout,
+            response_deadline,
             in_flight: Arc::new(AtomicI64::new(0)),
         }
     }
@@ -79,9 +103,18 @@ impl<T> CancelOnEofTransport<T> {
 impl<T> rmcp::transport::Transport<rmcp::RoleServer> for CancelOnEofTransport<T>
 where
     T: rmcp::transport::Transport<rmcp::RoleServer>,
+    T::Error: From<std::io::Error>,
 {
     type Error = T::Error;
 
+    /// Bounds a response/error write by `response_deadline` (requests pass
+    /// straight through, untimed — only a response can leave `in_flight`
+    /// permanently pinned). On timeout the write future is dropped —
+    /// releasing whatever lock the inner transport held across it, see the
+    /// type doc — `in_flight` is decremented the same as any other resolved
+    /// write, and `root` is cancelled directly: the peer has demonstrated it
+    /// is not going to read this response, so there is no reason to wait for
+    /// the next idle tick to notice.
     fn send(
         &mut self,
         item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
@@ -91,9 +124,30 @@ where
             rmcp::model::JsonRpcMessage::Response(_) | rmcp::model::JsonRpcMessage::Error(_)
         );
         let in_flight = self.in_flight.clone();
+        let root = self.root.clone();
+        let response_deadline = self.response_deadline;
         let send = self.inner.send(item);
         async move {
-            let result = send.await;
+            let result = match (is_response, response_deadline) {
+                (true, Some(deadline)) => match tokio::time::timeout(deadline, send).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            deadline_secs = deadline.as_secs(),
+                            "stdio bridge response-delivery deadline elapsed while a response \
+                             write was still pending (peer stopped reading); abandoning the \
+                             write and closing this session"
+                        );
+                        root.cancel();
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "response-delivery deadline elapsed before the write completed",
+                        )
+                        .into())
+                    }
+                },
+                _ => send.await,
+            };
             // Decrement once the write is resolved either way — see the
             // `in_flight` field doc for why a failed write must not be left
             // permanently counted as pending.
