@@ -128,6 +128,12 @@ const MAX_INFLIGHT_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(unix)]
 const MAX_CACHED_NAMESPACE_STORES: usize = 1024;
 
+/// Symlink-chain hop ceiling for events-path resolution. Matches the bound
+/// the daemon's socket-path traversal guard enforces, which is itself the
+/// kernel's total-links ceiling on Linux (40): both resolvers must agree,
+/// or a chain one accepts derives a different identity than the other.
+const EVENTS_SYMLINK_HOP_BOUND: u32 = 40;
+
 /// Cap on `QueryEvents` page size, in rows. The wire `PageRequest.limit` is
 /// client-supplied `u32`, and the daemon materializes the full page as a
 /// `Vec<Event>` and serializes it into one response frame — so an unbounded
@@ -138,8 +144,12 @@ const MAX_CACHED_NAMESPACE_STORES: usize = 1024;
 /// The split client's merged read requests a prefix of `offset + limit`
 /// rows, so this cap also bounds the deep-offset window a socket client can
 /// demand in one request.
-#[cfg(unix)]
-const MAX_QUERY_EVENTS_PAGE_ROWS: u32 = 4096;
+///
+/// Public (and defined on every platform) because in-tree consumers that
+/// read events through a possibly-split store must size their page requests
+/// under it — a deep read is a `before`-cursor walk at `offset: 0` in pages
+/// of at most this many rows, never one wide page.
+pub const MAX_QUERY_EVENTS_PAGE_ROWS: u32 = 4096;
 
 /// Default events database file, beside the main database file.
 ///
@@ -147,23 +157,65 @@ const MAX_QUERY_EVENTS_PAGE_ROWS: u32 = 4096;
 /// `khive.db.events.db`), never from its stem and never a fixed name in the
 /// parent directory: two independent databases that happen to share a
 /// directory (`a.db`, `b.db`) — or a stem (`a.db`, `a.sqlite`) — must each
-/// get their own event plane, not silently share one. The parent directory
-/// is canonicalized when it resolves, so path aliases of one database
-/// (relative spellings, symlinked directories) map to one sidecar instead of
-/// minting a distinct events database per spelling.
+/// get their own event plane, not silently share one. The whole path is
+/// canonicalized when the database file exists — final-component symlink
+/// aliases of one database must derive the same sidecar and socket as the
+/// target spelling, because backend identity already treats those aliases as
+/// one database. When the file does not exist yet, the parent directory alone
+/// is canonicalized when it resolves, so path aliases of a fresh database
+/// (relative spellings, symlinked directories) still map to one sidecar
+/// instead of minting a distinct events database per spelling.
 pub fn events_db_path_beside(main_db: &Path) -> PathBuf {
-    let mut name = main_db
+    // When the database file does not exist yet, the path can still be a
+    // symlink — a dangling alias whose target the first open will create.
+    // `canonicalize` refuses dangling links, so resolve final-component
+    // links by hand on that arm: alias-first and target-first cold starts
+    // must derive the same sidecar, or the first process to open each
+    // spelling writes audit records the other never reads.
+    let resolved = std::fs::canonicalize(main_db)
+        .unwrap_or_else(|_| resolve_dangling_final_component(main_db));
+    let mut name = resolved
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_else(|| std::ffi::OsString::from("khive.db"));
     name.push(".events.db");
-    let path = match main_db.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+    let path = match resolved.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         Some(dir) => std::fs::canonicalize(dir)
             .unwrap_or_else(|_| dir.to_path_buf())
             .join(&name),
         None => PathBuf::from(name),
     };
     absolutize(&path)
+}
+
+/// Follow final-component symlinks whose eventual target need not exist.
+/// The identity being recovered is the target's NAME — the file the first
+/// open through the alias will actually create — so a chain of links is
+/// walked (relative targets anchored at each link's parent) up to the same
+/// bound kernels use; a cycle or over-long chain stops at the last spelling,
+/// which `open()` will refuse anyway.
+fn resolve_dangling_final_component(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    // Same hop bound as the daemon's socket-path traversal guard (and the
+    // kernel's own total-links ceiling on Linux, 40): a chain the kernel
+    // would resolve must derive the target's sidecar, or a 33-hop alias
+    // opens fine yet splits its audit records from the target spelling.
+    for _ in 0..EVENTS_SYMLINK_HOP_BOUND {
+        match std::fs::read_link(&current) {
+            Ok(target) => {
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    match current.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+                        Some(dir) => dir.join(target),
+                        None => target,
+                    }
+                };
+            }
+            Err(_) => break,
+        }
+    }
+    current
 }
 
 /// Anchor a relative path to the current working directory. A bare relative
@@ -274,6 +326,22 @@ fn direct_backend(
     if let Some(existing) = registry.get(&key) {
         return Ok(Arc::clone(existing));
     }
+    refuse_events_db_symlinks(db_path)
+        .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
+    #[cfg(unix)]
+    if !read_only {
+        if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    // Directory trust comes after creation (a fresh parent in a trusted
+    // ancestor must be statable) and before any open: SQLite's open is
+    // path-based, so the only defense against a component swapped between
+    // validation and open is that no untrusted local user can write the
+    // directories the path traverses.
+    #[cfg(unix)]
+    ensure_events_db_parent_trusted(db_path)
+        .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     // Embedded writable mode holds the events database to the daemon's own
     // contract: owner-only from the first byte, never at the process umask,
     // and — because event rows carry the same audit payloads either way — a
@@ -282,9 +350,6 @@ fn direct_backend(
     #[cfg(unix)]
     if !read_only {
         use std::os::unix::fs::OpenOptionsExt;
-        if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -476,8 +541,13 @@ pub struct EventsDaemonGuard {
     _file: std::fs::File,
 }
 
-/// Try to become the events daemon for `socket_path`. `None` = another
-/// events daemon already holds the lock.
+/// Try to become the events daemon for `socket_path`. `None` = the lock
+/// could not be safely acquired — either another events daemon holds it, or
+/// a hardening step refused (symlinked lock entry, failed chmod). Both mean
+/// the caller must not serve; callers that need the socket directory
+/// validated must run `ensure_socket_dir_is_trusted` on the parent BEFORE
+/// calling this, so no lock-path operation happens in an untrusted
+/// directory.
 #[cfg(unix)]
 pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemonGuard> {
     let lock_path = socket_path.with_extension("lock");
@@ -485,20 +555,26 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
         std::fs::create_dir_all(parent).ok()?;
     }
     use std::os::unix::fs::OpenOptionsExt;
+    // `O_NOFOLLOW` pins the open to the final component: a symlink planted
+    // at the lock name is refused instead of redirecting the open (and the
+    // chmod below) to an attacker-selected target.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&lock_path)
         .ok()?;
     // `mode` applies only at creation; tighten a pre-existing lock file too.
-    // Best-effort: the file carries no data (it exists to be flocked), so a
-    // failed chmod is not grounds to refuse the lock.
-    let _ = std::fs::set_permissions(
-        &lock_path,
+    // Descriptor-based (`fchmod` on the handle just opened), never a second
+    // path lookup — and fail closed: with the inode pinned, a failed chmod
+    // is abnormal, and serving behind a lock file another user can open is
+    // exactly what the hardening exists to refuse.
+    file.set_permissions(
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-    );
+    )
+    .ok()?;
     use std::os::fd::AsRawFd;
     // SAFETY: `fd` is a live descriptor owned by `file` for the duration of
     // the call; `flock` reads nothing else.
@@ -510,6 +586,60 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
     }
 }
 
+/// Refuse to serve an events database whose path — or whose `-wal`/`-shm`
+/// sidecar path — is a pre-existing symlink. These paths are derived, never
+/// user-chosen (`events_db_path_beside` canonicalizes the main database
+/// spelling first), so a link here is a planted redirect, not an alias:
+/// permission hardening and SQLite would otherwise follow it and tighten or
+/// write event rows through to whatever file the link's author chose
+/// (CWE-59). Runs before any open on both the embedded and daemon arms; a
+/// link planted after admission is bounded by the daemon's trusted-directory
+/// contract on the socket parent.
+fn refuse_events_db_symlinks(db_path: &Path) -> anyhow::Result<()> {
+    let mut targets = vec![db_path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        targets.push(PathBuf::from(name));
+    }
+    for path in targets {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
+                "refusing to serve events: {} is a symlink; the events database and its \
+                 sidecars must be regular files",
+                path.display()
+            ),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!(
+                "refusing to serve events: cannot inspect {}: {e}",
+                path.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Require the directory holding the events database to be trusted before
+/// anything opens a path inside it. The symlink pre-checks and the fd-pinned
+/// chmod close the races they can see, but SQLite's own open is path-based
+/// and cannot be inode-pinned from here — so the remaining defense is the
+/// same one the daemon socket uses: no untrusted local user may be able to
+/// write (or swap components of) the directory the path traverses. Delegates
+/// to the socket-path walk, which validates every ancestor the kernel will
+/// visit, with the same ownership and sticky-bit rules.
+#[cfg(unix)]
+fn ensure_events_db_parent_trusted(db_path: &Path) -> anyhow::Result<()> {
+    let parent = absolutize(db_path);
+    let parent = parent.parent().filter(|p| !p.as_os_str().is_empty());
+    match parent {
+        Some(dir) => crate::daemon::ensure_socket_dir_is_trusted(dir).map_err(|e| {
+            anyhow::anyhow!("refusing to serve events from an untrusted directory: {e}")
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Create the events database file owner-only if it does not exist yet.
 /// The 0600 socket and peer-uid admission bound who can *talk to* the
 /// daemon; they bound nothing if the database file itself is readable by
@@ -518,9 +648,13 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
 #[cfg(unix)]
 fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
+    refuse_events_db_symlinks(db_path)?;
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // After creation so a fresh parent can be validated; a directory this
+    // process just created in a trusted ancestor passes by construction.
+    ensure_events_db_parent_trusted(db_path)?;
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -542,7 +676,7 @@ fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
 /// keep its database owner-only must not serve it.
 #[cfg(unix)]
 fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut targets = vec![db_path.to_path_buf()];
     for suffix in ["-wal", "-shm"] {
         let mut name = db_path.as_os_str().to_os_string();
@@ -550,16 +684,35 @@ fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
         targets.push(PathBuf::from(name));
     }
     for path in targets {
-        if !path.exists() {
-            continue;
-        }
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to serve events: cannot chmod 0600 {}: {e}. The events database \
-                 and its sidecars must be owner-only.",
-                path.display()
-            )
-        })?;
+        // Pin the inode before touching it: `O_NOFOLLOW` makes the open
+        // itself refuse a symlink at the final component, and the chmod is
+        // then issued on the returned handle (fchmod), so no path re-lookup
+        // exists between validation and the permission change for a swapped
+        // entry to exploit. A path-based lstat-then-chmod pair here would
+        // re-open the exact race it is defending against.
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                anyhow::bail!(
+                    "refusing to serve events: cannot open {} without following symlinks: \
+                     {e}. The events database and its sidecars must be regular files.",
+                    path.display()
+                )
+            }
+        };
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "refusing to serve events: cannot chmod 0600 {}: {e}. The events \
+                     database and its sidecars must be owner-only.",
+                    path.display()
+                )
+            })?;
     }
     Ok(())
 }
@@ -690,10 +843,17 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     // relative; anchor them before anything derives a parent from them.
     let db_path = &absolutize(db_path);
     let socket_path = &absolutize(socket_path);
+    // Directory trust comes FIRST: the lock guard below opens and chmods a
+    // path in this directory, and validating only before the later bind
+    // would let those operations run in a directory another user controls.
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        crate::daemon::ensure_socket_dir_is_trusted(parent)?;
+    }
     let Some(_guard) = try_acquire_events_daemon_guard(socket_path) else {
         tracing::info!(
             socket = %socket_path.display(),
-            "another events daemon holds the lock; exiting"
+            "events daemon lock unavailable (held by another daemon, or hardening refused); exiting"
         );
         return Ok(());
     };
@@ -705,10 +865,6 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     // creation; tighten any that already exist from before the hardening.
     harden_events_db_sidecars(db_path)?;
 
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-        crate::daemon::ensure_socket_dir_is_trusted(parent)?;
-    }
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
     }
@@ -1158,6 +1314,7 @@ impl EventsSplitClient {
             counters,
             outage_logged,
             delivery_timeout,
+            crate::daemon::daemon_shutdown_token(),
         ));
         Ok(client)
     }
@@ -1239,6 +1396,38 @@ impl EventsSplitClient {
     }
 }
 
+/// Drain every batch currently sitting in the fire-and-forget queue,
+/// counting each as a dropped batch/events and logging one summary line
+/// (never one line per batch — a full queue at shutdown is exactly the
+/// bursty case a per-batch log would flood). Non-blocking: `try_recv` only
+/// consumes what is already queued, so it terminates as soon as the queue
+/// (temporarily) empties even though the sender half is still live.
+#[cfg(unix)]
+fn drain_dropped_queue(
+    rx: &mut tokio::sync::mpsc::Receiver<(String, Vec<Event>)>,
+    counters: &ForwardingCounters,
+) {
+    let mut dropped_batches = 0u64;
+    let mut dropped_events = 0u64;
+    while let Ok((_, events)) = rx.try_recv() {
+        dropped_batches += 1;
+        dropped_events += events.len() as u64;
+    }
+    if dropped_batches > 0 {
+        counters
+            .dropped_batches
+            .fetch_add(dropped_batches, Ordering::Relaxed);
+        counters
+            .dropped_events
+            .fetch_add(dropped_events, Ordering::Relaxed);
+        tracing::warn!(
+            dropped_batches,
+            dropped_events,
+            "events forwarder shutting down; dropping queued loss-tolerant batches"
+        );
+    }
+}
+
 /// The background fire-and-forget forwarder: drains the bounded queue into
 /// framed appends on its own connection, reconnecting with backoff. A batch
 /// that cannot be delivered is dropped and counted — never retried, never
@@ -1250,17 +1439,22 @@ async fn run_forwarder(
     counters: Arc<ForwardingCounters>,
     outage_logged: Arc<AtomicBool>,
     delivery_timeout: Duration,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     // The client lives in a process-global registry, so its sender is never
     // dropped and `rx.recv()` alone would keep this tracked task alive
     // through daemon shutdown, forcing `drain()` to its full timeout.
     // Observe the shutdown token directly: queued batches at shutdown are a
-    // counted drop, exactly the lane's loss-tolerant contract.
-    let shutdown = crate::daemon::daemon_shutdown_token();
+    // counted drop, exactly the lane's loss-tolerant contract — enforced by
+    // draining and counting `rx` below on every shutdown exit, not just
+    // implied by the comment.
     let mut conn: Option<UnixStream> = None;
     loop {
         let (namespace, events) = tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => {
+                drain_dropped_queue(&mut rx, &counters);
+                break;
+            },
             received = rx.recv() => match received {
                 Some(batch) => batch,
                 None => break,
@@ -1290,7 +1484,16 @@ async fn run_forwarder(
         // lane's loss-tolerant contract); a timeout poisons the connection,
         // since the peer may answer the abandoned frame later.
         let delivered = tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => {
+                counters.dropped_batches.fetch_add(1, Ordering::Relaxed);
+                counters.dropped_events.fetch_add(count, Ordering::Relaxed);
+                tracing::warn!(
+                    dropped_events = count,
+                    "events forwarder shutting down mid-delivery; in-flight batch dropped"
+                );
+                drain_dropped_queue(&mut rx, &counters);
+                break;
+            },
             outcome = tokio::time::timeout(
                 delivery_timeout,
                 deliver_batch(&socket_path, &mut conn, &payload),
@@ -1320,7 +1523,10 @@ async fn run_forwarder(
                 );
             }
             tokio::select! {
-                _ = shutdown.cancelled() => break,
+                _ = shutdown.cancelled() => {
+                    drain_dropped_queue(&mut rx, &counters);
+                    break;
+                },
                 _ = tokio::time::sleep(FORWARDER_BACKOFF) => {}
             }
         }
@@ -1789,6 +1995,232 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn final_component_aliases_of_one_database_share_one_sidecar() {
+        // Backend identity canonicalizes the whole database path, so a
+        // final-component symlink alias is the same database; its sidecar
+        // and socket must be the same too, or a process opening one spelling
+        // writes event rows a process opening the other never reads.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        std::fs::write(&real, b"").unwrap();
+        let alias = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let real_sidecar = events_db_path_beside(&real);
+        let alias_sidecar = events_db_path_beside(&alias);
+        assert_eq!(
+            real_sidecar, alias_sidecar,
+            "a symlink alias of one database file must not mint a second event store"
+        );
+        assert_eq!(
+            events_socket_path_beside(&real_sidecar),
+            events_socket_path_beside(&alias_sidecar),
+        );
+        // Control: a genuinely distinct database in the same directory keeps
+        // its own sidecar — resolution must not collapse different files.
+        let other = dir.path().join("other.db");
+        std::fs::write(&other, b"").unwrap();
+        assert_ne!(events_db_path_beside(&other), real_sidecar);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_alias_derives_the_target_sidecar_on_cold_start() {
+        // Event-path derivation runs before backend creation, so the alias
+        // can be consulted while its target does not exist yet — the first
+        // open through the alias is what creates the target. A dangling
+        // link must therefore already derive the TARGET's sidecar, or an
+        // alias-first cold start and a later target-spelled process split
+        // the event store between them.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        let alias = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        // Neither real.db nor its sidecar exists at this point.
+        assert_eq!(
+            events_db_path_beside(&alias),
+            events_db_path_beside(&real),
+            "a dangling alias must derive the same sidecar its target will use"
+        );
+        // Chain: a link to a link resolves all the way down.
+        let chain = dir.path().join("chain.db");
+        std::os::unix::fs::symlink(&alias, &chain).unwrap();
+        assert_eq!(events_db_path_beside(&chain), events_db_path_beside(&real));
+        // Control: a distinct nonexistent file still gets its own sidecar.
+        assert_ne!(
+            events_db_path_beside(&dir.path().join("unrelated.db")),
+            events_db_path_beside(&real)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planted_symlink_at_the_sidecar_path_is_refused() {
+        // The sidecar path is derived, never user-chosen, so a pre-existing
+        // symlink there is a planted redirect: following it would tighten
+        // permissions on and write event rows into the link's target.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"victim-bytes").unwrap();
+        let mode_before = victim.metadata().unwrap().permissions();
+        let sidecar = dir.path().join("khive.db.events.db");
+        std::os::unix::fs::symlink(&victim, &sidecar).unwrap();
+        let err = match direct_backend_for(&sidecar) {
+            Ok(_) => panic!("a planted symlink at the sidecar path must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        // The link's target is untouched: content intact, mode not tightened.
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-bytes");
+        assert_eq!(victim.metadata().unwrap().permissions(), mode_before);
+        // A dangling link is refused too, and nothing is created at its
+        // target — without the refusal, the open itself would mint the
+        // redirect target.
+        let ghost_target = dir.path().join("ghost.db");
+        let dangling = dir.path().join("other.db.events.db");
+        std::os::unix::fs::symlink(&ghost_target, &dangling).unwrap();
+        assert!(direct_backend_for(&dangling).is_err());
+        assert!(
+            !ghost_target.exists(),
+            "refusal must not create the redirect target"
+        );
+        // Control: a regular path proceeds and the backend opens.
+        let regular = dir.path().join("plain.db.events.db");
+        direct_backend_for(&regular).expect("regular sidecar path must open");
+        assert!(regular.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_symlink_chains_within_the_kernel_bound_derive_the_target_sidecar() {
+        // Linux resolves up to 40 links per lookup; a 35-hop dangling chain
+        // therefore opens fine, so it must ALSO derive the target's sidecar
+        // — a resolver stopping short would split audit records between the
+        // alias and target spellings of one database.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        let mut prev = real.clone();
+        for i in 0..35 {
+            let link = dir.path().join(format!("hop{i}.db"));
+            std::os::unix::fs::symlink(&prev, &link).unwrap();
+            prev = link;
+        }
+        assert_eq!(
+            events_db_path_beside(&prev),
+            events_db_path_beside(&real),
+            "a 35-hop dangling chain must derive the target's sidecar"
+        );
+        // Control: an unrelated dangling path still derives its own name.
+        assert_ne!(
+            events_db_path_beside(&dir.path().join("unrelated.db")),
+            events_db_path_beside(&real)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_parent_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        // SQLite's open is path-based: the only sound defense against a
+        // component swapped after validation is refusing directories other
+        // local users can write. A group/other-writable parent is refused
+        // before any open; an owner-only parent proceeds.
+        let dir = tempfile::tempdir().unwrap();
+        let open_dir = dir.path().join("shared");
+        std::fs::create_dir(&open_dir).unwrap();
+        std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = direct_backend_for(&open_dir.join("khive.db.events.db"));
+        match refused {
+            Ok(_) => panic!("a world-writable events directory must be refused"),
+            Err(e) => assert!(
+                e.to_string().contains("untrusted directory"),
+                "refusal must name the directory trust rule: {e}"
+            ),
+        }
+        // Control: an owner-only sibling directory passes the same gate.
+        let safe_dir = dir.path().join("owned");
+        std::fs::create_dir(&safe_dir).unwrap();
+        std::fs::set_permissions(&safe_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        direct_backend_for(&safe_dir.join("khive.db.events.db"))
+            .expect("an owner-only events directory must open");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_refuses_a_sidecar_symlink_at_use_time() {
+        use std::os::unix::fs::PermissionsExt;
+        // The hardening step must be coupled to its validation: it opens
+        // each target with O_NOFOLLOW and chmods the returned handle, so a
+        // symlink present AT USE TIME is refused by the open itself — no
+        // lstat-then-chmod window — and the link's target keeps its mode.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"v").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let db = dir.path().join("db.events.db");
+        std::fs::write(&db, b"").unwrap();
+        let mut wal = db.as_os_str().to_os_string();
+        wal.push("-wal");
+        std::os::unix::fs::symlink(&victim, PathBuf::from(&wal)).unwrap();
+        let result = harden_events_db_sidecars(&db);
+        assert!(
+            result.is_err(),
+            "a symlinked -wal must be refused at hardening time"
+        );
+        let mode = victim.metadata().unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o644, "the link's target must keep its mode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_symlink_is_refused_and_target_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        // The daemon lock open is pinned with O_NOFOLLOW and chmods its own
+        // handle: a symlink planted at the lock name must refuse the guard,
+        // and the link's target must keep its inode content and mode. A
+        // plain lock in the same directory must still acquire — the control
+        // that proves the refusal is the symlink, not a broken guard.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"v").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let socket = dir.path().join("events.sock");
+        std::os::unix::fs::symlink(&victim, socket.with_extension("lock")).unwrap();
+        assert!(
+            try_acquire_events_daemon_guard(&socket).is_none(),
+            "a symlinked lock entry must refuse the guard"
+        );
+        let mode = victim.metadata().unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o644, "the symlink's target must keep its mode");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"v");
+        let clean = dir.path().join("clean.sock");
+        assert!(
+            try_acquire_events_daemon_guard(&clean).is_some(),
+            "a plain lock path in the same directory must still acquire"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planted_wal_symlink_is_refused_before_open() {
+        // SQLite creates `-wal` without O_EXCL, so a planted `-wal` symlink
+        // would redirect WAL writes; admission checks the sidecar suffixes
+        // before the database is ever created or opened.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"w").unwrap();
+        let sidecar = dir.path().join("db.events.db");
+        let mut wal = sidecar.as_os_str().to_os_string();
+        wal.push("-wal");
+        std::os::unix::fs::symlink(&victim, PathBuf::from(&wal)).unwrap();
+        assert!(direct_backend_for(&sidecar).is_err());
+        assert!(
+            !sidecar.exists(),
+            "refusal must precede creation of the events database"
+        );
+    }
+
     #[test]
     fn socket_derives_beside_the_sidecar() {
         let db = events_db_path_beside(Path::new("/data/khive.db"));
@@ -2231,6 +2663,182 @@ mod tests {
         assert!(
             matches!(ok, EventsResponse::Count { .. }),
             "valid namespace must dispatch, got {ok:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_counts_and_logs_queued_and_in_flight_batches_as_dropped() {
+        // ADR-170 requires shutdown drops to be visible via counters/logs.
+        // Both `run_forwarder` shutdown arms must therefore count every
+        // batch it loses: the one parked mid-delivery against a hung peer,
+        // and every batch still sitting in the queue behind it. Drives
+        // `run_forwarder` directly with a local `CancellationToken` (rather
+        // than through `EventsSplitClient`, which wires the process-wide
+        // `daemon_shutdown_token()` singleton) so cancelling shutdown here
+        // cannot leak into other tests sharing the process.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hung-shutdown.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Accept and hold the connection open without ever reading or
+        // replying, so the first delivery blocks in `deliver_batch`'s
+        // read_frame until shutdown cancels it.
+        let _server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    held.push(stream);
+                }
+            }
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<(String, Vec<Event>)>(8);
+        let counters = Arc::new(ForwardingCounters::default());
+        let outage_logged = Arc::new(AtomicBool::new(false));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        let forwarder = tokio::spawn(run_forwarder(
+            socket,
+            rx,
+            Arc::clone(&counters),
+            outage_logged,
+            Duration::from_secs(30),
+            shutdown.clone(),
+        ));
+
+        fn probe_event(tag: &str) -> Event {
+            Event::new(
+                "test",
+                tag,
+                khive_types::EventKind::Audit,
+                khive_types::SubstrateKind::Event,
+                "tester",
+            )
+        }
+
+        tx.try_send(("test".to_string(), vec![probe_event("in-flight")]))
+            .expect("queue has room for the in-flight batch");
+        // No externally observable "delivery started" signal exists short of
+        // instrumenting the forwarder; a short sleep reliably lands inside
+        // the delivery `select!` arm before shutdown cancels it, given the
+        // 30s delivery timeout has no chance to fire first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        tx.try_send((
+            "test".to_string(),
+            vec![probe_event("queued-1"), probe_event("queued-2")],
+        ))
+        .expect("queue has room for the first queued batch");
+        tx.try_send(("test".to_string(), vec![probe_event("queued-3")]))
+            .expect("queue has room for the second queued batch");
+
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("forwarder must exit promptly on shutdown")
+            .expect("forwarder task must not panic");
+
+        assert_eq!(
+            counters.dropped_batches.load(Ordering::Relaxed),
+            3,
+            "the in-flight batch and both queued batches must all be counted as dropped"
+        );
+        assert_eq!(
+            counters.dropped_events.load(Ordering::Relaxed),
+            4,
+            "1 in-flight + 2 + 1 queued events must all be counted as dropped"
+        );
+        assert_eq!(
+            counters.forwarded_batches.load(Ordering::Relaxed),
+            0,
+            "a hung peer never acknowledges anything in this test"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_during_backoff_drains_queued_batches() {
+        // A failed delivery sends the forwarder into `FORWARDER_BACKOFF`
+        // before it loops back to `rx.recv()`. Shutdown arriving while it
+        // sits in that backoff sleep must drain and count whatever is left
+        // in the queue, not just break out silently. Points at a socket path
+        // with no listener bound so the very first delivery attempt fails
+        // fast (connect refused) rather than needing a hung peer.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("no-listener.sock");
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<(String, Vec<Event>)>(8);
+        let counters = Arc::new(ForwardingCounters::default());
+        let outage_logged = Arc::new(AtomicBool::new(false));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        let forwarder = tokio::spawn(run_forwarder(
+            socket,
+            rx,
+            Arc::clone(&counters),
+            outage_logged,
+            Duration::from_secs(30),
+            shutdown.clone(),
+        ));
+
+        fn probe_event(tag: &str) -> Event {
+            Event::new(
+                "test",
+                tag,
+                khive_types::EventKind::Audit,
+                khive_types::SubstrateKind::Event,
+                "tester",
+            )
+        }
+
+        tx.try_send(("test".to_string(), vec![probe_event("failed-delivery")]))
+            .expect("queue has room for the first batch");
+
+        // Wait for the failed-delivery drop to land, which proves the
+        // forwarder has moved on to the `FORWARDER_BACKOFF` sleep.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if counters.dropped_batches.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "forwarder never dropped the first (unreachable-daemon) batch"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        tx.try_send((
+            "test".to_string(),
+            vec![
+                probe_event("queued-during-backoff-1"),
+                probe_event("queued-during-backoff-2"),
+            ],
+        ))
+        .expect("queue has room for the batch queued during backoff");
+
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("forwarder must exit promptly on shutdown, not wait out the full backoff")
+            .expect("forwarder task must not panic");
+
+        assert_eq!(
+            counters.dropped_batches.load(Ordering::Relaxed),
+            2,
+            "the failed-delivery batch and the batch queued during backoff must both be counted as dropped"
+        );
+        assert_eq!(
+            counters.dropped_events.load(Ordering::Relaxed),
+            3,
+            "1 failed-delivery + 2 queued-during-backoff events must all be counted as dropped"
+        );
+        assert_eq!(
+            counters.forwarded_batches.load(Ordering::Relaxed),
+            0,
+            "no listener is bound, so nothing can ever be acknowledged"
         );
     }
 

@@ -1300,6 +1300,26 @@ impl KhiveMcpServer {
     }
 
     /// Fingerprint of the runtime config this server's registry was built for.
+    /// The resolved events-split config of the default-backend runtime, if
+    /// any (ADR-170). Daemon supervision derives the events daemon's
+    /// db/socket from this exact value so the supervised daemon and the
+    /// forwarding clients cannot anchor at diverging paths.
+    pub(crate) fn events_split_config(
+        &self,
+    ) -> Option<&khive_runtime::events_split::EventsSplitConfig> {
+        self.runtime
+            .as_ref()
+            .and_then(|rt| rt.config().events_split.as_ref())
+    }
+
+    /// Whether the default-backend runtime is read-only. Daemon supervision
+    /// asks this before spawning an events daemon: the supervised daemon
+    /// opens the events sidecar writable, which a read-only deployment must
+    /// never cause (ADR-170).
+    pub(crate) fn default_runtime_is_read_only(&self) -> bool {
+        self.runtime.as_ref().is_some_and(|rt| rt.is_read_only())
+    }
+
     pub fn config_id(&self) -> &str {
         &self.config_id
     }
@@ -4080,10 +4100,12 @@ mod tests {
         let base = RuntimeConfig::no_embeddings();
         let utc = RuntimeConfig {
             display_timezone: "UTC".parse().expect("UTC is a known IANA zone"),
+            events_split: None,
             ..base.clone()
         };
         let new_york = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            events_split: None,
             ..base
         };
 
@@ -4114,10 +4136,12 @@ mod tests {
         let base = RuntimeConfig::no_embeddings();
         let a = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            events_split: None,
             ..base.clone()
         };
         let b = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            events_split: None,
             ..base
         };
 

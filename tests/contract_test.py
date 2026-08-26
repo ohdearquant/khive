@@ -45,6 +45,7 @@ The KKERNEL_BINARY env var overrides the default binary path. The server is the
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -253,11 +254,18 @@ _results: list[tuple[str, bool, str]] = []
 
 
 def _run_test(name: str, fn) -> None:
-    """Execute a test function; record pass/fail."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as db_file:
-        db_path = db_file.name
-    with tempfile.NamedTemporaryFile(suffix=".toml", delete=False) as config_file:
-        config_path = config_file.name
+    """Execute a test function; record pass/fail.
+
+    The database lives inside a private (0700) temporary directory, not bare
+    in /tmp: the events sidecar database is opened beside the main database,
+    and the server refuses to serve events from a directory other local
+    users can write (a bare /tmp parent fails that trust walk).
+    """
+    work_dir = tempfile.mkdtemp(prefix="khive-contract-")
+    db_path = os.path.join(work_dir, "contract.db")
+    config_path = os.path.join(work_dir, "contract.toml")
+    with open(config_path, "w", encoding="utf-8"):
+        pass
     proc = _start_server(db_path, config_path)
     try:
         fn(proc)
@@ -270,11 +278,7 @@ def _run_test(name: str, fn) -> None:
         print(f"         {exc}")
     finally:
         _stop_server(proc)
-        for path in (db_path, config_path):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

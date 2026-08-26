@@ -259,6 +259,58 @@ when unavailable) builds on the same socket pattern and the same durability
 reasoning. It is deliberately out of scope here; validating the hand-off
 primitive on the events lane comes first.
 
+## Amendment: `brain.event_counts` consistency under split reads (2026-08-26)
+
+The per-request page cap this daemon enforces
+(`khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS`, 4,096 rows) applies
+to every `QueryEvents` call, not only ones that happen to exceed it by
+accident. `brain.event_counts` (ADR-103 Stage 1) previously read its window
+with a single bounded `query_events` call, sized up to the pack's own window
+cap — sound only as long as that cap stayed under the daemon's. It does not:
+`brain.event_counts(exhaustive=true)` explicitly exists to serve windows up to
+2,000,000 events, and even the bounded default view's per-kind segregation
+(counting `audit` separately from every other kind so a busy kind cannot crowd
+a quiet one out of the shared budget — see `fetch_event_counts_window`) can
+need more than one page per side. A single wide query for either case is
+flatly refused by this daemon.
+
+`crates/khive-pack-brain/src/handlers.rs`'s `collect_events_cursor_walk` fixes
+this by walking a strict descending `created_at` cursor in
+transport-cap-sized pages (`TRANSPORT_PAGE_ROWS`, bound to
+`MAX_QUERY_EVENTS_PAGE_ROWS`), deduplicating same-microsecond ties by event id
+at each page boundary, instead of issuing one wide read. `khive-pack-moodboard`'s
+`moodboard.train_preference` judgment-snapshot read applies the identical
+cursor technique for the same reason. This ADR's split store does not use that
+technique itself: `SplitEventStore::query_events` fetches each backing store's
+matching prefix, merges and sorts them, then applies the requested window — a
+prefix-merge read with no cursor loop of its own. Both consumer-side walks
+apply uniformly, whether or not the runtime is actually configured for
+split/daemon mode, so neither pack's read behavior depends on that deployment
+detail.
+
+The tradeoff this walk accepts: the exact/full-window aggregation
+`brain.event_counts` documented before this change assumed one atomic
+snapshot read. A cursor walk instead issues one independent page (and, at a
+timestamp-tie boundary, one independent count) read per step against a live
+event plane. The result is a best-effort point-in-time view, not a snapshot —
+a row appended while the walk is in flight may be included or excluded
+depending on where the cursor stands when it lands, but is never
+double-counted (the boundary-microsecond dedup in the walk prevents that).
+`window_event_total` is likewise an independent `count_events` read, not
+derived from the walked rows, and can disagree with them by whatever appended
+or (soft-)deleted between the two reads.
+
+This is the intended consequence of the split, not a regression to revert:
+refusing to serve `brain.event_counts` under daemon mode until a snapshot
+primitive exists would be strictly worse than a documented best-effort view,
+and callers needing a closed population already have the tool for it —
+bound `until` in the past, per the handler's own doc. The relaxed contract is
+codified in the `brain.event_counts` and `exhaustive` param descriptions in
+`crates/khive-pack-brain/src/handlers.rs`, and pinned by regression tests in
+`crates/khive-pack-brain/src/tests.rs` (e.g.
+`concurrent_boundary_append_between_count_and_next_page_is_excluded_cleanly`,
+`max_timestamp_group_is_fully_collected_not_skipped`).
+
 ## References
 
 - ADR-067 (write-owner daemon; Amendment 4: writer-begin busy contract)
