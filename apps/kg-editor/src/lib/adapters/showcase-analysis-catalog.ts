@@ -1,5 +1,6 @@
 import { readOperatorShowcaseAccessToken } from "@/lib/adapters/preferred-showcase-source";
 import {
+  isShowcaseAnalysisId,
   normalizeRepositoryUrl,
   SHOWCASE_REGISTRY,
   type ShowcaseRegistryEntry,
@@ -8,7 +9,6 @@ import {
 export const SHOWCASE_CATALOG_MAX_ENTRIES = 64;
 export const SHOWCASE_CATALOG_MAX_BYTES = 256 * 1024;
 
-const ANALYSIS_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const CATALOG_SCHEMA = "khive.showcase.catalog.v1";
 
 export type ShowcaseAnalysisCatalogEntry = Readonly<{
@@ -75,7 +75,7 @@ export function parseShowcaseAnalysisCatalog(
     const analysisId = Reflect.get(candidate, "analysis_id");
     const canonicalUrl = Reflect.get(candidate, "canonical_url");
     if (
-      typeof analysisId !== "string" || !ANALYSIS_ID.test(analysisId) ||
+      !isShowcaseAnalysisId(analysisId) ||
       typeof canonicalUrl !== "string"
     ) {
       return invalidCatalog();
@@ -154,8 +154,13 @@ export function mergeShowcaseRegistry(
   catalog: readonly ShowcaseAnalysisCatalogEntry[],
   staticRegistry: readonly ShowcaseRegistryEntry[] = SHOWCASE_REGISTRY,
 ): readonly ShowcaseRegistryEntry[] {
+  // Catalog analysis IDs are authoritative for lookup: any static alias that
+  // collides with a claimed ID is dropped so first-match-wins resolution can
+  // reach the catalog's entry.
+  const catalogClaimedIds = new Set(catalog.map((entry) => entry.analysis_id));
   const merged: ShowcaseRegistryEntry[] = staticRegistry.map((entry) => ({
     ...entry,
+    aliases: entry.aliases.filter((alias) => !catalogClaimedIds.has(alias)),
     analysisId: undefined,
   }));
   const staticByUrl = new Map<string, number>();
@@ -182,6 +187,22 @@ export function mergeShowcaseRegistry(
       assetPath: undefined,
       analysisId: entry.analysis_id,
     });
+  }
+  for (const [index, staticEntry] of staticRegistry.entries()) {
+    const entry = merged[index];
+    const legacyId = staticEntry.analysisId;
+    if (
+      entry &&
+      isShowcaseAnalysisId(legacyId) &&
+      !catalogClaimedIds.has(legacyId) &&
+      entry.analysisId !== legacyId &&
+      !entry.aliases.includes(legacyId)
+    ) {
+      merged[index] = {
+        ...entry,
+        aliases: [...entry.aliases, legacyId],
+      };
+    }
   }
   return merged;
 }

@@ -414,10 +414,17 @@ fn redact_crossing_boundary_url_userinfo(text: &str) -> std::borrow::Cow<'_, str
         let terminated =
             rest.contains('@') || rest.contains(' ') || rest.contains('\n') || rest.contains('\r');
         if !terminated {
-            if let Some(colon) = rest.find(':') {
-                let user = &rest[..colon];
+            // Same rules as `find_url_userinfo`: the userinfo colon must sit
+            // in the authority component (before any `/`, `?`, or `#` — a
+            // later colon is path/query text), and only the password must be
+            // non-empty (an empty username, `redis://:pass`, is a standard
+            // connection-string form and no less a credential). The password
+            // run AFTER the colon is unrestricted — a crossing password may
+            // itself contain any of those delimiters.
+            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            if let Some(colon) = rest[..authority_end].find(':') {
                 let pass = &rest[colon + 1..];
-                if !user.is_empty() && !pass.is_empty() {
+                if !pass.is_empty() {
                     let redact_from = scheme_pos + 3 + colon;
                     let mut out = String::with_capacity(redact_from + REDACTION_MARKER.len());
                     out.push_str(&text[..redact_from]);
@@ -708,23 +715,30 @@ fn find_jwt(text: &str) -> Option<&str> {
     None
 }
 
-/// Detect `scheme://user:pass@host` patterns where the `user:pass` portion
-/// contains actual credentials (both user and pass non-empty).
+/// Detect `scheme://user:pass@host` patterns where the userinfo carries an
+/// actual credential: a non-empty password. The username may be empty —
+/// `redis://:secret@host` is a standard empty-user connection string and its
+/// password is no less a credential for the missing username.
 fn find_url_userinfo(text: &str) -> Option<&str> {
     let mut search = text;
     let mut base = 0usize;
     while let Some(at_rel) = search.find("://") {
         let at_abs = base + at_rel;
-        // After `://`, look for `@` before the next `/`, `?`, ` `, or newline.
+        // After `://`, only the authority component may carry userinfo: it
+        // ends at the first `/`, `?`, `#`, space, or newline. An `@` past
+        // that boundary is path/query text (`https://host/a:x@next`), not a
+        // credential.
         let rest_start = at_abs + 3;
         let rest = &text[rest_start..];
-        if let Some(at_pos) = rest.find('@') {
+        let authority_end = rest
+            .find(['/', '?', '#', ' ', '\n', '\r'])
+            .unwrap_or(rest.len());
+        if let Some(at_pos) = rest[..authority_end].rfind('@') {
             let userinfo = &rest[..at_pos];
-            // Must contain a colon and both sides non-empty.
+            // Must contain a colon with a non-empty password after it.
             if let Some(colon) = userinfo.find(':') {
-                let user = &userinfo[..colon];
                 let pass = &userinfo[colon + 1..];
-                if !user.is_empty() && !pass.is_empty() && pass.len() >= 4 {
+                if !pass.is_empty() {
                     // Return a slice starting from the scheme.  Walk back from
                     // `at_abs` to the first non-scheme char and resume just past
                     // it.  Use `char_indices` and skip by the separator's full
@@ -2241,6 +2255,75 @@ mod tests {
         let fake = "postgresql://dbuser:S3cr3tP4ss@db.example.com:5432/mydb";
         assert!(scan(fake).is_some(), "URL userinfo must be caught");
         assert_eq!(scan(fake).unwrap().detector, "url-userinfo");
+    }
+
+    #[test]
+    fn blocks_and_masks_url_userinfo_with_short_passwords() {
+        for password in ["a", "ab", "abc"] {
+            let content = format!(
+                "gate backend probe failed: postgres://svc:{password}@internal-host refused"
+            );
+
+            let detected = scan(&content).expect("short URL password must be detected");
+            assert_eq!(detected.detector, "url-userinfo");
+            assert!(
+                check(&content).is_err(),
+                "write gate must block {content:?}"
+            );
+            assert_eq!(
+                bounded_masked_log_text(&content),
+                "gate backend probe failed: ***MASKED*** refused",
+                "log boundary must mask {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_url_without_userinfo() {
+        let content = "gate backend probe failed: postgres://host:8080/path refused";
+
+        assert!(check(content).is_ok(), "host:port is not URL userinfo");
+        assert_eq!(bounded_masked_log_text(content), content);
+    }
+
+    #[test]
+    fn blocks_and_masks_empty_username_url_passwords() {
+        // Standard empty-user connection strings: the password is the
+        // credential whether or not a username precedes the colon.
+        for password in ["a", "ab", "%40", "密码"] {
+            let content =
+                format!("gate backend probe failed: redis://:{password}@internal-host refused");
+
+            let detected = scan(&content).expect("empty-username URL password must be detected");
+            assert_eq!(detected.detector, "url-userinfo");
+            assert!(
+                check(&content).is_err(),
+                "write gate must block {content:?}"
+            );
+            assert_eq!(
+                bounded_masked_log_text(&content),
+                "gate backend probe failed: ***MASKED*** refused",
+                "log boundary must mask {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_colon_at_pairs_outside_the_authority() {
+        // An `@` past the authority boundary is path/query/fragment text,
+        // not userinfo: `host/a:x@next` must not read as user `host/a` with
+        // password `x`.
+        for content in [
+            "see https://host/a:x@next for details",
+            "see https://host?time=12:30@zone for details",
+            "see https://host#frag:1@anchor for details",
+        ] {
+            assert!(
+                check(content).is_ok(),
+                "path/query/fragment `:`+`@` text is not userinfo: {content:?}"
+            );
+            assert_eq!(bounded_masked_log_text(content), content);
+        }
     }
 
     #[test]
@@ -3945,6 +4028,45 @@ mod tests {
         assert!(
             rendered.ends_with('…'),
             "truncated record must declare its own incompleteness: {rendered:?}"
+        );
+    }
+
+    /// Regression: the crossing fallback follows the same empty-username
+    /// rule as the canonical detector — `redis://:<password>` with the
+    /// terminating `@` beyond the mask-input cap must still be redacted.
+    #[test]
+    fn bounded_masked_log_text_redacts_crossing_empty_username_password() {
+        let huge_low_entropy_password = "b".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let raw = format!(
+            "gate backend probe failed: redis://:{huge_low_entropy_password}@internal-host refused"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"b".repeat(50)),
+            "no empty-username password fragment may survive the cap crossing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    /// Regression: the crossing fallback shares the canonical detector's
+    /// authority boundary — a colon after `/`, `?`, or `#` is path/query
+    /// text, so a capped input whose only colon-at pair sits in the path
+    /// must NOT be masked even when the `@` lies beyond the cap.
+    #[test]
+    fn bounded_masked_log_text_keeps_path_colon_text_crossing_the_cap() {
+        let filler = "z".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let raw = format!("see https://host/a:x{filler}@next for details");
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains("***MASKED***"),
+            "path-colon text must not read as a crossing credential: {rendered:?}"
+        );
+        assert!(
+            rendered.starts_with("see https://host/a:x"),
+            "the non-credential prefix must survive verbatim: {rendered:?}"
         );
     }
 

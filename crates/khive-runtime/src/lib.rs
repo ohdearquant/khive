@@ -58,7 +58,7 @@ pub use atomic_runner::{
     CommittedPostCommitEffects,
 };
 pub use blob::{
-    resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, VerifiedBlob,
+    resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, GovernedBlobError, VerifiedBlob,
     DEFAULT_BLOB_HYDRATION_BYTES,
 };
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
@@ -112,8 +112,8 @@ pub use operations::{
 };
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
-    hex_prefix_to_uuid_pattern, merge_entry_metadata, EdgeEndpointKind, EntityCreateSpec, LinkSpec,
-    NoteSearchHit, QueryResult, Resolved,
+    hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, EdgeEndpointKind,
+    EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,

@@ -195,6 +195,28 @@ describe("materialized repository lookup", () => {
     );
   });
 
+  it("keeps a curated analysis-id deep link addressable while catalog discovery is pending", async () => {
+    let releaseCatalog: (() => void) | undefined;
+    mockedCatalog.mockImplementation(() => new Promise((resolveCatalog) => {
+      releaseCatalog = () => resolveCatalog({
+        status: "ready",
+        entries: [defaultCatalogEntry],
+        message: "1 configured repository analysis discovered.",
+      });
+    }));
+    window.history.replaceState(null, "", "/?repo=khive");
+
+    const { container } = render(<Showcase />);
+
+    expect(new URL(window.location.href).searchParams.get("repo")).toBe("khive");
+    expect(releaseCatalog).toBeDefined();
+    releaseCatalog?.();
+    await waitFor(() => expect(container.querySelector(".repo-overview")).toBeVisible());
+    expect(new URL(window.location.href).searchParams.get("repo")).toBe(
+      bundle.meta.repository.canonical_url,
+    );
+  });
+
   it("preserves a direct investigation while canonicalizing a curated alias", async () => {
     const pool = bundle.graph.modules.items.find((module) =>
       module.source_path.endsWith("khive-db/src/pool.rs")
@@ -412,7 +434,7 @@ describe("materialized repository lookup", () => {
       expect.arrayContaining(["repo"]),
     );
     for (const key of url.searchParams.keys()) {
-      expect(["repo", "at", "module", "view"]).toContain(key);
+      expect(["repo", "at", "module", "module_id", "view"]).toContain(key);
     }
   });
 

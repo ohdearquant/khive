@@ -4,9 +4,9 @@
 //! lock file. The two-level shard is identical in shape to git's loose-object
 //! store, so a root holding millions of blobs never puts more than a few
 //! thousand entries in one directory. Writes are atomic-publish (khive#292):
-//! bytes land in a `tempfile` in the SAME shard directory as the final path
-//! (guaranteeing same-filesystem rename), the written length is checked against
-//! the input length, then `NamedTempFile::persist` performs the rename —
+//! bytes land in a temporary entry in the SAME shard directory as the final
+//! path (guaranteeing same-filesystem rename), the written length is checked
+//! against the input length, then an atomic rename publishes the entry —
 //! crash-safe (a crash mid-write leaves an orphaned temp file, never a
 //! partially-committed blob).
 
@@ -40,9 +40,118 @@ fn map_io_err(e: std::io::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Blob, op, e)
 }
 
+#[cfg(any(test, not(unix)))]
 fn shard_path(root: &Path, content_ref: &ContentRef) -> PathBuf {
     let hex = content_ref.as_str();
     root.join(&hex[0..2]).join(&hex[2..4]).join(hex)
+}
+
+#[cfg(unix)]
+fn open_blob_root_handle(root: &Path) -> std::io::Result<std::fs::File> {
+    open_dir_no_follow(root)
+}
+
+#[cfg(windows)]
+fn open_blob_root_handle(root: &Path) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let handle = OpenOptions::new()
+        .read(true)
+        // Retain the handle for the store's lifetime. Omitting
+        // FILE_SHARE_DELETE prevents the root's final component from being
+        // renamed or removed while this store can still issue operations.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(root)?;
+    let file_type = handle.metadata()?.file_type();
+    if file_type.is_symlink() || !file_type.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "blob store root is not a directory or is a reparse point: {}",
+                root.display()
+            ),
+        ));
+    }
+    Ok(handle)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_blob_root_handle(root: &Path) -> std::io::Result<std::fs::File> {
+    let handle = std::fs::File::open(root)?;
+    if !handle.metadata()?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("blob store root is not a directory: {}", root.display()),
+        ));
+    }
+    Ok(handle)
+}
+
+/// Fail closed when the canonical root spelling no longer names the same
+/// directory handle retained at construction. The comparison is only an
+/// invariant check: filesystem authority for the operation itself remains
+/// the retained handle, so a replacement after this check cannot redirect a
+/// handle-relative walk.
+#[cfg(unix)]
+fn verify_blob_root_identity(root: &Path, root_handle: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current = open_dir_no_follow(root).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "blob store root is no longer reachable as its initialization-time directory ({}): {error}",
+                root.display()
+            ),
+        )
+    })?;
+    let expected = root_handle.metadata()?;
+    let current = current.metadata()?;
+    if expected.dev() != current.dev() || expected.ino() != current.ino() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "blob store root no longer names its initialization-time directory: {}",
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_blob_root_identity(root: &Path, _root_handle: &std::fs::File) -> std::io::Result<()> {
+    // `root` is canonicalized before the retained handle opens. Re-resolving
+    // the spelling catches an ancestor redirect on Windows; the retained
+    // no-share-delete handle separately pins the root's final component, and
+    // the Windows leaf helpers compare their resolved target handles to that
+    // initialization-time root handle before use.
+    let current = root.canonicalize().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "blob store root is no longer reachable as its initialization-time directory ({}): {error}",
+                root.display()
+            ),
+        )
+    })?;
+    if current != root {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "blob store root no longer names its initialization-time directory: {}",
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Unlink one blob's shard-relative file using `O_NOFOLLOW`-verified
@@ -63,30 +172,28 @@ fn shard_path(root: &Path, content_ref: &ContentRef) -> PathBuf {
 /// (`walpin.rs`) and `khive-vamana`'s external-id sidecar
 /// (`external_ids.rs`) use for the same TOCTOU hazard.
 #[cfg(unix)]
-fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> std::io::Result<()> {
+fn unlink_blob_shard_file_no_follow(
+    root: &Path,
+    root_handle: &std::fs::File,
+    content_ref: &ContentRef,
+) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
 
+    verify_blob_root_identity(root, root_handle)?;
     let hex = content_ref.as_str();
-    let root_dir = open_dir_no_follow(root)?;
-    let shard1_dir = openat_dir_no_follow(root_dir.as_raw_fd(), &hex[0..2])?;
+    let shard1_dir = openat_dir_no_follow(root_handle.as_raw_fd(), &hex[0..2])?;
     let shard2_dir = openat_dir_no_follow(shard1_dir.as_raw_fd(), &hex[2..4])?;
-    let c_name = std::ffi::CString::new(hex)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    // SAFETY: `shard2_dir` is a live, open directory descriptor for the
-    // duration of this call, and `c_name` is NUL-terminated. `unlinkat`
-    // removes the named directory entry only — it acts on the shard
-    // directory's entry table, not through any symlink that entry might
-    // itself be, so this is safe even if `content_ref`'s target happens to
-    // be replaced by a symlink at unlink time.
-    let rc = unsafe { libc::unlinkat(shard2_dir.as_raw_fd(), c_name.as_ptr(), 0) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    // `unlinkat` removes this directory entry itself rather than following a
+    // leaf symlink, matching the original delete semantics.
+    unlink_entry_at(shard2_dir.as_raw_fd(), hex)
 }
 
 #[cfg(windows)]
-fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> std::io::Result<()> {
+fn unlink_blob_shard_file_no_follow(
+    root: &Path,
+    root_handle: &std::fs::File,
+    content_ref: &ContentRef,
+) -> std::io::Result<()> {
     // Windows equivalent of the Unix arm's fd-pinned walk. The Unix arm's
     // guarantee is: the root's ancestors are resolved exactly once (at
     // `open(root)`), every later step is relative to an already-verified
@@ -200,14 +307,14 @@ fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> st
         }
     }
 
+    verify_blob_root_identity(root, root_handle)?;
     let hex = content_ref.as_str();
     let shard1 = root.join(&hex[0..2]);
     let shard2 = shard1.join(&hex[2..4]);
-    let root_pin = open_dir_pinned_no_follow(root)?;
     let _shard1_pin = open_dir_pinned_no_follow(&shard1)?;
     let _shard2_pin = open_dir_pinned_no_follow(&shard2)?;
 
-    let expected = final_path_by_handle(&root_pin)?
+    let expected = final_path_by_handle(root_handle)?
         .join(&hex[0..2])
         .join(&hex[2..4])
         .join(hex);
@@ -252,7 +359,11 @@ fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> st
 }
 
 #[cfg(not(any(unix, windows)))]
-fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> std::io::Result<()> {
+fn unlink_blob_shard_file_no_follow(
+    root: &Path,
+    root_handle: &std::fs::File,
+    content_ref: &ContentRef,
+) -> std::io::Result<()> {
     // Neither `openat`/`O_NOFOLLOW` nor Windows directory-handle pinning is
     // available on this tier (which no release artifact targets), so this
     // checks each shard path component with `symlink_metadata` before the
@@ -266,6 +377,7 @@ fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> st
     // checked directories between this check and the `remove_file` call
     // below, so a component could still be swapped for a link in that
     // window (TOCTOU).
+    verify_blob_root_identity(root, root_handle)?;
     let hex = content_ref.as_str();
     let shard1 = root.join(&hex[0..2]);
     let shard2 = shard1.join(&hex[2..4]);
@@ -290,45 +402,17 @@ fn unlink_blob_shard_file_no_follow(root: &Path, content_ref: &ContentRef) -> st
 #[cfg(unix)]
 fn open_blob_shard_file_no_follow(
     root: &Path,
+    root_handle: &std::fs::File,
     content_ref: &ContentRef,
 ) -> std::io::Result<std::fs::File> {
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-
-    let hex = content_ref.as_str();
-    let root_dir = open_dir_no_follow(root)?;
-    let shard1_dir = openat_dir_no_follow(root_dir.as_raw_fd(), &hex[0..2])?;
-    let shard2_dir = openat_dir_no_follow(shard1_dir.as_raw_fd(), &hex[2..4])?;
-    let c_name = std::ffi::CString::new(hex)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-
-    // O_NONBLOCK keeps a planted FIFO/device-like entry from hanging the
-    // worker before fstat can reject it; it does not alter regular-file I/O.
-    // O_NOFOLLOW rejects a symlink leaf, while the two openat directory
-    // handles above pin and verify every intermediate component.
-    let fd = unsafe {
-        libc::openat(
-            shard2_dir.as_raw_fd(),
-            c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is newly returned and uniquely owned here.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    if !file.metadata()?.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "refusing to read a blob leaf that is not a regular file",
-        ));
-    }
-    Ok(file)
+    verify_blob_root_identity(root, root_handle)?;
+    open_blob_shard_file_at_no_follow(root_handle, content_ref, libc::O_RDONLY)
 }
 
 #[cfg(windows)]
 fn open_blob_shard_file_no_follow(
     root: &Path,
+    root_handle: &std::fs::File,
     content_ref: &ContentRef,
 ) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
@@ -387,13 +471,13 @@ fn open_blob_shard_file_no_follow(
         }
     }
 
+    verify_blob_root_identity(root, root_handle)?;
     let hex = content_ref.as_str();
     let shard1 = root.join(&hex[0..2]);
     let shard2 = shard1.join(&hex[2..4]);
-    let root_pin = open_dir_pinned_no_follow(root)?;
     let _shard1_pin = open_dir_pinned_no_follow(&shard1)?;
     let _shard2_pin = open_dir_pinned_no_follow(&shard2)?;
-    let expected = final_path_by_handle(&root_pin)?
+    let expected = final_path_by_handle(root_handle)?
         .join(&hex[0..2])
         .join(&hex[2..4])
         .join(hex);
@@ -426,9 +510,11 @@ fn open_blob_shard_file_no_follow(
 
 #[cfg(not(any(unix, windows)))]
 fn open_blob_shard_file_no_follow(
-    _root: &Path,
+    root: &Path,
+    root_handle: &std::fs::File,
     _content_ref: &ContentRef,
 ) -> std::io::Result<std::fs::File> {
+    verify_blob_root_identity(root, root_handle)?;
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "bounded verified blob reads require handle-relative no-follow file APIs",
@@ -483,6 +569,198 @@ fn openat_dir_no_follow(
     // SAFETY: `fd` was just returned by the successful `openat` above and is
     // uniquely owned by this `File`, which closes it exactly once on drop.
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn openat_regular_file_no_follow(
+    parent_fd: std::os::unix::io::RawFd,
+    name: &str,
+    access_flags: libc::c_int,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::FromRawFd;
+
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // O_NONBLOCK prevents a planted FIFO/device-like entry from hanging the
+    // worker before handle metadata can reject it. It is inert for regular
+    // files.
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            c_name.as_ptr(),
+            access_flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was newly returned and is transferred exactly once.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing non-regular blob store entry: {name}"),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_blob_shard_file_at_no_follow(
+    root_handle: &std::fs::File,
+    content_ref: &ContentRef,
+    access_flags: libc::c_int,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+
+    let hex = content_ref.as_str();
+    let shard1_dir = openat_dir_no_follow(root_handle.as_raw_fd(), &hex[0..2])?;
+    let shard2_dir = openat_dir_no_follow(shard1_dir.as_raw_fd(), &hex[2..4])?;
+    openat_regular_file_no_follow(shard2_dir.as_raw_fd(), hex, access_flags)
+}
+
+#[cfg(unix)]
+fn open_or_create_dir_at_no_follow(
+    parent_fd: std::os::unix::io::RawFd,
+    name: &str,
+) -> std::io::Result<std::fs::File> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    match openat_dir_no_follow(parent_fd, name) {
+        Ok(dir) => Ok(dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // SAFETY: `parent_fd` is live and `c_name` is NUL-terminated.
+            let rc = unsafe { libc::mkdirat(parent_fd, c_name.as_ptr(), 0o777) };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+            // Always validate the resulting entry on a descriptor. Another
+            // process may have won the creation race with a non-directory or
+            // a symlink.
+            openat_dir_no_follow(parent_fd, name)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn create_regular_file_at_no_follow(
+    parent_fd: std::os::unix::io::RawFd,
+    name: &str,
+    mode: libc::mode_t,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::FromRawFd;
+
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `parent_fd` is live, `c_name` is NUL-terminated, and the mode
+    // argument is supplied because O_CREAT is present.
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            c_name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was newly returned and is transferred exactly once.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn unlink_entry_at(parent_fd: std::os::unix::io::RawFd, name: &str) -> std::io::Result<()> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `parent_fd` is live and `c_name` is NUL-terminated.
+    let rc = unsafe { libc::unlinkat(parent_fd, c_name.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn rename_entry_at(
+    parent_fd: std::os::unix::io::RawFd,
+    from: &str,
+    to: &str,
+) -> std::io::Result<()> {
+    let c_from = std::ffi::CString::new(from)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let c_to = std::ffi::CString::new(to)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: both names are NUL-terminated and relative to the same live
+    // shard-directory handle.
+    let rc = unsafe { libc::renameat(parent_fd, c_from.as_ptr(), parent_fd, c_to.as_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn available_space_at(root_handle: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `root_handle` is live and `stat` is a valid output buffer.
+    let rc = unsafe { libc::fstatvfs(root_handle.as_raw_fd(), &mut stat) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // `f_bavail`'s width is platform-dependent (u64 on Linux glibc, u32 on
+    // macOS), so the widening is a no-op on some targets and required on
+    // others; the lint only sees one target at a time.
+    #[allow(clippy::useless_conversion)]
+    Ok(stat.f_frsize.saturating_mul(u64::from(stat.f_bavail)))
+}
+
+#[cfg(unix)]
+fn acquire_root_write_lock_at(root_handle: &std::fs::File) -> StorageResult<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let c_name = std::ffi::CString::new(ROOT_WRITE_LOCK_FILE)
+        .expect("the static blob root lock name contains no NUL");
+    // SAFETY: the root handle is live, the static name is NUL-terminated,
+    // and the mode is present because O_CREAT is used.
+    let fd = unsafe {
+        libc::openat(
+            root_handle.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666,
+        )
+    };
+    if fd < 0 {
+        return Err(map_io_err(
+            std::io::Error::last_os_error(),
+            "root_write_lock_open",
+        ));
+    }
+    // SAFETY: `fd` was newly returned and is transferred exactly once.
+    let lock_file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !lock_file
+        .metadata()
+        .map_err(|e| map_io_err(e, "root_write_lock_metadata"))?
+        .file_type()
+        .is_file()
+    {
+        return Err(map_io_err(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "blob root write lock is not a regular file",
+            ),
+            "root_write_lock_open",
+        ));
+    }
+    fs4::FileExt::lock(&lock_file).map_err(|e| map_io_err(e, "root_write_lock_acquire"))?;
+    Ok(lock_file)
 }
 
 /// Collision-resistant diagnostic identity for one canonical blob root.
@@ -559,6 +837,7 @@ fn crosses_floor(available: u64, required_write_bytes: u64, floor_bytes: u64) ->
     available.saturating_sub(required_write_bytes) < floor_bytes
 }
 
+#[cfg(any(test, not(unix)))]
 fn put_blocking_with_space_probe<F>(
     root: &Path,
     floor_bytes: u64,
@@ -640,11 +919,122 @@ where
     Ok(content_ref)
 }
 
+#[cfg(any(test, not(unix)))]
 fn put_blocking(root: &Path, floor_bytes: u64, bytes: Vec<u8>) -> StorageResult<ContentRef> {
     let _root_write_guard = acquire_root_write_lock(root)?;
     put_blocking_with_space_probe(root, floor_bytes, bytes, |path| fs4::available_space(path))
 }
 
+fn acquire_root_write_lock_anchored(
+    root: &Path,
+    root_handle: &std::fs::File,
+) -> StorageResult<std::fs::File> {
+    verify_blob_root_identity(root, root_handle)
+        .map_err(|e| map_io_err(e, "root_write_lock_identity"))?;
+    #[cfg(unix)]
+    {
+        acquire_root_write_lock_at(root_handle)
+    }
+    #[cfg(not(unix))]
+    {
+        acquire_root_write_lock(root)
+    }
+}
+
+#[cfg(unix)]
+fn put_blocking_from_root_handle(
+    root: &Path,
+    root_handle: &std::fs::File,
+    floor_bytes: u64,
+    bytes: Vec<u8>,
+) -> StorageResult<ContentRef> {
+    use std::os::unix::io::AsRawFd;
+
+    let _root_write_guard = acquire_root_write_lock_anchored(root, root_handle)?;
+    let digest = blake3::hash(&bytes);
+    let content_ref = ContentRef::from_digest_bytes(digest.as_bytes());
+
+    // Preserve the dedup/republish contract while opening the existing leaf
+    // relative to the retained root. A missing shard level and a missing leaf
+    // are both the ordinary publish path; every other traversal failure is a
+    // hard refusal.
+    match open_blob_shard_file_at_no_follow(root_handle, &content_ref, libc::O_WRONLY) {
+        Ok(file) => {
+            file.set_modified(SystemTime::now())
+                .map_err(|e| map_io_err(e, "put_touch_mtime"))?;
+            return Ok(content_ref);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_io_err(error, "put_touch_open")),
+    }
+
+    let required_write_bytes = bytes.len() as u64;
+    let available =
+        available_space_at(root_handle).map_err(|e| map_io_err(e, "put_check_space"))?;
+    if crosses_floor(available, required_write_bytes, floor_bytes) {
+        return Err(StorageError::CapacityFloor {
+            capability: StorageCapability::Blob,
+            volume: root.display().to_string(),
+            available_bytes: available,
+            floor_bytes,
+        });
+    }
+
+    let hex = content_ref.as_str();
+    let shard1_dir = open_or_create_dir_at_no_follow(root_handle.as_raw_fd(), &hex[0..2])
+        .map_err(|e| map_io_err(e, "put_mkdir"))?;
+    let shard2_dir = open_or_create_dir_at_no_follow(shard1_dir.as_raw_fd(), &hex[2..4])
+        .map_err(|e| map_io_err(e, "put_mkdir"))?;
+
+    let temp_name = format!(".tmp-{}", Uuid::new_v4());
+    let mut temp = create_regular_file_at_no_follow(shard2_dir.as_raw_fd(), &temp_name, 0o600)
+        .map_err(|e| map_io_err(e, "put_tempfile"))?;
+    let write_result = (|| -> StorageResult<()> {
+        temp.write_all(&bytes)
+            .map_err(|e| map_io_err(e, "put_write"))?;
+        temp.flush().map_err(|e| map_io_err(e, "put_flush"))?;
+        temp.sync_all().map_err(|e| map_io_err(e, "put_fsync"))?;
+
+        let written_len = temp
+            .metadata()
+            .map_err(|e| map_io_err(e, "put_verify"))?
+            .len();
+        if written_len != bytes.len() as u64 {
+            return Err(map_io_err(
+                std::io::Error::other(format!(
+                    "temp file length {written_len} does not match {} written bytes",
+                    bytes.len()
+                )),
+                "put_verify",
+            ));
+        }
+        Ok(())
+    })();
+    drop(temp);
+    if let Err(error) = write_result {
+        let _ = unlink_entry_at(shard2_dir.as_raw_fd(), &temp_name);
+        return Err(error);
+    }
+
+    if let Err(error) = rename_entry_at(shard2_dir.as_raw_fd(), &temp_name, hex) {
+        let _ = unlink_entry_at(shard2_dir.as_raw_fd(), &temp_name);
+        return Err(map_io_err(error, "put_persist"));
+    }
+    Ok(content_ref)
+}
+
+#[cfg(not(unix))]
+fn put_blocking_from_root_handle(
+    root: &Path,
+    root_handle: &std::fs::File,
+    floor_bytes: u64,
+    bytes: Vec<u8>,
+) -> StorageResult<ContentRef> {
+    verify_blob_root_identity(root, root_handle).map_err(|e| map_io_err(e, "put_root_identity"))?;
+    put_blocking(root, floor_bytes, bytes)
+}
+
+#[cfg(any(test, not(unix)))]
 fn acquire_root_write_lock(root: &Path) -> StorageResult<fs::File> {
     let lock_file = fs::OpenOptions::new()
         .read(true)
@@ -681,40 +1071,200 @@ fn acquire_database_gc_lock(database_path: Option<&Path>) -> StorageResult<Optio
     Ok(Some(lock_file))
 }
 
-fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
-    let mut out = Vec::new();
-    if !root.exists() {
-        return Ok(out);
+#[cfg(all(unix, target_os = "macos"))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: `__error` returns this thread's errno cell; obtaining the
+    // pointer has no preconditions beyond running on a thread, which every
+    // caller here does.
+    unsafe { libc::__error() }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: see the macOS arm above; `__errno_location` is the Linux/glibc
+    // equivalent thread-local errno accessor.
+    unsafe { libc::__errno_location() }
+}
+
+/// Zero `errno` on the current thread. `readdir` never clears `errno` itself
+/// on success, so this must run immediately before each call for the
+/// NULL-return ambiguity below to be resolvable afterward.
+#[cfg(unix)]
+fn clear_errno() {
+    // SAFETY: `errno_location` returns a valid, live thread-local `c_int`
+    // cell for the duration of this call.
+    unsafe { *errno_location() = 0 };
+}
+
+#[cfg(unix)]
+fn current_errno() -> libc::c_int {
+    // SAFETY: see `clear_errno`.
+    unsafe { *errno_location() }
+}
+
+/// List non-dot entry names of an open directory descriptor via `fdopendir`
+/// on an INDEPENDENTLY reopened fd for the same directory (`openat(dir_fd,
+/// ".", O_NOFOLLOW)`, never `dup(dir_fd)`) — the caller's descriptor stays
+/// owned by the caller and, just as importantly, keeps its own read
+/// position. `dup` shares the underlying open file description, and with it
+/// the directory-stream position, with the fd it was duplicated from; a
+/// persisted, repeatedly-listed handle (like `FsBlobStore::root_handle`)
+/// would silently read as empty on its second call once a `dup`'d
+/// `fdopendir`/`readdir` pass had already driven that shared position to
+/// EOF. `openat(..., ".", ...)` yields a genuinely new open file
+/// description, so this listing never perturbs the position of `dir_fd`
+/// itself. `.`/`..` are excluded so a handle-relative walk built on this can
+/// never step to a directory's parent or re-enter itself.
+///
+/// `readdir`'s NULL return is POSIX-ambiguous between end-of-stream and a
+/// read error, distinguished only by `errno`: EOF leaves it unchanged (`0`,
+/// since this loop always clears it first), an error sets it non-zero. This
+/// walk clears `errno` before every `readdir` call and checks it on a NULL
+/// return, so a mid-stream read error is reported as `Err` instead of
+/// silently truncating the listing as if the stream had simply ended — the
+/// distinction `transactional_orphan_sweep`'s candidate walk depends on to
+/// avoid treating a partial, error-truncated scan as a complete one. The
+/// `DIR*` stream is closed exactly once on every return path (`Ok`, the
+/// mid-stream error path, and the pre-loop `fdopendir` failure).
+#[cfg(unix)]
+fn read_dir_names_no_follow(dir_fd: std::os::unix::io::RawFd) -> std::io::Result<Vec<String>> {
+    use std::os::unix::io::IntoRawFd;
+
+    let reopened = openat_dir_no_follow(dir_fd, ".")?;
+    // SAFETY: `reopened` was just opened above and is uniquely owned; its
+    // raw fd is handed to `fdopendir`, which takes ownership of it on
+    // success (and closes it via `closedir` below).
+    let owned_fd = reopened.into_raw_fd();
+    // SAFETY: `owned_fd` is valid and uniquely owned; `fdopendir` takes
+    // ownership of it on success.
+    let dirp = unsafe { libc::fdopendir(owned_fd) };
+    if dirp.is_null() {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: `owned_fd` is still owned by us since `fdopendir` failed.
+        unsafe { libc::close(owned_fd) };
+        return Err(err);
     }
-    for l1 in fs::read_dir(root)? {
-        let l1 = l1?;
-        if !l1.file_type()?.is_dir() {
+    let mut names = Vec::new();
+    loop {
+        // `readdir` leaves `errno` untouched on EOF; clearing it here is
+        // what makes that observable as distinct from an error below.
+        clear_errno();
+        // SAFETY: `dirp` is a valid, open `DIR*` for this whole loop.
+        let entry = unsafe { libc::readdir(dirp) };
+        if entry.is_null() {
+            if current_errno() != 0 {
+                let err = std::io::Error::last_os_error();
+                // SAFETY: `dirp` is still open and owned by this call; this
+                // is the one closedir on the error path, matching the one
+                // closedir on the `Ok` path below.
+                unsafe { libc::closedir(dirp) };
+                return Err(err);
+            }
+            break;
+        }
+        // SAFETY: `d_name` is NUL-terminated, so its first byte is always
+        // in bounds; `.`/`..` (and any other dot-leading entry, e.g. an
+        // in-flight `.tmp-*` file or the root write-lock file) are rejected
+        // on this raw byte before any allocation happens for them.
+        let first = unsafe { *(*entry).d_name.as_ptr() };
+        if first == b'.' as libc::c_char {
             continue;
         }
-        for l2 in fs::read_dir(l1.path())? {
-            let l2 = l2?;
-            if !l2.file_type()?.is_dir() {
-                continue;
-            }
-            for entry in fs::read_dir(l2.path())? {
-                let entry = entry?;
-                if !entry.file_type()?.is_file() {
-                    continue;
-                }
-                // Non-hex names (in-flight `.tmp-*` files from a concurrent
-                // `put`, or anything else that landed under `root`) are
-                // silently skipped, never swept — orphan_sweep only ever acts
-                // on names that already round-trip through `ContentRef`.
-                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+        // SAFETY: `entry` is valid until the next `readdir`/`closedir`
+        // call; the name is copied out before either.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        names.push(name);
+    }
+    // SAFETY: `dirp` was successfully opened above and not yet closed.
+    unsafe { libc::closedir(dirp) };
+    Ok(names)
+}
+
+/// Enumerate orphan-sweep candidates and their mtimes entirely relative to
+/// the retained `root_handle` — no path is ever re-resolved from `root` for
+/// this walk, so a concurrent replacement of the root or a shard directory
+/// cannot redirect candidate enumeration or the mtime read used for
+/// `within_publish_grace` classification outside the retained root.
+///
+/// Each shard level is opened with `openat(..., O_NOFOLLOW)` relative to the
+/// previous, already-verified descriptor (same helpers `put`/`get`/`delete`
+/// use), so a symlink planted at either shard level is refused rather than
+/// followed and its contents skipped, never swept. A candidate's mtime is
+/// read via `fstat` on the handle returned by opening the leaf with
+/// `openat(..., O_NOFOLLOW)`, never via `fs::metadata` on a path. If the
+/// leaf cannot be opened as a verified regular file it is dropped entirely
+/// (nothing to protect — it is not a delete candidate); if it opens but its
+/// metadata/mtime cannot be read, it is kept as a candidate with an unknown
+/// mtime, which `within_publish_grace` treats as protected — the safe
+/// direction for a sweep that only ever destroys data.
+#[cfg(unix)]
+fn walk_blob_files_from_root_handle(
+    root_handle: &std::fs::File,
+    // Only used under `#[cfg(test)]`, to key `walk_leaf_sync_hook` by this
+    // walk's canonical root; underscore-prefixed so non-test builds don't
+    // warn on the unused parameter.
+    _root: &Path,
+) -> std::io::Result<Vec<(ContentRef, Option<SystemTime>)>> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut out = Vec::new();
+    for l1_name in read_dir_names_no_follow(root_handle.as_raw_fd())? {
+        let l1_dir = match openat_dir_no_follow(root_handle.as_raw_fd(), &l1_name) {
+            Ok(dir) => dir,
+            Err(_) => continue,
+        };
+        for l2_name in read_dir_names_no_follow(l1_dir.as_raw_fd())? {
+            let l2_dir = match openat_dir_no_follow(l1_dir.as_raw_fd(), &l2_name) {
+                Ok(dir) => dir,
+                Err(_) => continue,
+            };
+            for leaf_name in read_dir_names_no_follow(l2_dir.as_raw_fd())? {
+                // Non-hex names never round-trip through `ContentRef`;
+                // orphan_sweep only ever acts on names that do.
+                let Ok(content_ref) = ContentRef::from_hex(leaf_name.clone()) else {
                     continue;
                 };
-                if let Ok(content_ref) = ContentRef::from_hex(name) {
-                    out.push((content_ref, entry.path()));
+                #[cfg(all(test, unix))]
+                if let Some(hook) = walk_leaf_sync_hook::take(_root) {
+                    let _ = hook.reached.send(());
+                    let _ = hook.release.recv();
                 }
+                let file = match openat_regular_file_no_follow(
+                    l2_dir.as_raw_fd(),
+                    &leaf_name,
+                    libc::O_RDONLY,
+                ) {
+                    Ok(file) => file,
+                    Err(_) => continue,
+                };
+                let mtime = file.metadata().ok().and_then(|meta| meta.modified().ok());
+                out.push((content_ref, mtime));
             }
         }
     }
     Ok(out)
+}
+
+/// Non-Unix tier has no descriptor-relative directory-listing API in this
+/// codebase (see the equivalent fail-closed note on `unlink_blob_shard_file_no_follow`'s
+/// `not(any(unix, windows))` arm). Rather than fall back to path-based
+/// `fs::read_dir`/`fs::metadata` reads — which reintroduces exactly the
+/// TOCTOU this function exists to close — candidate enumeration refuses
+/// outright, and `transactional_orphan_sweep` surfaces that as a sweep
+/// failure instead of classifying anything.
+#[cfg(not(unix))]
+fn walk_blob_files_from_root_handle(
+    _root_handle: &std::fs::File,
+    _root: &Path,
+) -> std::io::Result<Vec<(ContentRef, Option<SystemTime>)>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "orphan sweep candidate enumeration requires descriptor-relative directory \
+         reads, available only on unix in this release; refusing to classify via \
+         path-based reads",
+    ))
 }
 
 /// Whether a candidate file is still inside its publish grace period and must
@@ -724,15 +1274,16 @@ fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
 /// commits the `content_ref`) means a blob can be physically on disk with
 /// zero live references for a window entirely outside this store's control —
 /// the referencing write simply hasn't happened yet. A file whose mtime is
-/// younger than `grace_period` is therefore treated as not-yet-orphaned:
-/// `fs::metadata` failing to report an age (removed mid-scan, clock
-/// weirdness) is treated the same way (age unknown -> protect it), the safe
-/// direction for a sweep that only ever destroys data.
-fn within_publish_grace(path: &Path, now: SystemTime, grace_period: Duration) -> bool {
-    let age = fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|mtime| now.duration_since(mtime).ok());
+/// younger than `grace_period` is therefore treated as not-yet-orphaned: an
+/// unreadable mtime (removed mid-scan, clock weirdness) is treated the same
+/// way (age unknown -> protect it), the safe direction for a sweep that only
+/// ever destroys data.
+fn within_publish_grace(
+    mtime: Option<SystemTime>,
+    now: SystemTime,
+    grace_period: Duration,
+) -> bool {
+    let age = mtime.and_then(|mtime| now.duration_since(mtime).ok());
     match age {
         Some(age) => age < grace_period,
         None => true,
@@ -748,15 +1299,15 @@ struct PreparedTransactionalSweep {
 /// Perform every filesystem-dependent part of candidate classification before
 /// SQLite's writer transaction opens.
 fn prepare_transactional_sweep(
-    files: Vec<(ContentRef, PathBuf)>,
+    files: Vec<(ContentRef, Option<SystemTime>)>,
     grace_period: Duration,
 ) -> PreparedTransactionalSweep {
     let now = SystemTime::now();
     let mut result = BlobOrphanSweepResult::default();
     let mut candidates = Vec::with_capacity(files.len());
-    for (content_ref, path) in files {
+    for (content_ref, mtime) in files {
         result.scanned += 1;
-        let within_grace = within_publish_grace(&path, now, grace_period);
+        let within_grace = within_publish_grace(mtime, now, grace_period);
         candidates.push((content_ref, within_grace));
     }
     PreparedTransactionalSweep { result, candidates }
@@ -1713,6 +2264,10 @@ fn write_lock_for_root(root: &Path) -> std::io::Result<Arc<tokio::sync::Mutex<()
 #[derive(Debug)]
 pub struct FsBlobStore {
     root: PathBuf,
+    /// Initialization-time filesystem authority for `root`. Every blob
+    /// descriptor walk starts from this retained handle rather than
+    /// re-opening the root path and trusting its mutable ancestors again.
+    root_handle: Arc<fs::File>,
     floor_bytes: u64,
     /// Shared per-canonical-root guard (see `write_lock_for_root`) that
     /// serializes the check-then-publish critical section of `put`: without
@@ -1773,9 +2328,12 @@ impl FsBlobStore {
                 root.display()
             )));
         }
+        let root_handle = Arc::new(open_blob_root_handle(&root)?);
         let write_lock = write_lock_for_root(&root)?;
+        verify_blob_root_identity(&root, &root_handle)?;
         Ok(Self {
             root,
+            root_handle,
             floor_bytes,
             write_lock,
             orphan_sweep_grace: Self::DEFAULT_ORPHAN_SWEEP_GRACE,
@@ -1809,6 +2367,7 @@ impl BlobStore for FsBlobStore {
         // whether anyone is still awaiting this future.
         let owned_guard = self.write_lock.clone().lock_owned().await;
         let root = self.root.clone();
+        let root_handle = Arc::clone(&self.root_handle);
         let floor_bytes = self.floor_bytes;
         // `sync_hook::take` (added for PR #922) is the
         // test-only seam that lets regression tests observe/control
@@ -1831,7 +2390,7 @@ impl BlobStore for FsBlobStore {
                     let _ = h.reached.send(());
                     let _ = h.release.recv();
                 }
-                put_blocking(&root, floor_bytes, bytes)
+                put_blocking_from_root_handle(&root, &root_handle, floor_bytes, bytes)
             };
             #[cfg(test)]
             if let Some(h) = &hook {
@@ -1862,6 +2421,7 @@ impl BlobStore for FsBlobStore {
         }
 
         let root = self.root.clone();
+        let root_handle = Arc::clone(&self.root_handle);
         let content_ref = content_ref.clone();
         #[cfg(test)]
         let read_hook = bounded_read_sync_hook::take(&root);
@@ -1869,23 +2429,24 @@ impl BlobStore for FsBlobStore {
             // Open exactly once. Both metadata and bytes below come from this
             // no-follow handle, so replacing the path after open cannot
             // switch the integrity authority underneath the read.
-            let mut file = open_blob_shard_file_no_follow(&root, &content_ref).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    StorageError::NotFound {
-                        capability: StorageCapability::Blob,
-                        resource: "blob",
-                        key: content_ref.to_string(),
+            let mut file = open_blob_shard_file_no_follow(&root, &root_handle, &content_ref)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        StorageError::NotFound {
+                            capability: StorageCapability::Blob,
+                            resource: "blob",
+                            key: content_ref.to_string(),
+                        }
+                    } else if e.kind() == std::io::ErrorKind::Unsupported {
+                        StorageError::Unsupported {
+                            capability: StorageCapability::Blob,
+                            operation: "get_bounded_verified".into(),
+                            message: e.to_string(),
+                        }
+                    } else {
+                        map_io_err(e, "get_bounded_verified.open")
                     }
-                } else if e.kind() == std::io::ErrorKind::Unsupported {
-                    StorageError::Unsupported {
-                        capability: StorageCapability::Blob,
-                        operation: "get_bounded_verified".into(),
-                        message: e.to_string(),
-                    }
-                } else {
-                    map_io_err(e, "get_bounded_verified.open")
-                }
-            })?;
+                })?;
 
             let metadata_bytes = file
                 .metadata()
@@ -1941,18 +2502,33 @@ impl BlobStore for FsBlobStore {
     }
 
     async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool> {
-        let path = shard_path(&self.root, content_ref);
-        tokio::task::spawn_blocking(move || Ok(path.exists()))
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Blob, "exists", e))?
+        let root = self.root.clone();
+        let root_handle = Arc::clone(&self.root_handle);
+        let content_ref = content_ref.clone();
+        tokio::task::spawn_blocking(move || {
+            match open_blob_shard_file_no_follow(&root, &root_handle, &content_ref) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(map_io_err(error, "exists")),
+            }
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Blob, "exists", e))?
     }
 
     async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>> {
-        let path = shard_path(&self.root, content_ref);
-        tokio::task::spawn_blocking(move || match fs::metadata(&path) {
-            Ok(meta) => Ok(Some(meta.len())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(map_io_err(e, "size")),
+        let root = self.root.clone();
+        let root_handle = Arc::clone(&self.root_handle);
+        let content_ref = content_ref.clone();
+        tokio::task::spawn_blocking(move || {
+            match open_blob_shard_file_no_follow(&root, &root_handle, &content_ref) {
+                Ok(file) => file
+                    .metadata()
+                    .map(|metadata| Some(metadata.len()))
+                    .map_err(|error| map_io_err(error, "size")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(map_io_err(error, "size")),
+            }
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Blob, "size", e))?
@@ -1960,9 +2536,10 @@ impl BlobStore for FsBlobStore {
 
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool> {
         let root = self.root.clone();
+        let root_handle = Arc::clone(&self.root_handle);
         let content_ref = content_ref.clone();
         tokio::task::spawn_blocking(move || {
-            match unlink_blob_shard_file_no_follow(&root, &content_ref) {
+            match unlink_blob_shard_file_no_follow(&root, &root_handle, &content_ref) {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Err(e) => Err(map_io_err(e, "delete")),
@@ -2071,15 +2648,22 @@ impl BlobStore for FsBlobStore {
 
         let root_guard = self.write_lock.clone().lock_owned().await;
         let root = self.root.clone();
+        let root_handle = Arc::clone(&self.root_handle);
         let scan_root = root.clone();
+        let scan_root_handle = Arc::clone(&root_handle);
         let grace_period = self.orphan_sweep_grace;
         let (write_guards, canonical_root, prepared) = tokio::task::spawn_blocking(move || {
-            let canonical_root = scan_root
-                .canonicalize()
+            verify_blob_root_identity(&scan_root, &scan_root_handle)
                 .map_err(|e| map_io_err(e, "transactional_orphan_sweep_root"))?;
-            let root_write_guard = acquire_root_write_lock(&canonical_root)?;
-            let candidates = walk_blob_files(&canonical_root)
+            // `self.root` was canonicalized at construction. Preserve that
+            // spelling instead of re-resolving mutable ancestors here.
+            let canonical_root = scan_root;
+            let root_write_guard =
+                acquire_root_write_lock_anchored(&canonical_root, &scan_root_handle)?;
+            let candidates = walk_blob_files_from_root_handle(&scan_root_handle, &canonical_root)
                 .map_err(|e| map_io_err(e, "transactional_orphan_sweep_walk"))?;
+            verify_blob_root_identity(&canonical_root, &scan_root_handle)
+                .map_err(|e| map_io_err(e, "transactional_orphan_sweep_root"))?;
             let prepared = prepare_transactional_sweep(candidates, grace_period);
             Ok::<_, StorageError>((
                 (
@@ -2153,6 +2737,7 @@ impl BlobStore for FsBlobStore {
             }
 
             let delete_root = canonical_root.clone();
+            let delete_root_handle = Arc::clone(&root_handle);
             let (returned_guards, deleted, batch_delete_error, returned_hook) =
                 tokio::task::spawn_blocking(move || {
                     #[cfg(test)]
@@ -2166,7 +2751,11 @@ impl BlobStore for FsBlobStore {
                     let mut deleted = 0_u64;
                     let mut first_error = None;
                     for content_ref in claimed_refs {
-                        match unlink_blob_shard_file_no_follow(&delete_root, &content_ref) {
+                        match unlink_blob_shard_file_no_follow(
+                            &delete_root,
+                            &delete_root_handle,
+                            &content_ref,
+                        ) {
                             Ok(()) => deleted += 1,
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                             Err(error) => {
@@ -2285,6 +2874,68 @@ mod sync_hook {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(&canonical)
             .and_then(VecDeque::pop_front)
+    }
+}
+
+/// Test-only pause fired the next time the orphan-sweep walk is about to
+/// open a leaf candidate file in `walk_blob_files_from_root_handle`. Lets a
+/// test replace that exact on-disk leaf entry with a symlink to an outside
+/// decoy between candidate discovery and the handle-relative open/fstat that
+/// classifies it, proving the classification stays anchored to the opened
+/// handle rather than re-resolving a path.
+///
+/// Keyed by the walking store's canonical root path (`entry`/`take` mirror
+/// `sync_hook` above), not a single process-wide slot: a process-wide slot
+/// is stealable by ANY other sweep walk that reaches a valid leaf while
+/// running concurrently in the same test binary (the crate's default
+/// parallel test runner interleaves `#[tokio::test]` functions), which made
+/// the swap regression test flaky under that interleaving. Each test in this
+/// module sweeps its own tempdir root, so keying by canonical root gives
+/// each test's hook install/take pair exclusive use of its own slot.
+#[cfg(all(test, unix))]
+mod walk_leaf_sync_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    pub(super) struct Hook {
+        pub(super) reached: Sender<()>,
+        pub(super) release: Receiver<()>,
+    }
+
+    fn registry() -> &'static StdMutex<HashMap<PathBuf, Hook>> {
+        static REGISTRY: OnceLock<StdMutex<HashMap<PathBuf, Hook>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    pub(super) fn install(root: &Path) -> (Receiver<()>, Sender<()>) {
+        let canonical = root
+            .canonicalize()
+            .expect("root must exist before installing a walk_leaf_sync_hook");
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                canonical,
+                Hook {
+                    reached: reached_tx,
+                    release: release_rx,
+                },
+            );
+        (reached_rx, release_tx)
+    }
+
+    /// `root` need not be pre-canonicalized by the caller -- both `install`
+    /// and `take` canonicalize.
+    pub(super) fn take(root: &Path) -> Option<Hook> {
+        let canonical = root.canonicalize().ok()?;
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&canonical)
     }
 }
 
@@ -2814,7 +3465,8 @@ mod tests {
         )
         .unwrap();
 
-        let error = unlink_blob_shard_file_no_follow(&root, &fake_ref).unwrap_err();
+        let root_handle = open_blob_root_handle(&root).unwrap();
+        let error = unlink_blob_shard_file_no_follow(&root, &root_handle, &fake_ref).unwrap_err();
         // `O_DIRECTORY | O_NOFOLLOW` against a symlink refuses to follow it,
         // but the exact errno is platform-dependent: Linux reports `ELOOP`,
         // Darwin reports `ENOTDIR` (the symlink itself is not a directory
@@ -2837,7 +3489,7 @@ mod tests {
         // compatibility release (it cannot prove a completed V21 epoch), so
         // this exercises the same underlying primitive directly rather than
         // going through that disabled API.
-        unlink_blob_shard_file_no_follow(&root, &real).unwrap();
+        unlink_blob_shard_file_no_follow(&root, &root_handle, &real).unwrap();
         assert!(!store.exists(&real).await.unwrap());
     }
 
@@ -2907,6 +3559,86 @@ mod tests {
                 .await
                 .unwrap(),
             bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_blob_store_refuses_root_replacement_before_put() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        let store = FsBlobStore::new(root.clone(), 0).unwrap();
+        let original_root = dir.path().join("blobs-original");
+        fs::rename(&root, &original_root).unwrap();
+
+        let redirected_root = tempfile::tempdir().unwrap();
+        symlink(redirected_root.path(), &root).unwrap();
+
+        let bytes = b"must not land in a replaced root".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+        store
+            .put(bytes)
+            .await
+            .expect_err("a root replaced after construction must be refused");
+
+        assert!(
+            !shard_path(redirected_root.path(), &content_ref).exists(),
+            "put must not publish into the tree selected by the replacement symlink"
+        );
+        assert!(
+            !shard_path(&original_root, &content_ref).exists(),
+            "a refused put must not mutate the initialization-time root either"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_blob_store_refuses_ancestor_replacement_for_existing_blob_operations() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ancestor = dir.path().join("store-parent");
+        let root = ancestor.join("blobs");
+        let store = FsBlobStore::new(root.clone(), 0).unwrap();
+        let bytes = b"same bytes in both trees".to_vec();
+        let content_ref = store.put(bytes.clone()).await.unwrap();
+
+        let original_ancestor = dir.path().join("store-parent-original");
+        fs::rename(&ancestor, &original_ancestor).unwrap();
+        let original_blob = shard_path(&original_ancestor.join("blobs"), &content_ref);
+
+        let redirected_ancestor = tempfile::tempdir().unwrap();
+        let redirected_blob = shard_path(&redirected_ancestor.path().join("blobs"), &content_ref);
+        fs::create_dir_all(redirected_blob.parent().unwrap()).unwrap();
+        fs::write(&redirected_blob, &bytes).unwrap();
+        symlink(redirected_ancestor.path(), &ancestor).unwrap();
+
+        store
+            .get_bounded_verified(&content_ref, bytes.len() as u64)
+            .await
+            .expect_err("a read through a replaced root ancestor must be refused");
+        store
+            .exists(&content_ref)
+            .await
+            .expect_err("exists through a replaced root ancestor must be refused");
+        store
+            .size(&content_ref)
+            .await
+            .expect_err("size through a replaced root ancestor must be refused");
+        store
+            .delete(&content_ref)
+            .await
+            .expect_err("delete through a replaced root ancestor must be refused");
+
+        assert!(
+            original_blob.exists(),
+            "refusal must preserve the initialization-time blob"
+        );
+        assert!(
+            redirected_blob.exists(),
+            "refusal must not read as authority or delete the redirected blob"
         );
     }
 
@@ -5550,4 +6282,156 @@ mod tests {
     // four `resolve_blob_root` env-precedence tests must not interleave under
     // the crate's default parallel test runner.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transactional_orphan_sweep_walk_ignores_a_leaf_swapped_for_an_outside_symlink_mid_scan(
+    ) {
+        // Regression for the PR #2201 review finding: the sweep's candidate
+        // walk and grace-period mtime read used to be two separate,
+        // path-based passes (`walk_blob_files` then `within_publish_grace`
+        // via `fs::metadata(path)`), neither pinned to the retained
+        // `root_handle`. A concurrent replacement of a leaf entry in the gap
+        // between those passes could make the mtime read observe a file
+        // OUTSIDE the retained root, letting a stale outside mtime evict the
+        // grace period for a freshly published in-root blob. The fix folds
+        // discovery and classification into one handle-relative
+        // openat(..., O_NOFOLLOW) + fstat in
+        // `walk_blob_files_from_root_handle`, so there is no later path
+        // re-resolution left to race. This test forces exactly that swap —
+        // via `walk_leaf_sync_hook`, between the leaf's hex-name discovery
+        // and its classifying open — and proves the outside decoy's stale
+        // mtime never reaches the sweep's counts.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+
+        let root = dir.path().join("blobs");
+        let store = std::sync::Arc::new(
+            FsBlobStore::new(root.clone(), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::from_secs(3600)),
+        );
+
+        // The one real, unreferenced candidate the sweep will discover. Its
+        // grace period is wide (1h) so correct handle-relative
+        // classification always protects it.
+        let real = store
+            .put(b"real freshly-published blob".to_vec())
+            .await
+            .unwrap();
+        let real_path = shard_path(&root, &real);
+
+        // Outside decoy sharing the SAME leaf name (content-ref hex), aged
+        // far past the grace period. If classification ever reads through
+        // a swapped symlink, the candidate looks like a stale, deletable
+        // orphan instead of a protected fresh publish.
+        let outside_dir = dir.path().join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let decoy_path = outside_dir.join(real.as_str());
+        fs::write(&decoy_path, b"outside decoy, must never be observed").unwrap();
+        let ancient = SystemTime::now() - Duration::from_secs(7200);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&decoy_path)
+            .unwrap()
+            .set_modified(ancient)
+            .unwrap();
+
+        let (reached, release) = walk_leaf_sync_hook::install(&root);
+        let sweep = {
+            let store = store.clone();
+            let sql = backend.sql();
+            tokio::spawn(async move { store.transactional_orphan_sweep(sql.as_ref(), true).await })
+        };
+        assert!(
+            recv_blocking(reached).await,
+            "sweep walk must reach the leaf classification pause"
+        );
+
+        // Swap the real leaf out from under the paused walk: same name, now
+        // a symlink resolving outside the retained root.
+        fs::remove_file(&real_path).unwrap();
+        std::os::unix::fs::symlink(&decoy_path, &real_path).unwrap();
+
+        release.send(()).unwrap();
+        let result = sweep.await.unwrap().unwrap();
+
+        assert_eq!(
+            result.would_delete, 0,
+            "an outside decoy's stale mtime must never make an in-root candidate \
+             eligible for deletion: {result:?}"
+        );
+        assert_eq!(
+            result.grace_period_skipped, 0,
+            "the swapped leaf is a symlink; `openat(..., O_NOFOLLOW)` refuses it, so it \
+             must be dropped from candidates entirely rather than counted (real or \
+             outside) at all: {result:?}"
+        );
+        assert_eq!(
+            result.scanned, 0,
+            "the symlinked leaf must never be scanned as a candidate: {result:?}"
+        );
+
+        // Restore a real leaf and confirm the walk is not permanently wedged
+        // by the hook: an un-swapped root still finds and reports a real,
+        // grace-protected candidate normally.
+        fs::remove_file(&real_path).unwrap();
+        fs::write(&real_path, b"real freshly-published blob").unwrap();
+        let control = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            control.grace_period_skipped, 1,
+            "control: the un-replaced root must still classify the real candidate as \
+             grace-protected: {control:?}"
+        );
+        assert_eq!(control.would_delete, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transactional_orphan_sweep_walk_still_finds_a_real_orphan_past_its_grace_period() {
+        // Control for the swap test above, using an independent root (no
+        // hook installed): the handle-relative walk must still classify and
+        // report a genuine past-grace orphan as deletable, proving the fix
+        // narrows the walk to descriptor-relative reads without disabling
+        // orphan detection itself.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+        let root = dir.path().join("blobs");
+        let store = FsBlobStore::new(root.clone(), 0)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::from_secs(60));
+
+        let orphan = store.put(b"aged real orphan".to_vec()).await.unwrap();
+        let path = shard_path(&root, &orphan);
+        let ancient = SystemTime::now() - Duration::from_secs(3600);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(ancient)
+            .unwrap();
+
+        let result = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.deleted, 1,
+            "a real orphan older than the grace period must still be swept: {result:?}"
+        );
+        assert!(!store.exists(&orphan).await.unwrap());
+    }
 }
