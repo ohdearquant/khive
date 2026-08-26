@@ -2356,6 +2356,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            events_split: None,
         };
         KhiveRuntime::new(config.clone()).expect("create migrated database");
         #[cfg(unix)]
