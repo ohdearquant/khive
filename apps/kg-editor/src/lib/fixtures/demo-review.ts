@@ -35,9 +35,9 @@ export const demoReviewFixture: ReviewBundle = {
   pull_request: {
     number: 184,
     title: "Curate assertion-level provenance and retire the batch-only model",
-    body: "Casey found that corrections are reviewed per assertion while provenance is currently attached only at batch level. This change preserves batch lineage and adds assertion-level evidence anchors.",
+    body: "The demo author found that corrections are reviewed per assertion while provenance is currently attached only at batch level. This change preserves batch lineage and adds assertion-level evidence anchors.",
     state: "open",
-    author: "actor:casey",
+    author: "actor:demo-author",
     created_at: "2026-08-07T17:20:00Z",
     head_sha: "7ea9c6b25e23a64c9b8b602b8a61c5da41f36e1a",
   },
@@ -53,8 +53,8 @@ export const demoReviewFixture: ReviewBundle = {
   change_set: {
     envelope: {
       schema_version: 1,
-      producer: "actor:casey",
-      producer_model_family: "family:demo-frontier",
+      producer: "actor:demo-author",
+      producer_model_family: "family:demo-author",
       staged_at: 1786123200000000,
       batch_id: "demo-enrich-2026-08-07-184",
     },
@@ -203,12 +203,12 @@ export const demoReviewFixture: ReviewBundle = {
   ],
   review_gate: {
     required: true,
-    producer_model_family: "family:demo-frontier",
+    producer_model_family: "family:demo-author",
     reviewer_model_family: null,
     eligible: false,
     approval_ready: false,
     status: "awaiting_independent_reviewer",
-    reason: "Select a reviewer outside family:demo-frontier before approval.",
+    reason: "Select a reviewer outside family:demo-author before approval.",
     persisted: false,
   },
   summary: {
@@ -255,7 +255,7 @@ export const demoReviewFixture: ReviewBundle = {
       id: "review-family",
       label: "Independent reviewer",
       status: "pending",
-      detail: "Select a reviewer outside family:demo-frontier before approval.",
+      detail: "Select a reviewer outside family:demo-author before approval.",
       duration_ms: 0,
     },
     ],
@@ -480,21 +480,21 @@ export const demoReviewFixture: ReviewBundle = {
     {
       sha: "7ea9c6b25e23a64c9b8b602b8a61c5da41f36e1a",
       subject: "kg: stage assertion-level provenance",
-      author: "actor:casey",
+      author: "actor:demo-author",
       created_at: "2026-08-07T17:20:00Z",
       state: "head",
     },
     {
       sha: "4c82e846d657ade7f2f2567618b9e63e80f42ea6",
       subject: "kg: snapshot after source refresh",
-      author: "actor:casey",
+      author: "actor:demo-author",
       created_at: "2026-08-07T15:08:00Z",
       state: "base",
     },
     {
       sha: "d124b53e0ff383b4aa2d872f0c1e7bd1065f2001",
       subject: "kg: resume the snapshot lane",
-      author: "khive-bot",
+      author: "actor:demo-automation",
       created_at: "2026-07-28T02:19:00Z",
       state: "ancestor",
     },
@@ -506,7 +506,7 @@ export const demoReviewFixture: ReviewBundle = {
     items: [
     {
       id: "activity-1",
-      actor: "actor:casey",
+      actor: "actor:demo-author",
       action: "opened this review",
       body: "Seven staged operations from demo-enrich-2026-08-07-184. Four route to tier 2.",
       created_at: "2026-08-07T17:20:00Z",
@@ -514,7 +514,7 @@ export const demoReviewFixture: ReviewBundle = {
     },
     {
       id: "activity-2",
-      actor: "khive/validate",
+      actor: "actor:demo-validator",
       action: "completed semantic checks",
       body: "No error-level findings. Citation freshness produced one non-blocking warning.",
       created_at: "2026-08-07T17:20:01Z",
@@ -522,7 +522,7 @@ export const demoReviewFixture: ReviewBundle = {
     },
     {
       id: "activity-3",
-      actor: "actor:robin",
+      actor: "actor:demo-reviewer",
       action: "left a review note",
       body: "Keep the historical batch model visible; supersession should affect the current view, not erase lineage.",
       created_at: "2026-08-07T17:24:00Z",
@@ -566,7 +566,7 @@ export const demoReviewFixture: ReviewBundle = {
         id: "436254d4",
         score: 0.853,
         memory_type: "semantic",
-        content: "Build the KG editor local-first with the curator persona as the driving committer and make growth reviewable, diffable, and revertible.",
+        content: "Build the KG editor local-first with the demo author as the driving committer and make growth reviewable, diffable, and revertible.",
       },
       {
         id: "b07f238e",
