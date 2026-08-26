@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 use khive_runtime::{merge_entry_metadata, LinkSpec, NamespaceToken, RuntimeError, VerbRegistry};
 
 use super::common::{
-    deser, enrich_allowlist_error, format_edge_output, parse_relation, resolve_uuid_unfiltered,
-    to_json, validate_weight, LinkParams,
+    deser, enrich_allowlist_error, enrich_bulk_atomic_allowlist_error, format_edge_output,
+    parse_relation, resolve_uuid_unfiltered, to_json, validate_weight, LinkParams,
 };
 use crate::KgPack;
 
@@ -66,7 +66,18 @@ impl KgPack {
                 registry
                     .validate_link_hooks(&self.runtime, token, &specs)
                     .await?;
-                let edges = self.runtime.link_many(token, specs).await?;
+                let edges = match self.runtime.link_many(token, specs.clone()).await {
+                    Ok(edges) => edges,
+                    Err(RuntimeError::InvalidInput(ref msg))
+                        if msg.contains("not in the base endpoint allowlist") =>
+                    {
+                        let enriched =
+                            enrich_bulk_atomic_allowlist_error(msg, &self.runtime, token, &specs)
+                                .await;
+                        return Err(RuntimeError::InvalidInput(enriched));
+                    }
+                    Err(e) => return Err(e),
+                };
                 let mut resp = serde_json::json!({
                     "attempted": attempted,
                     "created": edges.len(),
@@ -157,6 +168,20 @@ impl KgPack {
                         .await
                     {
                         Ok(edge) => results.push(to_json(&edge)?),
+                        Err(RuntimeError::InvalidInput(ref msg))
+                            if msg.contains("not in the base endpoint allowlist") =>
+                        {
+                            let enriched = enrich_allowlist_error(
+                                msg,
+                                &self.runtime,
+                                token,
+                                source,
+                                target,
+                                relation,
+                            )
+                            .await;
+                            error_list.push(json!({"index": idx, "error": enriched}));
+                        }
                         Err(e) => error_list.push(json!({"index": idx, "error": format!("{e}")})),
                     }
                 }

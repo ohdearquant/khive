@@ -931,6 +931,158 @@ async fn link_invalid_relation_error_attributes_each_resolved_kind_to_short_id()
     );
 }
 
+#[tokio::test]
+async fn link_invalid_relation_error_attributes_typed_entity_subtypes() {
+    use crate::KgPack;
+    use khive_pack_formal::FormalPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let source = rt
+        .create_entity(
+            &token,
+            "concept",
+            Some("theorem"),
+            "Src theorem",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create typed source");
+    let target = rt
+        .create_entity(
+            &token,
+            "concept",
+            Some("definition"),
+            "Tgt definition",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create typed target");
+    let source_short: String = source.id.to_string().chars().take(8).collect();
+    let target_short: String = target.id.to_string().chars().take(8).collect();
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(FormalPack::new(rt.clone()));
+    let registry = builder.build().expect("kg+formal registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+
+    let error = pack
+        .handle_link(
+            &token,
+            json!({
+                "source_id": source.id.to_string(),
+                "target_id": target.id.to_string(),
+                "relation": "implements",
+            }),
+            &registry,
+        )
+        .await
+        .expect_err("concept/theorem->concept/definition implements must be rejected")
+        .to_string();
+
+    assert!(
+        error.contains(&format!(
+            "source {source_short} resolved as concept/theorem"
+        )),
+        "source label must carry the typed subtype: {error}"
+    );
+    assert!(
+        error.contains(&format!(
+            "target {target_short} resolved as concept/definition"
+        )),
+        "target label must carry the typed subtype: {error}"
+    );
+    assert!(
+        error.contains("for concept/theorem\u{2192}concept/definition"),
+        "relation description must name the typed pair: {error}"
+    );
+}
+
+#[tokio::test]
+async fn bulk_link_errors_receive_endpoint_attribution_in_both_modes() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let concept_a = rt
+        .create_entity(&token, "concept", None, "A", None, None, vec![])
+        .await
+        .expect("create concept a");
+    let concept_b = rt
+        .create_entity(&token, "concept", None, "B", None, None, vec![])
+        .await
+        .expect("create concept b");
+    let document = rt
+        .create_entity(&token, "document", None, "Doc", None, None, vec![])
+        .await
+        .expect("create document");
+    let doc_short: String = document.id.to_string().chars().take(8).collect();
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("kg registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+
+    // Entry 0 is legal, entry 1 is the allowlist rejection — proving the
+    // attribution names the offending entry, not just the first one.
+    let links = json!([
+        {
+            "source_id": concept_a.id.to_string(),
+            "target_id": concept_b.id.to_string(),
+            "relation": "extends",
+        },
+        {
+            "source_id": document.id.to_string(),
+            "target_id": concept_a.id.to_string(),
+            "relation": "extends",
+        },
+    ]);
+
+    let atomic_err = pack
+        .handle_link(&token, json!({"links": links, "atomic": true}), &registry)
+        .await
+        .expect_err("atomic bulk with an illegal entry must be rejected")
+        .to_string();
+    assert!(
+        atomic_err.contains("entry 1:"),
+        "atomic error must name the offending entry index: {atomic_err}"
+    );
+    assert!(
+        atomic_err.contains(&format!("source {doc_short} resolved as document")),
+        "atomic error must attribute the offending resolved endpoints: {atomic_err}"
+    );
+
+    let non_atomic = pack
+        .handle_link(&token, json!({"links": links, "atomic": false}), &registry)
+        .await
+        .expect("non-atomic bulk returns per-entry errors");
+    assert_eq!(
+        non_atomic["created"], 1,
+        "legal entry must still be created"
+    );
+    assert_eq!(non_atomic["failed"], 1, "illegal entry must fail");
+    let entry_err = non_atomic["errors"][0]["error"]
+        .as_str()
+        .expect("error string");
+    assert_eq!(
+        non_atomic["errors"][0]["index"], 1,
+        "non-atomic error must keep the entry index"
+    );
+    assert!(
+        entry_err.contains(&format!("source {doc_short} resolved as document")),
+        "non-atomic error must attribute the resolved endpoints: {entry_err}"
+    );
+}
+
 fn configured_kg_endpoint_test_surface() -> (
     khive_runtime::KhiveRuntime,
     khive_runtime::NamespaceToken,
@@ -1005,14 +1157,15 @@ async fn bulk_link_symmetric_rejection_preserves_requested_pair_in_both_modes() 
                 .to_string()
         };
 
+        // Bulk allowlist errors are now enriched like the singleton path; the
+        // #1606 invariant is unchanged — the diagnostic must name the
+        // caller-ordered pair, never the UUID-canonical reverse pair.
         assert!(
-            message.contains(
-                "currently legal relations for concept -> project under the loaded endpoint rules: none"
-            ),
+            message.contains("No valid relations exist for concept\u{2192}project"),
             "atomic={atomic} must diagnose the caller-ordered pair; got: {message}"
         );
         assert!(
-            !message.contains("currently legal relations for project -> concept"),
+            !message.contains("project\u{2192}concept") && !message.contains("project -> concept"),
             "atomic={atomic} must not diagnose the UUID-canonical reverse pair; got: {message}"
         );
     }
