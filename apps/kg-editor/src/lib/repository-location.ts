@@ -139,10 +139,11 @@ function parseModulePath(
 // rejected at validation instead of silently losing exact identity.
 export function addressableModuleIdIssue(value: string): string | null {
   if (
+    value.length === 0 ||
     value.length > MODULE_ID_LIMIT ||
     /[?#\u0000-\u001f\u007f]/u.test(value)
   ) {
-    return "The module identifier must be a bounded printable value without URL delimiters.";
+    return "The module identifier must be a non-empty bounded printable value without URL delimiters.";
   }
   return null;
 }

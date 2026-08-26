@@ -55,7 +55,7 @@ describe("khive.repo.v1 browser contract", () => {
     expect(repoBundleSchema.safeParse(value).success).toBe(true);
   });
 
-  it.each(["khive?module", "khive#module"])(
+  it.each(["khive?module", "khive#module", ""])(
     "rejects a module identifier a share link could not carry %j",
     (id) => {
       const value = goldenValue() as {

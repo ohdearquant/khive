@@ -424,7 +424,7 @@ describe("repository showcase", () => {
     expect(within(inspector).getByRole("heading", { name: bundle.capability.labels.metrics.commits })).toBeVisible();
 
     await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), "pool.rs");
-    const poolResult = within(triage).getByRole("button", { name: /inspect .*pool\.rs/i });
+    const poolResult = within(triage).getAllByRole("button", { name: /inspect .*pool\.rs/i })[0];
     await user.click(poolResult);
     expect(within(inspector).getByRole("heading", { level: 3 }).textContent).toContain("pool.rs");
 
@@ -549,7 +549,7 @@ describe("repository showcase", () => {
     expect(inspector).toHaveTextContent(/inspector sampled/i);
 
     const cycleSection = within(inspector).getByText(cycle.id).closest("section")!;
-    await user.click(within(cycleSection).getByRole("button", { name: peer.source_path }));
+    await user.click(within(cycleSection).getByRole("button", { name: `Inspect ${peer.source_path}` }));
     expect(within(inspector).getByRole("heading", { level: 3 })).toHaveTextContent(peer.source_path);
   });
 

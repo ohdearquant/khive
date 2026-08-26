@@ -462,6 +462,7 @@ export function RepositoryTriage({
                       {inspectionTarget && (
                         <button
                           type="button"
+                          aria-label={moduleInspectLabel(moduleById, inspectionTarget)}
                           onClick={() => selectSignal(signal)}
                         >
                           Inspect {inspectionTarget.source_path}
@@ -625,6 +626,7 @@ export function RepositoryTriage({
                               <li key={module.id}>
                                 <button
                                   type="button"
+                                  aria-label={moduleInspectLabel(moduleById, module)}
                                   onClick={() => onInspectModule(module.id)}
                                 >
                                   {module.source_path}
@@ -655,6 +657,7 @@ export function RepositoryTriage({
                                 <li key={module.id}>
                                   <button
                                     type="button"
+                                    aria-label={moduleInspectLabel(moduleById, module)}
                                     onClick={() => onInspectModule(module.id)}
                                   >
                                     {module.source_path}
@@ -687,6 +690,7 @@ export function RepositoryTriage({
                               <span key={module.id}>
                                 <button
                                   type="button"
+                                  aria-label={moduleInspectLabel(moduleById, module)}
                                   onClick={() => onInspectModule(module.id)}
                                 >
                                   {module.source_path}
@@ -719,6 +723,7 @@ export function RepositoryTriage({
                           <li key={coupling.module.id}>
                             <button
                               type="button"
+                              aria-label={moduleInspectLabel(moduleById, coupling.module)}
                               onClick={() => onInspectModule(coupling.module.id)}
                             >
                               {coupling.module.source_path}
