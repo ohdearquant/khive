@@ -528,6 +528,15 @@ pub struct ProposalEntityPatch {
     pub properties: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// ADR-014 tri-state: absent leaves the type unchanged, `null` explicitly
+    /// clears it, a string sets it (validated against the kind's vocabulary
+    /// at apply time, per ADR-046 parity with the runtime entity update).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_opt_opt"
+    )]
+    pub entity_type: Option<Option<String>>,
 }
 
 /// Structured draft for adding a new note via a proposal.
@@ -966,6 +975,40 @@ mod tests {
         assert!(
             matches!(cs, ProposalChangeset::UpdateEntity { .. }),
             "expected UpdateEntity"
+        );
+
+        // Tri-state entity_type (ADR-014): absent vs explicit null vs set
+        // must all survive the proposal wire boundary distinctly.
+        for (json, expected) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"entity_type": null}), Some(None)),
+            (
+                serde_json::json!({"entity_type": "algorithm"}),
+                Some(Some("algorithm".to_string())),
+            ),
+        ] {
+            let v = serde_json::json!({"kind": "update_entity", "id": uuid, "patch": json});
+            let cs: ProposalChangeset =
+                serde_json::from_value(v).expect("UpdateEntity must deserialize");
+            let ProposalChangeset::UpdateEntity { patch, .. } = cs else {
+                panic!("expected UpdateEntity");
+            };
+            assert_eq!(patch.entity_type, expected, "patch: {json}");
+        }
+
+        // The clear must serialize back as an explicit null.
+        let patch = ProposalEntityPatch {
+            name: None,
+            description: None,
+            properties: None,
+            tags: None,
+            entity_type: Some(None),
+        };
+        let v = serde_json::to_value(&patch).expect("serialize");
+        assert_eq!(v.get("entity_type"), Some(&serde_json::Value::Null));
+        assert!(
+            v.get("name").is_none(),
+            "absent fields must not be serialized"
         );
 
         // AddEdge

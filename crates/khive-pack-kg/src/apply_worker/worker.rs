@@ -387,6 +387,21 @@ impl ProposalApplyWorker {
                 }
                 ProposalChangeset::UpdateEntity { id, patch } => {
                     let entity_id = Uuid::from_u128(id.to_u128());
+                    // ADR-014 parity with the direct update surface: a set
+                    // validates + normalizes against the registered
+                    // vocabulary for the entity's kind; a clear passes
+                    // through untouched.
+                    let entity_type = match &patch.entity_type {
+                        Some(Some(raw)) => {
+                            let entity = self.runtime.get_entity(token, entity_id).await?;
+                            Some(crate::handlers::validate_entity_type(
+                                &entity.kind,
+                                Some(raw.as_str()),
+                                registry,
+                            )?)
+                        }
+                        other => other.clone(),
+                    };
                     let plan = prepare_update_entity_plan(
                         &self.runtime,
                         token,
@@ -396,7 +411,7 @@ impl ProposalApplyWorker {
                             description: patch.description.clone(),
                             properties: patch.properties.clone(),
                             tags: patch.tags.clone(),
-                            entity_type: None,
+                            entity_type,
                         },
                     )
                     .await?;

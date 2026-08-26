@@ -86,15 +86,17 @@ impl EmbeddingModelPlan {
 /// a tag without losing existing tags, read the entity first, push the new tag,
 /// and pass the full list back.
 ///
-/// For `entity_type` — `Some(value)` validates and normalizes `value` through the
-/// installed entity-type registry. `None` leaves the current type unchanged.
+/// For `entity_type` — ADR-014 tri-state: `None` leaves the current type
+/// unchanged, `Some(None)` explicitly clears it, and `Some(Some(value))`
+/// validates and normalizes `value` through the installed entity-type
+/// registry.
 #[derive(Clone, Debug, Default)]
 pub struct EntityPatch {
     pub name: Option<String>,
     pub description: Option<Option<String>>,
     pub properties: Option<Value>,
     pub tags: Option<Vec<String>>,
-    pub entity_type: Option<String>,
+    pub entity_type: Option<Option<String>>,
 }
 
 /// Policy used when deduplicating two entities.
@@ -853,8 +855,15 @@ impl KhiveRuntime {
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
 
-        let validated_entity_type = match patch.entity_type.as_deref() {
-            Some(raw) => Some(self.validate_entity_type_for_kind(&entity.kind, Some(raw))?),
+        // ADR-014 tri-state: outer `None` = unchanged; `Some(None)` = explicit
+        // clear (no vocabulary validation — there is no value to validate);
+        // `Some(Some(raw))` = set, validated and normalized.
+        let validated_entity_type = match &patch.entity_type {
+            Some(None) => Some(None),
+            Some(Some(raw)) => Some(Some(
+                self.validate_entity_type_for_kind(&entity.kind, Some(raw))?
+                    .expect("set branch always yields a normalized value"),
+            )),
             None => None,
         };
 
@@ -4013,7 +4022,7 @@ mod tests {
                 &tok,
                 entity.id,
                 EntityPatch {
-                    entity_type: Some(" Algorithm ".to_string()),
+                    entity_type: Some(Some(" Algorithm ".to_string())),
                     ..Default::default()
                 },
             )
@@ -4039,7 +4048,7 @@ mod tests {
                 &tok,
                 entity.id,
                 EntityPatch {
-                    entity_type: Some("not_registered".to_string()),
+                    entity_type: Some(Some("not_registered".to_string())),
                     ..Default::default()
                 },
             )

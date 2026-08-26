@@ -197,8 +197,18 @@ impl KgPack {
                         )));
                     }
                 }
-                let entity_type =
-                    validate_entity_type(&entity.kind, p.entity_type.as_deref(), registry)?;
+                // ADR-014 tri-state: `Some(None)` is an explicit clear and
+                // bypasses the vocabulary check (runtime applies it);
+                // `Some(Some(raw))` validates + normalizes; `None` unchanged.
+                let entity_type = match &p.entity_type {
+                    Some(None) => Some(None),
+                    Some(Some(raw)) => Some(validate_entity_type(
+                        &entity.kind,
+                        Some(raw.as_str()),
+                        registry,
+                    )?),
+                    None => None,
+                };
                 let patch = EntityPatch {
                     name: string_value(p.name, "name")?,
                     description: description_patch(p.description)?,

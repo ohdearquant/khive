@@ -91,6 +91,23 @@ fn optional_create_string(args: &Value, key: &str) -> RuntimeResult<Option<Strin
     }
 }
 
+/// ADR-014 tri-state patch for entity `entity_type`, read from raw JSON to
+/// mirror `UpdateParams.entity_type`'s `tri_string` deserializer (the
+/// kkernel `--atomic` seam deserializes through that struct first, so the
+/// two surfaces cannot diverge): key absent -> `None` (unchanged), key
+/// present as `null` -> `Some(None)` (explicit clear), key present as a
+/// string -> `Some(Some(s))` (set); any other JSON type -> a hard error.
+fn optional_entity_type_patch(args: &Value, key: &str) -> RuntimeResult<Option<Option<String>>> {
+    match obj(args)?.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(value)) => Ok(Some(Some(value.clone()))),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{key} must be a string or null, got: {other}"
+        ))),
+    }
+}
+
 /// Nullable-string patch semantics mirroring the actually-reachable behavior
 /// of `khive-pack-kg::handlers::common::optional_string_patch`/
 /// `description_patch`, reimplemented here rather than imported (that
@@ -591,7 +608,9 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
                 Some("relation")
             } else if present("weight") {
                 Some("weight")
-            } else if present("entity_type") {
+            } else if o.contains_key("entity_type") {
+                // ADR-014 tri-state: a PRESENT key (including JSON `null`,
+                // the explicit clear) is inapplicable to notes.
                 Some("entity_type")
             } else {
                 None
@@ -616,7 +635,9 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
                 Some("salience")
             } else if present("decay_factor") {
                 Some("decay_factor")
-            } else if present("entity_type") {
+            } else if o.contains_key("entity_type") {
+                // ADR-014 tri-state: a PRESENT key (including JSON `null`,
+                // the explicit clear) is inapplicable to edges.
                 Some("entity_type")
             } else {
                 None
@@ -807,7 +828,7 @@ pub async fn prepare_update(
             let description = optional_string_patch(args, "description")?;
             let properties = optional_properties(args, "properties")?;
             let tags = optional_tags(args)?;
-            let entity_type = optional_create_string(args, "entity_type")?;
+            let entity_type = optional_entity_type_patch(args, "entity_type")?;
 
             prepare_update_entity_plan(
                 runtime,
@@ -4149,5 +4170,146 @@ mod tests {
         let (edge_count, _, _, _) =
             probe_edge_natural_key(&runtime, "local", a_id, x_id, "extends").await;
         assert_eq!(edge_count, 0, "no edge may have been committed");
+    }
+
+    /// ADR-014 tri-state on the atomic path: `entity_type: null` must
+    /// explicitly CLEAR a stored entity type (and reindex), not collapse to
+    /// "unchanged" like the old `optional_create_string` did.
+    #[tokio::test]
+    async fn atomic_update_entity_type_null_clears_stored_type() {
+        let runtime = scratch_runtime();
+        runtime.install_entity_type_validator(std::sync::Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            let normalized = raw.trim().to_ascii_lowercase();
+            if kind == "concept" && normalized == "algorithm" {
+                Ok(Some(normalized))
+            } else {
+                Err(RuntimeError::InvalidInput(format!(
+                    "unknown entity_type {raw:?} for {kind:?}; valid: algorithm"
+                )))
+            }
+        }));
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut entity = khive_storage::Entity::new("local", "concept", "AtomicNullClear");
+        entity.entity_type = Some("algorithm".to_string());
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": entity_id.to_string(), "entity_type": null}),
+            None,
+        )
+        .await
+        .expect("atomic prepare must accept entity_type: null");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("atomic update must run");
+        let post_commit = match outcome {
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        assert_eq!(
+            post_commit.as_slice(),
+            &[PostCommitEffect::ReindexEntity { entity_id }],
+            "a type clear that differs from the prior value must reindex"
+        );
+
+        let updated = runtime
+            .get_entity(&token, entity_id)
+            .await
+            .expect("read updated entity");
+        assert_eq!(
+            updated.entity_type, None,
+            "entity_type: null must clear the stored type"
+        );
+        assert_eq!(updated.name, "AtomicNullClear");
+    }
+
+    /// ADR-014 tri-state on the atomic path: a PRESENT `entity_type` key,
+    /// including JSON `null`, must be rejected on note and edge targets
+    /// (parity with `khive-pack-kg`'s `reject_inapplicable_fields`).
+    #[tokio::test]
+    async fn atomic_update_null_entity_type_rejected_for_note_and_edge() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let note = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "note body for entity_type guard",
+                Some(0.5),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+        let note_err = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": note.id.to_string(), "entity_type": null}),
+            Some(crate::atomic_prepare::AtomicUpdateKind::Note { specific: None }),
+        )
+        .await
+        .expect_err("entity_type: null on a note must be rejected");
+        assert!(
+            matches!(note_err, RuntimeError::InvalidInput(ref msg) if msg.contains("entity_type") && msg.contains("not valid for a note")),
+            "expected an InvalidInput naming entity_type for a note, got: {note_err:?}"
+        );
+
+        let source = khive_storage::Entity::new("local", "concept", "AtomicNullTypeEdgeSource");
+        let target = khive_storage::Entity::new("local", "concept", "AtomicNullTypeEdgeTarget");
+        let source_id = source.id;
+        let target_id = target.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(source)
+            .await
+            .expect("seed source");
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(target)
+            .await
+            .expect("seed target");
+        let edge = runtime
+            .link(
+                &token,
+                source_id,
+                target_id,
+                "supports".parse().expect("relation"),
+                0.5,
+                None,
+            )
+            .await
+            .expect("create edge");
+
+        let edge_err = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": edge.id.to_string(), "entity_type": null}),
+            Some(crate::atomic_prepare::AtomicUpdateKind::Edge),
+        )
+        .await
+        .expect_err("entity_type: null on an edge must be rejected");
+        assert!(
+            matches!(edge_err, RuntimeError::InvalidInput(ref msg) if msg.contains("entity_type") && msg.contains("not valid for an edge")),
+            "expected an InvalidInput naming entity_type for an edge, got: {edge_err:?}"
+        );
     }
 }
