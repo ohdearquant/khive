@@ -368,6 +368,16 @@
   margin: 0;
   min-height: 47px;
 }
+.analysisId {
+  color: var(--repo-muted);
+  display: block;
+  font-size: 8px;
+  margin-top: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .why {
   color: var(--repo-navy);
   display: block;
@@ -396,6 +406,8 @@
   color: var(--repo-navy);
   font-weight: 700;
   margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
   text-align: right;
 }
 
@@ -604,6 +616,17 @@
 }
 .inspectorSection li code {
   color: var(--repo-green);
+}
+.inspectorSection .cycleItem {
+  grid-template-columns: minmax(0, 1fr);
+}
+.inspectorSection .cycleIdentifier {
+  color: var(--repo-muted);
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .inspectorSection li span {
   color: var(--repo-muted);

@@ -1940,6 +1940,7 @@ async fn file_backed_runtime_persists() {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1965,6 +1966,7 @@ async fn file_backed_runtime_persists() {
         let config = RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2588,6 +2590,7 @@ mod embedder_registry_tests {
         KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2742,6 +2745,7 @@ mod embedder_registry_tests {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
