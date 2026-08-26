@@ -25,6 +25,30 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{base_entity_rule_allows, canonical_edge_endpoints, endpoint_matches};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+/// Test-only pause point at the read/write boundary of a guarded
+/// read-modify-write, so a race between two concurrent callers of the same
+/// PRODUCTION entry point (not the underlying store primitive) can be
+/// reproduced deterministically instead of relying on scheduler luck or
+/// sleeps. A no-op unless the calling task runs inside
+/// `AFTER_READ_BARRIER.scope(...)`; production code never establishes that
+/// scope, so `pause_after_read` costs nothing outside these regression
+/// tests, and it does not exist at all in non-test builds.
+#[cfg(test)]
+pub(crate) mod race_seam {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    tokio::task_local! {
+        pub(crate) static AFTER_READ_BARRIER: Arc<Barrier>;
+    }
+
+    pub(crate) async fn pause_after_read() {
+        if let Ok(barrier) = AFTER_READ_BARRIER.try_with(Arc::clone) {
+            barrier.wait().await;
+        }
+    }
+}
+
 pub(crate) fn stale_note_snapshot_error(id: Uuid) -> RuntimeError {
     RuntimeError::Khive(KhiveError::conflict(format!(
         "note {id} changed concurrently after it was read; retry with fresh state"
@@ -868,6 +892,8 @@ impl KhiveRuntime {
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
         let expected_updated_at = entity.updated_at;
         let expected_deleted_at = entity.deleted_at;
+        #[cfg(test)]
+        race_seam::pause_after_read().await;
 
         // ADR-014 tri-state: outer `None` = unchanged; `Some(None)` = explicit
         // clear (no vocabulary validation — there is no value to validate);
@@ -913,7 +939,19 @@ impl KhiveRuntime {
             changed_fields.push("entity_type");
         }
 
-        entity.updated_at = chrono::Utc::now().timestamp_micros();
+        // `updated_at` is also the optimistic-concurrency revision for
+        // full-entity replacement. Make it strictly advance even when two
+        // operations land inside one clock microsecond. Saturation is not a
+        // valid fallback: reusing i64::MAX would make the CAS accept a write
+        // without advancing its revision.
+        let minimum_updated_at = expected_updated_at.checked_add(1).ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "entity {id} updated_at is already at i64::MAX and cannot advance"
+            ))
+        })?;
+        entity.updated_at = chrono::Utc::now()
+            .timestamp_micros()
+            .max(minimum_updated_at);
         Ok((
             entity,
             reindex_required,
@@ -4192,6 +4230,167 @@ mod tests {
             "writer B's field must not be silently merged into the persisted row: {:?}",
             final_entity.properties
         );
+    }
+
+    /// Same race as `concurrent_entity_property_patches_from_one_revision_only_one_survives`,
+    /// but driven entirely through the PRODUCTION entry point
+    /// (`update_entity_with_embedding_report`) rather than the store's
+    /// `replace_entity_if_unchanged` primitive directly. This closes a gap
+    /// the primitive-level test cannot: it would still pass unchanged if the
+    /// production caller were reverted to an unconditional write, since it
+    /// never invokes that caller at all. Uses `race_seam::pause_after_read`
+    /// (test-only, compiled out of non-test builds) to force both concurrent
+    /// callers to observe the identical pre-write revision deterministically —
+    /// no sleeps, no reliance on scheduler ordering.
+    #[tokio::test]
+    async fn production_update_entity_refuses_concurrent_stale_writer() {
+        let rt = Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "ProductionRaceTarget",
+                None,
+                Some(serde_json::json!({"a": 0, "b": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let writer_a = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                rt.update_entity_with_embedding_report(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"a": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }))
+        };
+        let writer_b = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                rt.update_entity_with_embedding_report(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"b": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }))
+        };
+
+        let result_a = writer_a.await.expect("writer A task");
+        let result_b = writer_b.await.expect("writer B task");
+        let successes = [result_a.is_ok(), result_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one production caller must win the race; the other must be refused: \
+             a={result_a:?} b={result_b:?}"
+        );
+        let refused = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
+        match &refused {
+            Err(RuntimeError::Khive(khive_error)) => {
+                assert_eq!(
+                    khive_error.kind(),
+                    khive_types::ErrorKind::Conflict,
+                    "the losing production caller must surface a typed conflict, not \
+                     silently overwrite: {refused:?}"
+                );
+            }
+            other => panic!("expected a typed conflict error, got {other:?}"),
+        }
+
+        let final_entity = rt.get_entity(&tok, id).await.expect("read final entity");
+        assert_ne!(
+            final_entity.properties,
+            Some(serde_json::json!({"a": 1, "b": 1})),
+            "both racers' fields must never both land: that would mean the loser's stale \
+             write silently succeeded"
+        );
+    }
+
+    /// Regression: the entity CAS requires the replacement revision to be
+    /// STRICTLY greater than the stored one. If the replacement is computed
+    /// as a raw `Utc::now()` read, a stored revision that is at or ahead of
+    /// wall-clock time (a clock step backward, or — deterministically,
+    /// reproduced here — a stored revision manufactured slightly ahead of
+    /// "now") makes the new value fail to advance, and the CAS refuses a
+    /// write with NO concurrent writer involved at all. The fix must clamp
+    /// the replacement to `max(now, stored + 1)`; this test sets the stored
+    /// revision one full second into the future (far outside normal clock
+    /// skew) and asserts the update still succeeds instead of surfacing a
+    /// spurious conflict.
+    #[tokio::test]
+    async fn update_entity_succeeds_when_stored_revision_is_ahead_of_wall_clock() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "FutureRevisionTarget",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let future_micros = chrono::Utc::now().timestamp_micros() + 1_000_000;
+        let pool = rt.backend().pool_arc();
+        let id_str = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().expect("writer connection");
+            guard
+                .execute(
+                    "UPDATE entities SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![future_micros, id_str],
+                )
+                .expect("force future revision")
+        })
+        .await
+        .expect("join");
+
+        let updated = rt
+            .update_entity(
+                &tok,
+                id,
+                EntityPatch {
+                    description: Some(Some("patched after a forced future revision".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect(
+                "update must succeed and advance past the stored revision, not report a \
+                 spurious conflict when nothing else wrote to this row",
+            );
+        assert!(updated.updated_at > future_micros);
     }
 
     #[tokio::test]

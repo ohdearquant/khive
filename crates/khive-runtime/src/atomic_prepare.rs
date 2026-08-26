@@ -1010,6 +1010,21 @@ async fn prepare_update_edge(
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_default());
 
+        // `updated_at` must strictly advance past the snapshot even when two
+        // operations land inside one clock microsecond; saturating to
+        // i64::MAX would let the CAS accept a write without advancing its
+        // revision, so that is not a valid fallback (mirrors the note path).
+        let minimum_updated_at_micros = expected_updated_at
+            .timestamp_micros()
+            .checked_add(1)
+            .ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "edge {id} updated_at is already at i64::MAX and cannot advance"
+                ))
+            })?;
+        let symmetric_updated_at_micros = now.timestamp_micros().max(minimum_updated_at_micros);
+        let expected_deleted_at_micros = expected_deleted_at.map(|v| v.timestamp_micros());
+
         statements.push(PlanStatement {
             statement: edge_symmetric_delete_if_conflict_statement(
                 &namespace,
@@ -1031,9 +1046,11 @@ async fn prepare_update_edge(
                 canon_tgt,
                 edge.relation,
                 edge.weight,
-                now.timestamp_micros(),
+                symmetric_updated_at_micros,
                 metadata_str.as_deref(),
                 edge.target_backend.as_deref(),
+                expected_updated_at.timestamp_micros(),
+                expected_deleted_at_micros,
             ),
             guard: Some(AffectedRowGuard::exactly(1)),
         });
@@ -1054,7 +1071,25 @@ async fn prepare_update_edge(
         // affected-row result now means a concurrent writer moved this edge
         // between PREPARE and commit, and the atomic unit must roll back
         // instead of silently overwriting it.
-        edge.updated_at = now;
+        //
+        // `updated_at` must strictly advance past the snapshot even when two
+        // operations land inside one clock microsecond; saturating to
+        // i64::MAX would let the CAS accept a write without advancing its
+        // revision, so that is not a valid fallback (mirrors the note path).
+        let minimum_updated_at_micros = expected_updated_at
+            .timestamp_micros()
+            .checked_add(1)
+            .ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "edge {id} updated_at is already at i64::MAX and cannot advance"
+                ))
+            })?;
+        let now_micros = now.timestamp_micros().max(minimum_updated_at_micros);
+        edge.updated_at = chrono::DateTime::from_timestamp_micros(now_micros).ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "edge {id}: computed updated_at {now_micros} is not a valid timestamp"
+            ))
+        })?;
         statements.push(PlanStatement {
             statement: edge_replace_if_unchanged_statement(
                 &edge,

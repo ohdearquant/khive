@@ -4918,6 +4918,21 @@ pub struct QueryResult {
     pub truncated: bool,
 }
 
+/// Outcome of [`KhiveRuntime::update_edge_symmetric_dml`]'s in-transaction DML.
+enum SymmetricEdgeUpdateOutcome {
+    /// A canonical row already existed (ADR-039 DO NOTHING): the
+    /// requested edge was deleted, the existing canonical row (this id)
+    /// left untouched.
+    Absorbed(String),
+    /// No conflict; the requested edge was updated in place.
+    Updated,
+    /// No conflict, but the in-place `UPDATE` matched zero rows because
+    /// the row's revision or deletion marker moved after it was fetched —
+    /// a concurrent writer raced this update and must be refused, not
+    /// silently overwritten by a stale full-row write.
+    Stale,
+}
+
 impl KhiveRuntime {
     // ---- Query operations ----
 
@@ -5550,10 +5565,10 @@ impl KhiveRuntime {
     /// in-place UPDATE (case a, no conflict). Callers own the surrounding transaction
     /// boundary — this function issues DML only, no `BEGIN`/`COMMIT`/`ROLLBACK`.
     ///
-    /// Returns `Ok(Some(existing_id))` when a canonical conflict was absorbed (the
-    /// requested edge was deleted, the existing canonical row left untouched per
-    /// ADR-039 DO NOTHING), or `Ok(None)` when the requested edge was updated in
-    /// place. Shares its DML text with the atomic `prepare_update_edge` symmetric
+    /// The in-place update is guarded on the fetched snapshot's revision and
+    /// deletion marker (mirrors the non-symmetric `replace_edge_if_unchanged`
+    /// guard) and requires the replacement revision to strictly advance.
+    /// Shares its DML text with the atomic `prepare_update_edge` symmetric
     /// branch — see docs/operations.md#update_edge_symmetric_dml.
     #[allow(clippy::too_many_arguments)]
     fn update_edge_symmetric_dml(
@@ -5565,7 +5580,9 @@ impl KhiveRuntime {
         relation_str: &str,
         weight: f64,
         metadata: Option<String>,
-    ) -> Result<Option<String>, SqliteError> {
+        expected_updated_at_micros: i64,
+        expected_deleted_at_micros: Option<i64>,
+    ) -> Result<SymmetricEdgeUpdateOutcome, SqliteError> {
         // `updated_at` is stored in MICROSECONDS on `graph_edges` (every other
         // write path — `edge_upsert_statement`, `edge_soft_delete_statement` —
         // uses `timestamp_micros()`; the column is read back via
@@ -5573,7 +5590,22 @@ impl KhiveRuntime {
         // pre-existing bug in this raw-SQL path, found while unifying it with
         // the atomic builder (which already used `timestamp_micros()`
         // correctly).
-        let now_ts = chrono::Utc::now().timestamp_micros();
+        //
+        // The replacement revision must strictly advance past the snapshot
+        // even when two operations land inside one clock microsecond;
+        // saturating to i64::MAX would let the CAS accept a write without
+        // advancing its revision, so that is not a valid fallback (mirrors
+        // the note path).
+        let minimum_updated_at_micros =
+            expected_updated_at_micros.checked_add(1).ok_or_else(|| {
+                SqliteError::InvalidData(format!(
+                    "update_edge: edge {edge_id_str} updated_at is already at i64::MAX \
+                         and cannot advance"
+                ))
+            })?;
+        let now_ts = chrono::Utc::now()
+            .timestamp_micros()
+            .max(minimum_updated_at_micros);
 
         // Check for a conflicting canonical row (same namespace + natural key,
         // different id). This catches conflicts whether or not endpoints were flipped.
@@ -5609,10 +5641,13 @@ impl KhiveRuntime {
                 rusqlite::params![&ns, &edge_id_str],
             )
             .map_err(SqliteError::Rusqlite)?;
-            Ok(Some(existing_id))
+            Ok(SymmetricEdgeUpdateOutcome::Absorbed(existing_id))
         } else {
             // Case (a): no conflict — update source_id/target_id in-place,
-            // preserving the original edge UUID.
+            // preserving the original edge UUID. Guarded on the fetched
+            // snapshot's revision and deletion marker: a concurrent writer
+            // that moved this edge between fetch and this write must be
+            // refused, not silently overwritten by a stale full-row update.
             let affected = conn
                 .execute(
                     khive_db::stores::graph::EDGE_SYMMETRIC_UPDATE_INPLACE_SQL,
@@ -5625,18 +5660,15 @@ impl KhiveRuntime {
                         metadata,
                         &ns,
                         &edge_id_str,
+                        expected_updated_at_micros,
+                        expected_deleted_at_micros,
                     ],
                 )
                 .map_err(SqliteError::Rusqlite)?;
             if affected == 0 {
-                // The edge row was not found under the record's namespace.
-                // This must never happen because ns = record_ns (fetched above).
-                return Err(SqliteError::InvalidData(format!(
-                    "update_edge: zero rows affected updating edge {edge_id_str} \
-                     in namespace {ns} — row vanished between fetch and update"
-                )));
+                return Ok(SymmetricEdgeUpdateOutcome::Stale);
             }
-            Ok(None)
+            Ok(SymmetricEdgeUpdateOutcome::Updated)
         }
     }
 
@@ -5668,6 +5700,8 @@ impl KhiveRuntime {
             .ok_or_else(|| crate::RuntimeError::NotFound(format!("edge {edge_id}")))?;
         let expected_updated_at = edge.updated_at;
         let expected_deleted_at = edge.deleted_at;
+        #[cfg(test)]
+        crate::curation::race_seam::pause_after_read().await;
 
         // After fetching, all mutations and validation must use the
         // RECORD's namespace, not the caller's.  Derive record_tok from the stored edge
@@ -5732,16 +5766,16 @@ impl KhiveRuntime {
                 .as_ref()
                 .map(|v| serde_json::to_string(v).unwrap_or_default());
 
+            let expected_updated_at_micros = expected_updated_at.timestamp_micros();
+            let expected_deleted_at_micros = expected_deleted_at.map(|v| v.timestamp_micros());
+
             let pool = self.backend().pool_arc();
             // Route through the single-writer task when the write queue is
             // enabled; best-effort lookup degrades to the legacy pool-mutex
             // path (mirrors merge_entity/merge_note above).
             let writer_task = pool.writer_task_handle().ok().flatten();
 
-            // Some(surviving_id) when a canonical conflict was absorbed (the requested
-            // edge was deleted, existing canonical row left untouched per ADR-039 DO
-            // NOTHING), or None when the requested edge was updated in-place.
-            let surviving_id: Option<String> = if let Some(writer_task) = writer_task {
+            let outcome: SymmetricEdgeUpdateOutcome = if let Some(writer_task) = writer_task {
                 writer_task
                     .send(move |conn| {
                         Self::update_edge_symmetric_dml(
@@ -5753,6 +5787,8 @@ impl KhiveRuntime {
                             &relation_str,
                             weight,
                             metadata,
+                            expected_updated_at_micros,
+                            expected_deleted_at_micros,
                         )
                         .map_err(|e| {
                             khive_storage::StorageError::driver(
@@ -5777,6 +5813,8 @@ impl KhiveRuntime {
                             &relation_str,
                             weight,
                             metadata,
+                            expected_updated_at_micros,
+                            expected_deleted_at_micros,
                         )
                     })
                 })
@@ -5787,28 +5825,36 @@ impl KhiveRuntime {
                 .map_err(RuntimeError::Sqlite)?
             };
 
-            if let Some(sid) = surviving_id {
-                // A conflict was absorbed (ADR-039 DO NOTHING): re-fetch the surviving
-                // canonical row so the caller receives its real, UNMODIFIED attributes —
-                // including soft-deleted rows, since the survivor's tombstone state (if
-                // any) must not be resurrected by the absorbed update either. Use
-                // record_tok — the surviving row lives in the same namespace as the
-                // original.
-                let surviving_uuid = Uuid::parse_str(&sid).map_err(|e| {
-                    RuntimeError::Internal(format!("update_edge: surviving id parse failed: {e}"))
-                })?;
-                edge = self
-                    .get_edge_including_deleted(&record_tok, surviving_uuid)
-                    .await?
-                    .ok_or_else(|| {
+            match outcome {
+                SymmetricEdgeUpdateOutcome::Absorbed(sid) => {
+                    // A conflict was absorbed (ADR-039 DO NOTHING): re-fetch the surviving
+                    // canonical row so the caller receives its real, UNMODIFIED attributes —
+                    // including soft-deleted rows, since the survivor's tombstone state (if
+                    // any) must not be resurrected by the absorbed update either. Use
+                    // record_tok — the surviving row lives in the same namespace as the
+                    // original.
+                    let surviving_uuid = Uuid::parse_str(&sid).map_err(|e| {
                         RuntimeError::Internal(format!(
-                            "update_edge: surviving canonical row {surviving_uuid} vanished after update"
+                            "update_edge: surviving id parse failed: {e}"
                         ))
                     })?;
-            } else {
-                // Reflect canonical endpoints in the returned edge (no conflict absorbed).
-                edge.source_id = canon_src;
-                edge.target_id = canon_tgt;
+                    edge = self
+                        .get_edge_including_deleted(&record_tok, surviving_uuid)
+                        .await?
+                        .ok_or_else(|| {
+                            RuntimeError::Internal(format!(
+                                "update_edge: surviving canonical row {surviving_uuid} vanished after update"
+                            ))
+                        })?;
+                }
+                SymmetricEdgeUpdateOutcome::Updated => {
+                    // Reflect canonical endpoints in the returned edge (no conflict absorbed).
+                    edge.source_id = canon_src;
+                    edge.target_id = canon_tgt;
+                }
+                SymmetricEdgeUpdateOutcome::Stale => {
+                    return Err(crate::curation::stale_edge_snapshot_error(edge_id));
+                }
             }
         } else {
             // Non-symmetric: replace_edge_if_unchanged takes namespace from edge.namespace
@@ -5819,7 +5865,27 @@ impl KhiveRuntime {
             // silently overwritten by a full-row replacement derived from stale state.
             // `updated_at` must advance past the snapshot: the guard requires the
             // replacement revision to be strictly greater than the persisted one.
-            edge.updated_at = chrono::Utc::now();
+            // Make it strictly advance even when two operations land inside one
+            // clock microsecond; saturating to i64::MAX would let the CAS accept
+            // a write without advancing its revision, so that is not a valid
+            // fallback (mirrors the note path).
+            let minimum_updated_at_micros = expected_updated_at
+                .timestamp_micros()
+                .checked_add(1)
+                .ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "edge {edge_id} updated_at is already at i64::MAX and cannot advance"
+                ))
+            })?;
+            let now_micros = chrono::Utc::now()
+                .timestamp_micros()
+                .max(minimum_updated_at_micros);
+            edge.updated_at =
+                chrono::DateTime::from_timestamp_micros(now_micros).ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "edge {edge_id}: computed updated_at {now_micros} is not a valid timestamp"
+                    ))
+                })?;
             let persisted = graph
                 .replace_edge_if_unchanged(edge.clone(), expected_updated_at, expected_deleted_at)
                 .await?;
@@ -7003,6 +7069,213 @@ mod tests {
             final_edge.metadata.is_none(),
             "writer B's metadata must not be silently merged into the persisted row: {final_edge:?}"
         );
+    }
+
+    /// Same race as `concurrent_edge_patches_from_one_revision_only_one_survives`,
+    /// but driven entirely through the PRODUCTION entry point (`update_edge`,
+    /// non-symmetric branch) rather than `replace_edge_if_unchanged` directly.
+    /// This closes a gap the primitive-level test cannot: it would still pass
+    /// unchanged if `update_edge` were reverted to an unconditional write,
+    /// since it never invokes `update_edge` at all. Uses
+    /// `crate::curation::race_seam::pause_after_read` (test-only, compiled
+    /// out of non-test builds) to force both concurrent callers to observe
+    /// the identical pre-write revision deterministically — no sleeps, no
+    /// reliance on scheduler ordering.
+    #[tokio::test]
+    async fn production_update_edge_non_symmetric_refuses_concurrent_stale_writer() {
+        let rt = std::sync::Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.5, None)
+            .await
+            .unwrap();
+        let edge_id: Uuid = edge.id.into();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let writer_a = {
+            let rt = std::sync::Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(crate::curation::race_seam::AFTER_READ_BARRIER.scope(
+                barrier,
+                async move {
+                    rt.update_edge(
+                        &tok,
+                        edge_id,
+                        crate::curation::EdgePatch {
+                            weight: Some(0.9),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                },
+            ))
+        };
+        let writer_b = {
+            let rt = std::sync::Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(crate::curation::race_seam::AFTER_READ_BARRIER.scope(
+                barrier,
+                async move {
+                    rt.update_edge(
+                        &tok,
+                        edge_id,
+                        crate::curation::EdgePatch {
+                            properties: Some(serde_json::json!({"note": "from B"})),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                },
+            ))
+        };
+
+        let result_a = writer_a.await.expect("writer A task");
+        let result_b = writer_b.await.expect("writer B task");
+        let successes = [result_a.is_ok(), result_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one production caller must win the race; the other must be refused: \
+             a={result_a:?} b={result_b:?}"
+        );
+        let refused = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
+        match &refused {
+            Err(RuntimeError::Khive(khive_error)) => {
+                assert_eq!(
+                    khive_error.kind(),
+                    khive_types::ErrorKind::Conflict,
+                    "the losing production caller must surface a typed conflict, not \
+                     silently overwrite: {refused:?}"
+                );
+            }
+            other => panic!("expected a typed conflict error, got {other:?}"),
+        }
+
+        let final_edge = rt
+            .graph(&tok)
+            .expect("graph store")
+            .get_edge(LinkId::from(edge_id))
+            .await
+            .unwrap()
+            .expect("edge still exists");
+        assert!(
+            !((final_edge.weight - 0.9).abs() < 0.001 && final_edge.metadata.is_some()),
+            "both racers' changes must never both land: that would mean the loser's stale \
+             write silently succeeded: {final_edge:?}"
+        );
+    }
+
+    /// Symmetric-relation counterpart of
+    /// `production_update_edge_non_symmetric_refuses_concurrent_stale_writer`:
+    /// two production `update_edge` callers race a `competes_with` edge from
+    /// the same pre-write revision. Before the symmetric CAS guard, the
+    /// in-place `UPDATE` carried no expected-revision predicate, so both
+    /// commits would "succeed" and the second would silently discard the
+    /// first's weight change — this reddens if that guard (or its wiring
+    /// into `update_edge_symmetric_dml`) regresses.
+    #[tokio::test]
+    async fn production_update_edge_symmetric_refuses_concurrent_stale_writer() {
+        let rt = std::sync::Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::CompetesWith, 0.5, None)
+            .await
+            .unwrap();
+        let edge_id: Uuid = edge.id.into();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let writer_a = {
+            let rt = std::sync::Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(crate::curation::race_seam::AFTER_READ_BARRIER.scope(
+                barrier,
+                async move {
+                    rt.update_edge(
+                        &tok,
+                        edge_id,
+                        crate::curation::EdgePatch {
+                            weight: Some(0.9),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                },
+            ))
+        };
+        let writer_b = {
+            let rt = std::sync::Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(crate::curation::race_seam::AFTER_READ_BARRIER.scope(
+                barrier,
+                async move {
+                    rt.update_edge(
+                        &tok,
+                        edge_id,
+                        crate::curation::EdgePatch {
+                            weight: Some(0.1),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                },
+            ))
+        };
+
+        let result_a = writer_a.await.expect("writer A task");
+        let result_b = writer_b.await.expect("writer B task");
+        let successes = [result_a.is_ok(), result_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one production caller must win the symmetric-edge race; the other must \
+             be refused: a={result_a:?} b={result_b:?}"
+        );
+        let refused = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
+        match &refused {
+            Err(RuntimeError::Khive(khive_error)) => {
+                assert_eq!(
+                    khive_error.kind(),
+                    khive_types::ErrorKind::Conflict,
+                    "the losing production caller must surface a typed conflict, not \
+                     silently overwrite: {refused:?}"
+                );
+            }
+            other => panic!("expected a typed conflict error, got {other:?}"),
+        }
     }
 
     /// `updated_at` on this path must use `timestamp_micros()`, matching every other

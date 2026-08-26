@@ -2326,6 +2326,8 @@ pub(crate) async fn handle_heartbeat(
         .get_note(id)
         .await
         .map_err(|e| RuntimeError::Internal(format!("heartbeat: get_note: {e}")))?;
+    #[cfg(test)]
+    race_seam::pause_after_read().await;
 
     let now = Utc::now();
     // A supplied `at` must resolve to an instant before it is stored: the
@@ -3252,6 +3254,30 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
     tokens.join(" ")
 }
 
+/// Test-only pause point at `handle_heartbeat`'s read/write boundary, so a
+/// race between two concurrent callers of the PRODUCTION handler (not the
+/// underlying `replace_note_if_unchanged` store primitive) can be reproduced
+/// deterministically instead of relying on scheduler luck or sleeps. A no-op
+/// unless the calling task runs inside `AFTER_READ_BARRIER.scope(...)`;
+/// production dispatch never establishes that scope, so `pause_after_read`
+/// costs nothing outside these regression tests, and it does not exist at
+/// all in non-test builds.
+#[cfg(test)]
+mod race_seam {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    tokio::task_local! {
+        pub(crate) static AFTER_READ_BARRIER: Arc<Barrier>;
+    }
+
+    pub(crate) async fn pause_after_read() {
+        if let Ok(barrier) = AFTER_READ_BARRIER.try_with(Arc::clone) {
+            barrier.wait().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3534,6 +3560,125 @@ mod tests {
         assert!(
             final_props.get("last_success_at") != Some(&json!("2026-08-26T00:00:01Z")),
             "writer B's success timestamp must not be silently merged into the persisted row: {final_props:?}"
+        );
+    }
+
+    /// Same race as `concurrent_heartbeats_from_one_revision_only_one_survives`,
+    /// but driven entirely through the PRODUCTION entry point
+    /// (`handle_heartbeat`) rather than `replace_note_if_unchanged` directly.
+    /// This closes a gap the primitive-level test cannot: it would still pass
+    /// unchanged if `handle_heartbeat` were reverted to an unconditional
+    /// `upsert_note`, since it never invokes the handler at all. Uses
+    /// `race_seam::pause_after_read` (test-only, compiled out of non-test
+    /// builds) to force both concurrent callers to observe the identical
+    /// pre-write revision deterministically — no sleeps, no reliance on
+    /// scheduler ordering.
+    #[tokio::test]
+    async fn production_handle_heartbeat_refuses_concurrent_stale_writer() {
+        let runtime =
+            std::sync::Arc::new(khive_runtime::KhiveRuntime::memory().expect("in-memory runtime"));
+        let token = runtime
+            .authorize(khive_runtime::Namespace::parse("local").unwrap())
+            .expect("authorize");
+
+        super::handle_heartbeat(
+            &runtime,
+            &token,
+            json!({
+                "channel_kind": "email",
+                "channel_slug": "production-race@example.com",
+                "poll_interval_secs": 5,
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("seed heartbeat");
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let writer_a = {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let token = token.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(
+                super::race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                    super::handle_heartbeat(
+                        &runtime,
+                        &token,
+                        json!({
+                            "channel_kind": "email",
+                            "channel_slug": "production-race@example.com",
+                            "outcome": "failure",
+                            "error_class": "timeout",
+                            "error_message": "boom",
+                        }),
+                    )
+                    .await
+                }),
+            )
+        };
+        let writer_b = {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let token = token.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(
+                super::race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                    super::handle_heartbeat(
+                        &runtime,
+                        &token,
+                        json!({
+                            "channel_kind": "email",
+                            "channel_slug": "production-race@example.com",
+                            "poll_interval_secs": 9,
+                            "outcome": "success",
+                        }),
+                    )
+                    .await
+                }),
+            )
+        };
+
+        let result_a = writer_a.await.expect("writer A task");
+        let result_b = writer_b.await.expect("writer B task");
+        let successes = [result_a.is_ok(), result_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one production caller must win the race; the other must be refused: \
+             a={result_a:?} b={result_b:?}"
+        );
+        let refused = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
+        match &refused {
+            Err(khive_runtime::RuntimeError::Khive(khive_error)) => {
+                assert_eq!(
+                    khive_error.kind(),
+                    khive_types::ErrorKind::Conflict,
+                    "the losing production caller must surface a typed conflict, not \
+                     silently overwrite: {refused:?}"
+                );
+            }
+            other => panic!("expected a typed conflict error, got {other:?}"),
+        }
+
+        let store = runtime.notes(&token).expect("note store");
+        let id = super::heartbeat_note_id("local", "email", "production-race@example.com");
+        let final_note = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("heartbeat row still exists");
+        let final_props = final_note.properties.expect("heartbeat properties");
+        assert!(
+            !(final_props.get("last_failure_at").is_some()
+                && final_props["poll_interval_secs"] == json!(9)),
+            "both racers' fields must never both land: that would mean the loser's stale \
+             write silently succeeded: {final_props:?}"
         );
     }
 

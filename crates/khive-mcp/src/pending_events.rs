@@ -844,8 +844,21 @@ async fn run_pending_events_on_with_lease(
                         Some(error),
                     );
                     summary.failed += 1;
-                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim, None)
-                        .await
+                    let Some(expected_properties) =
+                        current_properties_for_finalize(rt, ns_str, id, "unsupported-repeat").await
+                    else {
+                        continue;
+                    };
+                    match finalize_fired_event(
+                        rt,
+                        ns_str,
+                        id,
+                        &props,
+                        completed_at,
+                        &claim,
+                        &expected_properties,
+                    )
+                    .await
                     {
                         Ok(true) => summary.finalized += 1,
                         Ok(false) => summary.skipped_race += 1,
@@ -882,8 +895,21 @@ async fn run_pending_events_on_with_lease(
                         updated_at,
                         Some(error),
                     );
-                    match finalize_fired_event(rt, ns_str, id, &props, updated_at, &claim, None)
-                        .await
+                    let Some(expected_properties) =
+                        current_properties_for_finalize(rt, ns_str, id, "failed-identity").await
+                    else {
+                        continue;
+                    };
+                    match finalize_fired_event(
+                        rt,
+                        ns_str,
+                        id,
+                        &props,
+                        updated_at,
+                        &claim,
+                        &expected_properties,
+                    )
+                    .await
                     {
                         Ok(true) => summary.finalized += 1,
                         Ok(false) => tracing::error!(
@@ -937,8 +963,22 @@ async fn run_pending_events_on_with_lease(
                         None,
                     );
 
-                    match finalize_fired_event(rt, ns_str, id, &props, updated_at, &claim, None)
-                        .await
+                    let Some(expected_properties) =
+                        current_properties_for_finalize(rt, ns_str, id, "missed").await
+                    else {
+                        summary.failed += 1;
+                        continue;
+                    };
+                    match finalize_fired_event(
+                        rt,
+                        ns_str,
+                        id,
+                        &props,
+                        updated_at,
+                        &claim,
+                        &expected_properties,
+                    )
+                    .await
                     {
                         Ok(true) => {
                             summary.missed.push(id);
@@ -996,8 +1036,21 @@ async fn run_pending_events_on_with_lease(
                         Some(error),
                     );
                     summary.failed += 1;
-                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim, None)
-                        .await
+                    let Some(expected_properties) =
+                        current_properties_for_finalize(rt, ns_str, id, "empty-payload").await
+                    else {
+                        continue;
+                    };
+                    match finalize_fired_event(
+                        rt,
+                        ns_str,
+                        id,
+                        &props,
+                        completed_at,
+                        &claim,
+                        &expected_properties,
+                    )
+                    .await
                     {
                         Ok(true) => summary.finalized += 1,
                         Ok(false) => summary.skipped_race += 1,
@@ -1026,8 +1079,21 @@ async fn run_pending_events_on_with_lease(
                         Some(error),
                     );
                     summary.failed += 1;
-                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim, None)
-                        .await
+                    let Some(expected_properties) =
+                        current_properties_for_finalize(rt, ns_str, id, "non-single-action").await
+                    else {
+                        continue;
+                    };
+                    match finalize_fired_event(
+                        rt,
+                        ns_str,
+                        id,
+                        &props,
+                        completed_at,
+                        &claim,
+                        &expected_properties,
+                    )
+                    .await
                     {
                         Ok(true) => summary.finalized += 1,
                         Ok(false) => summary.skipped_race += 1,
@@ -1162,7 +1228,7 @@ async fn run_pending_events_on_with_lease(
                     &final_props,
                     Utc::now().timestamp_micros(),
                     &claim,
-                    Some(&expected_properties),
+                    &expected_properties,
                 )
                 .await
                 {
@@ -2184,6 +2250,37 @@ async fn current_note_properties_text(
     }
 }
 
+/// Read the row's raw current properties at the same read boundary as a
+/// pending-action finalization decision, for use as `finalize_fired_event`'s
+/// mandatory exact-properties CAS fence. Returns `None` (and logs) on a read
+/// error or a vanished row; the caller must treat that as a failed
+/// finalization rather than retry with a stale or synthetic snapshot.
+async fn current_properties_for_finalize(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+    context: &'static str,
+) -> Option<String> {
+    match current_note_properties_text(rt, namespace, id).await {
+        Ok(Some(text)) => Some(text),
+        Ok(None) => {
+            tracing::error!(
+                scheduled_event_id = %id,
+                "pending-events: row vanished before {context} finalization"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::error!(
+                scheduled_event_id = %id,
+                error = %error,
+                "pending-events: could not read current properties before {context} finalization"
+            );
+            None
+        }
+    }
+}
+
 /// CAS-persist the post-drain state of a claimed event: `firing -> {fired |
 /// pending | missed | failed}` (`pending` is an advanced repeat; `failed` is
 /// the unattributed-generic-action policy state). `claimed_firing_at` is
@@ -2202,6 +2299,15 @@ struct FinalizeGuard<'a> {
     expected_properties: Option<&'a str>,
 }
 
+/// Finalize a row this process's own claim is dispatching, guarded on the
+/// row's exact current properties as well as claim identity. `expected_properties`
+/// is mandatory — not `Option` — so a future branch cannot silently drop the
+/// content fence by passing `None`: the claim token alone is an ownership
+/// fence, not a substitute for detecting a concurrent property writer that
+/// landed between claim and finalization (ADR-106). Callers must read the
+/// row's raw current properties at the same read boundary as their
+/// finalization decision — see `current_note_properties_text` — and pass
+/// that snapshot here.
 async fn finalize_fired_event(
     rt: &KhiveRuntime,
     namespace: &str,
@@ -2209,7 +2315,7 @@ async fn finalize_fired_event(
     properties: &Value,
     updated_at: i64,
     claim: &DispatchClaim,
-    expected_properties: Option<&str>,
+    expected_properties: &str,
 ) -> Result<bool> {
     finalize_firing_event(
         rt,
@@ -2220,7 +2326,7 @@ async fn finalize_fired_event(
         claim,
         FinalizeGuard {
             expired_at: None,
-            expected_properties,
+            expected_properties: Some(expected_properties),
         },
     )
     .await
@@ -5177,6 +5283,7 @@ mod tests {
             *trigger_fixed.offset(),
             &None,
         );
+        let expected_properties = get_raw_note_properties(&rt, id).await;
         assert!(finalize_fired_event(
             &rt,
             "local",
@@ -5184,7 +5291,7 @@ mod tests {
             &final_properties,
             Utc::now().timestamp_micros(),
             &claim,
-            None,
+            &expected_properties,
         )
         .await
         .expect("live owner finalizes"));
@@ -5813,6 +5920,7 @@ mod tests {
 
         // Finalize the fire as the drain would, then confirm the terminal
         // state is "fired" — the cancel never got a chance to overwrite it.
+        let expected_properties = get_raw_note_properties(&rt, id).await;
         let finalized = finalize_fired_event(
             &rt,
             "local",
@@ -5828,7 +5936,7 @@ mod tests {
             }),
             Utc::now().timestamp_micros(),
             &claim,
-            None,
+            &expected_properties,
         )
         .await
         .expect("finalize query");
@@ -6021,6 +6129,7 @@ mod tests {
         // A resumes (unaware it was reclaimed) and attempts to finalize using
         // its own stale claim token. This must be a no-op: it must NOT match
         // B's current firing_at, and must NOT clobber B's live claim.
+        let expected_properties_for_a = get_raw_note_properties(&rt, id).await;
         let a_finalize_result = finalize_fired_event(
             &rt,
             "local",
@@ -6036,7 +6145,7 @@ mod tests {
             }),
             Utc::now().timestamp_micros(),
             &a_claim,
-            None,
+            &expected_properties_for_a,
         )
         .await
         .expect("finalize query must not error");
@@ -6061,6 +6170,7 @@ mod tests {
 
         // B now finalizes with its own (correct) claim token — this must
         // succeed, proving the fix doesn't wedge legitimate finalization.
+        let expected_properties_for_b = get_raw_note_properties(&rt, id).await;
         let b_finalize_result = finalize_fired_event(
             &rt,
             "local",
@@ -6076,7 +6186,7 @@ mod tests {
             }),
             Utc::now().timestamp_micros(),
             &b_claim,
-            None,
+            &expected_properties_for_b,
         )
         .await
         .expect("finalize query must not error");
@@ -6160,7 +6270,7 @@ mod tests {
             &final_props,
             Utc::now().timestamp_micros(),
             &claim,
-            Some(&expected_properties),
+            &expected_properties,
         )
         .await
         .expect("finalize query must not error");
@@ -6192,7 +6302,7 @@ mod tests {
             &final_props,
             Utc::now().timestamp_micros(),
             &claim,
-            Some(&fresh_properties),
+            &fresh_properties,
         )
         .await
         .expect("finalize query must not error");

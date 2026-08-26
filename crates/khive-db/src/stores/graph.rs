@@ -300,10 +300,18 @@ pub const EDGE_SYMMETRIC_CONFLICT_PROBE_SQL: &str = "SELECT id FROM graph_edges 
 pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL: &str =
     "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2";
 
+/// Case (a) update, guarded on the fetched snapshot's revision and deletion
+/// marker: `?9`/`?10` pin `updated_at`/`deleted_at` as read, and `?5 >
+/// updated_at` requires the replacement revision to strictly advance —
+/// mirroring `edge_replace_if_unchanged_statement`'s guard so the symmetric
+/// path cannot silently overwrite a concurrent writer's change between the
+/// snapshot read and this write.
 pub const EDGE_SYMMETRIC_UPDATE_INPLACE_SQL: &str = "UPDATE graph_edges SET \
      source_id = ?1, target_id = ?2, relation = ?3, \
      weight = ?4, updated_at = ?5, metadata = ?6 \
-     WHERE namespace = ?7 AND id = ?8";
+     WHERE namespace = ?7 AND id = ?8 \
+       AND updated_at = ?9 AND deleted_at IS ?10 \
+       AND ?5 > updated_at";
 
 /// Plan-shape builder for [`EDGE_SYMMETRIC_CONFLICT_PROBE_SQL`] — the
 /// async prepare-time conflict probe.
@@ -341,7 +349,8 @@ pub fn edge_symmetric_delete_noncanonical_statement(namespace: &str, id: Uuid) -
 }
 
 /// Plan-shape builder for [`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`] —
-/// case (a): no conflict, update the requested row in place.
+/// case (a): no conflict, update the requested row in place, guarded on the
+/// fetched snapshot's revision and deletion marker.
 #[allow(clippy::too_many_arguments)]
 pub fn edge_symmetric_update_inplace_statement(
     namespace: &str,
@@ -352,6 +361,8 @@ pub fn edge_symmetric_update_inplace_statement(
     weight: f64,
     updated_at_micros: i64,
     metadata: Option<&str>,
+    expected_updated_at_micros: i64,
+    expected_deleted_at_micros: Option<i64>,
 ) -> SqlStatement {
     SqlStatement {
         sql: EDGE_SYMMETRIC_UPDATE_INPLACE_SQL.to_string(),
@@ -367,6 +378,11 @@ pub fn edge_symmetric_update_inplace_statement(
             },
             SqlValue::Text(namespace.to_string()),
             SqlValue::Text(id.to_string()),
+            SqlValue::Integer(expected_updated_at_micros),
+            match expected_deleted_at_micros {
+                Some(value) => SqlValue::Integer(value),
+                None => SqlValue::Null,
+            },
         ],
         label: Some("edge-symmetric-update-inplace".to_string()),
     }
@@ -482,6 +498,14 @@ pub fn edge_symmetric_delete_if_conflict_statement(
     }
 }
 
+/// `?10`/`?11` pin the fetched snapshot's `updated_at`/`deleted_at` and
+/// `?7 > updated_at` requires the replacement revision to strictly advance —
+/// guarding the in-place arm (`id = ?2`) against a concurrent writer that
+/// changed the row between the snapshot read and this statement. The
+/// absorbed arm (a differently-id'd canonical row) is intentionally left
+/// unguarded on revision: per ADR-039 DO NOTHING it self-assigns every
+/// column, so it is a no-op write regardless of the survivor's current
+/// state.
 #[allow(clippy::too_many_arguments)]
 pub fn edge_symmetric_absorb_or_update_inplace_statement(
     namespace: &str,
@@ -493,6 +517,8 @@ pub fn edge_symmetric_absorb_or_update_inplace_statement(
     updated_at_micros: i64,
     metadata: Option<&str>,
     target_backend: Option<&str>,
+    expected_updated_at_micros: i64,
+    expected_deleted_at_micros: Option<i64>,
 ) -> SqlStatement {
     SqlStatement {
         sql: "UPDATE graph_edges SET \
@@ -506,7 +532,8 @@ pub fn edge_symmetric_absorb_or_update_inplace_statement(
               target_backend = CASE WHEN id = ?2 THEN ?9 ELSE target_backend END \
               WHERE namespace = ?1 \
                 AND ( \
-                  (id = ?2 AND changes() = 0) \
+                  (id = ?2 AND changes() = 0 AND updated_at = ?10 AND deleted_at IS ?11 \
+                      AND ?7 > updated_at) \
                   OR (source_id = ?3 AND target_id = ?4 AND relation = ?5 \
                       AND id != ?2 AND changes() = 1) \
                 )"
@@ -525,6 +552,11 @@ pub fn edge_symmetric_absorb_or_update_inplace_statement(
             },
             match target_backend {
                 Some(b) => SqlValue::Text(b.to_string()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(expected_updated_at_micros),
+            match expected_deleted_at_micros {
+                Some(value) => SqlValue::Integer(value),
                 None => SqlValue::Null,
             },
         ],
