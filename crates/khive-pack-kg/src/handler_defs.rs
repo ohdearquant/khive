@@ -579,6 +579,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Filter to records with any listed tag (kind=\"entity\" or kind=\"note\", OR semantics, case-insensitive). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level via EntityFilter; note tags: Rust-level in the alive-set loop). For notes, tags are read from `properties[\"tags\"]` (there is no separate tag column on notes). E.g. [\"rust\", \"ml\"]. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
             },
             ParamDef {
+                name: "source",
+                param_type: "string",
+                required: false,
+                description: "Filter by exact retrieval source: text | vector | both. Applied before the caller limit inside a bounded candidate window; both means the final hit received both text and vector contributions.",
+            },
+            ParamDef {
                 name: "min_score",
                 param_type: "number",
                 required: false,
