@@ -10,8 +10,8 @@ use khive_runtime::{
 use super::common::{
     description_patch, deser, immutable_event_error, normalize_entity_timestamps,
     optional_string_patch, parse_relation, resolve_kind_spec, resolve_uuid_unfiltered,
-    resolve_uuid_unfiltered_including_deleted, string_value, to_json, DeleteParams, KindSpec,
-    UpdateParams,
+    resolve_uuid_unfiltered_including_deleted, string_value, to_json, validate_entity_type,
+    DeleteParams, KindSpec, UpdateParams,
 };
 use crate::KgPack;
 
@@ -34,7 +34,7 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
             } else {
                 None
             };
-            (bad, "name, description, tags, properties")
+            (bad, "name, description, tags, properties, entity_type")
         }
         KindSpec::Note { .. } => {
             let bad = if p.description.is_some() {
@@ -45,6 +45,8 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
                 Some("relation")
             } else if p.weight.is_some() {
                 Some("weight")
+            } else if p.entity_type.is_some() {
+                Some("entity_type")
             } else {
                 None
             };
@@ -63,6 +65,8 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
                 Some("salience")
             } else if p.decay_factor.is_some() {
                 Some("decay_factor")
+            } else if p.entity_type.is_some() {
+                Some("entity_type")
             } else {
                 None
             };
@@ -193,11 +197,24 @@ impl KgPack {
                         )));
                     }
                 }
+                // ADR-014 tri-state: `Some(None)` is an explicit clear and
+                // bypasses the vocabulary check (runtime applies it);
+                // `Some(Some(raw))` validates + normalizes; `None` unchanged.
+                let entity_type = match &p.entity_type {
+                    Some(None) => Some(None),
+                    Some(Some(raw)) => Some(validate_entity_type(
+                        &entity.kind,
+                        Some(raw.as_str()),
+                        registry,
+                    )?),
+                    None => None,
+                };
                 let patch = EntityPatch {
                     name: string_value(p.name, "name")?,
                     description: description_patch(p.description)?,
                     properties: p.properties,
                     tags: p.tags,
+                    entity_type,
                 };
                 let (entity, report) = self
                     .runtime

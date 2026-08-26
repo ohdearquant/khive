@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import {
+  addressableModuleIdIssue,
   addressableModulePathIssue,
   publicRepositoryUrlIssue,
 } from "@/lib/repository-location";
@@ -508,7 +509,7 @@ export const repoBundleSchema = z.strictObject({
       context.addIssue({ code: "custom", path: ["graph", key, "items"], message: "symbol-tier collections are typed but empty in khive.repo.v1" });
     }
   }
-  const sourcePaths = new Set<string>();
+  const moduleIds = new Set<string>();
   for (const [index, moduleNode] of bundle.graph.modules.items.entries()) {
     const pathIssue = addressableModulePathIssue(moduleNode.source_path);
     if (pathIssue) {
@@ -518,14 +519,22 @@ export const repoBundleSchema = z.strictObject({
         message: pathIssue,
       });
     }
-    if (sourcePaths.has(moduleNode.source_path)) {
+    const idIssue = addressableModuleIdIssue(moduleNode.id);
+    if (idIssue) {
       context.addIssue({
         code: "custom",
-        path: ["graph", "modules", "items", index, "source_path"],
-        message: "module source paths must be unique within a repository snapshot",
+        path: ["graph", "modules", "items", index, "id"],
+        message: idIssue,
       });
     }
-    sourcePaths.add(moduleNode.source_path);
+    if (moduleIds.has(moduleNode.id)) {
+      context.addIssue({
+        code: "custom",
+        path: ["graph", "modules", "items", index, "id"],
+        message: "module identifiers must be unique within a repository snapshot",
+      });
+    }
+    moduleIds.add(moduleNode.id);
   }
   for (const key of [
     "dependency_topology",
@@ -558,6 +567,49 @@ export type RepoPage<T> = {
   disclosure: z.infer<typeof disclosureSchema>;
 };
 export type RepoModule = RepoBundle["graph"]["modules"]["items"][number];
+
+// Bundles may carry duplicate source paths (IDs disambiguate), so accessible
+// names for module controls append a module-ID suffix — but only for the
+// colliding paths, keeping unique-path labels stable. The suffix length grows
+// per colliding group until every member's suffix is distinct (full-ID
+// uniqueness is schema-enforced, so a distinguishing length always exists).
+// The id → suffix map is derived once per module map and cached by map
+// identity.
+const disambiguationSuffixCache = new WeakMap<object, Map<string, string>>();
+
+function disambiguationSuffixes(
+  moduleById: ReadonlyMap<string, Pick<RepoModule, "id" | "source_path">>,
+): Map<string, string> {
+  const cached = disambiguationSuffixCache.get(moduleById);
+  if (cached) return cached;
+  const idsByPath = new Map<string, string[]>();
+  for (const entry of moduleById.values()) {
+    const group = idsByPath.get(entry.source_path);
+    if (group) group.push(entry.id);
+    else idsByPath.set(entry.source_path, [entry.id]);
+  }
+  const suffixes = new Map<string, string>();
+  for (const group of idsByPath.values()) {
+    if (group.length < 2) continue;
+    const maxLength = Math.max(...group.map((id) => id.length));
+    let length = 8;
+    for (; length < maxLength; length += 1) {
+      if (new Set(group.map((id) => id.slice(-length))).size === group.length) break;
+    }
+    for (const id of group) suffixes.set(id, id.slice(-length));
+  }
+  disambiguationSuffixCache.set(moduleById, suffixes);
+  return suffixes;
+}
+
+export function moduleInspectLabel(
+  moduleById: ReadonlyMap<string, Pick<RepoModule, "id" | "source_path">>,
+  moduleNode: Pick<RepoModule, "id" | "source_path">,
+): string {
+  const suffix = disambiguationSuffixes(moduleById).get(moduleNode.id);
+  const base = `Inspect ${moduleNode.source_path}`;
+  return suffix === undefined ? base : `${base} (${suffix})`;
+}
 export type RepoCommit = RepoBundle["graph"]["commits"]["items"][number];
 export type ViewId = keyof RepoBundle["capability"]["views"];
 

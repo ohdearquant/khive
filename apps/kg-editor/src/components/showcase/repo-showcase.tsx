@@ -24,7 +24,14 @@ import {
   TrendingUp,
   Users,
 } from "@/icons";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { DataState } from "@/components/data-state";
 import { RepositoryCommandPalette } from "@/components/showcase/repository-command-palette";
@@ -43,12 +50,17 @@ import { settleGraphLayout } from "@/lib/graph-layout";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import { buildRepositoryBrief } from "@/lib/repository-brief";
 import { buildStructureCouplingLens } from "@/lib/structure-coupling-lens";
+import {
+  buildStructureTreemap,
+  type TreemapRect,
+} from "@/lib/structure-treemap";
 import type {
   RepoBundle,
   RepoModule,
   RepoPage,
   ViewId,
 } from "@/lib/repo-bundle";
+import { moduleInspectLabel } from "@/lib/repo-bundle";
 import {
   parseRepositoryLocation,
   REPOSITORY_VIEW_IDS,
@@ -90,6 +102,8 @@ const UI_TREEMAP_LIMIT = 180;
 const UI_RESIDUAL_LIMIT = 80;
 const UI_GRAPH_EDGE_LIMIT = 50;
 const UI_COUPLING_EDGE_LIMIT = 20;
+const DENSE_GRAPH_LABEL_THRESHOLD = 24;
+const COMPACT_GRAPH_NODE_WIDTH = 26;
 
 function derivedDiamondPoints(x: number, y: number): string {
   const r = 1.1;
@@ -112,6 +126,35 @@ function formatDate(value: string): string {
     day: "numeric",
     year: "numeric",
   }).format(new Date(value));
+}
+
+function formatWeekTick(value: string): string {
+  const parsed = new Date(`${value}T00:00:00Z`);
+  // The schema constrains week_start by regex shape only, so a
+  // non-calendar date can arrive here. Date parsing either yields an
+  // Invalid Date (Intl would throw) or silently normalizes an impossible
+  // day (2026-02-30 becomes another date), so require an exact round
+  // trip and otherwise show the raw value.
+  if (
+    Number.isNaN(parsed.getTime()) ||
+    parsed.toISOString().slice(0, 10) !== value
+  ) {
+    return value;
+  }
+  return new Intl.DateTimeFormat("en", {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  }).format(parsed);
+}
+
+function chartTicks(max: number): number[] {
+  return [...new Set([0, Math.ceil(max / 2), max])];
+}
+
+function chartTickIndices(length: number): number[] {
+  if (length === 0) return [];
+  return [...new Set([0, Math.floor((length - 1) / 2), length - 1])];
 }
 
 function formatAnalysisWindow(
@@ -221,7 +264,7 @@ function ModuleInspectionControl({
       type="button"
       className={`repo-module-action ${className}`.trim()}
       data-module-id={moduleId}
-      aria-label={`Inspect ${moduleNode.source_path}`}
+      aria-label={moduleInspectLabel(moduleById, moduleNode)}
       aria-controls="repository-module-inspector"
       aria-pressed={selectedModuleId === moduleId}
       onClick={() => onInspectModule(moduleId)}
@@ -632,6 +675,8 @@ function StructureGraph({
     !focusedModuleIds.has(id);
   const isCouplingFocused = (id: string) =>
     lens === "hidden_coupling" && focusedModuleIds?.has(id) === true;
+  const compactGraphLabels =
+    displayedModules.length > DENSE_GRAPH_LABEL_THRESHOLD;
   const inspectCouplingEndpoint = (moduleId: string) => {
     setSelectedId(moduleId);
     onInspectModule(moduleId);
@@ -870,16 +915,20 @@ function StructureGraph({
             </button>
             {displayedPackages.map((item) => {
               const position = positions.get(item.id)!;
+              const compactLabel = compactGraphLabels && selectedId !== item.id;
               return (
                 <button
-                  className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""}`}
+                  aria-label={`${labels.node_types.package}: ${item.name}`}
+                  className={`repo-graph-node ${compactLabel ? "compact-label" : ""} ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""}`}
+                  data-package-node=""
                   data-node-id={item.id}
                   style={{
                     left: `${position.x}%`,
                     top: `${position.y}%`,
-                    width: `${nodeWidth(item.id)}px`,
+                    width: `${compactLabel ? COMPACT_GRAPH_NODE_WIDTH : nodeWidth(item.id)}px`,
                     ...kindHueStyle(entityLegendFor("project")),
                   }}
+                  title={compactLabel ? item.name : undefined}
                   type="button"
                   aria-pressed={selectedId === item.id}
                   key={item.id}
@@ -901,16 +950,21 @@ function StructureGraph({
             {displayedModules.map((item) => {
               const position = positions.get(item.id)!;
               const couplingCount = couplingNodeCounts.get(item.id);
+              const compactLabel = compactGraphLabels &&
+                selectedId !== item.id && !isCouplingFocused(item.id);
               return (
                 <button
-                  className={`repo-graph-node ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""} ${isCouplingFocused(item.id) ? "coupling-focused" : ""}`}
+                  aria-label={`${labels.node_types.module}: ${item.module_path}`}
+                  className={`repo-graph-node ${compactLabel ? "compact-label" : ""} ${selectedId === item.id ? "selected" : ""} ${isContextDimmed(item.id) ? "context-dimmed" : ""} ${isCouplingFocused(item.id) ? "coupling-focused" : ""}`}
+                  data-module-node=""
                   data-node-id={item.id}
                   style={{
                     left: `${position.x}%`,
                     top: `${position.y}%`,
-                    width: `${nodeWidth(item.id)}px`,
+                    width: `${compactLabel ? COMPACT_GRAPH_NODE_WIDTH : nodeWidth(item.id)}px`,
                     ...kindHueStyle(entityLegendFor("concept")),
                   }}
+                  title={compactLabel ? item.source_path : undefined}
                   type="button"
                   aria-pressed={selectedId === item.id}
                   key={item.id}
@@ -1307,6 +1361,7 @@ function HistoryFacet({
 
 function HistoryStructure({
   bundle,
+  moduleById,
   selectedModuleId,
   onInspectModule,
   onExploreStructure,
@@ -1365,7 +1420,7 @@ function HistoryStructure({
               <button
                 type="button"
                 data-module-id={module.id}
-                aria-label={`Inspect ${module.source_path}`}
+                aria-label={moduleInspectLabel(moduleById, module)}
                 aria-controls="repository-module-inspector"
                 aria-pressed={selectedModuleId === module.id}
                 className={`repo-list-row ${selectedModuleId === module.id ? "selected" : ""}`}
@@ -1802,60 +1857,126 @@ function HotspotQuadrantView({
   moduleById,
   selectedModuleId,
   onInspectModule,
+  onExploreStructure,
 }: ViewProps) {
   const analysis = bundle.aggregates.hotspot_quadrant;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
   const maxFanIn = Math.max(1, ...rows.map((row) => row.fan_in));
   const maxChanges = Math.max(1, ...rows.map((row) => row.commit_count));
+  const xTicks = chartTicks(maxFanIn);
+  const yTicks = chartTicks(maxChanges);
+  const plot = { left: 14, right: 94, top: 6, bottom: 56 };
+  const viewLabel = bundle.capability.views.hotspot_quadrant.label;
+  // An unavailable or known-empty page has no measured values, so an axis
+  // scale would be invented (the domain fallback is 1): render the data
+  // state instead of an empty plot (ADR-147 absence rule).
+  const chartState = analysis.data.disclosure.status === "unavailable"
+    ? <DataState className="repo-empty" state="unavailable" title={`${viewLabel} ${labels.unavailable.toLocaleLowerCase()}`} message={analysis.data.disclosure.reason ?? "This bundle does not claim hotspot data."} />
+    : isKnownEmptyRepoPage(analysis.data)
+      ? <DataState className="repo-empty" state="empty" title={`No ${viewLabel.toLocaleLowerCase()} rows`} message="Captured module churn and fan-in measurements belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
+      : null;
   return (
     <div className="repo-view-body repo-grid">
       <div className="repo-chart">
-        <svg
-          data-visualization="hotspot"
-          viewBox="0 0 100 70"
-          role="img"
-          aria-labelledby="hotspot-title hotspot-desc"
-        >
-          <title id="hotspot-title">
-            {bundle.capability.views.hotspot_quadrant.label}
-          </title>
-          <desc id="hotspot-desc">{analysis.meta.inputs.join(", ")}</desc>
-          <line className="repo-chart-grid" x1="50" y1="4" x2="50" y2="64" />
-          <line className="repo-chart-grid" x1="8" y1="34" x2="96" y2="34" />
-          <text className="repo-chart-axis" x="50" y="69" textAnchor="middle">
-            {labels.metrics.fan_in}
-          </text>
-          <text
-            className="repo-chart-axis"
-            transform="rotate(-90 2 35)"
-            x="2"
-            y="35"
-            textAnchor="middle"
+        {chartState ?? (
+          <svg
+            data-visualization="hotspot"
+            viewBox="0 0 100 70"
+            role="img"
+            aria-labelledby="hotspot-title hotspot-desc"
           >
-            {labels.metrics.change_frequency}
-          </text>
-          {rows.map((row) => {
-            const x = 8 + (row.fan_in / maxFanIn) * 86;
-            const y = 64 - (row.commit_count / maxChanges) * 58;
-            return (
-              <circle
-                key={row.module_id}
-                className={`repo-chart-dot ${row.quadrant === "high_churn_high_fan_in" ? "hot" : ""}`}
-                cx={x}
-                cy={y}
-                r="2.3"
-              >
-                <title>
-                  {moduleName(moduleById, row.module_id)} ·{" "}
-                  {labels.metrics.change_frequency}: {row.commit_count} ·{" "}
-                  {labels.metrics.fan_in}: {row.fan_in} ·{" "}
-                  {labels.hotspot_quadrants[row.quadrant]}
-                </title>
-              </circle>
-            );
-          })}
-        </svg>
+            <title id="hotspot-title">
+              {bundle.capability.views.hotspot_quadrant.label}
+            </title>
+            <desc id="hotspot-desc">{analysis.meta.inputs.join(", ")}</desc>
+            {xTicks.map((tick) => {
+              const x =
+                plot.left + (tick / maxFanIn) * (plot.right - plot.left);
+              return (
+                <g key={`hotspot-x-${tick}`}>
+                  <line
+                    className="repo-chart-grid"
+                    x1={x}
+                    y1={plot.top}
+                    x2={x}
+                    y2={plot.bottom}
+                  />
+                  <text
+                    className="repo-chart-axis"
+                    data-axis-tick="hotspot-x"
+                    data-axis-value={tick}
+                    x={x}
+                    y="62"
+                    textAnchor="middle"
+                  >
+                    {formatNumber(tick)}
+                  </text>
+                </g>
+              );
+            })}
+            {yTicks.map((tick) => {
+              const y =
+                plot.bottom - (tick / maxChanges) * (plot.bottom - plot.top);
+              return (
+                <g key={`hotspot-y-${tick}`}>
+                  <line
+                    className="repo-chart-grid"
+                    x1={plot.left}
+                    y1={y}
+                    x2={plot.right}
+                    y2={y}
+                  />
+                  <text
+                    className="repo-chart-axis"
+                    data-axis-tick="hotspot-y"
+                    data-axis-value={tick}
+                    x="11"
+                    y={y + 1.5}
+                    textAnchor="end"
+                  >
+                    {formatNumber(tick)}
+                  </text>
+                </g>
+              );
+            })}
+            <text className="repo-chart-axis" x="50" y="69" textAnchor="middle">
+              {labels.metrics.fan_in}
+            </text>
+            <text
+              className="repo-chart-axis"
+              transform="rotate(-90 2 35)"
+              x="2"
+              y="35"
+              textAnchor="middle"
+            >
+              {labels.metrics.change_frequency}
+            </text>
+            {rows.map((row) => {
+              const x =
+                plot.left + (row.fan_in / maxFanIn) * (plot.right - plot.left);
+              const y =
+                plot.bottom -
+                (row.commit_count / maxChanges) * (plot.bottom - plot.top);
+              return (
+                <circle
+                  key={row.module_id}
+                  className={`repo-chart-dot ${row.quadrant === "high_churn_high_fan_in" ? "hot" : ""}`}
+                  cx={x}
+                  cy={y}
+                  r="2.3"
+                >
+                  <title>
+                    {moduleName(moduleById, row.module_id)} ·{" "}
+                    {labels.metrics.change_frequency}: {row.commit_count} ·{" "}
+                    {labels.metrics.fan_in}: {row.fan_in} ·{" "}
+                    {labels.hotspot_quadrants[row.quadrant]}
+                  </title>
+                </circle>
+              );
+            })}
+          </svg>
+        )}
       </div>
       <section className="repo-card repo-table-wrap">
         <table className="repo-table">
@@ -1943,13 +2064,20 @@ function HiddenCouplingView({
                 </td>
                 <td>{formatNumber(row.cochange_count)}</td>
                 <td>
-                  <div
-                    className="repo-bar violet"
-                    aria-label={`${labels.metrics.support} ${formatPercent(row.support)}`}
-                  >
-                    <span
-                      style={{ width: `${Math.min(100, row.support * 100)}%` }}
-                    />
+                  <div className="repo-bar-reading">
+                    <div
+                      className="repo-bar violet"
+                      aria-label={`${labels.metrics.support} ${formatPercent(row.support)}`}
+                    >
+                      <span
+                        style={{
+                          width: `${Math.min(100, row.support * 100)}%`,
+                        }}
+                      />
+                    </div>
+                    <strong data-support-value={row.support}>
+                      {formatPercent(row.support)}
+                    </strong>
                   </div>
                 </td>
               </tr>
@@ -1989,79 +2117,141 @@ function TreemapView({
   const analysis = bundle.aggregates.structure_treemap;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_TREEMAP_LIMIT);
-  const maxActivity = Math.max(
-    1,
-    ...rows.map((row) =>
-      row.recent_commit_count.status === "available"
-        ? row.recent_commit_count.value
-        : 0,
-    ),
+  const packageById = new Map(
+    bundle.graph.packages.items.map((
+      packageNode,
+    ) => [packageNode.id, packageNode]),
+  );
+  const layout = buildStructureTreemap(
+    rows.map((row) => {
+      const moduleNode = moduleById.get(row.module_id);
+      const packageLabel = packageById.get(row.package_id)?.name ??
+        row.package_id;
+      return {
+        moduleId: row.module_id,
+        packageId: row.package_id,
+        packageLabel,
+        modulePath: moduleNode?.module_path ?? row.module_id,
+        sourcePath: moduleNode?.source_path ??
+          `${packageLabel}/uncaptured/${row.module_id}`,
+        sourceFileCount: row.source_file_count,
+        recentActivity: row.recent_commit_count.status === "available"
+          ? row.recent_commit_count.value
+          : null,
+      };
+    }),
   );
   return (
     <div className="repo-view-body">
       <div className="repo-legend">
         <span>
           <i className="green" />
-          {labels.metrics.source_files}
+          Area: {labels.metrics.source_files}
         </span>
         <span>
-          <i className="red" />
-          {labels.metrics.recent_activity}
+          <i className="violet" />
+          Color:{" "}
+          {layout.activityColoring === "unavailable"
+            ? labels.node_types.package
+            : labels.metrics.recent_activity}
         </span>
+        {layout.activityColoring === "partial" && (
+          <span>
+            Modules without recent-activity data keep the package tone.
+          </span>
+        )}
       </div>
       <div
         className="repo-treemap"
         role="list"
         aria-label={bundle.capability.views.structure_treemap.label}
+        data-structure-treemap
+        data-area-metric={layout.areaMetric}
       >
-        {rows.map((row) => {
-          const activity =
-            row.recent_commit_count.status === "available"
-              ? row.recent_commit_count.value
-              : 0;
-          const span = Math.min(6, Math.max(2, row.source_file_count));
-          const moduleNode = moduleById.get(row.module_id);
-          return (
-            <div
-              role="listitem"
-              style={{ gridColumn: `span ${span}` }}
-              key={row.module_id}
-            >
-              {moduleNode ? (
-                <button
-                  type="button"
-                  className={`repo-treemap-module ${activity > maxActivity * 0.55 ? "hot" : ""}`}
-                  data-module-id={row.module_id}
-                  aria-label={`Inspect ${moduleNode.source_path}`}
-                  aria-controls="repository-module-inspector"
-                  aria-pressed={selectedModuleId === row.module_id}
-                  onClick={() => onInspectModule(row.module_id)}
-                >
-                  <strong>{moduleNode.module_path}</strong>
-                  <span>
-                    {labels.metrics.source_files}: {row.source_file_count}
-                  </span>
-                  <span>
-                    {labels.metrics.recent_activity}:{" "}
-                    {availabilityText(
-                      row.recent_commit_count,
-                      labels,
-                      formatNumber,
-                    )}
-                  </span>
-                </button>
-              ) : (
-                <ModuleInspectionControl
-                  moduleId={row.module_id}
-                  moduleById={moduleById}
-                  modulePage={bundle.graph.modules}
-                  selectedModuleId={selectedModuleId}
-                  onInspectModule={onInspectModule}
-                />
-              )}
+        {layout.packages.map((packageLayout) => (
+          <section
+            className="repo-treemap-package"
+            data-treemap-package={packageLayout.id}
+            data-package-tone={packageLayout.tone}
+            key={packageLayout.id}
+            role="listitem"
+            style={treemapRectStyle(packageLayout.rect)}
+            aria-label={`${labels.node_types.package} ${packageLayout.label}`}
+          >
+            <span className="repo-treemap-package-label">
+              <i aria-hidden="true" />
+              {packageLayout.label}
+            </span>
+            <div className="repo-treemap-package-body">
+            {packageLayout.directories.map((directory) => (
+              <div
+                className="repo-treemap-directory"
+                data-treemap-directory={directory.label}
+                key={directory.id}
+                style={treemapRectStyle(directory.rect)}
+              >
+                <span className="repo-treemap-directory-label">
+                  {directory.label}
+                </span>
+                <div className="repo-treemap-directory-body">
+                {directory.modules.map((moduleLayout) => {
+                  const moduleNode = moduleById.get(moduleLayout.moduleId);
+                  if (!moduleNode) {
+                    return (
+                      <div
+                        className="repo-treemap-module missing"
+                        key={moduleLayout.moduleId}
+                        style={treemapRectStyle(moduleLayout.rect)}
+                      >
+                        <ModuleInspectionControl
+                          moduleId={moduleLayout.moduleId}
+                          moduleById={moduleById}
+                          modulePage={bundle.graph.modules}
+                          selectedModuleId={selectedModuleId}
+                          onInspectModule={onInspectModule}
+                        />
+                      </div>
+                    );
+                  }
+                  const activity = moduleLayout.recentActivity === null
+                    ? labels.unavailable
+                    : formatNumber(moduleLayout.recentActivity);
+                  return (
+                    <button
+                      type="button"
+                      className="repo-treemap-module"
+                      data-module-id={moduleLayout.moduleId}
+                      data-treemap-weight={moduleLayout.weight}
+                      data-activity-colored={moduleLayout.activityIntensity !== null || undefined}
+                      key={moduleLayout.moduleId}
+                      style={{
+                        ...treemapRectStyle(moduleLayout.rect),
+                        ...(moduleLayout.activityIntensity !== null
+                          ? { "--treemap-activity": String(moduleLayout.activityIntensity) }
+                          : {}),
+                      } as CSSProperties}
+                      aria-label={moduleInspectLabel(moduleById, moduleNode)}
+                      aria-controls="repository-module-inspector"
+                      aria-pressed={selectedModuleId === moduleLayout.moduleId}
+                      title={`${moduleNode.source_path} · ${labels.metrics.source_files}: ${formatNumber(moduleLayout.sourceFileCount)} · ${labels.metrics.recent_activity}: ${activity}`}
+                      onClick={() => onInspectModule(moduleLayout.moduleId)}
+                    >
+                      <strong>{moduleLayout.leafLabel}</strong>
+                      <span className="repo-treemap-context">
+                        {moduleLayout.parentLabel}
+                      </span>
+                      <span className="repo-treemap-metric">
+                        {labels.metrics.recent_activity}: {activity}
+                      </span>
+                    </button>
+                  );
+                })}
+                </div>
+              </div>
+            ))}
             </div>
-          );
-        })}
+          </section>
+        ))}
       </div>
       <LocalSliceDisclosure
         shown={rows.length}
@@ -2072,6 +2262,16 @@ function TreemapView({
       <BoundDisclosure page={analysis.data} labels={labels} />
     </div>
   );
+}
+
+function treemapRectStyle(rect: TreemapRect): CSSProperties {
+  const percent = (value: number) => `${(value * 100).toFixed(6)}%`;
+  return {
+    left: percent(rect.x),
+    top: percent(rect.y),
+    width: percent(rect.width),
+    height: percent(rect.height),
+  };
 }
 
 type CadencePage = RepoBundle["aggregates"]["cadence_timeline"]["commits"];
@@ -2168,8 +2368,21 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
   const labels = bundle.capability.labels;
   const commitRows = analysis.commits.items.slice(0, UI_ROW_LIMIT);
   const maxCommits = Math.max(1, ...commitRows.map((point) => point.count));
-  const width = Math.max(100, commitRows.length * 8);
+  const width = Math.max(100, commitRows.length * 8 + 20);
+  const plot = { left: 16, right: width - 4, top: 6, bottom: 58 };
+  const barStep = (plot.right - plot.left) / Math.max(1, commitRows.length);
+  const barWidth = Math.max(2, Math.min(5, barStep * 0.64));
+  const yTicks = chartTicks(maxCommits);
+  const weekTickIndices = chartTickIndices(commitRows.length);
   const releaseTags = analysis.release_tags.items.slice(0, UI_ROW_LIMIT);
+  // Same absence rule as the hotspot chart: with no measured commit weeks
+  // the y-axis domain fallback of 1 would invent a scale, so render the
+  // commit series' data state instead of an empty plot.
+  const chartState = analysis.commits.disclosure.status === "unavailable"
+    ? <DataState className="repo-empty" state="unavailable" title={`${labels.metrics.commits} ${labels.unavailable.toLocaleLowerCase()}`} message={analysis.commits.disclosure.reason ?? "This bundle does not claim commit cadence data."} />
+    : isKnownEmptyRepoPage(analysis.commits)
+      ? <DataState className="repo-empty" state="empty" title={`No ${labels.metrics.commits.toLocaleLowerCase()} cadence points`} message={`Captured weekly ${labels.metrics.commits.toLocaleLowerCase()} counts belong here.`} action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
+      : null;
   return (
     <div className="repo-view-body repo-grid">
       <div className="repo-chart">
@@ -2179,43 +2392,98 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
             {labels.metrics.commits}
           </span>
         </div>
-        <svg
-          data-visualization="cadence"
-          viewBox={`0 0 ${width} 70`}
-          role="img"
-          aria-labelledby="cadence-title cadence-desc"
-        >
-          <title id="cadence-title">
-            {bundle.capability.views.cadence_timeline.label}
-          </title>
-          <desc id="cadence-desc">{analysis.meta.inputs.join(", ")}</desc>
-          {commitRows.map((point, index) => {
-            const x = index * 8 + 4;
-            const height = (point.count / maxCommits) * 52;
-            return (
-              <rect
-                className="repo-chart-bar"
-                key={point.week_start}
-                x={x}
-                y={60 - height}
-                width="5"
-                height={height}
-              >
-                <title>
-                  {point.week_start} · {labels.metrics.commits}: {point.count}
-                </title>
-              </rect>
-            );
-          })}
-          <text
-            className="repo-chart-axis"
-            x={width / 2}
-            y="68"
-            textAnchor="middle"
+        {chartState ?? (
+          <svg
+            data-visualization="cadence"
+            viewBox={`0 0 ${width} 82`}
+            role="img"
+            aria-labelledby="cadence-title cadence-desc"
           >
-            {labels.metrics.week}
-          </text>
-        </svg>
+            <title id="cadence-title">
+              {bundle.capability.views.cadence_timeline.label}
+            </title>
+            <desc id="cadence-desc">{analysis.meta.inputs.join(", ")}</desc>
+            {yTicks.map((tick) => {
+              const y =
+                plot.bottom - (tick / maxCommits) * (plot.bottom - plot.top);
+              return (
+                <g key={`cadence-y-${tick}`}>
+                  <line
+                    className="repo-chart-grid"
+                    x1={plot.left}
+                    y1={y}
+                    x2={plot.right}
+                    y2={y}
+                  />
+                  <text
+                    className="repo-chart-axis"
+                    data-axis-tick="cadence-y"
+                    data-axis-value={tick}
+                    x="13"
+                    y={y + 1.5}
+                    textAnchor="end"
+                  >
+                    {formatNumber(tick)}
+                  </text>
+                </g>
+              );
+            })}
+            {commitRows.map((point, index) => {
+              const x = plot.left + index * barStep + (barStep - barWidth) / 2;
+              const height =
+                (point.count / maxCommits) * (plot.bottom - plot.top);
+              return (
+                <rect
+                  className="repo-chart-bar"
+                  key={point.week_start}
+                  x={x}
+                  y={plot.bottom - height}
+                  width={barWidth}
+                  height={height}
+                >
+                  <title>
+                    {point.week_start} · {labels.metrics.commits}:{" "}
+                    {point.count}
+                  </title>
+                </rect>
+              );
+            })}
+            {weekTickIndices.map((index) => {
+              const point = commitRows[index];
+              const x = plot.left + index * barStep + barStep / 2;
+              return (
+                <text
+                  className="repo-chart-axis"
+                  data-axis-tick="cadence-week"
+                  data-axis-value={point.week_start}
+                  key={`cadence-week-${point.week_start}`}
+                  x={x}
+                  y="69"
+                  textAnchor="middle"
+                >
+                  {formatWeekTick(point.week_start)}
+                </text>
+              );
+            })}
+            <text
+              className="repo-chart-axis"
+              x={width / 2}
+              y="80"
+              textAnchor="middle"
+            >
+              {labels.metrics.week}
+            </text>
+            <text
+              className="repo-chart-axis"
+              transform="rotate(-90 2 32)"
+              x="2"
+              y="32"
+              textAnchor="middle"
+            >
+              {labels.metrics.commits}
+            </text>
+          </svg>
+        )}
         <LocalSliceDisclosure
           shown={commitRows.length}
           total={analysis.commits.items.length}
@@ -2787,10 +3055,25 @@ export function RepoShowcase({
     function restoreLocation(announce = false) {
       const parsed = parseRepositoryLocation(new URL(window.location.href));
       const requestedPath = parsed.location.modulePath;
+      const requestedModuleId = parsed.location.moduleId;
+      const messages = parsed.issues.map((issue) => issue.message);
       let nextModuleId: string | null = defaultModuleId;
       let nextUnresolved: typeof unresolvedModule = null;
       let resolvedModuleRestore = false;
-      if (requestedPath) {
+      const requestedModule = requestedModuleId
+        ? moduleById.get(requestedModuleId)
+        : null;
+      if (requestedModule) {
+        nextModuleId = requestedModule.id;
+        resolvedModuleRestore = true;
+        if (
+          requestedPath && requestedPath !== requestedModule.source_path
+        ) {
+          messages.push(
+            "The module path did not match the requested module identifier; the link now uses the captured source path.",
+          );
+        }
+      } else if (requestedPath) {
         const matches = modulesBySourcePath.get(requestedPath) ?? [];
         if (matches.length === 1) {
           nextModuleId = matches[0].id;
@@ -2806,8 +3089,12 @@ export function RepoShowcase({
           };
         }
       }
+      if (requestedModuleId && !requestedModule) {
+        messages.push(
+          "The requested module identifier is not present in this bounded snapshot.",
+        );
+      }
       const nextView = parsed.location.view ?? "structure_graph";
-      const messages = parsed.issues.map((issue) => issue.message);
       const staleSnapshot = Boolean(
         parsed.location.snapshotSha &&
           parsed.location.snapshotSha !== snapshot.head_sha,
@@ -2849,10 +3136,11 @@ export function RepoShowcase({
         repository: repository.canonical_url,
         snapshotSha: parsed.location.snapshotSha ?? snapshot.head_sha,
         modulePath:
-          requestedPath ??
+          nextUnresolved?.path ??
           (nextModuleId
             ? (moduleById.get(nextModuleId)?.source_path ?? null)
             : null),
+        moduleId: nextModuleId,
         view: nextView,
       });
       if (canonical.href !== window.location.href) {
@@ -2888,6 +3176,7 @@ export function RepoShowcase({
       modulePath: moduleId
         ? (moduleById.get(moduleId)?.source_path ?? null)
         : missingPath,
+      moduleId,
       view,
     };
   }

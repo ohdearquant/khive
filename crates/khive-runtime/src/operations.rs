@@ -315,6 +315,118 @@ pub fn hex_prefix_to_uuid_pattern(prefix: &str) -> String {
     out
 }
 
+/// Return the inclusive lower and exclusive upper bounds for a UUID prefix
+/// stored as a canonical lowercase UUID string under SQLite's BINARY collation.
+///
+/// Compact hexadecimal prefixes and prefixes of the canonical dashed spelling
+/// are accepted. The returned bounds are canonicalized to lowercase; malformed
+/// dashed spellings and prefixes longer than one UUID fail closed. The upper
+/// bound is the shortest lexicographic successor, so a trailing run of `f`
+/// digits carries into the preceding digit. `g` is the exclusive sentinel when
+/// the prefix is all `f`, because canonical UUID strings contain only `0`-`f`.
+pub fn uuid_prefix_bounds(prefix: &str) -> Option<(String, String)> {
+    const HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
+
+    let compact = if prefix.contains('-') {
+        if prefix.len() > 36 {
+            return None;
+        }
+        let mut compact = String::with_capacity(32);
+        for (index, byte) in prefix.bytes().enumerate() {
+            if HYPHEN_POSITIONS.contains(&index) {
+                if byte != b'-' {
+                    return None;
+                }
+            } else if byte.is_ascii_hexdigit() {
+                compact.push(char::from(byte.to_ascii_lowercase()));
+            } else {
+                return None;
+            }
+        }
+        compact
+    } else {
+        if prefix.is_empty()
+            || prefix.len() > 32
+            || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        prefix.to_ascii_lowercase()
+    };
+
+    if compact.is_empty() || compact.len() > 32 {
+        return None;
+    }
+
+    let lower = hex_prefix_to_uuid_pattern(&compact);
+    let mut successor = compact.into_bytes();
+    let mut carried_past_start = true;
+    for index in (0..successor.len()).rev() {
+        let next = match successor[index] {
+            b'0'..=b'8' | b'a'..=b'e' => Some(successor[index] + 1),
+            b'9' => Some(b'a'),
+            b'f' => None,
+            _ => return None,
+        };
+        if let Some(next) = next {
+            successor[index] = next;
+            successor.truncate(index + 1);
+            carried_past_start = false;
+            break;
+        }
+    }
+
+    let upper = if carried_past_start {
+        "g".to_string()
+    } else {
+        let compact_upper = String::from_utf8(successor).ok()?;
+        hex_prefix_to_uuid_pattern(&compact_upper)
+    };
+    Some((lower, upper))
+}
+
+fn resolve_prefix_statement(
+    table: &str,
+    has_deleted_at: bool,
+    include_deleted: bool,
+    namespaces: Option<&[String]>,
+    lower: &str,
+    upper: &str,
+) -> SqlStatement {
+    let namespace_clause = namespaces.map(|namespaces| {
+        let placeholders: Vec<String> = (0..namespaces.len())
+            .map(|index| format!("?{}", index + 3))
+            .collect();
+        format!(" AND namespace IN ({})", placeholders.join(", "))
+    });
+    let deleted_filter = if has_deleted_at && !include_deleted {
+        " AND deleted_at IS NULL"
+    } else {
+        ""
+    };
+    let mut params = vec![
+        SqlValue::Text(lower.to_owned()),
+        SqlValue::Text(upper.to_owned()),
+    ];
+    if let Some(namespaces) = namespaces {
+        params.extend(
+            namespaces
+                .iter()
+                .map(|namespace| SqlValue::Text(namespace.clone())),
+        );
+    }
+
+    SqlStatement {
+        sql: format!(
+            "SELECT id FROM {table} \
+             WHERE id >= ?1 AND id < ?2{namespace_clause}{deleted_filter} LIMIT 2",
+            namespace_clause = namespace_clause.as_deref().unwrap_or("")
+        ),
+        params,
+        label: Some("resolve_prefix".into()),
+    }
+}
+
 fn text_preview(text: &str, max_chars: usize) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -4106,23 +4218,21 @@ impl KhiveRuntime {
         // by a `supersedes` edge is obsolete and excluded from default search.
         if !include_superseded && !alive_notes.is_empty() {
             let graph = self.graph(token)?;
-            let mut superseded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-            for &note_id in alive_notes.keys() {
-                let inbound = graph
-                    .neighbors(
-                        note_id,
-                        NeighborQuery {
-                            direction: Direction::In,
-                            relations: Some(vec![EdgeRelation::Supersedes]),
-                            limit: Some(1),
-                            min_weight: None,
-                        },
-                    )
-                    .await?;
-                if !inbound.is_empty() {
-                    superseded.insert(note_id);
-                }
-            }
+            let note_ids: Vec<Uuid> = alive_notes.keys().copied().collect();
+            let superseded: std::collections::HashSet<Uuid> = graph
+                .batch_neighbors(
+                    &note_ids,
+                    NeighborQuery {
+                        direction: Direction::In,
+                        relations: Some(vec![EdgeRelation::Supersedes]),
+                        limit: Some(1),
+                        min_weight: None,
+                    },
+                )
+                .await?
+                .into_iter()
+                .map(|(note_id, _)| note_id)
+                .collect();
             alive_notes.retain(|id, _| !superseded.contains(id));
         }
 
@@ -4195,9 +4305,9 @@ impl KhiveRuntime {
         self.resolve_prefix_inner(None, prefix, true).await
     }
 
-    /// Shared prefix-scan implementation over an explicit namespace set.
+    /// Shared indexed prefix-range lookup over an explicit namespace set.
     ///
-    /// `namespaces` selects the scan scope: `Some(&[ns])` reproduces the
+    /// `namespaces` selects the lookup scope: `Some(&[ns])` reproduces the
     /// historical primary-only behaviour (`resolve_prefix` /
     /// `resolve_prefix_including_deleted`); `None` applies
     /// no namespace predicate at all (`resolve_prefix_unfiltered*`).
@@ -4212,21 +4322,15 @@ impl KhiveRuntime {
         prefix: &str,
         include_deleted: bool,
     ) -> RuntimeResult<Option<Uuid>> {
-        use khive_storage::types::{SqlStatement, SqlValue};
-
         // Every caller is expected to pre-validate hex-only input, but this is
         // the single choke point every `resolve_prefix*` variant funnels
         // through, so re-validate here too. A prefix containing anything other
-        // than hex digits and
-        // canonical hyphen separators (`%`, `_`, or other LIKE-wildcard /
+        // than hex digits and canonical hyphen separators (`%`, `_`, or other
         // injection-shaped input) never matches a real id and is rejected
-        // before it can reach the LIKE pattern, instead of relying on bound
-        // params alone to neutralize wildcard semantics.
+        // before it can reach the range query.
         if !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
             return Ok(None);
         }
-
-        let pattern = format!("{}%", hex_prefix_to_uuid_pattern(prefix));
 
         // Injection: check PREFIX_RESOLVE_FAIL_NS (armed by
         // `arm_prefix_resolve_fail_scoped(prefix)`), exercising the storage-failure path
@@ -4240,6 +4344,10 @@ impl KhiveRuntime {
             ));
         }
 
+        let Some((lower, upper)) = uuid_prefix_bounds(prefix) else {
+            return Ok(None);
+        };
+
         let tables = [
             ("entities", true),
             ("notes", true),
@@ -4247,14 +4355,9 @@ impl KhiveRuntime {
             ("graph_edges", false),
         ];
 
-        let ns_clause = namespaces.map(|ns| {
-            let placeholders: Vec<String> = (0..ns.len()).map(|i| format!("?{}", i + 2)).collect();
-            format!(" AND namespace IN ({})", placeholders.join(", "))
-        });
-
         // A UUID can legitimately exist in more than one scanned table
         // (e.g. an entity id string that also happens to be an edge id — the
-        // scan is purely a text-prefix LIKE across independent tables, not a
+        // lookup is a text-prefix range across independent tables, not a
         // substrate-exclusive lookup). Without dedup, a single record hit
         // twice across tables inflated `matches.len()` past 1 and produced a
         // false `AmbiguousPrefix` naming the SAME UUID twice. `seen` tracks
@@ -4265,23 +4368,14 @@ impl KhiveRuntime {
         let mut reader = self.sql().reader().await.map_err(RuntimeError::Storage)?;
 
         for (table, has_deleted_at) in tables {
-            let deleted_filter = if has_deleted_at && !include_deleted {
-                " AND deleted_at IS NULL"
-            } else {
-                ""
-            };
-            let mut params = vec![SqlValue::Text(pattern.clone())];
-            if let Some(ns) = namespaces {
-                params.extend(ns.iter().map(|n| SqlValue::Text(n.clone())));
-            }
-            let sql = SqlStatement {
-                sql: format!(
-                    "SELECT id FROM {table} WHERE id LIKE ?1{ns_clause}{deleted_filter} LIMIT 2",
-                    ns_clause = ns_clause.as_deref().unwrap_or("")
-                ),
-                params,
-                label: Some("resolve_prefix".into()),
-            };
+            let sql = resolve_prefix_statement(
+                table,
+                has_deleted_at,
+                include_deleted,
+                namespaces,
+                &lower,
+                &upper,
+            );
             match reader.query_all(sql).await {
                 Ok(rows) => {
                     for row in rows {
@@ -4313,14 +4407,21 @@ impl KhiveRuntime {
         // so the sidecar scan merges into the same `matches`/`seen` set.
         if matches.len() <= 1 {
             if let Some(sidecar_sql) = self.events_sidecar_sql_read_only()? {
-                let mut params = vec![SqlValue::Text(pattern.clone())];
+                let mut params = vec![SqlValue::Text(lower.clone()), SqlValue::Text(upper.clone())];
                 if let Some(ns) = namespaces {
                     params.extend(ns.iter().map(|n| SqlValue::Text(n.clone())));
                 }
+                let namespace_clause = namespaces.map(|namespaces| {
+                    let placeholders: Vec<String> = (0..namespaces.len())
+                        .map(|index| format!("?{}", index + 3))
+                        .collect();
+                    format!(" AND namespace IN ({})", placeholders.join(", "))
+                });
                 let sql = SqlStatement {
                     sql: format!(
-                        "SELECT id FROM events WHERE id LIKE ?1{ns_clause} LIMIT 2",
-                        ns_clause = ns_clause.as_deref().unwrap_or("")
+                        "SELECT id FROM events \
+                         WHERE id >= ?1 AND id < ?2{namespace_clause} LIMIT 2",
+                        namespace_clause = namespace_clause.as_deref().unwrap_or("")
                     ),
                     params,
                     label: Some("resolve_prefix.events_sidecar".into()),
@@ -6173,13 +6274,62 @@ mod tests {
     use crate::runtime::{KhiveRuntime, NamespaceToken};
     use crate::{ActorRef, Namespace};
     use async_trait::async_trait;
-    use khive_storage::types::PathNode;
+    use khive_storage::types::{PathNode, SqlValue};
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_query_plan_uses_primary_key_range_seeks() {
+        let rt = rt();
+        let mut reader = rt.sql().reader().await.expect("prefix plan reader");
+        let mut plans = Vec::new();
+        let (lower, upper) =
+            super::uuid_prefix_bounds("0b6cf134").expect("valid compact UUID prefix");
+
+        for (table, has_deleted_at) in [
+            ("entities", true),
+            ("notes", true),
+            ("events", false),
+            ("graph_edges", false),
+        ] {
+            let rows = reader
+                .explain(super::resolve_prefix_statement(
+                    table,
+                    has_deleted_at,
+                    false,
+                    None,
+                    &lower,
+                    &upper,
+                ))
+                .await
+                .expect("explain prefix query");
+            let details: Vec<String> = rows
+                .iter()
+                .filter_map(|row| match row.get("detail") {
+                    Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                    _ => None,
+                })
+                .collect();
+            plans.push((table, details));
+        }
+
+        assert!(
+            plans.iter().all(|(table, details)| {
+                details.iter().any(|detail| {
+                    detail.contains(&format!("SEARCH {table}"))
+                        && detail.contains("id>?")
+                        && detail.contains("id<?")
+                }) && !details
+                    .iter()
+                    .any(|detail| detail.contains(&format!("SCAN {table}")))
+            }),
+            "every short-id table must use a primary-key range seek: {plans:?}"
+        );
     }
 
     #[test]
@@ -8774,6 +8924,44 @@ mod tests {
         assert_eq!(hex_prefix_to_uuid_pattern(partial), partial);
     }
 
+    #[test]
+    fn uuid_prefix_bounds_are_canonical_lowercase_half_open_ranges() {
+        assert_eq!(
+            super::uuid_prefix_bounds("0ABCDEFF"),
+            Some(("0abcdeff".into(), "0abcdf".into()))
+        );
+        assert_eq!(
+            super::uuid_prefix_bounds("aabbccdd1"),
+            Some(("aabbccdd-1".into(), "aabbccdd-2".into()))
+        );
+        assert_eq!(
+            super::uuid_prefix_bounds("AABBCCDD-19FF"),
+            Some(("aabbccdd-19ff".into(), "aabbccdd-1a".into()))
+        );
+        assert_eq!(
+            super::uuid_prefix_bounds("ffffffff"),
+            Some(("ffffffff".into(), "g".into()))
+        );
+    }
+
+    #[test]
+    fn uuid_prefix_bounds_reject_malformed_or_overlong_input() {
+        for invalid in [
+            "",
+            "aabbccdd_",
+            "aabbccdd1-",
+            "aabbccdd-11111",
+            "aabbccdd--",
+            "aabbccdd112240008000000000000ab1f",
+        ] {
+            assert_eq!(
+                super::uuid_prefix_bounds(invalid),
+                None,
+                "invalid prefix {invalid:?} must fail closed"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn resolve_prefix_compact_9_to_31_char_matches() {
         let rt = rt();
@@ -8884,6 +9072,41 @@ mod tests {
                 "boundary prefix of len {len} should resolve"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_range_preserves_boundaries_ambiguity_and_not_found() {
+        use khive_storage::entity::Entity;
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let ids = [
+            "0abcdefe-ffff-4fff-8fff-ffffffffffff",
+            "0abcdeff-0000-4000-8000-000000000001",
+            "0abcdeff-1000-4000-8000-000000000002",
+            "0abcdf00-0000-4000-8000-000000000003",
+        ];
+        let store = rt.entities(&tok).unwrap();
+        for (index, id) in ids.into_iter().enumerate() {
+            let mut entity = Entity::new("local", "concept", format!("RangeControl{index}"));
+            entity.id = Uuid::parse_str(id).unwrap();
+            store.upsert_entity(entity).await.unwrap();
+        }
+
+        let unique = rt.resolve_prefix(&tok, "0abcdeff0").await.unwrap();
+        assert_eq!(unique, Some(Uuid::parse_str(ids[1]).unwrap()));
+
+        let ambiguous = rt.resolve_prefix(&tok, "0abcdeff").await.unwrap_err();
+        assert!(
+            matches!(
+                ambiguous,
+                RuntimeError::AmbiguousPrefix { ref matches, .. } if matches.len() == 2
+            ),
+            "the two in-range UUIDs must remain ambiguous: {ambiguous:?}"
+        );
+
+        let missing = rt.resolve_prefix(&tok, "0abcdeff2").await.unwrap();
+        assert_eq!(missing, None, "adjacent UUIDs must not become prefix hits");
     }
 
     #[tokio::test]
@@ -14673,6 +14896,78 @@ mod tests {
         assert!(
             snap["fts_passes"].as_u64().unwrap_or(0) >= 1,
             "note search FTS execution must count fts_passes; got {snap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_notes_batches_supersedes_suppression_round_trip() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let ns = Namespace::parse("usage-note-supersedes-batch").unwrap();
+        let tok = NamespaceToken::for_namespace(ns);
+
+        let mut notes = Vec::new();
+        for ordinal in 0..4 {
+            notes.push(
+                rt.create_note(
+                    &tok,
+                    "observation",
+                    None,
+                    &format!("batchsupersedesprobe live candidate {ordinal}"),
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+                .expect("create_note must succeed"),
+            );
+        }
+        rt.link(
+            &tok,
+            notes[3].id,
+            notes[0].id,
+            EdgeRelation::Supersedes,
+            1.0,
+            None,
+        )
+        .await
+        .expect("supersedes link must succeed");
+
+        let ctx = crate::usage::UsageContext::new();
+        let hits = crate::usage::scope(ctx.clone(), async {
+            rt.search_notes(
+                &tok,
+                "batchsupersedesprobe",
+                None,
+                10,
+                None,
+                false,
+                &[],
+                None,
+            )
+            .await
+        })
+        .await
+        .expect("search_notes must succeed");
+
+        let hit_ids: std::collections::HashSet<Uuid> = hits.iter().map(|hit| hit.note_id).collect();
+        assert_eq!(
+            hit_ids.len(),
+            3,
+            "all live, non-superseded notes must remain"
+        );
+        assert!(
+            !hit_ids.contains(&notes[0].id),
+            "the superseded note must be excluded"
+        );
+        assert!(
+            notes[1..].iter().all(|note| hit_ids.contains(&note.id)),
+            "every live, non-superseded note must be returned"
+        );
+
+        let snap = ctx.snapshot();
+        assert_eq!(
+            snap["db_round_trips"], 1,
+            "supersedes suppression must use one batched adjacency query; got {snap:?}"
         );
     }
 

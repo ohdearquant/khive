@@ -713,6 +713,27 @@
   font-size: var(--khive-type-lg);
   margin-right: var(--khive-space-3);
 }
+.repo-graph-node.compact-label {
+  align-items: center;
+  aspect-ratio: 1;
+  border-radius: var(--khive-radius-pill);
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+  padding: 4px;
+  text-align: center;
+}
+.repo-graph-node.compact-label > span,
+.repo-graph-node.compact-label > strong { display: none; }
+/* Compact mode drops only the TEXT labels: the kind icon stays as the
+   node's visible identity and the coupling badge keeps its count. Both
+   are spans, so they must win over the hiding rule above. */
+.repo-graph-node.compact-label > .repo-node-kind-icon {
+  display: inline-flex;
+  float: none;
+  margin: 0;
+}
+.repo-graph-node.compact-label > .repo-graph-overlay-badge { display: inline-flex; }
 .repo-graph-node .repo-graph-overlay-badge {
   align-items: center;
   background: var(--khive-color-warning-soft);
@@ -895,6 +916,19 @@ button.repo-list-row:hover,
 }
 .repo-bar > span { background: var(--repo-green); display: block; height: 100%; }
 .repo-bar.violet > span { background: var(--repo-violet); }
+.repo-bar-reading {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(80px, 1fr) auto;
+  min-width: 140px;
+}
+.repo-bar-reading > strong {
+  font-size: var(--khive-type-sm);
+  font-variant-numeric: tabular-nums;
+  min-width: 3.5em;
+  text-align: right;
+}
 
 .repo-chart {
   background: var(--khive-color-surface-raised);
@@ -923,33 +957,148 @@ button.repo-list-row:hover,
 .repo-legend i.red { background: var(--red); }
 
 .repo-treemap {
-  display: grid;
-  gap: 5px;
-  grid-auto-flow: dense;
-  grid-template-columns: repeat(12, 1fr);
-  min-height: 420px;
+  background: var(--khive-color-surface-raised);
+  border: 1px solid var(--repo-border);
+  border-radius: var(--khive-radius-lg);
+  min-height: 560px;
+  overflow: hidden;
+  position: relative;
+}
+.repo-treemap-package {
+  --repo-treemap-tone: var(--khive-color-ontology-concept);
+  background: color-mix(in srgb, var(--repo-treemap-tone) 7%, var(--khive-color-surface-raised));
+  border: 2px solid color-mix(in srgb, var(--repo-treemap-tone) 54%, var(--khive-color-border));
+  container-type: size;
+  overflow: hidden;
+  position: absolute;
+}
+/* Children lay out inside a pixel-inset body band below the pixel-positioned
+   overlay label, so the label can never cover a child tile at any rendered
+   height. Where a tile is too short to afford the band, the label is hidden
+   and the body takes the full tile instead. */
+.repo-treemap-package-body {
+  inset: 24px 0 0 0;
+  position: absolute;
+}
+@container (max-height: 48px) {
+  .repo-treemap-package-label {
+    display: none;
+  }
+  .repo-treemap-package-body {
+    inset: 0;
+  }
+}
+.repo-treemap-package[data-package-tone="0"] { --repo-treemap-tone: var(--khive-color-ontology-concept); }
+.repo-treemap-package[data-package-tone="1"] { --repo-treemap-tone: var(--khive-color-ontology-document); }
+.repo-treemap-package[data-package-tone="2"] { --repo-treemap-tone: var(--khive-color-ontology-dataset); }
+.repo-treemap-package[data-package-tone="3"] { --repo-treemap-tone: var(--khive-color-ontology-project); }
+.repo-treemap-package[data-package-tone="4"] { --repo-treemap-tone: var(--khive-color-ontology-person); }
+.repo-treemap-package[data-package-tone="5"] { --repo-treemap-tone: var(--khive-color-ontology-org); }
+.repo-treemap-package[data-package-tone="6"] { --repo-treemap-tone: var(--khive-color-ontology-artifact); }
+.repo-treemap-package[data-package-tone="7"] { --repo-treemap-tone: var(--khive-color-ontology-service); }
+.repo-treemap-package[data-package-tone="8"] { --repo-treemap-tone: var(--khive-color-ontology-resource); }
+.repo-treemap-package-label,
+.repo-treemap-directory-label {
+  backdrop-filter: blur(3px);
+  border-radius: var(--khive-radius-xs);
+  color: var(--khive-color-text-primary);
+  font-size: var(--khive-type-micro);
+  font-weight: 750;
+  left: 3px;
+  line-height: 1.2;
+  max-width: calc(100% - 6px);
+  overflow: hidden;
+  padding: 2px 4px;
+  pointer-events: none;
+  position: absolute;
+  text-overflow: ellipsis;
+  top: 3px;
+  white-space: nowrap;
+  z-index: 3;
+}
+.repo-treemap-package-label {
+  background: color-mix(in srgb, var(--repo-treemap-tone) 38%, var(--khive-color-surface-overlay));
+}
+.repo-treemap-package-label i {
+  background: var(--repo-treemap-tone);
+  border-radius: var(--khive-radius-pill);
+  display: inline-block;
+  height: 6px;
+  margin-right: 4px;
+  width: 6px;
+}
+.repo-treemap-directory {
+  border: 1px solid color-mix(in srgb, var(--repo-treemap-tone) 31%, var(--khive-color-border));
+  container-type: size;
+  overflow: hidden;
+  position: absolute;
+}
+.repo-treemap-directory-label {
+  background: color-mix(in srgb, var(--repo-treemap-tone) 17%, var(--khive-color-surface-overlay));
+  color: var(--khive-color-text-secondary);
+  font-weight: 650;
+  top: 20px;
+}
+/* The directory label sits at a fixed 20px offset; modules lay out inside a
+   pixel-inset body band that starts below it, so the label can never cover a
+   module at any rendered height. Where the tile is too short to afford the
+   band, the label is hidden and the body takes the full tile. */
+.repo-treemap-directory-body {
+  inset: 40px 0 0 0;
+  position: absolute;
+}
+@container (max-height: 80px) {
+  .repo-treemap-directory-label {
+    display: none;
+  }
+  .repo-treemap-directory-body {
+    inset: 0;
+  }
 }
 .repo-treemap-module {
-  background: var(--khive-color-accent-soft);
-  border: 1px solid var(--khive-color-border-strong);
-  border-radius: var(--khive-radius-md);
-  color: var(--khive-color-success);
+  background: color-mix(in srgb, var(--repo-treemap-tone) 15%, var(--khive-color-surface-overlay));
+  border: 1px solid color-mix(in srgb, var(--repo-treemap-tone) 46%, var(--khive-color-border));
+  color: var(--khive-color-text-primary);
+  cursor: pointer;
   font: inherit;
-  min-height: 64px;
   overflow: hidden;
-  padding: 9px;
+  padding: clamp(3px, 0.55vw, 8px);
+  position: absolute;
   text-align: left;
-  width: 100%;
 }
-.repo-treemap > div { min-width: 0; }
-.repo-treemap-module { cursor: pointer; }
+/* Activity coloring (field-level join available): intensity 0..1 scales a
+   warm tone over the neutral surface; modules without the join keep the
+   package tone above. */
+.repo-treemap-module[data-activity-colored] {
+  background: color-mix(
+    in srgb,
+    var(--khive-color-warning) calc(8% + var(--treemap-activity, 0) * 58%),
+    var(--khive-color-surface-overlay)
+  );
+  border-color: color-mix(
+    in srgb,
+    var(--khive-color-warning) calc(20% + var(--treemap-activity, 0) * 56%),
+    var(--khive-color-border)
+  );
+}
 .repo-treemap-module:hover,
-.repo-treemap-module[aria-pressed="true"] { box-shadow: inset 0 0 0 2px var(--khive-color-accent); }
-.repo-treemap-module.hot { background: var(--khive-color-warning-soft); border-color: var(--khive-color-warning-soft); color: var(--khive-color-warning); }
+.repo-treemap-module[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--repo-treemap-tone) 28%, var(--khive-color-surface-overlay));
+  box-shadow: inset 0 0 0 2px var(--khive-color-accent);
+  z-index: 2;
+}
+.repo-treemap-module:focus-visible {
+  outline: 2px solid var(--khive-color-accent);
+  outline-offset: -3px;
+  z-index: 4;
+}
+.repo-treemap-module.missing { cursor: default; }
 .repo-treemap-module strong,
 .repo-treemap-module span { display: block; overflow: hidden; text-overflow: ellipsis; }
-.repo-treemap-module strong { font-size: var(--khive-type-md); white-space: nowrap; }
-.repo-treemap-module span { font-size: var(--khive-type-xs); margin-top: 3px; }
+.repo-treemap-module strong { font-size: var(--khive-type-sm); white-space: nowrap; }
+.repo-treemap-module span { font-size: var(--khive-type-micro); margin-top: 2px; white-space: nowrap; }
+.repo-treemap-context { color: var(--khive-color-text-secondary); }
+.repo-treemap-metric { color: var(--repo-treemap-tone); font-weight: 700; }
 
 .repo-score-grid { align-items: start; display: grid; gap: 10px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .repo-score-card { background: var(--khive-color-surface-overlay); border: 1px solid var(--repo-border); border-radius: var(--khive-radius-lg); min-height: 126px; padding: 13px; }
@@ -1043,6 +1192,7 @@ button.repo-list-row:hover,
   .repo-graph-toolbar { align-items: flex-start; flex-direction: column; }
   .repo-graph-lens-picker { flex-wrap: wrap; }
   .repo-graph-active-overlay { max-width: calc(100% - 20px); }
+  .repo-graph-node.compact-label { width: 20px !important; }
   .repo-coupling-lens > header { flex-direction: column; }
   .repo-coupling-lens > header p { text-align: left; }
   .repo-coupling-evidence { grid-template-columns: 1fr; }
@@ -1058,7 +1208,7 @@ button.repo-list-row:hover,
     overflow-wrap: anywhere;
     white-space: normal;
   }
-  .repo-treemap { grid-template-columns: repeat(6, 1fr); }
+  .repo-treemap { min-height: 680px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
