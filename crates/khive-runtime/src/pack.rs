@@ -599,6 +599,20 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// Override the ADR-133 audit-batch seam's tunables, applied when
+    /// `build()` lazily constructs the batch from `event_store`.
+    /// `None` (the default) uses `AuditBatchConfig::default()`. Exposed for
+    /// tests that need to force a small `max_pending_rows` or a short
+    /// `admission_deadline` to exercise admission-pressure paths
+    /// deterministically (khive#2117, khive#2147, khive#2208, khive#2217).
+    pub fn with_audit_batch_config(
+        &mut self,
+        config: crate::audit_batch::AuditBatchConfig,
+    ) -> &mut Self {
+        self.audit_batch_config = Some(config);
+        self
+    }
+
     /// Mark audit persistence unavailable because its backend is read-only.
     ///
     /// No `EventStore` is retained, so dispatch never attempts a write that is
@@ -1320,6 +1334,16 @@ impl VerbRegistry {
         })
     }
 
+    /// Test/diagnostic-only accessor for the underlying ADR-133 audit-batch
+    /// seam. `None` when no `EventStore` was configured (the batch is lazily
+    /// constructed from one). Exposed so admission-pressure mechanism tests
+    /// can saturate and drain the SAME instance a real dispatch uses
+    /// (khive#2117, khive#2147, khive#2208, khive#2217) instead of testing a
+    /// look-alike.
+    pub fn audit_batch_handle(&self) -> Option<Arc<crate::audit_batch::AuditBatch>> {
+        self.audit_batch.clone()
+    }
+
     /// Stop admitting new audit rows and wait for every already-accepted row
     /// to reach a terminal state (ADR-133).
     ///
@@ -1352,6 +1376,24 @@ impl VerbRegistry {
                 "message": "operation completed, but its dispatch audit event was not persisted because the audit backend is read-only",
             })
         })
+    }
+
+    /// Whether `verb`'s declared [`VerbCategory`] is `Assertive` — the
+    /// speech-act tag for handlers that "retrieve and present facts" (`get`,
+    /// `list`, `search`, `recall`, `gtd.tasks`, ...) rather than committing a
+    /// domain change. Unknown verbs are conservatively `false`.
+    ///
+    /// Used only to decide whether a dispatch's own audit-obligation row may
+    /// degrade to best-effort on transient audit-lane admission pressure
+    /// (`append_audit_event_best_effort`) — a read that performed no domain
+    /// write must not fail the caller just because the audit lane is
+    /// momentarily saturated (khive#2147, khive#2217). Never used for
+    /// permission checking, transport routing, or return-shape selection.
+    fn verb_is_read_only(&self, verb: &str) -> bool {
+        self.packs
+            .iter()
+            .find_map(|pack| pack.handlers().iter().find(|h| h.name == verb))
+            .is_some_and(|handler| handler.category == VerbCategory::Assertive)
     }
 
     /// Return the help schema envelope for a verb.
@@ -1540,6 +1582,7 @@ impl VerbRegistry {
                             event,
                             verb,
                             crate::audit_batch::AuditProducer::GateDenied,
+                            false,
                         )
                         .await;
                     }
@@ -1694,8 +1737,15 @@ impl VerbRegistry {
         } else {
             crate::audit_batch::AuditProducer::DispatchFailed
         };
-        append_audit_event_best_effort(self.audit_batch.as_ref(), store, event, verb, producer)
-            .await
+        append_audit_event_best_effort(
+            self.audit_batch.as_ref(),
+            store,
+            event,
+            verb,
+            producer,
+            self.verb_is_read_only(verb),
+        )
+        .await
     }
 
     fn gate_request_with_identity(
@@ -1745,6 +1795,7 @@ impl VerbRegistry {
                 event,
                 gate_req.verb.as_str(),
                 crate::audit_batch::AuditProducer::GateUnavailable,
+                false,
             )
             .await;
         }
@@ -1870,6 +1921,7 @@ impl VerbRegistry {
                                 storage_event,
                                 "config.lock",
                                 crate::audit_batch::AuditProducer::ConfigLocked,
+                                false,
                             )
                             .await;
                         }
@@ -1917,6 +1969,7 @@ impl VerbRegistry {
                             storage_event,
                             verb,
                             crate::audit_batch::AuditProducer::GateDenied,
+                            false,
                         )
                         .await;
                     }
@@ -2126,6 +2179,7 @@ impl VerbRegistry {
                                             storage_event,
                                             verb,
                                             crate::audit_batch::AuditProducer::DispatchSucceeded,
+                                            handler_def.category == VerbCategory::Assertive,
                                         )
                                         .await
                                     }
@@ -2148,6 +2202,7 @@ impl VerbRegistry {
                                             storage_event,
                                             verb,
                                             crate::audit_batch::AuditProducer::DispatchSucceeded,
+                                            handler_def.category == VerbCategory::Assertive,
                                         )
                                         .await
                                     }
@@ -2203,6 +2258,7 @@ impl VerbRegistry {
                                     storage_event,
                                     verb,
                                     producer,
+                                    handler_def.category == VerbCategory::Assertive,
                                 )
                                 .await
                             }
@@ -2341,6 +2397,7 @@ impl VerbRegistry {
                     storage_event,
                     verb,
                     crate::audit_batch::AuditProducer::UnknownVerb,
+                    false,
                 )
                 .await;
             }
@@ -3474,6 +3531,15 @@ async fn persist_git_digest_receipt(
 /// Every failure — obligation or observability — increments the
 /// process-wide diagnostics counter above.
 ///
+/// `is_read_only_verb` (khive#2147/khive#2217) narrows that obligation for
+/// one specific case: a `DispatchSucceeded`/`DispatchFailed` row for a verb
+/// whose category is `VerbCategory::Assertive` performs no domain write, so
+/// this row's own admission being transiently refused or timed out
+/// (`AuditTerminalReason::QueueAdmissionExhausted` /
+/// `AdmissionDeadlineExpired`) degrades to best-effort instead of failing the
+/// dispatch — the caller-visible read result is preserved. Every other
+/// obligation failure, and every failure for a non-read verb, is unaffected.
+///
 /// When the registry has an audit-batch seam configured (it is whenever
 /// `store` is), the row routes through
 /// [`crate::audit_batch::AuditBatchControl::submit`] instead of taking its
@@ -3487,8 +3553,11 @@ async fn append_audit_event_best_effort(
     event: Event,
     verb: &str,
     producer: crate::audit_batch::AuditProducer,
+    is_read_only_verb: bool,
 ) -> Result<(), RuntimeError> {
-    use crate::audit_batch::{classify, AuditBatchControl, AuditProductionClass};
+    use crate::audit_batch::{
+        classify, AuditBatchControl, AuditProductionClass, AuditTerminalReason,
+    };
 
     let is_obligation = classify(producer) == AuditProductionClass::DispatchObligation;
 
@@ -3498,6 +3567,29 @@ async fn append_audit_event_best_effort(
             .await
         {
             if is_obligation {
+                // khive#2147/khive#2217: a read verb performs no domain write, so
+                // when the audit-lane's OWN admission is merely under transient
+                // pressure (the row was refused before enqueue, or the caller's
+                // wait deadline elapsed on a row that is still likely to commit),
+                // failing the read discards a valid result to protect an
+                // obligation the read never needed as strictly as a write does.
+                // Any other reason (a definite store/durability failure) still
+                // fails the dispatch for reads exactly as it does for writes.
+                let admission_pressure = matches!(
+                    reason,
+                    AuditTerminalReason::QueueAdmissionExhausted
+                        | AuditTerminalReason::AdmissionDeadlineExpired
+                );
+                if is_read_only_verb && admission_pressure {
+                    AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        verb,
+                        reason = ?reason,
+                        "read verb's audit obligation degraded under audit-lane admission \
+                         pressure; dispatch still reports its own result (non-fatal)"
+                    );
+                    return Ok(());
+                }
                 AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(
                     verb,
