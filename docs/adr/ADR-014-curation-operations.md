@@ -660,6 +660,15 @@ must not resubmit the stale full row without a fresh read. A caller that wants a
 read the current record, recompute the documented patch or merge from that state, and submit the
 new revision as a new guarded attempt.
 
+The conflict travels on the existing error taxonomy rather than a new one. A refused write returns
+`ErrorKind::Conflict`, which serializes as `kind: "conflict"` and carries HTTP status 409. That
+taxonomy is closed, so the value is stable across versions and both in-process and over-the-wire
+callers may branch on it directly rather than parsing message text. This is why the wire surface is
+unchanged: the distinction a caller needs already existed, and no new error kind is added. Note that
+the guarded entity and edge paths reach it through `KhiveError::conflict`, not through
+`StorageError::Conflict`, which the note path used; a reader searching only for the latter will
+conclude no typed conflict is produced.
+
 ### Scope
 
 This change covers these six production-graph sites:
