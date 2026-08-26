@@ -48,3 +48,22 @@ it("renders a nested structure-area treemap with disambiguated leaf labels", asy
   expect(packCards.every((button) => Number(button.dataset.treemapWeight) > 0))
     .toBe(true);
 });
+
+it("suppresses directory labels in tiles too short for the fixed label offset", () => {
+  // jsdom cannot compute external CSS or container queries, so this guards
+  // the stylesheet contract structurally: the directory tile must be a size
+  // query container and short tiles must hide the pixel-positioned label
+  // that percentage insets cannot clear.
+  const css = readFileSync(
+    resolve(process.cwd(), "src/app/showcase.css"),
+    "utf8",
+  );
+  const directoryRule = css.match(
+    /\.repo-treemap-directory\s*\{[^}]*\}/,
+  )?.[0];
+  expect(directoryRule).toContain("container-type: size");
+  const suppression = css.match(
+    /@container \(max-height: \d+px\)\s*\{\s*\.repo-treemap-directory-label\s*\{[^}]*\}\s*\}/,
+  )?.[0];
+  expect(suppression).toContain("display: none");
+});

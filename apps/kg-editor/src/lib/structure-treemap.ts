@@ -62,8 +62,10 @@ type Weighted<T> = Readonly<{
 
 const UNIT_RECT: TreemapRect = { x: 0, y: 0, width: 1, height: 1 };
 // Overlay labels sit at the top of each package section and directory tile;
-// laying children into a top-inset body rectangle keeps the first tiles from
-// being covered by those labels.
+// laying children into a top-inset body rectangle reserves label space in
+// normalized coordinates. The labels themselves are pixel-positioned, so the
+// stylesheet additionally suppresses a directory label when its tile is too
+// short for the percentage inset to clear it.
 const PACKAGE_BODY_RECT: TreemapRect = { x: 0, y: 0.1, width: 1, height: 0.9 };
 const DIRECTORY_BODY_RECT: TreemapRect = {
   x: 0,

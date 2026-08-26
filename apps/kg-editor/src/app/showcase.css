@@ -978,6 +978,7 @@ button.repo-list-row:hover,
 }
 .repo-treemap-directory {
   border: 1px solid color-mix(in srgb, var(--repo-treemap-tone) 31%, var(--khive-color-border));
+  container-type: size;
   overflow: hidden;
   position: absolute;
 }
@@ -986,6 +987,15 @@ button.repo-list-row:hover,
   color: var(--khive-color-text-secondary);
   font-weight: 650;
   top: 20px;
+}
+/* The label sits at a fixed 20px offset while directory heights come from
+   normalized treemap percentages, so a short directory cannot clear it with
+   a percentage inset alone; suppress the label where it would sit over the
+   first module tiles. */
+@container (max-height: 48px) {
+  .repo-treemap-directory-label {
+    display: none;
+  }
 }
 .repo-treemap-module {
   background: color-mix(in srgb, var(--repo-treemap-tone) 15%, var(--khive-color-surface-overlay));
