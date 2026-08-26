@@ -1764,6 +1764,19 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
             brain_profile: None,
         })?;
 
+    // ADR-170 embedded mode: `kkernel exec`'s in-process fallback is a
+    // one-shot — a socket forwarder would be reaped at process exit before
+    // delivering, losing every event. The shared resolver already emits
+    // direct (socket-less) mode for exactly this class of host; only the
+    // resident daemon entrypoints upgrade to forwarding
+    // (`enable_events_forwarding_for_daemon`). SQLite's per-file
+    // cross-process exclusion covers direct appends overlapping a running
+    // events daemon.
+    debug_assert!(cfg
+        .events_split
+        .as_ref()
+        .is_none_or(|split| split.socket_path.is_none()));
+
     // Apply the explicit actor only AFTER the shared resolver has loaded the
     // project/config/environment fallbacks. This makes the CLI value the true
     // highest-precedence tier without coupling identity to storage namespace.

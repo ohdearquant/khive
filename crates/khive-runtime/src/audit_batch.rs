@@ -363,19 +363,19 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
         StorageError::WriteQueueFull { .. } | StorageError::WriterTaskBusy { .. } => {
             RetryDecision::Retry
         }
+        // Transient availability conditions, not judgments on the batch. The
+        // events-daemon forwarding lane (ADR-170) reports an unreachable or
+        // stalled daemon as `Pool`/`Timeout`; the direct SQL path reports
+        // acquisition pressure the same way. Both are exactly what the
+        // configured bounded retries exist for — treating them as terminal
+        // would abandon a generation on the first blip of a daemon restart.
+        StorageError::Pool { .. } | StorageError::Timeout { .. } => RetryDecision::Retry,
         StorageError::WriterTaskTerminated { request_state } => match request_state {
             WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack => {
                 RetryDecision::Retry
             }
             WriterTaskRequestState::SideEffectsUnknown => RetryDecision::Retry,
         },
-        // The events-split socket transport surfaces transient daemon-side
-        // conditions and transport loss as `Pool` (unreachable, retryable
-        // daemon refusal) and `Timeout` (round-trip clock expired). This lane
-        // is idempotent by construction, so replaying a batch whose commit
-        // state is unknown is safe, and the retry budget above bounds the
-        // attempts either way.
-        StorageError::Pool { .. } | StorageError::Timeout { .. } => RetryDecision::Retry,
         StorageError::Unsupported { operation, .. }
             if operation.as_ref() == "append_events_idempotent" =>
         {
