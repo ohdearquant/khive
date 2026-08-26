@@ -3196,7 +3196,9 @@ mod tests {
     /// response must not be misread as a probe acknowledgement; otherwise a
     /// client whose only interaction with the socket happened to be a
     /// metrics poll would be classified as the same live, identity-matching
-    /// khived.
+    /// khived. This response carries `request_id: None`, so it isolates the
+    /// `metrics.is_none()` conjunct — see the sibling test below for the
+    /// `request_id.is_none()` conjunct.
     #[tokio::test]
     async fn socket_speaks_khived_protocol_rejects_a_metrics_only_response() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3231,7 +3233,56 @@ mod tests {
              a probe acknowledgement"
         );
 
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), accept_task).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), accept_task)
+            .await
+            .expect("fake listener accept task timed out")
+            .expect("fake listener accept task panicked");
+    }
+
+    /// Regression (#2230): sibling of the metrics-only test above, isolating
+    /// the `request_id.is_none()` conjunct. A response with `metrics: None`
+    /// but an echoed `request_id: Some(_)` is otherwise identical to a probe
+    /// acknowledgement and must not be misread as one — a probe frame never
+    /// sets `request_id`, so an echo of one is proof the peer answered a
+    /// different, non-probe request.
+    #[tokio::test]
+    async fn socket_speaks_khived_protocol_rejects_a_response_with_request_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = dir.path().join("request-id.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind fake listener");
+        let accept_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _raw = read_frame(&mut stream).await.expect("read probe frame");
+                let resp = DaemonResponseFrame {
+                    ok: true,
+                    result: None,
+                    error: None,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: Some("expected-config".to_string()),
+                    version_mismatch: false,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    metrics: None,
+                    request_id: Some(42),
+                };
+                let payload = serde_json::to_vec(&resp).expect("encode response");
+                write_frame(&mut stream, &payload)
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        let speaks = socket_speaks_khived_protocol(&sock_path, "expected-config").await;
+        assert!(
+            !speaks,
+            "an otherwise-matching response carrying an echoed request_id must not be treated \
+             as a probe acknowledgement"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), accept_task)
+            .await
+            .expect("fake listener accept task timed out")
+            .expect("fake listener accept task panicked");
     }
 
     #[tokio::test]

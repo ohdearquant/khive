@@ -1152,8 +1152,18 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
             // in handle_conn produces ok=true + result=None + error=None.
             //
             // A normal successful dispatch always sets result=Some(_) (never None).
-            // A normal error dispatch sets ok=false. So the sentinel is unambiguous.
-            let is_probe_ack = resp.ok && resp.result.is_none() && resp.error.is_none();
+            // A normal error dispatch sets ok=false. `metrics_only` produces the
+            // exact same ok=true/result=None/error=None shape but carries
+            // metrics=Some(_); a request that itself echoed a request_id would
+            // carry request_id=Some(_). This probe frame sets neither, so both
+            // must come back None too — otherwise a metrics snapshot or an
+            // echoed request_id from an unrelated exchange would be misread as
+            // this probe's own acknowledgement.
+            let is_probe_ack = resp.ok
+                && resp.result.is_none()
+                && resp.error.is_none()
+                && resp.metrics.is_none()
+                && resp.request_id.is_none();
             if is_probe_ack
                 && !resp.version_mismatch
                 && !resp.namespace_mismatch
@@ -4769,6 +4779,64 @@ mod tests {
                  not None (which would cause silent fallback to local dispatch)"
             ),
         }
+
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── client-side probe rejects a metrics-only response (#2230) ────────────
+    //
+    // The daemon's `metrics_only` arm answers with `ok=true, result=None,
+    // error=None`, every mismatch flag false, the current protocol version,
+    // and a matching `served_config_id` — the exact same shape the probe-ack
+    // arm produces, differing only in carrying `metrics: Some(...)`. A
+    // well-formed metrics snapshot response must not be misread as this
+    // probe's own acknowledgement, or the client would defer to a peer that
+    // never actually answered the identity probe.
+
+    #[tokio::test]
+    #[serial]
+    async fn probe_daemon_identity_rejects_a_metrics_only_response() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake daemon socket");
+
+        let response = DaemonResponseFrame {
+            ok: true,
+            result: None,
+            error: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some(config_id.to_string()),
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: Some(khive_runtime::daemon::MetricsSnapshot::default()),
+            request_id: None,
+        };
+        let fake_handle = tokio::spawn(serve_one_response(listener, response));
+
+        let outcome = probe_daemon_identity(config_id, "test", 2_000).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle)
+            .await
+            .expect("fake daemon listener task timed out")
+            .expect("fake daemon listener task panicked");
+
+        assert!(
+            matches!(outcome, ProbeOutcome::Dead),
+            "an otherwise-matching response carrying a metrics snapshot must not be treated \
+             as a probe acknowledgement; got {outcome:?}"
+        );
 
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
