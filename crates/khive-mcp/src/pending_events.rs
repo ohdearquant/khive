@@ -844,7 +844,9 @@ async fn run_pending_events_on_with_lease(
                         Some(error),
                     );
                     summary.failed += 1;
-                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim).await {
+                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim, None)
+                        .await
+                    {
                         Ok(true) => summary.finalized += 1,
                         Ok(false) => summary.skipped_race += 1,
                         Err(error) => tracing::error!(
@@ -880,7 +882,9 @@ async fn run_pending_events_on_with_lease(
                         updated_at,
                         Some(error),
                     );
-                    match finalize_fired_event(rt, ns_str, id, &props, updated_at, &claim).await {
+                    match finalize_fired_event(rt, ns_str, id, &props, updated_at, &claim, None)
+                        .await
+                    {
                         Ok(true) => summary.finalized += 1,
                         Ok(false) => tracing::error!(
                             scheduled_event_id = %id,
@@ -933,7 +937,9 @@ async fn run_pending_events_on_with_lease(
                         None,
                     );
 
-                    match finalize_fired_event(rt, ns_str, id, &props, updated_at, &claim).await {
+                    match finalize_fired_event(rt, ns_str, id, &props, updated_at, &claim, None)
+                        .await
+                    {
                         Ok(true) => {
                             summary.missed.push(id);
                             summary.finalized += 1;
@@ -990,7 +996,9 @@ async fn run_pending_events_on_with_lease(
                         Some(error),
                     );
                     summary.failed += 1;
-                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim).await {
+                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim, None)
+                        .await
+                    {
                         Ok(true) => summary.finalized += 1,
                         Ok(false) => summary.skipped_race += 1,
                         Err(error) => tracing::error!(
@@ -1018,7 +1026,9 @@ async fn run_pending_events_on_with_lease(
                         Some(error),
                     );
                     summary.failed += 1;
-                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim).await {
+                    match finalize_fired_event(rt, ns_str, id, &props, completed_at, &claim, None)
+                        .await
+                    {
                         Ok(true) => summary.finalized += 1,
                         Ok(false) => summary.skipped_race += 1,
                         Err(error) => tracing::error!(
@@ -1110,6 +1120,33 @@ async fn run_pending_events_on_with_lease(
                         .await;
                     }
                 }
+                // Re-read the row's CURRENT properties immediately before
+                // finalizing, and guard the terminal write on exact equality
+                // to that read (mirroring `finalize_corrupt_receipt`'s
+                // `selected_properties` guard, #7 in the RMW census). Dispatch
+                // may have run for an arbitrary duration and this same process
+                // may have renewed the lease meanwhile, so the pre-dispatch
+                // `properties` snapshot captured at claim time is expected to
+                // have moved; only a read taken right here — after this
+                // process's own intervening writes have already landed —
+                // can distinguish "nothing else touched this row since I last
+                // looked" from a genuine concurrent writer.
+                let expected_properties = match current_note_properties_text(rt, ns_str, id).await {
+                    Ok(Some(text)) => text,
+                    Ok(None) => {
+                        summary.failed += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            scheduled_event_id = %id,
+                            error = %error,
+                            "pending-events: could not read current properties before finalization"
+                        );
+                        summary.failed += 1;
+                        continue;
+                    }
+                };
                 let (final_props, disposition) = final_properties_after_dispatch(
                     properties.clone().unwrap_or_else(|| json!({})),
                     receipt,
@@ -1125,6 +1162,7 @@ async fn run_pending_events_on_with_lease(
                     &final_props,
                     Utc::now().timestamp_micros(),
                     &claim,
+                    Some(&expected_properties),
                 )
                 .await
                 {
@@ -2102,6 +2140,50 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, now_micros: i64) -> Resu
     Ok(summary)
 }
 
+/// Read a `scheduled_event` note's CURRENT `properties` column, verbatim as
+/// stored (no round-trip through `serde_json` re-serialization), so a caller
+/// can use the exact byte string as an exact-equality CAS guard on a later
+/// write. Returns `Ok(None)` when the row is absent, soft-deleted, or no
+/// longer a `scheduled_event` note.
+async fn current_note_properties_text(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    id: uuid::Uuid,
+) -> Result<Option<String>> {
+    let mut reader = rt
+        .sql()
+        .reader()
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: open SQL reader: {e}"))?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT properties FROM notes \
+                  WHERE id = ?1 AND namespace = ?2 AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+            ],
+            label: Some("pending_events_current_properties".into()),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: read current properties: {e}"))?;
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => match row.get("properties") {
+            Some(SqlValue::Text(value)) => Ok(Some(value.clone())),
+            Some(SqlValue::Null) | None => Ok(None),
+            other => Err(anyhow::anyhow!(
+                "pending-events: unexpected properties column shape: {other:?}"
+            )),
+        },
+        _ => Err(anyhow::anyhow!(
+            "pending-events: multiple rows for scheduled_event {id}"
+        )),
+    }
+}
+
 /// CAS-persist the post-drain state of a claimed event: `firing -> {fired |
 /// pending | missed | failed}` (`pending` is an advanced repeat; `failed` is
 /// the unattributed-generic-action policy state). `claimed_firing_at` is
@@ -2110,6 +2192,16 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, now_micros: i64) -> Resu
 /// Clears `firing_at` on the terminal write. Returns
 /// `Ok(true)` iff exactly one row was updated. See
 /// `crates/khive-mcp/docs/api/pending-events.md`.
+/// Bundles `finalize_firing_event`'s two independent CAS guard inputs — the
+/// recovery-only legacy-stale timing predicate and the exact-properties
+/// equality predicate any caller may supply — into one parameter so the
+/// function stays under clippy's argument-count lint.
+#[derive(Clone, Copy, Default)]
+struct FinalizeGuard<'a> {
+    expired_at: Option<i64>,
+    expected_properties: Option<&'a str>,
+}
+
 async fn finalize_fired_event(
     rt: &KhiveRuntime,
     namespace: &str,
@@ -2117,8 +2209,21 @@ async fn finalize_fired_event(
     properties: &Value,
     updated_at: i64,
     claim: &DispatchClaim,
+    expected_properties: Option<&str>,
 ) -> Result<bool> {
-    finalize_firing_event(rt, namespace, id, properties, updated_at, claim, None).await
+    finalize_firing_event(
+        rt,
+        namespace,
+        id,
+        properties,
+        updated_at,
+        claim,
+        FinalizeGuard {
+            expired_at: None,
+            expected_properties,
+        },
+    )
+    .await
 }
 
 /// Finalize a row selected by the expired-lease recovery pass, but only while
@@ -2141,7 +2246,10 @@ async fn finalize_expired_firing_event(
         properties,
         updated_at,
         claim,
-        Some(snapshot),
+        FinalizeGuard {
+            expired_at: Some(snapshot.expired_at),
+            expected_properties: Some(snapshot.properties),
+        },
     )
     .await
 }
@@ -2153,9 +2261,12 @@ async fn finalize_firing_event(
     properties: &Value,
     updated_at: i64,
     claim: &DispatchClaim,
-    snapshot: Option<RecoverySnapshot<'_>>,
+    guard: FinalizeGuard<'_>,
 ) -> Result<bool> {
-    let expired_at = snapshot.map(|value| value.expired_at);
+    let FinalizeGuard {
+        expired_at,
+        expected_properties,
+    } = guard;
     let legacy_stale_before =
         expired_at.map(|value| value.saturating_sub(LEGACY_STALE_FIRING_TIMEOUT_MICROS));
     let mut properties = properties.clone();
@@ -2202,9 +2313,7 @@ async fn finalize_firing_event(
                 SqlValue::Text(claim.invocation_id.to_string()),
                 expired_at.map_or(SqlValue::Null, SqlValue::Integer),
                 legacy_stale_before.map_or(SqlValue::Null, SqlValue::Integer),
-                snapshot.map_or(SqlValue::Null, |value| {
-                    SqlValue::Text(value.properties.to_string())
-                }),
+                expected_properties.map_or(SqlValue::Null, |value| SqlValue::Text(value.to_string())),
             ],
             label: Some("pending_events_finalize_fired".into()),
         })
@@ -5075,6 +5184,7 @@ mod tests {
             &final_properties,
             Utc::now().timestamp_micros(),
             &claim,
+            None,
         )
         .await
         .expect("live owner finalizes"));
@@ -5718,6 +5828,7 @@ mod tests {
             }),
             Utc::now().timestamp_micros(),
             &claim,
+            None,
         )
         .await
         .expect("finalize query");
@@ -5925,6 +6036,7 @@ mod tests {
             }),
             Utc::now().timestamp_micros(),
             &a_claim,
+            None,
         )
         .await
         .expect("finalize query must not error");
@@ -5964,6 +6076,7 @@ mod tests {
             }),
             Utc::now().timestamp_micros(),
             &b_claim,
+            None,
         )
         .await
         .expect("finalize query must not error");
@@ -5981,6 +6094,115 @@ mod tests {
         assert!(
             final_props.get("firing_at").is_none() || final_props["firing_at"].is_null(),
             "firing_at must be cleared on terminal finalize, got {final_props:?}"
+        );
+    }
+
+    /// Regression for the normal-finalization lost-update race (khive #1753).
+    /// `finalize_fired_event` reads the row's CURRENT properties immediately
+    /// before finalizing (see the call site above `final_properties_after_dispatch`
+    /// in the main drain loop) and must refuse the terminal write if a
+    /// concurrent writer changed properties since that read, even though the
+    /// claim tokens (`firing_at`/`invocation_id`/lease) are still valid —
+    /// those predicates alone do not detect an out-of-band property change.
+    /// This deterministically reproduces "two reads from one revision": the
+    /// snapshot captured here (`expected_properties`) is used for the stale
+    /// finalize attempt AFTER a concurrent write has already landed, so the
+    /// exact-equality predicate must fail. Before threading a real snapshot
+    /// through, normal finalization always called with `snapshot=None`,
+    /// which makes `AND (?9 IS NULL OR properties = ?9)` unconditionally
+    /// true — this test reddens if that call reverts to `None`: the stale
+    /// finalize would then succeed and the concurrent writer's
+    /// `concurrent_marker` field would be silently discarded.
+    #[tokio::test]
+    async fn normal_finalize_refuses_when_a_concurrent_writer_changed_properties_since_the_read() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let past = "2000-01-01T00:00:00Z";
+        let id =
+            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+        let claim = claim_for_test(&rt, id, past).await;
+
+        // The finalizer's fresh pre-write read (what `current_note_properties_text`
+        // returns right before finalizing in production).
+        let expected_properties = get_raw_note_properties(&rt, id).await;
+
+        // A concurrent writer mutates the row AFTER that read while leaving
+        // every claim predicate (status/firing_at/invocation_id/lease)
+        // valid — e.g. an external property patch racing the finalizer.
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = json_set(properties, \
+                      '$.concurrent_marker', 'yes') WHERE id = ?1"
+                    .to_string(),
+                params: vec![SqlValue::Text(id.to_string())],
+                label: Some("test_concurrent_property_write".into()),
+            })
+            .await
+            .expect("concurrent write");
+        assert_eq!(rows, 1);
+        drop(writer);
+
+        let final_props = json!({
+            "trigger_at": past,
+            "repeat": null,
+            "status": "fired",
+            "event_type": "schedule",
+            "payload": "stats()",
+            "fired_at": Utc::now().to_rfc3339(),
+            "cancelled_at": null,
+        });
+        let finalized = finalize_fired_event(
+            &rt,
+            "local",
+            id,
+            &final_props,
+            Utc::now().timestamp_micros(),
+            &claim,
+            Some(&expected_properties),
+        )
+        .await
+        .expect("finalize query must not error");
+        assert!(
+            !finalized,
+            "finalize must refuse a terminal write when properties changed since the read it guards on"
+        );
+
+        let props_after = get_note_props(&rt, id).await;
+        assert_eq!(
+            props_after["status"].as_str(),
+            Some("firing"),
+            "the row must remain firing, not silently finalized over the concurrent writer's \
+             change: {props_after:?}"
+        );
+        assert_eq!(
+            props_after["concurrent_marker"].as_str(),
+            Some("yes"),
+            "the concurrent writer's field must survive the refused finalize: {props_after:?}"
+        );
+
+        // A finalize guarded on the CURRENT properties (as the real drain
+        // loop does, re-reading right before this call) must still succeed.
+        let fresh_properties = get_raw_note_properties(&rt, id).await;
+        let finalized_fresh = finalize_fired_event(
+            &rt,
+            "local",
+            id,
+            &final_props,
+            Utc::now().timestamp_micros(),
+            &claim,
+            Some(&fresh_properties),
+        )
+        .await
+        .expect("finalize query must not error");
+        assert!(
+            finalized_fresh,
+            "finalize with a fresh snapshot must succeed"
+        );
+        assert_eq!(
+            get_note_props(&rt, id).await["status"].as_str(),
+            Some("fired")
         );
     }
 
