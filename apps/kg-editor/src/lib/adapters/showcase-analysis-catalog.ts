@@ -154,8 +154,13 @@ export function mergeShowcaseRegistry(
   catalog: readonly ShowcaseAnalysisCatalogEntry[],
   staticRegistry: readonly ShowcaseRegistryEntry[] = SHOWCASE_REGISTRY,
 ): readonly ShowcaseRegistryEntry[] {
+  // Catalog analysis IDs are authoritative for lookup: any static alias that
+  // collides with a claimed ID is dropped so first-match-wins resolution can
+  // reach the catalog's entry.
+  const catalogClaimedIds = new Set(catalog.map((entry) => entry.analysis_id));
   const merged: ShowcaseRegistryEntry[] = staticRegistry.map((entry) => ({
     ...entry,
+    aliases: entry.aliases.filter((alias) => !catalogClaimedIds.has(alias)),
     analysisId: undefined,
   }));
   const staticByUrl = new Map<string, number>();
@@ -183,7 +188,6 @@ export function mergeShowcaseRegistry(
       analysisId: entry.analysis_id,
     });
   }
-  const catalogClaimedIds = new Set(catalog.map((entry) => entry.analysis_id));
   for (const [index, staticEntry] of staticRegistry.entries()) {
     const entry = merged[index];
     const legacyId = staticEntry.analysisId;

@@ -278,6 +278,29 @@ describe("showcase analysis catalog", () => {
     );
   });
 
+  it("strips a catalog-claimed ID from another static entry's pre-existing aliases", () => {
+    const earlierEntry: ShowcaseRegistryEntry = {
+      id: "github.com/example/earlier",
+      canonicalUrl: "https://github.com/example/earlier",
+      aliases: ["legacy-static-id", "https://github.com/example/earlier"],
+      assetPath: "/showcase/earlier.json",
+      analysisId: undefined,
+    };
+    const merged = mergeShowcaseRegistry([
+      {
+        analysis_id: "legacy-static-id",
+        canonical_url: "https://github.com/example/other",
+      },
+    ], [earlierEntry, staticEntry]);
+
+    expect(merged[0]?.aliases).not.toContain("legacy-static-id");
+    const lookup = resolveShowcaseRepository("legacy-static-id", merged);
+    expect(lookup.status).toBe("hit");
+    expect(lookup.status === "hit" && lookup.entry.id).toBe(
+      "analysis:legacy-static-id",
+    );
+  });
+
   it("keeps the legacy static ID as an alias when the catalog renames the same repository", () => {
     const merged = mergeShowcaseRegistry([
       {
