@@ -1067,6 +1067,37 @@ fn acquire_database_gc_lock(database_path: Option<&Path>) -> StorageResult<Optio
     Ok(Some(lock_file))
 }
 
+#[cfg(all(unix, target_os = "macos"))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: `__error` returns this thread's errno cell; obtaining the
+    // pointer has no preconditions beyond running on a thread, which every
+    // caller here does.
+    unsafe { libc::__error() }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: see the macOS arm above; `__errno_location` is the Linux/glibc
+    // equivalent thread-local errno accessor.
+    unsafe { libc::__errno_location() }
+}
+
+/// Zero `errno` on the current thread. `readdir` never clears `errno` itself
+/// on success, so this must run immediately before each call for the
+/// NULL-return ambiguity below to be resolvable afterward.
+#[cfg(unix)]
+fn clear_errno() {
+    // SAFETY: `errno_location` returns a valid, live thread-local `c_int`
+    // cell for the duration of this call.
+    unsafe { *errno_location() = 0 };
+}
+
+#[cfg(unix)]
+fn current_errno() -> libc::c_int {
+    // SAFETY: see `clear_errno`.
+    unsafe { *errno_location() }
+}
+
 /// List non-dot entry names of an open directory descriptor via `fdopendir`
 /// on an INDEPENDENTLY reopened fd for the same directory (`openat(dir_fd,
 /// ".", O_NOFOLLOW)`, never `dup(dir_fd)`) — the caller's descriptor stays
@@ -1080,6 +1111,17 @@ fn acquire_database_gc_lock(database_path: Option<&Path>) -> StorageResult<Optio
 /// description, so this listing never perturbs the position of `dir_fd`
 /// itself. `.`/`..` are excluded so a handle-relative walk built on this can
 /// never step to a directory's parent or re-enter itself.
+///
+/// `readdir`'s NULL return is POSIX-ambiguous between end-of-stream and a
+/// read error, distinguished only by `errno`: EOF leaves it unchanged (`0`,
+/// since this loop always clears it first), an error sets it non-zero. This
+/// walk clears `errno` before every `readdir` call and checks it on a NULL
+/// return, so a mid-stream read error is reported as `Err` instead of
+/// silently truncating the listing as if the stream had simply ended — the
+/// distinction `transactional_orphan_sweep`'s candidate walk depends on to
+/// avoid treating a partial, error-truncated scan as a complete one. The
+/// `DIR*` stream is closed exactly once on every return path (`Ok`, the
+/// mid-stream error path, and the pre-loop `fdopendir` failure).
 #[cfg(unix)]
 fn read_dir_names_no_follow(dir_fd: std::os::unix::io::RawFd) -> std::io::Result<Vec<String>> {
     use std::os::unix::io::IntoRawFd;
@@ -1100,9 +1142,20 @@ fn read_dir_names_no_follow(dir_fd: std::os::unix::io::RawFd) -> std::io::Result
     }
     let mut names = Vec::new();
     loop {
+        // `readdir` leaves `errno` untouched on EOF; clearing it here is
+        // what makes that observable as distinct from an error below.
+        clear_errno();
         // SAFETY: `dirp` is a valid, open `DIR*` for this whole loop.
         let entry = unsafe { libc::readdir(dirp) };
         if entry.is_null() {
+            if current_errno() != 0 {
+                let err = std::io::Error::last_os_error();
+                // SAFETY: `dirp` is still open and owned by this call; this
+                // is the one closedir on the error path, matching the one
+                // closedir on the `Ok` path below.
+                unsafe { libc::closedir(dirp) };
+                return Err(err);
+            }
             break;
         }
         // SAFETY: `d_name` is NUL-terminated, so its first byte is always
@@ -1145,6 +1198,10 @@ fn read_dir_names_no_follow(dir_fd: std::os::unix::io::RawFd) -> std::io::Result
 #[cfg(unix)]
 fn walk_blob_files_from_root_handle(
     root_handle: &std::fs::File,
+    // Only used under `#[cfg(test)]`, to key `walk_leaf_sync_hook` by this
+    // walk's canonical root; underscore-prefixed so non-test builds don't
+    // warn on the unused parameter.
+    _root: &Path,
 ) -> std::io::Result<Vec<(ContentRef, Option<SystemTime>)>> {
     use std::os::unix::io::AsRawFd;
 
@@ -1166,7 +1223,7 @@ fn walk_blob_files_from_root_handle(
                     continue;
                 };
                 #[cfg(test)]
-                if let Some(hook) = walk_leaf_sync_hook::take() {
+                if let Some(hook) = walk_leaf_sync_hook::take(_root) {
                     let _ = hook.reached.send(());
                     let _ = hook.release.recv();
                 }
@@ -1196,6 +1253,7 @@ fn walk_blob_files_from_root_handle(
 #[cfg(not(unix))]
 fn walk_blob_files_from_root_handle(
     _root_handle: &std::fs::File,
+    _root: &Path,
 ) -> std::io::Result<Vec<(ContentRef, Option<SystemTime>)>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -2598,7 +2656,7 @@ impl BlobStore for FsBlobStore {
             let canonical_root = scan_root;
             let root_write_guard =
                 acquire_root_write_lock_anchored(&canonical_root, &scan_root_handle)?;
-            let candidates = walk_blob_files_from_root_handle(&scan_root_handle)
+            let candidates = walk_blob_files_from_root_handle(&scan_root_handle, &canonical_root)
                 .map_err(|e| map_io_err(e, "transactional_orphan_sweep_walk"))?;
             verify_blob_root_identity(&canonical_root, &scan_root_handle)
                 .map_err(|e| map_io_err(e, "transactional_orphan_sweep_root"))?;
@@ -2815,15 +2873,25 @@ mod sync_hook {
     }
 }
 
-/// Test-only, single-slot (not path-keyed) pause fired the next time the
-/// orphan-sweep walk is about to open a leaf candidate file in
-/// `walk_blob_files_from_root_handle`. Lets a test replace that exact
-/// on-disk leaf entry with a symlink to an outside decoy between candidate
-/// discovery and the handle-relative open/fstat that classifies it, proving
-/// the classification stays anchored to the opened handle rather than
-/// re-resolving a path.
+/// Test-only pause fired the next time the orphan-sweep walk is about to
+/// open a leaf candidate file in `walk_blob_files_from_root_handle`. Lets a
+/// test replace that exact on-disk leaf entry with a symlink to an outside
+/// decoy between candidate discovery and the handle-relative open/fstat that
+/// classifies it, proving the classification stays anchored to the opened
+/// handle rather than re-resolving a path.
+///
+/// Keyed by the walking store's canonical root path (`entry`/`take` mirror
+/// `sync_hook` above), not a single process-wide slot: a process-wide slot
+/// is stealable by ANY other sweep walk that reaches a valid leaf while
+/// running concurrently in the same test binary (the crate's default
+/// parallel test runner interleaves `#[tokio::test]` functions), which made
+/// the swap regression test flaky under that interleaving. Each test in this
+/// module sweeps its own tempdir root, so keying by canonical root gives
+/// each test's hook install/take pair exclusive use of its own slot.
 #[cfg(test)]
 mod walk_leaf_sync_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc::{Receiver, Sender};
     use std::sync::{Mutex as StdMutex, OnceLock};
 
@@ -2832,28 +2900,38 @@ mod walk_leaf_sync_hook {
         pub(super) release: Receiver<()>,
     }
 
-    fn slot() -> &'static StdMutex<Option<Hook>> {
-        static SLOT: OnceLock<StdMutex<Option<Hook>>> = OnceLock::new();
-        SLOT.get_or_init(|| StdMutex::new(None))
+    fn registry() -> &'static StdMutex<HashMap<PathBuf, Hook>> {
+        static REGISTRY: OnceLock<StdMutex<HashMap<PathBuf, Hook>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
     }
 
-    pub(super) fn install() -> (Receiver<()>, Sender<()>) {
+    pub(super) fn install(root: &Path) -> (Receiver<()>, Sender<()>) {
+        let canonical = root
+            .canonicalize()
+            .expect("root must exist before installing a walk_leaf_sync_hook");
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        *slot()
+        registry()
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Hook {
-            reached: reached_tx,
-            release: release_rx,
-        });
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                canonical,
+                Hook {
+                    reached: reached_tx,
+                    release: release_rx,
+                },
+            );
         (reached_rx, release_tx)
     }
 
-    pub(super) fn take() -> Option<Hook> {
-        slot()
+    /// `root` need not be pre-canonicalized by the caller -- both `install`
+    /// and `take` canonicalize.
+    pub(super) fn take(root: &Path) -> Option<Hook> {
+        let canonical = root.canonicalize().ok()?;
+        registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+            .remove(&canonical)
     }
 }
 
@@ -6259,7 +6337,7 @@ mod tests {
             .set_modified(ancient)
             .unwrap();
 
-        let (reached, release) = walk_leaf_sync_hook::install();
+        let (reached, release) = walk_leaf_sync_hook::install(&root);
         let sweep = {
             let store = store.clone();
             let sql = backend.sql();
