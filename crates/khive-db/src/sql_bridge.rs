@@ -772,15 +772,32 @@ fn map_rusqlite_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Sql, op, e)
 }
 
+/// How an elapsed handle-slot deadline is classified. ADR-005 pins the
+/// raw-SQL reader admission paths (`sql_bridge.reader_open` and
+/// `sql_bridge.reader_operation`) to `StorageError::Timeout`; every other
+/// handle slot reports the typed `AdmissionTimeout`.
+#[derive(Clone, Copy)]
+enum SlotTimeoutClass {
+    Admission,
+    ReaderContract,
+}
+
 async fn acquire_handle_slot(
     slots: Arc<Semaphore>,
     timeout: std::time::Duration,
     operation: &'static str,
+    class: SlotTimeoutClass,
 ) -> Result<OwnedSemaphorePermit, StorageError> {
     tokio::time::timeout(timeout, slots.acquire_owned())
         .await
-        .map_err(|_| StorageError::Timeout {
-            operation: operation.into(),
+        .map_err(|_| match class {
+            SlotTimeoutClass::Admission => StorageError::AdmissionTimeout {
+                operation: operation.into(),
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            },
+            SlotTimeoutClass::ReaderContract => StorageError::Timeout {
+                operation: operation.into(),
+            },
         })?
         .map_err(|error| StorageError::Pool {
             operation: operation.into(),
@@ -920,6 +937,7 @@ async fn open_cached_reader_handle(
             pool.sql_bridge_reader_slots(),
             pool.config().checkout_timeout,
             "sql_bridge.reader_open",
+            SlotTimeoutClass::ReaderContract,
         ),
     )
     .await??;
@@ -991,6 +1009,7 @@ where
                 pool.sql_bridge_reader_slots(),
                 pool.config().checkout_timeout,
                 "sql_bridge.reader_operation",
+                SlotTimeoutClass::ReaderContract,
             )
             .await?,
         )
@@ -1002,6 +1021,7 @@ where
                     pool.sql_bridge_reader_slots(),
                     pool.config().checkout_timeout,
                     "sql_bridge.reader_operation",
+                    SlotTimeoutClass::ReaderContract,
                 ),
             )
             .await??,
@@ -1774,14 +1794,14 @@ where
         StorageCapability::Sql,
         operation,
         move |scope| {
-            let mut guard = pool
-                .reader_until(|| scope.should_stop())
-                .map_err(|error| {
-                    StorageError::driver(StorageCapability::Sql, "pool_reader", error)
-                })?
-                .ok_or_else(|| StorageError::Timeout {
-                    operation: operation.into(),
-                })?;
+            // Checkout tri-state (cancelled -> Timeout, admission expiry ->
+            // retryable AdmissionTimeout, other -> Driver) lives in ONE place:
+            // `ConnectionPool::resolve_reader_checkout`.
+            let mut guard = pool.resolve_reader_checkout(
+                StorageCapability::Sql,
+                operation,
+                pool.reader_until(|| scope.should_stop()),
+            )?;
             scope.with_pooled_reader(&mut guard, |conn| query(scope, conn))
         },
     )
@@ -2432,6 +2452,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                     self.pool.sql_bridge_writer_slots(),
                     self.pool.config().checkout_timeout,
                     "sql_bridge.writer_handle",
+                    SlotTimeoutClass::Admission,
                 )
                 .await?;
                 let (conn, handle_slot) =
@@ -2533,7 +2554,7 @@ impl khive_storage::SqlAccess for SqlBridge {
             // Contract: this acquire waits on the pool-wide one-permit
             // writer-handle budget — the same permit a live `writer()` handle
             // holds for its lifetime — so it times out with
-            // `StorageError::Timeout` after `checkout_timeout` while a writer
+            // `StorageError::AdmissionTimeout` after `checkout_timeout` while a writer
             // handle is checked out (and a `writer()` call times out while
             // this unit runs). Callers must not hold a boxed writer handle
             // across an `atomic_unit()` call on the same pool; drop the
@@ -2543,6 +2564,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 self.pool.sql_bridge_writer_slots(),
                 self.pool.config().checkout_timeout,
                 "sql_bridge.atomic_unit_handle",
+                SlotTimeoutClass::Admission,
             )
             .await?;
             let (conn, handle_slot) =
@@ -2726,6 +2748,9 @@ mod tests {
             .await
             .expect("cancelled reader checkout waited for the five-second pool timeout")
             .expect("checkout task panicked");
+        // Cancellation is NOT an admission wait: it must stay the non-admission
+        // Timeout, never the retryable AdmissionTimeout, so a cancelled request
+        // does not signal clients to retry into a saturated pool.
         assert!(matches!(result, Err(StorageError::Timeout { .. })));
 
         drop(held_reader);
@@ -2742,6 +2767,58 @@ mod tests {
             value, 0,
             "a DML statement started after its pre-admission checkout was cancelled"
         );
+        assert_eq!(
+            pool.available_readers(),
+            1,
+            "reader checkout leaked a permit"
+        );
+    }
+
+    /// A pooled-reader checkout that exhausts `checkout_timeout` WITHOUT any
+    /// cancellation is a genuine admission wait and must surface as the
+    /// retryable AdmissionTimeout. Before the fix, `reader_until`'s
+    /// pool-exhausted error was mapped to `StorageError::Driver`, so a
+    /// saturated pooled read stayed a non-retryable driver failure and the new
+    /// AdmissionTimeout branch (reachable only for `Ok(None)` cancellation) was
+    /// dead for real timeouts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_reader_checkout_timeout_is_a_retryable_admission_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_reader_admission_timeout.db")),
+            max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(200),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE reader_admission_probe(value INTEGER NOT NULL); \
+                 INSERT INTO reader_admission_probe VALUES (0);",
+            )
+            .unwrap();
+        // Hold the sole pooled reader so the contending checkout cannot succeed
+        // and must run `checkout_timeout` to exhaustion — no cancellation.
+        let held_reader = pool.reader().expect("hold the sole pooled reader");
+
+        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+        let mut contender = bridge.reader().await.unwrap();
+        let blocked = contender
+            .query_row(SqlStatement {
+                sql: "SELECT value FROM reader_admission_probe".into(),
+                params: vec![],
+                label: Some("reader-admission-timeout-probe".into()),
+            })
+            .await;
+        assert!(
+            matches!(blocked, Err(StorageError::AdmissionTimeout { .. })),
+            "an exhausted pooled-reader checkout must be a retryable AdmissionTimeout; got {blocked:?}"
+        );
+
+        drop(held_reader);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         assert_eq!(
             pool.available_readers(),
             1,
@@ -3366,7 +3443,7 @@ mod tests {
         };
         assert!(matches!(
             writer_error,
-            StorageError::Timeout { ref operation }
+            StorageError::AdmissionTimeout { ref operation, .. }
                 if operation.as_ref() == "sql_bridge.writer_handle"
         ));
         drop(writer);
@@ -3452,7 +3529,8 @@ mod tests {
                 Err(StorageError::Timeout { operation })
                     if operation.as_ref() == "sql_bridge.reader_operation"
             ),
-            "a second logical read must contend with the admitted transaction; got {blocked:?}"
+            "a second logical read must contend with the admitted transaction \
+             and time out with the ADR-005 reader contract error; got {blocked:?}"
         );
 
         reader
@@ -4816,7 +4894,7 @@ mod tests {
         let contender = bridge.writer().await;
         let retained_slot = matches!(
             &contender,
-            Err(StorageError::Timeout { operation })
+            Err(StorageError::AdmissionTimeout { operation, .. })
                 if operation.as_ref() == "sql_bridge.writer_handle"
         );
         drop(contender);
@@ -4960,6 +5038,7 @@ mod tests {
             pool.sql_bridge_writer_slots(),
             pool.config().checkout_timeout,
             "sql_bridge.writer_handle",
+            SlotTimeoutClass::Admission,
         )
         .await
         .unwrap();
@@ -5052,6 +5131,7 @@ mod tests {
             pool.sql_bridge_writer_slots(),
             pool.config().checkout_timeout,
             "sql_bridge.writer_handle",
+            SlotTimeoutClass::Admission,
         )
         .await
         .unwrap();
@@ -5626,6 +5706,7 @@ mod tests {
             pool.sql_bridge_writer_slots(),
             pool.config().checkout_timeout,
             "sql_bridge.writer_handle",
+            SlotTimeoutClass::Admission,
         )
         .await
         .unwrap();
@@ -5724,6 +5805,7 @@ mod tests {
             pool.sql_bridge_writer_slots(),
             pool.config().checkout_timeout,
             "sql_bridge.writer_handle",
+            SlotTimeoutClass::Admission,
         )
         .await
         .unwrap();
@@ -5826,6 +5908,7 @@ mod tests {
             pool.sql_bridge_writer_slots(),
             pool.config().checkout_timeout,
             "sql_bridge.writer_handle",
+            SlotTimeoutClass::Admission,
         )
         .await
         .unwrap();
@@ -5927,7 +6010,7 @@ mod tests {
         assert!(
             matches!(
                 &blocked,
-                Err(StorageError::Timeout { operation })
+                Err(StorageError::AdmissionTimeout { operation, .. })
                     if operation.as_ref() == "sql_bridge.atomic_unit_handle"
             ),
             "atomic_unit must time out on the shared writer permit while a \
@@ -6391,7 +6474,8 @@ mod tests {
                     if operation.as_ref() == "sql_bridge.reader_open"
             ),
             "queue-backed read with reader permits saturated must time out \
-             on the reader budget; got {starved:?}"
+             on the reader budget with the ADR-005 reader contract error; \
+             got {starved:?}"
         );
         drop(held);
 
