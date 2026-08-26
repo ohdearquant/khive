@@ -843,6 +843,63 @@ describe("repository showcase", () => {
     expect(weekTicks.every((tick) => tick.textContent?.trim())).toBe(true);
   });
 
+  it("renders data states instead of invented chart scales for empty pages", async () => {
+    const bundle = structuredClone(golden());
+    const emptyPage = {
+      items: [],
+      total_count: { status: "available", value: 0 },
+      bound: { kind: "all", max_items: 50000, order: "fixture" },
+      truncated: false,
+      disclosure: { status: "complete" },
+    };
+    bundle.aggregates.hotspot_quadrant.data = structuredClone(emptyPage) as never;
+    bundle.aggregates.cadence_timeline.commits = structuredClone(emptyPage) as never;
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(container.querySelector('[data-view-id="hotspot_quadrant"]')!);
+    expect(container.querySelector('svg[data-visualization="hotspot"]')).toBeNull();
+    expect(screen.getAllByText(/No .* rows/).length).toBeGreaterThan(0);
+
+    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+    expect(container.querySelector('svg[data-visualization="cadence"]')).toBeNull();
+  });
+
+  it("renders data states instead of invented chart scales for unavailable pages", async () => {
+    const bundle = structuredClone(golden());
+    const unavailablePage = {
+      items: [],
+      total_count: { status: "unavailable", reason: "fixture omitted" },
+      bound: { kind: "all", max_items: 50000, order: "fixture" },
+      truncated: false,
+      disclosure: { status: "unavailable", reason: "fixture omitted" },
+    };
+    bundle.aggregates.hotspot_quadrant.data = structuredClone(unavailablePage) as never;
+    bundle.aggregates.cadence_timeline.commits = structuredClone(unavailablePage) as never;
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(container.querySelector('[data-view-id="hotspot_quadrant"]')!);
+    expect(container.querySelector('svg[data-visualization="hotspot"]')).toBeNull();
+
+    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+    expect(container.querySelector('svg[data-visualization="cadence"]')).toBeNull();
+  });
+
+  it("falls back to the raw week value for schema-shaped but invalid dates", async () => {
+    const bundle = structuredClone(golden());
+    bundle.aggregates.cadence_timeline.commits.items[0].week_start = "2026-99-99";
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+    const firstTick = container.querySelector<SVGTextElement>(
+      '[data-axis-tick="cadence-week"]',
+    );
+    expect(firstTick).toHaveAttribute("data-axis-value", "2026-99-99");
+    expect(firstTick?.textContent).toBe("2026-99-99");
+  });
+
   it("surfaces a section's own truncation disclosure", () => {
     const bundle = structuredClone(golden());
     bundle.graph.modules.truncated = true;

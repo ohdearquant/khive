@@ -109,11 +109,18 @@ function formatDate(value: string): string {
 }
 
 function formatWeekTick(value: string): string {
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) {
+    // The schema constrains week_start by regex shape only, so a
+    // non-calendar date can arrive here; show the raw value instead of
+    // letting Intl throw on an Invalid Date.
+    return value;
+  }
   return new Intl.DateTimeFormat("en", {
     month: "short",
     day: "numeric",
     timeZone: "UTC",
-  }).format(new Date(`${value}T00:00:00Z`));
+  }).format(parsed);
 }
 
 function chartTicks(max: number): number[] {
@@ -1137,7 +1144,7 @@ function DependencyTopology({ bundle, moduleById, selectedModuleId, onInspectMod
   );
 }
 
-function HotspotQuadrantView({ bundle, moduleById, selectedModuleId, onInspectModule }: ViewProps) {
+function HotspotQuadrantView({ bundle, moduleById, selectedModuleId, onInspectModule, onExploreStructure }: ViewProps) {
   const analysis = bundle.aggregates.hotspot_quadrant;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
@@ -1146,10 +1153,19 @@ function HotspotQuadrantView({ bundle, moduleById, selectedModuleId, onInspectMo
   const xTicks = chartTicks(maxFanIn);
   const yTicks = chartTicks(maxChanges);
   const plot = { left: 14, right: 94, top: 6, bottom: 56 };
+  const viewLabel = bundle.capability.views.hotspot_quadrant.label;
+  // An unavailable or known-empty page has no measured values, so an axis
+  // scale would be invented (the domain fallback is 1): render the data
+  // state instead of an empty plot (ADR-147 absence rule).
+  const chartState = analysis.data.disclosure.status === "unavailable"
+    ? <DataState className="repo-empty" state="unavailable" title={`${viewLabel} ${labels.unavailable.toLocaleLowerCase()}`} message={analysis.data.disclosure.reason ?? "This bundle does not claim hotspot data."} />
+    : isKnownEmptyRepoPage(analysis.data)
+      ? <DataState className="repo-empty" state="empty" title={`No ${viewLabel.toLocaleLowerCase()} rows`} message="Captured module churn and fan-in measurements belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
+      : null;
   return (
     <div className="repo-view-body repo-grid">
       <div className="repo-chart">
-        <svg data-visualization="hotspot" viewBox="0 0 100 70" role="img" aria-labelledby="hotspot-title hotspot-desc">
+        {chartState ?? <svg data-visualization="hotspot" viewBox="0 0 100 70" role="img" aria-labelledby="hotspot-title hotspot-desc">
           <title id="hotspot-title">{bundle.capability.views.hotspot_quadrant.label}</title>
           <desc id="hotspot-desc">{analysis.meta.inputs.join(", ")}</desc>
           {xTicks.map((tick) => {
@@ -1167,7 +1183,7 @@ function HotspotQuadrantView({ bundle, moduleById, selectedModuleId, onInspectMo
             const y = plot.bottom - (row.commit_count / maxChanges) * (plot.bottom - plot.top);
             return <circle key={row.module_id} className={`repo-chart-dot ${row.quadrant === "high_churn_high_fan_in" ? "hot" : ""}`} cx={x} cy={y} r="2.3"><title>{moduleName(moduleById, row.module_id)} · {labels.metrics.change_frequency}: {row.commit_count} · {labels.metrics.fan_in}: {row.fan_in} · {labels.hotspot_quadrants[row.quadrant]}</title></circle>;
           })}
-        </svg>
+        </svg>}
       </div>
       <section className="repo-card repo-table-wrap">
         <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.change_frequency}</th><th>{labels.metrics.fan_in}</th><th>{bundle.capability.views.hotspot_quadrant.label}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><ModuleInspectionControl moduleId={row.module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} /></td><td>{row.commit_count}</td><td>{row.fan_in}</td><td>{labels.hotspot_quadrants[row.quadrant]}</td></tr>)}</tbody></table>
@@ -1252,11 +1268,19 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
   const yTicks = chartTicks(maxCommits);
   const weekTickIndices = chartTickIndices(commitRows.length);
   const releaseTags = analysis.release_tags.items.slice(0, UI_ROW_LIMIT);
+  // Same absence rule as the hotspot chart: with no measured commit weeks
+  // the y-axis domain fallback of 1 would invent a scale, so render the
+  // commit series' data state instead of an empty plot.
+  const chartState = analysis.commits.disclosure.status === "unavailable"
+    ? <DataState className="repo-empty" state="unavailable" title={`${labels.metrics.commits} ${labels.unavailable.toLocaleLowerCase()}`} message={analysis.commits.disclosure.reason ?? "This bundle does not claim commit cadence data."} />
+    : isKnownEmptyRepoPage(analysis.commits)
+      ? <DataState className="repo-empty" state="empty" title={`No ${labels.metrics.commits.toLocaleLowerCase()} cadence points`} message={`Captured weekly ${labels.metrics.commits.toLocaleLowerCase()} counts belong here.`} action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
+      : null;
   return (
     <div className="repo-view-body repo-grid">
       <div className="repo-chart">
         <div className="repo-legend"><span><i className="green" />{labels.metrics.commits}</span></div>
-        <svg data-visualization="cadence" viewBox={`0 0 ${width} 82`} role="img" aria-labelledby="cadence-title cadence-desc">
+        {chartState ?? <svg data-visualization="cadence" viewBox={`0 0 ${width} 82`} role="img" aria-labelledby="cadence-title cadence-desc">
           <title id="cadence-title">{bundle.capability.views.cadence_timeline.label}</title><desc id="cadence-desc">{analysis.meta.inputs.join(", ")}</desc>
           {yTicks.map((tick) => {
             const y = plot.bottom - (tick / maxCommits) * (plot.bottom - plot.top);
@@ -1274,7 +1298,7 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
           })}
           <text className="repo-chart-axis" x={width / 2} y="80" textAnchor="middle">{labels.metrics.week}</text>
           <text className="repo-chart-axis" transform="rotate(-90 2 32)" x="2" y="32" textAnchor="middle">{labels.metrics.commits}</text>
-        </svg>
+        </svg>}
         <LocalSliceDisclosure shown={commitRows.length} total={analysis.commits.items.length} label={labels.metrics.commits} labels={labels} />
       </div>
       <div className="repo-cadence-series">
