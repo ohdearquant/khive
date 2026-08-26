@@ -2392,6 +2392,78 @@ async fn search_kind_entity_still_works_alongside_memory_pack() {
 }
 
 #[tokio::test]
+async fn search_source_filter_is_strict_and_applied_before_limit() {
+    let fixture = pack_with_memory();
+
+    fixture
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "name": "SourceFilteredSearchProbe",
+                "description": "text retrieval source filter coverage"
+            }),
+        )
+        .await
+        .expect("create source-filter probe entity");
+
+    let text_result = fixture
+        .dispatch(
+            "search",
+            json!({
+                "kind": "entity",
+                "query": "SourceFilteredSearchProbe",
+                "source": "text",
+                "limit": 1
+            }),
+        )
+        .await
+        .expect("text is a valid source filter");
+    let text_hits = text_result.as_array().expect("search result is an array");
+    assert_eq!(text_hits.len(), 1, "the text hit survives the limit");
+    assert!(text_hits.iter().all(|hit| hit["source"] == "text"));
+
+    let vector_result = fixture
+        .dispatch(
+            "search",
+            json!({
+                "kind": "entity",
+                "query": "SourceFilteredSearchProbe",
+                "source": "vector",
+                "limit": 1
+            }),
+        )
+        .await
+        .expect("vector is a valid source filter");
+    assert_eq!(
+        vector_result,
+        json!([]),
+        "a text-only in-memory hit must not satisfy source=vector"
+    );
+
+    let err = fixture
+        .dispatch(
+            "search",
+            json!({
+                "kind": "entity",
+                "query": "SourceFilteredSearchProbe",
+                "source": "semantic"
+            }),
+        )
+        .await
+        .expect_err("unknown source filters must fail closed");
+    assert!(
+        is_invalid_input(&err),
+        "invalid source must be InvalidInput: {err:?}"
+    );
+    assert!(
+        invalid_input_message(&err).contains("source must be one of: text, vector, both"),
+        "invalid-source error must enumerate the wire values: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn search_bogus_kind_lists_memory_in_error() {
     // The error message for an unknown kind must list ALL registered kinds,
     // including those contributed by FakeMemoryPack. This proves the error
