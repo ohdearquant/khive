@@ -999,6 +999,10 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
 /// and the session closes (see [`crate::transport::CancelOnEofTransport`]),
 /// releasing its reader-pool admission and DB connection — a client that
 /// comes back simply respawns the bridge, seamlessly from its perspective.
+/// This closes only a genuinely idle session: an admitted request with a
+/// response still being written — running long, or delivered slowly to a
+/// backpressured reader — defers the close rather than being cancelled out
+/// from under it.
 ///
 /// Overridable via `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`; `0` disables it (an
 /// explicit opt-out, e.g. for a debugger holding a session open on purpose).
@@ -7576,6 +7580,179 @@ mod request_read_cancellation_tests {
         assert!(
             response.contains("\"id\":1"),
             "expected a JSON-RPC response for request id=1, got: {response}"
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// #2230 review round 2 (Medium): a request must stay "in flight" — and
+    /// therefore protected from the idle-close branch — until its response
+    /// has actually *finished writing*, not merely been handed to
+    /// `inner.send`. rmcp spawns the response send and the framed write
+    /// awaits the transport writer, so a slow/backpressured reader can leave
+    /// the write pending well after the handler itself already completed.
+    /// Before the fix, `in_flight` was decremented synchronously inside
+    /// `send` before the returned future was even polled, so this scenario
+    /// would have been misread as an idle session and the root token
+    /// cancelled out from under the still-undelivered response.
+    #[tokio::test]
+    async fn stdio_idle_timeout_does_not_cancel_while_a_response_write_is_backpressured() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let probe = QuickProbeServer;
+        let root = tokio_util::sync::CancellationToken::new();
+        // An 8-byte buffer for the server->client direction: the JSON-RPC
+        // response cannot fully land without the reader draining it, which
+        // this test deliberately never does — that is what keeps the write
+        // pending.
+        let (server_io, mut client_io) = tokio::io::duplex(8);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let idle_timeout = Duration::from_millis(50);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            Some(idle_timeout),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        client_io
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write one real JSON-RPC tool request");
+
+        // The handler itself finishes almost immediately (`QuickProbeServer`),
+        // but with nobody reading `client_io`, the response write cannot
+        // drain into the 8-byte pipe. This must not be read as idle across
+        // several idle windows.
+        tokio::time::sleep(idle_timeout * 4).await;
+        assert!(
+            !root.is_cancelled(),
+            "an admitted request's still-undelivered response must not be read as an idle session"
+        );
+
+        drop(client_io);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Distinguishes handler behavior by tool name: `"slow"` blocks for
+    /// `slow_delay` (keeping `in_flight` above zero across several idle
+    /// windows), `"quick"` (or anything else) completes immediately — used
+    /// to admit a second request while the first is still running.
+    #[derive(Clone)]
+    struct MixedDelayServer {
+        slow_started: Arc<tokio::sync::Notify>,
+        slow_delay: Duration,
+    }
+
+    impl rmcp::ServerHandler for MixedDelayServer {
+        fn call_tool(
+            &self,
+            request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let slow_started = self.slow_started.clone();
+            let slow_delay = self.slow_delay;
+            let is_slow = request.name.as_ref() == "slow";
+            async move {
+                if is_slow {
+                    slow_started.notify_one();
+                    tokio::time::sleep(slow_delay).await;
+                }
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// #2230 review round 2 (Medium): while an admitted request is still
+    /// running, deferring the idle close must not discard a second request
+    /// that arrives fragmented across the deferred window. Before the fix,
+    /// each deferral called `self.inner.receive()` fresh; rmcp's line-buffered
+    /// receive clears its buffer at the start of every call, so a chunk
+    /// already consumed before the timeout fired was silently dropped and
+    /// the remainder parsed as an invalid/garbage line — losing the second
+    /// request even though the session itself correctly stayed open.
+    #[tokio::test]
+    async fn stdio_idle_timeout_preserves_a_fragmented_request_while_another_is_in_flight() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let slow_started = Arc::new(tokio::sync::Notify::new());
+        let slow_delay = Duration::from_millis(400);
+        let idle_timeout = Duration::from_millis(50);
+        let probe = MixedDelayServer {
+            slow_started: slow_started.clone(),
+            slow_delay,
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            Some(idle_timeout),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (mut client_read, mut client_write) = tokio::io::split(client_io);
+
+        // Admit request 1: the slow handler keeps `in_flight` above zero for
+        // `slow_delay`, so every idle window in between must be deferred
+        // rather than closing the session.
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write slow request");
+        tokio::time::timeout(Duration::from_secs(2), slow_started.notified())
+            .await
+            .expect("slow handler never started");
+
+        // While request 1 is still in flight, write request 2 split into two
+        // chunks with a gap longer than the idle timeout, so the deferred-
+        // close loop iterates at least once between them.
+        let full = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\
+                     \"params\":{\"name\":\"quick\",\"arguments\":{}}}\n";
+        let full_bytes = full.as_bytes();
+        let split_at = full_bytes.len() / 2;
+        client_write
+            .write_all(&full_bytes[..split_at])
+            .await
+            .expect("write first half of the fragmented request");
+
+        tokio::time::sleep(idle_timeout * 3).await;
+        assert!(
+            !root.is_cancelled(),
+            "the still-running slow request must defer the idle close across the gap"
+        );
+
+        client_write
+            .write_all(&full_bytes[split_at..])
+            .await
+            .expect("write second half of the fragmented request");
+
+        // Both responses must arrive intact — id=1 once the slow handler
+        // finishes, id=2 as soon as the reassembled line is parsed.
+        let mut buf = vec![0u8; 8192];
+        let mut collected = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !(collected.contains("\"id\":1") && collected.contains("\"id\":2")) {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("did not receive both responses in time; got: {collected}");
+            }
+            let n = tokio::time::timeout(Duration::from_secs(2), client_read.read(&mut buf))
+                .await
+                .expect("read timed out waiting for a response")
+                .expect("read error on the client side of the duplex pipe");
+            collected.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(
+            collected.contains("\"id\":2"),
+            "the fragmented second request must be reassembled and answered intact; got: {collected}"
         );
 
         drop(client_write);

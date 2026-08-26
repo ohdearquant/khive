@@ -41,9 +41,16 @@ use crate::server::KhiveMcpServer;
 /// outlasts `idle_timeout` (slow verb, large batch) must not have its
 /// session torn down out from under it. `in_flight` counts JSON-RPC
 /// `Request` messages this transport has handed to rmcp minus the
-/// `Response`/`Error` messages it has sent back for them; the idle branch
-/// only treats a quiet window as EOF when that count is zero, i.e. nothing
-/// admitted is still awaiting its response.
+/// `Response`/`Error` messages it has *finished writing* back for them —
+/// not merely handed to `inner.send`, since rmcp spawns the response send
+/// and the underlying framed write awaits the transport writer, so a slow
+/// or stalled reader leaves the write pending well after `send` is called.
+/// The idle branch only treats a quiet window as EOF when that count is
+/// zero, i.e. nothing admitted has an undelivered response. A response
+/// write that fails also decrements the counter (once resolved, one way or
+/// another, it is no longer pending) — the broken transport will surface
+/// through `receive()` returning `None` on its own, so this counter must
+/// not be the thing that gets stuck open forever on a write error.
 pub(crate) struct CancelOnEofTransport<T> {
     inner: T,
     root: tokio_util::sync::CancellationToken,
@@ -79,13 +86,22 @@ where
         &mut self,
         item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
-        if matches!(
+        let is_response = matches!(
             item,
             rmcp::model::JsonRpcMessage::Response(_) | rmcp::model::JsonRpcMessage::Error(_)
-        ) {
-            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        );
+        let in_flight = self.in_flight.clone();
+        let send = self.inner.send(item);
+        async move {
+            let result = send.await;
+            // Decrement once the write is resolved either way — see the
+            // `in_flight` field doc for why a failed write must not be left
+            // permanently counted as pending.
+            if is_response {
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
+            result
         }
-        self.inner.send(item)
     }
 
     fn receive(
@@ -96,11 +112,22 @@ where
         let idle_timeout = self.idle_timeout;
         let in_flight = self.in_flight.clone();
         async move {
+            // Created once and reused across every retry below: `select!`ing
+            // a *fresh* `self.inner.receive()` each time the idle sleep wins
+            // would drop the in-progress read and restart it next iteration.
+            // rmcp's line-buffered receive clears its buffer at the start of
+            // each call, so restarting mid-read silently discards whatever
+            // prefix of the next request had already arrived before the
+            // deferred timeout — the remainder then parses as garbage.
+            // Racing the sleep against `&mut` this same pinned future keeps
+            // the partial read alive across as many deferrals as it takes.
+            let recv_fut = self.inner.receive();
+            tokio::pin!(recv_fut);
             loop {
                 let message = match idle_timeout {
                     Some(timeout) => {
                         tokio::select! {
-                            message = self.inner.receive() => message,
+                            message = &mut recv_fut => message,
                             () = tokio::time::sleep(timeout) => {
                                 if in_flight.load(Ordering::Acquire) > 0 {
                                     tracing::debug!(
@@ -120,7 +147,7 @@ where
                             }
                         }
                     }
-                    None => self.inner.receive().await,
+                    None => recv_fut.await,
                 };
                 if let Some(rmcp::model::JsonRpcMessage::Request(_)) = &message {
                     in_flight.fetch_add(1, Ordering::AcqRel);
