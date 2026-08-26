@@ -27,6 +27,18 @@ pub const WRITER_TASK_BEGIN_BUSY_STAGE: &str = "writer_task_begin_busy";
 /// failure is safe to retry.
 pub const STORAGE_ADMISSION_TIMEOUT_STAGE: &str = "storage_admission_timeout";
 
+/// Stable wire code/stage for a cached read-only transaction proactively
+/// rolled back after pinning a WAL snapshot past the configured
+/// `read_tx_max_age` bound (#1846). Always safe to retry: the eviction only
+/// ever fires on a read-only handle, so no side effect can exist for a
+/// retry to duplicate. Shared by both
+/// [`khive_storage::StorageError::ReadTransactionAgeEvicted`] (clean
+/// rollback) and
+/// [`khive_storage::StorageError::ReadTransactionAgeEvictionCleanupFailed`]
+/// (rollback denied or failed outright) — the rendered `message` field
+/// distinguishes the two; retry behavior is identical for both.
+pub const READ_TX_AGE_EVICTED_STAGE: &str = "read_tx_age_evicted";
+
 /// Stable ADR-131:251 `scope` discriminator carried on a
 /// [`WRITER_QUEUE_SATURATED_STAGE`] failure — distinguishes write-queue
 /// admission saturation from other `unavailable` failure kinds that share
@@ -606,17 +618,48 @@ impl RuntimeError {
         if let Some(context) = self.admission_failure_context() {
             return Some(context.into());
         }
-        let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = self else {
-            return None;
-        };
-        Some(RetryableFailureContext {
-            stage: WRITER_TASK_BEGIN_BUSY_STAGE,
-            timeout: Duration::from_millis(*timeout_ms),
-            capability: None,
-            operation: Some("writer_task_begin".to_string()),
-            scope: None,
-            retry_after_ms: None,
-        })
+        if let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = self {
+            return Some(RetryableFailureContext {
+                stage: WRITER_TASK_BEGIN_BUSY_STAGE,
+                timeout: Duration::from_millis(*timeout_ms),
+                capability: None,
+                operation: Some("writer_task_begin".to_string()),
+                scope: None,
+                retry_after_ms: None,
+            });
+        }
+        if let Self::Storage(khive_storage::StorageError::ReadTransactionAgeEvicted {
+            operation,
+            max_age_secs,
+        }) = self
+        {
+            return Some(RetryableFailureContext {
+                stage: READ_TX_AGE_EVICTED_STAGE,
+                timeout: Duration::from_secs(*max_age_secs),
+                capability: Some(khive_storage::StorageCapability::Sql),
+                operation: Some(operation.to_string()),
+                scope: None,
+                retry_after_ms: None,
+            });
+        }
+        if let Self::Storage(
+            khive_storage::StorageError::ReadTransactionAgeEvictionCleanupFailed {
+                operation,
+                max_age_secs,
+                ..
+            },
+        ) = self
+        {
+            return Some(RetryableFailureContext {
+                stage: READ_TX_AGE_EVICTED_STAGE,
+                timeout: Duration::from_secs(*max_age_secs),
+                capability: Some(khive_storage::StorageCapability::Sql),
+                operation: Some(operation.to_string()),
+                scope: None,
+                retry_after_ms: None,
+            });
+        }
+        None
     }
 }
 
@@ -769,5 +812,61 @@ mod channel_ingest_failure_class_tests {
         });
         assert!(mid_flight.admission_failure_context().is_none());
         assert!(mid_flight.retryable_failure_context().is_none());
+    }
+
+    /// Binds both age-eviction outcomes a cached-reader rollback can produce
+    /// (clean rollback vs. failed/denied cleanup) to the same retryable wire
+    /// stage: a regression that reverted either branch back to generic
+    /// `StorageError::Transaction` would drop this match arm entirely and
+    /// fail here, since `Transaction` does have a `retryable_failure_context`
+    /// mapping distinct from `super::READ_TX_AGE_EVICTED_STAGE`.
+    #[test]
+    fn both_read_tx_age_eviction_outcomes_map_to_the_same_retryable_stage() {
+        let clean = RuntimeError::Storage(khive_storage::StorageError::ReadTransactionAgeEvicted {
+            operation: "query_all".into(),
+            max_age_secs: 120,
+        });
+        let clean_context = clean
+            .retryable_failure_context()
+            .expect("a clean age eviction must be typed-retryable");
+        assert_eq!(clean_context.stage, super::READ_TX_AGE_EVICTED_STAGE);
+        assert_eq!(clean_context.timeout, Duration::from_secs(120));
+        assert_eq!(clean_context.operation.as_deref(), Some("query_all"));
+        assert_eq!(
+            clean_context.capability,
+            Some(khive_storage::StorageCapability::Sql)
+        );
+
+        let cleanup_failed = RuntimeError::Storage(
+            khive_storage::StorageError::ReadTransactionAgeEvictionCleanupFailed {
+                operation: "query_all".into(),
+                max_age_secs: 120,
+                message: "rollback failed: disk I/O error".into(),
+            },
+        );
+        let cleanup_failed_context = cleanup_failed
+            .retryable_failure_context()
+            .expect("a failed cleanup rollback must remain typed-retryable");
+        assert_eq!(
+            cleanup_failed_context.stage,
+            super::READ_TX_AGE_EVICTED_STAGE
+        );
+        assert_eq!(cleanup_failed_context.timeout, Duration::from_secs(120));
+        assert_eq!(
+            cleanup_failed_context.operation.as_deref(),
+            Some("query_all")
+        );
+        assert_eq!(
+            cleanup_failed_context.capability,
+            Some(khive_storage::StorageCapability::Sql)
+        );
+
+        assert_ne!(
+            clean.to_string(),
+            cleanup_failed.to_string(),
+            "the rendered message must distinguish a clean eviction from a failed cleanup even \
+             though both map to the same wire stage"
+        );
+        assert!(cleanup_failed.to_string().contains("rollback failed"));
     }
 }

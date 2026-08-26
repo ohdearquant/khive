@@ -148,6 +148,43 @@ MCP emits `code`/`stage` of `storage_admission_timeout` with the failing
 `scope`, and `retry_after_ms` are null: the handle-slot and reader-checkout
 budgets are capability-neutral and no separate backoff policy is defined.
 
+## Typed cached-reader read-transaction age eviction
+
+`sql_bridge`'s cached-reader read path proactively rolls back an admitted
+read transaction once it has pinned a WAL snapshot past the configured
+`read_tx_max_age` (#1846). Two typed, capability-neutral, `is_retryable() ==
+true` variants report the outcome, both public and both introduced by this
+change:
+
+- `StorageError::ReadTransactionAgeEvicted { operation, max_age_secs }` — the
+  `ROLLBACK` succeeded and autocommit was restored; the connection returns to
+  the pool ready for a fresh read snapshot.
+- `StorageError::ReadTransactionAgeEvictionCleanupFailed { operation,
+  max_age_secs, message }` — the `ROLLBACK` was denied or errored, or it
+  reported success without actually restoring autocommit. The connection is
+  discarded instead of being returned to the pool. `message` names which of
+  the two cleanup failures occurred.
+
+Both are always safe to retry: the age check runs before any read on the
+connection, so no side effect exists for a retry to duplicate, regardless of
+which cleanup outcome followed. Both are distinct from the generic
+`StorageError::Transaction` variant, whose other cases (write-side ambiguity,
+unrelated rollback failures) are not uniformly safe to retry — callers must
+not detect this condition by parsing rendered text.
+
+MCP maps both variants to the same `code`/`stage` of `read_tx_age_evicted`
+(`khive_runtime::error::READ_TX_AGE_EVICTED_STAGE`), the failing `operation`,
+`capability: "sql"`, `retryable: true`, and `timeout_ms` set to
+`max_age_secs * 1000`. `scope` and `retry_after_ms` are null. The rendered
+`message` field is the only wire-visible way to distinguish a clean eviction
+from a failed cleanup.
+
+`StorageError` is a public enum without `#[non_exhaustive]`, so adding these
+two variants is a Rust source-compatibility change for downstream code that
+exhaustively matches every variant; those matches must add
+`ReadTransactionAgeEvicted` and `ReadTransactionAgeEvictionCleanupFailed`
+arms.
+
 ## `is_fts5_syntax_error`
 
 `TextSearch::search` returns the same `Driver` variant for a malformed MATCH

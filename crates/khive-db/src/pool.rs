@@ -281,6 +281,16 @@ pub struct PoolConfig {
     ///
     /// Overridable via `KHIVE_WRITE_ADMISSION_DEADLINE_MS`.
     pub write_admission_deadline_ms: u64,
+    /// Maximum age an explicit cached-reader read transaction
+    /// (`sql_bridge`'s `BEGIN`-then-reuse path) may reach before its next use
+    /// is refused and it is rolled back instead of extending its WAL
+    /// snapshot further (#1846). Shares `KHIVE_TX_MAX_AGE_SECS` with the
+    /// ADR-091 Plank 1 visibility sweep in `checkpoint.rs` so one knob
+    /// governs both when an operator is warned about a stale reader and when
+    /// that reader's snapshot is actually released.
+    ///
+    /// Overridable via `KHIVE_TX_MAX_AGE_SECS`. Default: 120 seconds.
+    pub read_tx_max_age: Duration,
 }
 
 /// ADR-131 Decision 2's validated range for `write_admission_deadline_ms`.
@@ -333,6 +343,11 @@ impl Default for PoolConfig {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DEFAULT_WRITE_ADMISSION_DEADLINE_MS),
+            read_tx_max_age: crate::checkpoint::tx_age_thresholds_from_env(
+                Duration::from_secs(30),
+                Duration::from_secs(120),
+            )
+            .1,
         }
     }
 }
