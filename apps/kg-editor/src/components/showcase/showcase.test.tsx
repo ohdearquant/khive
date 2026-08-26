@@ -434,7 +434,7 @@ describe("materialized repository lookup", () => {
       expect.arrayContaining(["repo"]),
     );
     for (const key of url.searchParams.keys()) {
-      expect(["repo", "at", "module", "view"]).toContain(key);
+      expect(["repo", "at", "module", "module_id", "view"]).toContain(key);
     }
   });
 

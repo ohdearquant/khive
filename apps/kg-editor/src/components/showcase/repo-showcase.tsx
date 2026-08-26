@@ -49,6 +49,7 @@ import type {
   RepoPage,
   ViewId,
 } from "@/lib/repo-bundle";
+import { moduleInspectLabel } from "@/lib/repo-bundle";
 import {
   parseRepositoryLocation,
   REPOSITORY_VIEW_IDS,
@@ -221,7 +222,7 @@ function ModuleInspectionControl({
       type="button"
       className={`repo-module-action ${className}`.trim()}
       data-module-id={moduleId}
-      aria-label={`Inspect ${moduleNode.source_path}`}
+      aria-label={moduleInspectLabel(moduleById, moduleNode)}
       aria-controls="repository-module-inspector"
       aria-pressed={selectedModuleId === moduleId}
       onClick={() => onInspectModule(moduleId)}
@@ -1307,6 +1308,7 @@ function HistoryFacet({
 
 function HistoryStructure({
   bundle,
+  moduleById,
   selectedModuleId,
   onInspectModule,
   onExploreStructure,
@@ -1365,7 +1367,7 @@ function HistoryStructure({
               <button
                 type="button"
                 data-module-id={module.id}
-                aria-label={`Inspect ${module.source_path}`}
+                aria-label={moduleInspectLabel(moduleById, module)}
                 aria-controls="repository-module-inspector"
                 aria-pressed={selectedModuleId === module.id}
                 className={`repo-list-row ${selectedModuleId === module.id ? "selected" : ""}`}
@@ -2032,7 +2034,7 @@ function TreemapView({
                   type="button"
                   className={`repo-treemap-module ${activity > maxActivity * 0.55 ? "hot" : ""}`}
                   data-module-id={row.module_id}
-                  aria-label={`Inspect ${moduleNode.source_path}`}
+                  aria-label={moduleInspectLabel(moduleById, moduleNode)}
                   aria-controls="repository-module-inspector"
                   aria-pressed={selectedModuleId === row.module_id}
                   onClick={() => onInspectModule(row.module_id)}
@@ -2787,10 +2789,25 @@ export function RepoShowcase({
     function restoreLocation(announce = false) {
       const parsed = parseRepositoryLocation(new URL(window.location.href));
       const requestedPath = parsed.location.modulePath;
+      const requestedModuleId = parsed.location.moduleId;
+      const messages = parsed.issues.map((issue) => issue.message);
       let nextModuleId: string | null = defaultModuleId;
       let nextUnresolved: typeof unresolvedModule = null;
       let resolvedModuleRestore = false;
-      if (requestedPath) {
+      const requestedModule = requestedModuleId
+        ? moduleById.get(requestedModuleId)
+        : null;
+      if (requestedModule) {
+        nextModuleId = requestedModule.id;
+        resolvedModuleRestore = true;
+        if (
+          requestedPath && requestedPath !== requestedModule.source_path
+        ) {
+          messages.push(
+            "The module path did not match the requested module identifier; the link now uses the captured source path.",
+          );
+        }
+      } else if (requestedPath) {
         const matches = modulesBySourcePath.get(requestedPath) ?? [];
         if (matches.length === 1) {
           nextModuleId = matches[0].id;
@@ -2806,8 +2823,12 @@ export function RepoShowcase({
           };
         }
       }
+      if (requestedModuleId && !requestedModule) {
+        messages.push(
+          "The requested module identifier is not present in this bounded snapshot.",
+        );
+      }
       const nextView = parsed.location.view ?? "structure_graph";
-      const messages = parsed.issues.map((issue) => issue.message);
       const staleSnapshot = Boolean(
         parsed.location.snapshotSha &&
           parsed.location.snapshotSha !== snapshot.head_sha,
@@ -2849,10 +2870,11 @@ export function RepoShowcase({
         repository: repository.canonical_url,
         snapshotSha: parsed.location.snapshotSha ?? snapshot.head_sha,
         modulePath:
-          requestedPath ??
+          nextUnresolved?.path ??
           (nextModuleId
             ? (moduleById.get(nextModuleId)?.source_path ?? null)
             : null),
+        moduleId: nextModuleId,
         view: nextView,
       });
       if (canonical.href !== window.location.href) {
@@ -2888,6 +2910,7 @@ export function RepoShowcase({
       modulePath: moduleId
         ? (moduleById.get(moduleId)?.source_path ?? null)
         : missingPath,
+      moduleId,
       view,
     };
   }
