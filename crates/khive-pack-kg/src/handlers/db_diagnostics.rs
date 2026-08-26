@@ -23,10 +23,20 @@ fn annotate_graph_edge_integrity(report: &mut Value) {
     else {
         return;
     };
+    let pre_v14_duplicates = integrity
+        .get("pre_v14_duplicate_edge_state_detected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let delta = seq_rows - graph_rows;
     let relationship = match delta.cmp(&0) {
         std::cmp::Ordering::Greater => "ledger_ahead_consistent_with_hard_deletes",
         std::cmp::Ordering::Equal => "equal",
+        // A pre-V14 duplicate-ID state legitimately holds more edge rows than
+        // ledger rows (two namespaces sharing one edge UUID), so it is a
+        // known legacy condition, not an unexplained deficit.
+        std::cmp::Ordering::Less if pre_v14_duplicates => {
+            "ledger_behind_pre_v14_duplicate_edge_state"
+        }
         std::cmp::Ordering::Less => "ledger_behind_unexpected",
     };
 
@@ -139,6 +149,28 @@ mod tests {
         assert_eq!(
             integrity["graph_edges_seq_relationship"],
             "ledger_behind_unexpected"
+        );
+    }
+
+    #[test]
+    fn graph_edge_integrity_classifies_pre_v14_duplicate_state_as_legacy() {
+        // Mirrors the khive-db regression fixture: two graph_edges rows share
+        // one ledger row and the report flags the pre-V14 duplicate state.
+        let mut report = json!({
+            "graph_edge_integrity": {
+                "graph_edges_rows": 2,
+                "graph_edges_seq_rows": 1,
+                "pre_v14_duplicate_edge_state_detected": true,
+            }
+        });
+
+        annotate_graph_edge_integrity(&mut report);
+
+        let integrity = &report["graph_edge_integrity"];
+        assert_eq!(integrity["graph_edges_seq_minus_graph_edges"], -1);
+        assert_eq!(
+            integrity["graph_edges_seq_relationship"],
+            "ledger_behind_pre_v14_duplicate_edge_state"
         );
     }
 }

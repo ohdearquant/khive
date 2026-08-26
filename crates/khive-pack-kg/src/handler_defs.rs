@@ -1040,7 +1040,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                       graph_edges_rows across all namespaces including soft-deleted rows, and \
                       graph_edges_seq_rows across the insertion ledger, whose rows survive hard deletion. \
                       graph_edges_seq_minus_graph_edges and graph_edges_seq_relationship make the \
-                      expected non-negative ledger delta explicit; a negative delta is unexpected. \
+                      expected non-negative ledger delta explicit; a negative delta is unexpected \
+                      unless the report also flags the pre-V14 duplicate-edge state, which is \
+                      classified as ledger_behind_pre_v14_duplicate_edge_state. \
                       ADR-091 checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
                       WAL-pin holder census. The \
