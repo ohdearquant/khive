@@ -414,10 +414,17 @@ fn redact_crossing_boundary_url_userinfo(text: &str) -> std::borrow::Cow<'_, str
         let terminated =
             rest.contains('@') || rest.contains(' ') || rest.contains('\n') || rest.contains('\r');
         if !terminated {
-            if let Some(colon) = rest.find(':') {
-                let user = &rest[..colon];
+            // Same rules as `find_url_userinfo`: the userinfo colon must sit
+            // in the authority component (before any `/`, `?`, or `#` — a
+            // later colon is path/query text), and only the password must be
+            // non-empty (an empty username, `redis://:pass`, is a standard
+            // connection-string form and no less a credential). The password
+            // run AFTER the colon is unrestricted — a crossing password may
+            // itself contain any of those delimiters.
+            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            if let Some(colon) = rest[..authority_end].find(':') {
                 let pass = &rest[colon + 1..];
-                if !user.is_empty() && !pass.is_empty() {
+                if !pass.is_empty() {
                     let redact_from = scheme_pos + 3 + colon;
                     let mut out = String::with_capacity(redact_from + REDACTION_MARKER.len());
                     out.push_str(&text[..redact_from]);
@@ -4018,6 +4025,45 @@ mod tests {
         assert!(
             rendered.ends_with('…'),
             "truncated record must declare its own incompleteness: {rendered:?}"
+        );
+    }
+
+    /// Regression: the crossing fallback follows the same empty-username
+    /// rule as the canonical detector — `redis://:<password>` with the
+    /// terminating `@` beyond the mask-input cap must still be redacted.
+    #[test]
+    fn bounded_masked_log_text_redacts_crossing_empty_username_password() {
+        let huge_low_entropy_password = "b".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let raw = format!(
+            "gate backend probe failed: redis://:{huge_low_entropy_password}@internal-host refused"
+        );
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains(&"b".repeat(50)),
+            "no empty-username password fragment may survive the cap crossing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("***MASKED***"),
+            "mask marker must record that the credential was redacted: {rendered:?}"
+        );
+    }
+
+    /// Regression: the crossing fallback shares the canonical detector's
+    /// authority boundary — a colon after `/`, `?`, or `#` is path/query
+    /// text, so a capped input whose only colon-at pair sits in the path
+    /// must NOT be masked even when the `@` lies beyond the cap.
+    #[test]
+    fn bounded_masked_log_text_keeps_path_colon_text_crossing_the_cap() {
+        let filler = "z".repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS + 1000);
+        let raw = format!("see https://host/a:x{filler}@next for details");
+        let rendered = bounded_masked_log_text(&raw);
+        assert!(
+            !rendered.contains("***MASKED***"),
+            "path-colon text must not read as a crossing credential: {rendered:?}"
+        );
+        assert!(
+            rendered.starts_with("see https://host/a:x"),
+            "the non-credential prefix must survive verbatim: {rendered:?}"
         );
     }
 
