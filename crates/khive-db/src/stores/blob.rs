@@ -714,6 +714,10 @@ fn available_space_at(root_handle: &std::fs::File) -> std::io::Result<u64> {
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // `f_bavail`'s width is platform-dependent (u64 on Linux glibc, u32 on
+    // macOS), so the widening is a no-op on some targets and required on
+    // others; the lint only sees one target at a time.
+    #[allow(clippy::useless_conversion)]
     Ok(stat.f_frsize.saturating_mul(u64::from(stat.f_bavail)))
 }
 
@@ -1222,7 +1226,7 @@ fn walk_blob_files_from_root_handle(
                 let Ok(content_ref) = ContentRef::from_hex(leaf_name.clone()) else {
                     continue;
                 };
-                #[cfg(test)]
+                #[cfg(all(test, unix))]
                 if let Some(hook) = walk_leaf_sync_hook::take(_root) {
                     let _ = hook.reached.send(());
                     let _ = hook.release.recv();
@@ -2888,7 +2892,7 @@ mod sync_hook {
 /// the swap regression test flaky under that interleaving. Each test in this
 /// module sweeps its own tempdir root, so keying by canonical root gives
 /// each test's hook install/take pair exclusive use of its own slot.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod walk_leaf_sync_hook {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -6279,6 +6283,7 @@ mod tests {
     // the crate's default parallel test runner.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transactional_orphan_sweep_walk_ignores_a_leaf_swapped_for_an_outside_symlink_mid_scan(
     ) {
@@ -6389,6 +6394,7 @@ mod tests {
         assert_eq!(control.would_delete, 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transactional_orphan_sweep_walk_still_finds_a_real_orphan_past_its_grace_period() {
         // Control for the swap test above, using an independent root (no
