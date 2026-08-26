@@ -86,8 +86,11 @@ impl FallbackReason {
     }
 
     /// Legitimacy tier used only by the `KHIVE_DAEMON_STRICT` event-telemetry
-    /// policy (SPEC_DRAFT §3 D2). Only `Illegitimate` reasons are event-elevated;
-    /// the other two tiers stay quiet at event level regardless of mode.
+    /// policy (ADR-049 Amendment 2; see
+    /// `crates/khive-mcp/docs/api/daemon-lifecycle.md` §"Strict-mode fallback
+    /// accounting"). Every tier emits the WARN-level `daemon_fallback` event
+    /// and its per-reason counter; only `Illegitimate` reasons are elevated to
+    /// an error-level event plus `FALLBACK_STRICT_VIOLATIONS` in strict mode.
     fn severity(self) -> FallbackSeverity {
         match self {
             // A real misconfiguration: the client and daemon should have
@@ -114,7 +117,7 @@ impl FallbackReason {
 }
 
 /// Legitimacy tier for a [`FallbackReason`], keyed by the graduated fail-loud
-/// policy in SPEC_DRAFT §3 D2. See [`FallbackReason::severity`] for the
+/// policy in ADR-049 Amendment 2. See [`FallbackReason::severity`] for the
 /// per-variant mapping and its rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FallbackSeverity {
@@ -123,11 +126,11 @@ enum FallbackSeverity {
     Illegitimate,
     /// Historical rollout-transient telemetry tier. These outcomes are now
     /// terminal after a real write, but remain in the closed metrics vocabulary.
-    /// Never event-elevated, in strict mode or otherwise.
+    /// Never elevated past the WARN-level event, in strict mode or otherwise.
     RolloutTransient,
-    /// No daemon to forward to at all. Never event-elevated — this is the
-    /// ADR-049-mandated safety-net telemetry tier, not a signal that strict
-    /// mode permits local fallback.
+    /// No daemon to forward to at all. Never elevated past the WARN-level
+    /// event — this is the ADR-049-mandated safety-net telemetry tier, not a
+    /// signal that strict mode permits local fallback.
     NoDaemon,
 }
 
@@ -137,7 +140,8 @@ enum FallbackSeverity {
 ///   of completing the request locally, regardless of severity (#947).
 /// - Telemetry: [`record_fallback`] elevates only `Illegitimate` reasons to an
 ///   error-level event with the violation counter (D2-R1); the other severity
-///   tiers remain quiet at event level.
+///   tiers remain WARN-level `daemon_fallback` events and do not increment
+///   `FALLBACK_STRICT_VIOLATIONS`.
 ///
 /// Plain opt-in, default OFF — no hosted-vs-local auto-detection exists. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
