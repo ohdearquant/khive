@@ -94,11 +94,12 @@ pub enum ConfigError {
     /// Loader-context wrapper attaching the config file the error came from.
     ///
     /// Added as a wrapping variant, rather than reshaping the existing
-    /// variants, so existing matches and constructors keep compiling and the
-    /// `From<std::io::Error>` conversion survives. `Parse` already carries
-    /// its path and is never wrapped. Matches on `ConfigError` that inspect
-    /// specific variants should either match `InFile` and recurse into
-    /// `source`, or use a wildcard arm.
+    /// variants, so every existing constructor, field access, and the
+    /// `From<std::io::Error>` conversion survive unchanged. The enum is not
+    /// `#[non_exhaustive]`, so an exhaustive `match` on `ConfigError` must
+    /// still add an arm for this variant — either matching `InFile` and
+    /// recursing into `source`, or a wildcard. `Parse` already carries its
+    /// path and is never wrapped.
     #[error("{source} (config file: {})", path.display())]
     InFile {
         path: PathBuf,
