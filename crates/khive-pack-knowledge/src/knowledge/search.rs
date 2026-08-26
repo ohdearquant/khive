@@ -2763,8 +2763,18 @@ mod tests {
     /// Tokio time and the test-only per-term deadline control place expiry
     /// exactly between two queries, so the assertion never depends on corpus
     /// work taking longer than a machine-specific wall-clock budget.
+    ///
+    /// Scope: this covers the per-term BOUNDARY only. Advancing only the
+    /// async clock means the post-boundary term is refused by the
+    /// pre-registration deadline check, never by an in-flight SQLite
+    /// interrupt — that path has its own wall-clock test below. The old
+    /// wall-clock old-query oracle (running the pre-fix OR-joined SQL over
+    /// this corpus against a tuned budget) is deliberately retired with the
+    /// machine-timing flake it depended on; the all-or-nothing behavior of a
+    /// single statement crossing its deadline is what the in-flight test
+    /// below pins.
     #[tokio::test(start_paused = true)]
-    async fn per_term_fetch_degrades_under_deadline_where_or_joined_query_errors() {
+    async fn per_term_fetch_degrades_at_controlled_deadline_boundary() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
         const N: u32 = 1_000;
         const VOCAB: u32 = 20;
@@ -2800,6 +2810,42 @@ mod tests {
             outcome.atoms.len() <= CANDIDATE_POOL,
             "partial pool must respect the fetch cap; got {}",
             outcome.atoms.len()
+        );
+    }
+
+    /// Companion to the boundary test above: prove the wall-clock SQLite
+    /// cancellation path end to end. The statement is structurally slow (a
+    /// 1000^3 cross join — billions of row operations on any machine), so a
+    /// short real deadline reliably expires while the read is IN FLIGHT
+    /// inside SQLite, exercising deadline capture, the progress-handler
+    /// interrupt, cleanup, and the typed timeout — none of which the
+    /// paused-clock test can reach. A single statement crossing its deadline
+    /// yields an all-or-nothing `StorageError::Timeout`, the pre-fix
+    /// OR-joined query's failure mode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_flight_read_surfaces_typed_timeout_under_wall_clock_deadline() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let deadline = std::time::Duration::from_millis(50);
+        let result = khive_storage::scope_request_read_deadline(deadline, async {
+            let sql = runtime.sql();
+            let mut reader = sql.reader().await.expect("reader");
+            reader
+                .query_all(SqlStatement {
+                    sql: "WITH RECURSIVE numbers(value) AS (\
+                          SELECT 1 UNION ALL SELECT value + 1 FROM numbers WHERE value < 1000\
+                          ) SELECT SUM(a.value * b.value * c.value) \
+                          FROM numbers AS a CROSS JOIN numbers AS b CROSS JOIN numbers AS c"
+                        .into(),
+                    params: vec![],
+                    label: Some("knowledge-in-flight-deadline-probe".into()),
+                })
+                .await
+        })
+        .await;
+        assert!(
+            matches!(result, Err(khive_storage::StorageError::Timeout { .. })),
+            "an in-flight read crossing the wall-clock deadline must surface \
+             the typed timeout after interrupt cleanup; got {result:?}"
         );
     }
 
