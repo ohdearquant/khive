@@ -8,7 +8,10 @@ import {
   SHOWCASE_CATALOG_MAX_BYTES,
   SHOWCASE_CATALOG_MAX_ENTRIES,
 } from "@/lib/adapters/showcase-analysis-catalog";
-import type { ShowcaseRegistryEntry } from "@/lib/showcase-registry";
+import {
+  resolveShowcaseRepository,
+  type ShowcaseRegistryEntry,
+} from "@/lib/showcase-registry";
 
 const staticEntry: ShowcaseRegistryEntry = {
   id: "github.com/example/repository",
@@ -236,6 +239,7 @@ describe("showcase analysis catalog", () => {
     expect(registry).toStrictEqual([
       {
         ...staticEntry,
+        aliases: [...staticEntry.aliases, "legacy-static-id"],
         analysisId: "configured-analysis",
       },
       {
@@ -256,5 +260,41 @@ describe("showcase analysis catalog", () => {
         analysisId: undefined,
       },
     ]);
+  });
+
+  it("lets a catalog entry claiming the legacy static ID win the deep-link lookup", () => {
+    const merged = mergeShowcaseRegistry([
+      {
+        analysis_id: "legacy-static-id",
+        canonical_url: "https://github.com/example/other",
+      },
+    ], [staticEntry]);
+
+    expect(merged[0]?.aliases).not.toContain("legacy-static-id");
+    const lookup = resolveShowcaseRepository("legacy-static-id", merged);
+    expect(lookup.status).toBe("hit");
+    expect(lookup.status === "hit" && lookup.entry.id).toBe(
+      "analysis:legacy-static-id",
+    );
+  });
+
+  it("keeps the legacy static ID as an alias when the catalog renames the same repository", () => {
+    const merged = mergeShowcaseRegistry([
+      {
+        analysis_id: "renamed-analysis",
+        canonical_url: "https://github.com/example/repository",
+      },
+    ], [staticEntry]);
+
+    expect(merged).toStrictEqual([
+      {
+        ...staticEntry,
+        aliases: [...staticEntry.aliases, "legacy-static-id"],
+        analysisId: "renamed-analysis",
+      },
+    ]);
+    const lookup = resolveShowcaseRepository("legacy-static-id", merged);
+    expect(lookup.status).toBe("hit");
+    expect(lookup.status === "hit" && lookup.entry.id).toBe(staticEntry.id);
   });
 });

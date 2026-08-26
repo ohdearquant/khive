@@ -183,17 +183,20 @@ export function mergeShowcaseRegistry(
       analysisId: entry.analysis_id,
     });
   }
+  const catalogClaimedIds = new Set(catalog.map((entry) => entry.analysis_id));
   for (const [index, staticEntry] of staticRegistry.entries()) {
     const entry = merged[index];
+    const legacyId = staticEntry.analysisId;
     if (
       entry &&
-      entry.analysisId === undefined &&
-      isShowcaseAnalysisId(staticEntry.analysisId) &&
-      !entry.aliases.includes(staticEntry.analysisId)
+      isShowcaseAnalysisId(legacyId) &&
+      !catalogClaimedIds.has(legacyId) &&
+      entry.analysisId !== legacyId &&
+      !entry.aliases.includes(legacyId)
     ) {
       merged[index] = {
         ...entry,
-        aliases: [...entry.aliases, staticEntry.analysisId],
+        aliases: [...entry.aliases, legacyId],
       };
     }
   }
