@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import {
+  addressableModuleIdIssue,
   addressableModulePathIssue,
   publicRepositoryUrlIssue,
 } from "@/lib/repository-location";
@@ -518,6 +519,14 @@ export const repoBundleSchema = z.strictObject({
         message: pathIssue,
       });
     }
+    const idIssue = addressableModuleIdIssue(moduleNode.id);
+    if (idIssue) {
+      context.addIssue({
+        code: "custom",
+        path: ["graph", "modules", "items", index, "id"],
+        message: idIssue,
+      });
+    }
     if (moduleIds.has(moduleNode.id)) {
       context.addIssue({
         code: "custom",
@@ -558,6 +567,31 @@ export type RepoPage<T> = {
   disclosure: z.infer<typeof disclosureSchema>;
 };
 export type RepoModule = RepoBundle["graph"]["modules"]["items"][number];
+
+// Bundles may carry duplicate source paths (IDs disambiguate), so accessible
+// names for module controls append a short module-ID suffix — but only for
+// the colliding paths, keeping unique-path labels stable. The duplicate set
+// is derived once per module map and cached by map identity.
+const duplicateSourcePathCache = new WeakMap<object, Set<string>>();
+
+export function moduleInspectLabel(
+  moduleById: ReadonlyMap<string, Pick<RepoModule, "id" | "source_path">>,
+  moduleNode: Pick<RepoModule, "id" | "source_path">,
+): string {
+  let duplicated = duplicateSourcePathCache.get(moduleById);
+  if (!duplicated) {
+    duplicated = new Set<string>();
+    const seen = new Set<string>();
+    for (const entry of moduleById.values()) {
+      if (seen.has(entry.source_path)) duplicated.add(entry.source_path);
+      else seen.add(entry.source_path);
+    }
+    duplicateSourcePathCache.set(moduleById, duplicated);
+  }
+  const base = `Inspect ${moduleNode.source_path}`;
+  if (!duplicated.has(moduleNode.source_path)) return base;
+  return `${base} (${moduleNode.id.slice(-8)})`;
+}
 export type RepoCommit = RepoBundle["graph"]["commits"]["items"][number];
 export type ViewId = keyof RepoBundle["capability"]["views"];
 

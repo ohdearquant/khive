@@ -57,6 +57,8 @@ describe("repository investigation location", () => {
     ["overlong module", `module=${"a".repeat(1025)}`, "module"],
     ["empty module id", "module_id=", "module_id"],
     ["overlong module id", `module_id=${"a".repeat(1025)}`, "module_id"],
+    ["query-delimiter module id", "module_id=khive%3Fmodule", "module_id"],
+    ["fragment-delimiter module id", "module_id=khive%23module", "module_id"],
   ])(
     "rejects %s without accepting the ambiguous value",
     (_name, search, parameter) => {

@@ -29,6 +29,7 @@ import {
   type RepositorySignal,
 } from "@/lib/repository-brief";
 import type { RepoBundle, RepoModule, ViewId } from "@/lib/repo-bundle";
+import { moduleInspectLabel } from "@/lib/repo-bundle";
 
 import styles from "./repository-triage.module.css";
 
@@ -135,11 +136,13 @@ function Classification({
 
 function ModuleButton({
   module,
+  moduleById,
   selected,
   detail,
   onSelect,
 }: {
   module: RepoModule;
+  moduleById: ReadonlyMap<string, RepoModule>;
   selected: boolean;
   detail: string;
   onSelect: () => void;
@@ -149,7 +152,7 @@ function ModuleButton({
       type="button"
       className={styles.moduleButton}
       data-module-id={module.id}
-      aria-label={`Inspect ${module.source_path}`}
+      aria-label={moduleInspectLabel(moduleById, module)}
       aria-controls="repository-module-inspector"
       aria-pressed={selected}
       onClick={onSelect}
@@ -326,6 +329,7 @@ export function RepositoryTriage({
                         <ModuleButton
                           key={module.id}
                           module={module}
+                          moduleById={moduleById}
                           selected={module.id === selectedModuleId}
                           detail={`${module.language} · ${module.module_path}`}
                           onSelect={() => onInspectModule(module.id)}
@@ -364,6 +368,7 @@ export function RepositoryTriage({
                               </span>
                               <ModuleButton
                                 module={moduleNode}
+                                moduleById={moduleById}
                                 selected={moduleNode.id === selectedModuleId}
                                 detail={`${bundle.capability.views.api_surface.label} · ${
                                   formatNumber(entry.dependentCount)

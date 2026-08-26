@@ -133,19 +133,28 @@ function parseModulePath(
   return value;
 }
 
+// URL delimiters are excluded from the identifier contract itself (not just
+// the share-URL boundary) so every bundle-accepted module ID is representable
+// in an investigation link: an ID the share URL would have to omit is
+// rejected at validation instead of silently losing exact identity.
+export function addressableModuleIdIssue(value: string): string | null {
+  if (
+    value.length > MODULE_ID_LIMIT ||
+    /[?#\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    return "The module identifier must be a bounded printable value without URL delimiters.";
+  }
+  return null;
+}
+
 function parseModuleId(
   value: string | null,
   issues: RepositoryLocationIssue[],
 ): string | null {
   if (value == null) return null;
-  if (
-    value.length > MODULE_ID_LIMIT ||
-    /[\u0000-\u001f\u007f]/u.test(value)
-  ) {
-    issues.push({
-      parameter: "module_id",
-      message: "The module identifier must be a bounded printable value.",
-    });
+  const message = addressableModuleIdIssue(value);
+  if (message) {
+    issues.push({ parameter: "module_id", message });
     return null;
   }
   return value;

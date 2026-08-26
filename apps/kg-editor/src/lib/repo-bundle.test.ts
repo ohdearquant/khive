@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { parseRepoBundle, repoBundleSchema } from "@/lib/repo-bundle";
+import { moduleInspectLabel, parseRepoBundle, repoBundleSchema } from "@/lib/repo-bundle";
 
 const goldenPath = resolve(process.cwd(), "../../docs/schemas/examples/khive-repo-v1-khive.json");
 const schemaPath = resolve(process.cwd(), "../../docs/schemas/khive-repo-v1.schema.json");
@@ -53,6 +53,43 @@ describe("khive.repo.v1 browser contract", () => {
       value.graph.modules.items[0].source_path;
 
     expect(repoBundleSchema.safeParse(value).success).toBe(true);
+  });
+
+  it.each(["khive?module", "khive#module"])(
+    "rejects a module identifier a share link could not carry %j",
+    (id) => {
+      const value = goldenValue() as {
+        graph: { modules: { items: Array<{ id: string }> } };
+      };
+      value.graph.modules.items[0].id = id;
+
+      const parsed = repoBundleSchema.safeParse(value);
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) {
+        expect(
+          parsed.error.issues.some((issue) =>
+            issue.message.includes("URL delimiters")
+          ),
+        ).toBe(true);
+      }
+    },
+  );
+
+  it("appends a short id suffix to accessible labels only for shared source paths", () => {
+    const modules = [
+      { id: "khive:module:sha256:aaaa1111", source_path: "crates/a.rs" },
+      { id: "khive:module:sha256:bbbb2222", source_path: "crates/a.rs" },
+      { id: "khive:module:sha256:cccc3333", source_path: "crates/c.rs" },
+    ];
+    const byId = new Map(modules.map((module) => [module.id, module]));
+
+    expect(moduleInspectLabel(byId, modules[0])).toBe(
+      "Inspect crates/a.rs (aaaa1111)",
+    );
+    expect(moduleInspectLabel(byId, modules[1])).toBe(
+      "Inspect crates/a.rs (bbbb2222)",
+    );
+    expect(moduleInspectLabel(byId, modules[2])).toBe("Inspect crates/c.rs");
   });
 
   it("rejects duplicate module identifiers", () => {

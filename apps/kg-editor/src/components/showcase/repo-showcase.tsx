@@ -49,6 +49,7 @@ import type {
   RepoPage,
   ViewId,
 } from "@/lib/repo-bundle";
+import { moduleInspectLabel } from "@/lib/repo-bundle";
 import {
   parseRepositoryLocation,
   REPOSITORY_VIEW_IDS,
@@ -197,7 +198,7 @@ function ModuleInspectionControl({
       type="button"
       className={`repo-module-action ${className}`.trim()}
       data-module-id={moduleId}
-      aria-label={`Inspect ${moduleNode.source_path}`}
+      aria-label={moduleInspectLabel(moduleById, moduleNode)}
       aria-controls="repository-module-inspector"
       aria-pressed={selectedModuleId === moduleId}
       onClick={() => onInspectModule(moduleId)}
@@ -956,6 +957,7 @@ function HistoryFacet({
 
 function HistoryStructure({
   bundle,
+  moduleById,
   selectedModuleId,
   onInspectModule,
   onExploreStructure,
@@ -992,7 +994,7 @@ function HistoryStructure({
           <div className="repo-card-heading"><h3>{labels.node_types.module}</h3><p>{formatNumber(modules.length)}</p></div>
           <div className="repo-list">
             {modules.map((module) => (
-              <button type="button" data-module-id={module.id} aria-label={`Inspect ${module.source_path}`} aria-controls="repository-module-inspector" aria-pressed={selectedModuleId === module.id} className={`repo-list-row ${selectedModuleId === module.id ? "selected" : ""}`} key={module.id} onClick={() => { onInspectModule(module.id); setCommitSelection({ moduleId: module.id, commitId: "" }); }}>
+              <button type="button" data-module-id={module.id} aria-label={moduleInspectLabel(moduleById, module)} aria-controls="repository-module-inspector" aria-pressed={selectedModuleId === module.id} className={`repo-list-row ${selectedModuleId === module.id ? "selected" : ""}`} key={module.id} onClick={() => { onInspectModule(module.id); setCommitSelection({ moduleId: module.id, commitId: "" }); }}>
                 <Boxes aria-hidden="true" /><div><strong>{module.module_path}</strong><span>{module.source_path}</span></div>
               </button>
             ))}
@@ -1180,7 +1182,7 @@ function TreemapView({ bundle, moduleById, selectedModuleId, onInspectModule }: 
           const activity = row.recent_commit_count.status === "available" ? row.recent_commit_count.value : 0;
           const span = Math.min(6, Math.max(2, row.source_file_count));
           const moduleNode = moduleById.get(row.module_id);
-          return <div role="listitem" style={{ gridColumn: `span ${span}` }} key={row.module_id}>{moduleNode ? <button type="button" className={`repo-treemap-module ${activity > maxActivity * 0.55 ? "hot" : ""}`} data-module-id={row.module_id} aria-label={`Inspect ${moduleNode.source_path}`} aria-controls="repository-module-inspector" aria-pressed={selectedModuleId === row.module_id} onClick={() => onInspectModule(row.module_id)}><strong>{moduleNode.module_path}</strong><span>{labels.metrics.source_files}: {row.source_file_count}</span><span>{labels.metrics.recent_activity}: {availabilityText(row.recent_commit_count, labels, formatNumber)}</span></button> : <ModuleInspectionControl moduleId={row.module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} />}</div>;
+          return <div role="listitem" style={{ gridColumn: `span ${span}` }} key={row.module_id}>{moduleNode ? <button type="button" className={`repo-treemap-module ${activity > maxActivity * 0.55 ? "hot" : ""}`} data-module-id={row.module_id} aria-label={moduleInspectLabel(moduleById, moduleNode)} aria-controls="repository-module-inspector" aria-pressed={selectedModuleId === row.module_id} onClick={() => onInspectModule(row.module_id)}><strong>{moduleNode.module_path}</strong><span>{labels.metrics.source_files}: {row.source_file_count}</span><span>{labels.metrics.recent_activity}: {availabilityText(row.recent_commit_count, labels, formatNumber)}</span></button> : <ModuleInspectionControl moduleId={row.module_id} moduleById={moduleById} modulePage={bundle.graph.modules} selectedModuleId={selectedModuleId} onInspectModule={onInspectModule} />}</div>;
         })}
       </div>
       <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.structure_treemap.label} labels={labels} />
