@@ -1067,40 +1067,142 @@ fn acquire_database_gc_lock(database_path: Option<&Path>) -> StorageResult<Optio
     Ok(Some(lock_file))
 }
 
-fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
-    let mut out = Vec::new();
-    if !root.exists() {
-        return Ok(out);
+/// List non-dot entry names of an open directory descriptor via `fdopendir`
+/// on an INDEPENDENTLY reopened fd for the same directory (`openat(dir_fd,
+/// ".", O_NOFOLLOW)`, never `dup(dir_fd)`) — the caller's descriptor stays
+/// owned by the caller and, just as importantly, keeps its own read
+/// position. `dup` shares the underlying open file description, and with it
+/// the directory-stream position, with the fd it was duplicated from; a
+/// persisted, repeatedly-listed handle (like `FsBlobStore::root_handle`)
+/// would silently read as empty on its second call once a `dup`'d
+/// `fdopendir`/`readdir` pass had already driven that shared position to
+/// EOF. `openat(..., ".", ...)` yields a genuinely new open file
+/// description, so this listing never perturbs the position of `dir_fd`
+/// itself. `.`/`..` are excluded so a handle-relative walk built on this can
+/// never step to a directory's parent or re-enter itself.
+#[cfg(unix)]
+fn read_dir_names_no_follow(dir_fd: std::os::unix::io::RawFd) -> std::io::Result<Vec<String>> {
+    use std::os::unix::io::IntoRawFd;
+
+    let reopened = openat_dir_no_follow(dir_fd, ".")?;
+    // SAFETY: `reopened` was just opened above and is uniquely owned; its
+    // raw fd is handed to `fdopendir`, which takes ownership of it on
+    // success (and closes it via `closedir` below).
+    let owned_fd = reopened.into_raw_fd();
+    // SAFETY: `owned_fd` is valid and uniquely owned; `fdopendir` takes
+    // ownership of it on success.
+    let dirp = unsafe { libc::fdopendir(owned_fd) };
+    if dirp.is_null() {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: `owned_fd` is still owned by us since `fdopendir` failed.
+        unsafe { libc::close(owned_fd) };
+        return Err(err);
     }
-    for l1 in fs::read_dir(root)? {
-        let l1 = l1?;
-        if !l1.file_type()?.is_dir() {
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `dirp` is a valid, open `DIR*` for this whole loop.
+        let entry = unsafe { libc::readdir(dirp) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `d_name` is NUL-terminated, so its first byte is always
+        // in bounds; `.`/`..` (and any other dot-leading entry, e.g. an
+        // in-flight `.tmp-*` file or the root write-lock file) are rejected
+        // on this raw byte before any allocation happens for them.
+        let first = unsafe { *(*entry).d_name.as_ptr() };
+        if first == b'.' as libc::c_char {
             continue;
         }
-        for l2 in fs::read_dir(l1.path())? {
-            let l2 = l2?;
-            if !l2.file_type()?.is_dir() {
-                continue;
-            }
-            for entry in fs::read_dir(l2.path())? {
-                let entry = entry?;
-                if !entry.file_type()?.is_file() {
-                    continue;
-                }
-                // Non-hex names (in-flight `.tmp-*` files from a concurrent
-                // `put`, or anything else that landed under `root`) are
-                // silently skipped, never swept — orphan_sweep only ever acts
-                // on names that already round-trip through `ContentRef`.
-                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+        // SAFETY: `entry` is valid until the next `readdir`/`closedir`
+        // call; the name is copied out before either.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        names.push(name);
+    }
+    // SAFETY: `dirp` was successfully opened above and not yet closed.
+    unsafe { libc::closedir(dirp) };
+    Ok(names)
+}
+
+/// Enumerate orphan-sweep candidates and their mtimes entirely relative to
+/// the retained `root_handle` — no path is ever re-resolved from `root` for
+/// this walk, so a concurrent replacement of the root or a shard directory
+/// cannot redirect candidate enumeration or the mtime read used for
+/// `within_publish_grace` classification outside the retained root.
+///
+/// Each shard level is opened with `openat(..., O_NOFOLLOW)` relative to the
+/// previous, already-verified descriptor (same helpers `put`/`get`/`delete`
+/// use), so a symlink planted at either shard level is refused rather than
+/// followed and its contents skipped, never swept. A candidate's mtime is
+/// read via `fstat` on the handle returned by opening the leaf with
+/// `openat(..., O_NOFOLLOW)`, never via `fs::metadata` on a path. If the
+/// leaf cannot be opened as a verified regular file it is dropped entirely
+/// (nothing to protect — it is not a delete candidate); if it opens but its
+/// metadata/mtime cannot be read, it is kept as a candidate with an unknown
+/// mtime, which `within_publish_grace` treats as protected — the safe
+/// direction for a sweep that only ever destroys data.
+#[cfg(unix)]
+fn walk_blob_files_from_root_handle(
+    root_handle: &std::fs::File,
+) -> std::io::Result<Vec<(ContentRef, Option<SystemTime>)>> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut out = Vec::new();
+    for l1_name in read_dir_names_no_follow(root_handle.as_raw_fd())? {
+        let l1_dir = match openat_dir_no_follow(root_handle.as_raw_fd(), &l1_name) {
+            Ok(dir) => dir,
+            Err(_) => continue,
+        };
+        for l2_name in read_dir_names_no_follow(l1_dir.as_raw_fd())? {
+            let l2_dir = match openat_dir_no_follow(l1_dir.as_raw_fd(), &l2_name) {
+                Ok(dir) => dir,
+                Err(_) => continue,
+            };
+            for leaf_name in read_dir_names_no_follow(l2_dir.as_raw_fd())? {
+                // Non-hex names never round-trip through `ContentRef`;
+                // orphan_sweep only ever acts on names that do.
+                let Ok(content_ref) = ContentRef::from_hex(leaf_name.clone()) else {
                     continue;
                 };
-                if let Ok(content_ref) = ContentRef::from_hex(name) {
-                    out.push((content_ref, entry.path()));
+                #[cfg(test)]
+                if let Some(hook) = walk_leaf_sync_hook::take() {
+                    let _ = hook.reached.send(());
+                    let _ = hook.release.recv();
                 }
+                let file = match openat_regular_file_no_follow(
+                    l2_dir.as_raw_fd(),
+                    &leaf_name,
+                    libc::O_RDONLY,
+                ) {
+                    Ok(file) => file,
+                    Err(_) => continue,
+                };
+                let mtime = file.metadata().ok().and_then(|meta| meta.modified().ok());
+                out.push((content_ref, mtime));
             }
         }
     }
     Ok(out)
+}
+
+/// Non-Unix tier has no descriptor-relative directory-listing API in this
+/// codebase (see the equivalent fail-closed note on `unlink_blob_shard_file_no_follow`'s
+/// `not(any(unix, windows))` arm). Rather than fall back to path-based
+/// `fs::read_dir`/`fs::metadata` reads — which reintroduces exactly the
+/// TOCTOU this function exists to close — candidate enumeration refuses
+/// outright, and `transactional_orphan_sweep` surfaces that as a sweep
+/// failure instead of classifying anything.
+#[cfg(not(unix))]
+fn walk_blob_files_from_root_handle(
+    _root_handle: &std::fs::File,
+) -> std::io::Result<Vec<(ContentRef, Option<SystemTime>)>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "orphan sweep candidate enumeration requires descriptor-relative directory \
+         reads, available only on unix in this release; refusing to classify via \
+         path-based reads",
+    ))
 }
 
 /// Whether a candidate file is still inside its publish grace period and must
@@ -1110,15 +1212,16 @@ fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
 /// commits the `content_ref`) means a blob can be physically on disk with
 /// zero live references for a window entirely outside this store's control —
 /// the referencing write simply hasn't happened yet. A file whose mtime is
-/// younger than `grace_period` is therefore treated as not-yet-orphaned:
-/// `fs::metadata` failing to report an age (removed mid-scan, clock
-/// weirdness) is treated the same way (age unknown -> protect it), the safe
-/// direction for a sweep that only ever destroys data.
-fn within_publish_grace(path: &Path, now: SystemTime, grace_period: Duration) -> bool {
-    let age = fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|mtime| now.duration_since(mtime).ok());
+/// younger than `grace_period` is therefore treated as not-yet-orphaned: an
+/// unreadable mtime (removed mid-scan, clock weirdness) is treated the same
+/// way (age unknown -> protect it), the safe direction for a sweep that only
+/// ever destroys data.
+fn within_publish_grace(
+    mtime: Option<SystemTime>,
+    now: SystemTime,
+    grace_period: Duration,
+) -> bool {
+    let age = mtime.and_then(|mtime| now.duration_since(mtime).ok());
     match age {
         Some(age) => age < grace_period,
         None => true,
@@ -1134,15 +1237,15 @@ struct PreparedTransactionalSweep {
 /// Perform every filesystem-dependent part of candidate classification before
 /// SQLite's writer transaction opens.
 fn prepare_transactional_sweep(
-    files: Vec<(ContentRef, PathBuf)>,
+    files: Vec<(ContentRef, Option<SystemTime>)>,
     grace_period: Duration,
 ) -> PreparedTransactionalSweep {
     let now = SystemTime::now();
     let mut result = BlobOrphanSweepResult::default();
     let mut candidates = Vec::with_capacity(files.len());
-    for (content_ref, path) in files {
+    for (content_ref, mtime) in files {
         result.scanned += 1;
-        let within_grace = within_publish_grace(&path, now, grace_period);
+        let within_grace = within_publish_grace(mtime, now, grace_period);
         candidates.push((content_ref, within_grace));
     }
     PreparedTransactionalSweep { result, candidates }
@@ -2495,7 +2598,7 @@ impl BlobStore for FsBlobStore {
             let canonical_root = scan_root;
             let root_write_guard =
                 acquire_root_write_lock_anchored(&canonical_root, &scan_root_handle)?;
-            let candidates = walk_blob_files(&canonical_root)
+            let candidates = walk_blob_files_from_root_handle(&scan_root_handle)
                 .map_err(|e| map_io_err(e, "transactional_orphan_sweep_walk"))?;
             verify_blob_root_identity(&canonical_root, &scan_root_handle)
                 .map_err(|e| map_io_err(e, "transactional_orphan_sweep_root"))?;
@@ -2709,6 +2812,48 @@ mod sync_hook {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(&canonical)
             .and_then(VecDeque::pop_front)
+    }
+}
+
+/// Test-only, single-slot (not path-keyed) pause fired the next time the
+/// orphan-sweep walk is about to open a leaf candidate file in
+/// `walk_blob_files_from_root_handle`. Lets a test replace that exact
+/// on-disk leaf entry with a symlink to an outside decoy between candidate
+/// discovery and the handle-relative open/fstat that classifies it, proving
+/// the classification stays anchored to the opened handle rather than
+/// re-resolving a path.
+#[cfg(test)]
+mod walk_leaf_sync_hook {
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    pub(super) struct Hook {
+        pub(super) reached: Sender<()>,
+        pub(super) release: Receiver<()>,
+    }
+
+    fn slot() -> &'static StdMutex<Option<Hook>> {
+        static SLOT: OnceLock<StdMutex<Option<Hook>>> = OnceLock::new();
+        SLOT.get_or_init(|| StdMutex::new(None))
+    }
+
+    pub(super) fn install() -> (Receiver<()>, Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Hook {
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    pub(super) fn take() -> Option<Hook> {
+        slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -6055,4 +6200,154 @@ mod tests {
     // four `resolve_blob_root` env-precedence tests must not interleave under
     // the crate's default parallel test runner.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transactional_orphan_sweep_walk_ignores_a_leaf_swapped_for_an_outside_symlink_mid_scan(
+    ) {
+        // Regression for the PR #2201 review finding: the sweep's candidate
+        // walk and grace-period mtime read used to be two separate,
+        // path-based passes (`walk_blob_files` then `within_publish_grace`
+        // via `fs::metadata(path)`), neither pinned to the retained
+        // `root_handle`. A concurrent replacement of a leaf entry in the gap
+        // between those passes could make the mtime read observe a file
+        // OUTSIDE the retained root, letting a stale outside mtime evict the
+        // grace period for a freshly published in-root blob. The fix folds
+        // discovery and classification into one handle-relative
+        // openat(..., O_NOFOLLOW) + fstat in
+        // `walk_blob_files_from_root_handle`, so there is no later path
+        // re-resolution left to race. This test forces exactly that swap —
+        // via `walk_leaf_sync_hook`, between the leaf's hex-name discovery
+        // and its classifying open — and proves the outside decoy's stale
+        // mtime never reaches the sweep's counts.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = std::sync::Arc::new(crate::StorageBackend::sqlite(&db_path).unwrap());
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+
+        let root = dir.path().join("blobs");
+        let store = std::sync::Arc::new(
+            FsBlobStore::new(root.clone(), 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::from_secs(3600)),
+        );
+
+        // The one real, unreferenced candidate the sweep will discover. Its
+        // grace period is wide (1h) so correct handle-relative
+        // classification always protects it.
+        let real = store
+            .put(b"real freshly-published blob".to_vec())
+            .await
+            .unwrap();
+        let real_path = shard_path(&root, &real);
+
+        // Outside decoy sharing the SAME leaf name (content-ref hex), aged
+        // far past the grace period. If classification ever reads through
+        // a swapped symlink, the candidate looks like a stale, deletable
+        // orphan instead of a protected fresh publish.
+        let outside_dir = dir.path().join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let decoy_path = outside_dir.join(real.as_str());
+        fs::write(&decoy_path, b"outside decoy, must never be observed").unwrap();
+        let ancient = SystemTime::now() - Duration::from_secs(7200);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&decoy_path)
+            .unwrap()
+            .set_modified(ancient)
+            .unwrap();
+
+        let (reached, release) = walk_leaf_sync_hook::install();
+        let sweep = {
+            let store = store.clone();
+            let sql = backend.sql();
+            tokio::spawn(async move { store.transactional_orphan_sweep(sql.as_ref(), true).await })
+        };
+        assert!(
+            recv_blocking(reached).await,
+            "sweep walk must reach the leaf classification pause"
+        );
+
+        // Swap the real leaf out from under the paused walk: same name, now
+        // a symlink resolving outside the retained root.
+        fs::remove_file(&real_path).unwrap();
+        std::os::unix::fs::symlink(&decoy_path, &real_path).unwrap();
+
+        release.send(()).unwrap();
+        let result = sweep.await.unwrap().unwrap();
+
+        assert_eq!(
+            result.would_delete, 0,
+            "an outside decoy's stale mtime must never make an in-root candidate \
+             eligible for deletion: {result:?}"
+        );
+        assert_eq!(
+            result.grace_period_skipped, 0,
+            "the swapped leaf is a symlink; `openat(..., O_NOFOLLOW)` refuses it, so it \
+             must be dropped from candidates entirely rather than counted (real or \
+             outside) at all: {result:?}"
+        );
+        assert_eq!(
+            result.scanned, 0,
+            "the symlinked leaf must never be scanned as a candidate: {result:?}"
+        );
+
+        // Restore a real leaf and confirm the walk is not permanently wedged
+        // by the hook: an un-swapped root still finds and reports a real,
+        // grace-protected candidate normally.
+        fs::remove_file(&real_path).unwrap();
+        fs::write(&real_path, b"real freshly-published blob").unwrap();
+        let control = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            control.grace_period_skipped, 1,
+            "control: the un-replaced root must still classify the real candidate as \
+             grace-protected: {control:?}"
+        );
+        assert_eq!(control.would_delete, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transactional_orphan_sweep_walk_still_finds_a_real_orphan_past_its_grace_period() {
+        // Control for the swap test above, using an independent root (no
+        // hook installed): the handle-relative walk must still classify and
+        // report a genuine past-grace orphan as deletable, proving the fix
+        // narrows the walk to descriptor-relative reads without disabling
+        // orphan detection itself.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("khive.db");
+        let backend = crate::StorageBackend::sqlite(&db_path).unwrap();
+        {
+            let mut writer = backend.pool().writer().unwrap();
+            prepare_completed_v21_gc_fixture(writer.conn_mut());
+        }
+        let root = dir.path().join("blobs");
+        let store = FsBlobStore::new(root.clone(), 0)
+            .unwrap()
+            .with_orphan_sweep_grace(Duration::from_secs(60));
+
+        let orphan = store.put(b"aged real orphan".to_vec()).await.unwrap();
+        let path = shard_path(&root, &orphan);
+        let ancient = SystemTime::now() - Duration::from_secs(3600);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(ancient)
+            .unwrap();
+
+        let result = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.deleted, 1,
+            "a real orphan older than the grace period must still be swept: {result:?}"
+        );
+        assert!(!store.exists(&orphan).await.unwrap());
+    }
 }
