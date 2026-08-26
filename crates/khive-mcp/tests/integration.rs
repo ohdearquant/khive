@@ -4226,8 +4226,12 @@ fn actor_invalid_config_id_fails_at_load() {
     .unwrap();
 
     let err = KhiveConfig::load(Some(&path)).expect_err("invalid actor.id must fail at load");
+    let root = match &err {
+        ConfigError::InFile { source, .. } => source.as_ref(),
+        other => other,
+    };
     assert!(
-        matches!(err, ConfigError::InvalidActorId { .. }),
+        matches!(root, ConfigError::InvalidActorId { .. }),
         "expected ConfigError::InvalidActorId, got {err:?}"
     );
 }
@@ -4247,8 +4251,12 @@ fn actor_empty_string_id_fails_at_load() {
     .unwrap();
 
     let err = KhiveConfig::load(Some(&path)).expect_err("empty actor.id must fail at load");
+    let root = match &err {
+        ConfigError::InFile { source, .. } => source.as_ref(),
+        other => other,
+    };
     assert!(
-        matches!(err, ConfigError::InvalidActorId { .. }),
+        matches!(root, ConfigError::InvalidActorId { .. }),
         "expected ConfigError::InvalidActorId for empty string, got {err:?}"
     );
 }
