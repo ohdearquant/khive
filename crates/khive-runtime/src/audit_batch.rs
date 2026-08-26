@@ -163,8 +163,10 @@ pub enum AuditCommitOutcome {
 }
 
 /// Production-visible snapshot of [`AuditBatch::health_metrics`]. See there
-/// for field semantics; mirrors `khive_db::diagnostics::RuntimeAuditBatchMetrics`
-/// one-for-one so the registry owner can convert without loss.
+/// for field semantics. `khive_db::diagnostics::RuntimeAuditBatchMetrics` carries
+/// these three fields plus `admission_degraded_obligations`, which is sourced
+/// from a process-wide counter outside `AuditBatch` rather than from this
+/// struct — see `VerbRegistry::audit_batch_metrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditBatchHealthMetrics {
     pub flush_failures: u64,

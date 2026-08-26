@@ -265,6 +265,21 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
         "a queue-refusal degrade must count on its own dedicated counter, not \
          AUDIT_APPEND_FAILURES or AUDIT_OBLIGATION_APPEND_FAILURES"
     );
+    // The raw process-wide counter is an internal detail; what an operator
+    // actually reads is `db_diagnostics`, fed by `VerbRegistry::audit_batch_metrics()`
+    // (ADR-103 Amendment 3 / ADR-133 Amendment 1). Prove the threading, not
+    // just the counter increment: this assertion reddens if
+    // `RuntimeAuditBatchMetrics::admission_degraded_obligations` regresses to
+    // a hardcoded 0 or is dropped from the struct.
+    assert_eq!(
+        registry
+            .audit_batch_metrics()
+            .expect("event store configured, so the batch seam is too")
+            .admission_degraded_obligations,
+        audit_admission_degraded_obligation_count(),
+        "VerbRegistry::audit_batch_metrics() must surface the same admission-degraded count \
+         the production db_diagnostics verb reports"
+    );
 
     drop(occupant);
     drop(filler);

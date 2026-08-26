@@ -1323,6 +1323,13 @@ impl VerbRegistry {
     /// `KhiveRuntime::db_diagnostics_with_audit_metrics` so an operator can
     /// see flush failures and pure-observability degradation instead of the
     /// permanently-unavailable placeholder a bare `KhiveRuntime` reports.
+    ///
+    /// `admission_degraded_obligations` is sourced separately from
+    /// [`audit_admission_degraded_obligation_count`] rather than from
+    /// `batch.health_metrics()`: it counts a decision made in
+    /// `append_audit_event_best_effort` (ADR-103 Amendment 3 / ADR-133
+    /// Amendment 1), not a property of the batch itself, so it is process-wide
+    /// like the rest of this struct's fields rather than per-`AuditBatch`.
     pub fn audit_batch_metrics(&self) -> Option<khive_db::diagnostics::RuntimeAuditBatchMetrics> {
         self.audit_batch.as_ref().map(|batch| {
             let m = batch.health_metrics();
@@ -1330,6 +1337,7 @@ impl VerbRegistry {
                 flush_failures: m.flush_failures,
                 degraded_rows: m.degraded_rows,
                 degraded: m.degraded,
+                admission_degraded_obligations: audit_admission_degraded_obligation_count(),
             }
         })
     }
@@ -1390,6 +1398,17 @@ impl VerbRegistry {
     ///   also races admission pressure.
     /// - `db_diagnostics` may backfill WAL frames via a PASSIVE checkpoint
     ///   probe — physical I/O, not a pure in-memory read.
+    ///
+    /// What membership here means, precisely: the verb performs no domain
+    /// mutation, so its OWN per-dispatch audit/accounting row may be dropped
+    /// under transient admission pressure without the caller losing a
+    /// meaningful result (ADR-103 Amendment 3, ADR-133 Amendment 1). It does
+    /// NOT mean the handler is free of every event-plane write: `search`
+    /// still fires its own best-effort `SearchExecuted` telemetry, and
+    /// `context` still records a one-time `ConfigLocked` event, both on
+    /// independent code paths this mechanism never touches — those events
+    /// commit or fail on their own terms, unaffected by whether this
+    /// dispatch's own audit row degrades.
     ///
     /// Every entry here MUST be declared `VerbCategory::Assertive` in
     /// `khive-pack-kg/src/handler_defs.rs` — enforced by the
@@ -3409,8 +3428,12 @@ pub(crate) fn audit_obligation_append_failure_count() -> u64 {
 /// [`AUDIT_OBLIGATION_APPEND_FAILURES`] either — that counter's contract is
 /// "most call sites fold this failure into the dispatch's own error", which
 /// is exactly the propagation this admission-degrade path exists to avoid.
-/// Test-only reader for now: no production consumer reads it yet, but the
-/// mechanism tests need to observe it directly — including the
+/// Read in production by [`VerbRegistry::audit_batch_metrics`], which feeds
+/// it into `khive_db::diagnostics::RuntimeAuditBatchMetrics::admission_degraded_obligations`
+/// and from there into the `db_diagnostics` verb's
+/// `writer_contention.audit_admission_degraded_obligations` field (ADR-103
+/// Amendment 3) — an operator can read this counter without a test-only
+/// feature gate. The mechanism tests also read it directly, including the
 /// admission-pressure regression tests in `tests/read_verb_admission_exhaustion.rs`,
 /// which (like `khive-runtime/src/audit_batch.rs`'s own `test_internals`
 /// module) need it as `pub`, not `pub(crate)`, since they compile as a
@@ -3418,7 +3441,6 @@ pub(crate) fn audit_obligation_append_failure_count() -> u64 {
 static AUDIT_ADMISSION_DEGRADED_OBLIGATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(any(test, feature = "test-internals"))]
 pub fn audit_admission_degraded_obligation_count() -> u64 {
     AUDIT_ADMISSION_DEGRADED_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -3822,6 +3844,17 @@ pub(crate) mod tests {
     use crate::ActorRef;
     use khive_types::Pack;
 
+    /// Verbs known, by prior review (khive#2147/khive#2217 round 1), to have
+    /// their own accounting-bearing side effect despite being declared
+    /// `VerbCategory::Assertive` — see [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s
+    /// doc for why each is excluded. `VerbCategory::Assertive` alone cannot
+    /// distinguish these from a genuinely side-effect-free read (that is the
+    /// whole reason the allowlist exists instead of a bare category check),
+    /// so this denylist is the mechanizable guard against silently
+    /// reintroducing one of them: a category-only census would stay green if
+    /// either name were re-added to the allowlist.
+    const KNOWN_INCIDENTAL_WRITE_VERBS: &[&str] = &["memory.recall", "db_diagnostics"];
+
     /// khive-runtime links no real pack crates in its own test binary (see
     /// the comment on `CommProbeFactory` below), so
     /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`] cannot be checked
@@ -3832,6 +3865,21 @@ pub(crate) mod tests {
     /// `reclassify_from_live_source`. Every entry in the allowlist is
     /// currently declared in that one file; a verb from a different pack
     /// would need this scan extended to that pack's source first.
+    ///
+    /// This test proves category membership (`VerbCategory::Assertive`) and
+    /// non-membership in [`KNOWN_INCIDENTAL_WRITE_VERBS`]. It does NOT prove
+    /// general effect-purity: an Assertive handler may still emit its own
+    /// observability/config events on an independent, best-effort background
+    /// path (`search`'s `SearchExecuted` telemetry, `context`'s one-time
+    /// `ConfigLocked` event) that this test does not inspect and that this
+    /// PR's admission-degrade mechanism does not touch — those events commit
+    /// or fail on their own path regardless of what happens to this
+    /// dispatch's own audit row. Proving general effect-purity would require
+    /// an explicit per-handler effect/accounting capability tag, which is
+    /// out of scope here (see ADR-103 Amendment 3's "why this is accepted"
+    /// section); this census instead locks down the two properties that are
+    /// mechanizable today: declared category, and the one known-bad-name
+    /// regression class.
     #[test]
     fn admission_degrade_safe_verbs_are_registered_assertive() {
         let path = concat!(
@@ -3842,6 +3890,12 @@ pub(crate) mod tests {
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
 
         for verb in VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS {
+            assert!(
+                !KNOWN_INCIDENTAL_WRITE_VERBS.contains(verb),
+                "admission-degrade-safe verb {verb:?} is a known incidental-write verb \
+                 (khive#2147/khive#2217 round 1); it must not be re-added to \
+                 ADMISSION_DEGRADE_SAFE_VERBS even though it is VerbCategory::Assertive"
+            );
             // Anchored to exactly 8 leading spaces: that is the indentation
             // `HandlerDef { name: ... }` top-level fields use in this file,
             // versus 16 for a nested `ParamDef { name: ... }` — several

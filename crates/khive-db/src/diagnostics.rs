@@ -509,6 +509,19 @@ pub struct WriterContentionDiagnostics {
     pub audit_degraded: Option<bool>,
     /// Why `audit_degraded` is unavailable to this caller.
     pub audit_degraded_unavailable_reason: Option<String>,
+    /// Per-dispatch audit rows for an explicitly allowlisted, domain-write-free
+    /// read verb (`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`) whose commit was
+    /// skipped under transient audit-lane admission pressure — queue refusal or
+    /// the caller's admission-wait deadline expiring — while the dispatch still
+    /// reported its own successful result (ADR-103 Amendment 3, ADR-133
+    /// Amendment 1). This undercounts `brain.event_counts`'s cost totals for
+    /// exactly the rows counted here. Disjoint from `audit_degraded_rows`,
+    /// which counts pure-observability rows dropped for a different reason
+    /// (persistent commit failure, not admission pressure). `None` under the
+    /// same conditions as `audit_batch_flush_failures`.
+    pub audit_admission_degraded_obligations: Option<u64>,
+    /// Why `audit_admission_degraded_obligations` is unavailable to this caller.
+    pub audit_admission_degraded_obligations_unavailable_reason: Option<String>,
 }
 
 /// Process-wide audit-batch health counters, supplied by the runtime layer
@@ -524,6 +537,10 @@ pub struct RuntimeAuditBatchMetrics {
     pub degraded_rows: u64,
     /// Monotonic process-lifetime degradation flag.
     pub degraded: bool,
+    /// Admission-degrade-safe read verbs' audit rows dropped under transient
+    /// audit-lane admission pressure (ADR-103 Amendment 3, ADR-133
+    /// Amendment 1). Disjoint from `degraded_rows`.
+    pub admission_degraded_obligations: u64,
 }
 
 impl WriterContentionDiagnostics {
@@ -561,6 +578,12 @@ impl WriterContentionDiagnostics {
                 .flatten(),
             audit_degraded: runtime_audit_batch_metrics.map(|m| m.degraded),
             audit_degraded_unavailable_reason: runtime_audit_batch_metrics
+                .is_none()
+                .then(unavailable_reason)
+                .flatten(),
+            audit_admission_degraded_obligations: runtime_audit_batch_metrics
+                .map(|m| m.admission_degraded_obligations),
+            audit_admission_degraded_obligations_unavailable_reason: runtime_audit_batch_metrics
                 .is_none()
                 .then(unavailable_reason)
                 .flatten(),
@@ -1083,6 +1106,7 @@ mod tests {
                 flush_failures: 3,
                 degraded_rows: 7,
                 degraded: true,
+                admission_degraded_obligations: 5,
             }),
         )
         .await
@@ -1097,6 +1121,26 @@ mod tests {
             .is_none());
         assert_eq!(with_control.writer_contention.audit_degraded_rows, Some(7));
         assert_eq!(with_control.writer_contention.audit_degraded, Some(true));
+        assert_eq!(
+            with_control
+                .writer_contention
+                .audit_admission_degraded_obligations,
+            Some(5),
+            "an operator must be able to read the admission-degraded obligation count from \
+             db_diagnostics without a test-only feature gate (ADR-103 Amendment 3)"
+        );
+        assert!(with_control
+            .writer_contention
+            .audit_admission_degraded_obligations_unavailable_reason
+            .is_none());
+        assert!(without_control
+            .writer_contention
+            .audit_admission_degraded_obligations
+            .is_none());
+        assert!(without_control
+            .writer_contention
+            .audit_admission_degraded_obligations_unavailable_reason
+            .is_some());
 
         // Existing fields must be unaffected by the new ones — additive, not
         // a reshuffle.
