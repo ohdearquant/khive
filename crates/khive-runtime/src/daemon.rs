@@ -1636,9 +1636,23 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
     // same process, which would self-deadlock on `flock`.
     let _startup_lock = boot_guard;
 
-    if !cleanup_stale_daemon(&sock, &pid_file, allow_same_process_incumbent).await {
-        tracing::info!("a responsive khived is already running; exiting");
-        return Ok(());
+    if let Some(incumbent_pid) =
+        cleanup_stale_daemon(&sock, &pid_file, allow_same_process_incumbent).await
+    {
+        // #1874: a second daemon must refuse loudly (non-zero exit, pid named)
+        // rather than exit `Ok(())` — a silent success here is what let two
+        // detached daemons coexist on one store with neither side or its
+        // caller ever noticing.
+        tracing::error!(
+            pid = incumbent_pid,
+            socket = ?sock,
+            "refusing to start: a khived instance is already running"
+        );
+        anyhow::bail!(
+            "refusing to start: khived is already running as pid {incumbent_pid}, \
+             serving socket {}. Stop that instance first if you intend to replace it.",
+            sock.display()
+        );
     }
 
     let listener = UnixListener::bind(&sock)?;
@@ -1965,12 +1979,20 @@ fn pid_can_name_incumbent(pid: u32, current_pid: u32, allow_same_process_incumbe
     allow_same_process_incumbent || pid != current_pid
 }
 
+/// Check whether `pid_file`/`sock` already name a live, responsive daemon and,
+/// if not, remove the stale rendezvous files so the caller may bind fresh.
+///
+/// Returns `Some(pid)` when a live incumbent answered on `sock` — the caller
+/// must not clean up or bind, and must refuse to start rather than silently
+/// deferring (#1874: a quiet `Ok(())` here is exactly what let two detached
+/// daemons coexist on one store). Returns `None` when the rendezvous was
+/// stale (or absent) and has been cleared, so the caller may proceed.
 #[cfg(unix)]
 async fn cleanup_stale_daemon(
     sock: &std::path::Path,
     pid_file: &std::path::Path,
     allow_same_process_incumbent: bool,
-) -> bool {
+) -> Option<u32> {
     if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             if pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
@@ -1978,7 +2000,7 @@ async fn cleanup_stale_daemon(
                 && sock.exists()
                 && UnixStream::connect(sock).await.is_ok()
             {
-                return false;
+                return Some(pid);
             }
         }
     }
@@ -1992,7 +2014,7 @@ async fn cleanup_stale_daemon(
             tracing::warn!(error = %e, path = ?pid_file, "failed to remove stale PID file");
         }
     }
-    true
+    None
 }
 
 /// Create `pid_file` exclusively (`O_EXCL`) and write this process's PID.
