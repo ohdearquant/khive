@@ -39,14 +39,15 @@ use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 use khive_db::stores::attachment::delete_record_attachments_statement;
 use khive_db::stores::entity::{
-    entity_hard_delete_statement, entity_soft_delete_statement, entity_upsert_statement,
+    entity_hard_delete_statement, entity_replace_if_unchanged_statement,
+    entity_soft_delete_statement, entity_upsert_statement,
 };
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{
     edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
-    edge_soft_delete_statement, edge_symmetric_absorb_or_update_inplace_statement,
-    edge_symmetric_delete_if_conflict_statement, edge_upsert_statement,
+    edge_replace_if_unchanged_statement, edge_soft_delete_statement,
+    edge_symmetric_absorb_or_update_inplace_statement, edge_symmetric_delete_if_conflict_statement,
     purge_incident_edges_statement,
 };
 use khive_db::stores::note::{
@@ -884,10 +885,14 @@ pub async fn prepare_update_entity_plan(
     id: Uuid,
     patch: crate::curation::EntityPatch,
 ) -> RuntimeResult<AtomicOpPlan> {
-    let (entity, reindex_required, changed_fields) =
+    let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
         runtime.prepare_update_entity(token, id, patch).await?;
     let mut statements = vec![PlanStatement {
-        statement: entity_upsert_statement(&entity),
+        statement: entity_replace_if_unchanged_statement(
+            &entity,
+            expected_updated_at,
+            expected_deleted_at,
+        ),
         guard: Some(AffectedRowGuard::exactly(1)),
     }];
     statements.extend(event_append_statements(
@@ -941,6 +946,9 @@ async fn prepare_update_edge(
     args: &Value,
 ) -> RuntimeResult<AtomicOpPlan> {
     reject_inapplicable_update_fields(args, "edge")?;
+
+    let expected_updated_at = edge.updated_at;
+    let expected_deleted_at = edge.deleted_at;
 
     let relation_raw = optional_str(args, "relation");
     let weight = optional_f64(args, "weight")?;
@@ -1041,11 +1049,18 @@ async fn prepare_update_edge(
             relation: edge.relation,
         });
     } else {
-        // Non-symmetric: bit-for-bit the same builder `graph.upsert_edge`
-        // calls — see doc comment above.
+        // Non-symmetric: guarded replace of the read snapshot rather than
+        // `graph.upsert_edge`'s unconditional natural-key upsert — a zero
+        // affected-row result now means a concurrent writer moved this edge
+        // between PREPARE and commit, and the atomic unit must roll back
+        // instead of silently overwriting it.
         edge.updated_at = now;
         statements.push(PlanStatement {
-            statement: edge_upsert_statement(&edge),
+            statement: edge_replace_if_unchanged_statement(
+                &edge,
+                expected_updated_at,
+                expected_deleted_at,
+            ),
             guard: Some(AffectedRowGuard::exactly(1)),
         });
     }
@@ -3406,6 +3421,173 @@ mod tests {
         let events =
             events_for_target(&runtime, &token, requested_id, EventKind::EdgeUpdated).await;
         assert_eq!(events.len(), 1);
+    }
+
+    /// Regression for khive #1753: an entity atomic update plan is prepared
+    /// from one revision, a concurrent (out-of-plan) writer advances the row
+    /// past that revision before the plan commits, and the plan's guarded
+    /// `entity_replace_if_unchanged_statement` must then affect zero rows —
+    /// which `AffectedRowGuard::exactly(1)` must turn into a whole-unit
+    /// rollback, not a silent overwrite of the concurrent writer's change.
+    /// Before threading the expected revision into the plan's `WHERE`
+    /// predicate, this plan used the unconditional `entity_upsert_statement`,
+    /// which always affects exactly 1 row regardless of staleness — the
+    /// guard could never fire and this test would redden (the outcome would
+    /// be `Committed`, and the concurrent writer's `name` change would be
+    /// lost under the stale plan's `description`-only patch).
+    #[tokio::test]
+    async fn atomic_entity_update_plan_stale_revision_rolls_back_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entity = runtime
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "StaleEntityPlanTarget",
+                None,
+                Some(json!({"a": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        // PREPARE time: build the plan from the current (soon-to-be-stale)
+        // revision.
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": id.to_string(), "description": "from the stale plan"}),
+            None,
+        )
+        .await
+        .expect("prepare update entity plan");
+
+        // A concurrent writer commits BEFORE the plan runs, advancing the
+        // row's revision past what the plan's guard expects.
+        runtime
+            .update_entity(
+                &token,
+                id,
+                crate::curation::EntityPatch {
+                    name: Some("ConcurrentWriterWon".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("concurrent writer update");
+
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("the seam call itself must not error; the unit rolls back cleanly");
+        match outcome {
+            crate::atomic_runner::AtomicRunOutcome::RolledBack {
+                failed_op_index, ..
+            } => {
+                assert_eq!(
+                    failed_op_index, 0,
+                    "the sole op's guard must be the one that fails"
+                );
+            }
+            other => panic!(
+                "a stale entity plan must roll back, not silently overwrite the concurrent \
+                 writer's change: {other:?}"
+            ),
+        }
+
+        let after = runtime.get_entity(&token, id).await.expect("get_entity");
+        assert_eq!(
+            after.name, "ConcurrentWriterWon",
+            "the concurrent writer's committed name must survive the rolled-back stale plan"
+        );
+        assert_eq!(
+            after.description, None,
+            "the stale plan's description patch must NOT have landed"
+        );
+    }
+
+    /// Edge counterpart of `atomic_entity_update_plan_stale_revision_rolls_back_unit`:
+    /// a non-symmetric edge atomic update plan prepared from one revision
+    /// must roll back the whole unit when a concurrent writer advances the
+    /// row first, rather than silently overwriting that writer's change.
+    #[tokio::test]
+    async fn atomic_edge_update_plan_stale_revision_rolls_back_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "StaleEdgePlanA");
+        let b = khive_storage::Entity::new("local", "concept", "StaleEdgePlanB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        let edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .expect("seed edge");
+        let edge_id = Uuid::from(edge.id);
+
+        // PREPARE time: build the plan from the current (soon-to-be-stale)
+        // revision.
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": edge_id.to_string(), "properties": {"note": "from the stale plan"}}),
+            None,
+        )
+        .await
+        .expect("prepare update edge plan");
+
+        // A concurrent writer commits BEFORE the plan runs, advancing the
+        // row's revision past what the plan's guard expects.
+        runtime
+            .update_edge(
+                &token,
+                edge_id,
+                crate::curation::EdgePatch {
+                    weight: Some(0.75),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("concurrent writer update");
+
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("the seam call itself must not error; the unit rolls back cleanly");
+        match outcome {
+            crate::atomic_runner::AtomicRunOutcome::RolledBack {
+                failed_op_index, ..
+            } => {
+                assert_eq!(
+                    failed_op_index, 0,
+                    "the sole op's guard must be the one that fails"
+                );
+            }
+            other => panic!(
+                "a stale edge plan must roll back, not silently overwrite the concurrent \
+                 writer's change: {other:?}"
+            ),
+        }
+
+        let after = runtime
+            .get_edge(&token, edge_id)
+            .await
+            .expect("get_edge")
+            .expect("edge still exists");
+        assert!(
+            (after.weight - 0.75).abs() < 0.001,
+            "the concurrent writer's committed weight must survive the rolled-back stale plan: {after:?}"
+        );
+        assert!(
+            after.metadata.is_none(),
+            "the stale plan's properties patch must NOT have landed: {after:?}"
+        );
     }
 
     /// A soft-deleted surviving canonical row must not be resurrected by a

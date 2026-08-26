@@ -5666,6 +5666,8 @@ impl KhiveRuntime {
             .get_edge(LinkId::from(edge_id))
             .await?
             .ok_or_else(|| crate::RuntimeError::NotFound(format!("edge {edge_id}")))?;
+        let expected_updated_at = edge.updated_at;
+        let expected_deleted_at = edge.deleted_at;
 
         // After fetching, all mutations and validation must use the
         // RECORD's namespace, not the caller's.  Derive record_tok from the stored edge
@@ -5809,10 +5811,21 @@ impl KhiveRuntime {
                 edge.target_id = canon_tgt;
             }
         } else {
-            // Non-symmetric: upsert_edge takes namespace from edge.namespace (not from the
-            // graph store's routing namespace), so this is already record-namespace correct.
-            // `graph` is already self.graph(&record_tok)?.
-            graph.upsert_edge(edge.clone()).await?;
+            // Non-symmetric: replace_edge_if_unchanged takes namespace from edge.namespace
+            // (not from the graph store's routing namespace), so this is already
+            // record-namespace correct. `graph` is already self.graph(&record_tok)?.
+            // Guarded on the fetched snapshot's revision — a concurrent writer that moved
+            // this edge between the fetch above and this write must be refused, not
+            // silently overwritten by a full-row replacement derived from stale state.
+            // `updated_at` must advance past the snapshot: the guard requires the
+            // replacement revision to be strictly greater than the persisted one.
+            edge.updated_at = chrono::Utc::now();
+            let persisted = graph
+                .replace_edge_if_unchanged(edge.clone(), expected_updated_at, expected_deleted_at)
+                .await?;
+            if !persisted {
+                return Err(crate::curation::stale_edge_snapshot_error(edge_id));
+            }
         }
 
         // Audit event: use the record's namespace (record_ns) for the event payload.
@@ -6904,6 +6917,92 @@ mod tests {
             .await
             .unwrap();
         assert!((updated.weight - 0.5).abs() < 0.001);
+    }
+
+    /// Regression for the non-symmetric edge lost-update race (khive #1753).
+    /// Two readers fetch the SAME edge revision (nothing else writes between
+    /// these two `get_edge` calls, so this is a deterministic "two reads from
+    /// one revision", not a timing assumption), each derives an independent
+    /// patch (weight vs. metadata), and the two writes commit in a fixed
+    /// order. Before the guarded `replace_edge_if_unchanged` primitive,
+    /// `update_edge`'s non-symmetric branch called the unconditional
+    /// `graph.upsert_edge`, so both commits "succeeded" and B's write
+    /// silently discarded A's weight change. This reddens if the
+    /// `updated_at = ?11 AND deleted_at IS ?12 AND ?6 > updated_at` predicate
+    /// is dropped from `edge_replace_if_unchanged_statement`: B's write would
+    /// then also return `true` and A's weight update would be lost.
+    #[tokio::test]
+    async fn concurrent_edge_patches_from_one_revision_only_one_survives() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.5, None)
+            .await
+            .unwrap();
+        let edge_id: Uuid = edge.id.into();
+
+        let graph = rt.graph(&tok).expect("graph store");
+        let snapshot_for_a = graph
+            .get_edge(LinkId::from(edge_id))
+            .await
+            .unwrap()
+            .expect("edge exists");
+        let snapshot_for_b = graph
+            .get_edge(LinkId::from(edge_id))
+            .await
+            .unwrap()
+            .expect("edge exists");
+        assert_eq!(
+            snapshot_for_a.updated_at, snapshot_for_b.updated_at,
+            "both readers must observe the same pre-write revision for this to be a real race"
+        );
+        let expected_updated_at = snapshot_for_a.updated_at;
+        let expected_deleted_at = snapshot_for_a.deleted_at;
+
+        let mut edge_a = snapshot_for_a;
+        edge_a.weight = 0.9;
+        edge_a.updated_at = expected_updated_at + chrono::Duration::microseconds(1);
+
+        let mut edge_b = snapshot_for_b;
+        edge_b.metadata = Some(serde_json::json!({"note": "from B"}));
+        edge_b.updated_at = expected_updated_at + chrono::Duration::microseconds(1);
+
+        assert!(
+            graph
+                .replace_edge_if_unchanged(edge_a, expected_updated_at, expected_deleted_at)
+                .await
+                .expect("writer A CAS query"),
+            "the first committer from a shared revision must win"
+        );
+        assert!(
+            !graph
+                .replace_edge_if_unchanged(edge_b, expected_updated_at, expected_deleted_at)
+                .await
+                .expect("writer B CAS query"),
+            "the second committer from the SAME stale revision must be refused, not merged"
+        );
+
+        let final_edge = graph
+            .get_edge(LinkId::from(edge_id))
+            .await
+            .unwrap()
+            .expect("edge still exists");
+        assert!(
+            (final_edge.weight - 0.9).abs() < 0.001,
+            "writer A's weight change must survive: {final_edge:?}"
+        );
+        assert!(
+            final_edge.metadata.is_none(),
+            "writer B's metadata must not be silently merged into the persisted row: {final_edge:?}"
+        );
     }
 
     /// `updated_at` on this path must use `timestamp_micros()`, matching every other

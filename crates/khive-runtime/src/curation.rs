@@ -31,6 +31,18 @@ pub(crate) fn stale_note_snapshot_error(id: Uuid) -> RuntimeError {
     )))
 }
 
+pub(crate) fn stale_entity_snapshot_error(id: Uuid) -> RuntimeError {
+    RuntimeError::Khive(KhiveError::conflict(format!(
+        "entity {id} changed concurrently after it was read; retry with fresh state"
+    )))
+}
+
+pub(crate) fn stale_edge_snapshot_error(id: Uuid) -> RuntimeError {
+    RuntimeError::Khive(KhiveError::conflict(format!(
+        "edge {id} changed concurrently after it was read; retry with fresh state"
+    )))
+}
+
 /// Immutable embedding-registry view for one logical write.
 ///
 /// Document byte budgets are derived from the model name at the embedding seam,
@@ -835,7 +847,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
         patch: EntityPatch,
-    ) -> RuntimeResult<(Entity, bool, Vec<&'static str>)> {
+    ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref name) = patch.name {
             crate::secret_gate::check(name)?;
@@ -854,6 +866,8 @@ impl KhiveRuntime {
             .get_entity(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
+        let expected_updated_at = entity.updated_at;
+        let expected_deleted_at = entity.deleted_at;
 
         // ADR-014 tri-state: outer `None` = unchanged; `Some(None)` = explicit
         // clear (no vocabulary validation — there is no value to validate);
@@ -900,7 +914,13 @@ impl KhiveRuntime {
         }
 
         entity.updated_at = chrono::Utc::now().timestamp_micros();
-        Ok((entity, reindex_required, changed_fields))
+        Ok((
+            entity,
+            reindex_required,
+            changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+        ))
     }
 
     pub async fn update_entity(
@@ -921,11 +941,16 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
-        let (entity, reindex_required, changed_fields) =
+        let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
             self.prepare_update_entity(token, id, patch).await?;
 
         let store = self.entities(token)?;
-        store.upsert_entity(entity.clone()).await?;
+        let persisted = store
+            .replace_entity_if_unchanged(entity.clone(), expected_updated_at, expected_deleted_at)
+            .await?;
+        if !persisted {
+            return Err(stale_entity_snapshot_error(id));
+        }
 
         let embedding_report = if reindex_required {
             self.reindex_entity(token, &entity).await?
@@ -3616,6 +3641,8 @@ pub(crate) fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usiz
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
     use khive_storage::types::{Direction, TextFilter, TextQueryMode, TextSearchRequest};
@@ -4017,7 +4044,13 @@ mod tests {
             .await
             .unwrap();
 
-        let (prepared, reindex_required, changed_fields) = rt
+        let (
+            prepared,
+            reindex_required,
+            changed_fields,
+            _expected_updated_at,
+            _expected_deleted_at,
+        ) = rt
             .prepare_update_entity(
                 &tok,
                 entity.id,
@@ -4055,6 +4088,110 @@ mod tests {
             .await
             .expect_err("unregistered entity_type must be rejected");
         assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+    }
+
+    /// Regression for the entity lost-update race (khive #1753): two writers
+    /// read the same entity revision, then commit successive patches to
+    /// independent properties fields. Before the guarded
+    /// `replace_entity_if_unchanged` primitive, `update_entity_with_embedding_report`
+    /// wrote an unconditional `entity_upsert_statement`, so both patches
+    /// "succeeded" and the second silently discarded the first's field
+    /// (`a=1` was overwritten back to `a=0` when B's stale full-row replace
+    /// landed). This test forces the interleaving with a `Barrier` — both
+    /// readers are released together, so both `prepare_update_entity` calls
+    /// observe the SAME pre-write revision (asserted below) — then commits
+    /// deterministically in a fixed A-then-B order. It reddens if the
+    /// `AND ?8 > updated_at` / `updated_at = ?13` predicate is dropped from
+    /// `entity_replace_if_unchanged_statement`: with an unconditional UPDATE
+    /// (or `entity_upsert_statement`), B's write would also return `true`
+    /// and `b` would be lost from the final properties.
+    #[tokio::test]
+    async fn concurrent_entity_property_patches_from_one_revision_only_one_survives() {
+        let rt = Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "RaceTarget",
+                None,
+                Some(serde_json::json!({"a": 0, "b": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let reader_a = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                rt.prepare_update_entity(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"a": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            })
+        };
+        let reader_b = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                rt.prepare_update_entity(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"b": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            })
+        };
+
+        let (entity_a, _, _, expected_updated_at_a, expected_deleted_at_a) =
+            reader_a.await.unwrap().expect("reader A prepares");
+        let (entity_b, _, _, expected_updated_at_b, expected_deleted_at_b) =
+            reader_b.await.unwrap().expect("reader B prepares");
+        assert_eq!(
+            expected_updated_at_a, expected_updated_at_b,
+            "both readers must observe the same pre-write revision for this to be a real race"
+        );
+
+        let store = rt.entities(&tok).expect("entity store");
+        assert!(
+            store
+                .replace_entity_if_unchanged(entity_a, expected_updated_at_a, expected_deleted_at_a)
+                .await
+                .expect("writer A CAS query"),
+            "the first committer from a shared revision must win"
+        );
+        assert!(
+            !store
+                .replace_entity_if_unchanged(entity_b, expected_updated_at_b, expected_deleted_at_b)
+                .await
+                .expect("writer B CAS query"),
+            "the second committer from the SAME stale revision must be refused, not merged"
+        );
+
+        let final_entity = rt.get_entity(&tok, id).await.expect("read final entity");
+        assert_eq!(
+            final_entity.properties,
+            Some(serde_json::json!({"a": 1, "b": 0})),
+            "writer B's field must not be silently merged into the persisted row: {:?}",
+            final_entity.properties
+        );
     }
 
     #[tokio::test]
