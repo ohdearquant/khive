@@ -29,6 +29,10 @@ use serial_test::serial;
 
 struct FakeStore {
     fail_next: AtomicUsize,
+    /// Armed N times: the next N `append_events_idempotent` calls fail with
+    /// `StorageError::Pool` — the shape the ADR-170 forwarding lane reports
+    /// for an unreachable events daemon.
+    fail_pool_next: AtomicUsize,
     calls: AtomicU64,
     rows: Mutex<Vec<Event>>,
     /// Armed once: the next `append_events_idempotent` call commits its rows
@@ -42,6 +46,7 @@ impl FakeStore {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             fail_next: AtomicUsize::new(0),
+            fail_pool_next: AtomicUsize::new(0),
             calls: AtomicU64::new(0),
             rows: Mutex::new(Vec::new()),
             ambiguous_ack_once: std::sync::atomic::AtomicBool::new(false),
@@ -98,6 +103,13 @@ impl EventStore for FakeStore {
         if self.fail_next.load(Ordering::SeqCst) > 0 {
             self.fail_next.fetch_sub(1, Ordering::SeqCst);
             return Err(StorageError::WriterTaskBusy { timeout_ms: 1 });
+        }
+        if self.fail_pool_next.load(Ordering::SeqCst) > 0 {
+            self.fail_pool_next.fetch_sub(1, Ordering::SeqCst);
+            return Err(StorageError::Pool {
+                operation: "append_events_idempotent".into(),
+                message: "events daemon unreachable (simulated transient outage)".into(),
+            });
         }
         let ambiguous = self
             .ambiguous_ack_once
@@ -301,6 +313,29 @@ async fn d1_retry_table_uses_typed_request_state() {
         store.calls.load(Ordering::SeqCst),
         2,
         "one failure then one successful retry"
+    );
+}
+
+/// A transient forwarding failure (`StorageError::Pool`, the shape the
+/// ADR-170 events-daemon lane reports while the daemon restarts) must use the
+/// configured bounded retries, not abandon the generation on first failure.
+#[serial]
+#[tokio::test]
+async fn d1_transient_forwarding_failure_is_retried_not_terminal() {
+    let store = FakeStore::new();
+    store.fail_pool_next.store(1, Ordering::SeqCst);
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let outcome = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(outcome, Ok(AuditCommitOutcome::Committed));
+    assert_eq!(
+        store.calls.load(Ordering::SeqCst),
+        2,
+        "one transient Pool failure then one successful retry"
     );
 }
 
