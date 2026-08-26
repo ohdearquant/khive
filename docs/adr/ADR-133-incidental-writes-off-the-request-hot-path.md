@@ -609,3 +609,50 @@ at the production seam.
 
 **Sample audit events.** Rejected: sampling changes what the audit trail means, and under ADR-103
 it would change what usage gets accounted.
+
+## Amendment 1 (2026-08-26): A Named, Bounded Exception to D4/INV-1 for Admission-Pressure Reads
+
+**Status**: Accepted, implemented alongside PR #2228 (khive#2147/khive#2217/khive#2208).
+
+D2 states: _"A dispatch must not report success when the record that accounts for, authorizes, or
+audits it did not commit"_ (`ADR-133:297-298`), and D4/INV-1 states the same as a system-wide
+invariant: _"Accounting-, authorization-, and security-audit-bearing records are written exactly
+once: never dropped, never volatile at return, never falsely acknowledged, never duplicated"_
+(`ADR-133:436-438`), with failure mode 3 named explicitly as _"Falsely acknowledged — the operation
+reports success when the record did not commit"_ (`ADR-133:375`).
+
+This amendment qualifies both sentences for one narrow, named case: the eleven read verbs on
+`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` (`crates/khive-runtime/src/pack.rs`; the full list and
+rationale are in ADR-103 Amendment 3), and only when the row's own commit did not happen because
+the audit lane's admission was transiently exhausted or the caller's bounded wait for it elapsed —
+`AuditTerminalReason::QueueAdmissionExhausted` or `AdmissionDeadlineExpired`, never a persistent
+commit failure. For that verb set and those two terminal reasons, the dispatch reports its
+already-computed successful read result while its own audit/accounting row is dropped best-effort.
+This is exactly failure mode 3 (falsely acknowledged) for an accounting-bearing row, deliberately
+permitted for this bounded case.
+
+**Why this is a scoped exception and not a reopening of D4/INV-1 generally:**
+
+- It applies to reads only. A read verb performs no domain write; the value being protected by
+  D2's "must not report success" rule is the accounting record of work already done, not
+  correctness of a mutation. Losing that accounting record loses a count, not state.
+- It applies to two specific terminal reasons, not persistent store failure. A persistently
+  failing store still fails these dispatches exactly as D2 requires for any other
+  accounting-bearing row — the exception exists only for the audit lane's own transient
+  admission pressure, not for durability loss.
+- It is opt-in per verb, fail-closed by default (`VerbRegistry::admission_degrade_safe`): an
+  unclassified or newly added Assertive handler is NOT eligible until someone deliberately reviews
+  it and adds it to the allowlist, preserving D5/INV-2's "unclassified resolves to the stricter
+  handling" posture for everything not on the list.
+- The resulting loss is counted, not silent — see ADR-103 Amendment 3's diagnostics requirement.
+
+**What does not change:** D4/INV-1 continues to hold without qualification for every write, every
+non-allowlisted Assertive handler, gate-denial rows, unknown-verb rows, and `git.digest` receipts.
+D2's "must not report success" sentence is unqualified for a persistent commit failure on any row,
+including the eleven allowlisted verbs — the exception is admission pressure specifically, not
+store failure generally.
+
+This amendment does not revisit "Split the audit row so accounting lives in its own record" from
+Alternatives considered above — that remains rejected for the reasons stated there (a migration,
+and it breaks the response/audit-payload identity property). The accepted trade here is a bounded,
+measured undercount over that redesign.

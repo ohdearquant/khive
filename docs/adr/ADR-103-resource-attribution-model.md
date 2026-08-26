@@ -887,3 +887,56 @@ accepted placement for future implementation, not a shipped operator knob.
 - Neutral: `work_class`, quota mechanism, phase-span events, and the staged landing
   plan are all unchanged; the response-envelope addition is additive for tolerant
   JSON consumers (Part 3's scoped compatibility statement).
+
+## Amendment 3 (2026-08-26): Admission-Pressure Read-Cost Undercount for an Explicit Allowlist
+
+**Status**: Accepted, implemented alongside PR #2228 (khive#2147/khive#2217/khive#2208).
+
+Decision (b) established that accounting rides the per-dispatch audit row: `resource.cost_unit`
+lives in the same `EventKind::Audit` row the dispatch's own audit obligation writes
+(`ADR-103:127-152`), and Consequences already states that row "is the daemon's default
+construction" with no second row (`ADR-103:401-406`). This amendment narrows what "the row
+commits" guarantees for one bounded case: transient admission pressure on the audit lane
+itself, for a fixed, named set of read verbs.
+
+### The narrowed guarantee
+
+Under audit-lane admission pressure — `AuditTerminalReason::QueueAdmissionExhausted` (the row was
+refused before it could be enqueued) or `AuditTerminalReason::AdmissionDeadlineExpired` (the
+caller's bounded wait for the row's commit elapsed while the row was still pending or in-flight) —
+the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`
+(`crates/khive-runtime/src/pack.rs`: `get`, `list`, `stats`, `search`, `neighbors`, `traverse`,
+`context`, `query`, `resolve`, `whoami`, `verbs`) may be dropped best-effort instead of failing the
+dispatch. The caller still receives the read's successful result.
+
+**Consequence, stated precisely:** `brain.event_counts`'s `total_cost_unit` and
+`cost_unit_by_verb` aggregation (Amendment 1) undercount those eleven verbs by the `cost_unit` of
+every row dropped this way. The loss is:
+
+- **Bounded to the allowlisted verb set.** No other Assertive handler, and no write of any kind,
+  is affected — see "What does not change" below.
+- **Bounded to transient audit-lane admission pressure**, not persistent store failure. A
+  persistent commit failure for one of these rows is unaffected by this amendment and is handled
+  exactly as any other row of its class.
+- **Counted and exported**, not silent. Every drop increments a dedicated process-wide counter
+  (`AUDIT_ADMISSION_DEGRADED_OBLIGATIONS` in `crates/khive-runtime/src/pack.rs`) that is threaded
+  through `VerbRegistry::audit_batch_metrics()` into
+  `khive_db::diagnostics::WriterContentionDiagnostics::audit_admission_degraded_obligations`,
+  visible on the `db_diagnostics` verb — an operator can read the undercount directly instead of
+  inferring it from a cost-total discrepancy.
+
+### What does not change
+
+Writes and every Assertive handler NOT on the allowlist keep hard-fail semantics: a persistent or
+admission-pressure commit failure on their audit row still fails the dispatch. This amendment does
+not touch `DispatchFailed`, `DispatchObligation` rows for write verbs, gate-denial rows,
+unknown-verb rows, or `git.digest` receipts — all of those remain obligation-bearing with no
+degradation path.
+
+### Why this is accepted rather than fixed by splitting the row
+
+The alternative — a dedicated accounting row separate from the read-observability row — was
+considered and rejected for this PR as new storage-and-plumbing machinery. See the companion
+amendment in `docs/adr/ADR-133-incidental-writes-off-the-request-hot-path.md` ("Amendment 1") for
+the corresponding narrowing of that record's D4/INV-1 language, which this same PR's change
+requires.
