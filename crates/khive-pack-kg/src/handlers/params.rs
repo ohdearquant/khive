@@ -120,6 +120,11 @@ pub struct UpdateParams {
     pub(crate) decay_factor: Option<Option<f64>>,
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
+    /// ADR-014 tri-state: absent = unchanged, JSON `null` = explicit clear,
+    /// string = set (validated against the kind's registered vocabulary).
+    /// Same `Option<Option<T>>` shape as `salience`/`decay_factor` above.
+    #[serde(default, deserialize_with = "tri_string")]
+    pub(crate) entity_type: Option<Option<String>>,
     pub(crate) relation: Option<String>,
     pub(crate) weight: Option<f64>,
     pub(crate) entity_kind: Option<Value>,
@@ -303,5 +308,15 @@ pub(crate) struct ResolveParams {
 }
 
 pub(crate) fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
+    Ok(Some(Option::deserialize(d)?))
+}
+
+/// String analog of [`tri_f64`] (ADR-014 patch-style updates): with the
+/// struct-level `#[serde(default)]`, an absent key deserializes to `None`
+/// (leave unchanged) while a present key keeps its `null`/value distinction
+/// as `Some(None)` (explicit clear) / `Some(Some(s))` (set).
+pub(crate) fn tri_string<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<String>>, D::Error> {
     Ok(Some(Option::deserialize(d)?))
 }

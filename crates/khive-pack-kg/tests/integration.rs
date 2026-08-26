@@ -4093,6 +4093,478 @@ async fn update_entity_without_kind_resolves_from_uuid() {
     );
 }
 
+/// A property-only historical type can be promoted into the indexed
+/// `entity_type` column without replacing any unrelated entity fields.
+#[tokio::test]
+async fn update_entity_type_promotes_property_type_into_typed_listing() {
+    let pack = pack();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "name": "HistoricalAlgorithm",
+                "description": "predates the entity_type column",
+                "properties": {"type": "algorithm", "keep": "preserved"},
+                "tags": ["historical", "control"]
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"]
+        .as_str()
+        .expect("create response must contain an id")
+        .to_string();
+
+    let before = pack
+        .dispatch(
+            "list",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "entity_type": "algorithm"
+            }),
+        )
+        .await
+        .expect("typed list before backfill must succeed");
+    assert!(
+        list_items(&before).iter().all(|item| item["id"] != id),
+        "a property-only historical type must not satisfy the column-backed filter"
+    );
+
+    let updated = pack
+        .dispatch("update", json!({"id": id, "entity_type": "algorithm"}))
+        .await
+        .expect("update must accept a registered entity_type");
+
+    assert_eq!(updated["entity_type"], "algorithm");
+    assert_eq!(updated["name"], "HistoricalAlgorithm");
+    assert_eq!(updated["description"], "predates the entity_type column");
+    assert_eq!(updated["properties"]["type"], "algorithm");
+    assert_eq!(updated["properties"]["keep"], "preserved");
+    assert_eq!(updated["tags"], json!(["historical", "control"]));
+
+    let after = pack
+        .dispatch(
+            "list",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "entity_type": "algorithm"
+            }),
+        )
+        .await
+        .expect("typed list after backfill must succeed");
+    assert_eq!(
+        list_items(&after)
+            .iter()
+            .filter(|item| item["id"] == id)
+            .count(),
+        1,
+        "the backfilled entity must appear exactly once in typed listing"
+    );
+}
+
+#[tokio::test]
+async fn update_unrelated_entity_field_preserves_entity_type() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "entity_type": "algorithm",
+                "name": "TypedControl",
+                "properties": {"keep": true},
+                "tags": ["preserve"]
+            }),
+        )
+        .await
+        .expect("create must succeed");
+
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({
+                "id": created["id"],
+                "description": "unrelated patch"
+            }),
+        )
+        .await
+        .expect("unrelated update must succeed");
+
+    assert_eq!(updated["entity_type"], "algorithm");
+    assert_eq!(updated["name"], "TypedControl");
+    assert_eq!(updated["description"], "unrelated patch");
+    assert_eq!(updated["properties"], json!({"keep": true}));
+    assert_eq!(updated["tags"], json!(["preserve"]));
+}
+
+#[tokio::test]
+async fn update_entity_type_rejects_unregistered_value_without_mutating_entity() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "name": "InvalidTypeControl"
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"].as_str().expect("id").to_string();
+
+    let err = pack
+        .dispatch("update", json!({"id": id, "entity_type": "not_registered"}))
+        .await
+        .expect_err("an unregistered entity_type must be rejected");
+    let message = invalid_input_message(&err);
+    assert!(message.contains("entity_type"), "error: {message}");
+    assert!(message.contains("not_registered"), "error: {message}");
+    assert!(message.contains("algorithm"), "error: {message}");
+
+    let entity = pack
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("rejected update must leave the entity readable");
+    assert!(
+        entity["entity_type"].is_null(),
+        "a rejected update must not mutate entity_type: {entity}"
+    );
+}
+
+#[tokio::test]
+async fn update_entity_type_is_rejected_for_non_entity_substrates() {
+    let pack = pack();
+    let note = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "note control"}),
+        )
+        .await
+        .expect("create note");
+    let note_err = pack
+        .dispatch(
+            "update",
+            json!({"id": note["id"], "entity_type": "algorithm"}),
+        )
+        .await
+        .expect_err("entity_type on a note must be rejected");
+    assert!(
+        invalid_input_message(&note_err).contains("not valid for a note"),
+        "error: {note_err}"
+    );
+
+    let source = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "EntityTypeEdgeSource"}),
+        )
+        .await
+        .expect("create source");
+    let target = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "EntityTypeEdgeTarget"}),
+        )
+        .await
+        .expect("create target");
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": source["id"],
+                "target_id": target["id"],
+                "relation": "supports"
+            }),
+        )
+        .await
+        .expect("create edge");
+    let edge_err = pack
+        .dispatch(
+            "update",
+            json!({"id": edge["id"], "entity_type": "algorithm"}),
+        )
+        .await
+        .expect_err("entity_type on an edge must be rejected");
+    assert!(
+        invalid_input_message(&edge_err).contains("not valid for an edge"),
+        "error: {edge_err}"
+    );
+}
+
+/// ADR-014 tri-state: an explicit JSON `null` clears a stored entity type
+/// (and reindexes), unlike absent (unchanged) — the pre-fix
+/// `Option<String>` collapsed null into absent and could never clear.
+#[tokio::test]
+async fn update_entity_type_null_clears_stored_type() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "entity_type": "algorithm",
+                "name": "NullClearEntity"
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"].as_str().expect("id").to_string();
+
+    let updated = pack
+        .dispatch("update", json!({"id": id, "entity_type": null}))
+        .await
+        .expect("entity_type: null must clear the stored type");
+    assert!(
+        updated["entity_type"].is_null(),
+        "entity_type: null must clear the column: {updated}"
+    );
+    assert_eq!(updated["name"], "NullClearEntity");
+
+    let listed = pack
+        .dispatch(
+            "list",
+            json!({"kind": "entity", "entity_kind": "concept", "entity_type": "algorithm"}),
+        )
+        .await
+        .expect("typed list must succeed");
+    assert!(
+        list_items(&listed).iter().all(|item| item["id"] != id),
+        "a cleared entity must drop out of the typed listing: {listed}"
+    );
+}
+
+/// ADR-014 tri-state: a PRESENT `entity_type` key — including JSON `null` —
+/// is inapplicable to note and edge targets and must be rejected (not
+/// silently accepted).
+#[tokio::test]
+async fn update_null_entity_type_rejected_for_note_and_edge() {
+    let pack = pack();
+    let note = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "null type note"}),
+        )
+        .await
+        .expect("create note");
+    let note_err = pack
+        .dispatch("update", json!({"id": note["id"], "entity_type": null}))
+        .await
+        .expect_err("entity_type: null on a note must be rejected");
+    assert!(
+        invalid_input_message(&note_err).contains("not valid for a note"),
+        "error: {note_err}"
+    );
+
+    let source = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "NullTypeEdgeSource"}),
+        )
+        .await
+        .expect("create source");
+    let target = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "NullTypeEdgeTarget"}),
+        )
+        .await
+        .expect("create target");
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": source["id"],
+                "target_id": target["id"],
+                "relation": "supports"
+            }),
+        )
+        .await
+        .expect("create edge");
+    let edge_err = pack
+        .dispatch("update", json!({"id": edge["id"], "entity_type": null}))
+        .await
+        .expect_err("entity_type: null on an edge must be rejected");
+    assert!(
+        invalid_input_message(&edge_err).contains("not valid for an edge"),
+        "error: {edge_err}"
+    );
+}
+
+/// ADR-046 parity: a proposal UpdateEntity patch setting `entity_type`
+/// survives propose -> approve -> apply with normalization and persistence.
+#[tokio::test]
+async fn proposal_update_entity_type_apply_sets_and_normalizes() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "entity_kind": "concept", "name": "ProposedTyped"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created["id"].as_str().expect("id").to_string();
+
+    let propose_result = pack
+        .dispatch(
+            "propose",
+            json!({
+                "title": "SetEntityTypeViaProposal",
+                "description": "Set the entity type through the proposal path",
+                "changeset": {
+                    "kind": "update_entity",
+                    "id": entity_id,
+                    "patch": {"entity_type": " Algorithm "}
+                }
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let proposal_id = propose_result["id"].as_str().expect("id").to_string();
+
+    pack.dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
+        .await
+        .expect("review(approve) must succeed");
+
+    let updated = pack
+        .dispatch("get", json!({"id": entity_id}))
+        .await
+        .expect("get");
+    assert_eq!(
+        updated["entity_type"], "algorithm",
+        "proposal apply must normalize + persist entity_type: {updated}"
+    );
+}
+
+/// ADR-014/ADR-046 parity: a proposal patch `entity_type: null` clears the
+/// stored type on apply.
+#[tokio::test]
+async fn proposal_update_entity_type_null_apply_clears() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "entity_type": "algorithm",
+                "name": "ProposedClear"
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created["id"].as_str().expect("id").to_string();
+
+    let propose_result = pack
+        .dispatch(
+            "propose",
+            json!({
+                "title": "ClearEntityTypeViaProposal",
+                "description": "Clear the entity type through the proposal path",
+                "changeset": {
+                    "kind": "update_entity",
+                    "id": entity_id,
+                    "patch": {"entity_type": null}
+                }
+            }),
+        )
+        .await
+        .expect("propose must accept entity_type: null");
+    let proposal_id = propose_result["id"].as_str().expect("id").to_string();
+
+    pack.dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
+        .await
+        .expect("review(approve) must succeed");
+
+    let updated = pack
+        .dispatch("get", json!({"id": entity_id}))
+        .await
+        .expect("get");
+    assert!(
+        updated["entity_type"].is_null(),
+        "proposal apply must clear entity_type: {updated}"
+    );
+}
+
+/// ADR-046 parity: an (kind, entity_type) pair the vocabulary rejects is
+/// refused at apply time — the proposal reverts to `approved`, the entity
+/// is unmutated, and no applied event is emitted.
+#[tokio::test]
+async fn proposal_update_invalid_entity_type_pair_reverts() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "entity_kind": "concept", "name": "ProposedInvalid"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created["id"].as_str().expect("id").to_string();
+
+    let propose_result = pack
+        .dispatch(
+            "propose",
+            json!({
+                "title": "InvalidEntityTypeViaProposal",
+                "description": "Reject an invalid kind and entity type pair on apply",
+                "changeset": {
+                    "kind": "update_entity",
+                    "id": entity_id,
+                    "patch": {"entity_type": "not_registered"}
+                }
+            }),
+        )
+        .await
+        .expect("propose must succeed (validation happens at apply)");
+    let proposal_id = propose_result["id"].as_str().expect("id").to_string();
+
+    pack.dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
+        .await
+        .expect("review(approve) must succeed");
+
+    let entity = pack
+        .dispatch("get", json!({"id": entity_id}))
+        .await
+        .expect("get after failed apply");
+    assert!(
+        entity["entity_type"].is_null(),
+        "a failed apply must not mutate entity_type: {entity}"
+    );
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "proposal_applied", "limit": 10}),
+        )
+        .await
+        .expect("list proposal_applied must succeed");
+    // The apply attempt is still audited, but its recorded result must be the
+    // failure, never a successful application.
+    let items = list_items(&events);
+    assert!(
+        !items.is_empty(),
+        "the failed apply must be audited: {events}"
+    );
+    for item in items {
+        let result = &item["payload"]["result"];
+        assert!(
+            !result["failed"].is_null(),
+            "proposal_applied must record the failed result: {item}"
+        );
+        assert_eq!(
+            result["failed"]["applied_step_count"], 0,
+            "no step may have applied: {item}"
+        );
+    }
+}
+
 /// ADR-014: `delete` without `kind` resolves the substrate from the UUID.
 #[tokio::test]
 async fn delete_entity_without_kind_resolves_from_uuid() {

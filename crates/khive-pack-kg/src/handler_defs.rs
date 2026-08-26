@@ -351,7 +351,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     HandlerDef {
         name: "update",
         description: "Patch entity, note, or edge fields. Accepted fields depend on substrate: \
-                       entities accept name/description/properties/tags; notes accept \
+                       entities accept name/description/properties/tags/entity_type; notes accept \
                        name/content/salience/decay_factor/properties; edges accept relation/weight/properties.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
@@ -423,6 +423,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "array of string",
                 required: false,
                 description: "Replace tag list.",
+            },
+            ParamDef {
+                name: "entity_type",
+                param_type: "string",
+                required: false,
+                description: "Registered entity type to set (entities only). The value is validated against the entity kind's closed vocabulary and reindexed.",
             },
         ],
     },
