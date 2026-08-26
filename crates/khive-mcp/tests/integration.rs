@@ -1896,6 +1896,13 @@ impl khive_types::Pack for ErrorInjectPack {
             category: VerbCategory::Assertive,
             params: &[],
         },
+        HandlerDef {
+            name: "read_tx_age_evicted",
+            description: "returns a typed cached-reader read-transaction age eviction error",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
     ];
 }
 
@@ -1949,6 +1956,14 @@ impl PackRuntime for ErrorInjectPack {
                 khive_storage::StorageError::AdmissionTimeout {
                     operation: "sql_bridge.writer_handle".into(),
                     timeout_ms: 30_000,
+                },
+            ));
+        }
+        if verb == "read_tx_age_evicted" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::ReadTransactionAgeEvicted {
+                    operation: "sql_bridge.cached_reader".into(),
+                    max_age_secs: 120,
                 },
             ));
         }
@@ -2198,6 +2213,46 @@ async fn storage_admission_timeout_survives_storage_runtime_and_mcp_wire() -> an
             "retry_after_ms": serde_json::Value::Null,
         }),
         "an admission deadline that expired before acquisition must stay a retryable resource failure on the wire"
+    );
+
+    Ok(())
+}
+
+/// #1846 / PR #2229 follow-up: a cached read-only transaction evicted for
+/// pinning a WAL snapshot past `read_tx_max_age` must remain a
+/// machine-detectable retryable failure once it crosses the normal MCP
+/// dispatch boundary — not just at the direct `StorageError::is_retryable()`
+/// call site. Without `RuntimeError::retryable_failure_context()` special-
+/// casing `StorageError::ReadTransactionAgeEvicted`, this would flatten to
+/// `runtime_error_value`'s plain-string fallback and lose `retryable: true`.
+#[tokio::test]
+async fn read_tx_age_evicted_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "read_tx_age_evicted()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "read_tx_age_evicted",
+            "stage": "read_tx_age_evicted",
+            "message": "storage: cached read-only transaction exceeded the maximum read-transaction age (120s) during sql_bridge.cached_reader and was rolled back; retry to open a fresh read snapshot",
+            "retryable": true,
+            "timeout_ms": 120_000,
+            "capability": "sql",
+            "operation": "sql_bridge.cached_reader",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
+        }),
+        "a read-age eviction must stay a caller-visible retryable unavailable on the wire"
     );
 
     Ok(())

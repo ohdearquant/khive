@@ -27,6 +27,13 @@ pub const WRITER_TASK_BEGIN_BUSY_STAGE: &str = "writer_task_begin_busy";
 /// failure is safe to retry.
 pub const STORAGE_ADMISSION_TIMEOUT_STAGE: &str = "storage_admission_timeout";
 
+/// Stable wire code/stage for a cached read-only transaction proactively
+/// rolled back after pinning a WAL snapshot past the configured
+/// `read_tx_max_age` bound (#1846). Always safe to retry: the eviction only
+/// ever fires on a read-only handle, so no side effect can exist for a
+/// retry to duplicate.
+pub const READ_TX_AGE_EVICTED_STAGE: &str = "read_tx_age_evicted";
+
 /// Stable ADR-131:251 `scope` discriminator carried on a
 /// [`WRITER_QUEUE_SATURATED_STAGE`] failure — distinguishes write-queue
 /// admission saturation from other `unavailable` failure kinds that share
@@ -606,17 +613,31 @@ impl RuntimeError {
         if let Some(context) = self.admission_failure_context() {
             return Some(context.into());
         }
-        let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = self else {
-            return None;
-        };
-        Some(RetryableFailureContext {
-            stage: WRITER_TASK_BEGIN_BUSY_STAGE,
-            timeout: Duration::from_millis(*timeout_ms),
-            capability: None,
-            operation: Some("writer_task_begin".to_string()),
-            scope: None,
-            retry_after_ms: None,
-        })
+        if let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = self {
+            return Some(RetryableFailureContext {
+                stage: WRITER_TASK_BEGIN_BUSY_STAGE,
+                timeout: Duration::from_millis(*timeout_ms),
+                capability: None,
+                operation: Some("writer_task_begin".to_string()),
+                scope: None,
+                retry_after_ms: None,
+            });
+        }
+        if let Self::Storage(khive_storage::StorageError::ReadTransactionAgeEvicted {
+            operation,
+            max_age_secs,
+        }) = self
+        {
+            return Some(RetryableFailureContext {
+                stage: READ_TX_AGE_EVICTED_STAGE,
+                timeout: Duration::from_secs(*max_age_secs),
+                capability: Some(khive_storage::StorageCapability::Sql),
+                operation: Some(operation.to_string()),
+                scope: None,
+                retry_after_ms: None,
+            });
+        }
+        None
     }
 }
 

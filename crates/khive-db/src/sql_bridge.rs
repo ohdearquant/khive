@@ -1085,13 +1085,9 @@ where
                 match owned_handle.conn.execute_batch("ROLLBACK") {
                     Ok(()) if owned_handle.conn.is_autocommit() => {
                         drop(owned_handle.read_transaction_slot.take());
-                        Err(StorageError::Transaction {
+                        Err(StorageError::ReadTransactionAgeEvicted {
                             operation: operation.into(),
-                            message: format!(
-                                "cached read-only transaction exceeded the maximum read-transaction \
-                                 age ({}s) and was rolled back; retry to open a fresh read snapshot",
-                                read_tx_max_age.as_secs()
-                            ),
+                            max_age_secs: read_tx_max_age.as_secs(),
                         })
                     }
                     Ok(()) => {
@@ -4061,6 +4057,138 @@ mod tests {
             })
             .await
             .expect("the handle must remain usable for a fresh autocommit read after eviction");
+    }
+
+    /// #1846 follow-up: the age-eviction branch
+    /// has a rollback-failure path distinct from
+    /// `failed_cached_reader_rollback_deregisters_only_when_connection_is_discarded`
+    /// above (which covers an explicit caller-issued `ROLLBACK`, not the
+    /// age-triggered cleanup rollback). When SQLite denies the age-triggered
+    /// `ROLLBACK`, the branch must still discard the poisoned connection,
+    /// deregister the expired transaction span, and release the reader
+    /// admission permit rather than leaking either.
+    #[tokio::test]
+    #[serial_test::serial(tx_registry)]
+    async fn expired_cached_reader_transaction_rollback_denial_discards_connection_and_releases_admission(
+    ) {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        fn deny_rollback(ctx: AuthContext<'_>) -> Authorization {
+            match ctx.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(
+                dir.path()
+                    .join("sql_bridge_reader_tx_max_age_rollback_denied.db"),
+            ),
+            max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(20),
+            read_tx_max_age: std::time::Duration::from_millis(20),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let origin_view = database_tx_view(&pool);
+        let conn = open_standalone_reader(&pool).unwrap();
+        let mut reader = SqliteReader {
+            handle: Some(StandaloneHandle {
+                conn,
+                _retained_slot: None,
+                read_transaction_slot: None,
+            }),
+            pool: Arc::clone(&pool),
+        };
+
+        reader
+            .query_all(SqlStatement {
+                sql: "BEGIN DEFERRED".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("begin admitted transaction");
+        reader
+            .query_all(SqlStatement {
+                sql: "SELECT * FROM sqlite_schema".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("materialize read snapshot");
+        assert!(
+            khive_storage::tx_registry::oldest_for(&origin_view).is_some(),
+            "the open transaction must be registered before it ages out"
+        );
+
+        reader
+            .handle
+            .as_ref()
+            .expect("reader must retain its connection")
+            .conn
+            .authorizer(Some(deny_rollback))
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+        let evictions_before = crate::checkpoint::read_tx_max_age_evictions();
+        let error = reader
+            .query_all(SqlStatement {
+                sql: "SELECT * FROM sqlite_schema".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect_err("a denied rollback on an expired transaction must surface an error");
+        assert!(
+            error.is_retryable(),
+            "even a failed cleanup rollback must remain classified retryable so callers open a \
+             fresh handle: {error}"
+        );
+        assert!(
+            error.to_string().contains("failed to roll back"),
+            "the failure must be attributable to the denied ROLLBACK, not silent success: {error}"
+        );
+        assert_eq!(
+            crate::checkpoint::read_tx_max_age_evictions(),
+            evictions_before + 1,
+            "the eviction attempt must still be counted even though cleanup failed"
+        );
+        assert!(
+            khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+            "a denied rollback must discard the connection and deregister the expired \
+             transaction span rather than leaking it"
+        );
+        assert_eq!(
+            pool.sql_bridge_reader_slots().available_permits(),
+            1,
+            "discarding the poisoned connection must release the reader admission slot"
+        );
+
+        let reuse = reader
+            .query_all(SqlStatement {
+                sql: "SELECT * FROM sqlite_schema".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        let message = match reuse {
+            Err(StorageError::Pool { message, .. }) => message,
+            other => panic!(
+                "reusing this discarded reader must fail loudly with 'connection already \
+                 consumed' rather than silently reopening; got {other:?}"
+            ),
+        };
+        assert!(
+            message.contains("connection already consumed"),
+            "expected the discarded reader's reuse error to name the pinned failure; got \
+             {message:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

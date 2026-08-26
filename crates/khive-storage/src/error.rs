@@ -136,6 +136,24 @@ pub enum StorageError {
         message: String,
     },
 
+    /// A cached read-only handle's admitted transaction pinned a WAL
+    /// snapshot past the configured `read_tx_max_age` bound and was
+    /// proactively rolled back so the next call can open a fresh snapshot
+    /// (#1846). Distinct from the generic [`StorageError::Transaction`]
+    /// variant — which also covers failed-cleanup and write-side ambiguity
+    /// cases that are not uniformly safe to retry — so callers (and MCP
+    /// dispatch) can recognize this specific, always-safe-to-retry
+    /// condition by variant rather than by parsing rendered text.
+    #[error(
+        "cached read-only transaction exceeded the maximum read-transaction age \
+         ({max_age_secs}s) during {operation} and was rolled back; retry to open a fresh \
+         read snapshot"
+    )]
+    ReadTransactionAgeEvicted {
+        operation: Cow<'static, str>,
+        max_age_secs: u64,
+    },
+
     #[error("serialization failure in {capability:?}: {message}")]
     Serialization {
         capability: StorageCapability,
@@ -245,6 +263,7 @@ impl StorageError {
             | Self::Timeout { .. }
             | Self::AdmissionTimeout { .. }
             | Self::Transaction { .. }
+            | Self::ReadTransactionAgeEvicted { .. }
             | Self::WriteQueueFull { .. }
             | Self::WriterTaskBusy { .. }
             | Self::WriterTaskTerminated { .. }
@@ -261,6 +280,7 @@ impl StorageError {
                 | Self::Timeout { .. }
                 | Self::AdmissionTimeout { .. }
                 | Self::Transaction { .. }
+                | Self::ReadTransactionAgeEvicted { .. }
                 | Self::WriteQueueFull { .. }
                 | Self::WriterTaskBusy { .. }
         )
