@@ -1314,6 +1314,7 @@ impl EventsSplitClient {
             counters,
             outage_logged,
             delivery_timeout,
+            crate::daemon::daemon_shutdown_token(),
         ));
         Ok(client)
     }
@@ -1395,6 +1396,38 @@ impl EventsSplitClient {
     }
 }
 
+/// Drain every batch currently sitting in the fire-and-forget queue,
+/// counting each as a dropped batch/events and logging one summary line
+/// (never one line per batch — a full queue at shutdown is exactly the
+/// bursty case a per-batch log would flood). Non-blocking: `try_recv` only
+/// consumes what is already queued, so it terminates as soon as the queue
+/// (temporarily) empties even though the sender half is still live.
+#[cfg(unix)]
+fn drain_dropped_queue(
+    rx: &mut tokio::sync::mpsc::Receiver<(String, Vec<Event>)>,
+    counters: &ForwardingCounters,
+) {
+    let mut dropped_batches = 0u64;
+    let mut dropped_events = 0u64;
+    while let Ok((_, events)) = rx.try_recv() {
+        dropped_batches += 1;
+        dropped_events += events.len() as u64;
+    }
+    if dropped_batches > 0 {
+        counters
+            .dropped_batches
+            .fetch_add(dropped_batches, Ordering::Relaxed);
+        counters
+            .dropped_events
+            .fetch_add(dropped_events, Ordering::Relaxed);
+        tracing::warn!(
+            dropped_batches,
+            dropped_events,
+            "events forwarder shutting down; dropping queued loss-tolerant batches"
+        );
+    }
+}
+
 /// The background fire-and-forget forwarder: drains the bounded queue into
 /// framed appends on its own connection, reconnecting with backoff. A batch
 /// that cannot be delivered is dropped and counted — never retried, never
@@ -1406,17 +1439,22 @@ async fn run_forwarder(
     counters: Arc<ForwardingCounters>,
     outage_logged: Arc<AtomicBool>,
     delivery_timeout: Duration,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     // The client lives in a process-global registry, so its sender is never
     // dropped and `rx.recv()` alone would keep this tracked task alive
     // through daemon shutdown, forcing `drain()` to its full timeout.
     // Observe the shutdown token directly: queued batches at shutdown are a
-    // counted drop, exactly the lane's loss-tolerant contract.
-    let shutdown = crate::daemon::daemon_shutdown_token();
+    // counted drop, exactly the lane's loss-tolerant contract — enforced by
+    // draining and counting `rx` below on every shutdown exit, not just
+    // implied by the comment.
     let mut conn: Option<UnixStream> = None;
     loop {
         let (namespace, events) = tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => {
+                drain_dropped_queue(&mut rx, &counters);
+                break;
+            },
             received = rx.recv() => match received {
                 Some(batch) => batch,
                 None => break,
@@ -1446,7 +1484,16 @@ async fn run_forwarder(
         // lane's loss-tolerant contract); a timeout poisons the connection,
         // since the peer may answer the abandoned frame later.
         let delivered = tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => {
+                counters.dropped_batches.fetch_add(1, Ordering::Relaxed);
+                counters.dropped_events.fetch_add(count, Ordering::Relaxed);
+                tracing::warn!(
+                    dropped_events = count,
+                    "events forwarder shutting down mid-delivery; in-flight batch dropped"
+                );
+                drain_dropped_queue(&mut rx, &counters);
+                break;
+            },
             outcome = tokio::time::timeout(
                 delivery_timeout,
                 deliver_batch(&socket_path, &mut conn, &payload),
@@ -2613,6 +2660,96 @@ mod tests {
         assert!(
             matches!(ok, EventsResponse::Count { .. }),
             "valid namespace must dispatch, got {ok:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_counts_and_logs_queued_and_in_flight_batches_as_dropped() {
+        // ADR-170 requires shutdown drops to be visible via counters/logs.
+        // Both `run_forwarder` shutdown arms must therefore count every
+        // batch it loses: the one parked mid-delivery against a hung peer,
+        // and every batch still sitting in the queue behind it. Drives
+        // `run_forwarder` directly with a local `CancellationToken` (rather
+        // than through `EventsSplitClient`, which wires the process-wide
+        // `daemon_shutdown_token()` singleton) so cancelling shutdown here
+        // cannot leak into other tests sharing the process.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hung-shutdown.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Accept and hold the connection open without ever reading or
+        // replying, so the first delivery blocks in `deliver_batch`'s
+        // read_frame until shutdown cancels it.
+        let _server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    held.push(stream);
+                }
+            }
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<(String, Vec<Event>)>(8);
+        let counters = Arc::new(ForwardingCounters::default());
+        let outage_logged = Arc::new(AtomicBool::new(false));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        let forwarder = tokio::spawn(run_forwarder(
+            socket,
+            rx,
+            Arc::clone(&counters),
+            outage_logged,
+            Duration::from_secs(30),
+            shutdown.clone(),
+        ));
+
+        fn probe_event(tag: &str) -> Event {
+            Event::new(
+                "test",
+                tag,
+                khive_types::EventKind::Audit,
+                khive_types::SubstrateKind::Event,
+                "tester",
+            )
+        }
+
+        tx.try_send(("test".to_string(), vec![probe_event("in-flight")]))
+            .expect("queue has room for the in-flight batch");
+        // No externally observable "delivery started" signal exists short of
+        // instrumenting the forwarder; a short sleep reliably lands inside
+        // the delivery `select!` arm before shutdown cancels it, given the
+        // 30s delivery timeout has no chance to fire first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        tx.try_send((
+            "test".to_string(),
+            vec![probe_event("queued-1"), probe_event("queued-2")],
+        ))
+        .expect("queue has room for the first queued batch");
+        tx.try_send(("test".to_string(), vec![probe_event("queued-3")]))
+            .expect("queue has room for the second queued batch");
+
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("forwarder must exit promptly on shutdown")
+            .expect("forwarder task must not panic");
+
+        assert_eq!(
+            counters.dropped_batches.load(Ordering::Relaxed),
+            3,
+            "the in-flight batch and both queued batches must all be counted as dropped"
+        );
+        assert_eq!(
+            counters.dropped_events.load(Ordering::Relaxed),
+            4,
+            "1 in-flight + 2 + 1 queued events must all be counted as dropped"
+        );
+        assert_eq!(
+            counters.forwarded_batches.load(Ordering::Relaxed),
+            0,
+            "a hung peer never acknowledges anything in this test"
         );
     }
 
