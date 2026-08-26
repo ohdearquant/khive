@@ -369,6 +369,13 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
             }
             WriterTaskRequestState::SideEffectsUnknown => RetryDecision::Retry,
         },
+        // The events-split socket transport surfaces transient daemon-side
+        // conditions and transport loss as `Pool` (unreachable, retryable
+        // daemon refusal) and `Timeout` (round-trip clock expired). This lane
+        // is idempotent by construction, so replaying a batch whose commit
+        // state is unknown is safe, and the retry budget above bounds the
+        // attempts either way.
+        StorageError::Pool { .. } | StorageError::Timeout { .. } => RetryDecision::Retry,
         StorageError::Unsupported { operation, .. }
             if operation.as_ref() == "append_events_idempotent" =>
         {

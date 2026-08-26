@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{uuid_prefix_bounds, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::schema::{
@@ -16,6 +16,24 @@ use super::util::{
     tags_to_json, validate_atom_content,
 };
 use super::KnowledgeHandlers;
+
+fn knowledge_get_prefix_statement(prefix: &str) -> Option<SqlStatement> {
+    let (lower, upper) = uuid_prefix_bounds(prefix)?;
+    Some(SqlStatement {
+        // A domain's FTS mirror atom has the same UUID. UNION (rather than
+        // UNION ALL) deduplicates that legitimate cross-table duplicate so
+        // one domain is not reported as an ambiguous prefix.
+        sql: "SELECT id FROM knowledge_domains \
+              WHERE id >= ?1 AND id < ?2 AND deleted_at IS NULL \
+              UNION \
+              SELECT id FROM knowledge_atoms \
+              WHERE id >= ?1 AND id < ?2 AND deleted_at IS NULL \
+              ORDER BY id LIMIT 2"
+            .into(),
+        params: vec![SqlValue::Text(lower), SqlValue::Text(upper)],
+        label: Some("knowledge.get.resolve_prefix".into()),
+    })
+}
 
 impl KnowledgeHandlers {
     pub(crate) async fn upsert_atoms(
@@ -490,24 +508,14 @@ impl KnowledgeHandlers {
             }
 
             if id.len() >= 8 && id.chars().all(|c| c.is_ascii_hexdigit()) {
-                let pattern = format!("{}%", hex_prefix_to_uuid_pattern(&id));
-                // A domain's FTS mirror atom has the same UUID. UNION (rather than
-                // UNION ALL) deduplicates that legitimate cross-table duplicate so
-                // one domain is not reported as an ambiguous prefix.
-                let rows = reader
-                    .query_all(SqlStatement {
-                        sql: "SELECT id FROM knowledge_domains \
-                              WHERE id LIKE ?1 AND deleted_at IS NULL \
-                              UNION \
-                              SELECT id FROM knowledge_atoms \
-                              WHERE id LIKE ?1 AND deleted_at IS NULL \
-                              ORDER BY id LIMIT 2"
-                            .into(),
-                        params: vec![SqlValue::Text(pattern)],
-                        label: Some("knowledge.get.resolve_prefix".into()),
-                    })
-                    .await
-                    .map_err(|e| sql_err("get by prefix", e))?;
+                let rows = if let Some(statement) = knowledge_get_prefix_statement(&id) {
+                    reader
+                        .query_all(statement)
+                        .await
+                        .map_err(|e| sql_err("get by prefix", e))?
+                } else {
+                    Vec::new()
+                };
                 let matches: Vec<String> =
                     rows.iter().filter_map(|row| row_str(row, "id")).collect();
                 match matches.as_slice() {
@@ -983,6 +991,49 @@ mod tests {
     // requiring a live DB connection.
 
     use khive_runtime::secret_gate::check;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+    use khive_storage::SqlValue;
+
+    #[tokio::test]
+    async fn get_prefix_query_plan_uses_primary_key_range_seeks() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(crate::KnowledgePack::new(runtime.clone()));
+        let registry = builder.build().expect("registry builds");
+        registry.apply_schema_plans(runtime.backend());
+
+        let mut reader = runtime.sql().reader().await.expect("prefix plan reader");
+        let rows = reader
+            .explain(
+                super::knowledge_get_prefix_statement("0b6cf134")
+                    .expect("valid compact UUID prefix"),
+            )
+            .await
+            .expect("explain knowledge prefix query");
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            ["knowledge_domains", "knowledge_atoms"]
+                .iter()
+                .all(|table| {
+                    details.iter().any(|detail| {
+                        detail.contains(&format!("SEARCH {table}"))
+                            && detail.contains("id>?")
+                            && detail.contains("id<?")
+                    }) && !details
+                        .iter()
+                        .any(|detail| detail.contains(&format!("SCAN {table}")))
+                }),
+            "knowledge.get short-id tables must use primary-key range seeks: {details:?}"
+        );
+    }
 
     #[test]
     fn atom_body_with_fake_aws_key_is_blocked() {
