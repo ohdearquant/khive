@@ -883,6 +883,127 @@ describe("repository showcase", () => {
     expect(screen.getByText(/Contract-owned median 4\.0/)).toBeVisible();
   });
 
+  it("renders readable chart scales and keeps hotspot bubbles inside the plot", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(
+      container.querySelector('[data-view-id="hotspot_quadrant"]')!,
+    );
+    const hotspot = container.querySelector<SVGSVGElement>(
+      'svg[data-visualization="hotspot"]',
+    )!;
+    const xTicks = Array.from(
+      hotspot.querySelectorAll<SVGTextElement>('[data-axis-tick="hotspot-x"]'),
+    );
+    const yTicks = Array.from(
+      hotspot.querySelectorAll<SVGTextElement>('[data-axis-tick="hotspot-y"]'),
+    );
+    expect(xTicks.length).toBeGreaterThanOrEqual(2);
+    expect(yTicks.length).toBeGreaterThanOrEqual(2);
+    expect(xTicks[0]).toHaveAttribute("data-axis-value", "0");
+    expect(yTicks[0]).toHaveAttribute("data-axis-value", "0");
+
+    const bubbles = Array.from(
+      hotspot.querySelectorAll<SVGCircleElement>(".repo-chart-dot"),
+    );
+    expect(bubbles.length).toBeGreaterThan(0);
+    for (const bubble of bubbles) {
+      const x = Number(bubble.getAttribute("cx"));
+      const radius = Number(bubble.getAttribute("r"));
+      expect(x - radius).toBeGreaterThanOrEqual(10);
+      expect(x + radius).toBeLessThanOrEqual(100);
+    }
+
+    await user.click(
+      container.querySelector('[data-view-id="cadence_timeline"]')!,
+    );
+    const cadence = container.querySelector<SVGSVGElement>(
+      'svg[data-visualization="cadence"]',
+    )!;
+    const valueTicks = Array.from(
+      cadence.querySelectorAll<SVGTextElement>('[data-axis-tick="cadence-y"]'),
+    );
+    expect(valueTicks.length).toBeGreaterThanOrEqual(2);
+    expect(valueTicks[0]).toHaveAttribute("data-axis-value", "0");
+
+    const weekTicks = Array.from(
+      cadence.querySelectorAll<SVGTextElement>('[data-axis-tick="cadence-week"]'),
+    );
+    const cadenceRows = bundle.aggregates.cadence_timeline.commits.items;
+    expect(weekTicks.length).toBeGreaterThanOrEqual(2);
+    expect(weekTicks[0]).toHaveAttribute(
+      "data-axis-value",
+      cadenceRows[0].week_start,
+    );
+    expect(weekTicks.at(-1)).toHaveAttribute(
+      "data-axis-value",
+      cadenceRows.at(-1)?.week_start,
+    );
+    expect(weekTicks.every((tick) => tick.textContent?.trim())).toBe(true);
+  });
+
+  it("renders data states instead of invented chart scales for empty pages", async () => {
+    const bundle = structuredClone(golden());
+    const emptyPage = {
+      items: [],
+      total_count: { status: "available", value: 0 },
+      bound: { kind: "all", max_items: 50000, order: "fixture" },
+      truncated: false,
+      disclosure: { status: "complete" },
+    };
+    bundle.aggregates.hotspot_quadrant.data = structuredClone(emptyPage) as never;
+    bundle.aggregates.cadence_timeline.commits = structuredClone(emptyPage) as never;
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(container.querySelector('[data-view-id="hotspot_quadrant"]')!);
+    expect(container.querySelector('svg[data-visualization="hotspot"]')).toBeNull();
+    expect(screen.getAllByText(/No .* rows/).length).toBeGreaterThan(0);
+
+    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+    expect(container.querySelector('svg[data-visualization="cadence"]')).toBeNull();
+  });
+
+  it("renders data states instead of invented chart scales for unavailable pages", async () => {
+    const bundle = structuredClone(golden());
+    const unavailablePage = {
+      items: [],
+      total_count: { status: "unavailable", reason: "fixture omitted" },
+      bound: { kind: "all", max_items: 50000, order: "fixture" },
+      truncated: false,
+      disclosure: { status: "unavailable", reason: "fixture omitted" },
+    };
+    bundle.aggregates.hotspot_quadrant.data = structuredClone(unavailablePage) as never;
+    bundle.aggregates.cadence_timeline.commits = structuredClone(unavailablePage) as never;
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(container.querySelector('[data-view-id="hotspot_quadrant"]')!);
+    expect(container.querySelector('svg[data-visualization="hotspot"]')).toBeNull();
+
+    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+    expect(container.querySelector('svg[data-visualization="cadence"]')).toBeNull();
+  });
+
+  it.each(["2026-99-99", "2026-02-30"])(
+    "falls back to the raw week value for schema-shaped but invalid date %s",
+    async (weekStart) => {
+      const bundle = structuredClone(golden());
+      bundle.aggregates.cadence_timeline.commits.items[0].week_start = weekStart;
+      const user = userEvent.setup();
+      const { container } = render(<RepoShowcase bundle={bundle} />);
+
+      await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+      const firstTick = container.querySelector<SVGTextElement>(
+        '[data-axis-tick="cadence-week"]',
+      );
+      expect(firstTick).toHaveAttribute("data-axis-value", weekStart);
+      expect(firstTick?.textContent).toBe(weekStart);
+    },
+  );
+
   it("surfaces a section's own truncation disclosure", () => {
     const bundle = structuredClone(golden());
     bundle.graph.modules.truncated = true;

@@ -115,6 +115,35 @@ function formatDate(value: string): string {
   }).format(new Date(value));
 }
 
+function formatWeekTick(value: string): string {
+  const parsed = new Date(`${value}T00:00:00Z`);
+  // The schema constrains week_start by regex shape only, so a
+  // non-calendar date can arrive here. Date parsing either yields an
+  // Invalid Date (Intl would throw) or silently normalizes an impossible
+  // day (2026-02-30 becomes another date), so require an exact round
+  // trip and otherwise show the raw value.
+  if (
+    Number.isNaN(parsed.getTime()) ||
+    parsed.toISOString().slice(0, 10) !== value
+  ) {
+    return value;
+  }
+  return new Intl.DateTimeFormat("en", {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  }).format(parsed);
+}
+
+function chartTicks(max: number): number[] {
+  return [...new Set([0, Math.ceil(max / 2), max])];
+}
+
+function chartTickIndices(length: number): number[] {
+  if (length === 0) return [];
+  return [...new Set([0, Math.floor((length - 1) / 2), length - 1])];
+}
+
 function formatAnalysisWindow(
   window: AnalysisWindow,
   snapshotTime: string,
@@ -1804,60 +1833,126 @@ function HotspotQuadrantView({
   moduleById,
   selectedModuleId,
   onInspectModule,
+  onExploreStructure,
 }: ViewProps) {
   const analysis = bundle.aggregates.hotspot_quadrant;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
   const maxFanIn = Math.max(1, ...rows.map((row) => row.fan_in));
   const maxChanges = Math.max(1, ...rows.map((row) => row.commit_count));
+  const xTicks = chartTicks(maxFanIn);
+  const yTicks = chartTicks(maxChanges);
+  const plot = { left: 14, right: 94, top: 6, bottom: 56 };
+  const viewLabel = bundle.capability.views.hotspot_quadrant.label;
+  // An unavailable or known-empty page has no measured values, so an axis
+  // scale would be invented (the domain fallback is 1): render the data
+  // state instead of an empty plot (ADR-147 absence rule).
+  const chartState = analysis.data.disclosure.status === "unavailable"
+    ? <DataState className="repo-empty" state="unavailable" title={`${viewLabel} ${labels.unavailable.toLocaleLowerCase()}`} message={analysis.data.disclosure.reason ?? "This bundle does not claim hotspot data."} />
+    : isKnownEmptyRepoPage(analysis.data)
+      ? <DataState className="repo-empty" state="empty" title={`No ${viewLabel.toLocaleLowerCase()} rows`} message="Captured module churn and fan-in measurements belong here." action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
+      : null;
   return (
     <div className="repo-view-body repo-grid">
       <div className="repo-chart">
-        <svg
-          data-visualization="hotspot"
-          viewBox="0 0 100 70"
-          role="img"
-          aria-labelledby="hotspot-title hotspot-desc"
-        >
-          <title id="hotspot-title">
-            {bundle.capability.views.hotspot_quadrant.label}
-          </title>
-          <desc id="hotspot-desc">{analysis.meta.inputs.join(", ")}</desc>
-          <line className="repo-chart-grid" x1="50" y1="4" x2="50" y2="64" />
-          <line className="repo-chart-grid" x1="8" y1="34" x2="96" y2="34" />
-          <text className="repo-chart-axis" x="50" y="69" textAnchor="middle">
-            {labels.metrics.fan_in}
-          </text>
-          <text
-            className="repo-chart-axis"
-            transform="rotate(-90 2 35)"
-            x="2"
-            y="35"
-            textAnchor="middle"
+        {chartState ?? (
+          <svg
+            data-visualization="hotspot"
+            viewBox="0 0 100 70"
+            role="img"
+            aria-labelledby="hotspot-title hotspot-desc"
           >
-            {labels.metrics.change_frequency}
-          </text>
-          {rows.map((row) => {
-            const x = 8 + (row.fan_in / maxFanIn) * 86;
-            const y = 64 - (row.commit_count / maxChanges) * 58;
-            return (
-              <circle
-                key={row.module_id}
-                className={`repo-chart-dot ${row.quadrant === "high_churn_high_fan_in" ? "hot" : ""}`}
-                cx={x}
-                cy={y}
-                r="2.3"
-              >
-                <title>
-                  {moduleName(moduleById, row.module_id)} ·{" "}
-                  {labels.metrics.change_frequency}: {row.commit_count} ·{" "}
-                  {labels.metrics.fan_in}: {row.fan_in} ·{" "}
-                  {labels.hotspot_quadrants[row.quadrant]}
-                </title>
-              </circle>
-            );
-          })}
-        </svg>
+            <title id="hotspot-title">
+              {bundle.capability.views.hotspot_quadrant.label}
+            </title>
+            <desc id="hotspot-desc">{analysis.meta.inputs.join(", ")}</desc>
+            {xTicks.map((tick) => {
+              const x =
+                plot.left + (tick / maxFanIn) * (plot.right - plot.left);
+              return (
+                <g key={`hotspot-x-${tick}`}>
+                  <line
+                    className="repo-chart-grid"
+                    x1={x}
+                    y1={plot.top}
+                    x2={x}
+                    y2={plot.bottom}
+                  />
+                  <text
+                    className="repo-chart-axis"
+                    data-axis-tick="hotspot-x"
+                    data-axis-value={tick}
+                    x={x}
+                    y="62"
+                    textAnchor="middle"
+                  >
+                    {formatNumber(tick)}
+                  </text>
+                </g>
+              );
+            })}
+            {yTicks.map((tick) => {
+              const y =
+                plot.bottom - (tick / maxChanges) * (plot.bottom - plot.top);
+              return (
+                <g key={`hotspot-y-${tick}`}>
+                  <line
+                    className="repo-chart-grid"
+                    x1={plot.left}
+                    y1={y}
+                    x2={plot.right}
+                    y2={y}
+                  />
+                  <text
+                    className="repo-chart-axis"
+                    data-axis-tick="hotspot-y"
+                    data-axis-value={tick}
+                    x="11"
+                    y={y + 1.5}
+                    textAnchor="end"
+                  >
+                    {formatNumber(tick)}
+                  </text>
+                </g>
+              );
+            })}
+            <text className="repo-chart-axis" x="50" y="69" textAnchor="middle">
+              {labels.metrics.fan_in}
+            </text>
+            <text
+              className="repo-chart-axis"
+              transform="rotate(-90 2 35)"
+              x="2"
+              y="35"
+              textAnchor="middle"
+            >
+              {labels.metrics.change_frequency}
+            </text>
+            {rows.map((row) => {
+              const x =
+                plot.left + (row.fan_in / maxFanIn) * (plot.right - plot.left);
+              const y =
+                plot.bottom -
+                (row.commit_count / maxChanges) * (plot.bottom - plot.top);
+              return (
+                <circle
+                  key={row.module_id}
+                  className={`repo-chart-dot ${row.quadrant === "high_churn_high_fan_in" ? "hot" : ""}`}
+                  cx={x}
+                  cy={y}
+                  r="2.3"
+                >
+                  <title>
+                    {moduleName(moduleById, row.module_id)} ·{" "}
+                    {labels.metrics.change_frequency}: {row.commit_count} ·{" "}
+                    {labels.metrics.fan_in}: {row.fan_in} ·{" "}
+                    {labels.hotspot_quadrants[row.quadrant]}
+                  </title>
+                </circle>
+              );
+            })}
+          </svg>
+        )}
       </div>
       <section className="repo-card repo-table-wrap">
         <table className="repo-table">
@@ -2170,8 +2265,21 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
   const labels = bundle.capability.labels;
   const commitRows = analysis.commits.items.slice(0, UI_ROW_LIMIT);
   const maxCommits = Math.max(1, ...commitRows.map((point) => point.count));
-  const width = Math.max(100, commitRows.length * 8);
+  const width = Math.max(100, commitRows.length * 8 + 20);
+  const plot = { left: 16, right: width - 4, top: 6, bottom: 58 };
+  const barStep = (plot.right - plot.left) / Math.max(1, commitRows.length);
+  const barWidth = Math.max(2, Math.min(5, barStep * 0.64));
+  const yTicks = chartTicks(maxCommits);
+  const weekTickIndices = chartTickIndices(commitRows.length);
   const releaseTags = analysis.release_tags.items.slice(0, UI_ROW_LIMIT);
+  // Same absence rule as the hotspot chart: with no measured commit weeks
+  // the y-axis domain fallback of 1 would invent a scale, so render the
+  // commit series' data state instead of an empty plot.
+  const chartState = analysis.commits.disclosure.status === "unavailable"
+    ? <DataState className="repo-empty" state="unavailable" title={`${labels.metrics.commits} ${labels.unavailable.toLocaleLowerCase()}`} message={analysis.commits.disclosure.reason ?? "This bundle does not claim commit cadence data."} />
+    : isKnownEmptyRepoPage(analysis.commits)
+      ? <DataState className="repo-empty" state="empty" title={`No ${labels.metrics.commits.toLocaleLowerCase()} cadence points`} message={`Captured weekly ${labels.metrics.commits.toLocaleLowerCase()} counts belong here.`} action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
+      : null;
   return (
     <div className="repo-view-body repo-grid">
       <div className="repo-chart">
@@ -2181,43 +2289,98 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
             {labels.metrics.commits}
           </span>
         </div>
-        <svg
-          data-visualization="cadence"
-          viewBox={`0 0 ${width} 70`}
-          role="img"
-          aria-labelledby="cadence-title cadence-desc"
-        >
-          <title id="cadence-title">
-            {bundle.capability.views.cadence_timeline.label}
-          </title>
-          <desc id="cadence-desc">{analysis.meta.inputs.join(", ")}</desc>
-          {commitRows.map((point, index) => {
-            const x = index * 8 + 4;
-            const height = (point.count / maxCommits) * 52;
-            return (
-              <rect
-                className="repo-chart-bar"
-                key={point.week_start}
-                x={x}
-                y={60 - height}
-                width="5"
-                height={height}
-              >
-                <title>
-                  {point.week_start} · {labels.metrics.commits}: {point.count}
-                </title>
-              </rect>
-            );
-          })}
-          <text
-            className="repo-chart-axis"
-            x={width / 2}
-            y="68"
-            textAnchor="middle"
+        {chartState ?? (
+          <svg
+            data-visualization="cadence"
+            viewBox={`0 0 ${width} 82`}
+            role="img"
+            aria-labelledby="cadence-title cadence-desc"
           >
-            {labels.metrics.week}
-          </text>
-        </svg>
+            <title id="cadence-title">
+              {bundle.capability.views.cadence_timeline.label}
+            </title>
+            <desc id="cadence-desc">{analysis.meta.inputs.join(", ")}</desc>
+            {yTicks.map((tick) => {
+              const y =
+                plot.bottom - (tick / maxCommits) * (plot.bottom - plot.top);
+              return (
+                <g key={`cadence-y-${tick}`}>
+                  <line
+                    className="repo-chart-grid"
+                    x1={plot.left}
+                    y1={y}
+                    x2={plot.right}
+                    y2={y}
+                  />
+                  <text
+                    className="repo-chart-axis"
+                    data-axis-tick="cadence-y"
+                    data-axis-value={tick}
+                    x="13"
+                    y={y + 1.5}
+                    textAnchor="end"
+                  >
+                    {formatNumber(tick)}
+                  </text>
+                </g>
+              );
+            })}
+            {commitRows.map((point, index) => {
+              const x = plot.left + index * barStep + (barStep - barWidth) / 2;
+              const height =
+                (point.count / maxCommits) * (plot.bottom - plot.top);
+              return (
+                <rect
+                  className="repo-chart-bar"
+                  key={point.week_start}
+                  x={x}
+                  y={plot.bottom - height}
+                  width={barWidth}
+                  height={height}
+                >
+                  <title>
+                    {point.week_start} · {labels.metrics.commits}:{" "}
+                    {point.count}
+                  </title>
+                </rect>
+              );
+            })}
+            {weekTickIndices.map((index) => {
+              const point = commitRows[index];
+              const x = plot.left + index * barStep + barStep / 2;
+              return (
+                <text
+                  className="repo-chart-axis"
+                  data-axis-tick="cadence-week"
+                  data-axis-value={point.week_start}
+                  key={`cadence-week-${point.week_start}`}
+                  x={x}
+                  y="69"
+                  textAnchor="middle"
+                >
+                  {formatWeekTick(point.week_start)}
+                </text>
+              );
+            })}
+            <text
+              className="repo-chart-axis"
+              x={width / 2}
+              y="80"
+              textAnchor="middle"
+            >
+              {labels.metrics.week}
+            </text>
+            <text
+              className="repo-chart-axis"
+              transform="rotate(-90 2 32)"
+              x="2"
+              y="32"
+              textAnchor="middle"
+            >
+              {labels.metrics.commits}
+            </text>
+          </svg>
+        )}
         <LocalSliceDisclosure
           shown={commitRows.length}
           total={analysis.commits.items.length}
