@@ -4106,23 +4106,21 @@ impl KhiveRuntime {
         // by a `supersedes` edge is obsolete and excluded from default search.
         if !include_superseded && !alive_notes.is_empty() {
             let graph = self.graph(token)?;
-            let mut superseded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-            for &note_id in alive_notes.keys() {
-                let inbound = graph
-                    .neighbors(
-                        note_id,
-                        NeighborQuery {
-                            direction: Direction::In,
-                            relations: Some(vec![EdgeRelation::Supersedes]),
-                            limit: Some(1),
-                            min_weight: None,
-                        },
-                    )
-                    .await?;
-                if !inbound.is_empty() {
-                    superseded.insert(note_id);
-                }
-            }
+            let note_ids: Vec<Uuid> = alive_notes.keys().copied().collect();
+            let superseded: std::collections::HashSet<Uuid> = graph
+                .batch_neighbors(
+                    &note_ids,
+                    NeighborQuery {
+                        direction: Direction::In,
+                        relations: Some(vec![EdgeRelation::Supersedes]),
+                        limit: Some(1),
+                        min_weight: None,
+                    },
+                )
+                .await?
+                .into_iter()
+                .map(|(note_id, _)| note_id)
+                .collect();
             alive_notes.retain(|id, _| !superseded.contains(id));
         }
 
@@ -14673,6 +14671,78 @@ mod tests {
         assert!(
             snap["fts_passes"].as_u64().unwrap_or(0) >= 1,
             "note search FTS execution must count fts_passes; got {snap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_notes_batches_supersedes_suppression_round_trip() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let ns = Namespace::parse("usage-note-supersedes-batch").unwrap();
+        let tok = NamespaceToken::for_namespace(ns);
+
+        let mut notes = Vec::new();
+        for ordinal in 0..4 {
+            notes.push(
+                rt.create_note(
+                    &tok,
+                    "observation",
+                    None,
+                    &format!("batchsupersedesprobe live candidate {ordinal}"),
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+                .expect("create_note must succeed"),
+            );
+        }
+        rt.link(
+            &tok,
+            notes[3].id,
+            notes[0].id,
+            EdgeRelation::Supersedes,
+            1.0,
+            None,
+        )
+        .await
+        .expect("supersedes link must succeed");
+
+        let ctx = crate::usage::UsageContext::new();
+        let hits = crate::usage::scope(ctx.clone(), async {
+            rt.search_notes(
+                &tok,
+                "batchsupersedesprobe",
+                None,
+                10,
+                None,
+                false,
+                &[],
+                None,
+            )
+            .await
+        })
+        .await
+        .expect("search_notes must succeed");
+
+        let hit_ids: std::collections::HashSet<Uuid> = hits.iter().map(|hit| hit.note_id).collect();
+        assert_eq!(
+            hit_ids.len(),
+            3,
+            "all live, non-superseded notes must remain"
+        );
+        assert!(
+            !hit_ids.contains(&notes[0].id),
+            "the superseded note must be excluded"
+        );
+        assert!(
+            notes[1..].iter().all(|note| hit_ids.contains(&note.id)),
+            "every live, non-superseded note must be returned"
+        );
+
+        let snap = ctx.snapshot();
+        assert_eq!(
+            snap["db_round_trips"], 1,
+            "supersedes suppression must use one batched adjacency query; got {snap:?}"
         );
     }
 
