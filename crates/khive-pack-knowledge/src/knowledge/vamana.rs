@@ -987,7 +987,7 @@ fn decode_ann_dir_name(name: &str) -> Option<(String, String)> {
     }
     let mut bytes = Vec::with_capacity(raw.len() / 2);
     // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-    #[allow(clippy::chunks_exact_to_as_chunks)]
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     for pair in raw.chunks_exact(2) {
         let hi = (pair[0] as char).to_digit(16)?;
         let lo = (pair[1] as char).to_digit(16)?;
@@ -1516,7 +1516,7 @@ async fn replay_final_states(
                 return Err(format!("final upsert for {uuid}: embedding missing on row"));
             };
             // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-            #[allow(clippy::chunks_exact_to_as_chunks)]
+            #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
             let vec: Vec<f32> = bytes
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1728,7 +1728,7 @@ async fn fetch_fresh_tail_snapshot(
             ));
         }
         // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(clippy::chunks_exact_to_as_chunks)]
+        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
         let embedding = bytes
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -2455,7 +2455,7 @@ async fn scan_corpus_raw(
             continue;
         }
         // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(clippy::chunks_exact_to_as_chunks)]
+        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
         let vec: Vec<f32> = bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

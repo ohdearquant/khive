@@ -1227,7 +1227,7 @@ async fn load_and_build_from_vector_store(
             continue;
         }
         // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(clippy::chunks_exact_to_as_chunks)]
+        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
         let vec: Vec<f32> = bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1750,7 +1750,7 @@ async fn fetch_final_tail_on(
             return Err(format!("tail upsert {subject}: embedding is not a blob"));
         };
         // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(clippy::chunks_exact_to_as_chunks)]
+        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
         let vector: Vec<f32> = bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

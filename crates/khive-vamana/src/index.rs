@@ -738,7 +738,7 @@ impl VamanaIndex {
             )));
         }
         // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(clippy::chunks_exact_to_as_chunks)]
+        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
         let vectors: Vec<f32> = vector_bytes
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))

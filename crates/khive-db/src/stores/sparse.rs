@@ -517,7 +517,7 @@ impl SqliteSparseStore {
 
                 // `as_chunks` is unstable on stable; keep `chunks_exact`
                 // until it lands.
-                #[allow(clippy::chunks_exact_to_as_chunks)]
+                #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
                 let stored_values: Vec<f32> = values_blob
                     .chunks_exact(4)
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))

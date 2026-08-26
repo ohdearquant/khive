@@ -652,7 +652,7 @@ pub fn read_external_ids_sidecar(dir: &std::path::Path) -> Result<([u8; 32], Vec
 
     let mut ids = Vec::with_capacity(count);
     // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-    #[allow(clippy::chunks_exact_to_as_chunks)]
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     for chunk in id_bytes.chunks_exact(16) {
         let raw: [u8; 16] = chunk.try_into().unwrap();
         ids.push(Uuid::from_bytes(raw));
