@@ -53,18 +53,23 @@ are terminal for the generation, not retried.
 
 - `QueueAdmissionExhausted` — `state.pending.len() >= max_pending_rows` at enqueue time. The row
   is never pushed and never counted in `submitted_rows`: a pure refusal, safe to retry.
-- `AdmissionDeadlineExpired` — the row was already pushed onto `state.pending` (and counted) when
-  the caller's `tokio::time::timeout(admission_deadline, rx)` elapsed waiting for its generation's
-  outcome. The row is left in place; the generation driver drains and commits (or terminally
-  fails) it independently of this caller's timeout, so the caller cannot tell from the reason
-  alone whether the row eventually landed. Retrying is only safe for an idempotent caller.
+- `AdmissionDeadlineExpired` — the row was already pushed and counted when the caller's
+  `tokio::time::timeout(admission_deadline, rx)` elapsed waiting for its generation's outcome. By
+  that moment the row may still be sitting in `state.pending`, or the driver may have already
+  drained it into an in-flight generation — either way it remains enqueued and unresolved, and the
+  generation driver commits (or terminally fails) it independently of this caller's timeout, so the
+  caller cannot tell from the reason alone whether the row eventually landed, or even which of
+  those two states it was in. Retrying is only safe for an idempotent caller.
 
 `pack.rs::append_audit_event_best_effort` treats both as "audit-lane admission pressure": for a
-`DispatchObligation` row produced by a read-only verb (`VerbCategory::Assertive`), either reason
-degrades to best-effort instead of failing the dispatch — the read performed no domain write, so
-discarding its already-computed result to protect an obligation it does not need as strictly as a
-write does inverts the point of serving it (khive#2147, khive#2217). Every other obligation
-failure, and every failure for a non-read verb, is unaffected — write-side hard-fail semantics are
+`DispatchObligation` row produced by a verb that is both `VerbCategory::Assertive` AND explicitly
+opted in via `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` (an explicit, fail-closed allowlist —
+`Assertive` alone is not a sound proxy, since some Assertive handlers have their own
+accounting-bearing side effects; see that constant's doc comment), either reason degrades to
+best-effort instead of failing the dispatch — the read performed no domain write, so discarding
+its already-computed result to protect an obligation it does not need as strictly as a write does
+inverts the point of serving it (khive#2147, khive#2217). Every other obligation failure, and
+every failure for a non-opted-in verb, is unaffected — write-side hard-fail semantics are
 unchanged.
 
 ## Supervision and failure ownership (owner ruling R1)

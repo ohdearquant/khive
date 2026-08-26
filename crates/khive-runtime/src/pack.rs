@@ -1378,18 +1378,59 @@ impl VerbRegistry {
         })
     }
 
-    /// Whether `verb`'s declared [`VerbCategory`] is `Assertive` — the
-    /// speech-act tag for handlers that "retrieve and present facts" (`get`,
-    /// `list`, `search`, `recall`, `gtd.tasks`, ...) rather than committing a
-    /// domain change. Unknown verbs are conservatively `false`.
+    /// Explicit, fail-closed opt-in for admission-pressure audit degradation
+    /// (khive#2147/khive#2217). `VerbCategory::Assertive` alone is NOT a
+    /// sound proxy for "safe to drop this dispatch's own audit row under
+    /// audit-lane admission pressure": several Assertive handlers have
+    /// their own accounting-bearing side effects. Two known examples,
+    /// deliberately excluded here:
+    /// - `memory.recall` dispatches `brain.record_serve` as a background
+    ///   write; degrading `memory.recall`'s row raises the risk that a
+    ///   serve goes unaccounted for if the ledger dispatch itself later
+    ///   also races admission pressure.
+    /// - `db_diagnostics` may backfill WAL frames via a PASSIVE checkpoint
+    ///   probe — physical I/O, not a pure in-memory read.
+    ///
+    /// Every entry here MUST be declared `VerbCategory::Assertive` in
+    /// `khive-pack-kg/src/handler_defs.rs` — enforced by the
+    /// `admission_degrade_safe_verbs_are_registered_assertive` census test
+    /// below, which re-derives the classification from that file's live
+    /// source rather than trusting this list's own claim. Adding a verb
+    /// from a different pack requires extending that test's source scan,
+    /// not just this list.
+    const ADMISSION_DEGRADE_SAFE_VERBS: &'static [&'static str] = &[
+        "get",
+        "list",
+        "stats",
+        "search",
+        "neighbors",
+        "traverse",
+        "context",
+        "query",
+        "resolve",
+        "whoami",
+        "verbs",
+    ];
+
+    /// Whether `verb` is both declared [`VerbCategory::Assertive`] (the
+    /// speech-act tag for handlers that "retrieve and present facts" rather
+    /// than committing a domain change) AND explicitly opted in to
+    /// admission-pressure audit degradation via
+    /// [`Self::ADMISSION_DEGRADE_SAFE_VERBS`]. Unknown or non-opted-in verbs
+    /// are conservatively `false` — fail-closed, so a new Assertive handler
+    /// hard-fails its audit obligation like any write until someone
+    /// deliberately reviews it and adds it to the allowlist.
     ///
     /// Used only to decide whether a dispatch's own audit-obligation row may
     /// degrade to best-effort on transient audit-lane admission pressure
     /// (`append_audit_event_best_effort`) — a read that performed no domain
     /// write must not fail the caller just because the audit lane is
-    /// momentarily saturated (khive#2147, khive#2217). Never used for
-    /// permission checking, transport routing, or return-shape selection.
-    fn verb_is_read_only(&self, verb: &str) -> bool {
+    /// momentarily saturated. Never used for permission checking, transport
+    /// routing, or return-shape selection.
+    fn admission_degrade_safe(&self, verb: &str) -> bool {
+        if !Self::ADMISSION_DEGRADE_SAFE_VERBS.contains(&verb) {
+            return false;
+        }
         self.packs
             .iter()
             .find_map(|pack| pack.handlers().iter().find(|h| h.name == verb))
@@ -1743,7 +1784,7 @@ impl VerbRegistry {
             event,
             verb,
             producer,
-            self.verb_is_read_only(verb),
+            self.admission_degrade_safe(verb),
         )
         .await
     }
@@ -2179,7 +2220,7 @@ impl VerbRegistry {
                                             storage_event,
                                             verb,
                                             crate::audit_batch::AuditProducer::DispatchSucceeded,
-                                            handler_def.category == VerbCategory::Assertive,
+                                            self.admission_degrade_safe(verb),
                                         )
                                         .await
                                     }
@@ -2202,7 +2243,7 @@ impl VerbRegistry {
                                             storage_event,
                                             verb,
                                             crate::audit_batch::AuditProducer::DispatchSucceeded,
-                                            handler_def.category == VerbCategory::Assertive,
+                                            self.admission_degrade_safe(verb),
                                         )
                                         .await
                                     }
@@ -2258,7 +2299,7 @@ impl VerbRegistry {
                                     storage_event,
                                     verb,
                                     producer,
-                                    handler_def.category == VerbCategory::Assertive,
+                                    self.admission_degrade_safe(verb),
                                 )
                                 .await
                             }
@@ -3354,6 +3395,34 @@ pub(crate) fn audit_obligation_append_failure_count() -> u64 {
     AUDIT_OBLIGATION_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide count of `DispatchObligation` rows whose commit was skipped
+/// under transient audit-lane admission pressure for an
+/// [`VerbRegistry::admission_degrade_safe`] verb (khive#2147/khive#2217).
+/// Deliberately its own counter, disjoint from both
+/// [`AUDIT_APPEND_FAILURES`] and [`AUDIT_OBLIGATION_APPEND_FAILURES`]: this
+/// case is neither. It is not [`AUDIT_APPEND_FAILURES`] — that counter's own
+/// contract (`khive-db`'s `WriterContentionDiagnostics::audit_append_failures`
+/// doc) says an obligation-bearing row's commit failure "either fail[s] the
+/// dispatch... or [is] tracked by the runtime's own separate
+/// obligation-failure counter instead", and this dispatch does neither: it
+/// reports the caller's already-computed success with no error. It is not
+/// [`AUDIT_OBLIGATION_APPEND_FAILURES`] either — that counter's contract is
+/// "most call sites fold this failure into the dispatch's own error", which
+/// is exactly the propagation this admission-degrade path exists to avoid.
+/// Test-only reader for now: no production consumer reads it yet, but the
+/// mechanism tests need to observe it directly — including the
+/// admission-pressure regression tests in `tests/read_verb_admission_exhaustion.rs`,
+/// which (like `khive-runtime/src/audit_batch.rs`'s own `test_internals`
+/// module) need it as `pub`, not `pub(crate)`, since they compile as a
+/// separate external binary outside this crate.
+static AUDIT_ADMISSION_DEGRADED_OBLIGATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, feature = "test-internals"))]
+pub fn audit_admission_degraded_obligation_count() -> u64 {
+    AUDIT_ADMISSION_DEGRADED_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 const GIT_DIGEST_RECEIPT_FAILURE: &str =
     "git_digest_receipt_persist_failed: git.digest writes may have committed, but no durable \
      success receipt was confirmed; inspect ingest state before retrying";
@@ -3528,17 +3597,22 @@ async fn persist_git_digest_receipt(
 /// failure is logged and counted but never returned, matching the pre-ADR-133
 /// best-effort contract.
 ///
-/// Every failure — obligation or observability — increments the
-/// process-wide diagnostics counter above.
+/// Every failure — obligation or observability — increments one of the
+/// process-wide diagnostics counters above; the one exception is the
+/// admission-degrade case below, which increments its own dedicated
+/// [`AUDIT_ADMISSION_DEGRADED_OBLIGATIONS`] counter instead — it is neither
+/// a swallowed observability failure nor a propagated obligation failure.
 ///
 /// `is_read_only_verb` (khive#2147/khive#2217) narrows that obligation for
 /// one specific case: a `DispatchSucceeded`/`DispatchFailed` row for a verb
-/// whose category is `VerbCategory::Assertive` performs no domain write, so
-/// this row's own admission being transiently refused or timed out
-/// (`AuditTerminalReason::QueueAdmissionExhausted` /
+/// that [`VerbRegistry::admission_degrade_safe`] has explicitly opted in
+/// (Assertive alone is not a sufficient signal — see that method's doc)
+/// performs no domain write, so this row's own admission being transiently
+/// refused or timed out (`AuditTerminalReason::QueueAdmissionExhausted` /
 /// `AdmissionDeadlineExpired`) degrades to best-effort instead of failing the
 /// dispatch — the caller-visible read result is preserved. Every other
-/// obligation failure, and every failure for a non-read verb, is unaffected.
+/// obligation failure, and every failure for a non-opted-in verb, is
+/// unaffected.
 ///
 /// When the registry has an audit-batch seam configured (it is whenever
 /// `store` is), the row routes through
@@ -3581,7 +3655,8 @@ async fn append_audit_event_best_effort(
                         | AuditTerminalReason::AdmissionDeadlineExpired
                 );
                 if is_read_only_verb && admission_pressure {
-                    AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    AUDIT_ADMISSION_DEGRADED_OBLIGATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(
                         verb,
                         reason = ?reason,
@@ -3746,6 +3821,59 @@ pub(crate) mod tests {
     use super::*;
     use crate::ActorRef;
     use khive_types::Pack;
+
+    /// khive-runtime links no real pack crates in its own test binary (see
+    /// the comment on `CommProbeFactory` below), so
+    /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`] cannot be checked
+    /// against a live registered `HandlerDef` here. Instead this
+    /// re-derives each opted-in verb's classification from
+    /// `khive-pack-kg/src/handler_defs.rs`'s live source — the same
+    /// fail-closed pattern as `adr133_writer_census.rs`'s
+    /// `reclassify_from_live_source`. Every entry in the allowlist is
+    /// currently declared in that one file; a verb from a different pack
+    /// would need this scan extended to that pack's source first.
+    #[test]
+    fn admission_degrade_safe_verbs_are_registered_assertive() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../khive-pack-kg/src/handler_defs.rs"
+        );
+        let source =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+
+        for verb in VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS {
+            // Anchored to exactly 8 leading spaces: that is the indentation
+            // `HandlerDef { name: ... }` top-level fields use in this file,
+            // versus 16 for a nested `ParamDef { name: ... }` — several
+            // handlers (e.g. `search`) declare a `query`/`kind`/... param
+            // whose own `name:` field would otherwise collide with a verb
+            // of the same name declared later in the file.
+            let needle = format!("\n        name: \"{verb}\",");
+            let name_pos = source.find(&needle).unwrap_or_else(|| {
+                panic!(
+                    "admission-degrade-safe verb {verb:?} has no top-level `HandlerDef` in \
+                     khive-pack-kg/src/handler_defs.rs; update the allowlist or this \
+                     census's source path"
+                )
+            });
+            // Each `HandlerDef` literal in this file declares `category:`
+            // shortly after `name:`, well before the next handler's own
+            // `name:` field — bound the scan to the text up to the next
+            // `HandlerDef {` (or EOF) so a later handler's category can
+            // never be misattributed to this one.
+            let block_end = source[name_pos..]
+                .find("HandlerDef {")
+                .map(|offset| name_pos + offset)
+                .unwrap_or(source.len());
+            let block = &source[name_pos..block_end];
+            assert!(
+                block.contains("VerbCategory::Assertive"),
+                "admission-degrade-safe verb {verb:?} is declared in \
+                 khive-pack-kg/src/handler_defs.rs but is not VerbCategory::Assertive; \
+                 admission degradation must not silently apply to a write-capable verb"
+            );
+        }
+    }
 
     static COMM_PROBE_GRANTED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);

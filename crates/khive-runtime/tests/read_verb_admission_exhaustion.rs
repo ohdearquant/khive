@@ -25,13 +25,16 @@ use serde_json::Value;
 use khive_runtime::audit_batch::{
     fault_injection, AuditBatchConfig, AuditBatchControl, AuditProducer, PreparedAuditRow,
 };
-use khive_runtime::pack::{HandlerDef, PackRuntime, VerbRegistryBuilder};
+use khive_runtime::pack::{
+    audit_admission_degraded_obligation_count, HandlerDef, PackRuntime, VerbRegistryBuilder,
+};
 use khive_runtime::runtime::NamespaceToken;
 use khive_runtime::RuntimeError;
 use khive_storage::types::{BatchWriteSummary, Page, PageRequest};
 use khive_storage::{Event, EventFilter, EventStore, StorageResult};
 use khive_types::pack::{Pack, Visibility};
 use khive_types::{EventKind, EventOutcome, SubstrateKind, VerbCategory};
+use serial_test::serial;
 
 #[derive(Default)]
 struct MemoryEventStore {
@@ -182,6 +185,10 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
     }
 }
 
+// Both tests in this file arm `fault_injection`'s process-global
+// `SUPERVISOR_SLEEP_BEFORE_SPAWN` flag; running them concurrently races one
+// test's arm against the other's supervisor loop consuming it.
+#[serial]
 #[tokio::test]
 async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
     let store = Arc::new(MemoryEventStore::default());
@@ -243,6 +250,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
     // admission (immediate `QueueAdmissionExhausted`, no wait), but that
     // failure degrades to best-effort instead of discarding the read's
     // already-computed result.
+    let before_degraded = audit_admission_degraded_obligation_count();
     let result = registry
         .dispatch("list", Value::Null)
         .await
@@ -251,7 +259,88 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
         result,
         serde_json::json!({ "pack": "alpha", "verb": "list" })
     );
+    assert_eq!(
+        audit_admission_degraded_obligation_count(),
+        before_degraded + 1,
+        "a queue-refusal degrade must count on its own dedicated counter, not \
+         AUDIT_APPEND_FAILURES or AUDIT_OBLIGATION_APPEND_FAILURES"
+    );
 
     drop(occupant);
     drop(filler);
+}
+
+/// khive#2117/khive#2208 + khive#2147/khive#2217 combined: a read dispatch
+/// must also survive its own audit row's admission *deadline* elapsing, not
+/// just an immediate queue-full refusal — the two `AuditTerminalReason`
+/// variants are distinct call sites in `append_audit_event_best_effort` and
+/// this exercises the one `read_verb_dispatch_survives_audit_lane_admission_exhaustion`
+/// above does not: `AdmissionDeadlineExpired` on a row that was already
+/// enqueued (`state.pending`), rather than `QueueAdmissionExhausted` before
+/// enqueue.
+// Both tests in this file arm `fault_injection`'s process-global
+// `SUPERVISOR_SLEEP_BEFORE_SPAWN` flag; running them concurrently races one
+// test's arm against the other's supervisor loop consuming it.
+#[serial]
+#[tokio::test]
+async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
+    let store = Arc::new(MemoryEventStore::default());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(AlphaPack);
+    builder.with_event_store(store);
+    builder.with_audit_batch_config(AuditBatchConfig {
+        // Room for the occupant row plus this test's own "list" row, so the
+        // "list" row is never refused on admission — it must enqueue and
+        // then wait out its own short deadline instead.
+        max_pending_rows: std::num::NonZeroUsize::new(4).unwrap(),
+        admission_deadline: std::time::Duration::from_millis(30),
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("registry builds");
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("event store configured, so the batch seam is too");
+
+    // Hold the supervisor inside its first generation for the test's
+    // duration, mirroring the queue-full test above: an occupant row is
+    // drained into the armed sleep, so any row submitted afterward sits in
+    // `state.pending`, undrained, until its own `admission_deadline` elapses.
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let occupant_batch = audit_batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.occupant"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snap = audit_batch.test_snapshot();
+        snap.pending_rows == 0 && snap.in_flight_generation.is_some()
+    })
+    .await;
+
+    // The read's own audit row now enqueues behind the stalled generation
+    // (the queue has room, so this is not `QueueAdmissionExhausted`) and
+    // waits out its 30ms `admission_deadline` — `AdmissionDeadlineExpired`.
+    // That failure must still degrade to best-effort: the dispatch reports
+    // its own already-computed result rather than discarding it.
+    let before_degraded = audit_admission_degraded_obligation_count();
+    let result = registry
+        .dispatch("list", Value::Null)
+        .await
+        .expect("a read verb must not fail when its own audit row's admission deadline elapses");
+    assert_eq!(
+        result,
+        serde_json::json!({ "pack": "alpha", "verb": "list" })
+    );
+    assert_eq!(
+        audit_admission_degraded_obligation_count(),
+        before_degraded + 1,
+        "a deadline-expiry degrade must count on its own dedicated counter too, not just \
+         the queue-refusal arm"
+    );
+
+    drop(occupant);
 }

@@ -107,15 +107,18 @@ pub enum AuditTerminalReason {
     /// generation with anyone — safe to retry, and doing so applies the
     /// obligation at most once.
     QueueAdmissionExhausted,
-    /// The row was already enqueued (counted in `submitted_rows`,
-    /// `state.pending`) when this caller's `AuditBatchConfig::admission_deadline`
-    /// elapsed waiting for its generation's outcome. Unlike
-    /// [`Self::QueueAdmissionExhausted`], the row was not refused: it stays
-    /// queued and is drained and committed (or terminally failed) by the
-    /// generation driver independently of this caller's timeout, so the
+    /// The row was already enqueued (counted in `submitted_rows`) when this
+    /// caller's `AuditBatchConfig::admission_deadline` elapsed waiting for
+    /// its generation's outcome. Unlike [`Self::QueueAdmissionExhausted`],
+    /// the row was not refused: by the moment the deadline fires it may
+    /// still be sitting in `state.pending`, or the driver may have already
+    /// drained it into an in-flight generation — either way it remains
+    /// enqueued and unresolved, and is committed (or terminally failed) by
+    /// the generation driver independently of this caller's timeout, so the
     /// caller cannot tell from this reason alone whether the row eventually
-    /// committed. Retrying is only safe for an idempotent caller — the prior
-    /// submission may still land.
+    /// committed, or even which of those two states it was in when the
+    /// deadline elapsed. Retrying is only safe for an idempotent caller —
+    /// the prior submission may still land.
     AdmissionDeadlineExpired,
     /// A row shared this generation's id with a previously stored row whose
     /// columns or observation projection did not match exactly.
