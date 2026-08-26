@@ -1636,8 +1636,13 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
     // same process, which would self-deadlock on `flock`.
     let _startup_lock = boot_guard;
 
-    if let Some(incumbent_pid) =
-        cleanup_stale_daemon(&sock, &pid_file, allow_same_process_incumbent).await
+    if let Some(incumbent_pid) = cleanup_stale_daemon(
+        &sock,
+        &pid_file,
+        allow_same_process_incumbent,
+        dispatcher.config_id(),
+    )
+    .await
     {
         // #1874: a second daemon must refuse loudly (non-zero exit, pid named)
         // rather than exit `Ok(())` — a silent success here is what let two
@@ -1686,8 +1691,13 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
                 drop(listener);
                 let _ = std::fs::remove_file(&sock);
             }
-            if pid_file_names_a_reachable_daemon(&pid_file, &sock, allow_same_process_incumbent)
-                .await
+            if pid_file_names_a_reachable_daemon(
+                &pid_file,
+                &sock,
+                allow_same_process_incumbent,
+                dispatcher.config_id(),
+            )
+            .await
             {
                 tracing::info!(
                     "a replacement khived already claimed the pid/socket rendezvous; exiting"
@@ -1986,40 +1996,61 @@ fn pid_can_name_incumbent(pid: u32, current_pid: u32, allow_same_process_incumbe
 #[cfg(unix)]
 const DUPLICATE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Whether the listener at `sock` actually speaks the khived wire protocol.
+/// Whether the listener at `sock` actually speaks the khived wire protocol
+/// **as the same khived this process would defer to** — identified by
+/// `expected_config_id`.
 ///
 /// A live PID plus an accepting Unix socket is not proof of khived: any
 /// unrelated process that happens to have bound the same path also answers
-/// `connect()`. This sends a bounded `probe_only` frame (the same identity
-/// probe the client-side recovery path uses) and requires a well-formed
-/// [`DaemonResponseFrame`] back. Any frame that parses — even one reporting
-/// `version_mismatch` or `config_mismatch` — proves the peer speaks this
-/// protocol and is therefore a real khived instance that must not be treated
-/// as stale. A connect that succeeds but never answers, times out, or
-/// answers with non-protocol bytes is not khived and falls through to the
-/// stale-socket recovery path instead.
+/// `connect()`. Nor is any well-formed [`DaemonResponseFrame`] proof: a
+/// `config_mismatch`/`version_mismatch` response, or a legacy pre-probe
+/// daemon that falls through to normal dispatch on the empty `ops` string,
+/// both deserialize cleanly without being the unambiguous "yes, alive and
+/// identity-matching" answer this check needs. This sends a bounded
+/// `probe_only` frame (the same identity probe the client-side recovery path
+/// uses, `crates/khive-mcp/src/daemon.rs::probe_daemon_identity`) carrying
+/// this process's own `config_id`, and requires the exact probe-ack sentinel
+/// (`ok=true, result=None, error=None`) plus matching protocol version and
+/// `served_config_id` back — mirroring the client probe's `is_probe_ack`
+/// check so both sides of the protocol agree on what "alive" means. Connect,
+/// write, and read are all inside the one bounded timeout: `UnixStream::connect`
+/// itself awaits write readiness, so a listener with a saturated accept
+/// backlog could otherwise hold this call open past the advertised bound.
+/// A connect that succeeds but never answers, times out, or answers with
+/// non-protocol bytes, a mismatched identity, or a non-ack response is not
+/// treated as the same khived and falls through to the stale-socket recovery
+/// path instead.
 #[cfg(unix)]
-async fn socket_speaks_khived_protocol(sock: &std::path::Path) -> bool {
-    let Ok(mut stream) = UnixStream::connect(sock).await else {
-        return false;
-    };
+async fn socket_speaks_khived_protocol(sock: &std::path::Path, expected_config_id: &str) -> bool {
     let probe = DaemonRequestFrame {
         probe_only: true,
         protocol_version: PROTOCOL_VERSION,
+        config_id: expected_config_id.to_string(),
         ..Default::default()
     };
     let Ok(payload) = serde_json::to_vec(&probe) else {
         return false;
     };
-    tokio::time::timeout(DUPLICATE_PROBE_TIMEOUT, async {
+    let response = tokio::time::timeout(DUPLICATE_PROBE_TIMEOUT, async {
+        let mut stream = UnixStream::connect(sock).await.ok()?;
         write_frame(&mut stream, &payload).await.ok()?;
         let raw = read_frame(&mut stream).await.ok()?;
         serde_json::from_slice::<DaemonResponseFrame>(&raw).ok()
     })
     .await
     .ok()
-    .flatten()
-    .is_some()
+    .flatten();
+
+    let Some(resp) = response else {
+        return false;
+    };
+    let is_probe_ack = resp.ok && resp.result.is_none() && resp.error.is_none();
+    is_probe_ack
+        && !resp.version_mismatch
+        && !resp.namespace_mismatch
+        && !resp.config_mismatch
+        && resp.daemon_protocol_version == PROTOCOL_VERSION
+        && resp.served_config_id.as_deref() == Some(expected_config_id)
 }
 
 /// Check whether `pid_file`/`sock` already name a live, responsive daemon and,
@@ -2035,13 +2066,14 @@ async fn cleanup_stale_daemon(
     sock: &std::path::Path,
     pid_file: &std::path::Path,
     allow_same_process_incumbent: bool,
+    expected_config_id: &str,
 ) -> Option<u32> {
     if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             if pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
                 && is_process_running(pid)
                 && sock.exists()
-                && socket_speaks_khived_protocol(sock).await
+                && socket_speaks_khived_protocol(sock, expected_config_id).await
             {
                 return Some(pid);
             }
@@ -2091,6 +2123,7 @@ async fn pid_file_names_a_reachable_daemon(
     pid_file: &std::path::Path,
     sock: &std::path::Path,
     allow_same_process_incumbent: bool,
+    expected_config_id: &str,
 ) -> bool {
     let Ok(pid_str) = std::fs::read_to_string(pid_file) else {
         return false;
@@ -2101,7 +2134,7 @@ async fn pid_file_names_a_reachable_daemon(
     pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
         && is_process_running(pid)
         && sock.exists()
-        && socket_speaks_khived_protocol(sock).await
+        && socket_speaks_khived_protocol(sock, expected_config_id).await
 }
 
 #[cfg(unix)]
@@ -3055,8 +3088,8 @@ mod tests {
         });
 
         assert!(
-            socket_speaks_khived_protocol(&sock_path).await,
-            "a real khived answering the probe_only frame must be recognized"
+            socket_speaks_khived_protocol(&sock_path, "probe-test").await,
+            "a real khived answering the probe_only frame with a matching config_id must be recognized"
         );
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), accept_task).await;
@@ -3084,7 +3117,7 @@ mod tests {
         });
 
         let before = tokio::time::Instant::now();
-        let speaks = socket_speaks_khived_protocol(&sock_path).await;
+        let speaks = socket_speaks_khived_protocol(&sock_path, "probe-test").await;
         let elapsed = before.elapsed();
 
         assert!(
@@ -3099,6 +3132,50 @@ mod tests {
         accept_task.abort();
         let _ = accept_task.await;
         drop(held);
+    }
+
+    /// #2230 review round 2 (Medium): a well-formed [`DaemonResponseFrame`]
+    /// that is not the unambiguous probe-ack sentinel — e.g. one reporting a
+    /// `config_mismatch` for a *different* config_id, exactly what a live
+    /// khived serving another store would send back — must not be treated as
+    /// the same live, identity-matching duplicate. Before this fix, any
+    /// frame that merely deserialized was accepted, so this response would
+    /// have been misclassified as "alive" and refused a legitimate boot.
+    #[tokio::test]
+    async fn socket_speaks_khived_protocol_rejects_a_non_ack_or_mismatched_response() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = dir.path().join("mismatched.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind fake listener");
+        let accept_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _raw = read_frame(&mut stream).await.expect("read probe frame");
+                let resp = DaemonResponseFrame {
+                    ok: false,
+                    result: None,
+                    error: None,
+                    namespace_mismatch: false,
+                    config_mismatch: true,
+                    served_config_id: Some("someone-elses-config".to_string()),
+                    version_mismatch: false,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    metrics: None,
+                    request_id: None,
+                };
+                let payload = serde_json::to_vec(&resp).expect("encode response");
+                write_frame(&mut stream, &payload)
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        let speaks = socket_speaks_khived_protocol(&sock_path, "expected-config").await;
+        assert!(
+            !speaks,
+            "a well-formed but non-ack / identity-mismatched response must not be treated as \
+             the same live khived"
+        );
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), accept_task).await;
     }
 
     #[tokio::test]
