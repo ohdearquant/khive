@@ -137,14 +137,33 @@ DEFERRED`-then-reuse path used by multi-call GQL/SPARQL cursors and any
 caller-issued `BEGIN`) reads `PoolConfig::read_tx_max_age` — the same
 `KHIVE_TX_MAX_AGE_SECS` value this sweep uses — on every reuse of the handle.
 Once the admitted transaction's age reaches that bound, the next call is
-refused, the transaction is rolled back, and the connection is returned to
-the pool ready for a fresh snapshot; the refusal is `StorageError::Transaction`
-(`is_retryable() == true`) and is counted in
-`checkpoint::read_tx_max_age_evictions()` (surfaced as
-`checkpoint_counters.read_tx_max_age_evictions` in `db_diagnostics`). This
-bounds how long a periodically-reused reader (a long-lived MCP session that
-keeps calling in) can keep extending its pin, closing the #1812/#1876 gap for
-that case. It does **not** cover a transaction abandoned mid-flight with no
+refused and the transaction is rolled back. Two outcomes are possible,
+distinguished by dedicated `StorageError` variants (both
+`is_retryable() == true` and both counted in
+`checkpoint::read_tx_max_age_evictions()`, surfaced as
+`checkpoint_counters.read_tx_max_age_evictions` in `db_diagnostics`):
+
+- **Clean rollback** — `ROLLBACK` succeeds and autocommit is restored. The
+  connection is returned to the pool ready for a fresh snapshot, and the
+  refusal is `StorageError::ReadTransactionAgeEvicted { operation,
+  max_age_secs }`.
+- **Failed cleanup** — `ROLLBACK` is denied (e.g. by an authorizer hook) or
+  errors outright, or it reports success without actually restoring
+  autocommit. The poisoned connection is discarded instead of being returned
+  to the pool, and the refusal is
+  `StorageError::ReadTransactionAgeEvictionCleanupFailed { operation,
+  max_age_secs, message }`, whose `message` names which of the two cleanup
+  failures occurred. The age check itself still ran before any read on the
+  connection, so retrying on a fresh connection remains just as safe as the
+  clean-rollback case.
+
+Both variants map to the same retryable `read_tx_age_evicted` wire stage at
+the MCP boundary (`khive_runtime::error::READ_TX_AGE_EVICTED_STAGE`); the
+rendered `message` field is what a caller reads to tell the two outcomes
+apart. This bounds how long a periodically-reused reader (a long-lived MCP
+session that keeps calling in) can keep extending its pin, closing the
+#1812/#1876 gap for that case. It does **not** cover a transaction abandoned
+mid-flight with no
 further calls at all: `rusqlite::Connection` is thread-owned and not `Sync`,
 and a genuinely idle connection has no in-flight statement for
 `sqlite3_interrupt` to act on, so reaching *that* connection from outside
