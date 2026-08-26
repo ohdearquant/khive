@@ -934,8 +934,25 @@ button.repo-list-row:hover,
   --repo-treemap-tone: var(--khive-color-ontology-concept);
   background: color-mix(in srgb, var(--repo-treemap-tone) 7%, var(--khive-color-surface-raised));
   border: 2px solid color-mix(in srgb, var(--repo-treemap-tone) 54%, var(--khive-color-border));
+  container-type: size;
   overflow: hidden;
   position: absolute;
+}
+/* Children lay out inside a pixel-inset body band below the pixel-positioned
+   overlay label, so the label can never cover a child tile at any rendered
+   height. Where a tile is too short to afford the band, the label is hidden
+   and the body takes the full tile instead. */
+.repo-treemap-package-body {
+  inset: 24px 0 0 0;
+  position: absolute;
+}
+@container (max-height: 48px) {
+  .repo-treemap-package-label {
+    display: none;
+  }
+  .repo-treemap-package-body {
+    inset: 0;
+  }
 }
 .repo-treemap-package[data-package-tone="0"] { --repo-treemap-tone: var(--khive-color-ontology-concept); }
 .repo-treemap-package[data-package-tone="1"] { --repo-treemap-tone: var(--khive-color-ontology-document); }
@@ -988,13 +1005,20 @@ button.repo-list-row:hover,
   font-weight: 650;
   top: 20px;
 }
-/* The label sits at a fixed 20px offset while directory heights come from
-   normalized treemap percentages, so a short directory cannot clear it with
-   a percentage inset alone; suppress the label where it would sit over the
-   first module tiles. */
-@container (max-height: 48px) {
+/* The directory label sits at a fixed 20px offset; modules lay out inside a
+   pixel-inset body band that starts below it, so the label can never cover a
+   module at any rendered height. Where the tile is too short to afford the
+   band, the label is hidden and the body takes the full tile. */
+.repo-treemap-directory-body {
+  inset: 40px 0 0 0;
+  position: absolute;
+}
+@container (max-height: 80px) {
   .repo-treemap-directory-label {
     display: none;
+  }
+  .repo-treemap-directory-body {
+    inset: 0;
   }
 }
 .repo-treemap-module {

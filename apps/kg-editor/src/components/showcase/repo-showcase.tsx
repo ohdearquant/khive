@@ -1238,6 +1238,7 @@ function TreemapView({ bundle, moduleById, selectedModuleId, onInspectModule }: 
               <i aria-hidden="true" />
               {packageLayout.label}
             </span>
+            <div className="repo-treemap-package-body">
             {packageLayout.directories.map((directory) => (
               <div
                 className="repo-treemap-directory"
@@ -1248,6 +1249,7 @@ function TreemapView({ bundle, moduleById, selectedModuleId, onInspectModule }: 
                 <span className="repo-treemap-directory-label">
                   {directory.label}
                 </span>
+                <div className="repo-treemap-directory-body">
                 {directory.modules.map((moduleLayout) => {
                   const moduleNode = moduleById.get(moduleLayout.moduleId);
                   if (!moduleNode) {
@@ -1300,8 +1302,10 @@ function TreemapView({ bundle, moduleById, selectedModuleId, onInspectModule }: 
                     </button>
                   );
                 })}
+                </div>
               </div>
             ))}
+            </div>
           </section>
         ))}
       </div>

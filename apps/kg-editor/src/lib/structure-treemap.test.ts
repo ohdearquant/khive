@@ -80,17 +80,17 @@ describe("structure treemap layout", () => {
       "src",
       "tests",
     ]);
-    // Package share x directory share within the 0.9-high package body x
-    // module share within the 0.84-high directory body (top space is
-    // reserved for the overlay labels).
+    // Package share x directory share x module share; each level fills its
+    // parent's body rectangle (label clearance is a renderer/pixel concern,
+    // not part of the normalized layout).
     expect(globalModuleArea(layout, "module-alpha-pack"))
-      .toBeCloseTo((6 / 8) * 0.9 * (4 / 6) * 0.84, 8);
+      .toBeCloseTo((6 / 8) * (4 / 6), 8);
     expect(globalModuleArea(layout, "module-beta-pack"))
-      .toBeCloseTo((2 / 8) * 0.9 * 0.84, 8);
+      .toBeCloseTo(2 / 8, 8);
     expect(globalModuleArea(layout, "module-alpha-integration"))
-      .toBeCloseTo((6 / 8) * 0.9 * (2 / 6) * 0.84 * 0.5, 8);
+      .toBeCloseTo((6 / 8) * (2 / 6) * 0.5, 8);
     expect(globalModuleArea(layout, "module-alpha-smoke"))
-      .toBeCloseTo((6 / 8) * 0.9 * (2 / 6) * 0.84 * 0.5, 8);
+      .toBeCloseTo((6 / 8) * (2 / 6) * 0.5, 8);
   });
 
   it("normalizes activity into color intensity and never into area", () => {

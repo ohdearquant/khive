@@ -61,18 +61,10 @@ type Weighted<T> = Readonly<{
 }>;
 
 const UNIT_RECT: TreemapRect = { x: 0, y: 0, width: 1, height: 1 };
-// Overlay labels sit at the top of each package section and directory tile;
-// laying children into a top-inset body rectangle reserves label space in
-// normalized coordinates. The labels themselves are pixel-positioned, so the
-// stylesheet additionally suppresses a directory label when its tile is too
-// short for the percentage inset to clear it.
-const PACKAGE_BODY_RECT: TreemapRect = { x: 0, y: 0.1, width: 1, height: 0.9 };
-const DIRECTORY_BODY_RECT: TreemapRect = {
-  x: 0,
-  y: 0.16,
-  width: 1,
-  height: 0.84,
-};
+// Children fill the unit rectangle. Label clearance is not a normalized-space
+// concern: the renderer places children inside a pixel-inset body element so
+// the fixed-position overlay labels can never cover them, whatever the tile's
+// rendered height.
 const PACKAGE_TONE_COUNT = 9;
 
 function compareText(left: string, right: string): number {
@@ -228,7 +220,7 @@ export function buildStructureTreemap(
           weight: entry.weight,
           value: entry,
         })),
-        PACKAGE_BODY_RECT,
+        UNIT_RECT,
       );
 
       return {
@@ -251,7 +243,7 @@ export function buildStructureTreemap(
               weight: moduleWeight(row),
               value: row,
             })),
-            DIRECTORY_BODY_RECT,
+            UNIT_RECT,
           );
           return {
             id: directory.id,
