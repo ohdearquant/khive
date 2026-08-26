@@ -26,6 +26,7 @@ import {
 } from "@/lib/adapters/showcase-analysis-catalog";
 import type { RepoBundle } from "@/lib/repo-bundle";
 import {
+  isShowcaseAnalysisId,
   resolveShowcaseRepository,
   type ShowcaseRegistryEntry,
 } from "@/lib/showcase-registry";
@@ -114,6 +115,14 @@ function replaceRepositoryQuery(
       : (current.searchParams.get("view") as RepositoryLocation["view"]),
   };
   const url = repositoryLocationUrl(current, location);
+  // Catalog analysis IDs are safe bounded tokens, but they are not URLs, so
+  // the generic location serializer intentionally omits them. Keep that one
+  // token class addressable while asynchronous catalog discovery decides
+  // which canonical repository it names; all unrelated parameters and the
+  // hash remain scrubbed by repositoryLocationUrl above.
+  if (repository && isShowcaseAnalysisId(repository) && !url.searchParams.has("repo")) {
+    url.searchParams.set("repo", repository);
+  }
   window.history.replaceState(null, "", `${url.pathname}${url.search}`);
 }
 
