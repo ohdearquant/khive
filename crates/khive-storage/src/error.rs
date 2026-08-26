@@ -118,6 +118,18 @@ pub enum StorageError {
     #[error("timeout during {operation}")]
     Timeout { operation: Cow<'static, str> },
 
+    /// A bounded wait for storage admission (a reader/writer handle slot or a
+    /// pooled reader checkout) elapsed before anything was acquired. The
+    /// operation never started, so retrying cannot duplicate a side effect —
+    /// distinct from [`StorageError::Timeout`], which makes no claim about
+    /// whether work was in flight when the deadline expired.
+    #[error("admission timeout during {operation} after {timeout_ms}ms")]
+    AdmissionTimeout {
+        operation: Cow<'static, str>,
+        /// The configured admission deadline that elapsed, in milliseconds.
+        timeout_ms: u64,
+    },
+
     #[error("sql transaction failure during {operation}: {message}")]
     Transaction {
         operation: Cow<'static, str>,
@@ -231,6 +243,7 @@ impl StorageError {
             | Self::BlobDigestMismatch { .. } => Some(StorageCapability::Blob),
             Self::Pool { .. }
             | Self::Timeout { .. }
+            | Self::AdmissionTimeout { .. }
             | Self::Transaction { .. }
             | Self::WriteQueueFull { .. }
             | Self::WriterTaskBusy { .. }
@@ -246,6 +259,7 @@ impl StorageError {
             self,
             Self::Pool { .. }
                 | Self::Timeout { .. }
+                | Self::AdmissionTimeout { .. }
                 | Self::Transaction { .. }
                 | Self::WriteQueueFull { .. }
                 | Self::WriterTaskBusy { .. }

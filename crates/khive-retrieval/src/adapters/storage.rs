@@ -21,7 +21,7 @@ use crate::hybrid::{KeywordSearch, VectorSearch};
 /// Convert a `StorageError` into a `RetrievalError`.
 ///
 /// Maps storage-level errors to the closest retrieval error variant:
-/// - Timeout errors -> `QueryTimeout` (transient, retryable)
+/// - Timeout / AdmissionTimeout errors -> `QueryTimeout` (transient, retryable)
 /// - InvalidInput errors -> `InvalidQuery` (permanent)
 /// - Keyword-context errors -> `Bm25` (permanent)
 /// - Everything else -> `Hnsw` (permanent)
@@ -32,7 +32,11 @@ pub(super) fn storage_err_to_retrieval(
     use khive_storage::StorageError;
 
     match err {
-        StorageError::Timeout { .. } => {
+        // Both timeout shapes are transient. AdmissionTimeout in particular is
+        // retryable at the storage layer (the operation never began); dropping
+        // it into the permanent Hnsw/Bm25 arm below would erase that signal and
+        // turn a saturated-pool retry into a hard failure.
+        StorageError::Timeout { .. } | StorageError::AdmissionTimeout { .. } => {
             // Storage timeouts are transient — map to QueryTimeout so retry logic works.
             RetrievalError::QueryTimeout { elapsed_ms: 0 }
         }
@@ -415,6 +419,28 @@ mod tests {
         assert!(
             ret.is_transient(),
             "QueryTimeout must be classified as transient for retry logic"
+        );
+    }
+
+    #[test]
+    fn storage_err_admission_timeout_maps_to_query_timeout() {
+        use khive_storage::StorageError;
+        // AdmissionTimeout is retryable at the storage layer (the operation
+        // never began). It must reach the transient QueryTimeout arm, not fall
+        // through to the permanent Hnsw/Bm25 default, otherwise a saturated-pool
+        // condition becomes a hard retrieval failure.
+        let err = StorageError::AdmissionTimeout {
+            operation: std::borrow::Cow::Borrowed("search"),
+            timeout_ms: 30_000,
+        };
+        let ret = storage_err_to_retrieval(err, "vector search");
+        assert!(
+            matches!(ret, RetrievalError::QueryTimeout { .. }),
+            "storage AdmissionTimeout must map to QueryTimeout (transient), got: {ret:?}"
+        );
+        assert!(
+            ret.is_transient(),
+            "AdmissionTimeout must remain transient through the retrieval adapter"
         );
     }
 

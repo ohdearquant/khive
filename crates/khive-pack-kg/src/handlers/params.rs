@@ -167,6 +167,7 @@ pub(crate) struct SearchParams {
     pub(crate) include_superseded: Option<bool>,
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
+    pub(crate) source: Option<String>,
     pub(crate) min_score: Option<f64>,
 }
 
