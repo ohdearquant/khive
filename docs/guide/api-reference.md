@@ -353,6 +353,10 @@ full record with `get(id=...)` (or `list`) when you need more than what they ret
 
 Return aggregate KG substrate counts (entities, edges, notes). No params.
 
+The response carries a `count_scope` object stating what the counts range over:
+`{"namespaces": "caller_visible", "rows": "live_only"}` — counts cover the namespaces visible to
+the caller and exclude soft-deleted rows.
+
 ```
 request(ops="stats()")
 ```
@@ -859,6 +863,16 @@ count is the legacy cross-namespace duplicate-ID state that can make a multi-nam
 walk lossy. The two row counts are raw evidence, not a parity verdict: list-sequence rows
 intentionally survive hard deletion, so the ledger can legitimately contain more rows than the
 live edge table. `graph_edge_integrity_error` explains a missing integrity section.
+
+The handler additionally annotates `graph_edge_integrity` with four derived fields:
+`graph_edges_rows_scope` (`{"namespaces": "all", "rows": "live_and_soft_deleted"}`),
+`graph_edges_seq_rows_scope` (`{"namespaces": "all", "rows":
+"inserted_ids_retained_after_hard_delete"}`), `graph_edges_seq_minus_graph_edges` (the signed
+ledger delta), and `graph_edges_seq_relationship` — one of
+`ledger_ahead_consistent_with_hard_deletes`, `equal`,
+`ledger_behind_pre_v14_duplicate_edge_state` (a negative delta while the report flags the pre-V14
+duplicate-edge state), or `ledger_behind_unexpected` (a negative delta with no known legacy
+explanation).
 Sections that cannot be collected (in-memory backend, missing file, unsupported platform) carry
 explicit reasons rather than being silently omitted.
 

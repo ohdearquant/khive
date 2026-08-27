@@ -3323,6 +3323,7 @@ mod tests {
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse(&ns).unwrap(),
@@ -3850,6 +3851,7 @@ mod tests {
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse(&ns).unwrap(),
@@ -3967,6 +3969,7 @@ mod tests {
             let runtime = super::KhiveRuntime::new(RuntimeConfig {
                 git_write: Default::default(),
                 display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+                events_split: None,
                 db_path: None,
                 blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::parse(&ns).unwrap(),

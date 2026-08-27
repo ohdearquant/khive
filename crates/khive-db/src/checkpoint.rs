@@ -101,6 +101,13 @@ static CHECKPOINT_LIFECYCLE_APPEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// was full, closed, or could not serialize the payload.
 static CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS: AtomicU64 = AtomicU64::new(0);
 
+/// Count of cached-reader explicit read transactions rolled back on reuse
+/// for exceeding `read_tx_max_age` (#1846), across this process's lifetime.
+/// Unlike the Plank 1 sweep above, this is reclamation, not just visibility:
+/// each count here is a WAL snapshot that was actually released rather than
+/// merely logged as stale. See `sql_bridge.rs::execute_standalone_read`.
+static READ_TX_MAX_AGE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
 /// One backend-scoped observation produced by the periodic checkpoint task's
 /// own PASSIVE pass. Logical frame counts and the physical `-wal` allocation
 /// are intentionally separate: SQLite may retain/reuse the sidecar after the
@@ -244,6 +251,21 @@ pub fn checkpoint_lifecycle_append_failures() -> u64 {
     CHECKPOINT_LIFECYCLE_APPEND_FAILURES.load(Ordering::Relaxed)
 }
 
+/// Total cached-reader read transactions rolled back on reuse for exceeding
+/// `read_tx_max_age` (#1846), across this process's lifetime.
+pub fn read_tx_max_age_evictions() -> u64 {
+    READ_TX_MAX_AGE_EVICTIONS.load(Ordering::Relaxed)
+}
+
+/// Records one cached-reader read transaction rolled back on reuse for
+/// exceeding `read_tx_max_age`. Called from `sql_bridge.rs` at the point the
+/// rollback is issued, regardless of whether the rollback itself succeeds —
+/// this counts the eviction *attempt*, matching the `truncate_attempts`
+/// naming convention above.
+pub(crate) fn note_read_tx_max_age_eviction() {
+    READ_TX_MAX_AGE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Total checkpoint lifecycle transitions rejected before append.
 pub fn checkpoint_lifecycle_enqueue_drops() -> u64 {
     CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.load(Ordering::Relaxed)
@@ -294,6 +316,7 @@ pub(crate) fn reset_checkpoint_metrics_for_tests() {
     CHECKPOINT_LIFECYCLE_APPEND_ATTEMPTS.store(0, Ordering::Relaxed);
     CHECKPOINT_LIFECYCLE_APPEND_FAILURES.store(0, Ordering::Relaxed);
     CHECKPOINT_LIFECYCLE_ENQUEUE_DROPS.store(0, Ordering::Relaxed);
+    READ_TX_MAX_AGE_EVICTIONS.store(0, Ordering::Relaxed);
 }
 
 /// Outcome of a single checkpoint attempt.
@@ -399,9 +422,16 @@ pub struct CheckpointConfig {
     pub tx_warn_secs: Duration,
 
     /// ADR-091 Plank 1 hard cap: age past which the same sweep escalates the
-    /// oldest registry entry to `tracing::error!`. This is visibility only —
-    /// nothing here can force-close a stale span; see
-    /// `crates/khive-db/docs/design.md` for why.
+    /// oldest registry entry to `tracing::error!`. The sweep itself is
+    /// visibility only — nothing in `TxAgeSweepState` force-closes a stale
+    /// span. `sql_bridge.rs`'s cached-reader read-transaction path shares
+    /// this exact value (via `PoolConfig::read_tx_max_age`, #1846) to
+    /// actually roll back and evict an explicit read transaction the next
+    /// time its handle is reused past this age — reclamation for the
+    /// "reused periodically" case, not the "held idle with no further calls"
+    /// case the ADR named as its accepted gap; see
+    /// `crates/khive-db/docs/api/checkpoint.md`'s Plank 1 section for the
+    /// distinction and why the latter remains open design work.
     ///
     /// Overridable via `KHIVE_TX_MAX_AGE_SECS`.
     /// Default: 120 seconds.
@@ -507,7 +537,7 @@ impl CheckpointConfig {
 /// together rather than silently honored. Resetting both to the caller's
 /// defaults (rather than just clamping one) avoids guessing which of the two
 /// the operator actually meant to change.
-fn tx_age_thresholds_from_env(
+pub(crate) fn tx_age_thresholds_from_env(
     default_warn: Duration,
     default_max: Duration,
 ) -> (Duration, Duration) {

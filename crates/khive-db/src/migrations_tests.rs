@@ -889,13 +889,17 @@ fn v4_creates_consolidated_fts_tables() {
 }
 
 #[test]
-fn rejects_pre_consolidation_ledger() {
+fn rejects_ledger_ahead_of_binary_latest() {
     let mut conn = open_memory();
-    // Simulate a database carrying the old, pre-consolidation V1..V22 ledger.
+    // Simulate a database whose recorded version is ahead of everything this
+    // build knows — a newer build's ledger (historically, the
+    // pre-consolidation shape). Computed from the live chain so the fixture
+    // stays ahead when a real migration lands on the number a literal would
+    // have pinned.
     conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
     conn.execute(
-        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (22, 'legacy', 0)",
-        [],
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, 'legacy', 0)",
+        rusqlite::params![latest_schema_version() + 1],
     )
     .unwrap();
 
@@ -2466,7 +2470,7 @@ fn v21_legacy_refs_remain_pending_until_explicit_stage_and_finalize() {
 #[test]
 fn v21_empty_database_fast_path_is_atomic_and_complete() {
     let mut conn = open_memory();
-    assert_eq!(run_migrations(&mut conn).unwrap(), 21);
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
     assert_eq!(
         attachment_cutover_status(&conn).unwrap(),
         AttachmentCutoverStatus::Complete

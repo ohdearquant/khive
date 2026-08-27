@@ -389,6 +389,28 @@ fn start_daemon_components_if_daemon(
     if !args.daemon {
         return 0;
     }
+    // ADR-170: the main daemon supervises the events daemon — spawn it when
+    // the events socket is unreachable, respawn if it dies. Both paths come
+    // from the server's own resolved events-split config, so the supervised
+    // daemon and the forwarding clients cannot anchor at diverging paths;
+    // a socket is present exactly when this host upgraded to forwarding
+    // (`enable_events_forwarding_for_daemon`), and the `KHIVE_EVENTS_SPLIT=0`
+    // kill-switch already produced no split at resolution.
+    // A read-only deployment never supervises an events daemon: the
+    // supervised process opens the events sidecar writable, which would
+    // create and schema-initialize it on this deployment's behalf. The
+    // runtime side independently refuses to forward writes when its backend
+    // is read-only, so the two guards fail safe together.
+    #[cfg(unix)]
+    if server.default_runtime_is_read_only() {
+        tracing::info!("read-only deployment: events daemon supervision skipped");
+    } else if let Some(split) = server.events_split_config() {
+        if let Some(socket) = split.socket_path.clone() {
+            khive_runtime::daemon::track_background_task(
+                khive_runtime::events_split::supervise_events_daemon(split.db_path.clone(), socket),
+            );
+        }
+    }
     crate::components::start_daemon_components_with_schedule(server, schedule_rt)
 }
 
@@ -2516,6 +2538,33 @@ async fn prepare_configured_storage_topology(
     // database files.
     validate_effective_backend_alias_modes(&effective_backends)?;
 
+    // ADR-170: the events split must anchor beside the store that actually
+    // holds this deployment's data. The resolver derived it from
+    // `base_config.db_path`, which for declared-backend configs is the
+    // materialized `$HOME/.khive/khive.db` default rather than the declared
+    // main backend — re-anchor beside main's declared file here, preserving
+    // the resolver/daemon-host mode decision (direct vs forwarding) by
+    // re-deriving the socket beside the moved events db. An in-memory main
+    // (including a force-memory override) carries no event-plane split.
+    if let Some(split) = base_config.events_split.take() {
+        let main_path = effective_backends
+            .iter()
+            .find(|b| b.name == BackendId::MAIN && b.kind == BackendKind::Sqlite)
+            .and_then(|b| b.path.as_ref());
+        if let Some(main_path) = main_path {
+            let expanded = khive_runtime::expand_tilde(main_path);
+            let db_path = khive_runtime::events_split::events_db_path_beside(&expanded);
+            let socket_path = split
+                .socket_path
+                .is_some()
+                .then(|| khive_runtime::events_split::events_socket_path_beside(&db_path));
+            base_config.events_split = Some(khive_runtime::events_split::EventsSplitConfig {
+                db_path,
+                socket_path,
+            });
+        }
+    }
+
     // Open each declared backend, deduplicating SQLite backends by canonical
     // path (ADR-028 §8). Schema preparation is deliberately deferred until
     // after main is identified: every distinct secondary must be inventoried
@@ -2616,27 +2665,27 @@ async fn prepare_configured_storage_topology(
         // selection required for verified migration must fail without leaving
         // a new incomplete marker. The blob pack's backend mode governs
         // read-only wrapping during serving boot.
-        let blob_runtime_read_only = if base_config.packs.iter().any(|pack| pack == "blob") {
+        let blob_governing_backend = if base_config.packs.iter().any(|pack| pack == "blob") {
             match khive_cfg.packs.get("blob") {
                 Some(pack) => backends
                     .get(pack.backend.as_str())
+                    .cloned()
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "[packs.blob].backend = {:?} references an unknown backend",
                             pack.backend
                         )
-                    })?
-                    .is_read_only(),
-                None => main_backend.is_read_only(),
+                    })?,
+                None => main_backend.clone(),
             }
         } else {
-            main_backend.is_read_only()
+            main_backend.clone()
         };
         resolve_blob_hydrator_for_boot(
             &base_config,
             khive_cfg,
             main_backend.as_ref(),
-            blob_runtime_read_only,
+            blob_governing_backend.as_ref(),
         )?
     } else {
         None
@@ -2708,9 +2757,14 @@ async fn build_registry_for_multi_backend_inner(
     // hydrator `Arc` on every runtime handle this boot produces. `core()`
     // clones share each runtime's one-shot slot, so they see this same pair.
     if let Some(hydrator) = shared_hydrator {
-        default_runtime.install_blob_hydrator(Arc::clone(&hydrator))?;
+        // The shared install: the hydrator's mode was decided above from the
+        // blob pack's backend, and the receiving handles legitimately mix
+        // modes (a writable blob secondary beside a read-only main is a
+        // documented topology), so each handle's own domain-store mode must
+        // not gate this install.
+        default_runtime.install_shared_blob_hydrator(Arc::clone(&hydrator))?;
         for rt in per_pack_runtimes_local.values() {
-            rt.install_blob_hydrator(Arc::clone(&hydrator))?;
+            rt.install_shared_blob_hydrator(Arc::clone(&hydrator))?;
         }
     }
 
@@ -2981,6 +3035,13 @@ pub async fn build_server_with_explicit_namespace(
         },
         brain_profile: args.brain_profile.clone(),
     })?;
+    let config = {
+        let mut config = config;
+        if args.daemon {
+            enable_events_forwarding_for_daemon(&mut config);
+        }
+        config
+    };
 
     // Regression fence: `config.db_path` must agree with what the canonical
     // resolver derives from this same `--db` input, or `config_id` (computed
@@ -3453,14 +3514,25 @@ fn resolve_blob_hydrator_for_boot(
     config: &RuntimeConfig,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
-    read_only: bool,
+    governing_backend: &StorageBackend,
 ) -> anyhow::Result<Option<Arc<BlobHydrator>>> {
-    match khive_runtime::resolve_blob_store_for_mode(khive_cfg, backend, read_only) {
-        Ok(store) => Ok(Some(Arc::new(BlobHydrator::new(
-            store,
-            config.blob_hydration_bytes,
-        )?))),
-        Err(error) if khive_cfg.storage.blob.is_none() => {
+    // Resolution and construction are fused inside the runtime so the mode
+    // is DERIVED from the governing backend's own access mode (the backend
+    // the blob pack maps to, ADR-160 D3) rather than declared here, and the
+    // hydrator comes back stamped as governed — the only kind the shared
+    // install seam accepts. Read-only derivation opens an existing root and
+    // never creates one; the extra wrap over an already-wrapped store is
+    // documented harmless (reads delegate, mutators refuse).
+    match BlobHydrator::resolve_for_governing_backend(
+        khive_cfg,
+        backend,
+        governing_backend,
+        config.blob_hydration_bytes,
+    ) {
+        Ok(hydrator) => Ok(Some(Arc::new(hydrator))),
+        Err(khive_runtime::GovernedBlobError::Resolve(error))
+            if khive_cfg.storage.blob.is_none() =>
+        {
             tracing::debug!(
                 error = %error,
                 "no usable BlobStore for this backend and no [storage.blob] configured; \
@@ -3486,12 +3558,8 @@ pub async fn build_single_backend_runtime(
     let backend = Arc::new(open_single_backend(&config)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
-    let hydrator = resolve_blob_hydrator_for_boot(
-        &config,
-        khive_cfg,
-        backend.as_ref(),
-        backend.is_read_only(),
-    )?;
+    let hydrator =
+        resolve_blob_hydrator_for_boot(&config, khive_cfg, backend.as_ref(), backend.as_ref())?;
     crate::attachment_cutover::coordinate_attachment_cutover(
         Arc::clone(&backend),
         hydrator.clone(),
@@ -3533,7 +3601,7 @@ async fn prepare_single_backend_for_schema_admin(
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator = if schema_admin_requires_blob_hydrator(Arc::clone(&backend)).await? {
-        resolve_blob_hydrator_for_boot(config, khive_cfg, backend.as_ref(), backend.is_read_only())?
+        resolve_blob_hydrator_for_boot(config, khive_cfg, backend.as_ref(), backend.as_ref())?
     } else {
         None
     };
@@ -3559,14 +3627,22 @@ async fn prepare_core_schema_for_boot(
 /// application-assisted V21 attachment cutover. Production host boot should use
 /// [`build_single_backend_runtime`], [`build_server`], or the async multi-backend
 /// builders instead. Calling this helper is sound only when `backend` is the
-/// runtime's backend and its attachment-cutover status is already `Complete`.
+/// runtime's backend and its attachment-cutover status is already `Complete`;
+/// the same-backend precondition is now enforced by identity rather than
+/// documented, since the resolved mode derives from `backend` and a mismatch
+/// would silently resolve the wrong store mode for the receiving runtime.
 pub fn install_resolved_blob_store(
     rt: &KhiveRuntime,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
 ) -> anyhow::Result<Option<Arc<BlobHydrator>>> {
-    let hydrator =
-        resolve_blob_hydrator_for_boot(rt.config(), khive_cfg, backend, rt.is_read_only())?;
+    if !std::ptr::eq(rt.backend(), backend) {
+        anyhow::bail!(
+            "install_resolved_blob_store requires the runtime's own backend: the supplied \
+             backend reference is not the runtime's"
+        );
+    }
+    let hydrator = resolve_blob_hydrator_for_boot(rt.config(), khive_cfg, backend, backend)?;
     if let Some(hydrator) = hydrator.as_ref() {
         rt.install_blob_hydrator(Arc::clone(hydrator))?;
     }
@@ -3896,9 +3972,50 @@ pub fn resolve_runtime_config_with_db_anchor(
         resolved
     };
 
+    // ADR-170: events-daemon split. Every file-backed resolution routes event
+    // persistence to the events database beside the main store, in DIRECT
+    // mode: this resolver serves one-shot hosts (`kkernel exec`, `reindex`,
+    // ingest) and tests, which have no events daemon to talk to. Resident
+    // daemon hosts upgrade the resolved config to socket forwarding
+    // themselves — see [`enable_events_forwarding_for_daemon`] — because
+    // only they supervise an events daemon at the derived socket.
+    // In-memory resolutions (tests) keep the legacy main-store event plane.
+    // `KHIVE_EVENTS_SPLIT=0` is the deployment kill-switch back to legacy.
+    let resolved = {
+        let mut resolved = resolved;
+        let kill_switch = std::env::var("KHIVE_EVENTS_SPLIT").is_ok_and(|v| v.trim() == "0");
+        if !kill_switch {
+            if let Some(main_db) = resolved.db_path.as_deref() {
+                resolved.events_split = Some(khive_runtime::events_split::EventsSplitConfig {
+                    db_path: khive_runtime::events_split::events_db_path_beside(main_db),
+                    socket_path: None,
+                });
+            }
+        }
+        resolved
+    };
+
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
     // config-file (tier-2) so that a project or global TOML always wins over the env var.
     Ok((apply_env_brain_profile(resolved), db_anchor))
+}
+
+/// Upgrade a resolved config's event plane from direct (embedded) mode to
+/// socket forwarding — the resident-daemon half of the ADR-170 split.
+///
+/// `resolve_runtime_config_with_db_anchor` always resolves the event plane in
+/// direct mode because most of its callers (one-shot CLI, tests) have no
+/// events daemon. The two daemon hosts (`build_server_with_explicit_namespace`
+/// under `--daemon`, and `kkernel mcp`'s multi-backend arm) call this after
+/// resolution; they are exactly the processes that also supervise an events
+/// daemon at the derived socket (`start_daemon_components_if_daemon`), so the
+/// socket this routes to is the one that same host keeps alive.
+pub fn enable_events_forwarding_for_daemon(config: &mut RuntimeConfig) {
+    if let Some(split) = config.events_split.as_mut() {
+        split.socket_path = Some(khive_runtime::events_split::events_socket_path_beside(
+            &split.db_path,
+        ));
+    }
 }
 
 /// Apply `KHIVE_BRAIN_PROFILE` env var as the tier-3 fallback for `brain_profile`.
@@ -4248,6 +4365,70 @@ mod tests {
         })
         .expect("resolve config")
         .packs
+    }
+
+    /// ADR-170 host-class contract: the shared resolver must emit the events
+    /// split in DIRECT mode (socket-less), because most of its callers —
+    /// one-shot CLI hosts and every test that builds a server — have no
+    /// events daemon to forward to. A resolver that emits a socket here
+    /// routes those hosts' events at a daemon that does not exist: appends
+    /// are silently dropped and synchronous provenance reads fail closed
+    /// (measured: the schedule drain refused to dispatch a due event).
+    /// Resident daemon hosts get forwarding only through the explicit
+    /// upgrade, at a socket derived beside the events db (never a global
+    /// socket, which would cross-wire a second database's events).
+    #[test]
+    #[serial]
+    fn resolver_emits_direct_events_mode_and_daemon_upgrade_derives_socket_beside_db() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("khive.db");
+        let mut resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(db.to_str().expect("utf8")),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(kg_test_packs()),
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        let split = resolved
+            .events_split
+            .as_ref()
+            .expect("file-backed resolution must configure the events split");
+        // The sidecar derives from the full main-db file name with the
+        // parent canonicalized (macOS temp dirs live behind /var symlinks).
+        let dir_real = dir.path().canonicalize().expect("canonicalize temp dir");
+        assert_eq!(split.db_path, dir_real.join("khive.db.events.db"));
+        assert_eq!(
+            split.socket_path, None,
+            "the shared resolver must emit direct mode; only daemon hosts upgrade"
+        );
+
+        enable_events_forwarding_for_daemon(&mut resolved);
+        let split = resolved.events_split.as_ref().expect("split still set");
+        assert_eq!(
+            split.socket_path.as_deref(),
+            Some(dir_real.join("khive.db.events.sock").as_path()),
+            "daemon upgrade must derive the socket beside the events db, not globally"
+        );
+
+        // In-memory resolutions carry no event-plane split at all.
+        let in_memory = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(kg_test_packs()),
+            brain_profile: None,
+        })
+        .expect("resolve in-memory config");
+        assert!(in_memory.events_split.is_none());
     }
 
     #[test]
@@ -6113,6 +6294,64 @@ region = "us-east-1"
             debug.contains("S3BlobStore"),
             "expected the installed store to be an S3BlobStore, got: {debug}"
         );
+    }
+
+    /// A read-only runtime resolving an EXISTING blob root must be able to
+    /// install it for bounded reads: the boot helper's hydrator carries its
+    /// mode from construction, so the runtime's read-only install seam
+    /// accepts it, serves reads, and refuses mutation. Without the
+    /// mode-aware construction, the install refuses the hydrator the boot
+    /// just resolved and a read-only snapshot cannot serve blobs at all.
+    #[tokio::test]
+    #[serial]
+    async fn install_resolved_blob_store_read_only_runtime_gets_bounded_reads() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        use khive_storage::BlobStore as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let main_path = dir.path().join("snapshot.db");
+        prepare_current_snapshot_source(&main_path);
+
+        // Seed an existing root while writable; the read-only boot below
+        // must open it without creating anything.
+        let blob_root = dir.path().join("blobs");
+        let seeded = {
+            let seed_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_root.clone(), 0).expect("seed store");
+            seed_store.put(b"seed".to_vec()).await.expect("seed put")
+        };
+
+        let khive_cfg = KhiveConfig {
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::Fs {
+                    root: Some(blob_root.display().to_string()),
+                    floor_bytes: Some(0),
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let backend =
+            Arc::new(StorageBackend::sqlite_read_only(&main_path).expect("read-only backend"));
+        assert!(backend.is_read_only());
+        let runtime = khive_runtime::KhiveRuntime::from_backend(
+            Arc::clone(&backend),
+            base_runtime_config_for_multi_backend(),
+        );
+        assert!(runtime.is_read_only());
+
+        let _hydrator = install_resolved_blob_store(&runtime, &khive_cfg, backend.as_ref())
+            .expect("a read-only runtime must install its resolved existing root")
+            .expect("the configured root resolves to a store");
+
+        let installed = runtime.blob_store().expect("installed store");
+        assert!(
+            installed.exists(&seeded).await.expect("exists"),
+            "bounded reads must be served from the existing root"
+        );
+        let err = installed
+            .put(b"post".to_vec())
+            .await
+            .expect_err("mutation must refuse on the read-only snapshot");
+        assert!(err.to_string().contains("read-only"), "{err}");
     }
 
     /// Positive counterpart to `multi_backend_boot_wires_configured_s3_blob_store`:
