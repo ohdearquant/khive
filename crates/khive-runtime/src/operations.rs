@@ -7359,6 +7359,31 @@ mod tests {
             "test setup: the concurrent write must actually advance the revision"
         );
 
+        // Prove every non-target premise BEFORE the DML runs. Asserting them
+        // afterwards cannot distinguish "the survivor already held the canonical
+        // key and the conflict predicate refused" from "the survivor appeared
+        // later", and it cannot show which conjunct did the refusing.
+        assert_eq!(
+            stale_deleted_at_micros, None,
+            "fixture premise: the stale snapshot must be of a LIVE edge, otherwise \
+             `deleted_at IS ?14` would refuse and this stops being an isolating fixture"
+        );
+        let survivor_before = rt.get_edge(&tok, survivor_id).await.unwrap().expect(
+            "fixture premise: the survivor must already own the canonical natural key \
+                 before the stale DML runs",
+        );
+        assert_eq!(
+            survivor_before.relation,
+            EdgeRelation::CompetesWith,
+            "fixture premise: the survivor must occupy the canonical natural key this stale \
+             writer is about to target, otherwise there is no conflict to absorb and the \
+             refusal would be attributable to something else: {survivor_before:?}"
+        );
+        assert_ne!(
+            survivor_id, e_id,
+            "fixture premise: the survivor and the stale writer's edge must be distinct rows"
+        );
+
         // Reproduce the exact DML `update_edge` runs for the stale writer,
         // using the snapshot it captured BEFORE the concurrent write above.
         let pool = rt.backend().pool_arc();

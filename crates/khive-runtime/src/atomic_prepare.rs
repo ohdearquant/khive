@@ -3503,6 +3503,30 @@ mod tests {
         .await
         .expect("prepare update entity plan");
 
+        // Read the plan's OWN bound revisions, so the isolation below is
+        // derived from the plan rather than assumed about it. Per
+        // `entity_replace_if_unchanged_statement`, `?8` (index 7) is the
+        // replacement revision and `?13` (index 12) the expected one.
+        let (planned_replacement, plan_expected) = {
+            let statements = match &plan {
+                AtomicOpPlan::Update(p) => p.statements.clone(),
+                other => panic!("expected an Update plan, got {other:?}"),
+            };
+            // Locate by LABEL, never by the guard text. A locator keyed on
+            // `?8 > updated_at` would stop finding the statement in exactly the
+            // mutation run that deletes that conjunct, so the arm would report
+            // on this fixture's locator instead of on the guard.
+            let cas = statements
+                .iter()
+                .find(|s| s.statement.label.as_deref() == Some("entity-replace-if-unchanged"))
+                .expect("the plan must carry the guarded entity replacement");
+            let read = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Integer(v) => *v,
+                other => panic!("param {i} must be an integer revision, got {other:?}"),
+            };
+            (read(7), read(12))
+        };
+
         // A concurrent writer commits BEFORE the plan runs, advancing the
         // row's revision past what the plan's guard expects.
         runtime
@@ -3516,6 +3540,45 @@ mod tests {
             )
             .await
             .expect("concurrent writer update");
+
+        // Pin the stored revision one microsecond BELOW the plan's replacement.
+        // This is what makes the test specific to the guard it names. Both the
+        // plan and the concurrent writer derive their revision from
+        // `max(now, expected + 1)`, so left alone the concurrent write lands at
+        // or past the plan's own replacement and BOTH conjuncts refuse — the
+        // test would then stay green if either guard were deleted. Pinning
+        // leaves `?8 > updated_at` satisfied, so it cannot be the refuser,
+        // while `updated_at = ?13` is violated, which is the single condition
+        // this test names. The shape is reachable in production whenever the
+        // concurrent writer's clock trails the preparing writer's.
+        let stored_pinned = planned_replacement - 1;
+        assert_ne!(
+            stored_pinned, plan_expected,
+            "fixture premise: the pinned revision must differ from the plan's expected \
+             revision, otherwise `updated_at = ?13` would MATCH and nothing would refuse \
+             the plan"
+        );
+        {
+            let mut writer = runtime.sql().writer().await.expect("writer");
+            let affected = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE entities SET updated_at = ?1 WHERE id = ?2".to_string(),
+                    params: vec![
+                        SqlValue::Integer(stored_pinned),
+                        SqlValue::Text(id.to_string()),
+                    ],
+                    label: Some("test-pin-stored-revision".to_string()),
+                })
+                .await
+                .expect("pin the stored revision");
+            assert_eq!(affected, 1, "the pin must touch exactly the seeded row");
+        }
+        assert!(
+            planned_replacement > stored_pinned,
+            "fixture premise: the plan's replacement must still strictly advance past the \
+             stored revision, otherwise `?8 > updated_at` would refuse and this stops being \
+             a test of the expected-revision guard"
+        );
 
         let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
             .await
@@ -3580,6 +3643,29 @@ mod tests {
         .await
         .expect("prepare update edge plan");
 
+        // Read the plan's OWN bound revisions, so the isolation below is
+        // derived from the plan rather than assumed about it. Per
+        // `edge_replace_if_unchanged_statement`, `?6` (index 5) is the
+        // replacement revision and `?11` (index 10) the expected one.
+        let (planned_replacement, plan_expected) = {
+            let statements = match &plan {
+                AtomicOpPlan::Update(p) => p.statements.clone(),
+                other => panic!("expected an Update plan, got {other:?}"),
+            };
+            // Locate by LABEL, never by the guard text — see the entity sibling
+            // above: a locator keyed on the conjunct disappears in exactly the
+            // mutation run that deletes it.
+            let cas = statements
+                .iter()
+                .find(|s| s.statement.label.as_deref() == Some("edge-replace-if-unchanged"))
+                .expect("the plan must carry the guarded edge replacement");
+            let read = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Integer(v) => *v,
+                other => panic!("param {i} must be an integer revision, got {other:?}"),
+            };
+            (read(5), read(10))
+        };
+
         // A concurrent writer commits BEFORE the plan runs, advancing the
         // row's revision past what the plan's guard expects.
         runtime
@@ -3593,6 +3679,42 @@ mod tests {
             )
             .await
             .expect("concurrent writer update");
+
+        // Pin the stored revision one microsecond BELOW the plan's replacement,
+        // for the same reason as the entity sibling above: both the plan and
+        // the concurrent writer derive their revision from
+        // `max(now, expected + 1)`, so left alone BOTH conjuncts refuse and the
+        // test would stay green if either guard were deleted. Pinning leaves
+        // `?6 > updated_at` satisfied, so it cannot be the refuser, while
+        // `updated_at = ?11` is violated — the single condition this test names.
+        let stored_pinned = planned_replacement - 1;
+        assert_ne!(
+            stored_pinned, plan_expected,
+            "fixture premise: the pinned revision must differ from the plan's expected \
+             revision, otherwise `updated_at = ?11` would MATCH and nothing would refuse \
+             the plan"
+        );
+        {
+            let mut writer = runtime.sql().writer().await.expect("writer");
+            let affected = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE graph_edges SET updated_at = ?1 WHERE id = ?2".to_string(),
+                    params: vec![
+                        SqlValue::Integer(stored_pinned),
+                        SqlValue::Text(edge_id.to_string()),
+                    ],
+                    label: Some("test-pin-stored-revision".to_string()),
+                })
+                .await
+                .expect("pin the stored revision");
+            assert_eq!(affected, 1, "the pin must touch exactly the seeded edge");
+        }
+        assert!(
+            planned_replacement > stored_pinned,
+            "fixture premise: the plan's replacement must still strictly advance past the \
+             stored revision, otherwise `?6 > updated_at` would refuse and this stops being \
+             a test of the expected-revision guard"
+        );
 
         let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
             .await

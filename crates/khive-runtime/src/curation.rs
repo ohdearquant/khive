@@ -4410,12 +4410,35 @@ mod tests {
             .await
             .expect("prepare update");
 
-        // Force the replacement revision to EQUAL the stored one. `?13`/`?14`
-        // still match exactly, so this is not a stale-snapshot refusal — the
-        // only predicate that can reject it is `?8 > updated_at`.
+        // Force the replacement revision to EQUAL the stored one, then PROVE the
+        // isolation rather than asserting it in prose. Reading the row back is
+        // what makes `?13` and `?14` observed facts here instead of values
+        // carried out of `prepare_update_entity`'s setup read.
         replacement.updated_at = expected_updated_at;
 
         let store = rt.entities(&tok).expect("entity store");
+        let stored = store
+            .get_entity_including_deleted(id)
+            .await
+            .expect("read stored row")
+            .expect("row present before CAS");
+        assert_eq!(
+            stored.updated_at, expected_updated_at,
+            "fixture premise: nothing moved the stored revision between prepare and CAS, \
+             otherwise `?13` would refuse and this stops being an isolating fixture"
+        );
+        assert_eq!(
+            stored.deleted_at, expected_deleted_at,
+            "fixture premise: the stored deletion marker must still equal the snapshot's, \
+             otherwise `deleted_at IS ?14` would refuse and this stops being an isolating \
+             fixture"
+        );
+        assert_eq!(
+            replacement.updated_at, stored.updated_at,
+            "fixture premise: the replacement revision must NOT advance past the stored one, \
+             which is the single condition under test"
+        );
+
         let committed = store
             .replace_entity_if_unchanged(replacement, expected_updated_at, expected_deleted_at)
             .await
