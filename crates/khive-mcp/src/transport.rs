@@ -202,8 +202,20 @@ fn drop_stale_obligations(
 /// able to carry the next message, and cancelling on it would lose a healthy
 /// session to a signal.
 ///
-/// The message that hit it is still lost; rmcp handles that the same way it
-/// handles any other transport-send error. What is preserved is the session.
+/// The message that hit it is still lost, and what happens next depends on
+/// which class it belonged to. For a server-initiated request rmcp hands the
+/// error to the local responder that was awaiting it
+/// (`rmcp-1.8.0/src/service.rs:1066-1073`), and it does the same for a
+/// notification (`:1074-1093`), so in both cases a local caller learns. For a
+/// response it only logs (`:1095-1112`): nothing is sent to the peer, no local
+/// caller is waiting, and the serve loop stays alive, so the client that asked
+/// the question waits for an answer that will never arrive and cannot tell that
+/// from a slow one.
+///
+/// That asymmetry is why this predicate is not the whole condition. Keeping the
+/// session is the better trade only when losing the message leaves someone able
+/// to observe the loss. It never does for a response, so the caller pairs this
+/// with the message class rather than using it alone.
 pub(crate) trait RepeatableWriteError {
     fn is_repeatable(&self) -> bool;
 }
@@ -310,16 +322,21 @@ where
             // saying separately from the timeout case.
             //
             // The exception is a write error that says the operation may simply
-            // be repeated. There the writer is still usable, so cancelling
-            // would trade a lost message for a lost session. See
+            // be repeated, on a message that is not a response. There the writer
+            // is still usable and the loss is observable by someone, so
+            // cancelling would trade a lost message for a lost session. A
+            // response gets no such exception: rmcp only logs a failed response
+            // send, so the peer is left waiting on an answer that is not coming
+            // and closing is the only way it finds out. See
             // `RepeatableWriteError`.
             if let Err(error) = &result {
-                if error.is_repeatable() {
+                if error.is_repeatable() && !is_response {
                     tracing::warn!(
                         %error,
                         is_response,
-                        "stdio bridge write was interrupted; the writer is still usable, so \
-                         the session stays open and the error is reported unchanged"
+                        "stdio bridge write was interrupted; the writer is still usable and this \
+                         is not a response, so the session stays open and the error is reported \
+                         unchanged"
                     );
                 } else {
                     tracing::warn!(

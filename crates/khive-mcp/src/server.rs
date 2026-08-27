@@ -8310,12 +8310,19 @@ mod request_read_cancellation_tests {
         }
     }
 
-    /// The exception to "every failed outbound write closes the session".
+    /// The exception to "every failed outbound write closes the session", and
+    /// it is narrower than the writer's health alone.
     ///
     /// An interrupted flush leaves the writer usable, so closing on it would
     /// trade a lost message for a lost session. The second send is what makes
     /// that claim rather than assuming it: if the transport were dead the
     /// assertion could not distinguish a correct decision from a lucky one.
+    ///
+    /// This arm uses a NOTIFICATION because the exception is scoped to the
+    /// classes whose loss someone can observe. See
+    /// `an_interrupted_response_still_closes_the_session` for the other side of
+    /// that boundary, which is the arm that would go red if the scope were
+    /// dropped.
     #[tokio::test]
     async fn an_interrupted_write_leaves_the_session_open_and_the_writer_usable() {
         use rmcp::transport::async_rw::AsyncRwTransport;
@@ -8372,6 +8379,63 @@ mod request_read_cancellation_tests {
         assert!(
             !root.is_cancelled(),
             "a successful write after an interrupted one must leave the session open"
+        );
+    }
+
+    /// The boundary of that exception: a usable writer is not enough when the
+    /// message was a RESPONSE.
+    ///
+    /// The interrupted flush leaves the writer able to carry the next message,
+    /// exactly as in the notification arm, so this test differs from that one
+    /// in the message class and nothing else. The outcome differs because rmcp
+    /// treats the classes differently. A failed notification or server-initiated
+    /// request send reaches a local responder (`rmcp-1.8.0`
+    /// `src/service.rs:1074-1093` and `:1066-1073`), so something in the process
+    /// learns the message was lost. A failed response send is only logged
+    /// (`:1095-1112`): nothing goes to the peer, no local caller is waiting, and
+    /// the serve loop keeps running. The client that asked the question would
+    /// wait on an answer that is not coming and could not tell that from a slow
+    /// one. Closing is what turns that into an EOF it can act on.
+    #[tokio::test]
+    async fn an_interrupted_response_still_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let writer = InterruptOnceWriter {
+            interrupted_yet: false,
+        };
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, writer),
+            root.clone(),
+            None,
+            // Long enough that the deadline cannot be what resolves this write,
+            // so a pass here cannot come from the timeout path.
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let response = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("answering a request", None),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(response))
+            .await
+            .expect("an interrupted flush must resolve, not hang")
+            .expect_err("an interrupted flush must be reported as an error");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "this arm must exercise the interrupted class, not some other failure: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "an interrupted RESPONSE must still close the session: the writer's health does not \
+             help a peer that is waiting on an answer rmcp will only log the loss of"
         );
     }
 }
