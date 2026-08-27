@@ -2434,16 +2434,16 @@ pub(crate) async fn handle_heartbeat(
     // `replace_note_if_unchanged` uses for every other guarded note update
     // (khive-runtime's `update_note_from_snapshot_with_embedding_report`).
     //
-    // ⚠ The `None` branch is NOT guarded, and being a new row does not make it
-    // safe. The hazard here is not losing prior state, it is two concurrent
-    // FIRST writes: the note id is deterministic per channel, so two heartbeats
-    // racing on a channel's first report can both read `None` and both take
-    // this branch. `upsert_note` rewrites every mutable column on an id
-    // conflict and reports no conflict outcome, so the later write silently
-    // replaces the earlier report. Closing it needs an insert-if-absent
-    // primitive that reports whether it inserted; that primitive does not exist
-    // yet, so this branch is knowingly left unguarded and tracked separately
-    // rather than widened into this change.
+    // The `None` branch needs its own guard, and being a new row is not what
+    // makes it safe. The hazard there is not losing prior state, it is two
+    // concurrent FIRST writes: the note id is deterministic per channel, so two
+    // heartbeats racing on a channel's first report can both read `None` and
+    // both take that branch. `upsert_note` rewrites every mutable column on an
+    // id conflict and reports no conflict outcome, so the later write would
+    // silently replace the earlier report. `insert_note_if_absent` leaves an
+    // existing row untouched and reports whether this call inserted it, so the
+    // loser is told it lost — the same conflict the `Some` arm returns, reached
+    // from the other direction.
     match existing {
         Some(snapshot) => {
             let persisted = store
@@ -2462,10 +2462,17 @@ pub(crate) async fn handle_heartbeat(
             }
         }
         None => {
-            store
-                .upsert_note(note)
-                .await
-                .map_err(|e| RuntimeError::Internal(format!("heartbeat: upsert_note: {e}")))?;
+            let inserted = store.insert_note_if_absent(note).await.map_err(|e| {
+                RuntimeError::Internal(format!("heartbeat: insert_note_if_absent: {e}"))
+            })?;
+            if !inserted {
+                return Err(RuntimeError::Khive(khive_types::KhiveError::conflict(
+                    format!(
+                        "heartbeat: channel {}:{} was first reported concurrently; retry",
+                        p.channel_kind, p.channel_slug
+                    ),
+                )));
+            }
         }
     }
 
@@ -3719,6 +3726,131 @@ mod tests {
                 && final_props["poll_interval_secs"] == json!(9)),
             "both racers' fields must never both land: that would mean the loser's stale \
              write silently succeeded: {final_props:?}"
+        );
+    }
+
+    /// The same production race, but with NO row seeded first, so both callers
+    /// take the `None` arm.
+    ///
+    /// `production_handle_heartbeat_refuses_concurrent_stale_writer` seeds the
+    /// row before racing, so it can only ever exercise the `Some(snapshot)`
+    /// CAS branch — it stays green against a build whose `None` arm is an
+    /// unconditional upsert. That is the first-write race: the heartbeat note
+    /// id is deterministic per channel, so two callers reporting a channel for
+    /// the first time both read absence, and an upsert resolves that by
+    /// overwriting, losing the first report with no error to either caller.
+    #[tokio::test]
+    async fn production_handle_heartbeat_refuses_concurrent_first_writer() {
+        let runtime =
+            std::sync::Arc::new(khive_runtime::KhiveRuntime::memory().expect("in-memory runtime"));
+        let token = runtime
+            .authorize(khive_runtime::Namespace::parse("local").unwrap())
+            .expect("authorize");
+
+        let id = super::heartbeat_note_id("local", "email", "first-write-race@example.com");
+        // The premise this test rests on: nothing is seeded, so both racers
+        // must take the `None` arm. Without this the test could silently
+        // degrade into a copy of the seeded one.
+        assert!(
+            runtime
+                .notes(&token)
+                .expect("note store")
+                .get_note(id)
+                .await
+                .expect("read the heartbeat row")
+                .is_none(),
+            "fixture premise: no heartbeat row may exist for this channel before the race, \
+             otherwise both callers take the guarded `Some` arm and the first-write race is \
+             never exercised"
+        );
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let writer_a = {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let token = token.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(
+                super::race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                    super::handle_heartbeat(
+                        &runtime,
+                        &token,
+                        json!({
+                            "channel_kind": "email",
+                            "channel_slug": "first-write-race@example.com",
+                            "outcome": "failure",
+                            "error_class": "timeout",
+                            "error_message": "boom",
+                        }),
+                    )
+                    .await
+                }),
+            )
+        };
+        let writer_b = {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let token = token.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(
+                super::race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                    super::handle_heartbeat(
+                        &runtime,
+                        &token,
+                        json!({
+                            "channel_kind": "email",
+                            "channel_slug": "first-write-race@example.com",
+                            "poll_interval_secs": 9,
+                            "outcome": "success",
+                        }),
+                    )
+                    .await
+                }),
+            )
+        };
+
+        let result_a = writer_a.await.expect("writer A task");
+        let result_b = writer_b.await.expect("writer B task");
+        let successes = [result_a.is_ok(), result_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one first-writer must win; the other must be refused rather than \
+             silently replacing the winner's report: a={result_a:?} b={result_b:?}"
+        );
+        let refused = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
+        match &refused {
+            Err(khive_runtime::RuntimeError::Khive(khive_error)) => {
+                assert_eq!(
+                    khive_error.kind(),
+                    khive_types::ErrorKind::Conflict,
+                    "the losing first-writer must surface a typed conflict: {refused:?}"
+                );
+            }
+            other => panic!("expected a typed conflict error, got {other:?}"),
+        }
+
+        let store = runtime.notes(&token).expect("note store");
+        let final_note = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("the winner's heartbeat row must exist");
+        let final_props = final_note.properties.expect("heartbeat properties");
+        // The winner's report must be intact, not a blend of both. Each racer
+        // reports a distinguishing field the other never sends.
+        let is_a = final_props.get("last_failure_at").is_some();
+        let is_b = final_props["poll_interval_secs"] == json!(9);
+        assert!(
+            is_a ^ is_b,
+            "the surviving row must be exactly one racer's report, never both racers' fields \
+             merged, which is what a losing write silently succeeding would produce: \
+             {final_props:?}"
         );
     }
 

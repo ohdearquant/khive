@@ -4212,6 +4212,26 @@ mod tests {
                 other => panic!("param 6 must be a deletion marker, got {other:?}"),
             };
 
+            // The delete's OWN identity conjuncts. Reading them into the
+            // survivor-count panic message below is not asserting them: point
+            // `?1` or `?2` at a row that does not exist and the delete still
+            // affects zero rows, its `0..=1` guard still accepts that, and
+            // statement 2 still refuses on the pinned stale revision — so the
+            // test stays green while establishing nothing about which row the
+            // named delete attempted.
+            assert_eq!(
+                text(0),
+                "local",
+                "fixture premise: the delete's `?1` must be the namespace the row lives in, \
+                 otherwise `namespace = ?1` refuses on its own"
+            );
+            assert_eq!(
+                text(1),
+                requested_id.to_string(),
+                "fixture premise: the delete's `?2` must be the edge under test, otherwise \
+                 `id = ?2` refuses on identity and the delete never attempted the requested row"
+            );
+
             let requested_now = runtime
                 .get_edge_including_deleted(&token, requested_id)
                 .await
