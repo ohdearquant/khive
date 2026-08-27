@@ -2516,7 +2516,7 @@ async fn schema_admin_requires_blob_hydrator(backend: Arc<StorageBackend>) -> an
     }
 
     Ok(
-        khive_pack_moodboard::legacy_preference_model_count(backend.sql().as_ref())
+        crate::attachment_cutover::legacy_preference_model_count(backend.sql().as_ref())
             .await
             .context("count legacy moodboard models before resolving blob storage")?
             != 0,
@@ -2693,6 +2693,7 @@ async fn prepare_configured_storage_topology(
     crate::attachment_cutover::coordinate_attachment_cutover(
         Arc::clone(&main_backend),
         shared_hydrator.clone(),
+        crate::attachment_cutover::legacy_preference_verifier(),
     )
     .await?;
 
@@ -3563,6 +3564,7 @@ pub async fn build_single_backend_runtime(
     crate::attachment_cutover::coordinate_attachment_cutover(
         Arc::clone(&backend),
         hydrator.clone(),
+        crate::attachment_cutover::legacy_preference_verifier(),
     )
     .await?;
 
@@ -3605,8 +3607,12 @@ async fn prepare_single_backend_for_schema_admin(
     } else {
         None
     };
-    crate::attachment_cutover::coordinate_attachment_cutover(Arc::clone(&backend), hydrator)
-        .await?;
+    crate::attachment_cutover::coordinate_attachment_cutover(
+        Arc::clone(&backend),
+        hydrator,
+        crate::attachment_cutover::legacy_preference_verifier(),
+    )
+    .await?;
     Ok(backend)
 }
 
@@ -6399,6 +6405,9 @@ region = "us-east-1"
         }
     }
 
+    // Requires the "moodboard" pack name to be registered, which only
+    // happens when the optional khive-pack-moodboard crate is linked in.
+    #[cfg(feature = "pack-moodboard")]
     #[tokio::test]
     async fn multi_backend_boot_shares_one_hydrator_across_default_core_blob_and_moodboard() {
         let blob_root = tempfile::tempdir().expect("blob root");

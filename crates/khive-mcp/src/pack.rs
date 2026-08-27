@@ -27,6 +27,7 @@ pub use khive_pack_kg::KgPack as _KgPack;
 pub use khive_pack_knowledge::KnowledgePack as _KnowledgePack;
 #[doc(hidden)]
 pub use khive_pack_memory::MemoryPack as _MemoryPack;
+#[cfg(feature = "pack-moodboard")]
 #[doc(hidden)]
 pub use khive_pack_moodboard::MoodboardPack as _MoodboardPack;
 #[doc(hidden)]
