@@ -335,11 +335,42 @@ where
                     }
                     None => recv_fut.await,
                 };
+                // A second outstanding obligation under an id that already has
+                // one is refused rather than admitted. Two entries sharing an
+                // id make retirement ambiguous, and BOTH ways of resolving it
+                // are wrong: retiring the first match can leave a completed
+                // request's instant as the newest entry and defer past the
+                // older obligation's TTL (the leak), while retiring the last
+                // match can leave the older instant and close the session out
+                // from under a live handler (the opposite failure). There is
+                // no third choice, because the transport cannot tell the two
+                // apart — the ambiguity has to be refused where it enters.
+                //
+                // MCP requires a request id to be unused within a session
+                // (2025-11-25, "Requests"), so a conforming peer never reaches
+                // this. A non-conforming one must not be able to corrupt the
+                // session's lifetime accounting from the wire, which is what
+                // makes this the transport's problem rather than the peer's.
+                let mut duplicate_id = None;
                 if let Some(rmcp::model::JsonRpcMessage::Request(request)) = &message {
                     if let Ok(mut q) = in_flight.lock() {
                         drop_stale_obligations(&mut q, obligation_ttl);
-                        q.push_back((request.id.clone(), Instant::now()));
+                        if q.iter().any(|(entry, _)| *entry == request.id) {
+                            duplicate_id = Some(request.id.clone());
+                        } else {
+                            q.push_back((request.id.clone(), Instant::now()));
+                        }
                     }
+                }
+                if let Some(id) = duplicate_id {
+                    tracing::warn!(
+                        duplicate_request_id = ?id,
+                        "stdio bridge received a request whose id already has an outstanding \
+                         obligation; the response could not be attributed to either, so this \
+                         session is closed rather than left with corrupt lifetime accounting"
+                    );
+                    root.cancel();
+                    return None;
                 }
                 if message.is_none() {
                     root.cancel();

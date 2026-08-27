@@ -310,6 +310,15 @@ been asked anything, so enabling the idle timeout by default would reverse that
 decision. Turn it on where session churn is cheap and a pinned WAL connection
 is not: a supervised deployment, a CI harness, a batch runner.
 
+**A session also closes on a duplicate outstanding request id.** MCP requires a
+request id to be unused within a session, and this transport tracks outstanding
+requests by id in order to decide whether a quiet session still has work
+running. Two live requests sharing an id make that undecidable: a completing
+response could discharge either, and picking wrong either keeps a finished
+session alive indefinitely or closes a live one. The second such request is
+therefore refused and the session closes, with the id logged at `WARN`. A
+conforming client never reaches this.
+
 **Known gap.** The response-delivery deadline covers responses this transport
 writes. It does not cover parse-error responses, which the underlying line
 transport writes directly through its own framed writer without passing through

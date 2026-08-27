@@ -7828,6 +7828,92 @@ mod request_read_cancellation_tests {
         );
     }
 
+    /// Regression: two outstanding obligations under one request id are
+    /// refused, not resolved by guessing.
+    ///
+    /// Retirement matches on request id, so two live entries sharing an id
+    /// make it ambiguous which one a completing response discharges — and both
+    /// resolutions are wrong in opposite directions. Removing the first match
+    /// can leave a *completed* request's instant as the newest entry, so the
+    /// freshness check defers past the older obligation's TTL: the unbounded
+    /// session this whole mechanism exists to close. Removing the last match
+    /// can leave the older instant, so the session closes out from under a
+    /// live handler. The transport cannot tell the two apart, so it refuses
+    /// the second admission instead.
+    ///
+    /// Idle reaping is off and the pipe is deliberately never closed, so the
+    /// refusal is the only thing that can end this session. A build that
+    /// admitted the duplicate would leave `root` uncancelled and this test
+    /// would exhaust its bound.
+    #[tokio::test]
+    async fn stdio_refuses_a_second_outstanding_obligation_under_one_request_id() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let first_admitted = Arc::new(tokio::sync::Notify::new());
+        let probe = OutOfOrderProbeServer {
+            first_admitted: first_admitted.clone(),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // No idle timer: only the duplicate-id refusal can close this.
+            None,
+            None,
+            Some(Duration::from_secs(3600)),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (_client_read, mut client_write) = tokio::io::split(client_io);
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
+                        \"params\":{\"name\":\"probe\",\"arguments\":{}}}\n";
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the first request");
+        tokio::time::timeout(Duration::from_secs(2), first_admitted.notified())
+            .await
+            .expect("rmcp never admitted the first request");
+
+        // Premise: id 1 is genuinely still outstanding. Without this the second
+        // request would just be a reuse after retirement, which is legitimate
+        // and not what this test is about.
+        assert_eq!(
+            obligations.lock().expect("obligation queue poisoned").len(),
+            1,
+            "fixture premise: the first request must still be outstanding when the duplicate \
+             arrives, otherwise nothing is ambiguous"
+        );
+        assert!(
+            !root.is_cancelled(),
+            "fixture premise: a single outstanding request must not have closed the session"
+        );
+
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the duplicate-id request");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "a second outstanding obligation under an id that already has one must close the \
+             session; admitting it leaves retirement to pick an entry arbitrarily, which \
+             corrupts the freshness check in one direction or the other"
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
     /// Regression: the obligation queue must not grow without bound.
     ///
     /// Retirement is keyed by request id, so it only ever removes the entry
