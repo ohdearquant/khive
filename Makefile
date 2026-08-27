@@ -1,9 +1,15 @@
 # The full pack set the installed daemon must serve. `make local` verifies the
 # freshly built artifact before installation by running verbs() against that
-# exact binary. The floor is the current 90-verb production surface: additions
+# exact binary. The floor is the current 98-verb production surface: additions
 # pass without a Makefile change, while any loss remains fail-closed.
-FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal
-LOCAL_VERB_FLOOR := 90
+#
+# `moodboard` belongs in this list because `build-local` links pack-moodboard,
+# so the artifact serves the pack's seven verbs whether or not the list names
+# it. Omitting it did not make the gate lenient about a pack it never built; it
+# made the gate blind to seven verbs the artifact was already shipping, so
+# losing all of them still cleared a floor set below their count.
+FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal,moodboard
+LOCAL_VERB_FLOOR := 98
 CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
 FLEET_ARTIFACT ?=
@@ -80,9 +86,10 @@ build:
 # binary an operator actually serves, and both packs are now optional crate
 # dependencies rather than unconditional ones. A default `cargo build` links
 # neither, which is the point of making them optional; a locally installed
-# kkernel still needs them, because FULL_PACKS above names `formal` and
-# verify-local-artifact runs the artifact with that list — a binary without the
-# pack answers `unknown pack name "formal"` and the verification gate fails.
+# kkernel still needs them, because FULL_PACKS above names both `formal` and
+# `moodboard` and verify-local-artifact runs the artifact with that list — a
+# binary without the pack answers `unknown pack name "formal"` and the
+# verification gate fails.
 # The same applies at runtime to any KHIVE_PACKS naming `formal` or `moodboard`.
 build-local:
 	@echo "==> Building kkernel (release, channel-email, channel-telegram, pack-formal, pack-moodboard)..."
