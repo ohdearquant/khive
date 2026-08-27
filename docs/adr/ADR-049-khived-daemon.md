@@ -423,9 +423,11 @@ to restart only on unsuccessful exit treats exit 0 as a deliberate stop.
 
 **The class rule is "who resolves it", not "how long it lasts".** A refusal
 exits 0 when the condition can only be resolved by something other than a later
-retry of this process — an operator changing configuration, or another process
-that already owns the rendezvous. A refusal exits nonzero when the resolver IS a
-later retry of this process, so that a supervisor restart is the remedy.
+retry of this process: an operator changing configuration, or another process
+resolving the rendezvous. Naming a possible resolver is not a finding that one
+exists. The code says only that the resolution lies outside this process. A
+refusal exits nonzero when the resolver IS a later retry of this process, so
+that a supervisor restart is the remedy.
 
 Transience is not the test. A rollout in which an older daemon answers the probe
 can last hours and still exits 0, because no number of restarts of this process
@@ -714,8 +716,10 @@ easy to invert:
   An earlier draft of this amendment classed refusals by transience, which put
   state 12 in the retryable class and exited nonzero. It was wrong, and working
   out why is what produced the rule now stated above: where the resolver is the
-  _other_ process, restarting this one cannot help, and a restart loop is the
-  likely result. Exit 0 encodes "someone else has this", not "nothing is wrong".
+  _other_ process, restarting this one cannot help, and under the
+  restart-on-nonzero policy Amendment 7 selects, a restart loop is the likely
+  result. Exit 0 encodes "the resolution lies outside this process", not
+  "nothing is wrong" and not "someone else has this".
   That same draft called state 12 transient, a peer between fork and bind. That
   description is withdrawn for the reason recorded in the note above, and the
   exit code rests on the asymmetry Amendment 7 states, not on that mechanism.
@@ -946,9 +950,11 @@ because retiring exit 4 created the need: a nonzero code was never a substitute
 for saying what the incumbent is.
 
 What the exit-code change does is raise the operational cost of omitting it.
-With exit 0 the refusal is terminal, so the message is the only channel the
-operator gets, and a refusal printing the bare number leaves them with nothing
-to act on.
+Under the restart-on-nonzero policy selected above, exit 0 makes the refusal
+terminal, so the message is the only channel the operator gets, and a refusal
+printing the bare number leaves them with nothing to act on. Under a policy that
+restarts on either status the message is no less necessary, because no restart
+of this process reaches the condition either way.
 
 ### Exit 4 is retired, not reused
 
