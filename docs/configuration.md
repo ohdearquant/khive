@@ -339,6 +339,12 @@ exits only on receive EOF, cancellation, or a task join error. A session left
 running against a writer that cannot write is one that will never answer
 anything, so the transport ends it here. A write that succeeds changes nothing.
 
+One class of write error is excepted: an error saying the operation was
+interrupted and may simply be repeated. The writer behind such an error is still
+usable, so ending the session would trade one lost message for a session that
+could have gone on serving. That message is still lost, and the error still
+reaches whoever was awaiting it. Only the session survives.
+
 **Known gap.** The response-delivery deadline covers responses this transport
 writes. It does not cover parse-error responses, which the underlying line
 transport writes directly through its own framed writer without passing through

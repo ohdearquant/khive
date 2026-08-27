@@ -8266,4 +8266,112 @@ mod request_read_cancellation_tests {
         );
         let _ = reader.await;
     }
+
+    /// A writer whose first flush is interrupted and which works from then on.
+    ///
+    /// This is the shape Tokio's blocking stdout adapter presents on EINTR: it
+    /// restores its idle state and puts the writer back before returning the
+    /// flush error (`tokio-1.52.4/src/io/blocking.rs:146-176`), and its
+    /// `uninterruptibly!` retry macro (`:183-192`) is not applied to that
+    /// branch. Writes are accepted and discarded, because what this arm asserts
+    /// is the session's fate, not the bytes.
+    struct InterruptOnceWriter {
+        interrupted_yet: bool,
+    }
+
+    impl tokio::io::AsyncWrite for InterruptOnceWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.interrupted_yet {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.interrupted_yet = true;
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "flush interrupted by a signal",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The exception to "every failed outbound write closes the session".
+    ///
+    /// An interrupted flush leaves the writer usable, so closing on it would
+    /// trade a lost message for a lost session. The second send is what makes
+    /// that claim rather than assuming it: if the transport were dead the
+    /// assertion could not distinguish a correct decision from a lucky one.
+    #[tokio::test]
+    async fn an_interrupted_write_leaves_the_session_open_and_the_writer_usable() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let writer = InterruptOnceWriter {
+            interrupted_yet: false,
+        };
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, writer),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let notification = || {
+            rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
+                jsonrpc: rmcp::model::JsonRpcVersion2_0,
+                notification: rmcp::model::ServerNotification::ProgressNotification(
+                    rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                        progress_token: rmcp::model::ProgressToken(
+                            rmcp::model::NumberOrString::Number(1),
+                        ),
+                        progress: 1.0,
+                        total: None,
+                        message: None,
+                    }),
+                ),
+            })
+        };
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(notification()))
+            .await
+            .expect("an interrupted flush must resolve, not hang")
+            .expect_err("an interrupted flush must be reported as an error");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "this arm must exercise the interrupted class, not some other failure: {error}"
+        );
+        assert!(
+            !root.is_cancelled(),
+            "an interrupted write must not close the session; the writer is still usable"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), transport.send(notification()))
+            .await
+            .expect("the second write must resolve, not hang")
+            .expect("the writer is usable after an interrupted flush, so the next write succeeds");
+        assert!(
+            !root.is_cancelled(),
+            "a successful write after an interrupted one must leave the session open"
+        );
+    }
 }

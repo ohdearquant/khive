@@ -188,10 +188,36 @@ fn drop_stale_obligations(
     }
 }
 
+/// Whether a failed outbound write names an operation that may simply be
+/// repeated, leaving the writer usable.
+///
+/// `ErrorKind::Interrupted` is the one such class the stdio path can reach, and
+/// it reaches it through flush rather than through write. Tokio's blocking
+/// stdout adapter restores `State::Idle` and puts its writer back before it
+/// returns the flush result (`tokio-1.52.4/src/io/blocking.rs:146-176`), and
+/// the `uninterruptibly!` macro that repeats interrupted operations
+/// (`:183-192`) is not applied to that branch. `FramedWrite` propagates the
+/// error up unchanged (`tokio-util-0.7.18/src/codec/framed_impl.rs:277-303`).
+/// So an EINTR during flush arrives here as `Err` from a writer that is still
+/// able to carry the next message, and cancelling on it would lose a healthy
+/// session to a signal.
+///
+/// The message that hit it is still lost; rmcp handles that the same way it
+/// handles any other transport-send error. What is preserved is the session.
+pub(crate) trait RepeatableWriteError {
+    fn is_repeatable(&self) -> bool;
+}
+
+impl RepeatableWriteError for std::io::Error {
+    fn is_repeatable(&self) -> bool {
+        self.kind() == std::io::ErrorKind::Interrupted
+    }
+}
+
 impl<T> rmcp::transport::Transport<rmcp::RoleServer> for CancelOnEofTransport<T>
 where
     T: rmcp::transport::Transport<rmcp::RoleServer>,
-    T::Error: From<std::io::Error>,
+    T::Error: From<std::io::Error> + RepeatableWriteError,
 {
     type Error = T::Error;
 
@@ -230,6 +256,12 @@ where
     /// failed request or notification write strands the session exactly as a
     /// failed response did — the argument for the narrower rule pointed at a
     /// mechanism without reading what it does, and is withdrawn.
+    ///
+    /// One class of failure is excepted, and it is excepted on read evidence
+    /// rather than on the same kind of argument: an error saying the operation
+    /// may simply be repeated leaves the writer usable, so cancelling on it
+    /// would lose a healthy session. See `RepeatableWriteError` for which class
+    /// that is and how it reaches this transport.
     ///
     /// A failed write is reported once, here, whichever way it failed: the
     /// deadline arm's error names its own cause, so a second log line at the
@@ -276,15 +308,29 @@ where
             // one write and carry on; see the method doc for why this covers
             // requests and notifications too, and why the error case needs
             // saying separately from the timeout case.
+            //
+            // The exception is a write error that says the operation may simply
+            // be repeated. There the writer is still usable, so cancelling
+            // would trade a lost message for a lost session. See
+            // `RepeatableWriteError`.
             if let Err(error) = &result {
-                tracing::warn!(
-                    %error,
-                    is_response,
-                    response_deadline_secs = response_deadline.map(|d| d.as_secs()),
-                    "stdio bridge could not deliver an outbound message to its peer; closing \
-                     this session rather than leaving it alive unable to answer"
-                );
-                root.cancel();
+                if error.is_repeatable() {
+                    tracing::warn!(
+                        %error,
+                        is_response,
+                        "stdio bridge write was interrupted; the writer is still usable, so \
+                         the session stays open and the error is reported unchanged"
+                    );
+                } else {
+                    tracing::warn!(
+                        %error,
+                        is_response,
+                        response_deadline_secs = response_deadline.map(|d| d.as_secs()),
+                        "stdio bridge could not deliver an outbound message to its peer; closing \
+                         this session rather than leaving it alive unable to answer"
+                    );
+                    root.cancel();
+                }
             }
             // Clear THIS request's obligation once the write is resolved
             // either way — see the `in_flight` field doc for why a failed
