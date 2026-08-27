@@ -4362,16 +4362,21 @@ mod tests {
     /// Isolating fixture for the `AND ?8 > updated_at` conjunct of
     /// `entity_replace_if_unchanged_statement`.
     ///
-    /// The concurrent-race tests above cannot cover it: in their fixture the
-    /// revision guard (`updated_at = ?13`) and the strict-advance guard
-    /// (`?8 > updated_at`) are each independently sufficient to refuse the
-    /// losing writer, so neither test reddens when only one conjunct is
-    /// removed. Measured by mutation against this suite: tautologizing
-    /// `updated_at = ?13` + `deleted_at IS ?14` reddens only
-    /// `production_update_entity_refuses_concurrent_stale_writer`;
-    /// tautologizing `?8 > updated_at` alone reddened NOTHING in
-    /// `khive-runtime` before this test existed; only defeating all three at
-    /// once reddens the race tests. This test strips the second mechanism:
+    /// The concurrent-race tests above cannot cover it. What is measured, and
+    /// deterministic: tautologizing `?8 > updated_at` alone reddened NOTHING in
+    /// `khive-runtime` before this test existed, because the revision guard
+    /// (`updated_at = ?13`) refuses the losing writer on its own whatever the
+    /// clock did. Tautologizing `updated_at = ?13` + `deleted_at IS ?14`
+    /// reddens only `production_update_entity_refuses_concurrent_stale_writer`,
+    /// and defeating all three at once reddens the race tests.
+    ///
+    /// What is NOT claimed, because the fixture cannot support it: that the two
+    /// guards are each independently sufficient. The race fixture pins the two
+    /// racers' EXPECTED revisions equal but never their REPLACEMENT revisions,
+    /// which both come from `max(now, expected + 1)`. So with `updated_at = ?13`
+    /// removed, whether strict advance still refuses depends on which clock read
+    /// won — a race, not a property of the fixture. This test strips the second
+    /// mechanism by construction instead:
     /// it supplies the CORRECT expected revision and deletion marker, so
     /// `?13`/`?14` are satisfied by construction, and the ONLY thing that can
     /// refuse the write is the strict-advance conjunct.
@@ -4426,6 +4431,116 @@ mod tests {
         let stored = rt.get_entity(&tok, id).await.expect("read back");
         assert_eq!(
             stored.properties,
+            Some(serde_json::json!({"a": 0})),
+            "the refused write must not have landed"
+        );
+    }
+
+    /// Isolating fixture for the `AND deleted_at IS ?14` conjunct of
+    /// `entity_replace_if_unchanged_statement`.
+    ///
+    /// The revision-based race fixtures cannot reach it, because a soft delete
+    /// does not move the revision: `entity_soft_delete_statement` is
+    /// `SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL` and never
+    /// touches `updated_at`. So a writer holding a pre-delete snapshot still has
+    /// the CORRECT expected revision after the row is tombstoned, and its
+    /// replacement revision still advances. Every conjunct except `?14` is
+    /// satisfied, and dropping `?14` would let that writer's `deleted_at = NULL`
+    /// land — resurrecting a tombstone, with no revision conflict anywhere to
+    /// signal it.
+    ///
+    /// This fixture does not merely claim that isolation, it asserts it: both
+    /// other conjuncts are checked against the post-delete row before the CAS
+    /// runs, so a future change that makes one of them refuse instead turns this
+    /// test red rather than silently converting it into a whole-guard test.
+    #[tokio::test]
+    async fn entity_cas_refuses_a_stale_replacement_that_would_resurrect_a_tombstone() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "Tombstoned",
+                None,
+                Some(serde_json::json!({"a": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        // Snapshot BEFORE the delete: this is the stale writer's view.
+        let (replacement, _, _, expected_updated_at, expected_deleted_at) = rt
+            .prepare_update_entity(
+                &tok,
+                id,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"a": 1})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepare update");
+        assert_eq!(
+            expected_deleted_at, None,
+            "fixture premise: the snapshot must be of a LIVE row"
+        );
+
+        rt.delete_entity(&tok, id, false)
+            .await
+            .expect("soft delete");
+
+        let store = rt.entities(&tok).expect("entity store");
+        let tombstoned = store
+            .get_entity_including_deleted(id)
+            .await
+            .expect("read tombstone")
+            .expect("row still present after soft delete");
+
+        // Prove the isolation rather than asserting it in prose. `?13` matches
+        // because the soft delete left the revision alone, and `?8 > updated_at`
+        // holds because the prepared replacement advanced past it. That leaves
+        // `deleted_at IS ?14` as the only conjunct able to refuse the write.
+        assert_eq!(
+            tombstoned.updated_at, expected_updated_at,
+            "fixture premise: soft delete must NOT move `updated_at`, otherwise \
+             `?13` would refuse and this stops being an isolating fixture"
+        );
+        assert!(
+            replacement.updated_at > tombstoned.updated_at,
+            "fixture premise: the replacement revision must still advance, \
+             otherwise `?8 > updated_at` would refuse and this stops being an \
+             isolating fixture"
+        );
+        assert!(
+            tombstoned.deleted_at.is_some(),
+            "fixture premise: the row must actually be tombstoned"
+        );
+
+        let committed = store
+            .replace_entity_if_unchanged(replacement, expected_updated_at, expected_deleted_at)
+            .await
+            .expect("CAS query");
+        assert!(
+            !committed,
+            "a replacement carrying a pre-delete snapshot must be refused after the row is \
+             soft-deleted: without `deleted_at IS ?14` it would write `deleted_at = NULL` over \
+             the tombstone and silently resurrect a deleted entity"
+        );
+
+        let after = store
+            .get_entity_including_deleted(id)
+            .await
+            .expect("read back")
+            .expect("row present");
+        assert!(
+            after.deleted_at.is_some(),
+            "the tombstone must survive the refused write"
+        );
+        assert_eq!(
+            after.properties,
             Some(serde_json::json!({"a": 0})),
             "the refused write must not have landed"
         );
