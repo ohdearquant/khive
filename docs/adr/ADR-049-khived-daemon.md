@@ -660,6 +660,11 @@ asserts its exit code, since an otherwise-correct refusal carrying the wrong
 code either drives a supervisor restart loop or silently retires a retryable
 state.
 
+Where a state's test runs below process level, the exit code is asserted against
+the value the classification maps to rather than against a real process exit,
+and at least one end-to-end test per exit class asserts a real process exit code
+so the mapping itself is covered.
+
 "One test per state" is not by itself enough to tell a conforming test from one
 that checks an error value, so each state's test declares four things
 explicitly. Without all four, a test can be green while proving nothing:
