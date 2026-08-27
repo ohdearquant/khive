@@ -319,6 +319,11 @@ session alive indefinitely or closes a live one. The second such request is
 therefore refused and the session closes, with the id logged at `WARN`. A
 conforming client never reaches this.
 
+An id counts as outstanding for this purpose while its entry is still tracked,
+including after it has passed the obligation TTL. Ageing past that TTL means the
+request no longer defers the idle close; it does not mean the request finished,
+and the handler may well still be running. Reuse is refused in that state too.
+
 **Known gap.** The response-delivery deadline covers responses this transport
 writes. It does not cover parse-error responses, which the underlying line
 transport writes directly through its own framed writer without passing through

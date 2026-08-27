@@ -351,13 +351,27 @@ where
                 // this. A non-conforming one must not be able to corrupt the
                 // session's lifetime accounting from the wire, which is what
                 // makes this the transport's problem rather than the peer's.
+                //
+                // The duplicate scan runs BEFORE the staleness drop, and that
+                // order is load-bearing. A stale entry is an id whose response
+                // was never observed — the handler may still be running, since
+                // rmcp keeps it alive independently of this receive loop until
+                // it constructs its response. Dropping it first would convert
+                // exactly the ambiguous case into a silent re-admission: the
+                // id passes the check, is pushed as a fresh entry, and the
+                // first of the two eventual responses retires the NEW entry by
+                // id match, leaving the older live handler untracked and the
+                // idle branch free to close out from under it. Scanning the
+                // full queue first refuses that reuse instead. It costs
+                // nothing a conforming peer can notice, because an id whose
+                // response WAS written is not in the queue at all.
                 let mut duplicate_id = None;
                 if let Some(rmcp::model::JsonRpcMessage::Request(request)) = &message {
                     if let Ok(mut q) = in_flight.lock() {
-                        drop_stale_obligations(&mut q, obligation_ttl);
                         if q.iter().any(|(entry, _)| *entry == request.id) {
                             duplicate_id = Some(request.id.clone());
                         } else {
+                            drop_stale_obligations(&mut q, obligation_ttl);
                             q.push_back((request.id.clone(), Instant::now()));
                         }
                     }

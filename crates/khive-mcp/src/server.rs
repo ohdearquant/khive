@@ -7914,6 +7914,115 @@ mod request_read_cancellation_tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
     }
 
+    /// Regression: an id whose obligation has gone STALE is still a duplicate.
+    ///
+    /// Staleness is a statement about the freshness check, not about the
+    /// handler: rmcp keeps a spawned handler alive independently of this
+    /// receive loop, so an entry past its TTL routinely names a request that
+    /// is still running and has simply not answered yet. If the staleness drop
+    /// runs before the duplicate scan, that entry is gone by the time the scan
+    /// looks, the reused id is admitted as a fresh obligation, and the first of
+    /// the two eventual responses retires the NEW entry by id match — leaving
+    /// the older live handler untracked and the idle branch free to close out
+    /// from under it. Scanning before pruning refuses the reuse instead.
+    ///
+    /// This is the arm the earlier ordering passed: the plain duplicate test
+    /// above uses an hour-long TTL, so its entry is never stale and the two
+    /// orderings are indistinguishable there.
+    ///
+    /// Idle reaping is off and the pipe is never closed, so the refusal is the
+    /// only thing that can end this session.
+    #[tokio::test]
+    async fn stdio_refuses_a_reused_id_whose_obligation_is_already_stale() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const OBLIGATION_TTL: Duration = Duration::from_millis(100);
+
+        let first_admitted = Arc::new(tokio::sync::Notify::new());
+        let probe = OutOfOrderProbeServer {
+            first_admitted: first_admitted.clone(),
+            // Parks forever on the first call: the handler outlives its TTL.
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // No idle timer: only the duplicate-id refusal can close this.
+            None,
+            None,
+            Some(OBLIGATION_TTL),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (_client_read, mut client_write) = tokio::io::split(client_io);
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
+                        \"params\":{\"name\":\"probe\",\"arguments\":{}}}\n";
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the first request");
+        tokio::time::timeout(Duration::from_secs(2), first_admitted.notified())
+            .await
+            .expect("rmcp never admitted the first request");
+
+        tokio::time::sleep(OBLIGATION_TTL * 3).await;
+
+        // Premise, asserted rather than assumed: the entry is still in the
+        // queue AND the transport's own freshness rule already calls it stale.
+        // Both halves matter — a test that only slept would pass against a
+        // build that pruned the entry, since an empty queue also admits the
+        // reuse without closing, which is the very defect under test.
+        {
+            let queue = obligations.lock().expect("obligation queue poisoned");
+            let (id, admitted_at) = queue
+                .front()
+                .expect(
+                    "fixture premise: the unanswered obligation must still be queued when the \
+                     reused id arrives; an empty queue means something pruned it and this test \
+                     can no longer distinguish the orderings",
+                )
+                .clone();
+            assert_eq!(
+                id,
+                rmcp::model::NumberOrString::Number(1),
+                "fixture premise: the queued entry must be the request under test"
+            );
+            assert!(
+                admitted_at.elapsed() >= OBLIGATION_TTL,
+                "fixture premise: the entry must already be STALE by the transport's own rule, \
+                 otherwise this is just the plain duplicate case"
+            );
+        }
+        assert!(
+            !root.is_cancelled(),
+            "fixture premise: a single outstanding request must not have closed the session"
+        );
+
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the request reusing the stale id");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "reusing an id whose obligation is stale but whose handler is still alive must close \
+             the session. Admitting it lets the first response retire the wrong entry, which \
+             leaves a live handler untracked and the idle close free to fire under it."
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
     /// Regression: the obligation queue must not grow without bound.
     ///
     /// Retirement is keyed by request id, so it only ever removes the entry
@@ -8028,13 +8137,12 @@ mod request_read_cancellation_tests {
     /// admissions, on top of the TTL. That is the leak the TTL closes,
     /// reintroduced behind a timer.
     ///
-    /// The fixture makes the gap the discriminator. Request 1 parks forever;
-    /// request 2 is admitted `ADMISSION_GAP` later and completes. Retiring by
-    /// id leaves request 1's instant, so the session closes at roughly
-    /// `OBLIGATION_TTL` after request 1. Retiring oldest-first leaves request
-    /// 2's, so it closes at roughly `ADMISSION_GAP + OBLIGATION_TTL`. The
-    /// assertion sits between the two, far enough from both that it measures
-    /// the guard rather than the scheduler.
+    /// The fixture makes the surviving queue entry the discriminator. Request
+    /// 1 parks forever; request 2 is admitted `ADMISSION_GAP` later and
+    /// completes. Both behaviours leave the queue holding exactly one entry,
+    /// so the test reads WHICH one through the transport's obligation handle:
+    /// retiring by id leaves request 1, retiring oldest-first leaves request
+    /// 2. That comparison is exact and involves no wall clock.
     #[tokio::test]
     async fn stdio_idle_timeout_reaps_on_the_older_obligation_when_a_newer_one_completes_first() {
         use rmcp::transport::async_rw::AsyncRwTransport;
@@ -8046,9 +8154,6 @@ mod request_read_cancellation_tests {
         // out and the session closes before request 2 is ever admitted.
         const ADMISSION_GAP: Duration = Duration::from_millis(1500);
         const OBLIGATION_TTL: Duration = Duration::from_millis(2000);
-        // Correct behaviour closes at ~2000ms after request 1; the defect
-        // closes at ~3500ms. 2750ms is the midpoint, 750ms clear of each.
-        const DISCRIMINATING_DEADLINE: Duration = Duration::from_millis(2750);
 
         let first_admitted = Arc::new(tokio::sync::Notify::new());
         let probe = OutOfOrderProbeServer {
@@ -8065,6 +8170,7 @@ mod request_read_cancellation_tests {
             None,
             Some(OBLIGATION_TTL),
         );
+        let obligations = transport.in_flight_handle();
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
         let (mut client_read, mut client_write) = tokio::io::split(client_io);
 
@@ -8106,6 +8212,57 @@ mod request_read_cancellation_tests {
             "expected the SECOND request's response to arrive first, got: {response}"
         );
 
+        // The discriminator is the IDENTITY of the surviving entry, read
+        // straight out of the queue, not when the session happens to close.
+        // Both behaviours leave exactly one entry, so length alone proves
+        // nothing and is used here only to synchronize: retirement runs after
+        // the response write resolves, which is not ordered against the
+        // client's read returning. Once the queue has settled to one entry,
+        // retiring by id leaves request 1 (still outstanding) and retiring
+        // oldest-first leaves request 2 (already completed).
+        //
+        // An earlier version of this test asserted instead that the close
+        // landed before a 2750ms midpoint between the correct ~2000ms and the
+        // defect's ~3500ms. That measured the scheduler as much as the guard:
+        // a loaded worker that delays polling the receive task or the timer by
+        // more than the 750ms margin fails a correct implementation. Nothing
+        // below reads a wall clock.
+        let settle_deadline = Duration::from_secs(10);
+        let settled_at = Instant::now();
+        loop {
+            let len = obligations.lock().expect("obligation queue poisoned").len();
+            if len == 1 {
+                break;
+            }
+            assert!(
+                settled_at.elapsed() < settle_deadline,
+                "the obligation queue never settled to a single entry after the second \
+                 request's response was read; it holds {len}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let surviving = obligations
+            .lock()
+            .expect("obligation queue poisoned")
+            .front()
+            .expect("the queue settled to one entry, so it has a front")
+            .0
+            .clone();
+        assert_eq!(
+            surviving,
+            rmcp::model::NumberOrString::Number(1),
+            "the entry left outstanding must be request 1, whose handler never answered. \
+             Finding request 2 here means the completed request's response retired the OLDEST \
+             entry rather than its own, so the outstanding request's admission instant was \
+             dropped and the idle close would be deferred by the {}ms admission gap on top of \
+             the {}ms TTL.",
+            ADMISSION_GAP.as_millis(),
+            OBLIGATION_TTL.as_millis(),
+        );
+
+        // The close itself is still asserted, bounded generously: this arm is
+        // about the timer firing at all, and a late close fails it only by
+        // exceeding a deadline no correct run approaches.
         let hard_deadline = Duration::from_secs(10);
         while !root.is_cancelled() && admitted_first.elapsed() < hard_deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -8113,17 +8270,6 @@ mod request_read_cancellation_tests {
         assert!(
             root.is_cancelled(),
             "the session must close once the older obligation passes its TTL"
-        );
-        let closed_after = admitted_first.elapsed();
-        assert!(
-            closed_after < DISCRIMINATING_DEADLINE,
-            "the session must close on the OLDER obligation's TTL (~{}ms after its admission), \
-             not on the newer completed request's (~{}ms). Closed at {}ms, which means the \
-             completed request's admission instant was left in the queue and the outstanding \
-             one was dropped.",
-            OBLIGATION_TTL.as_millis(),
-            (ADMISSION_GAP + OBLIGATION_TTL).as_millis(),
-            closed_after.as_millis(),
         );
 
         drop(client_write);
@@ -8315,6 +8461,36 @@ mod request_read_cancellation_tests {
         }
     }
 
+    /// Read half that reports how many bytes it has actually handed to its
+    /// caller. `write_all` into a duplex pipe proves only that bytes reached
+    /// the buffer; the invariant in the fragmentation test below is about what
+    /// the server's receive future did with them, so the test needs to observe
+    /// consumption rather than delivery.
+    struct CountingReader<R> {
+        inner: R,
+        delivered: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingReader<R> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let before = buf.filled().len();
+            let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+            if matches!(poll, std::task::Poll::Ready(Ok(()))) {
+                let read = buf.filled().len() - before;
+                if read > 0 {
+                    this.delivered
+                        .fetch_add(read, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            poll
+        }
+    }
+
     /// Regression: while an admitted request is still
     /// running, deferring the idle close must not discard a second request
     /// that arrives fragmented across the deferred window. Before the fix,
@@ -8323,6 +8499,12 @@ mod request_read_cancellation_tests {
     /// already consumed before the timeout fired was silently dropped and
     /// the remainder parsed as an invalid/garbage line — losing the second
     /// request even though the session itself correctly stayed open.
+    ///
+    /// The first fragment must be proven CONSUMED before the idle window
+    /// elapses, or the test does not exercise the invariant it names: in any
+    /// execution where the reader had not yet run, a fresh-receive
+    /// implementation discards nothing and passes. `CountingReader` supplies
+    /// that barrier.
     #[tokio::test]
     async fn stdio_idle_timeout_preserves_a_fragmented_request_while_another_is_in_flight() {
         use rmcp::transport::async_rw::AsyncRwTransport;
@@ -8338,6 +8520,11 @@ mod request_read_cancellation_tests {
         let root = tokio_util::sync::CancellationToken::new();
         let (server_io, client_io) = tokio::io::duplex(16 * 1024);
         let (server_read, server_write) = tokio::io::split(server_io);
+        let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_read = CountingReader {
+            inner: server_read,
+            delivered: Arc::clone(&consumed),
+        };
         let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(server_read, server_write),
             root.clone(),
@@ -8368,10 +8555,26 @@ mod request_read_cancellation_tests {
                      \"params\":{\"name\":\"quick\",\"arguments\":{}}}\n";
         let full_bytes = full.as_bytes();
         let split_at = full_bytes.len() / 2;
+        let baseline = consumed.load(std::sync::atomic::Ordering::SeqCst);
         client_write
             .write_all(&full_bytes[..split_at])
             .await
             .expect("write first half of the fragmented request");
+
+        // Barrier: the fragment must be inside the server's line buffer before
+        // the idle window elapses, otherwise this test proves nothing. Waiting
+        // on the byte counter rather than on a sleep is what makes the
+        // discarded-prefix scenario actually occur on every run.
+        let want = baseline + split_at;
+        let barrier_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while consumed.load(std::sync::atomic::Ordering::SeqCst) < want {
+            assert!(
+                tokio::time::Instant::now() < barrier_deadline,
+                "the server never consumed the first fragment: {} of {want} bytes delivered",
+                consumed.load(std::sync::atomic::Ordering::SeqCst),
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         tokio::time::sleep(idle_timeout * 3).await;
         assert!(
