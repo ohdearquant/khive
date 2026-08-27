@@ -886,59 +886,87 @@ command line, as state 12's already does.**
 
 The class rule asks whether a later attempt of this process can observe a
 different classification. Amendment 6 established that the answer is the same in
-both states, so the rule does not separate them. Nothing else did either. A
-nonzero code asserts that a supervisor restart is the remedy; exit 0 asserts
-that someone else owns the rendezvous. State 9 can prove neither. `ECONNREFUSED`
-with a live recorded pid is consistent with a crashed daemon whose socket file
-outlived it and whose pid was recycled by an unrelated process, and that is
-exactly the reading Amendment 6 arrived at.
+both states, so the rule does not separate them. Nothing else did either.
+
+**What exit 0 means here, stated so it cannot be read as an ownership claim.** A
+nonzero code says a later attempt of this process is the remedy. Exit 0 says the
+opposite: this process must not retry, and whatever resolves the condition lies
+outside it. That is the exit table's own reading, "resolver is an operator or
+another process", and it is a statement about where the resolution lives, not a
+finding that some particular other process holds the rendezvous. Amendment 6's
+fact 3 forbids the stronger reading in both states, and nothing below relies on
+it.
+
+State 9 licenses neither code on evidence. `ECONNREFUSED` with a live recorded
+pid is consistent with a crashed daemon whose socket file outlived it and whose
+pid was recycled by an unrelated process, and that is exactly the reading
+Amendment 6 arrived at.
 
 So the split cannot be settled on evidence, and pretending otherwise is what
 produced the withdrawn trajectory argument. It is settled on the asymmetry of
 being wrong.
 
-### The asymmetry of harm
+### The asymmetry of harm, and the supervisor policy it assumes
 
-A wrong exit 0 wedges boot **visibly**. The refusal is terminal for a supervisor
-configured to restart only on unsuccessful exit, so it happens once, an operator
-sees one refusal naming a pid and a command line, and the command line is the
-evidence that tells them whether the incumbent is a khived at all.
+**The asymmetry is not deployment-independent, and this document chooses a
+policy rather than discovering a fact.** It optimises for a supervisor that
+restarts on nonzero exit and treats exit 0 as a deliberate stop. That is the
+shape `launchd` gives with `KeepAlive { SuccessfulExit: false }`, and it is what
+the deployments this ADR is written for run. A supervisor configured the other
+way — restarting on exit 0, or on both statuses, or alerting louder on nonzero —
+inverts the reasoning below, and an operator running one should read this
+section as stating which policy the codes were chosen against rather than as an
+argument that holds everywhere.
+
+Under that policy, a wrong exit 0 wedges boot **visibly**. The refusal is
+terminal, so it happens once, an operator sees one refusal naming a pid and a
+command line, and the command line is the evidence that tells them whether the
+incumbent is a khived at all.
 
 A wrong nonzero wedges boot **silently and repeatedly**. The supervisor restarts,
 the next probe reads the same stale socket and the same recycled pid, and the
 loop produces no information it did not have on the first attempt. This is the
 failure mode the class rule exists to prevent, stated in Amendment 6 for state
-12: exit 0 encodes "someone else has this", not "nothing is wrong".
+12: exit 0 encodes "do not retry this here", not "nothing is wrong".
 
-The two errors are not symmetric in cost, and only one of them is observable by
-the person who can fix it. That is the whole license for the code, and it is
-stated as such rather than dressed as a fact about what the daemon is doing.
+The two errors are not symmetric in cost under that policy, and only one of them
+is observable by the person who can fix it. That is the whole license for the
+code, and it is stated as such rather than dressed as a fact about what the
+daemon is doing.
 
-### The command line is now load-bearing for state 9
+### The command line requirement propagates to state 9
 
-Amendment 6 argued that state 12's refusal must print the pid **and** its
-command line, because the class rule has exactly one failure mode — a recycled
-pid that reads as a live incumbent forever — and the command line is the only
-evidence that distinguishes it from a genuine race. State 9 has the identical
-failure mode and did not have the identical remedy, because its nonzero code
-appeared to offer the supervisor a way out. Removing that code removes the
-excuse: with exit 0, the refusal message is the only channel left, so it carries
-the same two facts. A refusal that prints the bare number leaves an operator
-with nothing to act on and no signal that anything is wrong.
+Amendment 6 required state 12's refusal to print the pid **and** its command
+line, because the class rule has exactly one failure mode — a recycled pid that
+reads as a live incumbent forever — and the command line is the only evidence
+that distinguishes it from a genuine race. **That requirement follows from
+Amendment 6's fact 3, which applies to both states, so state 9 was always owed
+it.** It is added here because this is the amendment that revisits state 9, not
+because retiring exit 4 created the need: a nonzero code was never a substitute
+for saying what the incumbent is.
+
+What the exit-code change does is raise the operational cost of omitting it.
+With exit 0 the refusal is terminal, so the message is the only channel the
+operator gets, and a refusal printing the bare number leaves them with nothing
+to act on.
 
 ### Exit 4 is retired, not reused
 
-Like exit 1 and exit 5, exit 4 stays defined and unemitted. A supervisor keyed
-on the old value reads a retired code rather than silently inheriting a reused
-one, which is the same guarantee Amendment 6 gave when state 13 left exit 5.
+Like exit 1 and exit 5, exit 4 stays defined and unassigned. Nothing emits it
+now, so no supervisor reads a 4 for state 9. The point of reserving rather than
+recycling is the opposite one: an existing exit-4 rule somewhere must not start
+firing on a **new** meaning silently attached to that number. This is the same
+guarantee Amendment 6 gave when state 13 left exit 5.
 
 ### What this does not claim
 
 It does not claim that a state 9 observation means another process owns the
-rendezvous. It claims that a boot which cannot tell the difference should stop
-and say so, rather than ask a supervisor to try again at something no retry
-reaches. The three facts recorded in Amendment 6 are unchanged and remain the
-reason no trajectory reading is available here.
+rendezvous. Exit 0 here means this process must not retry and the resolution
+lies outside it, which is a disposition rather than a finding about who holds
+what. It claims that a boot which cannot tell the difference should stop and say
+so, rather than ask a supervisor to try again at something no retry reaches. The
+three facts recorded in Amendment 6 are unchanged and remain the reason no
+trajectory reading is available here.
 
 ### Test obligations
 
