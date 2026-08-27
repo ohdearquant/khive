@@ -500,10 +500,13 @@ not reopened from the same premise:
    forgot it.
 
 What is left, once the boot window is impossible and the shutdown window is
-unobservable, is fact 3: the observation that actually persists in either state
-is a recorded pid that has been reused by an unrelated live process, which no
-retry of this process ever resolves. Neither state licenses a trajectory
-reading, then, and these exit codes are normative for supervisors. **The codes in the table below are UNCHANGED and
+unobservable, is fact 3, and fact 3 is a statement about what cannot be known
+rather than about what is happening. Ownership and trajectory are both unproven
+in either state. Pid reuse is one explanation the observation admits and the one
+that no retry of this process ever resolves, but the facts do not establish that
+it is the explanation in any given case, and nothing here should be read as
+saying they do. Neither state licenses a trajectory reading, then, and these
+exit codes are normative for supervisors. **The codes in the table below are UNCHANGED and
 remain what implementations follow.** What is open is their justification, and
 it is tracked here rather than asserted. Resolving it is deliberately out of
 scope for this amendment: the classification is already the improvement over the
