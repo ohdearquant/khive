@@ -199,10 +199,32 @@ where
     /// straight through, untimed — only a response can leave `in_flight`
     /// permanently pinned). On timeout the write future is dropped —
     /// releasing whatever lock the inner transport held across it, see the
-    /// type doc — `in_flight` is decremented the same as any other resolved
-    /// write, and `root` is cancelled directly: the peer has demonstrated it
-    /// is not going to read this response, so there is no reason to wait for
-    /// the next idle tick to notice.
+    /// type doc — and `in_flight` is decremented the same as any other
+    /// resolved write.
+    ///
+    /// A response write that RESOLVES AS AN ERROR cancels `root` for the same
+    /// reason a timed-out one does, and the two together are what actually
+    /// bound the write side. The deadline only covers a write left *pending*:
+    /// a peer that has stopped reading while its pipe stays open. A peer that
+    /// closes the side it reads from fails the write immediately instead, well
+    /// inside any deadline, so nothing here would fire — and rmcp does not
+    /// close the session on its own behalf: the response-send task logs the
+    /// error and returns (`rmcp-1.8.0`, `src/service.rs:1105-1112`), while the
+    /// inner transport reports writer errors independently of the reader
+    /// (`src/transport/async_rw.rs:107-122`). With the read side still open
+    /// and silent, the receive loop stays pending, and with idle reaping
+    /// disabled by default there is no later tick to notice. So the session
+    /// would outlive the peer's ability to receive anything from it.
+    ///
+    /// Gated on `is_response` deliberately. A response is the discharge of an
+    /// admitted obligation, so failing to write one means an admitted request
+    /// can never be answered on this session. Server-initiated requests carry
+    /// their own send accounting inside rmcp (`SendTaskResult::Request`), and
+    /// bringing them under this rule is a separate change.
+    ///
+    /// A failed write is reported once, here, whichever way it failed: the
+    /// deadline arm's error names its own cause, so a second log line at the
+    /// timeout would only repeat it.
     fn send(
         &mut self,
         item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
@@ -230,23 +252,30 @@ where
             let result = match (is_response, response_deadline) {
                 (true, Some(deadline)) => match tokio::time::timeout(deadline, send).await {
                     Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(
-                            deadline_secs = deadline.as_secs(),
-                            "stdio bridge response-delivery deadline elapsed while a response \
-                             write was still pending (peer stopped reading); abandoning the \
-                             write and closing this session"
-                        );
-                        root.cancel();
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "response-delivery deadline elapsed before the write completed",
-                        )
-                        .into())
-                    }
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "response-delivery deadline elapsed before the write completed",
+                    )
+                    .into()),
                 },
                 _ => send.await,
             };
+            // Either failure — the write outlived its deadline, or it resolved
+            // as an error — means this peer will not be receiving the answer to
+            // a request it was admitted to make. Close the session rather than
+            // fail one write and carry on; see the method doc for why the error
+            // case needs saying separately from the timeout case.
+            if is_response {
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        %error,
+                        response_deadline_secs = response_deadline.map(|d| d.as_secs()),
+                        "stdio bridge could not deliver a response to its peer; closing this \
+                         session rather than leaving it alive with an unanswerable request"
+                    );
+                    root.cancel();
+                }
+            }
             // Clear THIS request's obligation once the write is resolved
             // either way — see the `in_flight` field doc for why a failed
             // write must not be left permanently counted as pending, and why

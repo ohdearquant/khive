@@ -8089,4 +8089,110 @@ mod request_read_cancellation_tests {
         );
         let _ = reader.await;
     }
+
+    /// The deadline bounds a write left PENDING. It says nothing about a write
+    /// that fails immediately, which is what a half-closed peer produces: one
+    /// that closes the side it reads from while keeping the side it writes to
+    /// open. rmcp does not close the session for us there — the response-send
+    /// task logs the error and returns (`rmcp-1.8.0` `src/service.rs:1105-1112`)
+    /// — the receive loop stays pending on the still-open read side, and idle
+    /// reaping is off by default, so before this the session outlived the
+    /// peer's ability to receive anything from it.
+    ///
+    /// Two independent pipes, because a single `duplex` cannot be half-closed:
+    /// dropping either end closes both directions, and `tokio::io::split`
+    /// keeps the stream alive until both halves drop. Separate pipes for the
+    /// read source and the write sink are what let the peer close exactly one.
+    #[tokio::test]
+    async fn response_write_that_fails_fast_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        // peer -> server: held open and silent, so the receive side would stay
+        // pending forever. This is what makes the missing cancel a leak rather
+        // than a race with EOF.
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        // server -> peer: the peer has closed the side it reads from, so every
+        // write fails with BrokenPipe.
+        let (server_write, peer_read_side) = tokio::io::duplex(1024);
+        drop(peer_read_side);
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            // Long enough that the deadline cannot be what resolves this
+            // write. If the fix were the deadline rather than the error path,
+            // the 2s bound below would trip instead of the assertion.
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let message = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("peer closed its read side", None),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a closed pipe must fail fast, not wait out its deadline")
+            .expect_err("a write to a closed pipe must not report success");
+
+        assert!(
+            !error.to_string().contains("deadline"),
+            "this must exercise the error path, not the deadline path: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "a response that could not be written must close the session; rmcp only logs it"
+        );
+    }
+
+    /// Discriminating arm: the rule is scoped to responses on purpose, so a
+    /// failed NOTIFICATION write must leave the session alone. Without this,
+    /// the test above would also pass against a blanket cancel-on-any-write-
+    /// error, which is a wider change than the one being made.
+    #[tokio::test]
+    async fn notification_write_that_fails_fast_leaves_the_session_open() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let (server_write, peer_read_side) = tokio::io::duplex(1024);
+        drop(peer_read_side);
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let message = rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            notification: rmcp::model::ServerNotification::ProgressNotification(
+                rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                    progress_token: rmcp::model::ProgressToken(
+                        rmcp::model::NumberOrString::Number(1),
+                    ),
+                    progress: 1.0,
+                    total: None,
+                    message: None,
+                }),
+            ),
+        });
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a closed pipe must fail fast, not wait out its deadline");
+
+        assert!(
+            !root.is_cancelled(),
+            "the cancel is scoped to responses; a failed notification must not close the session"
+        );
+    }
 }

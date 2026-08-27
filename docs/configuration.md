@@ -324,6 +324,15 @@ including after it has passed the obligation TTL. Ageing past that TTL means the
 request no longer defers the idle close; it does not mean the request finished,
 and the handler may well still be running. Reuse is refused in that state too.
 
+**A session also closes when a response cannot be written at all.** A response
+write that fails is the same fact as one that outlives its deadline: the peer
+will not be receiving the answer to a request it was admitted to make. It is
+worth stating separately because the deadline does not cover it. The deadline
+bounds a write left _pending_, which is what a peer that stops reading with its
+pipe still open produces; a peer that closes the side it reads from fails the
+write immediately instead, well inside any deadline. The rule is scoped to
+responses, so a failed notification write does not close the session.
+
 **Known gap.** The response-delivery deadline covers responses this transport
 writes. It does not cover parse-error responses, which the underlying line
 transport writes directly through its own framed writer without passing through
