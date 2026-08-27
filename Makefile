@@ -76,13 +76,21 @@ fmt-check:
 build:
 	cd crates && cargo build --workspace --release
 
+# pack-formal and pack-moodboard are listed here because this recipe builds the
+# binary an operator actually serves, and both packs are now optional crate
+# dependencies rather than unconditional ones. A default `cargo build` links
+# neither, which is the point of making them optional; a locally installed
+# kkernel still needs them, because FULL_PACKS above names `formal` and
+# verify-local-artifact runs the artifact with that list — a binary without the
+# pack answers `unknown pack name "formal"` and the verification gate fails.
+# The same applies at runtime to any KHIVE_PACKS naming `formal` or `moodboard`.
 build-local:
-	@echo "==> Building kkernel (release, channel-email, channel-telegram)..."
+	@echo "==> Building kkernel (release, channel-email, channel-telegram, pack-formal, pack-moodboard)..."
 	@python3 scripts/build_local_artifact.py \
 		--cargo "$$CARGO_VALUE" \
 		--manifest-path crates/Cargo.toml \
 		--package kkernel \
-		--features channel-email,channel-telegram \
+		--features channel-email,channel-telegram,pack-formal,pack-moodboard \
 		--receipt "$$LOCAL_BUILD_RECEIPT_VALUE"
 
 # Reject a FULL_PACKS/LOCAL_VERB_FLOOR value (from the Makefile default or a
