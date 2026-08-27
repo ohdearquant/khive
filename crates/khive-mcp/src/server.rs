@@ -7530,14 +7530,23 @@ mod request_read_cancellation_tests {
         // Deliberately never write anything and never drop `client_io`: the
         // pipe stays open exactly like an abandoned bridge's client — this
         // must still be reaped once the idle timeout elapses.
+        // Observe the cancellation BEFORE consuming the service, and it has to
+        // be in this order. `RunningService` holds a `dg: DropGuard`
+        // (rmcp 1.8.0, `src/service.rs:712`) and `waiting(mut self)` consumes
+        // `self`, so the guard cancels this very token as `waiting` returns
+        // whatever the transport did. Asserting `root.is_cancelled()` after
+        // that await therefore passes even with the adapter's cancel deleted:
+        // it measures rmcp's drop guard, not the idle path. Awaiting
+        // `root.cancelled()` while the service is still alive is the only
+        // ordering that can tell the two apart.
+        tokio::time::timeout(Duration::from_secs(2), root.cancelled())
+            .await
+            .expect("idle timeout must cancel the exact root token passed into rmcp");
+
         let reason = tokio::time::timeout(Duration::from_secs(2), running.waiting())
             .await
             .expect("idle timeout never closed the session")
             .expect("rmcp service task panicked");
-        assert!(
-            root.is_cancelled(),
-            "idle timeout must cancel the exact root token passed into rmcp"
-        );
         assert!(
             matches!(
                 reason,
