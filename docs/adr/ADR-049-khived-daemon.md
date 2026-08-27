@@ -450,12 +450,14 @@ published cannot be re-observed differently, so no retry reaches a different
 classification and it exits 0. State 7 is nonzero on the state 8 reading: a peer
 that did not answer within the deadline may answer within the next one.
 
-**OPEN: the split between exit 4 and exit 0 for states 9 and 12 is currently
-unlicensed.** Asking only whether a later attempt observes a different
-classification is necessary but not sufficient, because it is true of both
-states. They arise from the same instant of the same race and only the socket
-separates them, so the class rule alone does not say which of them gets a
-retryable code.
+**The split between exit 4 and exit 0 for states 9 and 12 was unlicensed. It is
+closed by Amendment 7, which gives both states exit 0 and retires exit 4.** The
+note below is kept as written because it is the evidence Amendment 7 rests on,
+and because the premise it withdrew must not be reopened. Asking only whether a
+later attempt observes a different classification is necessary but not
+sufficient, because it is true of both states. They arise from the same instant
+of the same race and only the socket separates them, so the class rule alone
+does not say which of them gets a retryable code.
 
 An earlier version of this section supplied that license with a trajectory
 argument: a socket present with a live refusing owner was said to be a daemon
@@ -506,26 +508,25 @@ in either state. Pid reuse is one explanation the observation admits and the one
 that no retry of this process ever resolves, but the facts do not establish that
 it is the explanation in any given case, and nothing here should be read as
 saying they do. Neither state licenses a trajectory reading, then, and these
-exit codes are normative for supervisors. **The codes in the table below are UNCHANGED and
-remain what implementations follow.** What is open is their justification, and
-it is tracked here rather than asserted. Resolving it is deliberately out of
-scope for this amendment: the classification is already the improvement over the
-code, and inventing a second mechanism to replace a refuted one, in the round
-that refuted it, is how the first one got here.
+exit codes are normative for supervisors. Resolving the split was deliberately
+out of scope for Amendment 6: the classification was already the improvement
+over the code, and inventing a second mechanism to replace a refuted one, in the
+round that refuted it, is how the first one got here. **Amendment 7 resolves it
+on the ground stated there, and the table below carries the resolved codes.**
 
 **Codes are numeric and distinct, not merely "nonzero".** A supervisor and an
 end-to-end test both need to tell these apart, and "nonzero" is a class, not a
 value:
 
-| Exit | Meaning                                                            | States                        |
-| ---- | ------------------------------------------------------------------ | ----------------------------- |
-| 0    | Refused; resolver is an operator or another process                | 1, 2, 3, 4, 6, 12, 13, 14, 15 |
-| 1    | Reserved for unclassified failure; never emitted by classification | —                             |
-| 2    | Refused; connected but the peer did not answer                     | 7                             |
-| 3    | Refused; the peer's reply did not parse                            | 8                             |
-| 4    | Refused; connection refused while the recorded pid is running      | 9                             |
-| 5    | Reserved; formerly state 13, retired by this amendment             | —                             |
-| 6    | Refused; the peer answered but its identity could not be resolved  | 5                             |
+| Exit | Meaning                                                            | States                           |
+| ---- | ------------------------------------------------------------------ | -------------------------------- |
+| 0    | Refused; resolver is an operator or another process                | 1, 2, 3, 4, 6, 9, 12, 13, 14, 15 |
+| 1    | Reserved for unclassified failure; never emitted by classification | —                                |
+| 2    | Refused; connected but the peer did not answer                     | 7                                |
+| 3    | Refused; the peer's reply did not parse                            | 8                                |
+| 4    | Reserved; formerly state 9, retired by Amendment 7                 | —                                |
+| 5    | Reserved; formerly state 13, retired by Amendment 6                | —                                |
+| 6    | Refused; the peer answered but its identity could not be resolved  | 5                                |
 
 Exit 1 is reserved so that an unclassified crash can never be mistaken for a
 classified refusal. States 10, 11, and 12s have no exit code because they
@@ -556,7 +557,7 @@ old value reads a retired code rather than silently inheriting a reused one.
 | 6   | Parseable non-acknowledgement                     | connect ok, frame deserializes, reply does NOT have ack shape                                                                                                        | Refuse to start; name the observed shape                                                                                                                                                               | 0    |
 | 7   | Silent connect                                    | connect ok, no parseable response within the deadline                                                                                                                | Refuse; distinct error "connected but did not answer"                                                                                                                                                  | 2    |
 | 8   | Malformed reply                                   | connect ok, bytes returned, frame does not parse                                                                                                                     | Refuse to start                                                                                                                                                                                        | 3    |
-| 9   | Connection refused, pid live                      | `ECONNREFUSED`, pid running                                                                                                                                          | Refuse; name the pid                                                                                                                                                                                   | 4    |
+| 9   | Connection refused, pid live                      | `ECONNREFUSED`, pid running                                                                                                                                          | Refuse; name the pid AND its command line                                                                                                                                                              | 0    |
 | 10  | Connection refused, no live listener              | `ECONNREFUSED`, and the recorded pid is not running OR no usable pid record exists (file absent, empty, or not parseable as a pid)                                   | Clean up and bind                                                                                                                                                                                      | —    |
 | 11  | No socket, no live pid                            | socket absent, and the recorded pid is not running OR no usable pid record exists (file absent, empty, or not parseable as a pid) — the same predicate state 10 uses | Clean up and bind                                                                                                                                                                                      | —    |
 | 12  | No socket, pid live, incumbency not permitted     | socket absent, pid running, and EITHER the pid is not this process OR same-process incumbency is not permitted                                                       | Refuse; name the pid AND its command line                                                                                                                                                              | 0    |
@@ -716,9 +717,8 @@ easy to invert:
   _other_ process, restarting this one cannot help, and a restart loop is the
   likely result. Exit 0 encodes "someone else has this", not "nothing is wrong".
   That same draft called state 12 transient, a peer between fork and bind. That
-  description is withdrawn for the reason recorded in the open note above, and
-  the exit code now rests on the class rule with its justification tracked as
-  open, not on that mechanism.
+  description is withdrawn for the reason recorded in the note above, and the
+  exit code rests on the asymmetry Amendment 7 states, not on that mechanism.
 
   **The refusal must name the pid AND its command line**, because the class rule
   has one failure mode and this is it. A pid file can outlive its writer and the
@@ -796,11 +796,12 @@ Where a state's test runs below process level, the exit code is asserted against
 the value the classification maps to rather than against a real process exit,
 and at least one end-to-end test per **emitted** exit class asserts a real
 process exit code so the mapping itself is covered. The emitted classes are 0,
-2, 3, 4, and 6. Codes 1 and 5 are reserved and unemitted by classification, so
+2, 3, and 6. Codes 1, 4, and 5 are reserved and unemitted by classification, so
 they are deliberately not exercised as classification outcomes; requiring an
 end-to-end test for them would require producing an outcome this document
-forbids. A test that asserts no classified refusal ever exits 1 or 5 is welcome
-but belongs to the reserved-code guarantee, not to this per-class obligation.
+forbids. A test that asserts no classified refusal ever exits 1, 4, or 5 is
+welcome but belongs to the reserved-code guarantee, not to this per-class
+obligation.
 
 "One test per state" is not by itself enough to tell a conforming test from one
 that checks an error value, so each state's test declares four things
@@ -872,3 +873,84 @@ boot fence, the exactly-once recovery boundary of Amendment 3, and the socket
 accessibility narrowing of Amendment 4 all stand as written. This amendment
 constrains only what boot may conclude from a probe result, and what it may do
 about it.
+
+## Amendment 7 (2026-08-27): states 9 and 12 share one exit code
+
+Amendment 6 classified the incumbent states and left one question open: why
+state 9 exits 4 and state 12 exits 0, when its own reading says ownership and
+trajectory are unproven in both. This amendment closes it. **State 9 exits 0.
+Exit 4 is retired and not reused. State 9's refusal names the pid and its
+command line, as state 12's already does.**
+
+### Why neither code was licensed by evidence
+
+The class rule asks whether a later attempt of this process can observe a
+different classification. Amendment 6 established that the answer is the same in
+both states, so the rule does not separate them. Nothing else did either. A
+nonzero code asserts that a supervisor restart is the remedy; exit 0 asserts
+that someone else owns the rendezvous. State 9 can prove neither. `ECONNREFUSED`
+with a live recorded pid is consistent with a crashed daemon whose socket file
+outlived it and whose pid was recycled by an unrelated process, and that is
+exactly the reading Amendment 6 arrived at.
+
+So the split cannot be settled on evidence, and pretending otherwise is what
+produced the withdrawn trajectory argument. It is settled on the asymmetry of
+being wrong.
+
+### The asymmetry of harm
+
+A wrong exit 0 wedges boot **visibly**. The refusal is terminal for a supervisor
+configured to restart only on unsuccessful exit, so it happens once, an operator
+sees one refusal naming a pid and a command line, and the command line is the
+evidence that tells them whether the incumbent is a khived at all.
+
+A wrong nonzero wedges boot **silently and repeatedly**. The supervisor restarts,
+the next probe reads the same stale socket and the same recycled pid, and the
+loop produces no information it did not have on the first attempt. This is the
+failure mode the class rule exists to prevent, stated in Amendment 6 for state
+12: exit 0 encodes "someone else has this", not "nothing is wrong".
+
+The two errors are not symmetric in cost, and only one of them is observable by
+the person who can fix it. That is the whole license for the code, and it is
+stated as such rather than dressed as a fact about what the daemon is doing.
+
+### The command line is now load-bearing for state 9
+
+Amendment 6 argued that state 12's refusal must print the pid **and** its
+command line, because the class rule has exactly one failure mode — a recycled
+pid that reads as a live incumbent forever — and the command line is the only
+evidence that distinguishes it from a genuine race. State 9 has the identical
+failure mode and did not have the identical remedy, because its nonzero code
+appeared to offer the supervisor a way out. Removing that code removes the
+excuse: with exit 0, the refusal message is the only channel left, so it carries
+the same two facts. A refusal that prints the bare number leaves an operator
+with nothing to act on and no signal that anything is wrong.
+
+### Exit 4 is retired, not reused
+
+Like exit 1 and exit 5, exit 4 stays defined and unemitted. A supervisor keyed
+on the old value reads a retired code rather than silently inheriting a reused
+one, which is the same guarantee Amendment 6 gave when state 13 left exit 5.
+
+### What this does not claim
+
+It does not claim that a state 9 observation means another process owns the
+rendezvous. It claims that a boot which cannot tell the difference should stop
+and say so, rather than ask a supervisor to try again at something no retry
+reaches. The three facts recorded in Amendment 6 are unchanged and remain the
+reason no trajectory reading is available here.
+
+### Test obligations
+
+The per-class end-to-end obligation now covers 0, 2, 3, and 6. State 9's test
+asserts exit 0 and asserts that the refusal message contains both the pid and
+the command line, since dropping either is the failure this amendment guards
+and neither is visible in an exit code. The reserved-code guarantee gains exit
+4: no classified refusal ever exits 1, 4, or 5.
+
+### What is unchanged
+
+Every other state's disposition and exit code, the class rule itself, the
+precedence order, the three withdrawn-premise facts, and all of Amendments 1
+through 5. This amendment changes one exit code, one disposition string, and the
+reserved set.
