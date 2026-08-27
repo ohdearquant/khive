@@ -444,22 +444,32 @@ published cannot be re-observed differently, so no retry reaches a different
 classification and it exits 0. State 7 is nonzero on the state 8 reading: a peer
 that did not answer within the deadline may answer within the next one.
 
-> **OPEN — states 9 and 12 are not separated by the rule as written, and this
-> amendment does not settle it.** The two arise from the same instant of the
-> same race and only the socket separates them: no socket with a live foreign
-> pid is state 12 and exits 0, while a socket present and refusing with a live
-> pid is state 9 and exits 4. The rule above does not license that split. From
-> state 12 a retry reaches a binding outcome if the recorded pid dies before
-> binding (state 11), and from state 9 it reaches one on the same condition
-> (state 10), so "can a later attempt observe a different classification" is
-> true of both. The state 12 rationale below argues instead from the _expected_
-> trajectory — the peer is already booting and will own the rendezvous, so a
-> restart loop is the likely result — and that argument applies to state 9's
-> not-yet-bound half just as well. Either the rule needs a second clause that
-> names the discriminator, or one of the two codes is wrong. Resolving it by
-> asserting a distinction between them is what this note exists to prevent;
-> the contract is normative for supervisors, so it is a decision to be taken
-> and recorded, not inferred. Tracked before Amendment 6 is treated as settled.
+**Second clause: where a live recorded pid is shared, the socket names that
+pid's trajectory.** Asking only whether a later attempt observes a different
+classification is necessary but not sufficient, because it is true of both
+states 9 and 12. They arise from the same instant of the same race and only the
+socket separates them, so on the first clause alone the split between exit 4 and
+exit 0 is unlicensed. What licenses it is which classification the trajectory
+leads to: binding by this process, or refusal by an owner.
+
+A socket present with a live recorded pid that refuses connections is a daemon
+_past_ its listener. The lifecycle rule above requires that on SIGTERM/SIGINT a
+daemon stop accepting, drain in-flight requests, and only then remove the socket
+and the PID file, so a refusing socket with its owner still alive is that daemon
+draining, and its next state is death. That death lands in whichever of the two
+genuinely stale states applies: state 11 when the drain completed its own
+cleanup, state 10 when the socket outlived the process. Both are states this
+process resolves by cleaning up and binding, so the resolver is a later attempt
+of this process and nonzero stands. State 9 keeps exit 4.
+
+A live recorded pid with no socket is _before_ its listener. Its next state is
+ownership, which a later attempt observes as state 1, so the resolver is the
+other process, and a supervisor restart loop is the harm the code has to avoid.
+State 12 keeps exit 0.
+
+The bind-to-listen gap does reach state 9, for at most one attempt, and it is
+harmless there: the retry meets state 1 and exits 0, at a cost of one supervisor
+restart.
 
 **Codes are numeric and distinct, not merely "nonzero".** A supervisor and an
 end-to-end test both need to tell these apart, and "nonzero" is a class, not a
