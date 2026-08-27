@@ -514,6 +514,37 @@ pub struct WriterContentionDiagnostics {
     pub audit_degraded: Option<bool>,
     /// Why `audit_degraded` is unavailable to this caller.
     pub audit_degraded_unavailable_reason: Option<String>,
+    /// Per-dispatch audit rows for an explicitly allowlisted, domain-write-free
+    /// read verb (`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`) that were
+    /// **refused before they could be enqueued** on the audit lane
+    /// (`AuditTerminalReason::QueueAdmissionExhausted`) while the dispatch
+    /// still reported its own successful result (ADR-103 Amendment 3, ADR-133
+    /// Amendment 1). This is a confirmed, terminal accounting loss: the row
+    /// never shared a generation with anyone and will never commit, so it
+    /// undercounts `brain.event_counts`'s cost totals for exactly the rows
+    /// counted here. Disjoint from `audit_degraded_rows` (a different reason:
+    /// persistent commit failure of a pure-observability row, not admission
+    /// pressure) and from `audit_admission_unresolved_obligations` (a row that
+    /// was enqueued and may still commit). `None` under the same conditions as
+    /// `audit_batch_flush_failures`.
+    pub audit_admission_refused_obligations: Option<u64>,
+    /// Why `audit_admission_refused_obligations` is unavailable to this caller.
+    pub audit_admission_refused_obligations_unavailable_reason: Option<String>,
+    /// Per-dispatch audit rows for an explicitly allowlisted, domain-write-free
+    /// read verb (`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`) that were
+    /// **already enqueued but had not resolved when the caller's admission
+    /// wait deadline elapsed** (`AuditTerminalReason::AdmissionDeadlineExpired`)
+    /// while the dispatch still reported its own successful result (ADR-103
+    /// Amendment 3, ADR-133 Amendment 1). Unlike
+    /// `audit_admission_refused_obligations`, a row counted here is not a
+    /// confirmed loss — it may still be committed by the generation driver
+    /// independently of the caller's timeout — so this field is an upper
+    /// bound on the eventual undercount, not the undercount itself. `None`
+    /// under the same conditions as `audit_batch_flush_failures`.
+    pub audit_admission_unresolved_obligations: Option<u64>,
+    /// Why `audit_admission_unresolved_obligations` is unavailable to this
+    /// caller.
+    pub audit_admission_unresolved_obligations_unavailable_reason: Option<String>,
 }
 
 /// Process-wide audit-batch health counters, supplied by the runtime layer
@@ -529,6 +560,18 @@ pub struct RuntimeAuditBatchMetrics {
     pub degraded_rows: u64,
     /// Monotonic process-lifetime degradation flag.
     pub degraded: bool,
+    /// Admission-degrade-safe read verbs' audit rows refused before enqueue
+    /// under transient audit-lane admission pressure (ADR-103 Amendment 3,
+    /// ADR-133 Amendment 1) — a confirmed, terminal accounting loss. Disjoint
+    /// from `degraded_rows` and from `admission_unresolved_obligations`.
+    pub admission_refused_obligations: u64,
+    /// Admission-degrade-safe read verbs' audit rows that were already
+    /// enqueued but had not resolved when the caller's admission wait
+    /// deadline elapsed (ADR-103 Amendment 3, ADR-133 Amendment 1). Not a
+    /// confirmed loss — the row may still commit — so this is an upper bound
+    /// on the eventual undercount. Disjoint from `degraded_rows` and from
+    /// `admission_refused_obligations`.
+    pub admission_unresolved_obligations: u64,
 }
 
 impl WriterContentionDiagnostics {
@@ -566,6 +609,18 @@ impl WriterContentionDiagnostics {
                 .flatten(),
             audit_degraded: runtime_audit_batch_metrics.map(|m| m.degraded),
             audit_degraded_unavailable_reason: runtime_audit_batch_metrics
+                .is_none()
+                .then(unavailable_reason)
+                .flatten(),
+            audit_admission_refused_obligations: runtime_audit_batch_metrics
+                .map(|m| m.admission_refused_obligations),
+            audit_admission_refused_obligations_unavailable_reason: runtime_audit_batch_metrics
+                .is_none()
+                .then(unavailable_reason)
+                .flatten(),
+            audit_admission_unresolved_obligations: runtime_audit_batch_metrics
+                .map(|m| m.admission_unresolved_obligations),
+            audit_admission_unresolved_obligations_unavailable_reason: runtime_audit_batch_metrics
                 .is_none()
                 .then(unavailable_reason)
                 .flatten(),
@@ -1088,6 +1143,8 @@ mod tests {
                 flush_failures: 3,
                 degraded_rows: 7,
                 degraded: true,
+                admission_refused_obligations: 5,
+                admission_unresolved_obligations: 2,
             }),
         )
         .await
@@ -1102,6 +1159,46 @@ mod tests {
             .is_none());
         assert_eq!(with_control.writer_contention.audit_degraded_rows, Some(7));
         assert_eq!(with_control.writer_contention.audit_degraded, Some(true));
+        assert_eq!(
+            with_control
+                .writer_contention
+                .audit_admission_refused_obligations,
+            Some(5),
+            "an operator must be able to read the admission-refused obligation count from \
+             db_diagnostics without a test-only feature gate (ADR-103 Amendment 3)"
+        );
+        assert!(with_control
+            .writer_contention
+            .audit_admission_refused_obligations_unavailable_reason
+            .is_none());
+        assert_eq!(
+            with_control
+                .writer_contention
+                .audit_admission_unresolved_obligations,
+            Some(2),
+            "an operator must be able to distinguish enqueued-but-unresolved rows from \
+             confirmed-refused rows (ADR-103 Amendment 3)"
+        );
+        assert!(with_control
+            .writer_contention
+            .audit_admission_unresolved_obligations_unavailable_reason
+            .is_none());
+        assert!(without_control
+            .writer_contention
+            .audit_admission_refused_obligations
+            .is_none());
+        assert!(without_control
+            .writer_contention
+            .audit_admission_refused_obligations_unavailable_reason
+            .is_some());
+        assert!(without_control
+            .writer_contention
+            .audit_admission_unresolved_obligations
+            .is_none());
+        assert!(without_control
+            .writer_contention
+            .audit_admission_unresolved_obligations_unavailable_reason
+            .is_some());
 
         // Existing fields must be unaffected by the new ones — additive, not
         // a reshuffle.
