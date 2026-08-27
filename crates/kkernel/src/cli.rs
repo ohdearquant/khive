@@ -1472,7 +1472,7 @@ mod tests {
         let migrated = StorageBackend::sqlite(&path).expect("reopen migrated database");
         assert_eq!(
             migrated.prepare_core_schema().unwrap(),
-            ATTACHMENT_CUTOVER_VERSION
+            khive_db::migrations::latest_schema_version()
         );
         let attachment = migrated
             .attachments()
@@ -1554,7 +1554,7 @@ mod tests {
             let conn = backend.pool().reader().expect("inspect completed topology");
             assert_eq!(
                 read_schema_version(conn.conn()).unwrap(),
-                ATTACHMENT_CUTOVER_VERSION
+                khive_db::migrations::latest_schema_version()
             );
             assert_eq!(
                 attachment_cutover_status(conn.conn()).unwrap(),
@@ -1596,7 +1596,7 @@ mod tests {
         );
         assert_eq!(
             read_schema_version(secondary_conn.conn()).unwrap(),
-            ATTACHMENT_CUTOVER_VERSION
+            khive_db::migrations::latest_schema_version()
         );
     }
 
@@ -1626,7 +1626,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_migrate_one_declared_main_uses_its_configured_path() {
-        use khive_db::migrations::{read_schema_version, ATTACHMENT_CUTOVER_VERSION};
+        use khive_db::migrations::read_schema_version;
 
         let tmp = TempDir::new().expect("temp dir");
         let main = tmp.path().join("declared-main.db");
@@ -1647,7 +1647,7 @@ mod tests {
         let conn = backend.pool().reader().unwrap();
         assert_eq!(
             read_schema_version(conn.conn()).unwrap(),
-            ATTACHMENT_CUTOVER_VERSION
+            khive_db::migrations::latest_schema_version()
         );
     }
 
