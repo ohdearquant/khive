@@ -472,14 +472,22 @@ not reopened from the same premise:
    cannot be a peer caught between fork and bind: the pid file does not exist
    yet at that point in boot.
 
-2. **Shutdown runs the other way.** The lifecycle rule earlier in this document
-   has SIGTERM/SIGINT stop accepting, drain in-flight requests, then remove
-   socket and PID file, in that order. The window in which the socket is gone
-   while the pid file still names a live process is therefore LATE SHUTDOWN, not
-   early boot. Read against the code, a state 12 observation is at least as
-   consistent with a daemon about to exit — whose next state is 11, which this
-   process resolves by binding — as with one about to bind. That reading argues
-   for nonzero, the opposite of what the table gives it.
+2. **Shutdown runs the other way, but a conforming boot cannot observe it.** The
+   lifecycle rule earlier in this document has SIGTERM/SIGINT stop accepting,
+   drain in-flight requests, then remove socket and PID file, in that order. An
+   earlier version of this note inferred from that ordering that a state 12
+   observation is at least as consistent with a daemon about to exit as with one
+   about to bind, and that the reading therefore argues for nonzero. **That
+   inference does not survive the locking, and is withdrawn.** Shutdown unlinks
+   only while holding the recovery lock, and when it cannot acquire that lock it
+   skips the unlink entirely rather than proceeding unlocked
+   (`crates/khive-runtime/src/daemon.rs:1856-1870`); the two unlinks themselves
+   are adjacent syscalls inside that critical section (`:1888-1892`). Daemon boot
+   must hold the same exclusive lock across cleanup, bind and pid-write
+   (`daemon.rs:186-195` and `:268-281`). A conforming competing boot therefore
+   blocks until both files are gone, and cannot observe the orderly
+   socket-gone/pid-live interval at all. The shutdown ordering stands as a fact.
+   It licenses nothing about state 12, in either direction.
 
 3. **A live recorded pid proves nothing about ownership, in either state.**
    Liveness is `kill(pid, 0)` (`daemon.rs:1943-1996`) and the incumbent check is
@@ -491,8 +499,11 @@ not reopened from the same premise:
    pid may belong to an unrelated long-lived process; the withdrawn clause
    forgot it.
 
-Neither state licenses a trajectory reading, then, and these exit codes are
-normative for supervisors. **The codes in the table below are UNCHANGED and
+What is left, once the boot window is impossible and the shutdown window is
+unobservable, is fact 3: the observation that actually persists in either state
+is a recorded pid that has been reused by an unrelated live process, which no
+retry of this process ever resolves. Neither state licenses a trajectory
+reading, then, and these exit codes are normative for supervisors. **The codes in the table below are UNCHANGED and
 remain what implementations follow.** What is open is their justification, and
 it is tracked here rather than asserted. Resolving it is deliberately out of
 scope for this amendment: the classification is already the improvement over the
