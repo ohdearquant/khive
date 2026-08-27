@@ -106,6 +106,11 @@ pub(crate) struct CancelOnEofTransport<T> {
     /// and defer past the older obligation's TTL. Removing the entry whose id
     /// matches keeps `back()` the genuinely newest outstanding admission,
     /// which is what the freshness rule assumes.
+    ///
+    /// Because retirement is keyed, a request that never produces a response
+    /// would hold its entry for the life of the session. Entries past
+    /// `obligation_ttl` are therefore dropped whenever this queue is touched;
+    /// see [`drop_stale_obligations`].
     in_flight: Arc<Mutex<VecDeque<(rmcp::model::RequestId, Instant)>>>,
     /// How long an outstanding request keeps deferring the idle close. `None`
     /// defers without bound. See the type doc.
@@ -143,6 +148,43 @@ impl<T> CancelOnEofTransport<T> {
             in_flight: Arc::new(Mutex::new(VecDeque::new())),
             obligation_ttl,
         }
+    }
+
+    /// The obligation queue, for tests that need to observe its size.
+    #[cfg(test)]
+    pub(crate) fn in_flight_handle(
+        &self,
+    ) -> Arc<Mutex<VecDeque<(rmcp::model::RequestId, Instant)>>> {
+        self.in_flight.clone()
+    }
+}
+
+/// Drops obligations that are already past their TTL.
+///
+/// An entry older than `obligation_ttl` is, by this transport's own rule, no
+/// longer evidence of life: the freshness check will not defer on it. Keeping
+/// it buys nothing, and keeping it *forever* is a real cost, because
+/// retirement is keyed by request id and so only ever removes the entry whose
+/// response was actually written. A request that never produces one — a
+/// handler that panics, a request the peer cancels — would otherwise hold its
+/// entry for the life of the session, and a long-lived session accumulates one
+/// per such request without bound.
+///
+/// Entries are pushed in admission order, so the stale ones are a prefix.
+///
+/// With no TTL configured there is no notion of staleness and nothing is
+/// dropped. That is the configuration which already restores the unbounded
+/// defer (see the type doc), so it is unbounded in the same way for the same
+/// reason.
+fn drop_stale_obligations(
+    queue: &mut VecDeque<(rmcp::model::RequestId, Instant)>,
+    obligation_ttl: Option<std::time::Duration>,
+) {
+    let Some(ttl) = obligation_ttl else {
+        return;
+    };
+    while queue.front().is_some_and(|(_, at)| at.elapsed() >= ttl) {
+        queue.pop_front();
     }
 }
 
@@ -182,6 +224,7 @@ where
         let in_flight = self.in_flight.clone();
         let root = self.root.clone();
         let response_deadline = self.response_deadline;
+        let obligation_ttl = self.obligation_ttl;
         let send = self.inner.send(item);
         async move {
             let result = match (is_response, response_deadline) {
@@ -209,12 +252,13 @@ where
             // write must not be left permanently counted as pending, and why
             // the entry removed has to be the matching one rather than the
             // oldest. An id-less error matches nothing and removes nothing.
-            if let Some(id) = retire_id {
-                if let Ok(mut q) = in_flight.lock() {
+            if let Ok(mut q) = in_flight.lock() {
+                if let Some(id) = retire_id {
                     if let Some(position) = q.iter().position(|(entry, _)| *entry == id) {
                         q.remove(position);
                     }
                 }
+                drop_stale_obligations(&mut q, obligation_ttl);
             }
             result
         }
@@ -293,6 +337,7 @@ where
                 };
                 if let Some(rmcp::model::JsonRpcMessage::Request(request)) = &message {
                     if let Ok(mut q) = in_flight.lock() {
+                        drop_stale_obligations(&mut q, obligation_ttl);
                         q.push_back((request.id.clone(), Instant::now()));
                     }
                 }

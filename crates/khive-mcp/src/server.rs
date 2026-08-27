@@ -7828,6 +7828,77 @@ mod request_read_cancellation_tests {
         );
     }
 
+    /// Regression: the obligation queue must not grow without bound.
+    ///
+    /// Retirement is keyed by request id, so it only ever removes the entry
+    /// whose response was actually written. A request that never produces one
+    /// — a handler that panics, a request the peer cancels — leaves its entry
+    /// behind. Under the earlier oldest-first retirement any completion
+    /// removed *some* entry, so the queue tracked admissions minus
+    /// completions; keying by id means an unanswered request now holds its
+    /// slot for the life of the session unless something drops it.
+    ///
+    /// Nothing here waits on the idle timer: it is disabled, so the only thing
+    /// that can bound this queue is the staleness drop.
+    #[tokio::test]
+    async fn stdio_obligation_queue_drops_entries_past_their_ttl() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const OBLIGATION_TTL: Duration = Duration::from_millis(100);
+        // Longer than the TTL, so every earlier admission is already stale by
+        // the time the next one arrives and the queue can never hold two.
+        const ADMISSION_GAP: Duration = Duration::from_millis(150);
+        const ADMISSIONS: u32 = 4;
+
+        let probe = SlowProbeServer {
+            started: Arc::new(tokio::sync::Notify::new()),
+            // Never answers, so nothing is ever retired by id.
+            delay: Duration::from_secs(3600),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // Idle reaping off: this test is about the queue, not the timer.
+            None,
+            None,
+            Some(OBLIGATION_TTL),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        for id in 1..=ADMISSIONS {
+            client_io
+                .write_all(
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\
+                         \"params\":{{\"name\":\"probe\",\"arguments\":{{}}}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            tokio::time::sleep(ADMISSION_GAP).await;
+        }
+
+        let outstanding = obligations.lock().expect("obligation queue poisoned").len();
+        assert!(
+            outstanding <= 1,
+            "an unanswered request must not hold its obligation slot past the TTL: after \
+             {ADMISSIONS} admissions spaced {}ms apart against a {}ms TTL the queue holds \
+             {outstanding} entries. Without the staleness drop it would hold {ADMISSIONS}, one \
+             per admission, and would keep growing for as long as the session lives.",
+            ADMISSION_GAP.as_millis(),
+            OBLIGATION_TTL.as_millis(),
+        );
+
+        drop(client_io);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
     /// Parks forever on the first call and answers every later one promptly,
     /// so a test can produce out-of-order response completion: the request
     /// admitted first stays outstanding while a later one completes.
