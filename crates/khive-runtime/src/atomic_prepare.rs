@@ -3508,9 +3508,10 @@ mod tests {
         // Read the plan's OWN bound values, so the isolation below is
         // derived from the plan rather than assumed about it. Per
         // `entity_replace_if_unchanged_statement`, `?8` (index 7) is the
-        // replacement revision, `?13` (index 12) the expected one, and `?14`
-        // (index 13) the expected deletion marker.
-        let (planned_replacement, plan_expected, plan_expected_deleted) = {
+        // replacement revision, `?12` (index 11) the target id, `?13`
+        // (index 12) the expected revision, and `?14` (index 13) the
+        // expected deletion marker.
+        let (planned_replacement, plan_target_id, plan_expected, plan_expected_deleted) = {
             let statements = match &plan {
                 AtomicOpPlan::Update(p) => p.statements.clone(),
                 other => panic!("expected an Update plan, got {other:?}"),
@@ -3532,8 +3533,24 @@ mod tests {
                 SqlValue::Integer(v) => Some(*v),
                 other => panic!("param {i} must be a deletion marker, got {other:?}"),
             };
-            (read(7), read(12), read_marker(13))
+            let read_text = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Text(v) => v.clone(),
+                other => panic!("param {i} must be a text id, got {other:?}"),
+            };
+            (read(7), read_text(11), read(12), read_marker(13))
         };
+        // The identity conjunct, on the same footing as the revision and the
+        // deletion marker. `id = ?12` is live in the same UPDATE, so a plan
+        // that bound any other row's id would affect zero rows and roll the
+        // unit back for a reason this test does not name — an outcome
+        // indistinguishable from the one it does name.
+        assert_eq!(
+            plan_target_id,
+            id.to_string(),
+            "fixture premise: the plan's `?12` must be the row under test, otherwise \
+             `id = ?12` refuses on identity and the rollback stops being attributable to \
+             the expected-revision guard"
+        );
 
         // A concurrent writer commits BEFORE the plan runs, advancing the
         // row's revision past what the plan's guard expects.
@@ -3616,11 +3633,27 @@ mod tests {
             .expect("the seam call itself must not error; the unit rolls back cleanly");
         match outcome {
             crate::atomic_runner::AtomicRunOutcome::RolledBack {
-                failed_op_index, ..
+                failed_op_index,
+                failure,
             } => {
                 assert_eq!(
                     failed_op_index, 0,
                     "the sole op's guard must be the one that fails"
+                );
+                // Attribution rather than inference. The premises above
+                // establish that every non-target conjunct holds; this names
+                // the statement that actually refused. Without it a unit that
+                // rolled back at some other statement reads identically from
+                // the outside, which is the whole failure mode those premises
+                // were approximating.
+                assert_eq!(
+                    failure,
+                    crate::atomic_runner::AtomicOpFailure::GuardFailed {
+                        statement_label: Some("entity-replace-if-unchanged".to_string()),
+                        expected: crate::atomic_plan::AffectedRowGuard::exactly(1),
+                        observed: 0,
+                    },
+                    "the guarded entity replacement must be the statement whose guard refused"
                 );
             }
             other => panic!(
@@ -3677,9 +3710,10 @@ mod tests {
         // Read the plan's OWN bound values, so the isolation below is
         // derived from the plan rather than assumed about it. Per
         // `edge_replace_if_unchanged_statement`, `?6` (index 5) is the
-        // replacement revision, `?11` (index 10) the expected one, and `?12`
-        // (index 11) the expected deletion marker.
-        let (planned_replacement, plan_expected, plan_expected_deleted) = {
+        // replacement revision, `?10` (index 9) the target id, `?11`
+        // (index 10) the expected revision, and `?12` (index 11) the expected
+        // deletion marker.
+        let (planned_replacement, plan_target_id, plan_expected, plan_expected_deleted) = {
             let statements = match &plan {
                 AtomicOpPlan::Update(p) => p.statements.clone(),
                 other => panic!("expected an Update plan, got {other:?}"),
@@ -3700,8 +3734,22 @@ mod tests {
                 SqlValue::Integer(v) => Some(*v),
                 other => panic!("param {i} must be a deletion marker, got {other:?}"),
             };
-            (read(5), read(10), read_marker(11))
+            let read_text = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Text(v) => v.clone(),
+                other => panic!("param {i} must be a text id, got {other:?}"),
+            };
+            (read(5), read_text(9), read(10), read_marker(11))
         };
+        // The identity conjunct, for the same reason as the entity sibling:
+        // `id = ?10` is live in the same UPDATE and a misbound target refuses
+        // indistinguishably.
+        assert_eq!(
+            plan_target_id,
+            edge_id.to_string(),
+            "fixture premise: the plan's `?10` must be the edge under test, otherwise \
+             `id = ?10` refuses on identity and the rollback stops being attributable to \
+             the expected-revision guard"
+        );
 
         // A concurrent writer commits BEFORE the plan runs, advancing the
         // row's revision past what the plan's guard expects.
@@ -3781,11 +3829,22 @@ mod tests {
             .expect("the seam call itself must not error; the unit rolls back cleanly");
         match outcome {
             crate::atomic_runner::AtomicRunOutcome::RolledBack {
-                failed_op_index, ..
+                failed_op_index,
+                failure,
             } => {
                 assert_eq!(
                     failed_op_index, 0,
                     "the sole op's guard must be the one that fails"
+                );
+                // Attribution rather than inference — see the entity sibling.
+                assert_eq!(
+                    failure,
+                    crate::atomic_runner::AtomicOpFailure::GuardFailed {
+                        statement_label: Some("edge-replace-if-unchanged".to_string()),
+                        expected: crate::atomic_plan::AffectedRowGuard::exactly(1),
+                        observed: 0,
+                    },
+                    "the guarded edge replacement must be the statement whose guard refused"
                 );
             }
             other => panic!(
@@ -4041,13 +4100,94 @@ mod tests {
             .expect("concurrent writer update");
         assert!((concurrent.weight - 0.77).abs() < 1e-9);
 
-        // The guarded delete refuses on THREE independent premises — the
-        // expected revision (`?6`), the expected deletion marker (`?7`), and
-        // the EXISTS survivor at the natural key (`?3`/`?4`/`?5`). All three
-        // produce the same observable, a zero-row delete that rolls the unit
-        // back, so without asserting the other two this fixture cannot say the
-        // revision guard is what refused. Read the plan's own bound values and
-        // check the world against them, immediately before the DML.
+        // Statement 2's in-place arm carries a strict-advance conjunct
+        // (`?7 > updated_at`) beside the expected-revision conjunct
+        // (`updated_at = ?10`) this test names. Both the plan and the
+        // concurrent writer derive their revision from `max(now, expected + 1)`
+        // and the concurrent writer ran LATER, so left alone the stored
+        // revision sits at or past the plan's replacement and BOTH conjuncts
+        // refuse — the test would stay green with either one deleted. Pin the
+        // stored revision one microsecond below the plan's replacement, the
+        // same treatment the entity and edge siblings above already carry.
+        let (absorb_replacement, absorb_expected, absorb_expected_deleted, absorb_ns, absorb_id) = {
+            let statements = match &plan {
+                AtomicOpPlan::Update(p) => p.statements.clone(),
+                other => panic!("expected an Update plan, got {other:?}"),
+            };
+            let s = statements
+                .iter()
+                .find(|st| {
+                    st.statement.label.as_deref() == Some("edge-symmetric-absorb-or-update-inplace")
+                })
+                .expect("the plan must carry the guarded symmetric in-place absorb");
+            let int = |i: usize| match &s.statement.params[i] {
+                SqlValue::Integer(v) => *v,
+                other => panic!("param {i} must be an integer revision, got {other:?}"),
+            };
+            let marker = |i: usize| match &s.statement.params[i] {
+                SqlValue::Null => None,
+                SqlValue::Integer(v) => Some(*v),
+                other => panic!("param {i} must be a deletion marker, got {other:?}"),
+            };
+            let txt = |i: usize| match &s.statement.params[i] {
+                SqlValue::Text(v) => v.clone(),
+                other => panic!("param {i} must be text, got {other:?}"),
+            };
+            (int(6), int(9), marker(10), txt(0), txt(1))
+        };
+        let stored_pinned = absorb_replacement - 1;
+        assert_ne!(
+            stored_pinned, absorb_expected,
+            "fixture premise: the pinned revision must differ from the plan's `?10`, otherwise \
+             `updated_at = ?10` would MATCH and nothing would refuse the in-place arm (and the \
+             guarded delete's `updated_at = ?6`, bound to the same value, would MATCH too and \
+             fire, leaving `changes() = 1` and selecting the absorbed arm instead)"
+        );
+        {
+            let mut writer = runtime.sql().writer().await.expect("writer");
+            let affected = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE graph_edges SET updated_at = ?1 WHERE id = ?2".to_string(),
+                    params: vec![
+                        SqlValue::Integer(stored_pinned),
+                        SqlValue::Text(requested_id.to_string()),
+                    ],
+                    label: Some("test-pin-stored-revision".to_string()),
+                })
+                .await
+                .expect("pin the stored revision");
+            assert_eq!(affected, 1, "the pin must touch exactly the requested edge");
+        }
+        assert!(
+            absorb_replacement > stored_pinned,
+            "fixture premise: the plan's `?7` must still strictly advance past the stored \
+             revision, otherwise `?7 > updated_at` refuses too and the refusal stops being \
+             attributable to `updated_at = ?10`"
+        );
+
+        // A symmetric plan carries TWO guarded statements, and it matters
+        // which one refuses.
+        //
+        //   1. `edge-symmetric-delete-if-conflict`, guarded
+        //      `{expected_min: 0, expected_max: Some(1)}` — a zero-row delete
+        //      SATISFIES this guard. It does not roll the unit back. Its
+        //      effect here is to leave SQLite's `changes()` at 0.
+        //   2. `edge-symmetric-absorb-or-update-inplace`, guarded
+        //      `exactly(1)` — this is the statement that refuses and rolls the
+        //      unit back, through its in-place arm
+        //      `(id = ?2 AND changes() = 0 AND updated_at = ?10 AND
+        //        deleted_at IS ?11 AND ?7 > updated_at)`,
+        //      whose `updated_at = ?10` is the stale-revision guard under
+        //      test. The absorbed arm needs `changes() = 1`, so the delete
+        //      refusing is what selects the in-place arm.
+        //
+        // So the premises come in two layers. The delete's own predicates
+        // (`?6`, `?7`, and the EXISTS survivor at `?3`/`?4`/`?5`) are premised
+        // because they decide WHETHER the delete fires, and therefore which
+        // arm of statement 2 is live. Statement 2's remaining conjuncts are
+        // premised because each of them refuses identically to the revision
+        // guard this test names. Read the plans' own bound values and check
+        // the world against them, immediately before the DML.
         {
             let statements = match &plan {
                 AtomicOpPlan::Update(p) => p.statements.clone(),
@@ -4137,16 +4277,70 @@ mod tests {
             );
         }
 
+        // Statement 2's remaining conjuncts. Each of these refuses the in-place
+        // arm identically to the revision guard this test names, so each has to
+        // be shown satisfied for the attribution to hold.
+        assert_eq!(
+            absorb_ns, "local",
+            "fixture premise: the plan's `?1` must be the namespace the row lives in, \
+             otherwise the outer `namespace = ?1` refuses on its own"
+        );
+        assert_eq!(
+            absorb_id,
+            requested_id.to_string(),
+            "fixture premise: the plan's `?2` must be the edge under test, otherwise the \
+             in-place arm's `id = ?2` refuses on identity"
+        );
+        {
+            let stored = runtime
+                .get_edge_including_deleted(&token, requested_id)
+                .await
+                .expect("read the requested edge")
+                .expect("the requested edge is present before the plan runs");
+            assert_eq!(
+                stored.updated_at.timestamp_micros(),
+                stored_pinned,
+                "fixture premise: the pin must be what the guard reads at DML time, so the \
+                 stored revision is the pinned value and nothing re-advanced it"
+            );
+            assert_eq!(
+                stored.deleted_at.map(|d| d.timestamp_micros()),
+                absorb_expected_deleted,
+                "fixture premise: the stored deletion marker must MATCH the plan's `?11`, \
+                 otherwise `deleted_at IS ?11` refuses too and the refusal stops being \
+                 attributable to `updated_at = ?10`"
+            );
+        }
+
         let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
             .await
             .expect("the seam call itself must not error; the unit rolls back cleanly");
         match outcome {
             crate::atomic_runner::AtomicRunOutcome::RolledBack {
-                failed_op_index, ..
+                failed_op_index,
+                failure,
             } => {
                 assert_eq!(
                     failed_op_index, 0,
                     "the sole op's guard must be the one that fails"
+                );
+                // The decisive attribution, and the reason the two-layer
+                // premise stack above exists: `failed_op_index` cannot
+                // distinguish the two statements, because both live in op 0.
+                // Naming the label is what says the in-place absorb refused
+                // rather than the delete — and the delete's `0..=1` guard
+                // means it CANNOT be the refuser, so a run that reported it
+                // here would be evidence the guards had been rewired.
+                assert_eq!(
+                    failure,
+                    crate::atomic_runner::AtomicOpFailure::GuardFailed {
+                        statement_label: Some(
+                            "edge-symmetric-absorb-or-update-inplace".to_string()
+                        ),
+                        expected: crate::atomic_plan::AffectedRowGuard::exactly(1),
+                        observed: 0,
+                    },
+                    "the guarded in-place absorb must be the statement whose guard refused"
                 );
             }
             other => panic!(
