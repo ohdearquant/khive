@@ -328,3 +328,133 @@ is not consulted as request cancellation state, preserving repeated daemon-run
 tests. A blocking write that ignores async abort continues to own its SQLite
 connection until its blocking closure exits; the daemon never interrupts that
 write or reports a retryable read timeout for it.
+
+## Amendment 6 (2026-08-26): incumbent classification at boot
+
+Boot answers one question — "may I clean up the rendezvous and bind?" — and the
+convergence invariant above requires that the answer be governed by whether a
+daemon is **live**, never by whether it is one this process would choose to talk
+to. This amendment separates those two questions and enumerates the states boot
+must distinguish.
+
+### Liveness and acceptability are different questions
+
+- **Liveness**: is a process serving this socket right now? Answered by the
+  connect and by whether anything comes back at all.
+- **Acceptability**: is that process a peer this client can share the rendezvous
+  with? Answered by identity — protocol version and `config_id`.
+
+Unlink-and-rebind is licensed by a negative answer to **liveness only**. It is
+never licensed by a negative answer to acceptability, because an unacceptable
+peer that is alive still owns the socket. Removing its rendezvous files does not
+stop it, and binding a second listener beside it violates the "exactly one live,
+identity-matching daemon" convergence requirement directly.
+
+A probe predicate that returns a bare boolean invites the collapse, because a
+single bit cannot carry the difference between "nothing is there" and "something
+is there that I may not use". Boot classification therefore returns a
+disposition, not a boolean:
+
+```
+MayBind
+Refuse { pid: Option<u32>, reason: RefusalReason }
+```
+
+`MayBind` is the only value that permits binding a listener.
+
+### Incumbent states
+
+`PID live` means the recorded pid names a running process. `connect` is the
+bounded probe connect. `response` is what came back within the probe deadline.
+
+Exit codes are normative because supervisors read them: a supervisor configured
+to restart only on unsuccessful exit treats exit 0 as a deliberate stop.
+**Configuration-class** refusals — an operator must act, and restarting cannot
+help — exit 0. **State-class** refusals — transient or unclassified, where a
+retry may succeed — exit nonzero.
+
+| #  | State                                         | Observable                                                | Disposition                                                                                   | Exit    |
+| -- | --------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------- | ------- |
+| 1  | Exact acknowledgement                         | connect ok, probe ack, identity matches                   | Refuse to start; report the incumbent pid                                                     | 0       |
+| 2  | Protocol-version mismatch                     | connect ok, `version_mismatch`                            | Refuse; name both versions and the remedy. Never unlink                                       | 0       |
+| 3  | Config mismatch                               | connect ok, `config_mismatch`, `served_config_id` present | Refuse by default; name the first differing field without values. Opt-in replacement only     | 0       |
+| 4  | Metrics-only reply                            | connect ok, reply carries metrics                         | Refuse to start                                                                               | 0       |
+| 5  | Silent connect                                | connect ok, no parseable response within the deadline     | Refuse; distinct error "connected but did not answer"                                         | nonzero |
+| 6  | Malformed reply                               | connect ok, bytes returned, frame does not parse          | Refuse to start                                                                               | nonzero |
+| 7  | Connection refused, pid live                  | `ECONNREFUSED`, pid running                               | Refuse; name the pid                                                                          | nonzero |
+| 8  | Connection refused, pid dead                  | `ECONNREFUSED`, pid not running                           | Clean up and bind                                                                             | —       |
+| 9  | No socket, pid dead                           | socket absent, pid not running or pid file absent         | Clean up and bind                                                                             | —       |
+| 10 | No socket, pid live                           | socket absent, pid running                                | Refuse; name the pid, unless the pid is this process and same-process incumbency is permitted | 0       |
+| 11 | Other connect error (`EACCES`, `ENOTSOCK`, …) | connect fails, not refused                                | Refuse; name the errno                                                                        | nonzero |
+
+Only states 8 and 9 are genuinely stale. Collapsing any of 2, 3, 5, 6, 7, 10 or
+11 into "clean up and bind" is the defect this amendment forbids.
+
+Every state above is reachable from the boot probe except **state 4**. The boot
+probe's request frame does not set the metrics flag, and the daemon's
+metrics reply is gated on that flag in the requesting frame, so a metrics-only
+reply cannot be elicited by boot. State 4 is retained as a defensive
+classification because a reply carrying metrics is unambiguous proof of life
+whatever elicited it, and misreading it as absence would be the same defect.
+
+Two consequences of the existing contract are worth stating because they are
+easy to invert:
+
+- **State 3 is not automatic replacement.** The Consequences section's
+  description of the daemon as disposable, in the sense that killing and
+  respawning it is safe, licenses replacement being _safe_. It does not make
+  replacement something boot performs unprompted. Disposable does not mean
+  auto-replaced at boot.
+- **State 10 is a clean exit.** The convergence requirement already anticipates
+  multiple launch attempts and lets the daemon-side fence choose the sole owner,
+  so losing that fence is legitimate rather than an error. Blocking and
+  re-probing belong to the client-side recoverer, never to daemon boot.
+
+### Replacing a live incumbent
+
+Removal of a live incumbent is operator-elected and available only through an
+explicit `--replace-incumbent` opt-in. Every step is required:
+
+1. Classify. Proceed only from states 1 through 4, where a daemon identity was
+   positively read. Never from 5, 6, 7, 10 or 11 — those have not established
+   what would be killed.
+2. Signal `SIGTERM` to the recorded pid.
+3. Wait, bounded, for process death. Death is **observed**, never assumed.
+4. On timeout, refuse: leave the socket intact and name the pid. Never escalate
+   to `SIGKILL` implicitly, and never unlink a socket whose owner is still
+   alive.
+5. Only after observed death, remove the socket and pid file, then bind.
+
+Step 3 is the substance. Removing a rendezvous file is not a way to stop a
+process.
+
+### Test obligations
+
+One test per state, each asserting the **outcome** rather than the return value.
+For every refuse state that must assert: the incumbent is still alive, the
+socket still exists, and no second listener was bound. A test that checks only
+the returned error passes while the socket is unlinked underneath a live
+process, which is precisely the failure being prevented. Each refuse state also
+asserts its exit code, since an otherwise-correct refusal carrying the wrong
+code either drives a supervisor restart loop or silently retires a retryable
+state.
+
+Two further tests are required because their absence is what allowed the
+collapse:
+
+- A test that starts a real live incumbent and drives each non-acknowledgement
+  class against it, asserting that startup never leaves two live daemons.
+- A `--replace-incumbent` timeout test in which the incumbent ignores `SIGTERM`,
+  asserting refusal with the socket intact.
+
+Each state's guard carries a mutation control: defeat the guard, confirm that
+exactly that state's test fails, and restore from a snapshot rather than by
+reapplying an inverse edit.
+
+### What is unchanged
+
+The convergence requirement, the client-side recoverer lock, the daemon-side
+boot fence, the exactly-once recovery boundary of Amendment 3, and the socket
+accessibility narrowing of Amendment 4 all stand as written. This amendment
+constrains only what boot may conclude from a probe result, and what it may do
+about it.
