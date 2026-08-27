@@ -361,14 +361,26 @@ direction, once all four conjuncts hold the rendezvous is kept whatever the
 peer would have replied, because nothing asks it. The amendment's
 classification replaces this predicate; it does not refine it.
 
-A boolean probe of the shape this amendment breaks apart does exist, but it
-answers a different question. `probe_daemon_identity` in
-`crates/khive-mcp/src/daemon.rs` collapses ack shape, three mismatch flags,
-protocol version, and served config id into one condition, and its callers ask
-whether a _client_ may dispatch to the daemon or must fall back — including its
-own boot fence, which is not the daemon-boot rendezvous decision governed here.
-It is the closest existing analogue to the classification below and a useful
-reference for implementers, but it is not the predicate this amendment changes.
+A probe that collapses the distinctions this amendment draws does exist, but it
+answers a different question and it is not itself a boolean.
+`probe_daemon_identity` in `crates/khive-mcp/src/daemon.rs` returns a four-way
+`ProbeOutcome` — `Alive`, `Dead`, `Timeout`, and a lock-contended variant — so
+its callers can already separate a slow peer, and an unconfirmable peer boot,
+from a dead or mismatched one. What is collapsed is narrower: reaching `Alive`
+requires one boolean, `is_probe_ack`, conjoined with three mismatch flags,
+protocol version, and served config id, and everything failing that conjunction
+lands in the single `Dead` bucket. Its callers ask whether a _client_ may
+dispatch to the daemon or must fall back — including its own boot fence, which
+is not the daemon-boot rendezvous decision governed here.
+
+Its ack test is also weaker than the definition below, and deliberately so for
+its own purpose: `is_probe_ack` is `ok && result.is_none() && error.is_none()`,
+which does **not** exclude a reply carrying `metrics` or a `request_id`. An
+implementer must not read that predicate as an implementation of Amendment 6's
+ack shape; under this amendment a metrics-bearing reply is state 4 and never an
+acknowledgement. The function is the closest existing analogue to the
+classification below and a useful reference, but it is not the predicate this
+amendment changes, and its ack sentinel is not the one this amendment defines.
 
 Boot answers one question — "may I clean up the rendezvous and bind?" — and the
 convergence invariant above requires that the answer be governed by whether a
@@ -417,10 +429,37 @@ later retry of this process, so that a supervisor restart is the remedy.
 
 Transience is not the test. A rollout in which an older daemon answers the probe
 can last hours and still exits 0, because no number of restarts of this process
-ends it. A peer caught between fork and bind lasts milliseconds and also exits
-0, because the other process is the one that resolves it. Conversely a reply
-that failed to parse may be a one-off and exits nonzero, because retrying is
-exactly what might succeed.
+ends it. A peer caught between fork and bind lasts milliseconds and **in state
+12** also exits 0, because the other process is the one that resolves it.
+Conversely a reply that failed to parse may be a one-off and exits nonzero,
+because retrying is exactly what might succeed.
+
+**What "who resolves it" asks, stated once.** Nonzero asks whether a later
+attempt of this process can observe a _different classification_, not whether
+this attempt could have bound. That is the reading states 5 and 8 already use: a
+peer that has not published its identity may publish it before the next probe,
+and a reply that failed to parse may parse next time, so in both the retry is
+the resolver. State 15 is the counter-case — an identity the peer positively
+published cannot be re-observed differently, so no retry reaches a different
+classification and it exits 0. State 7 is nonzero on the state 8 reading: a peer
+that did not answer within the deadline may answer within the next one.
+
+> **OPEN — states 9 and 12 are not separated by the rule as written, and this
+> amendment does not settle it.** The two arise from the same instant of the
+> same race and only the socket separates them: no socket with a live foreign
+> pid is state 12 and exits 0, while a socket present and refusing with a live
+> pid is state 9 and exits 4. The rule above does not license that split. From
+> state 12 a retry reaches a binding outcome if the recorded pid dies before
+> binding (state 11), and from state 9 it reaches one on the same condition
+> (state 10), so "can a later attempt observe a different classification" is
+> true of both. The state 12 rationale below argues instead from the _expected_
+> trajectory — the peer is already booting and will own the rendezvous, so a
+> restart loop is the likely result — and that argument applies to state 9's
+> not-yet-bound half just as well. Either the rule needs a second clause that
+> names the discriminator, or one of the two codes is wrong. Resolving it by
+> asserting a distinction between them is what this note exists to prevent;
+> the contract is normative for supervisors, so it is a decision to be taken
+> and recorded, not inferred. Tracked before Amendment 6 is treated as settled.
 
 **Codes are numeric and distinct, not merely "nonzero".** A supervisor and an
 end-to-end test both need to tell these apart, and "nonzero" is a class, not a
@@ -685,8 +724,13 @@ state.
 
 Where a state's test runs below process level, the exit code is asserted against
 the value the classification maps to rather than against a real process exit,
-and at least one end-to-end test per exit class asserts a real process exit code
-so the mapping itself is covered.
+and at least one end-to-end test per **emitted** exit class asserts a real
+process exit code so the mapping itself is covered. The emitted classes are 0,
+2, 3, 4, and 6. Codes 1 and 5 are reserved and unemitted by classification, so
+they are deliberately not exercised as classification outcomes; requiring an
+end-to-end test for them would require producing an outcome this document
+forbids. A test that asserts no classified refusal ever exits 1 or 5 is welcome
+but belongs to the reserved-code guarantee, not to this per-class obligation.
 
 "One test per state" is not by itself enough to tell a conforming test from one
 that checks an error value, so each state's test declares four things
