@@ -66,6 +66,28 @@ pub const NOTE_UPSERT_SQL: &str = "INSERT INTO notes \
        updated_at = excluded.updated_at, \
        deleted_at = excluded.deleted_at";
 
+/// Insert-if-absent counterpart to [`NOTE_UPSERT_SQL`], for a caller whose
+/// read found no row.
+///
+/// Identical column list and parameter order, and deliberately
+/// `DO NOTHING` rather than `DO UPDATE`: the point is that a row already
+/// present must survive untouched, so the losing caller can be told it lost
+/// instead of silently overwriting the winner. `changes()` is then the
+/// answer to "did I insert it", which `DO UPDATE` cannot report.
+pub const NOTE_INSERT_IF_ABSENT_SQL: &str = "INSERT INTO notes \
+     (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+      properties, created_at, updated_at, deleted_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+     ON CONFLICT(id) DO NOTHING";
+
+/// The exact statement this store's `insert_note_if_absent` issues.
+pub fn note_insert_if_absent_statement(note: &Note) -> SqlStatement {
+    let mut statement = note_upsert_statement(note);
+    statement.sql = NOTE_INSERT_IF_ABSENT_SQL.to_string();
+    statement.label = Some("note-insert-if-absent".to_string());
+    statement
+}
+
 /// The exact true UPSERT this store's `upsert_note` issues.
 pub fn note_upsert_statement(note: &Note) -> SqlStatement {
     let properties_str = note
@@ -884,6 +906,24 @@ impl NoteStore for SqlNoteStore {
             stmt.raw_execute()?;
             assign_note_seq(conn, &id_str)?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn insert_note_if_absent(&self, note: Note) -> Result<bool, StorageError> {
+        let id_str = note.id.to_string();
+        let statement = note_insert_if_absent_statement(&note);
+        self.with_writer_tx("insert_note_if_absent", move |conn| {
+            let mut stmt = conn.prepare_cached(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            let inserted = stmt.raw_execute()? > 0;
+            // Only a real insert needs a sequence number. Assigning one on the
+            // no-op path would write to a row this call did not create, which
+            // is the overwrite this primitive exists to avoid.
+            if inserted {
+                assign_note_seq(conn, &id_str)?;
+            }
+            Ok(inserted)
         })
         .await
     }

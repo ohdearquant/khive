@@ -169,6 +169,49 @@ async fn replace_note_cas_requires_new_revision_strictly_greater_than_snapshot()
     assert_eq!(persisted.updated_at, 101);
 }
 
+/// `insert_note_if_absent` reports whether THIS call inserted, and leaves a
+/// row that already exists exactly as it was.
+///
+/// Both halves matter and neither implies the other. An implementation that
+/// upserts and returns `true` satisfies "the row exists afterwards" while
+/// destroying the first writer's content, which is the whole failure being
+/// prevented; one that returns `true` unconditionally reports a win to a
+/// caller that lost. So the loser's return value and the survivor's content
+/// are asserted separately.
+#[tokio::test]
+async fn insert_note_if_absent_reports_the_loser_and_leaves_the_winner_untouched() {
+    let store = setup_memory_store();
+
+    let first = make_note("default", "observation", "first writer");
+    let id = first.id;
+    assert!(
+        store.insert_note_if_absent(first).await.unwrap(),
+        "the first insert on an absent id must report that it inserted"
+    );
+
+    // Same id, different content: the deterministic-id case this primitive
+    // exists for, where a second caller also read absence.
+    let mut second = make_note("default", "insight", "second writer");
+    second.id = id;
+    second.updated_at += 1;
+    assert!(
+        !store.insert_note_if_absent(second).await.unwrap(),
+        "a second insert on an id that now exists must report that it did NOT insert, \
+         rather than reporting success to a caller whose write did not land"
+    );
+
+    let persisted = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(
+        persisted.content, "first writer",
+        "the pre-existing row must survive byte-for-byte: overwriting it is the behaviour \
+         this primitive exists to avoid, and it is invisible to the return value alone"
+    );
+    assert_eq!(
+        persisted.kind, "observation",
+        "no column of the pre-existing row may be rewritten by the refused insert"
+    );
+}
+
 #[tokio::test]
 async fn test_kind_roundtrip_all_variants() {
     let store = setup_memory_store();
