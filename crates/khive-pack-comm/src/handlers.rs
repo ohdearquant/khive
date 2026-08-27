@@ -2391,6 +2391,26 @@ pub(crate) async fn handle_heartbeat(
         .map(|n| n.created_at)
         .unwrap_or_else(|| now.timestamp_micros());
 
+    // `updated_at` is also the optimistic-concurrency revision `replace_note_if_unchanged`
+    // checks with `?10 > updated_at`. Two heartbeats landing in the same stored microsecond,
+    // or a backward wall-clock step, must not report a conflict when no concurrent writer
+    // touched the row — make the replacement revision strictly advance past the existing
+    // snapshot instead of trusting `Utc::now()` alone (mirrors
+    // `update_note_from_snapshot_with_embedding_report`). A brand-new channel has no prior
+    // revision to advance past.
+    let updated_at_micros = match existing.as_ref() {
+        Some(snapshot) => {
+            let minimum = snapshot.updated_at.checked_add(1).ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "heartbeat: channel {}:{} updated_at is already at i64::MAX and cannot advance",
+                    p.channel_kind, p.channel_slug
+                ))
+            })?;
+            now.timestamp_micros().max(minimum)
+        }
+        None => now.timestamp_micros(),
+    };
+
     let note = Note {
         id,
         namespace: ns.to_string(),
@@ -2403,7 +2423,7 @@ pub(crate) async fn handle_heartbeat(
         expires_at: None,
         properties: Some(props),
         created_at,
-        updated_at: now.timestamp_micros(),
+        updated_at: updated_at_micros,
         deleted_at: None,
     };
 
@@ -3679,6 +3699,94 @@ mod tests {
                 && final_props["poll_interval_secs"] == json!(9)),
             "both racers' fields must never both land: that would mean the loser's stale \
              write silently succeeded: {final_props:?}"
+        );
+    }
+
+    /// A heartbeat's replacement revision must strictly advance past the
+    /// existing row's own `updated_at`, not just past `Utc::now()`: two
+    /// heartbeats landing in the same stored microsecond, or a backward
+    /// wall-clock step, are the SAME code path as this test forces (the
+    /// fix's `max(now, snapshot+1)` does not distinguish "now == snapshot"
+    /// from "now < snapshot" — both take the `snapshot+1` branch). Before the
+    /// fix, `handle_heartbeat` derived the replacement revision straight from
+    /// `Utc::now().timestamp_micros()`, so forcing the stored snapshot ahead
+    /// of wall-clock time reproduces both scenarios deterministically without
+    /// a clock-injection seam.
+    #[tokio::test]
+    async fn handle_heartbeat_does_not_false_conflict_when_snapshot_is_ahead_of_wall_clock() {
+        let runtime = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+        let token = runtime
+            .authorize(khive_runtime::Namespace::parse("local").unwrap())
+            .expect("authorize");
+
+        super::handle_heartbeat(
+            &runtime,
+            &token,
+            json!({
+                "channel_kind": "email",
+                "channel_slug": "clock-skew@example.com",
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("seed heartbeat");
+
+        let store = runtime.notes(&token).expect("note store");
+        let id = super::heartbeat_note_id("local", "email", "clock-skew@example.com");
+        let seeded = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("seeded heartbeat row");
+
+        // Force the stored revision far ahead of any `Utc::now()` the next
+        // handler call will observe — the same condition as an equal-
+        // microsecond write or a backward clock step.
+        let future_updated_at = seeded.updated_at + 60_000_000; // +60s
+        let mut ahead = seeded.clone();
+        ahead.updated_at = future_updated_at;
+        let forced = store
+            .replace_note_if_unchanged(ahead, seeded.updated_at, seeded.deleted_at)
+            .await
+            .expect("test setup: force the snapshot ahead of wall-clock time");
+        assert!(
+            forced,
+            "test setup CAS must succeed against the freshly seeded row"
+        );
+
+        let result = super::handle_heartbeat(
+            &runtime,
+            &token,
+            json!({
+                "channel_kind": "email",
+                "channel_slug": "clock-skew@example.com",
+                "outcome": "failure",
+                "error_class": "timeout",
+                "error_message": "boom",
+            }),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a heartbeat with no competing writer must not be refused just because the \
+             stored revision is at or ahead of wall-clock now: {result:?}"
+        );
+
+        let final_note = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("heartbeat row still exists");
+        assert!(
+            final_note.updated_at > future_updated_at,
+            "the replacement revision must still strictly advance past the forced-ahead \
+             snapshot: {final_note:?}"
+        );
+        let final_props = final_note.properties.expect("heartbeat properties");
+        assert_eq!(
+            final_props["consecutive_failures"],
+            json!(1),
+            "the accepted write must actually be the failure report just sent: {final_props:?}"
         );
     }
 

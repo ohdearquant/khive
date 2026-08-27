@@ -803,6 +803,8 @@ async fn run_pending_events_on_with_lease(
                             "anonymous:local".to_string()
                         }
                     });
+                #[cfg(test)]
+                race_seam::pause_before_finalize_read().await;
                 let claim =
                     match claim_pending_event(rt, ns_str, id, occurrence_id, &receipt_actor, lease)
                         .await
@@ -832,7 +834,16 @@ async fn run_pending_events_on_with_lease(
                     .is_some_and(|repeat| !matches!(repeat, "daily" | "weekly" | "monthly"))
                 {
                     let error = "scheduled event uses an unsupported repeat expression; only daily, weekly, and monthly are executable";
-                    let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                    summary.failed += 1;
+                    let Some(expected_properties) =
+                        current_properties_for_finalize(rt, ns_str, id, "unsupported-repeat").await
+                    else {
+                        continue;
+                    };
+                    let Some(mut props) = expected_properties_value(&expected_properties, id)
+                    else {
+                        continue;
+                    };
                     props["status"] = json!("failed");
                     let (error_key, error_at_key) = dispatch_error_property_keys(&props);
                     props[error_key] = json!(error);
@@ -843,12 +854,6 @@ async fn run_pending_events_on_with_lease(
                         completed_at,
                         Some(error),
                     );
-                    summary.failed += 1;
-                    let Some(expected_properties) =
-                        current_properties_for_finalize(rt, ns_str, id, "unsupported-repeat").await
-                    else {
-                        continue;
-                    };
                     match finalize_fired_event(
                         rt,
                         ns_str,
@@ -885,7 +890,15 @@ async fn run_pending_events_on_with_lease(
                         eprintln!("[pending-events] dispatch refused for note {id}: {error}");
                     }
                     summary.failed += 1;
-                    let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                    let Some(expected_properties) =
+                        current_properties_for_finalize(rt, ns_str, id, "failed-identity").await
+                    else {
+                        continue;
+                    };
+                    let Some(mut props) = expected_properties_value(&expected_properties, id)
+                    else {
+                        continue;
+                    };
                     props["status"] = json!("failed");
                     props["dispatch_error"] = json!(error);
                     props["dispatch_failed_at"] = json!(Utc::now().to_rfc3339());
@@ -895,11 +908,6 @@ async fn run_pending_events_on_with_lease(
                         updated_at,
                         Some(error),
                     );
-                    let Some(expected_properties) =
-                        current_properties_for_finalize(rt, ns_str, id, "failed-identity").await
-                    else {
-                        continue;
-                    };
                     match finalize_fired_event(
                         rt,
                         ns_str,
@@ -938,7 +946,17 @@ async fn run_pending_events_on_with_lease(
                             grace.num_seconds()
                         );
                     }
-                    let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                    let Some(expected_properties) =
+                        current_properties_for_finalize(rt, ns_str, id, "missed").await
+                    else {
+                        summary.failed += 1;
+                        continue;
+                    };
+                    let Some(mut props) = expected_properties_value(&expected_properties, id)
+                    else {
+                        summary.failed += 1;
+                        continue;
+                    };
                     props["missed_at"] = json!(now.timestamp_micros());
                     match advance_repeat_past_missed(&repeat, trigger_at, now) {
                         Some(next_at) => {
@@ -963,12 +981,6 @@ async fn run_pending_events_on_with_lease(
                         None,
                     );
 
-                    let Some(expected_properties) =
-                        current_properties_for_finalize(rt, ns_str, id, "missed").await
-                    else {
-                        summary.failed += 1;
-                        continue;
-                    };
                     match finalize_fired_event(
                         rt,
                         ns_str,
@@ -1024,7 +1036,16 @@ async fn run_pending_events_on_with_lease(
                         event_type,
                         "pending-events: refusing empty scheduled-event dispatch"
                     );
-                    let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                    summary.failed += 1;
+                    let Some(expected_properties) =
+                        current_properties_for_finalize(rt, ns_str, id, "empty-payload").await
+                    else {
+                        continue;
+                    };
+                    let Some(mut props) = expected_properties_value(&expected_properties, id)
+                    else {
+                        continue;
+                    };
                     let (error_key, error_at_key) = dispatch_error_property_keys(&props);
                     props[error_key] = json!(error);
                     props[error_at_key] = json!(Utc::now().to_rfc3339());
@@ -1035,12 +1056,6 @@ async fn run_pending_events_on_with_lease(
                         completed_at,
                         Some(error),
                     );
-                    summary.failed += 1;
-                    let Some(expected_properties) =
-                        current_properties_for_finalize(rt, ns_str, id, "empty-payload").await
-                    else {
-                        continue;
-                    };
                     match finalize_fired_event(
                         rt,
                         ns_str,
@@ -1068,7 +1083,16 @@ async fn run_pending_events_on_with_lease(
                         scheduled_event_id = %id,
                         "pending-events: refusing non-single scheduled action"
                     );
-                    let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                    summary.failed += 1;
+                    let Some(expected_properties) =
+                        current_properties_for_finalize(rt, ns_str, id, "non-single-action").await
+                    else {
+                        continue;
+                    };
+                    let Some(mut props) = expected_properties_value(&expected_properties, id)
+                    else {
+                        continue;
+                    };
                     props["dispatch_error"] = json!(error);
                     props["dispatch_failed_at"] = json!(Utc::now().to_rfc3339());
                     props["status"] = json!("failed");
@@ -1078,12 +1102,6 @@ async fn run_pending_events_on_with_lease(
                         completed_at,
                         Some(error),
                     );
-                    summary.failed += 1;
-                    let Some(expected_properties) =
-                        current_properties_for_finalize(rt, ns_str, id, "non-single-action").await
-                    else {
-                        continue;
-                    };
                     match finalize_fired_event(
                         rt,
                         ns_str,
@@ -1213,8 +1231,13 @@ async fn run_pending_events_on_with_lease(
                         continue;
                     }
                 };
+                let Some(expected_value) = expected_properties_value(&expected_properties, id)
+                else {
+                    summary.failed += 1;
+                    continue;
+                };
                 let (final_props, disposition) = final_properties_after_dispatch(
-                    properties.clone().unwrap_or_else(|| json!({})),
+                    expected_value,
                     receipt,
                     &completion,
                     trigger_at,
@@ -2250,6 +2273,28 @@ async fn current_note_properties_text(
     }
 }
 
+/// Parses a finalizer's freshly read current-properties CAS snapshot into the
+/// `Value` base a terminal write's field mutations are applied to. Callers
+/// must build their write on this value, not on the page-query snapshot taken
+/// before the claim — a property written between that snapshot and this read
+/// still passes the CAS fence (it is part of what "current" means by the time
+/// this is called) but would otherwise be silently discarded by a write whose
+/// base predates it. Returns `None` (and logs) if the stored text is not
+/// valid JSON; the caller must treat that as a failed finalization.
+fn expected_properties_value(expected_properties: &str, id: uuid::Uuid) -> Option<Value> {
+    match serde_json::from_str(expected_properties) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::error!(
+                scheduled_event_id = %id,
+                error = %error,
+                "pending-events: could not parse current properties for finalization"
+            );
+            None
+        }
+    }
+}
+
 /// Read the row's raw current properties at the same read boundary as a
 /// pending-action finalization decision, for use as `finalize_fired_event`'s
 /// mandatory exact-properties CAS fence. Returns `None` (and logs) on a read
@@ -3084,6 +3129,44 @@ pub async fn schedule_tick_loop(
                     "schedule drain pass failed: {e}"
                 )));
             }
+        }
+    }
+}
+
+/// Test-only pause point right after a drain iteration's page-query
+/// snapshot (`properties`) and before claim/dispatch/finalization, so a
+/// concurrent property write landing between that snapshot and the
+/// finalizer's later fresh current-properties read can be reproduced
+/// deterministically instead of relying on scheduler luck or sleeps. A
+/// no-op unless the calling task runs inside `PAUSE_GATE.scope(...)`;
+/// production code never establishes that scope, so this costs nothing
+/// outside these regression tests, and it does not exist at all in
+/// non-test builds. Mirrors `khive-runtime::curation::race_seam`.
+#[cfg(test)]
+pub(crate) mod race_seam {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    /// Two-phase handshake: `reached` lets the driving test learn the drain
+    /// task has arrived at the pause point (i.e. genuinely parked, not just
+    /// scheduled) before it performs a concurrent write; `release` then lets
+    /// the driving test resume the drain task only once that write has
+    /// landed. A single shared `Barrier` cannot express this — both parties
+    /// would resume together with no window for the test to act in between.
+    #[derive(Clone)]
+    pub(crate) struct PauseGate {
+        pub(crate) reached: Arc<Barrier>,
+        pub(crate) release: Arc<Barrier>,
+    }
+
+    tokio::task_local! {
+        pub(crate) static PAUSE_GATE: PauseGate;
+    }
+
+    pub(crate) async fn pause_before_finalize_read() {
+        if let Ok(gate) = PAUSE_GATE.try_with(Clone::clone) {
+            gate.reached.wait().await;
+            gate.release.wait().await;
         }
     }
 }
@@ -6314,6 +6397,83 @@ mod tests {
             get_note_props(&rt, id).await["status"].as_str(),
             Some("fired")
         );
+    }
+
+    /// Regression test driven through the PRODUCTION
+    /// drain entry point (`run_pending_events_on`) rather than calling
+    /// `final_properties_after_dispatch` directly — this closes a gap a
+    /// primitive-level test cannot: it would still pass unchanged if the
+    /// drain loop's call site reverted to building `final_props` from the
+    /// stale pre-claim `properties` snapshot instead of the freshly read
+    /// `expected_properties`, since it would never invoke that call site at
+    /// all. Uses `race_seam::pause_before_finalize_read` (test-only,
+    /// compiled out of non-test builds) to force the concurrent property
+    /// write to land deterministically between claim/dispatch and the
+    /// finalizer's fresh current-properties read — no sleeps, no reliance on
+    /// scheduler ordering.
+    #[tokio::test]
+    async fn production_drain_preserves_a_property_written_between_claim_and_current_read() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let gate = race_seam::PauseGate {
+            reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+            release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+        };
+
+        let drain_task = {
+            let rt = rt.clone();
+            let gate = gate.clone();
+            tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
+                let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                run_pending_events_on(&rt, &server, false).await
+            }))
+        };
+
+        // Block until the drain task has genuinely parked at the seam
+        // (before its candidate-page query), THEN write, THEN release it —
+        // guaranteeing the write lands strictly between the drain's
+        // page-query snapshot and its later fresh pre-finalize read.
+        gate.reached.wait().await;
+
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = json_set(properties, \
+                      '$.custom', 'added-concurrently') WHERE id = ?1"
+                    .to_string(),
+                params: vec![SqlValue::Text(id.to_string())],
+                label: Some("test_concurrent_property_add".into()),
+            })
+            .await
+            .expect("concurrent write");
+        assert_eq!(rows, 1);
+        drop(writer);
+
+        gate.release.wait().await;
+        let summary = drain_task
+            .await
+            .expect("drain task")
+            .expect("drain must not error");
+        assert_eq!(summary.fired, 1, "the event must have fired: {summary:?}");
+
+        let stored = get_note_props(&rt, id).await;
+        assert_eq!(
+            stored["custom"].as_str(),
+            Some("added-concurrently"),
+            "a property written between claim and the finalizer's current-properties read \
+             must survive finalization, got {stored:?}"
+        );
+        assert_eq!(stored["status"].as_str(), Some("fired"));
     }
 
     /// `schedule.cancel` on a row that is currently `status="firing"` — even

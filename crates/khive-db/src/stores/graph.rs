@@ -300,6 +300,22 @@ pub const EDGE_SYMMETRIC_CONFLICT_PROBE_SQL: &str = "SELECT id FROM graph_edges 
 pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL: &str =
     "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2";
 
+/// Canonical `update_edge`'s guarded variant of
+/// [`EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL`]: `?3`/`?4` pin the fetched
+/// snapshot's `updated_at`/`deleted_at` so a writer whose edge changed
+/// concurrently after it read that snapshot cannot delete the row out from
+/// under the concurrent write, even though a canonical survivor genuinely
+/// exists at the natural key. Zero affected rows means stale, not
+/// "no conflict" — the caller has already confirmed a conflicting canonical
+/// row exists before running this statement. Deliberately a DIFFERENT
+/// constant from the unguarded one above: merge's predicate-based rewrites
+/// (`khive-runtime::curation`) intentionally keep running the unguarded form
+/// inside their own single writer transaction and must not be changed to
+/// bind this one.
+pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL: &str =
+    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2 \
+     AND updated_at = ?3 AND deleted_at IS ?4";
+
 /// Case (a) update, guarded on the fetched snapshot's revision and deletion
 /// marker: `?9`/`?10` pin `updated_at`/`deleted_at` as read, and `?5 >
 /// updated_at` requires the replacement revision to strictly advance —
@@ -417,7 +433,14 @@ pub fn edge_symmetric_update_inplace_statement(
 //
 // 1. [`edge_symmetric_delete_if_conflict_statement`]: deletes the requested
 //    (non-canonical) row IF AND ONLY IF a differently-id'd canonical row
-//    exists at the target natural key at THIS moment (guard: 0 or 1 rows).
+//    exists at the target natural key at THIS moment AND the row's own
+//    `updated_at`/`deleted_at` still match the snapshot this plan was built
+//    from (guard: 0 or 1 rows) — a plan built from a since-changed snapshot
+//    must not delete the row just because some other, unrelated conflict
+//    happens to exist; the second statement's own commit-time predicate
+//    (below) then sees `changes() = 0` and fails its `exactly(1)` guard,
+//    aborting the whole atomic unit rather than silently absorbing a
+//    concurrent writer's change.
 // 2. [`edge_symmetric_absorb_or_update_inplace_statement`]: a single
 //    `UPDATE` that no longer trusts an `id = ?2 OR natural-key` predicate
 //    (ADR-099 §B3 — that predicate could
@@ -471,16 +494,20 @@ pub fn edge_symmetric_update_inplace_statement(
 // a value computed before the
 // SAME atomic unit's other ops have run is not a fact this plan can stand
 // behind, so result rendering no longer trusts it.
+#[allow(clippy::too_many_arguments)]
 pub fn edge_symmetric_delete_if_conflict_statement(
     namespace: &str,
     id: Uuid,
     canon_src: Uuid,
     canon_tgt: Uuid,
     relation: EdgeRelation,
+    expected_updated_at_micros: i64,
+    expected_deleted_at_micros: Option<i64>,
 ) -> SqlStatement {
     SqlStatement {
         sql: "DELETE FROM graph_edges \
               WHERE namespace = ?1 AND id = ?2 \
+                AND updated_at = ?6 AND deleted_at IS ?7 \
                 AND EXISTS ( \
                   SELECT 1 FROM graph_edges \
                   WHERE namespace = ?1 AND source_id = ?3 AND target_id = ?4 \
@@ -493,6 +520,11 @@ pub fn edge_symmetric_delete_if_conflict_statement(
             SqlValue::Text(canon_src.to_string()),
             SqlValue::Text(canon_tgt.to_string()),
             SqlValue::Text(relation.to_string()),
+            SqlValue::Integer(expected_updated_at_micros),
+            match expected_deleted_at_micros {
+                Some(value) => SqlValue::Integer(value),
+                None => SqlValue::Null,
+            },
         ],
         label: Some("edge-symmetric-delete-if-conflict".to_string()),
     }

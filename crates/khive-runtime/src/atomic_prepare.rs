@@ -1032,6 +1032,8 @@ async fn prepare_update_edge(
                 canon_src,
                 canon_tgt,
                 edge.relation,
+                expected_updated_at.timestamp_micros(),
+                expected_deleted_at_micros,
             ),
             guard: Some(AffectedRowGuard {
                 expected_min: 0,
@@ -3789,6 +3791,116 @@ mod tests {
         assert_eq!(
             canonical_after.weight, 0.6,
             "the pre-existing canonical row must never have been touched by the aborted update"
+        );
+    }
+
+    /// The symmetric absorption delete's atomic commit-time statement
+    /// (`edge_symmetric_delete_if_conflict_statement`) must refuse a plan
+    /// built from a since-changed snapshot, exactly like the non-symmetric
+    /// `atomic_edge_update_plan_stale_revision_rolls_back_unit` case above —
+    /// even though a genuine canonical survivor exists at the target natural
+    /// key. `E`'s own revision changes (via an unrelated production
+    /// `update_edge` call) AFTER `prepare_update` captured its snapshot but
+    /// BEFORE the plan runs; the whole atomic unit must roll back rather than
+    /// silently absorbing `E` into the survivor and discarding the
+    /// concurrent write.
+    #[tokio::test]
+    async fn atomic_update_edge_symmetric_absorption_plan_stale_revision_rolls_back_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "StaleAbsorbA");
+        let b = khive_storage::Entity::new("local", "concept", "StaleAbsorbB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        // The pre-existing canonical row this plan will try to absorb into.
+        let canonical_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .expect("seed canonical edge");
+        let canonical_id = Uuid::from(canonical_edge.id);
+
+        // E: the requested edge under test.
+        let requested_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .expect("seed requested edge");
+        let requested_id = Uuid::from(requested_edge.id);
+
+        // PREPARE time: build the plan from the current (soon-to-be-stale)
+        // revision.
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": requested_id.to_string(), "relation": "competes_with", "weight": 0.9}),
+            None,
+        )
+        .await
+        .expect("prepare update edge (symmetric absorption)");
+
+        // A concurrent writer commits BEFORE the plan runs, advancing E's
+        // revision past what the plan's guard expects. Relation stays
+        // `extends` (non-symmetric), so this lands via the already-guarded
+        // replace path — independent of the absorption bug under test.
+        let concurrent = runtime
+            .update_edge(
+                &token,
+                requested_id,
+                crate::curation::EdgePatch {
+                    weight: Some(0.77),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("concurrent writer update");
+        assert!((concurrent.weight - 0.77).abs() < 1e-9);
+
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("the seam call itself must not error; the unit rolls back cleanly");
+        match outcome {
+            crate::atomic_runner::AtomicRunOutcome::RolledBack {
+                failed_op_index, ..
+            } => {
+                assert_eq!(
+                    failed_op_index, 0,
+                    "the sole op's guard must be the one that fails"
+                );
+            }
+            other => panic!(
+                "a stale absorption plan must roll back, not silently absorb E into the \
+                 survivor and discard the concurrent writer's change: {other:?}"
+            ),
+        }
+
+        let requested_after = runtime
+            .get_edge(&token, requested_id)
+            .await
+            .expect("get_edge")
+            .expect("E must still exist after the rolled-back absorption");
+        assert_eq!(
+            requested_after.relation,
+            EdgeRelation::Extends,
+            "E must be untouched by the rolled-back absorption: {requested_after:?}"
+        );
+        assert!(
+            (requested_after.weight - 0.77).abs() < 1e-9,
+            "the concurrent writer's committed weight must survive the rolled-back plan: \
+             {requested_after:?}"
+        );
+
+        let canonical_after = runtime
+            .get_edge(&token, canonical_id)
+            .await
+            .expect("get_edge")
+            .expect("S must still exist after the rolled-back absorption");
+        assert_eq!(
+            canonical_after.weight, 0.6,
+            "the survivor must never have been touched by the aborted absorption"
         );
     }
 

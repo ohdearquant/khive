@@ -4919,6 +4919,7 @@ pub struct QueryResult {
 }
 
 /// Outcome of [`KhiveRuntime::update_edge_symmetric_dml`]'s in-transaction DML.
+#[derive(Debug)]
 enum SymmetricEdgeUpdateOutcome {
     /// A canonical row already existed (ADR-039 DO NOTHING): the
     /// requested edge was deleted, the existing canonical row (this id)
@@ -5636,11 +5637,27 @@ impl KhiveRuntime {
             // same shared `EDGE_SYMMETRIC_*_SQL` text and must honor the same
             // contract. Return the surviving id unchanged so the caller
             // re-fetches its real (unmodified) attributes.
-            conn.execute(
-                khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
-                rusqlite::params![&ns, &edge_id_str],
-            )
-            .map_err(SqliteError::Rusqlite)?;
+            //
+            // Guarded on the fetched snapshot's revision and deletion marker:
+            // a concurrent writer that changed this edge between fetch and
+            // this write must be refused, not silently deleted just because
+            // a canonical survivor happens to exist. Zero affected rows here
+            // means stale, not "no conflict" — the probe above already
+            // confirmed a conflicting canonical row exists.
+            let affected = conn
+                .execute(
+                    khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL,
+                    rusqlite::params![
+                        &ns,
+                        &edge_id_str,
+                        expected_updated_at_micros,
+                        expected_deleted_at_micros,
+                    ],
+                )
+                .map_err(SqliteError::Rusqlite)?;
+            if affected == 0 {
+                return Ok(SymmetricEdgeUpdateOutcome::Stale);
+            }
             Ok(SymmetricEdgeUpdateOutcome::Absorbed(existing_id))
         } else {
             // Case (a): no conflict — update source_id/target_id in-place,
@@ -7276,6 +7293,118 @@ mod tests {
             }
             other => panic!("expected a typed conflict error, got {other:?}"),
         }
+    }
+
+    /// The symmetric absorption delete (case (b): a canonical survivor `S`
+    /// already exists at the target natural key) must refuse a stale writer
+    /// the same way the in-place update arm (case (a)) already does. `E`'s
+    /// own revision advances after a would-be stale writer's snapshot read;
+    /// that snapshot is then fed straight into the exact DML `update_edge`
+    /// runs, reproducing the race deterministically (no scheduler-dependent
+    /// concurrency needed: the outcome depends only on which snapshot the
+    /// delete is guarded against, not on wall-clock interleaving).
+    #[tokio::test]
+    async fn update_edge_symmetric_absorption_refuses_stale_snapshot_when_survivor_exists() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Survivor S already owns the canonical natural key before the
+        // stale writer's snapshot is even read.
+        let survivor = rt
+            .link(&tok, a.id, b.id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .unwrap();
+        let survivor_id: Uuid = survivor.id.into();
+
+        // E: the edge a stale writer will try to move onto that same
+        // natural key.
+        let e = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .unwrap();
+        let e_id: Uuid = e.id.into();
+        let stale_updated_at_micros = e.updated_at.timestamp_micros();
+        let stale_deleted_at_micros = e.deleted_at.map(|t| t.timestamp_micros());
+
+        // A concurrent writer advances E's own revision after that snapshot
+        // was captured.
+        let advanced = rt
+            .update_edge(
+                &tok,
+                e_id,
+                crate::curation::EdgePatch {
+                    weight: Some(0.77),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("concurrent writer update");
+        assert_ne!(
+            advanced.updated_at.timestamp_micros(),
+            stale_updated_at_micros,
+            "test setup: the concurrent write must actually advance the revision"
+        );
+
+        // Reproduce the exact DML `update_edge` runs for the stale writer,
+        // using the snapshot it captured BEFORE the concurrent write above.
+        let pool = rt.backend().pool_arc();
+        let guard = pool.writer().expect("writer guard");
+        let (canon_src, canon_tgt) =
+            canonical_edge_endpoints(EdgeRelation::CompetesWith, a.id, b.id);
+        let outcome = guard
+            .transaction(|conn| {
+                KhiveRuntime::update_edge_symmetric_dml(
+                    conn,
+                    "local",
+                    &e_id.to_string(),
+                    &canon_src.to_string(),
+                    &canon_tgt.to_string(),
+                    "competes_with",
+                    0.9,
+                    None,
+                    stale_updated_at_micros,
+                    stale_deleted_at_micros,
+                )
+            })
+            .expect("dml call must not error");
+        drop(guard);
+        assert!(
+            matches!(outcome, SymmetricEdgeUpdateOutcome::Stale),
+            "a stale writer must be refused, not silently absorbed into the survivor: {outcome:?}"
+        );
+
+        let e_after = rt
+            .get_edge(&tok, e_id)
+            .await
+            .unwrap()
+            .expect("E must still exist after the refused absorption");
+        assert_eq!(
+            e_after.relation,
+            EdgeRelation::Extends,
+            "E must be untouched by the refused absorption: {e_after:?}"
+        );
+        assert!(
+            (e_after.weight - 0.77).abs() < 1e-9,
+            "the concurrent writer's weight must survive the refused absorption: {e_after:?}"
+        );
+
+        let s_after = rt
+            .get_edge(&tok, survivor_id)
+            .await
+            .unwrap()
+            .expect("S must still exist after the refused absorption");
+        assert_eq!(
+            s_after.weight, 0.6,
+            "the survivor must be untouched by the refused absorption: {s_after:?}"
+        );
     }
 
     /// `updated_at` on this path must use `timestamp_micros()`, matching every other
