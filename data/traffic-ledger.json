@@ -161,13 +161,97 @@
       "unique_clones": 22,
       "views": 80,
       "unique_views": 16
+    },
+    "2026-08-13": {
+      "clones": 28,
+      "unique_clones": 6,
+      "views": 26,
+      "unique_views": 8
+    },
+    "2026-08-14": {
+      "clones": 570,
+      "unique_clones": 46,
+      "views": 154,
+      "unique_views": 11
+    },
+    "2026-08-15": {
+      "clones": 1072,
+      "unique_clones": 62,
+      "views": 105,
+      "unique_views": 9
+    },
+    "2026-08-16": {
+      "clones": 958,
+      "unique_clones": 56,
+      "views": 105,
+      "unique_views": 6
+    },
+    "2026-08-17": {
+      "clones": 838,
+      "unique_clones": 53,
+      "views": 107,
+      "unique_views": 6
+    },
+    "2026-08-18": {
+      "clones": 601,
+      "unique_clones": 36,
+      "views": 8,
+      "unique_views": 3
+    },
+    "2026-08-19": {
+      "clones": 886,
+      "unique_clones": 45,
+      "views": 24,
+      "unique_views": 6
+    },
+    "2026-08-20": {
+      "clones": 609,
+      "unique_clones": 25,
+      "views": 9,
+      "unique_views": 7
+    },
+    "2026-08-21": {
+      "clones": 810,
+      "unique_clones": 18,
+      "views": 59,
+      "unique_views": 20
+    },
+    "2026-08-22": {
+      "clones": 3543,
+      "unique_clones": 123,
+      "views": 2,
+      "unique_views": 2
+    },
+    "2026-08-23": {
+      "clones": 1839,
+      "unique_clones": 54,
+      "views": 25,
+      "unique_views": 5
+    },
+    "2026-08-24": {
+      "clones": 6038,
+      "unique_clones": 66,
+      "views": 101,
+      "unique_views": 5
+    },
+    "2026-08-25": {
+      "clones": 5997,
+      "unique_clones": 64,
+      "views": 38,
+      "unique_views": 11
+    },
+    "2026-08-26": {
+      "clones": 7246,
+      "unique_clones": 143,
+      "views": 74,
+      "unique_views": 16
     }
   },
   "last_snapshot": {
-    "taken_at": "2026-08-14T05:52:23Z",
-    "clones_14d": 34508,
-    "unique_clones_14d": 1386,
-    "views_14d": 3141,
-    "unique_views_14d": 262
+    "taken_at": "2026-08-27T08:04:28Z",
+    "clones_14d": 31035,
+    "unique_clones_14d": 620,
+    "views_14d": 837,
+    "unique_views_14d": 78
   }
 }
