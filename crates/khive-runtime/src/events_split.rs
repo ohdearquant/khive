@@ -1765,31 +1765,12 @@ impl SplitEventStore {
     pub fn new(legacy: Arc<dyn EventStore>, lane: Arc<dyn EventStore>) -> Self {
         Self { legacy, lane }
     }
-}
 
-#[async_trait]
-impl EventStore for SplitEventStore {
-    async fn append_event(&self, event: Event) -> StorageResult<()> {
-        self.legacy.append_event(event).await
-    }
-
-    async fn append_events(&self, events: Vec<Event>) -> StorageResult<BatchWriteSummary> {
-        self.legacy.append_events(events).await
-    }
-
-    async fn get_event(&self, id: Uuid) -> StorageResult<Option<Event>> {
-        // Domain events (legacy) are the likelier and cheaper hit; fall back
-        // to the lane for audit-batch rows.
-        if let Some(event) = self.legacy.get_event(id).await? {
-            return Ok(Some(event));
-        }
-        self.lane.get_event(id).await
-    }
-
-    async fn query_events(
+    async fn query_events_page(
         &self,
         filter: EventFilter,
         page: PageRequest,
+        include_total: bool,
     ) -> StorageResult<Page<Event>> {
         // Offset pagination cannot be split across two stores: fetch each
         // store's prefix covering the requested window, merge in the stores'
@@ -1821,14 +1802,27 @@ impl EventStore for SplitEventStore {
             offset: 0,
             limit: window.min(u64::from(u32::MAX)) as u32,
         };
-        let legacy = self
-            .legacy
-            .query_events(filter.clone(), prefix.clone())
-            .await?;
-        let lane = self.lane.query_events(filter, prefix).await?;
-        let total = match (legacy.total, lane.total) {
-            (Some(a), Some(b)) => Some(a + b),
-            _ => None,
+        let legacy = if include_total {
+            self.legacy
+                .query_events(filter.clone(), prefix.clone())
+                .await?
+        } else {
+            self.legacy
+                .query_events_without_total(filter.clone(), prefix.clone())
+                .await?
+        };
+        let lane = if include_total {
+            self.lane.query_events(filter, prefix).await?
+        } else {
+            self.lane.query_events_without_total(filter, prefix).await?
+        };
+        let total = if include_total {
+            match (legacy.total, lane.total) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            }
+        } else {
+            None
         };
         let mut items = legacy.items;
         items.extend(lane.items);
@@ -1843,6 +1837,42 @@ impl EventStore for SplitEventStore {
             .take(page.limit as usize)
             .collect();
         Ok(Page { items, total })
+    }
+}
+
+#[async_trait]
+impl EventStore for SplitEventStore {
+    async fn append_event(&self, event: Event) -> StorageResult<()> {
+        self.legacy.append_event(event).await
+    }
+
+    async fn append_events(&self, events: Vec<Event>) -> StorageResult<BatchWriteSummary> {
+        self.legacy.append_events(events).await
+    }
+
+    async fn get_event(&self, id: Uuid) -> StorageResult<Option<Event>> {
+        // Domain events (legacy) are the likelier and cheaper hit; fall back
+        // to the lane for audit-batch rows.
+        if let Some(event) = self.legacy.get_event(id).await? {
+            return Ok(Some(event));
+        }
+        self.lane.get_event(id).await
+    }
+
+    async fn query_events(
+        &self,
+        filter: EventFilter,
+        page: PageRequest,
+    ) -> StorageResult<Page<Event>> {
+        self.query_events_page(filter, page, true).await
+    }
+
+    async fn query_events_without_total(
+        &self,
+        filter: EventFilter,
+        page: PageRequest,
+    ) -> StorageResult<Page<Event>> {
+        self.query_events_page(filter, page, false).await
     }
 
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
@@ -1960,6 +1990,7 @@ impl EventStore for SplitEventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     // The full daemon/forwarding test suite for this module lands with the
     // final slice of this series; these tests cover the naming and
@@ -2348,6 +2379,66 @@ mod tests {
         (legacy, lane)
     }
 
+    struct QueryPathSpy {
+        inner: Arc<dyn EventStore>,
+        query_calls: Arc<std::sync::atomic::AtomicUsize>,
+        no_total_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl EventStore for QueryPathSpy {
+        async fn append_event(&self, event: Event) -> StorageResult<()> {
+            self.inner.append_event(event).await
+        }
+
+        async fn append_events(&self, events: Vec<Event>) -> StorageResult<BatchWriteSummary> {
+            self.inner.append_events(events).await
+        }
+
+        async fn get_event(&self, id: Uuid) -> StorageResult<Option<Event>> {
+            self.inner.get_event(id).await
+        }
+
+        async fn query_events(
+            &self,
+            filter: EventFilter,
+            page: PageRequest,
+        ) -> StorageResult<Page<Event>> {
+            self.query_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.query_events(filter, page).await
+        }
+
+        async fn query_events_without_total(
+            &self,
+            filter: EventFilter,
+            page: PageRequest,
+        ) -> StorageResult<Page<Event>> {
+            self.no_total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.query_events_without_total(filter, page).await
+        }
+
+        async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
+            self.inner.count_events(filter).await
+        }
+
+        fn preflight_event(&self, event: &Event) -> StorageResult<()> {
+            self.inner.preflight_event(event)
+        }
+
+        async fn append_events_idempotent(
+            &self,
+            events: Vec<Event>,
+        ) -> StorageResult<IdempotentEventBatchResult> {
+            self.inner.append_events_idempotent(events).await
+        }
+
+        fn supports_idempotent_audit_batch(&self) -> bool {
+            self.inner.supports_idempotent_audit_batch()
+        }
+    }
+
     /// A retried audit batch whose first attempt landed on the legacy store
     /// before the cutover must be answered by the legacy store's comparison,
     /// never re-inserted into the lane — otherwise merged reads and counts
@@ -2443,6 +2534,100 @@ mod tests {
             .await
             .expect("a window at the bound is admitted");
         assert!(at_bound.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merged_query_without_total_matches_interleaved_query_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let (legacy, lane) = store_pair(dir.path());
+
+        let mut legacy_older = split_retry_event("legacy-older");
+        legacy_older.created_at = 100;
+        let mut lane_newer = split_retry_event("lane-newer");
+        lane_newer.created_at = 400;
+        let mut legacy_newer = split_retry_event("legacy-newer");
+        legacy_newer.created_at = 300;
+        let mut lane_older = split_retry_event("lane-older");
+        lane_older.created_at = 200;
+
+        legacy.append_event(legacy_older).await.unwrap();
+        lane.append_event(lane_newer).await.unwrap();
+        legacy.append_event(legacy_newer).await.unwrap();
+        lane.append_event(lane_older).await.unwrap();
+
+        let split = SplitEventStore::new(legacy, lane);
+        let filter = EventFilter::default();
+        let page = PageRequest {
+            offset: 0,
+            limit: 10,
+        };
+        let with_total = split
+            .query_events(filter.clone(), page.clone())
+            .await
+            .unwrap();
+        let without_total = split
+            .query_events_without_total(filter, page)
+            .await
+            .unwrap();
+
+        assert_eq!(without_total.total, None);
+        assert_eq!(without_total.items, with_total.items);
+        assert_eq!(
+            without_total
+                .items
+                .iter()
+                .map(|event| event.created_at)
+                .collect::<Vec<_>>(),
+            vec![400, 300, 200, 100]
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_query_without_total_uses_no_total_path_for_both_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let (legacy_inner, lane_inner) = store_pair(dir.path());
+        legacy_inner
+            .append_event(split_retry_event("legacy"))
+            .await
+            .unwrap();
+        lane_inner
+            .append_event(split_retry_event("lane"))
+            .await
+            .unwrap();
+
+        let legacy_query_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let legacy_no_total_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lane_query_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lane_no_total_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let legacy: Arc<dyn EventStore> = Arc::new(QueryPathSpy {
+            inner: legacy_inner,
+            query_calls: Arc::clone(&legacy_query_calls),
+            no_total_calls: Arc::clone(&legacy_no_total_calls),
+        });
+        let lane: Arc<dyn EventStore> = Arc::new(QueryPathSpy {
+            inner: lane_inner,
+            query_calls: Arc::clone(&lane_query_calls),
+            no_total_calls: Arc::clone(&lane_no_total_calls),
+        });
+        let split = SplitEventStore::new(legacy, lane);
+
+        let page = split
+            .query_events_without_total(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.total, None);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(legacy_query_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(lane_query_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(legacy_no_total_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(lane_no_total_calls.load(Ordering::Relaxed), 1);
     }
 
     #[cfg(unix)]

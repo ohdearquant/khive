@@ -165,6 +165,66 @@ impl SqlEventStore {
             .await
         }
     }
+
+    async fn query_events_page(
+        &self,
+        filter: EventFilter,
+        page: PageRequest,
+        include_total: bool,
+    ) -> Result<Page<Event>, StorageError> {
+        let namespace = self.namespace.clone();
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Events,
+            operation: "query_events".into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
+
+        self.with_reader("query_events", move |conn| {
+            let (where_clause, mut data_filter_params) =
+                build_event_filter_sql(conn, &namespace, &filter)?;
+
+            let total = if include_total {
+                let count_sql = format!("SELECT COUNT(*) FROM events{}", where_clause);
+                let mut stmt = conn.prepare(&count_sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    data_filter_params.iter().map(|p| p.as_ref()).collect();
+                Some(stmt.query_row(param_refs.as_slice(), |row| row.get::<_, i64>(0))? as u64)
+            } else {
+                None
+            };
+
+            data_filter_params.push(Box::new(limit_i64));
+            data_filter_params.push(Box::new(offset_i64));
+
+            let limit_idx = data_filter_params.len() - 1;
+            let offset_idx = data_filter_params.len();
+
+            let data_sql = format!(
+                "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
+                        payload_schema_version, profile_state_version, duration_us, target_id, \
+                        session_id, aggregate_kind, aggregate_id, created_at \
+                 FROM events{} ORDER BY created_at DESC, id DESC LIMIT ?{} OFFSET ?{}",
+                where_clause, limit_idx, offset_idx,
+            );
+
+            let mut stmt = conn.prepare(&data_sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                data_filter_params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), read_event)?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+
+            Ok(Page { items, total })
+        })
+        .await
+    }
 }
 
 // =============================================================================
@@ -1264,60 +1324,15 @@ impl EventStore for SqlEventStore {
         filter: EventFilter,
         page: PageRequest,
     ) -> Result<Page<Event>, StorageError> {
-        let namespace = self.namespace.clone();
-        let limit_i64 = i64::from(page.limit);
-        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
-            capability: StorageCapability::Events,
-            operation: "query_events".into(),
-            message: format!(
-                "PageRequest: offset must be <= i64::MAX, got {}",
-                page.offset
-            ),
-        })?;
+        self.query_events_page(filter, page, true).await
+    }
 
-        self.with_reader("query_events", move |conn| {
-            let (where_clause, filter_params) = build_event_filter_sql(conn, &namespace, &filter)?;
-
-            let count_sql = format!("SELECT COUNT(*) FROM events{}", where_clause);
-            let total: i64 = {
-                let mut stmt = conn.prepare(&count_sql)?;
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    filter_params.iter().map(|p| p.as_ref()).collect();
-                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
-            };
-
-            let (_, data_filter_params) = build_event_filter_sql(conn, &namespace, &filter)?;
-            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = data_filter_params;
-            all_params.push(Box::new(limit_i64));
-            all_params.push(Box::new(offset_i64));
-
-            let limit_idx = all_params.len() - 1;
-            let offset_idx = all_params.len();
-
-            let data_sql = format!(
-                "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
-                        payload_schema_version, profile_state_version, duration_us, target_id, \
-                        session_id, aggregate_kind, aggregate_id, created_at \
-                 FROM events{} ORDER BY created_at DESC, id DESC LIMIT ?{} OFFSET ?{}",
-                where_clause, limit_idx, offset_idx,
-            );
-
-            let mut stmt = conn.prepare(&data_sql)?;
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                all_params.iter().map(|p| p.as_ref()).collect();
-            let rows = stmt.query_map(param_refs.as_slice(), read_event)?;
-
-            let mut items = Vec::new();
-            for row in rows {
-                items.push(row?);
-            }
-
-            Ok(Page {
-                items,
-                total: Some(total as u64),
-            })
-        })
-        .await
+    async fn query_events_without_total(
+        &self,
+        filter: EventFilter,
+        page: PageRequest,
+    ) -> Result<Page<Event>, StorageError> {
+        self.query_events_page(filter, page, false).await
     }
 
     async fn count_events(&self, filter: EventFilter) -> Result<u64, StorageError> {

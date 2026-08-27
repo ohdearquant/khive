@@ -71,6 +71,37 @@ async fn test_count_events() {
 }
 
 #[tokio::test]
+async fn query_events_without_total_matches_query_events_items_and_order() {
+    let store = setup_memory_store();
+
+    let mut older = make_event("default");
+    older.created_at = 100;
+    store.append_event(older).await.unwrap();
+
+    let mut newer = make_event("default");
+    newer.created_at = 200;
+    store.append_event(newer).await.unwrap();
+
+    let filter = EventFilter::default();
+    let page = PageRequest {
+        offset: 0,
+        limit: 10,
+    };
+    let with_total = store
+        .query_events(filter.clone(), page.clone())
+        .await
+        .unwrap();
+    let without_total = store
+        .query_events_without_total(filter, page)
+        .await
+        .unwrap();
+
+    assert_eq!(without_total.total, None);
+    assert_eq!(without_total.items, with_total.items);
+    assert_eq!(with_total.total, Some(2));
+}
+
+#[tokio::test]
 async fn test_query_events_filter_by_verb() {
     let store = setup_memory_store();
 

@@ -224,6 +224,19 @@ pub trait EventStore: Send + Sync + 'static {
         filter: EventFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Event>>;
+    /// Query events without requiring [`Page::total`].
+    ///
+    /// The default is correct, rather than merely tolerated: it returns a
+    /// total the caller said it did not need, which costs a count but is never
+    /// wrong. Backends can override this method when they can avoid that
+    /// count while returning the same page of events.
+    async fn query_events_without_total(
+        &self,
+        filter: EventFilter,
+        page: PageRequest,
+    ) -> StorageResult<Page<Event>> {
+        self.query_events(filter, page).await
+    }
     /// Count events matching a filter.
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64>;
 
@@ -278,5 +291,60 @@ pub trait EventStore: Send + Sync + 'static {
     /// build time instead of appearing healthy.
     fn supports_idempotent_audit_batch(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DefaultEventStore;
+
+    fn unsupported(operation: &'static str) -> StorageError {
+        StorageError::Unsupported {
+            capability: StorageCapability::Events,
+            operation: operation.into(),
+            message: "test store does not implement this operation".into(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventStore for DefaultEventStore {
+        async fn append_event(&self, _event: Event) -> StorageResult<()> {
+            Err(unsupported("append_event"))
+        }
+
+        async fn append_events(&self, _events: Vec<Event>) -> StorageResult<BatchWriteSummary> {
+            Err(unsupported("append_events"))
+        }
+
+        async fn get_event(&self, _id: Uuid) -> StorageResult<Option<Event>> {
+            Err(unsupported("get_event"))
+        }
+
+        async fn query_events(
+            &self,
+            _filter: EventFilter,
+            _page: PageRequest,
+        ) -> StorageResult<Page<Event>> {
+            Ok(Page {
+                items: Vec::new(),
+                total: Some(7),
+            })
+        }
+
+        async fn count_events(&self, _filter: EventFilter) -> StorageResult<u64> {
+            Err(unsupported("count_events"))
+        }
+    }
+
+    #[tokio::test]
+    async fn default_query_events_without_total_delegates_to_query_events() {
+        let page = DefaultEventStore
+            .query_events_without_total(EventFilter::default(), PageRequest::default())
+            .await
+            .expect("default method should delegate to query_events");
+
+        assert_eq!(page.total, Some(7));
     }
 }
