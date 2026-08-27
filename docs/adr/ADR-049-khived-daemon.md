@@ -331,6 +331,15 @@ write or reports a retryable read timeout for it.
 
 ## Amendment 6 (2026-08-26): incumbent classification at boot
 
+**This amendment specifies a contract that current code does not satisfy.** It
+is normative, not descriptive: every rule below states what boot must do, and
+none of it should be read as an account of what boot does today. The present
+implementation reduces the probe to a boolean that is true only for an exact
+acknowledgement, and treats everything else — including replies from
+demonstrably live daemons — as grounds for removing the rendezvous. Bringing the
+code to this contract is a prerequisite for the guarantees stated here, not a
+consequence of recording them.
+
 Boot answers one question — "may I clean up the rendezvous and bind?" — and the
 convergence invariant above requires that the answer be governed by whether a
 daemon is **live**, never by whether it is one this process would choose to talk
@@ -373,22 +382,46 @@ to restart only on unsuccessful exit treats exit 0 as a deliberate stop.
 help — exit 0. **State-class** refusals — transient or unclassified, where a
 retry may succeed — exit nonzero.
 
-| #  | State                                         | Observable                                                | Disposition                                                                                   | Exit    |
-| -- | --------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------- | ------- |
-| 1  | Exact acknowledgement                         | connect ok, probe ack, identity matches                   | Refuse to start; report the incumbent pid                                                     | 0       |
-| 2  | Protocol-version mismatch                     | connect ok, `version_mismatch`                            | Refuse; name both versions and the remedy. Never unlink                                       | 0       |
-| 3  | Config mismatch                               | connect ok, `config_mismatch`, `served_config_id` present | Refuse by default; name the first differing field without values. Opt-in replacement only     | 0       |
-| 4  | Metrics-only reply                            | connect ok, reply carries metrics                         | Refuse to start                                                                               | 0       |
-| 5  | Silent connect                                | connect ok, no parseable response within the deadline     | Refuse; distinct error "connected but did not answer"                                         | nonzero |
-| 6  | Malformed reply                               | connect ok, bytes returned, frame does not parse          | Refuse to start                                                                               | nonzero |
-| 7  | Connection refused, pid live                  | `ECONNREFUSED`, pid running                               | Refuse; name the pid                                                                          | nonzero |
-| 8  | Connection refused, pid dead                  | `ECONNREFUSED`, pid not running                           | Clean up and bind                                                                             | —       |
-| 9  | No socket, pid dead                           | socket absent, pid not running or pid file absent         | Clean up and bind                                                                             | —       |
-| 10 | No socket, pid live                           | socket absent, pid running                                | Refuse; name the pid, unless the pid is this process and same-process incumbency is permitted | 0       |
-| 11 | Other connect error (`EACCES`, `ENOTSOCK`, …) | connect fails, not refused                                | Refuse; name the errno                                                                        | nonzero |
+| #  | State                                         | Observable                                                                                                                                                               | Disposition                                                                                   | Exit    |
+| -- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------- | ------- |
+| 1  | Exact acknowledgement                         | connect ok, probe ack, identity matches                                                                                                                                  | Refuse to start; report the incumbent pid                                                     | 0       |
+| 2  | Protocol-version mismatch                     | connect ok, `version_mismatch`                                                                                                                                           | Refuse; name both versions and the remedy. Never unlink                                       | 0       |
+| 3  | Config mismatch                               | connect ok, `config_mismatch`, `served_config_id` present                                                                                                                | Refuse by default; name the first differing field without values. Opt-in replacement only     | 0       |
+| 4  | Metrics-only reply                            | connect ok, reply carries metrics                                                                                                                                        | Refuse to start                                                                               | 0       |
+| 5  | Parseable non-acknowledgement                 | connect ok, frame deserializes, shape is not the probe ack (any of `result`/`error`/`request_id` present, or no mismatch flag set but the reply is otherwise not an ack) | Refuse to start; name the observed shape                                                      | 0       |
+| 6  | Identity unresolved                           | connect ok, otherwise ack-shaped, `served_config_id` absent or unequal with no mismatch flag set                                                                         | Refuse to start; name the pid and that identity could not be established                      | 0       |
+| 7  | Silent connect                                | connect ok, no parseable response within the deadline                                                                                                                    | Refuse; distinct error "connected but did not answer"                                         | nonzero |
+| 8  | Malformed reply                               | connect ok, bytes returned, frame does not parse                                                                                                                         | Refuse to start                                                                               | nonzero |
+| 9  | Connection refused, pid live                  | `ECONNREFUSED`, pid running                                                                                                                                              | Refuse; name the pid                                                                          | nonzero |
+| 10 | Connection refused, pid dead                  | `ECONNREFUSED`, pid not running                                                                                                                                          | Clean up and bind                                                                             | —       |
+| 11 | No socket, pid dead                           | socket absent, pid not running or pid file absent                                                                                                                        | Clean up and bind                                                                             | —       |
+| 12 | No socket, pid live                           | socket absent, pid running                                                                                                                                               | Refuse; name the pid, unless the pid is this process and same-process incumbency is permitted | 0       |
+| 13 | Other connect error (`EACCES`, `ENOTSOCK`, …) | connect fails, not refused                                                                                                                                               | Refuse; name the errno                                                                        | nonzero |
 
-Only states 8 and 9 are genuinely stale. Collapsing any of 2, 3, 5, 6, 7, 10 or
-11 into "clean up and bind" is the defect this amendment forbids.
+Only states 10 and 11 are genuinely stale. Collapsing any other state into
+"clean up and bind" is the defect this amendment forbids.
+
+**Precedence.** A single reply can satisfy more than one row. Classification is
+by first match in table order, so a reply carrying both a mismatch flag and an
+unexpected shape is classified by the mismatch, which is the more specific and
+more actionable diagnosis. Any reply that reaches the end of the response rows
+without matching is state 5; state 5 is the catch-all for "a live peer answered
+and it was not an acknowledgement", and it must never fall through to cleanup.
+
+**States 5 and 6 are the ones an enumeration drawn from a single build will
+miss**, so they are stated explicitly. A daemon built before the probe frame
+existed deserializes the frame, ignores the unknown probe field, dispatches the
+empty operation string, and returns an ordinary success or error response. That
+response is well-formed, comes from a demonstrably live process, and is not an
+acknowledgement. Nothing about it is malformed, silent, or mismatched, so
+without state 5 a conforming implementation has no disposition for it and may
+classify it as stale. During any rollout in which two daemon builds exist on one
+machine, this is not a corner case; it is the expected observation.
+
+State 6 covers the same hazard on the identity axis: a reply that is otherwise
+ack-shaped but whose `served_config_id` is absent or does not match, while no
+mismatch flag is set. Identity that cannot be established is not identity that
+was refuted, and neither is death.
 
 Every state above is reachable from the boot probe except **state 4**. The boot
 probe's request frame does not set the metrics flag, and the daemon's
@@ -405,19 +438,39 @@ easy to invert:
   respawning it is safe, licenses replacement being _safe_. It does not make
   replacement something boot performs unprompted. Disposable does not mean
   auto-replaced at boot.
-- **State 10 is a clean exit.** The convergence requirement already anticipates
-  multiple launch attempts and lets the daemon-side fence choose the sole owner,
-  so losing that fence is legitimate rather than an error. Blocking and
-  re-probing belong to the client-side recoverer, never to daemon boot.
+- **State 12 is a clean exit, and it is the one exception to the class rule.**
+  The convergence requirement already anticipates multiple launch attempts and
+  lets the daemon-side fence choose the sole owner, so losing that fence is
+  legitimate rather than an error. Blocking and re-probing belong to the
+  client-side recoverer, never to daemon boot.
+
+  This deserves stating plainly because state 12 is transient — a peer between
+  fork and bind — and the class rule above would otherwise put a transient
+  condition in the state class and exit nonzero. The distinguishing invariant is
+  **who is expected to resolve it**, not how long it lasts: in every state-class
+  case the resolver is a later retry of _this_ process, so a supervisor restart
+  is the remedy. In state 12 the resolver is the _other_ process, which is
+  already booting and will own the rendezvous; restarting this one cannot help
+  and a restart loop is the likely result. Exit 0 encodes "someone else has
+  this", not "nothing is wrong".
 
 ### Replacing a live incumbent
 
-Removal of a live incumbent is operator-elected and available only through an
-explicit `--replace-incumbent` opt-in. Every step is required:
+This section specifies a capability that **does not exist yet**. No replacement
+flag is present on any current command surface, and nothing here describes
+maintained behaviour. It is written as a contract so that the capability, when
+built, is built with the safety sequence rather than acquiring it afterwards.
+Implementing it requires naming the owning subcommand and its parsing, which
+this amendment deliberately leaves to the implementing change.
+
+Removal of a live incumbent is operator-elected and gated behind an explicit
+`--replace-incumbent` opt-in. Every step is required:
 
 1. Classify. Proceed only from states 1 through 4, where a daemon identity was
-   positively read. Never from 5, 6, 7, 10 or 11 — those have not established
-   what would be killed.
+   positively read. Never from states 5 through 9, 12, or 13 — those have either
+   not established what would be killed, or not established that anything is
+   there at all. State 6 in particular is excluded precisely because an identity
+   that could not be resolved is not an identity that was refuted.
 2. Signal `SIGTERM` to the recorded pid.
 3. Wait, bounded, for process death. Death is **observed**, never assumed.
 4. On timeout, refuse: leave the socket intact and name the pid. Never escalate
@@ -438,6 +491,31 @@ process, which is precisely the failure being prevented. Each refuse state also
 asserts its exit code, since an otherwise-correct refusal carrying the wrong
 code either drives a supervisor restart loop or silently retires a retryable
 state.
+
+"One test per state" is not by itself enough to tell a conforming test from one
+that checks an error value, so each state's test declares four things
+explicitly. Without all four, a test can be green while proving nothing:
+
+| Element                      | What it fixes                                                                                                                                                                            |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Peer setup**               | Exactly what the fixture puts behind the socket: a real daemon, a synthetic listener with a scripted reply, or nothing. Names which, and for a scripted reply, the exact response frame. |
+| **Probe input**              | The frame boot sends, so a test cannot accidentally exercise a different state than the one it names.                                                                                    |
+| **Rendezvous postcondition** | Whether the socket file and pid file still exist afterwards, asserted by stat, not inferred from the absence of an error.                                                                |
+| **Listener count**           | How many processes hold the socket after boot returns. This is the assertion that actually detects the double-bind, and no other element substitutes for it.                             |
+
+Two states need their mechanism named because the general recipe does not reach
+them. **State 4** cannot be elicited by the real boot probe, so its test is
+explicitly synthetic: a scripted listener that returns a metrics-carrying reply.
+The test asserts the classification, and must be labelled synthetic so a later
+reader does not mistake it for evidence that boot can reach the state. **States
+10 and 11** are the two that bind, so their postcondition is inverted: the test
+asserts the rendezvous was replaced and that exactly one listener — this process
+— holds it afterwards.
+
+Where a state's test runs below process level, the exit code is asserted against
+the value the classification maps to rather than against a real process exit,
+and at least one end-to-end test per exit class asserts a real process exit code
+so the mapping itself is covered.
 
 Two further tests are required because their absence is what allowed the
 collapse:
