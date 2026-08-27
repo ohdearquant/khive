@@ -775,8 +775,12 @@ async fn run_pending_events_on_with_lease(
                         .map(|actor| reminder_delivery_action(actor, &content))
                 };
 
-                // ── Determine repeat (read before claim; only informs which
-                // finalize branch runs below, never mutates the row read) ──
+                // ── Determine repeat (read before claim) ──
+                // This value gates ADMISSION only — which finalize branch is
+                // eligible. It must never reach anything WRITTEN: the value the
+                // finalizer schedules from is re-derived at the write, from the
+                // same fresh read the CAS is guarded on. See the re-derivation
+                // just before `final_properties_after_dispatch`.
                 let repeat = properties
                     .as_ref()
                     .and_then(|p| p.get("repeat"))
@@ -1244,6 +1248,55 @@ async fn run_pending_events_on_with_lease(
                     summary.failed += 1;
                     continue;
                 };
+                // Re-derive the SCHEDULING inputs from the fresh read too, not
+                // just the properties blob. `trigger_at`, `trigger_offset` and
+                // `repeat` above came from the pre-claim page snapshot, and
+                // guarding the write on the fresh properties text protects the
+                // blob while still letting a stale scheduling decision be
+                // computed from it: `final_properties_after_dispatch` uses
+                // these three to write the next `trigger_at` and the terminal
+                // `status`. A writer that changed `repeat` or `trigger_at`
+                // between the page snapshot and the fresh read would have its
+                // value retained as the CAS base and then immediately
+                // contradicted by a next-occurrence computed from the value it
+                // replaced.
+                //
+                // The earlier values keep their job: they gate ADMISSION (is
+                // this due, is it inside the grace window), which is a decision
+                // about whether to dispatch at all and is correctly made from
+                // what was observed before the claim. What must not come from
+                // them is anything WRITTEN.
+                let trigger_at_fresh_str = expected_value
+                    .get("trigger_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let (trigger_at, trigger_offset) = match trigger_at_fresh_str
+                    .parse::<DateTime<FixedOffset>>()
+                {
+                    Ok(fixed) => (fixed.with_timezone(&Utc), *fixed.offset()),
+                    Err(_) => {
+                        // The row's own `trigger_at` stopped being parseable
+                        // between the page read and here. Refuse rather than
+                        // fall back to the stale pair: falling back is
+                        // exactly the silent-overwrite this guard exists to
+                        // prevent, and the dispatch has already happened, so
+                        // the honest outcome is a failed finalization that
+                        // recovery will re-examine.
+                        tracing::error!(
+                            scheduled_event_id = %id,
+                            trigger_at = %trigger_at_fresh_str,
+                            "pending-events: trigger_at not parseable at finalization; refusing \
+                             to finalize from the pre-claim snapshot"
+                        );
+                        summary.failed += 1;
+                        continue;
+                    }
+                };
+                let repeat = expected_value
+                    .get("repeat")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+
                 let (final_props, disposition) = final_properties_after_dispatch(
                     expected_value,
                     receipt,
@@ -6485,6 +6538,86 @@ mod tests {
              must survive finalization, got {stored:?}"
         );
         assert_eq!(stored["status"].as_str(), Some("fired"));
+    }
+
+    /// Guarding the finalizer's write on the freshly-read properties protects
+    /// the properties BLOB while still allowing a stale SCHEDULING decision to
+    /// be computed over it. `repeat` and `trigger_at` are parsed from the
+    /// pre-claim candidate page; if the finalizer keeps using those, a writer
+    /// who cancels the repeat in the claim window has their edit retained as
+    /// the CAS base and then immediately contradicted by a next occurrence
+    /// scheduled from the value they replaced.
+    ///
+    /// This fixture makes the two behaviours produce different terminal states
+    /// rather than different timestamps, so the assertion cannot pass by
+    /// rounding: the event is seeded `repeat: "daily"`, and the concurrent
+    /// write clears `repeat` while the drain is parked at the seam. Scheduling
+    /// from the fresh read yields a terminal `fired`; scheduling from the stale
+    /// page yields a rescheduled `pending` with an advanced `trigger_at`.
+    #[tokio::test]
+    async fn production_drain_schedules_from_the_fresh_read_not_the_page_snapshot() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            Some("daily"),
+            "schedule",
+        )
+        .await;
+
+        let gate = race_seam::PauseGate {
+            reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+            release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+        };
+
+        let drain_task = {
+            let rt = rt.clone();
+            let gate = gate.clone();
+            tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
+                let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                run_pending_events_on(&rt, &server, false).await
+            }))
+        };
+
+        gate.reached.wait().await;
+
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql:
+                    "UPDATE notes SET properties = json_set(properties, '$.repeat', json('null')) \
+                      WHERE id = ?1"
+                        .to_string(),
+                params: vec![SqlValue::Text(id.to_string())],
+                label: Some("test_concurrent_repeat_clear".into()),
+            })
+            .await
+            .expect("concurrent write");
+        assert_eq!(rows, 1);
+        drop(writer);
+
+        gate.release.wait().await;
+        let summary = drain_task
+            .await
+            .expect("drain task")
+            .expect("drain must not error");
+        assert_eq!(summary.fired, 1, "the event must have fired: {summary:?}");
+
+        let stored = get_note_props(&rt, id).await;
+        assert!(
+            stored.get("repeat").is_none() || stored["repeat"].is_null(),
+            "the concurrent clear of `repeat` must survive finalization, got {stored:?}"
+        );
+        assert_eq!(
+            stored["status"].as_str(),
+            Some("fired"),
+            "finalization must schedule from the repeat it read fresh (cleared, so terminal), \
+             not from the pre-claim page snapshot (\"daily\", which would reschedule to \
+             pending): got {stored:?}"
+        );
     }
 
     /// `schedule.cancel` on a row that is currently `status="firing"` — even

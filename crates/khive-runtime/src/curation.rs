@@ -4143,15 +4143,27 @@ mod tests {
     /// an unconditional UPDATE (or `entity_upsert_statement`), B's write would
     /// also return `true` and `b` would be lost from the final properties.
     ///
-    /// It does NOT redden on a single-conjunct removal, and that is measured,
-    /// not assumed: in this fixture `updated_at = ?13` and `?8 > updated_at`
-    /// are each independently sufficient to refuse B, so tautologizing either
-    /// one alone leaves this test green. Attribution to a specific conjunct
-    /// therefore comes from the isolating fixtures —
+    /// It does NOT redden when only `?8 > updated_at` is removed: with
+    /// `updated_at = ?13` intact, B is refused by the revision guard whatever
+    /// the clock did, so this fixture cannot see that conjunct disappear.
+    ///
+    /// It cannot ATTRIBUTE a failure to `updated_at = ?13` either, but for a
+    /// different reason, and the difference matters. Both racers take their
+    /// replacement revision from `prepare_update_entity`'s
+    /// `max(now_micros, expected + 1)` above; this test pins the two EXPECTED
+    /// revisions equal, never the two REPLACEMENT revisions. So with
+    /// `updated_at = ?13` removed, whether B is still refused depends on
+    /// whether B's wall-clock read happened to exceed A's committed revision.
+    /// That is a race, not a property of the fixture, and no single run of it
+    /// establishes either answer.
+    ///
+    /// Attribution therefore comes from fixtures that force the question:
     /// `entity_cas_refuses_a_replacement_revision_that_does_not_advance` for
     /// the strict-advance conjunct, and
-    /// `production_update_entity_refuses_concurrent_stale_writer`, which does
-    /// redden on the `?13`/`?14` half alone.
+    /// `production_update_entity_refuses_concurrent_stale_writer` for the
+    /// production wiring. Making this fixture attribute as well would mean
+    /// pinning both replacement revisions to a common `expected + 1`; it is
+    /// deliberately left as a whole-guard test instead.
     ///
     /// SCOPE: this exercises the STORE PRIMITIVE directly and never invokes
     /// `update_entity`, so it stays green if the production caller is reverted

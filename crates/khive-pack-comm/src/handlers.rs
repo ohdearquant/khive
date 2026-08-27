@@ -2430,10 +2430,20 @@ pub(crate) async fn handle_heartbeat(
     // Guard the read-modify-write: `props` above was carried forward from
     // `existing`, so a concurrent heartbeat that committed after that read
     // (e.g. flipping `consecutive_failures`/`last_error`) must not be
-    // silently discarded by this write. A brand-new channel (`existing ==
-    // None`) has no prior state to lose, so it inserts unguarded — the same
-    // shape `replace_note_if_unchanged` uses for every other guarded note
-    // update (khive-runtime's `update_note_from_snapshot_with_embedding_report`).
+    // silently discarded by this write — the same shape
+    // `replace_note_if_unchanged` uses for every other guarded note update
+    // (khive-runtime's `update_note_from_snapshot_with_embedding_report`).
+    //
+    // ⚠ The `None` branch is NOT guarded, and being a new row does not make it
+    // safe. The hazard here is not losing prior state, it is two concurrent
+    // FIRST writes: the note id is deterministic per channel, so two heartbeats
+    // racing on a channel's first report can both read `None` and both take
+    // this branch. `upsert_note` rewrites every mutable column on an id
+    // conflict and reports no conflict outcome, so the later write silently
+    // replaces the earlier report. Closing it needs an insert-if-absent
+    // primitive that reports whether it inserted; that primitive does not exist
+    // yet, so this branch is knowingly left unguarded and tracked separately
+    // rather than widened into this change.
     match existing {
         Some(snapshot) => {
             let persisted = store
@@ -3483,11 +3493,15 @@ mod tests {
     /// and the final `consecutive_failures`/`last_failure_at` assertions
     /// would observe B's fields instead of A's.
     ///
-    /// SCOPE: this exercises the STORE PRIMITIVE directly and never invokes
-    /// `handle_heartbeat`, so it stays green if the handler is reverted to an
-    /// unconditional `upsert_note`. The wiring is covered separately by
-    /// `production_handle_heartbeat_refuses_concurrent_stale_writer`; both are
-    /// required, neither substitutes for the other.
+    /// SCOPE: the race here is two direct `replace_note_if_unchanged` calls
+    /// against the STORE PRIMITIVE. `handle_heartbeat` IS invoked, once, at the
+    /// top, and only to seed the row — so reverting the handler's guarded
+    /// branch to an unconditional `upsert_note` changes the seed and not the
+    /// race, and this test stays green. That is measured: under exactly that
+    /// wiring mutation the only test that reddens is
+    /// `production_handle_heartbeat_refuses_concurrent_stale_writer`, which is
+    /// what covers the wiring. Both are required, neither substitutes for the
+    /// other.
     #[tokio::test]
     async fn concurrent_heartbeats_from_one_revision_only_one_survives() {
         let runtime = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
