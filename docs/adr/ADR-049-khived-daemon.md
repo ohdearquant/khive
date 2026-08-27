@@ -623,35 +623,56 @@ Removal of a live incumbent is operator-elected and gated behind an explicit
    thing that must never be done on the word of an obsolete signal is to kill
    the process that sent it. Refuse, name both namespaces, leave the rendezvous
    alone.
-2. **Bind the pid to the socket, on evidence the incumbent cannot author.** The
+2. **Bind the pid to the socket, and state what that binding is worth.** The
    classification above proves that _something_ live is serving the socket and
    what protocol and configuration it speaks. It does not prove that the process
    named by the pid file is that something. A pid file can be stale or its pid
    reused while an unrelated process answers on the socket, and signalling on
    that evidence kills a process this boot never contacted.
 
-   **An earlier draft of this amendment required the acknowledgement to carry
-   the serving process's own pid (`served_pid`) and justified that as the
-   portable choice. It was wrong twice over.** It was circular: the threat this
-   step exists to answer is an unrelated process answering on the socket, and
-   the remedy asked exactly that process to name itself — a same-uid squatter
-   supplies the recorded integer and passes. And its portability premise was
-   false in this repository, which already performs the platform-specific
-   peer-credential lookup the draft called unavailable: `peer_uid` reads
+   **The hazard this step guards is accidental pid reuse, and naming it is what
+   makes the evidence legible.** The acknowledgement must carry the serving
+   process's own pid (`served_pid`), and it must equal the recorded pid. That
+   binds socket to process for the accidental case, which is the case that
+   actually occurs: a pid recycled onto an unrelated process is a process that
+   does not speak this protocol, so it never produces an acknowledgement at all
+   — it lands in state 6, 7, or 8, and replacement is unavailable from every one
+   of those. The daemon that does answer reports its own true pid, which fails
+   the equality check against a stale record. Neither path signals.
+
+   **What `served_pid` alone does not establish is resistance to a process that
+   deliberately lies**, and that limit is worth stating precisely rather than
+   leaving a reader to assume the field is an ownership proof. A same-uid
+   process can bind the socket and return whatever integer it likes. That
+   process is already inside this daemon's trust boundary: the accept path
+   admits peers by same-uid check rather than same-principal
+   (`crates/khive-runtime/src/daemon.rs`), and anything able to squat the
+   rendezvous could signal the daemon directly without involving this sequence
+   at all. So `served_pid` is not load-bearing against a deliberate liar, and
+   this section does not claim it is.
+
+   **Where the platform exposes a kernel peer pid, replacement requires it too,
+   and refuses on any disagreement.** `SO_PEERCRED` on Linux and
+   `LOCAL_PEERPID` on macOS both report the peer of a connected unix socket, and
+   the repository already performs the sibling lookup for uid — `peer_uid` reads
    `getpeereid(2)` on macOS/BSD and `SO_PEERCRED` on Linux
    (`crates/khive-runtime/src/daemon.rs`), is used on the accept path, and
    carries a regression test asserting it reports the connecting process's uid.
+   The kernel pid must equal both `served_pid` and the recorded pid. This turns
+   the self-report into a cross-check wherever a cross-check is available, and a
+   disagreement between the two is itself disqualifying: refuse and name all
+   three values.
 
-   The binding evidence is therefore the **kernel's answer for the peer of the
-   probe connection**, never a field the responder fills in: the peer pid from
-   `SO_PEERCRED` on Linux or `LOCAL_PEERPID` on macOS, required to equal the
-   recorded pid. Where the platform exposes no peer pid, **replacement is
-   unavailable on that platform** — refuse and say so. Where the lookup fails,
-   or the peer pid does not equal the recorded pid, replacement is likewise
-   unavailable — refuse and name both values. Do not fall back to signalling the
-   recorded pid, and do not fall back to a responder-supplied value. An
-   ownership check that degrades to "signal it anyway" is not a check, and one
-   the suspect can answer about itself is not evidence.
+   Both platforms this daemon targets expose such a lookup, so in practice the
+   cross-check is required everywhere khived runs. A platform exposing neither
+   would fall back to `served_pid` alone, and an implementer should know that
+   this is the weakest evidence anywhere in this section.
+
+   If the acknowledgement carries no `served_pid`, or it does not equal the
+   recorded pid, or an available kernel peer pid disagrees with either,
+   **replacement is unavailable** — refuse and name the values. Do not fall back
+   to signalling the recorded pid. An ownership check that degrades to "signal
+   it anyway" is not a check.
 3. Signal `SIGTERM` to the pid established in step 2.
 4. Wait, bounded, for process death. Death is **observed**, never assumed.
 5. On timeout, refuse: leave the socket intact and name the pid. Never escalate
@@ -663,13 +684,13 @@ Steps 2 and 4 are the substance. Step 4 because removing a rendezvous file is
 not a way to stop a process; step 2 because every other step is careful about
 _how_ the incumbent is stopped while assuming _which_ process it is.
 
-Neither the peer-pid lookup nor any equivalent exists on the probe path today:
-`peer_uid` establishes only the peer's uid, and `LOCAL_PEERPID` is not spelled
-anywhere in this repository. Adding a peer-pid lookup beside `peer_uid`, and
-carrying its result out to the classification, is part of implementing this
-section; until it exists `--replace-incumbent` cannot be built to this contract.
-`served_pid` is named above only to record what was rejected, and must not be
-added to the response frame.
+Neither half of that evidence exists today. `served_pid` is not a field on the
+response frame, and no peer-pid lookup sits on the probe path: `peer_uid`
+establishes only the peer's uid, and `LOCAL_PEERPID` is not spelled anywhere in
+this repository. Implementing this section means adding both — the field to the
+response frame, and a peer-pid lookup beside `peer_uid` whose result reaches the
+classification — and until both exist `--replace-incumbent` cannot be built to
+this contract.
 
 ### Test obligations
 
@@ -759,6 +780,17 @@ collapse:
   class against it, asserting that startup never leaves two live daemons.
 - A `--replace-incumbent` timeout test in which the incumbent ignores `SIGTERM`,
   asserting refusal with the socket intact.
+- A `--replace-incumbent` test in which the acknowledgement carries a
+  `served_pid` that does not equal the recorded pid, asserting that **no signal
+  is sent** — the assertion is on the absence of the signal, not merely on the
+  refusal, because a sequence that signals and then reports refusal passes an
+  error-value check while doing the exact damage this step exists to prevent.
+  A sibling case with `served_pid` absent entirely, asserting the same.
+- A `--replace-incumbent` test on a platform exposing a kernel peer pid, in
+  which the kernel pid and a truthful `served_pid` agree and replacement
+  proceeds, paired with one in which they disagree and no signal is sent. The
+  disagreeing case is what proves the cross-check is read at all; without it the
+  agreeing case passes whether or not the kernel lookup is wired up.
 
 Each state's guard carries a mutation control: defeat the guard, confirm that
 exactly that state's test fails, and restore from a snapshot rather than by
