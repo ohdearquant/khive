@@ -775,10 +775,26 @@ fn build_note_filter_where(
                 // (`idx_notes_unread_probe_recipient`) carries this exact
                 // expression as a key column, so recipient scoping happens
                 // inside the index instead of row-by-row across every
-                // actor's unread rows. Collapsing empty into missing is
-                // deliberate and matches every consumer's read model: actor
-                // labels are validated non-empty at write time, and gtd
-                // already renders an empty `priority` as the default.
+                // actor's unread rows.
+                //
+                // This widens the op by exactly one shape: a row whose
+                // property is PRESENT and an empty string now matches, where
+                // `expr = ? OR expr IS NULL` did not. No verb can write that
+                // shape -- `to_actor`/`from_actor` are rejected empty at
+                // send (`validate_actor_label`) and at ingest, and
+                // `priority` is closed to p0..p3 (`is_valid_priority`, at
+                // `task_create` and at the filter). So the widening reaches
+                // only legacy and direct-store rows, the same population
+                // `EqOrMissing` exists for.
+                //
+                // For such a gtd row the widened filter AGREES with
+                // `priority_rank`, which already ranks an empty priority as
+                // the p2 default. It does not agree with `render_task`,
+                // which renders the stored empty string verbatim, so a
+                // `priority="p2"` filter can return a legacy row that
+                // renders with an empty priority. That divergence between
+                // the two gtd read paths predates this change and is not
+                // resolved here.
                 conditions.push(format!(
                     "ifnull({expr}, '') IN (?{n}, '')",
                     n = params.len()
