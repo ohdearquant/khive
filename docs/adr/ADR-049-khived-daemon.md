@@ -795,9 +795,9 @@ For every refuse state that must assert: the incumbent is still alive, the
 socket still exists, and no second listener was bound. A test that checks only
 the returned error passes while the socket is unlinked underneath a live
 process, which is precisely the failure being prevented. Each refuse state also
-asserts its exit code, since an otherwise-correct refusal carrying the wrong
-code either drives a restart loop under the restart-on-nonzero policy these
-codes are chosen for, or silently retires a retryable state.
+asserts its exit code, since under the restart-on-nonzero policy these codes are
+chosen for, an otherwise-correct refusal carrying the wrong code either drives a
+restart loop or silently retires a retryable state.
 
 Where a state's test runs below process level, the exit code is asserted against
 the value the classification maps to rather than against a real process exit,
@@ -977,7 +977,9 @@ It does not claim that a state 9 observation means another process owns the
 rendezvous. Exit 0 here means this process must not retry and the resolution
 lies outside it, which is a disposition rather than a finding about who holds
 what. It claims that a boot which cannot tell the difference should stop and say
-so, rather than ask a supervisor to try again at something no retry reaches. The
+so, rather than declare itself retryable at something a retry of this process
+does not resolve. What a supervisor then does with that is the supervisor's
+policy, which is why the code is chosen for a stated one. The
 three facts recorded in Amendment 6 are unchanged and remain the reason no
 trajectory reading is available here.
 
