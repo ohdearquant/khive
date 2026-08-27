@@ -822,8 +822,10 @@ pub async fn prepare_update(
             // Decide step lives in curation.rs's `prepare_update_entity` —
             // the SAME function canonical `update_entity` calls. Only the
             // arg-extraction (raw JSON -> `EntityPatch`) and the plan-shape
-            // wiring (domain object -> `PlanStatement` via the shared
-            // `entity_upsert_statement` builder) are atomic-path-specific.
+            // wiring are atomic-path-specific: the domain object becomes a
+            // `PlanStatement` via `entity_replace_if_unchanged_statement`,
+            // whose CAS predicate binds the snapshot's revision and deletion
+            // marker, under an exactly-one affected-row guard.
             reject_inapplicable_update_fields(args, "entity")?;
             let name = entity_name_patch(args)?;
             let description = optional_string_patch(args, "description")?;
@@ -3503,11 +3505,12 @@ mod tests {
         .await
         .expect("prepare update entity plan");
 
-        // Read the plan's OWN bound revisions, so the isolation below is
+        // Read the plan's OWN bound values, so the isolation below is
         // derived from the plan rather than assumed about it. Per
         // `entity_replace_if_unchanged_statement`, `?8` (index 7) is the
-        // replacement revision and `?13` (index 12) the expected one.
-        let (planned_replacement, plan_expected) = {
+        // replacement revision, `?13` (index 12) the expected one, and `?14`
+        // (index 13) the expected deletion marker.
+        let (planned_replacement, plan_expected, plan_expected_deleted) = {
             let statements = match &plan {
                 AtomicOpPlan::Update(p) => p.statements.clone(),
                 other => panic!("expected an Update plan, got {other:?}"),
@@ -3524,7 +3527,12 @@ mod tests {
                 SqlValue::Integer(v) => *v,
                 other => panic!("param {i} must be an integer revision, got {other:?}"),
             };
-            (read(7), read(12))
+            let read_marker = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Null => None,
+                SqlValue::Integer(v) => Some(*v),
+                other => panic!("param {i} must be a deletion marker, got {other:?}"),
+            };
+            (read(7), read(12), read_marker(13))
         };
 
         // A concurrent writer commits BEFORE the plan runs, advancing the
@@ -3579,6 +3587,29 @@ mod tests {
              stored revision, otherwise `?8 > updated_at` would refuse and this stops being \
              a test of the expected-revision guard"
         );
+        // The remaining non-target conjunct. `deleted_at IS ?14` is live in the
+        // same UPDATE, so without this read the fixture would stay green if the
+        // deletion marker were the actual refuser — the refusal would look
+        // identical. Read the row as it stands at DML time, after both the
+        // concurrent writer and the pin.
+        {
+            let stored = runtime
+                .get_entity_including_deleted(&token, id)
+                .await
+                .expect("read the stored row")
+                .expect("the seeded row is present before the plan runs");
+            assert_eq!(
+                stored.updated_at, stored_pinned,
+                "fixture premise: the pin must be what the guard reads, so the stored \
+                 revision is the pinned value and nothing re-advanced it"
+            );
+            assert_eq!(
+                stored.deleted_at, plan_expected_deleted,
+                "fixture premise: the stored deletion marker must MATCH the plan's `?14`, \
+                 otherwise `deleted_at IS ?14` refuses too and this stops being a test of \
+                 the expected-revision guard alone"
+            );
+        }
 
         let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
             .await
@@ -3643,11 +3674,12 @@ mod tests {
         .await
         .expect("prepare update edge plan");
 
-        // Read the plan's OWN bound revisions, so the isolation below is
+        // Read the plan's OWN bound values, so the isolation below is
         // derived from the plan rather than assumed about it. Per
         // `edge_replace_if_unchanged_statement`, `?6` (index 5) is the
-        // replacement revision and `?11` (index 10) the expected one.
-        let (planned_replacement, plan_expected) = {
+        // replacement revision, `?11` (index 10) the expected one, and `?12`
+        // (index 11) the expected deletion marker.
+        let (planned_replacement, plan_expected, plan_expected_deleted) = {
             let statements = match &plan {
                 AtomicOpPlan::Update(p) => p.statements.clone(),
                 other => panic!("expected an Update plan, got {other:?}"),
@@ -3663,7 +3695,12 @@ mod tests {
                 SqlValue::Integer(v) => *v,
                 other => panic!("param {i} must be an integer revision, got {other:?}"),
             };
-            (read(5), read(10))
+            let read_marker = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Null => None,
+                SqlValue::Integer(v) => Some(*v),
+                other => panic!("param {i} must be a deletion marker, got {other:?}"),
+            };
+            (read(5), read(10), read_marker(11))
         };
 
         // A concurrent writer commits BEFORE the plan runs, advancing the
@@ -3715,6 +3752,29 @@ mod tests {
              stored revision, otherwise `?6 > updated_at` would refuse and this stops being \
              a test of the expected-revision guard"
         );
+        // The remaining non-target conjunct, for the same reason as the entity
+        // sibling: `deleted_at IS ?12` is live in the same UPDATE and would
+        // produce an indistinguishable refusal.
+        {
+            let stored = runtime
+                .get_edge_including_deleted(&token, edge_id)
+                .await
+                .expect("read the stored edge")
+                .expect("the seeded edge is present before the plan runs");
+            assert_eq!(
+                stored.updated_at.timestamp_micros(),
+                stored_pinned,
+                "fixture premise: the pin must be what the guard reads, so the stored \
+                 revision is the pinned value and nothing re-advanced it"
+            );
+            assert_eq!(
+                stored.deleted_at.map(|d| d.timestamp_micros()),
+                plan_expected_deleted,
+                "fixture premise: the stored deletion marker must MATCH the plan's `?12`, \
+                 otherwise `deleted_at IS ?12` refuses too and this stops being a test of \
+                 the expected-revision guard alone"
+            );
+        }
 
         let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
             .await
@@ -3980,6 +4040,102 @@ mod tests {
             .await
             .expect("concurrent writer update");
         assert!((concurrent.weight - 0.77).abs() < 1e-9);
+
+        // The guarded delete refuses on THREE independent premises — the
+        // expected revision (`?6`), the expected deletion marker (`?7`), and
+        // the EXISTS survivor at the natural key (`?3`/`?4`/`?5`). All three
+        // produce the same observable, a zero-row delete that rolls the unit
+        // back, so without asserting the other two this fixture cannot say the
+        // revision guard is what refused. Read the plan's own bound values and
+        // check the world against them, immediately before the DML.
+        {
+            let statements = match &plan {
+                AtomicOpPlan::Update(p) => p.statements.clone(),
+                other => panic!("expected an Update plan, got {other:?}"),
+            };
+            // By LABEL, for the same reason as the siblings above.
+            let del = statements
+                .iter()
+                .find(|s| s.statement.label.as_deref() == Some("edge-symmetric-delete-if-conflict"))
+                .expect("the plan must carry the guarded symmetric delete");
+            let text = |i: usize| match &del.statement.params[i] {
+                SqlValue::Text(v) => v.clone(),
+                other => panic!("param {i} must be text, got {other:?}"),
+            };
+            let plan_expected_updated = match &del.statement.params[5] {
+                SqlValue::Integer(v) => *v,
+                other => panic!("param 5 must be the expected revision, got {other:?}"),
+            };
+            let plan_expected_deleted = match &del.statement.params[6] {
+                SqlValue::Null => None,
+                SqlValue::Integer(v) => Some(*v),
+                other => panic!("param 6 must be a deletion marker, got {other:?}"),
+            };
+
+            let requested_now = runtime
+                .get_edge_including_deleted(&token, requested_id)
+                .await
+                .expect("read the requested edge")
+                .expect("the requested edge is present before the plan runs");
+            assert_ne!(
+                requested_now.updated_at.timestamp_micros(),
+                plan_expected_updated,
+                "fixture premise: the concurrent writer must actually have moved the \
+                 revision past the plan's `?6`, otherwise nothing refuses the delete"
+            );
+            assert_eq!(
+                requested_now.deleted_at.map(|d| d.timestamp_micros()),
+                plan_expected_deleted,
+                "fixture premise: the stored deletion marker must MATCH the plan's `?7`, \
+                 otherwise `deleted_at IS ?7` refuses too and the refusal is not \
+                 attributable to the revision guard"
+            );
+
+            // The EXISTS arm. A missing survivor refuses the delete on its own
+            // and looks identical from outside, so the premise has to be that
+            // arm's OWN question. Do not reconstruct it from the seeded row's
+            // endpoints: the natural key the plan binds is the canonical
+            // ordering, which need not equal the order the survivor was stored
+            // in, and a hand-built comparison would be asserting my model of
+            // canonicalisation rather than the predicate. Run the subquery
+            // verbatim against the plan's own bound parameters instead.
+            assert_ne!(
+                canonical_id, requested_id,
+                "fixture premise: the survivor must be a DIFFERENT row, since the EXISTS \
+                 arm excludes the requested id"
+            );
+            let survivors = {
+                let mut reader = runtime.sql().reader().await.expect("sql reader");
+                reader
+                    .query_scalar(SqlStatement {
+                        sql: "SELECT count(*) FROM graph_edges \
+                              WHERE namespace = ?1 AND source_id = ?3 AND target_id = ?4 \
+                                AND relation = ?5 AND id != ?2"
+                            .to_string(),
+                        params: del.statement.params[0..5].to_vec(),
+                        label: Some("test-survivor-exists-premise".to_string()),
+                    })
+                    .await
+                    .expect("run the plan's own EXISTS predicate")
+            };
+            let survivors = match survivors {
+                Some(SqlValue::Integer(n)) => n,
+                other => panic!("count(*) must come back as an integer, got {other:?}"),
+            };
+            assert_eq!(
+                survivors,
+                1,
+                "fixture premise: exactly one survivor must satisfy the plan's own EXISTS \
+                 predicate (namespace {}, source {}, target {}, relation {}, id != {}), \
+                 otherwise the delete refuses on the survivor arm and the refusal is not \
+                 attributable to the revision guard",
+                text(0),
+                text(2),
+                text(3),
+                text(4),
+                text(1),
+            );
+        }
 
         let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
             .await
