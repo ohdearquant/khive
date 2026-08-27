@@ -340,12 +340,35 @@ write or reports a retryable read timeout for it.
 
 **This amendment specifies a contract that current code does not satisfy.** It
 is normative, not descriptive: every rule below states what boot must do, and
-none of it should be read as an account of what boot does today. The present
-implementation reduces the probe to a boolean that is true only for an exact
-acknowledgement, and treats everything else — including replies from
-demonstrably live daemons — as grounds for removing the rendezvous. Bringing the
+none of it should be read as an account of what boot does today. Bringing the
 code to this contract is a prerequisite for the guarantees stated here, not a
 consequence of recording them.
+
+What boot does today is further from this contract than a collapsed
+classification. `cleanup_stale_daemon` in `crates/khive-runtime/src/daemon.rs`
+sends no probe at all: it reads the pid file, and keeps the rendezvous only if
+the pid parses, names a process that is running, the socket path exists, and a
+plain connect to it succeeds. Any other outcome unlinks both the socket and the
+pid file. So there is no reply to classify on this path, and the states below
+have no counterpart in it.
+
+That matters in a specific direction. Because the predicate is conjunctive and
+begins at the pid file, a **live** daemon whose pid file is missing, truncated,
+unreadable, or holding a pid the check declines to accept falls through to the
+unlink branch and has its socket removed underneath it, purely on the strength
+of a file that is not the thing being tested for liveness. In the other
+direction, once all four conjuncts hold the rendezvous is kept whatever the
+peer would have replied, because nothing asks it. The amendment's
+classification replaces this predicate; it does not refine it.
+
+A boolean probe of the shape this amendment breaks apart does exist, but it
+answers a different question. `probe_daemon_identity` in
+`crates/khive-mcp/src/daemon.rs` collapses ack shape, three mismatch flags,
+protocol version, and served config id into one condition, and its callers ask
+whether a _client_ may dispatch to the daemon or must fall back — including its
+own boot fence, which is not the daemon-boot rendezvous decision governed here.
+It is the closest existing analogue to the classification below and a useful
+reference for implementers, but it is not the predicate this amendment changes.
 
 Boot answers one question — "may I clean up the rendezvous and bind?" — and the
 convergence invariant above requires that the answer be governed by whether a
@@ -435,7 +458,7 @@ old value reads a retired code rather than silently inheriting a reused one.
 | #   | State                                             | Observable                                                                                                                                                           | Disposition                                                                                                                                                                                            | Exit |
 | --- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---- |
 | 1   | Exact acknowledgement                             | connect ok, probe ack, identity matches                                                                                                                              | Refuse to start; report the incumbent pid                                                                                                                                                              | 0    |
-| 2   | Protocol-version mismatch                         | connect ok, `version_mismatch`                                                                                                                                       | Refuse; name both versions and the remedy. Never unlink                                                                                                                                                | 0    |
+| 2   | Protocol-version mismatch                         | connect ok, and either `version_mismatch` set OR `daemon_protocol_version` unequal to this build's — the two are independent fields, see the precedence rules below  | Refuse; name both versions and the remedy. Never unlink                                                                                                                                                | 0    |
 | 3   | Config mismatch                                   | connect ok, `config_mismatch` set — `served_config_id` may be absent, and is not part of this predicate                                                              | Refuse by default; name the first differing field without values when `served_config_id` is present, otherwise say identity was not echoed. Never unlink; replacing the incumbent is out of scope here | 0    |
 | 4   | Metrics-only reply                                | connect ok, reply carries metrics                                                                                                                                    | Refuse to start                                                                                                                                                                                        | 0    |
 | 5   | Identity unresolved                               | connect ok, reply HAS ack shape, no mismatch flag set, `served_config_id` ABSENT                                                                                     | Refuse to start; name the pid and that identity could not be established                                                                                                                               | 6    |
@@ -698,10 +721,24 @@ writing this one and should not be rediscovered:
   recipe therefore has to define an explicit valid baseline frame and override
   only the distinguishing fields per row.
 - State 13 is not observable at the listener-count element: the socket path is
-  present but not connectable, so no fixture can count who holds it. Either give
-  13 a seam whose owner is known, or exempt it from the four-element rule and
-  name a testable substitute — never waive the element that detects the
-  double-bind while still calling it mandatory.
+  present but not connectable, so no fixture can count who holds it. It is
+  exempt from that one element, and the substitute is fixed here rather than
+  left to the recipe, because an open-ended "testable substitute" readmits
+  exactly the test this section excludes everywhere else — one that asserts the
+  returned error and nothing about what boot did.
+
+  The substitute is a seam recording boot's **attempts**: how many times it
+  tried to bind the socket, and how many times it tried to unlink either
+  rendezvous path. A conforming state-13 test asserts both counts are zero and
+  that the socket and pid paths are unchanged by stat, in addition to the exit
+  code. Attempt counts rather than outcomes, because the failure being excluded
+  is boot _trying_ and being defeated by the environment, which is
+  indistinguishable from boot correctly refusing if only the end state is read.
+  The connect error alone is never sufficient: it describes what boot saw, not
+  what boot then did.
+
+  Never waive the element that detects the double-bind while still calling it
+  mandatory.
 
 Two obligations belong to this classification contract rather than to the
 fixture recipe, and both are required here because their absence is what allowed
