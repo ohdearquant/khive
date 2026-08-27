@@ -1309,6 +1309,32 @@ async fn run_pending_events_on_with_lease(
                         continue;
                     }
                 };
+                // The receipt persisted at claim time names an occurrence
+                // derived from the trigger the page query saw. If the row is
+                // now scheduled for a different instant, writing a terminal row
+                // would pair that receipt with a trigger it does not describe —
+                // and terminal rows are past the reach of recovery, whose scan
+                // fences on `status = 'firing'`, so nothing would ever
+                // re-examine it. Refuse for the same reason and in the same
+                // shape as the unparseable-trigger branch above: the dispatch
+                // has happened, so the honest outcome is a failed finalization
+                // that leaves the row `firing` for the receipt validator to
+                // adjudicate once the lease expires.
+                let fresh_occurrence_id = dispatch_occurrence_id(id, trigger_at);
+                if fresh_occurrence_id != claim.occurrence_id {
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        trigger_at = %trigger_at_fresh_str,
+                        claimed_occurrence_id = %claim.occurrence_id,
+                        fresh_occurrence_id = %fresh_occurrence_id,
+                        "pending-events: the event was rescheduled after its dispatch was \
+                         claimed; refusing to finalize a terminal row whose receipt names a \
+                         different occurrence"
+                    );
+                    summary.failed += 1;
+                    continue;
+                }
+
                 let repeat = expected_value
                     .get("repeat")
                     .and_then(Value::as_str)
@@ -6864,6 +6890,109 @@ mod tests {
         assert!(
             stored.get("dispatch_receipt").is_none() || stored["dispatch_receipt"].is_null(),
             "no receipt may be persisted for a claim that never succeeded: {stored:?}"
+        );
+    }
+
+    /// The post-claim half of the same invariant, and the one that cannot be
+    /// left to recovery.
+    ///
+    /// A reschedule landing after the claim but before the finalizer's fresh
+    /// read is INSIDE that read, so every finalization CAS predicate passes:
+    /// status, `firing_at`, invocation id, lease, and the exact-properties
+    /// fence all match. Committing there would write a terminal `fired` row
+    /// whose `dispatch_receipt.occurrence_id` names the old instant while
+    /// `trigger_at` names the new one — and the receipt validator that would
+    /// catch that pairing is only ever reached through the recovery scan, which
+    /// fences on `status = 'firing'`. A terminal row is past it forever, so the
+    /// mismatch would never be adjudicated at all.
+    ///
+    /// So the drain must refuse instead, leaving the row `firing` for recovery.
+    /// This differs from
+    /// `production_drain_refuses_to_claim_an_event_rescheduled_in_the_claim_window`
+    /// only in WHICH seam the write lands at, which is what makes the two
+    /// windows separately load-bearing.
+    #[tokio::test]
+    async fn production_drain_refuses_to_finalize_an_event_rescheduled_after_the_claim() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let gate = race_seam::PauseGate {
+            at: race_seam::PausePoint::BeforeFinalizeRead,
+            reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+            release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+        };
+
+        let drain_task = {
+            let rt = rt.clone();
+            let gate = gate.clone();
+            tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
+                let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                run_pending_events_on(&rt, &server, false).await
+            }))
+        };
+
+        // Parked AFTER claim and dispatch, so the claim's trigger_at fence has
+        // already passed and this write cannot be caught by it. Still a valid
+        // parseable instant, so the refusal cannot be confused with the
+        // unparseable-trigger branch.
+        gate.reached.wait().await;
+        let rescheduled_trigger = "2002-01-01T00:00:00Z";
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = json_set(properties, '$.trigger_at', ?2) \
+                      WHERE id = ?1"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(rescheduled_trigger.to_string()),
+                ],
+                label: Some("test_reschedule_after_claim".into()),
+            })
+            .await
+            .expect("concurrent write");
+        assert_eq!(rows, 1);
+        drop(writer);
+
+        gate.release.wait().await;
+        let summary = drain_task
+            .await
+            .expect("drain task")
+            .expect("drain must not error");
+        assert_eq!(
+            summary.fired, 0,
+            "no terminal row may be written for an occurrence the row no longer names: {summary:?}"
+        );
+        assert_eq!(
+            summary.failed, 1,
+            "the refusal must be recorded as a failed finalization, which is what leaves the row \
+             for recovery: {summary:?}"
+        );
+
+        let stored = get_note_props(&rt, id).await;
+        assert_eq!(
+            stored["status"].as_str(),
+            Some("firing"),
+            "the row must stay firing so the recovery scan, which fences on status='firing', can \
+             still reach it; a terminal row would be past that scan forever: {stored:?}"
+        );
+        assert_eq!(
+            stored["trigger_at"].as_str(),
+            Some(rescheduled_trigger),
+            "the writer's reschedule must survive: {stored:?}"
+        );
+        assert!(
+            stored.get("dispatch_receipt").is_some(),
+            "the claim receipt stays on the row for the validator to adjudicate: {stored:?}"
         );
     }
 
