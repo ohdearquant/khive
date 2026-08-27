@@ -7996,4 +7996,97 @@ mod request_read_cancellation_tests {
             "error must state the accepted range: {rendered}"
         );
     }
+
+    /// The response-delivery deadline had no test that ever let it elapse:
+    /// the only coverage rejected `0` at startup, which exercises the parser
+    /// and not the bound. A bound whose expiry is never observed is a claim,
+    /// so this drives a real write against a peer that has stopped reading.
+    #[tokio::test]
+    async fn response_write_past_its_deadline_is_abandoned_and_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        // A 16-byte pipe that nobody reads. `_client_io` is held, not dropped,
+        // so this is a peer that is present and simply not reading — the case
+        // the deadline exists for. Dropping it would produce a broken pipe
+        // instead, which is a different failure and already handled.
+        let (server_io, _client_io) = tokio::io::duplex(16);
+        let (read, write) = tokio::io::split(server_io);
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            None,
+            Some(Duration::from_millis(50)),
+            None,
+        );
+
+        // An error response is a response for this purpose: `send` bounds
+        // `Response` and `Error` alike, because either one can leave the write
+        // pinned.
+        let message = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("x".repeat(4096), None),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("the deadline must resolve the write; it hung instead")
+            .expect_err("a write that outlived its deadline must not report success");
+
+        assert!(
+            error.to_string().contains("deadline"),
+            "the error must name the deadline that abandoned the write: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "a peer that stops reading must close the session, not just fail one write"
+        );
+    }
+
+    /// Discriminating arm for the test above. Without this, that test would
+    /// also pass against a deadline that fired on every response regardless of
+    /// whether the peer was reading.
+    #[tokio::test]
+    async fn response_write_inside_its_deadline_succeeds_and_leaves_the_session_open() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+        use tokio::io::AsyncReadExt;
+
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        // This peer reads.
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let _ = client_io.read(&mut buf).await;
+            buf
+        });
+
+        let message = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("read by the peer", None),
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a reading peer must not hit the 2s test bound")
+            .expect("a write to a reading peer must succeed");
+
+        assert!(
+            !root.is_cancelled(),
+            "a response delivered inside its deadline must not close the session"
+        );
+        let _ = reader.await;
+    }
 }
