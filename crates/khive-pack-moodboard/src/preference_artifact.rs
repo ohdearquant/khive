@@ -466,6 +466,8 @@ pub async fn verify_legacy_preference_attachments(
 #[derive(Debug, Default)]
 pub struct MoodboardLegacyPreferenceVerifier;
 
+impl khive_runtime::preference_verification::sealed::Sealed for MoodboardLegacyPreferenceVerifier {}
+
 #[async_trait::async_trait]
 impl LegacyPreferenceVerifier for MoodboardLegacyPreferenceVerifier {
     async fn verify_legacy_preference_attachments(
