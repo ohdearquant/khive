@@ -689,6 +689,10 @@ async fn run_pending_events_on_with_lease(
                 };
                 let trigger_at = trigger_at_fixed.with_timezone(&Utc);
                 let trigger_offset = *trigger_at_fixed.offset();
+                // Owned copy of the exact bytes this page snapshot saw, so the
+                // claim below can fence on them however `properties` is
+                // borrowed or moved in between.
+                let snapshot_trigger_at = trigger_at_str.to_string();
 
                 if trigger_at > now {
                     summary.skipped_not_due += 1;
@@ -791,7 +795,11 @@ async fn run_pending_events_on_with_lease(
                 // pending -> firing now so a concurrent `schedule.cancel`
                 // cannot land between the read and this point (whichever
                 // side wins the CAS proceeds; the loser skips). The same
-                // claim gates the missed path too.
+                // claim gates the missed path too. The claim also fences on
+                // the snapshot's `trigger_at`, so a writer that reschedules
+                // the event in that same window makes the claim a no-op
+                // instead of stamping this occurrence id onto a row that is
+                // now scheduled for a different instant.
                 let occurrence_id = dispatch_occurrence_id(id, trigger_at);
                 let receipt_actor = creator
                     .as_ref()
@@ -807,19 +815,28 @@ async fn run_pending_events_on_with_lease(
                             "anonymous:local".to_string()
                         }
                     });
-                let claim =
-                    match claim_pending_event(rt, ns_str, id, occurrence_id, &receipt_actor, lease)
-                        .await
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            if verbose {
-                                eprintln!("[pending-events] claim failed for note {id}: {e}");
-                            }
-                            summary.failed += 1;
-                            continue;
+                #[cfg(test)]
+                race_seam::pause_before_claim().await;
+                let claim = match claim_pending_event(
+                    rt,
+                    ns_str,
+                    id,
+                    occurrence_id,
+                    &snapshot_trigger_at,
+                    &receipt_actor,
+                    lease,
+                )
+                .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if verbose {
+                            eprintln!("[pending-events] claim failed for note {id}: {e}");
                         }
-                    };
+                        summary.failed += 1;
+                        continue;
+                    }
+                };
                 let Some(claim) = claim else {
                     if verbose {
                         eprintln!(
@@ -1505,11 +1522,26 @@ fn validate_dispatch_receipt(
 
 /// CAS-claim a pending scheduled event and atomically persist the occurrence
 /// and invocation identity before any action future can be polled.
+///
+/// `expected_trigger_at` is the raw `trigger_at` string the caller's page
+/// snapshot saw, and the claim refuses unless the row still carries those exact
+/// bytes. That is what keeps the persisted receipt's `occurrence_id` — derived
+/// from the snapshot's instant — describing the same occurrence the row is
+/// scheduled for. Without it a writer landing between the page query and this
+/// claim reschedules the event while the claim stamps the old occurrence onto
+/// it, and the resulting terminal row fails receipt validation and is
+/// quarantined as indeterminate rather than read as the dispatch it was.
+/// A refusal costs nothing: the row stays `pending` and the next drain picks it
+/// up from the value the writer actually left. The comparison is on bytes, not
+/// on the parsed instant, so a rewrite to a different spelling of the same
+/// instant also refuses; that is stricter than the invariant strictly needs and
+/// the extra refusals cost one drain interval each.
 async fn claim_pending_event(
     rt: &KhiveRuntime,
     namespace: &str,
     id: uuid::Uuid,
     occurrence_id: uuid::Uuid,
+    expected_trigger_at: &str,
     actor: &str,
     lease: DispatchLeaseConfig,
 ) -> Result<Option<DispatchClaim>> {
@@ -1544,7 +1576,8 @@ async fn claim_pending_event(
                     AND namespace = ?5 \
                     AND kind = 'scheduled_event' \
                     AND deleted_at IS NULL \
-                    AND json_extract(properties, '$.status') = 'pending'"
+                    AND json_extract(properties, '$.status') = 'pending' \
+                    AND json_extract(properties, '$.trigger_at') = ?6"
                 .to_string(),
             params: vec![
                 SqlValue::Integer(updated_at),
@@ -1552,6 +1585,7 @@ async fn claim_pending_event(
                 SqlValue::Text(receipt_json),
                 SqlValue::Text(id.to_string()),
                 SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(expected_trigger_at.to_string()),
             ],
             label: Some("pending_events_claim_firing".into()),
         })
@@ -3194,11 +3228,13 @@ pub async fn schedule_tick_loop(
     }
 }
 
-/// Test-only pause point right after a drain iteration's page-query
-/// snapshot (`properties`) and before claim/dispatch/finalization, so a
-/// concurrent property write landing between that snapshot and the
-/// finalizer's later fresh current-properties read can be reproduced
-/// deterministically instead of relying on scheduler luck or sleeps. A
+/// Test-only pause points inside a drain iteration, so a concurrent property
+/// write landing in one of its races can be reproduced deterministically
+/// instead of relying on scheduler luck or sleeps. There are two, and they
+/// bracket different windows: `pause_before_claim` parks between the page-query
+/// snapshot (`properties`) and the CAS claim, and `pause_before_finalize_read`
+/// parks after claim and dispatch and immediately before the finalizer's fresh
+/// current-properties read. Each is a
 /// no-op unless the calling task runs inside `PAUSE_GATE.scope(...)`;
 /// production code never establishes that scope, so this costs nothing
 /// outside these regression tests, and it does not exist at all in
@@ -3208,6 +3244,20 @@ pub(crate) mod race_seam {
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
+    /// Which of the drain's windows a gate is armed for. A gate trips at the
+    /// point it names and nowhere else, so a drain that passes through both
+    /// seams parks once, at the one the test asked for. Without this a test
+    /// arming the earlier window would also be caught by the later one and
+    /// hang waiting for a second handshake it never planned to perform.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum PausePoint {
+        /// Between the page-query snapshot and the CAS claim.
+        BeforeClaim,
+        /// After claim and dispatch, immediately before the finalizer's fresh
+        /// current-properties read.
+        BeforeFinalizeRead,
+    }
+
     /// Two-phase handshake: `reached` lets the driving test learn the drain
     /// task has arrived at the pause point (i.e. genuinely parked, not just
     /// scheduled) before it performs a concurrent write; `release` then lets
@@ -3216,6 +3266,7 @@ pub(crate) mod race_seam {
     /// would resume together with no window for the test to act in between.
     #[derive(Clone)]
     pub(crate) struct PauseGate {
+        pub(crate) at: PausePoint,
         pub(crate) reached: Arc<Barrier>,
         pub(crate) release: Arc<Barrier>,
     }
@@ -3224,11 +3275,21 @@ pub(crate) mod race_seam {
         pub(crate) static PAUSE_GATE: PauseGate;
     }
 
-    pub(crate) async fn pause_before_finalize_read() {
+    async fn pause_at(point: PausePoint) {
         if let Ok(gate) = PAUSE_GATE.try_with(Clone::clone) {
-            gate.reached.wait().await;
-            gate.release.wait().await;
+            if gate.at == point {
+                gate.reached.wait().await;
+                gate.release.wait().await;
+            }
         }
+    }
+
+    pub(crate) async fn pause_before_claim() {
+        pause_at(PausePoint::BeforeClaim).await;
+    }
+
+    pub(crate) async fn pause_before_finalize_read() {
+        pause_at(PausePoint::BeforeFinalizeRead).await;
     }
 }
 
@@ -3796,14 +3857,15 @@ mod tests {
     }
 
     async fn claim_for_test(rt: &KhiveRuntime, id: uuid::Uuid, trigger_at: &str) -> DispatchClaim {
-        let trigger_at = trigger_at
+        let parsed = trigger_at
             .parse::<DateTime<Utc>>()
             .expect("trigger timestamp");
         claim_pending_event(
             rt,
             "local",
             id,
-            dispatch_occurrence_id(id, trigger_at),
+            dispatch_occurrence_id(id, parsed),
+            trigger_at,
             "anonymous:local",
             DispatchLeaseConfig::from_env(),
         )
@@ -6487,6 +6549,7 @@ mod tests {
         .await;
 
         let gate = race_seam::PauseGate {
+            at: race_seam::PausePoint::BeforeFinalizeRead,
             reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
             release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
         };
@@ -6569,6 +6632,7 @@ mod tests {
         .await;
 
         let gate = race_seam::PauseGate {
+            at: race_seam::PausePoint::BeforeFinalizeRead,
             reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
             release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
         };
@@ -6617,6 +6681,189 @@ mod tests {
             "finalization must schedule from the repeat it read fresh (cleared, so terminal), \
              not from the pre-claim page snapshot (\"daily\", which would reschedule to \
              pending): got {stored:?}"
+        );
+    }
+
+    /// The claim's `trigger_at` fence, isolated. The receipt's `occurrence_id`
+    /// is derived from the caller's page snapshot, so a claim that lands on a
+    /// row whose `trigger_at` has since moved would persist an occurrence id
+    /// describing an instant the row is no longer scheduled for. Receipt
+    /// validation rejects exactly that pairing, so such a row can only ever be
+    /// quarantined as indeterminate; refusing the claim is what keeps it out of
+    /// the durable record in the first place.
+    #[tokio::test]
+    async fn claim_refuses_when_a_concurrent_writer_rescheduled_since_the_page_read() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let snapshot_trigger = "2000-01-01T00:00:00Z";
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            snapshot_trigger,
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        // Positive control in the same test: the fence admits the claim when
+        // the row still carries the snapshot's bytes. Without this arm a
+        // refusal below would be consistent with a fence that refuses
+        // everything, which proves nothing about the race.
+        let admitted = claim_pending_event(
+            &rt,
+            "local",
+            id,
+            dispatch_occurrence_id(id, snapshot_trigger.parse::<DateTime<Utc>>().unwrap()),
+            snapshot_trigger,
+            "actor:test",
+            short_test_lease(),
+        )
+        .await
+        .expect("claim query must not error");
+        assert!(
+            admitted.is_some(),
+            "the claim must be admitted when the row still holds the snapshot's trigger_at"
+        );
+
+        // Put the row back to pending so the refusal arm is testing the
+        // trigger_at predicate and not the status one.
+        let rescheduled_trigger = "2000-06-01T00:00:00Z";
+        force_set_properties(
+            &rt,
+            id,
+            &json!({
+                "trigger_at": rescheduled_trigger,
+                "status": "pending",
+                "action": "stats()",
+                "event_type": "schedule",
+            }),
+        )
+        .await;
+
+        let refused = claim_pending_event(
+            &rt,
+            "local",
+            id,
+            dispatch_occurrence_id(id, snapshot_trigger.parse::<DateTime<Utc>>().unwrap()),
+            snapshot_trigger,
+            "actor:test",
+            short_test_lease(),
+        )
+        .await
+        .expect("claim query must not error");
+        assert!(
+            refused.is_none(),
+            "the claim must refuse once the row's trigger_at has moved away from the snapshot"
+        );
+
+        let stored = get_note_props(&rt, id).await;
+        assert_eq!(
+            stored["status"].as_str(),
+            Some("pending"),
+            "a refused claim must leave the row claimable by the next drain: {stored:?}"
+        );
+        assert_eq!(
+            stored["trigger_at"].as_str(),
+            Some(rescheduled_trigger),
+            "a refused claim must leave the writer's reschedule intact: {stored:?}"
+        );
+        assert!(
+            stored.get("dispatch_receipt").is_none() || stored["dispatch_receipt"].is_null(),
+            "a refused claim must persist no receipt: {stored:?}"
+        );
+    }
+
+    /// The same refusal, driven through the production drain rather than the
+    /// claim primitive, so it would fail if the drain's call site stopped
+    /// passing the page snapshot's `trigger_at` down. Parks at
+    /// `PausePoint::BeforeClaim` so the concurrent reschedule lands strictly
+    /// between the candidate-page query and the claim: that is the window in
+    /// which the occurrence id is already derived but not yet persisted.
+    #[tokio::test]
+    async fn production_drain_refuses_to_claim_an_event_rescheduled_in_the_claim_window() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let gate = race_seam::PauseGate {
+            at: race_seam::PausePoint::BeforeClaim,
+            reached: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+            release: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+        };
+
+        let drain_task = {
+            let rt = rt.clone();
+            let gate = gate.clone();
+            tokio::spawn(race_seam::PAUSE_GATE.scope(gate, async move {
+                let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                run_pending_events_on(&rt, &server, false).await
+            }))
+        };
+
+        gate.reached.wait().await;
+
+        // Still due, so the row stays a drain candidate and the refusal cannot
+        // be confused with the event simply not being ready.
+        let rescheduled_trigger = "2001-01-01T00:00:00Z";
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = json_set(properties, '$.trigger_at', ?2) \
+                      WHERE id = ?1"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(rescheduled_trigger.to_string()),
+                ],
+                label: Some("test_concurrent_reschedule".into()),
+            })
+            .await
+            .expect("concurrent write");
+        assert_eq!(rows, 1);
+        drop(writer);
+
+        gate.release.wait().await;
+        let summary = drain_task
+            .await
+            .expect("drain task")
+            .expect("drain must not error");
+        assert_eq!(
+            summary.fired, 0,
+            "an event rescheduled inside the claim window must not fire on this pass: {summary:?}"
+        );
+        assert_eq!(
+            summary.skipped_race, 1,
+            "the pass must record the refusal as a lost race, not as a failure or a silent \
+             no-candidate pass: {summary:?}"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "a refused claim is not an error: {summary:?}"
+        );
+
+        let stored = get_note_props(&rt, id).await;
+        assert_eq!(
+            stored["status"].as_str(),
+            Some("pending"),
+            "the refused row must stay pending for the next drain: {stored:?}"
+        );
+        assert_eq!(
+            stored["trigger_at"].as_str(),
+            Some(rescheduled_trigger),
+            "the writer's reschedule must survive: {stored:?}"
+        );
+        assert!(
+            stored.get("dispatch_receipt").is_none() || stored["dispatch_receipt"].is_null(),
+            "no receipt may be persisted for a claim that never succeeded: {stored:?}"
         );
     }
 
