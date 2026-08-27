@@ -995,27 +995,76 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
     }
 }
 
-/// Idle timeout for a stdio bridge session: no request for this long
-/// and the session closes (see [`crate::transport::CancelOnEofTransport`]),
-/// releasing its reader-pool admission and DB connection — a client that
-/// comes back simply respawns the bridge, seamlessly from its perspective.
+/// Optional idle timeout for a stdio bridge session: when configured, no
+/// request for this long and the session closes (see
+/// [`crate::transport::CancelOnEofTransport`]), releasing its reader-pool
+/// admission and DB connection — a client that comes back simply respawns the
+/// bridge, seamlessly from its perspective.
 /// This closes only a genuinely idle session: an admitted request with a
 /// response still being written — running long, or delivered slowly to a
 /// backpressured reader — defers the close rather than being cancelled out
 /// from under it, up to the separate response-delivery bound documented on
 /// [`stdio_bridge_response_deadline_from_env`].
 ///
-/// Overridable via `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`; `0` disables it (an
-/// explicit opt-out, e.g. for a debugger holding a session open on purpose).
-/// An unparsable value falls back to the default rather than panicking or
-/// disabling the timeout outright, matching this codebase's other
-/// `_from_env` helpers. Default: 3600s (60 minutes) — generous enough that
-/// ordinary gaps between requests in a live session never trip it, short
-/// enough that an abandoned bridge does not pin a reader-pool slot / WAL
-/// connection for hours or days.
+/// **Off unless configured, and that is a deliberate reading of existing
+/// repository law rather than caution.** ADR-091 enumerates "kill long-lived
+/// reader sessions" among its rejected alternatives, on the ground that
+/// long-lived stdio sessions are live Claude Code instances and closing them
+/// by age is a worse user experience than bounding what they hold underneath
+/// them. Closing a session after an hour of quiet is that rejected policy
+/// whatever the mechanism, because this transport has no signal that
+/// separates an abandoned pipe from a live client that simply has not been
+/// asked anything. Defaulting it on would reverse an accepted decision from
+/// inside an unrelated change, so the default is off and turning it on is an
+/// operator's explicit act — a supervised deployment, a CI harness, or any
+/// context where session churn is cheap and a pinned WAL connection is not.
+/// Making it the default requires amending ADR-091, not a different number
+/// here.
+///
+/// Set `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS` to a positive number of seconds to
+/// enable it. `0`, absent, and unparsable all leave it disabled; unparsable
+/// falls back rather than panicking, matching this codebase's other
+/// `_from_env` helpers, and it falls back to *disabled* because a typo must
+/// never silently start closing live sessions. 3600 is the suggested value
+/// where it is wanted: long enough that ordinary gaps in a live session never
+/// trip it.
 fn stdio_bridge_idle_timeout_from_env() -> Option<std::time::Duration> {
-    const DEFAULT_SECS: u64 = 3600;
     let secs = std::env::var("KHIVE_BRIDGE_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// How long an admitted request whose response has not been written keeps
+/// deferring the idle close.
+///
+/// The idle check must not treat a session with work outstanding as idle, or
+/// it cancels a running handler out from under itself. But rmcp spawns each
+/// request handler and drops the join handle, so a handler that panics never
+/// reaches the response construction that would clear its obligation. Deferring
+/// on an outstanding obligation with no bound therefore hands any panicking
+/// handler the power to disable idle reaping for the life of the session — the
+/// exact unbounded lifetime the idle timeout exists to close, reintroduced
+/// through the guard that protects it.
+///
+/// This bound is separate from the idle window on purpose. Reusing the idle
+/// window would mean a handler that runs longer than one quiet window stops
+/// protecting its own session, which is the guarantee the obligation exists to
+/// provide. It is set far above any real handler and answers a different
+/// question: not "has this session been quiet" but "has this request been
+/// outstanding so long that its handler must be gone".
+///
+/// Overridable via `KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS`; `0` disables the
+/// bound, restoring the unbounded defer. An unparsable value falls back to the
+/// default. Default: 3600s.
+fn stdio_bridge_request_obligation_ttl_from_env() -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 3600;
+    let secs = std::env::var("KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_SECS);
@@ -1494,6 +1543,7 @@ impl KhiveMcpServer {
                 root,
                 idle_timeout,
                 Some(response_deadline),
+                stdio_bridge_request_obligation_ttl_from_env(),
             )
         };
 
@@ -1538,6 +1588,7 @@ impl KhiveMcpServer {
             root.clone(),
             stdio_bridge_idle_timeout_from_env(),
             Some(response_deadline),
+            stdio_bridge_request_obligation_ttl_from_env(),
         );
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
@@ -7416,6 +7467,7 @@ mod request_read_cancellation_tests {
             root.clone(),
             None,
             None,
+            Some(Duration::from_secs(3600)),
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7471,6 +7523,7 @@ mod request_read_cancellation_tests {
             root.clone(),
             Some(Duration::from_millis(50)),
             None,
+            Some(Duration::from_secs(3600)),
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7530,6 +7583,7 @@ mod request_read_cancellation_tests {
             root.clone(),
             Some(idle_timeout),
             None,
+            Some(Duration::from_secs(3600)),
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7624,6 +7678,7 @@ mod request_read_cancellation_tests {
             root.clone(),
             Some(idle_timeout),
             None,
+            Some(Duration::from_secs(3600)),
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
         let (mut client_read, mut client_write) = tokio::io::split(client_io);
@@ -7662,6 +7717,87 @@ mod request_read_cancellation_tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
     }
 
+    /// A handler that never answers must not disable idle reaping for the life
+    /// of the session.
+    ///
+    /// rmcp spawns each request handler with `spawn_service_task` and drops the
+    /// join handle, so a panicking handler never reaches the response
+    /// construction that clears its obligation. The observable at this
+    /// transport is exactly "an admitted request whose response never arrives",
+    /// which is what this fixture produces directly — a handler that parks
+    /// forever. Driving a real panic through rmcp would test rmcp's task
+    /// plumbing rather than this guard, and would give the same observable.
+    ///
+    /// Without the obligation TTL the idle branch defers on every window
+    /// forever and this test hangs at its final assertion. With it, the
+    /// obligation stops counting as evidence of life once it is older than the
+    /// TTL, and the next idle window closes the session.
+    #[tokio::test]
+    async fn stdio_idle_timeout_reaps_a_session_whose_handler_never_answers() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use std::time::Instant;
+        use tokio::io::AsyncWriteExt;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let idle_timeout = Duration::from_millis(50);
+        // Longer than the idle window, so the obligation genuinely defers at
+        // least one window before ageing out — otherwise this test would pass
+        // even with the freshness check wired to a constant `false`.
+        let obligation_ttl = Duration::from_millis(150);
+        let probe = SlowProbeServer {
+            started: started.clone(),
+            // Far beyond the test's own timeout: the handler never answers.
+            delay: Duration::from_secs(3600),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            Some(idle_timeout),
+            None,
+            Some(obligation_ttl),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (_client_read, mut client_write) = tokio::io::split(client_io);
+
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write one real JSON-RPC tool request");
+
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("rmcp never admitted the request handler");
+
+        // While the obligation is still fresh it must protect the session, or
+        // this test would also pass against a build that simply ignores
+        // in-flight work.
+        tokio::time::sleep(idle_timeout + idle_timeout / 2).await;
+        assert!(
+            !root.is_cancelled(),
+            "a fresh obligation must still defer the idle close"
+        );
+
+        // Past the TTL the obligation stops being evidence of life. The pipe is
+        // deliberately still open: only the timeout can end this session.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !root.is_cancelled() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "an obligation older than the TTL must stop deferring the idle close, or a \
+             handler that never answers disables idle reaping for the life of the session"
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
     /// Regression: a request must stay "in flight" — and
     /// therefore protected from the idle-close branch — until its response
     /// has actually *finished writing*, not merely been handed to
@@ -7691,6 +7827,7 @@ mod request_read_cancellation_tests {
             root.clone(),
             Some(idle_timeout),
             None,
+            Some(Duration::from_secs(3600)),
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7743,6 +7880,7 @@ mod request_read_cancellation_tests {
             root.clone(),
             None,
             Some(response_deadline),
+            Some(Duration::from_secs(3600)),
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7847,6 +7985,7 @@ mod request_read_cancellation_tests {
             root.clone(),
             Some(idle_timeout),
             None,
+            Some(Duration::from_secs(3600)),
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
         let (mut client_read, mut client_write) = tokio::io::split(client_io);

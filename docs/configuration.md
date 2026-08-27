@@ -290,6 +290,35 @@ partial-override mode.
 
 ---
 
+## Stdio bridge session lifetime
+
+Three environment variables bound how long a stdio bridge session and its
+individual writes may live. They are read once at serve time.
+
+| Variable                               | Default      | Effect                                                                                                                                                                                                |
+| -------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`       | **disabled** | When set to a positive number, a session that receives no request for this many seconds closes, releasing its reader-pool admission and DB connection. `0`, absent, or unparsable leaves it disabled. |
+| `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`  | `300`        | The longest a single response write may stay pending before it is abandoned and the session closes. `0` is rejected at startup rather than treated as an opt-out.                                     |
+| `KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS` | `3600`       | How long an admitted request whose response has not been written keeps deferring the idle close. Only reached when the idle timeout is enabled. `0` restores an unbounded defer.                      |
+
+**Idle reaping is off by default, and that is deliberate.**
+[ADR-091](adr/ADR-091-wal-snapshot-lifetime.md) rejects closing long-lived
+reader sessions by age, on the ground that they are live clients and that
+bounding what they hold underneath them is the better fix. This transport has
+no signal separating an abandoned pipe from a live client that has simply not
+been asked anything, so enabling the idle timeout by default would reverse that
+decision. Turn it on where session churn is cheap and a pinned WAL connection
+is not: a supervised deployment, a CI harness, a batch runner.
+
+**Known gap.** The response-delivery deadline covers responses this transport
+writes. It does not cover parse-error responses, which the underlying line
+transport writes directly through its own framed writer without passing through
+the deadline. A peer that sends malformed input and then stops reading can
+leave that one write pending; with the idle timeout enabled it is bounded by
+the idle window, and with the idle timeout disabled it is not bounded. Closing
+that gap requires replacing or adapting the line transport and is tracked
+separately.
+
 ## Troubleshooting a connect failure
 
 **Symptom:** an MCP client (Claude Code, Claude Desktop, Codex, Gemini) reports

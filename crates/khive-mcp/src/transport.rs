@@ -5,9 +5,9 @@
 //! transports (e.g. Streamable HTTP) register with [`TransportRegistry::register`]
 //! before serving, so the serve path never hard-codes a transport enum.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 
@@ -52,11 +52,33 @@ use crate::server::KhiveMcpServer;
 /// through `receive()` returning `None` on its own, so this counter must
 /// not be the thing that gets stuck open forever on a write error.
 ///
+/// **An obligation is evidence of life only while it is fresh.** rmcp spawns
+/// each request handler with `spawn_service_task` and drops the join handle
+/// (`rmcp::service`), so a handler that panics never reaches the response
+/// construction that would let this transport decrement. A bare counter would
+/// then stay positive for the life of the process and the idle branch would
+/// defer forever — the precise unbounded lifetime this type exists to close,
+/// reintroduced through its own guard. `in_flight` therefore records the
+/// *instant* each request was admitted, and the idle branch defers only while
+/// the newest outstanding obligation is younger than `obligation_ttl`. An
+/// obligation older than that is not distinguishable, by any signal available
+/// at the transport, from a handler that died without answering.
+///
+/// `obligation_ttl` is deliberately NOT the idle window. Tying the two
+/// together would make a long-running handler stop protecting its own session
+/// after a single quiet window, which is the guarantee this counter exists to
+/// provide. It is its own bound, set well above any real handler, and it
+/// answers a different question: not "has this session been quiet" but "has
+/// this request been outstanding so long that the handler must be gone".
+/// `None` restores the unbounded defer, and with it the leak — it exists for
+/// callers that do not enable idle reaping at all, where the defer decision is
+/// never reached.
+///
 /// A response write that never resolves — a peer that admits a request,
 /// then stops reading its response while keeping the pipe open — would
 /// otherwise pin this session (and its reader-pool admission / DB
-/// connection) forever: `in_flight` would never return to zero, so the idle
-/// check above would defer indefinitely. `response_deadline` bounds the
+/// connection) forever: the obligation would never clear, so the idle
+/// check above would defer for as long as the freshness rule allows. `response_deadline` bounds the
 /// write itself (see [`Self::send`]) rather than the idle check: rmcp's
 /// underlying `AsyncRwTransport` serializes writes through a
 /// `tokio::sync::Mutex` held across the pending write's `.await`, so a
@@ -71,7 +93,13 @@ pub(crate) struct CancelOnEofTransport<T> {
     root: tokio_util::sync::CancellationToken,
     idle_timeout: Option<std::time::Duration>,
     response_deadline: Option<std::time::Duration>,
-    in_flight: Arc<AtomicI64>,
+    /// Admission instants of requests handed to rmcp whose response has not
+    /// finished writing. Ordered oldest-first; see the type doc for why the
+    /// instants matter and not just the count.
+    in_flight: Arc<Mutex<VecDeque<Instant>>>,
+    /// How long an outstanding request keeps deferring the idle close. `None`
+    /// defers without bound. See the type doc.
+    obligation_ttl: Option<std::time::Duration>,
 }
 
 impl<T> CancelOnEofTransport<T> {
@@ -84,18 +112,26 @@ impl<T> CancelOnEofTransport<T> {
     /// `idle_timeout`, and meaningful whether or not an idle timeout is
     /// configured. `None` disables the bound (a response write waits
     /// unbounded, matching this transport's pre-existing behavior).
+    ///
+    /// `obligation_ttl`: how long an admitted request whose response has not
+    /// been written keeps deferring the idle close. `None` defers without
+    /// bound, which is only safe where `idle_timeout` is also `None`, because
+    /// a handler that panics never produces the response that would clear the
+    /// obligation (see the type doc).
     pub(crate) fn with_idle_timeout(
         inner: T,
         root: tokio_util::sync::CancellationToken,
         idle_timeout: Option<std::time::Duration>,
         response_deadline: Option<std::time::Duration>,
+        obligation_ttl: Option<std::time::Duration>,
     ) -> Self {
         Self {
             inner,
             root,
             idle_timeout,
             response_deadline,
-            in_flight: Arc::new(AtomicI64::new(0)),
+            in_flight: Arc::new(Mutex::new(VecDeque::new())),
+            obligation_ttl,
         }
     }
 }
@@ -148,11 +184,16 @@ where
                 },
                 _ => send.await,
             };
-            // Decrement once the write is resolved either way — see the
-            // `in_flight` field doc for why a failed write must not be left
-            // permanently counted as pending.
+            // Clear one obligation once the write is resolved either way — see
+            // the `in_flight` field doc for why a failed write must not be left
+            // permanently counted as pending. The oldest entry is dropped
+            // rather than this request's own: the entries are interchangeable
+            // for the freshness test the idle branch performs, and rmcp does
+            // not guarantee responses resolve in admission order.
             if is_response {
-                in_flight.fetch_sub(1, Ordering::AcqRel);
+                if let Ok(mut q) = in_flight.lock() {
+                    q.pop_front();
+                }
             }
             result
         }
@@ -165,6 +206,7 @@ where
         let root = self.root.clone();
         let idle_timeout = self.idle_timeout;
         let in_flight = self.in_flight.clone();
+        let obligation_ttl = self.obligation_ttl;
         async move {
             // Created once and reused across every retry below: `select!`ing
             // a *fresh* `self.inner.receive()` each time the idle sleep wins
@@ -183,7 +225,21 @@ where
                         tokio::select! {
                             message = &mut recv_fut => message,
                             () = tokio::time::sleep(timeout) => {
-                                if in_flight.load(Ordering::Acquire) > 0 {
+                                // Defer only on a FRESH obligation. The newest
+                                // entry is the test: if even that one predates a
+                                // full idle window, everything outstanding is
+                                // stale and none of it is evidence of life. See
+                                // the type doc for why a bare count cannot be
+                                // trusted here.
+                                let fresh = in_flight
+                                    .lock()
+                                    .ok()
+                                    .and_then(|q| q.back().copied())
+                                    .is_some_and(|newest| match obligation_ttl {
+                                        Some(ttl) => newest.elapsed() < ttl,
+                                        None => true,
+                                    });
+                                if fresh {
                                     tracing::debug!(
                                         idle_timeout_secs = timeout.as_secs(),
                                         "stdio bridge idle timeout elapsed but an admitted \
@@ -191,6 +247,17 @@ where
                                          session close"
                                     );
                                     continue;
+                                }
+                                if in_flight.lock().is_ok_and(|q| !q.is_empty()) {
+                                    tracing::warn!(
+                                        idle_timeout_secs = timeout.as_secs(),
+                                        obligation_ttl_secs =
+                                            obligation_ttl.map(|d| d.as_secs()),
+                                        "stdio bridge closing with admitted requests whose \
+                                         responses never arrived and whose admission is older \
+                                         than the request-obligation TTL; treating them as \
+                                         dead rather than deferring indefinitely"
+                                    );
                                 }
                                 tracing::info!(
                                     idle_timeout_secs = timeout.as_secs(),
@@ -204,7 +271,9 @@ where
                     None => recv_fut.await,
                 };
                 if let Some(rmcp::model::JsonRpcMessage::Request(_)) = &message {
-                    in_flight.fetch_add(1, Ordering::AcqRel);
+                    if let Ok(mut q) = in_flight.lock() {
+                        q.push_back(Instant::now());
+                    }
                 }
                 if message.is_none() {
                     root.cancel();
