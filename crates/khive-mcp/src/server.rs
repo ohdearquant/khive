@@ -995,6 +995,80 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
     }
 }
 
+/// Idle timeout for a stdio bridge session: no request for this long
+/// and the session closes (see [`crate::transport::CancelOnEofTransport`]),
+/// releasing its reader-pool admission and DB connection — a client that
+/// comes back simply respawns the bridge, seamlessly from its perspective.
+/// This closes only a genuinely idle session: an admitted request with a
+/// response still being written — running long, or delivered slowly to a
+/// backpressured reader — defers the close rather than being cancelled out
+/// from under it, up to the separate response-delivery bound documented on
+/// [`stdio_bridge_response_deadline_from_env`].
+///
+/// Overridable via `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`; `0` disables it (an
+/// explicit opt-out, e.g. for a debugger holding a session open on purpose).
+/// An unparsable value falls back to the default rather than panicking or
+/// disabling the timeout outright, matching this codebase's other
+/// `_from_env` helpers. Default: 3600s (60 minutes) — generous enough that
+/// ordinary gaps between requests in a live session never trip it, short
+/// enough that an abandoned bridge does not pin a reader-pool slot / WAL
+/// connection for hours or days.
+fn stdio_bridge_idle_timeout_from_env() -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 3600;
+    let secs = std::env::var("KHIVE_BRIDGE_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// Response-delivery deadline for a stdio bridge session: the longest a
+/// single response write may stay pending before it is abandoned (see
+/// [`crate::transport::CancelOnEofTransport::send`]) and this session is
+/// closed. Independent of the idle timeout above — it bounds an admitted
+/// request's response write directly, rather than the gap between
+/// requests. Without this bound, a peer that admits a request and then
+/// stops reading its response — while leaving the pipe itself open — keeps
+/// that write pending forever, so the idle timeout would defer indefinitely
+/// (an in-flight response always defers idle-close) and the session would
+/// never be reaped.
+///
+/// Overridable via `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`, accepted range
+/// 1..=u64::MAX seconds. Unlike `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`, this bound
+/// cannot be disabled: `0` is a startup error naming the variable, the
+/// rejected value, and the accepted range, rather than a silent opt-out — a
+/// configuration that restores an unbounded pending write restores the
+/// defect this deadline exists to close (see the type doc above). An
+/// unparsable value falls back to the default rather than erroring, matching
+/// this codebase's other `_from_env` helpers. Default: 300s (5 minutes) —
+/// long enough that legitimately slow verbs and ordinary reader backpressure
+/// never trip it, short enough that a peer that has genuinely stopped
+/// reading does not pin the session's reader-pool admission / DB connection
+/// indefinitely.
+fn stdio_bridge_response_deadline_from_env() -> anyhow::Result<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 300;
+    let secs = match std::env::var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => secs,
+            Err(_) => DEFAULT_SECS,
+        },
+        Err(_) => DEFAULT_SECS,
+    };
+    if secs == 0 {
+        anyhow::bail!(
+            "KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 is not accepted: the response-delivery \
+             deadline cannot be disabled (a disabled deadline lets a peer that stops reading \
+             pin the bridge's response write forever). Set it to a positive number of seconds \
+             (accepted range: 1..=u64::MAX, default {DEFAULT_SECS})."
+        );
+    }
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 impl KhiveMcpServer {
     /// Build a server from `runtime.config().packs`. Errors if any pack is unknown or missing deps.
     ///
@@ -1409,13 +1483,17 @@ impl KhiveMcpServer {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
         let root = tokio_util::sync::CancellationToken::new();
+        let idle_timeout = stdio_bridge_idle_timeout_from_env();
+        let response_deadline = stdio_bridge_response_deadline_from_env()?;
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
-            crate::transport::CancelOnEofTransport::new(
+            crate::transport::CancelOnEofTransport::with_idle_timeout(
                 crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
                     read, write,
                 )),
                 root,
+                idle_timeout,
+                Some(response_deadline),
             )
         };
 
@@ -1454,9 +1532,12 @@ impl KhiveMcpServer {
 
         let root = tokio_util::sync::CancellationToken::new();
         let (read, write) = stdio();
-        let transport = crate::transport::CancelOnEofTransport::new(
+        let response_deadline = stdio_bridge_response_deadline_from_env()?;
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(read, write),
             root.clone(),
+            stdio_bridge_idle_timeout_from_env(),
+            Some(response_deadline),
         );
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
@@ -7330,9 +7411,11 @@ mod request_read_cancellation_tests {
         let root = tokio_util::sync::CancellationToken::new();
         let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
         let (read, write) = tokio::io::split(server_io);
-        let transport = crate::transport::CancelOnEofTransport::new(
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(read, write),
             root.clone(),
+            None,
+            None,
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7366,6 +7449,466 @@ mod request_read_cancellation_tests {
             ),
             "unexpected rmcp quit reason after EOF: {reason:?}"
         );
+    }
+
+    /// An idle stdio bridge — pipe still open, no request sent — must
+    /// be reaped the same way a real EOF is, not held open indefinitely.
+    #[tokio::test]
+    async fn stdio_idle_timeout_cancels_root_without_eof() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let probe = EofProbeServer {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            Some(Duration::from_millis(50)),
+            None,
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        // Deliberately never write anything and never drop `client_io`: the
+        // pipe stays open exactly like an abandoned bridge's client — this
+        // must still be reaped once the idle timeout elapses.
+        let reason = tokio::time::timeout(Duration::from_secs(2), running.waiting())
+            .await
+            .expect("idle timeout never closed the session")
+            .expect("rmcp service task panicked");
+        assert!(
+            root.is_cancelled(),
+            "idle timeout must cancel the exact root token passed into rmcp"
+        );
+        assert!(
+            matches!(
+                reason,
+                rmcp::service::QuitReason::Closed | rmcp::service::QuitReason::Cancelled
+            ),
+            "unexpected rmcp quit reason after idle timeout: {reason:?}"
+        );
+        drop(client_io);
+    }
+
+    /// Completes every `tools/call` immediately — unlike [`EofProbeServer`],
+    /// which blocks its handler on cancellation. Used where a test needs
+    /// requests to actually finish (dropping the transport's in-flight
+    /// count back to zero) rather than staying admitted forever.
+    #[derive(Clone)]
+    struct QuickProbeServer;
+
+    impl rmcp::ServerHandler for QuickProbeServer {
+        async fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResult, McpError> {
+            Ok(rmcp::model::CallToolResult::success(Vec::new()))
+        }
+    }
+
+    /// Acceptance: a live client with traffic inside every idle window
+    /// must never be reaped, even once total elapsed time exceeds the
+    /// timeout many times over.
+    #[tokio::test]
+    async fn stdio_idle_timeout_does_not_reap_client_with_intermittent_traffic() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let probe = QuickProbeServer;
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let idle_timeout = Duration::from_millis(150);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            Some(idle_timeout),
+            None,
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        // Five requests spaced well inside the 150ms idle window, totaling
+        // ~200ms — more than the timeout itself, but never a single gap that
+        // exceeds it.
+        for id in 1..=5u32 {
+            client_io
+                .write_all(
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\
+                         \"params\":{{\"name\":\"probe\",\"arguments\":{{}}}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        assert!(
+            !root.is_cancelled(),
+            "intermittent traffic inside every idle window must never trip the idle timeout"
+        );
+
+        // Real oracle: prove the timeout is actually
+        // armed on this exact transport/config rather than merely assumed.
+        // If the mechanism were silently disabled or ignored, `root` would
+        // never be cancelled here and this test would time out instead of
+        // passing — a stronger guard than the traffic-keeps-it-alive
+        // assertion above, which a disabled timeout would also satisfy.
+        tokio::time::timeout(idle_timeout * 6, running.waiting())
+            .await
+            .expect(
+                "idle timeout never fired once traffic stopped — the timeout \
+                 mechanism is not armed",
+            )
+            .expect("rmcp service task panicked");
+        assert!(
+            root.is_cancelled(),
+            "idle timeout must fire once traffic genuinely stops, proving it \
+             is armed for this test"
+        );
+        drop(client_io);
+    }
+
+    #[derive(Clone)]
+    struct SlowProbeServer {
+        started: Arc<tokio::sync::Notify>,
+        delay: Duration,
+    }
+
+    impl rmcp::ServerHandler for SlowProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let started = self.started.clone();
+            let delay = self.delay;
+            async move {
+                started.notify_one();
+                tokio::time::sleep(delay).await;
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// High-severity regression: rmcp keeps racing
+    /// `transport.receive()` while an admitted request runs in its own task,
+    /// so a handler that outlives the idle window must still complete and
+    /// return its response rather than being cancelled by the next
+    /// `receive()` timing out.
+    #[tokio::test]
+    async fn stdio_idle_timeout_does_not_cancel_an_admitted_long_running_request() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler_delay = Duration::from_millis(300);
+        let idle_timeout = Duration::from_millis(50);
+        let probe = SlowProbeServer {
+            started: started.clone(),
+            delay: handler_delay,
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            Some(idle_timeout),
+            None,
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (mut client_read, mut client_write) = tokio::io::split(client_io);
+
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write one real JSON-RPC tool request");
+
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("rmcp never admitted the request handler");
+
+        // The handler keeps running well past several idle windows while the
+        // wire itself sends nothing further — this must not be reaped.
+        tokio::time::sleep(idle_timeout * 4).await;
+        assert!(
+            !root.is_cancelled(),
+            "an admitted in-flight request must not be cancelled by the wire-idle timeout"
+        );
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), client_read.read(&mut buf))
+            .await
+            .expect("the long-running handler never produced its response")
+            .expect("read error on the client side of the duplex pipe");
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("\"id\":1"),
+            "expected a JSON-RPC response for request id=1, got: {response}"
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: a request must stay "in flight" — and
+    /// therefore protected from the idle-close branch — until its response
+    /// has actually *finished writing*, not merely been handed to
+    /// `inner.send`. rmcp spawns the response send and the framed write
+    /// awaits the transport writer, so a slow/backpressured reader can leave
+    /// the write pending well after the handler itself already completed.
+    /// Before the fix, `in_flight` was decremented synchronously inside
+    /// `send` before the returned future was even polled, so this scenario
+    /// would have been misread as an idle session and the root token
+    /// cancelled out from under the still-undelivered response.
+    #[tokio::test]
+    async fn stdio_idle_timeout_does_not_cancel_while_a_response_write_is_backpressured() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let probe = QuickProbeServer;
+        let root = tokio_util::sync::CancellationToken::new();
+        // An 8-byte buffer for the server->client direction: the JSON-RPC
+        // response cannot fully land without the reader draining it, which
+        // this test deliberately never does — that is what keeps the write
+        // pending.
+        let (server_io, mut client_io) = tokio::io::duplex(8);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let idle_timeout = Duration::from_millis(50);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            Some(idle_timeout),
+            None,
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        client_io
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write one real JSON-RPC tool request");
+
+        // The handler itself finishes almost immediately (`QuickProbeServer`),
+        // but with nobody reading `client_io`, the response write cannot
+        // drain into the 8-byte pipe. This must not be read as idle across
+        // several idle windows.
+        tokio::time::sleep(idle_timeout * 4).await;
+        assert!(
+            !root.is_cancelled(),
+            "an admitted request's still-undelivered response must not be read as an idle session"
+        );
+
+        drop(client_io);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: a response write that never resolves — a peer
+    /// that admits a request, then never reads its response and never
+    /// disconnects — must itself be bounded by `response_deadline`, not
+    /// merely deferred by the idle-close check forever. This is the
+    /// assertion that reddens if the response-delivery deadline is removed
+    /// (passed as `None`): `root` would then never be cancelled and the
+    /// poll loop below would exhaust its bound without ever observing
+    /// cancellation.
+    #[tokio::test]
+    async fn stdio_idle_timeout_reaps_a_peer_that_stops_reading_its_response() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let probe = QuickProbeServer;
+        let root = tokio_util::sync::CancellationToken::new();
+        // Same 8-byte-buffer trick as the test above: the response cannot
+        // fully land without the reader draining it. Unlike that test, this
+        // one never reads from `client_io` and never drops it — the pipe
+        // stays open exactly like a peer that admitted a request and then
+        // simply stopped reading.
+        let (server_io, mut client_io) = tokio::io::duplex(8);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let response_deadline = Duration::from_millis(150);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            Some(response_deadline),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        client_io
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write one real JSON-RPC tool request");
+
+        // The core claim: root cancellation — the actual reaping signal —
+        // must land within `response_deadline` of admission, not merely
+        // "eventually". Polled rather than slept for the full bound so this
+        // resolves as soon as it happens and reddens immediately (via the
+        // assertion below) if the response-delivery deadline stops firing.
+        let bound = response_deadline + Duration::from_millis(500);
+        let poll_deadline = tokio::time::Instant::now() + bound;
+        while !root.is_cancelled() && tokio::time::Instant::now() < poll_deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "the response-delivery deadline must cancel the root token within {bound:?} of \
+             admission — a peer that admits a request and stops reading its response must not \
+             pin the session"
+        );
+
+        // The abandoned write is dropped (not merely deferred) on timeout,
+        // which releases rmcp's internal transport-write lock — so the
+        // post-cancellation drain's `close()` is not itself blocked on that
+        // same stuck write, and `waiting()` resolves promptly rather than
+        // riding out rmcp's multi-second drain window.
+        let reason = tokio::time::timeout(Duration::from_secs(2), running.waiting())
+            .await
+            .expect("rmcp never finished closing after the response-delivery deadline")
+            .expect("rmcp service task panicked");
+        assert!(
+            matches!(
+                reason,
+                rmcp::service::QuitReason::Closed | rmcp::service::QuitReason::Cancelled
+            ),
+            "unexpected rmcp quit reason after the response-delivery deadline: {reason:?}"
+        );
+        drop(client_io);
+    }
+
+    /// Distinguishes handler behavior by tool name: `"slow"` blocks for
+    /// `slow_delay` (keeping `in_flight` above zero across several idle
+    /// windows), `"quick"` (or anything else) completes immediately — used
+    /// to admit a second request while the first is still running.
+    #[derive(Clone)]
+    struct MixedDelayServer {
+        slow_started: Arc<tokio::sync::Notify>,
+        slow_delay: Duration,
+    }
+
+    impl rmcp::ServerHandler for MixedDelayServer {
+        fn call_tool(
+            &self,
+            request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let slow_started = self.slow_started.clone();
+            let slow_delay = self.slow_delay;
+            let is_slow = request.name.as_ref() == "slow";
+            async move {
+                if is_slow {
+                    slow_started.notify_one();
+                    tokio::time::sleep(slow_delay).await;
+                }
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// Regression: while an admitted request is still
+    /// running, deferring the idle close must not discard a second request
+    /// that arrives fragmented across the deferred window. Before the fix,
+    /// each deferral called `self.inner.receive()` fresh; rmcp's line-buffered
+    /// receive clears its buffer at the start of every call, so a chunk
+    /// already consumed before the timeout fired was silently dropped and
+    /// the remainder parsed as an invalid/garbage line — losing the second
+    /// request even though the session itself correctly stayed open.
+    #[tokio::test]
+    async fn stdio_idle_timeout_preserves_a_fragmented_request_while_another_is_in_flight() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let slow_started = Arc::new(tokio::sync::Notify::new());
+        let slow_delay = Duration::from_millis(400);
+        let idle_timeout = Duration::from_millis(50);
+        let probe = MixedDelayServer {
+            slow_started: slow_started.clone(),
+            slow_delay,
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            Some(idle_timeout),
+            None,
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (mut client_read, mut client_write) = tokio::io::split(client_io);
+
+        // Admit request 1: the slow handler keeps `in_flight` above zero for
+        // `slow_delay`, so every idle window in between must be deferred
+        // rather than closing the session.
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write slow request");
+        tokio::time::timeout(Duration::from_secs(2), slow_started.notified())
+            .await
+            .expect("slow handler never started");
+
+        // While request 1 is still in flight, write request 2 split into two
+        // chunks with a gap longer than the idle timeout, so the deferred-
+        // close loop iterates at least once between them.
+        let full = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\
+                     \"params\":{\"name\":\"quick\",\"arguments\":{}}}\n";
+        let full_bytes = full.as_bytes();
+        let split_at = full_bytes.len() / 2;
+        client_write
+            .write_all(&full_bytes[..split_at])
+            .await
+            .expect("write first half of the fragmented request");
+
+        tokio::time::sleep(idle_timeout * 3).await;
+        assert!(
+            !root.is_cancelled(),
+            "the still-running slow request must defer the idle close across the gap"
+        );
+
+        client_write
+            .write_all(&full_bytes[split_at..])
+            .await
+            .expect("write second half of the fragmented request");
+
+        // Both responses must arrive intact — id=1 once the slow handler
+        // finishes, id=2 as soon as the reassembled line is parsed.
+        let mut buf = vec![0u8; 8192];
+        let mut collected = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !(collected.contains("\"id\":1") && collected.contains("\"id\":2")) {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("did not receive both responses in time; got: {collected}");
+            }
+            let n = tokio::time::timeout(Duration::from_secs(2), client_read.read(&mut buf))
+                .await
+                .expect("read timed out waiting for a response")
+                .expect("read error on the client side of the duplex pipe");
+            collected.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(
+            collected.contains("\"id\":2"),
+            "the fragmented second request must be reassembled and answered intact; got: {collected}"
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
     }
 
     #[tokio::test]
@@ -7449,5 +7992,39 @@ mod request_read_cancellation_tests {
                 );
             }
         }
+    }
+
+    // ── KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 must not disable the bound ──
+
+    /// The response-delivery deadline used to treat `0` as "disable
+    /// the bound", mirroring `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS=0`. Unlike the
+    /// idle timeout, an unbounded response-delivery deadline restores the
+    /// exact defect this deadline exists to close (a peer that admits a
+    /// request and stops reading pins the bridge's response write forever)
+    /// — so `0` is now a hard startup error instead of a supported opt-out.
+    #[test]
+    #[serial_test::serial]
+    fn response_deadline_from_env_rejects_zero() {
+        std::env::set_var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS", "0");
+        let result = stdio_bridge_response_deadline_from_env();
+        std::env::remove_var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS");
+
+        let error = result.expect_err(
+            "KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 must be rejected, not silently accepted \
+             as \"disable the bound\"",
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS"),
+            "error must name the offending variable: {rendered}"
+        );
+        assert!(
+            rendered.contains("=0"),
+            "error must name the rejected value: {rendered}"
+        );
+        assert!(
+            rendered.contains("1..=u64::MAX"),
+            "error must state the accepted range: {rendered}"
+        );
     }
 }
