@@ -331,6 +331,31 @@ pub trait NoteStore: Send + Sync + 'static {
             message: "this backend does not implement guarded note replacement".into(),
         })
     }
+    /// Insert a note only if no row already holds its id, reporting whether
+    /// this call is the one that inserted it.
+    ///
+    /// This closes the other half of the read-modify-write race that
+    /// [`NoteStore::replace_note_if_unchanged`] closes. That one protects a
+    /// caller who read an existing row; this one protects a caller who read
+    /// *no* row. Where the id is derived rather than freshly generated — a
+    /// deterministic per-subject id — two callers can both read absence and
+    /// both write, and an upsert resolves that by overwriting, so the first
+    /// caller's write is lost with no error on either side. Returns `false`
+    /// when a row already existed, which the caller maps to a conflict rather
+    /// than to success.
+    ///
+    /// The pre-existing row is left exactly as it is: this must not be
+    /// implemented as an upsert, since overwriting is the behaviour being
+    /// avoided. The default returns `Unsupported` for that reason, rather
+    /// than falling back to `upsert_note` and silently reintroducing the
+    /// race under a name that promises otherwise.
+    async fn insert_note_if_absent(&self, _note: Note) -> StorageResult<bool> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "insert_note_if_absent".into(),
+            message: "this backend does not implement guarded note insertion".into(),
+        })
+    }
     /// Insert or update a batch of notes.
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary>;
     /// Fetch a note by UUID, returning `None` if absent.
