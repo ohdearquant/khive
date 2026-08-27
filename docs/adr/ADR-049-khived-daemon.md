@@ -429,10 +429,16 @@ later retry of this process, so that a supervisor restart is the remedy.
 
 Transience is not the test. A rollout in which an older daemon answers the probe
 can last hours and still exits 0, because no number of restarts of this process
-ends it. A peer caught between fork and bind lasts milliseconds and **in state
-12** also exits 0, because the other process is the one that resolves it.
-Conversely a reply that failed to parse may be a one-off and exits nonzero,
-because retrying is exactly what might succeed.
+ends it. Conversely a reply that failed to parse may be a one-off and exits
+nonzero, because retrying is exactly what might succeed. How long a condition
+lasts and who resolves it are independent properties, and only the second one is
+the test.
+
+An earlier draft made that point with a peer caught between fork and bind,
+offered as the short-lived case that still exits 0. That example is withdrawn:
+the code publishes the socket before the pid file, so no observation of a
+booting peer produces state 12 at all. The open note below records the reading
+at source.
 
 **What "who resolves it" asks, stated once.** Nonzero asks whether a later
 attempt of this process can observe a _different classification_, not whether
@@ -444,32 +450,54 @@ published cannot be re-observed differently, so no retry reaches a different
 classification and it exits 0. State 7 is nonzero on the state 8 reading: a peer
 that did not answer within the deadline may answer within the next one.
 
-**Second clause: where a live recorded pid is shared, the socket names that
-pid's trajectory.** Asking only whether a later attempt observes a different
+**OPEN: the split between exit 4 and exit 0 for states 9 and 12 is currently
+unlicensed.** Asking only whether a later attempt observes a different
 classification is necessary but not sufficient, because it is true of both
-states 9 and 12. They arise from the same instant of the same race and only the
-socket separates them, so on the first clause alone the split between exit 4 and
-exit 0 is unlicensed. What licenses it is which classification the trajectory
-leads to: binding by this process, or refusal by an owner.
+states. They arise from the same instant of the same race and only the socket
+separates them, so the class rule alone does not say which of them gets a
+retryable code.
 
-A socket present with a live recorded pid that refuses connections is a daemon
-_past_ its listener. The lifecycle rule above requires that on SIGTERM/SIGINT a
-daemon stop accepting, drain in-flight requests, and only then remove the socket
-and the PID file, so a refusing socket with its owner still alive is that daemon
-draining, and its next state is death. That death lands in whichever of the two
-genuinely stale states applies: state 11 when the drain completed its own
-cleanup, state 10 when the socket outlived the process. Both are states this
-process resolves by cleaning up and binding, so the resolver is a later attempt
-of this process and nonzero stands. State 9 keeps exit 4.
+An earlier version of this section supplied that license with a trajectory
+argument: a socket present with a live refusing owner was said to be a daemon
+_past_ its listener, and a live recorded pid with no socket a peer _before_ its
+listener, whose next state is ownership. **That argument is withdrawn.** Three
+facts, each read at source, are why. They are recorded here so the question is
+not reopened from the same premise:
 
-A live recorded pid with no socket is _before_ its listener. Its next state is
-ownership, which a later attempt observes as state 1, so the resolver is the
-other process, and a supervisor restart loop is the harm the code has to avoid.
-State 12 keeps exit 0.
+1. **Boot publishes the socket before the pid file.** In
+   `crates/khive-runtime/src/daemon.rs`, `UnixListener::bind(&sock)` is at line
+   1644 and `write_pid_file_exclusive(&pid_file)` at line 1662, with only the
+   chmod and the socket-identity capture between them. A booting peer therefore
+   has a socket before it has a pid record, so "no socket, live recorded pid"
+   cannot be a peer caught between fork and bind: the pid file does not exist
+   yet at that point in boot.
 
-The bind-to-listen gap does reach state 9, for at most one attempt, and it is
-harmless there: the retry meets state 1 and exits 0, at a cost of one supervisor
-restart.
+2. **Shutdown runs the other way.** The lifecycle rule earlier in this document
+   has SIGTERM/SIGINT stop accepting, drain in-flight requests, then remove
+   socket and PID file, in that order. The window in which the socket is gone
+   while the pid file still names a live process is therefore LATE SHUTDOWN, not
+   early boot. Read against the code, a state 12 observation is at least as
+   consistent with a daemon about to exit — whose next state is 11, which this
+   process resolves by binding — as with one about to bind. That reading argues
+   for nonzero, the opposite of what the table gives it.
+
+3. **A live recorded pid proves nothing about ownership, in either state.**
+   Liveness is `kill(pid, 0)` (`daemon.rs:1943-1996`) and the incumbent check is
+   a plain connect. Neither establishes that the recorded pid owns the socket,
+   or that it is a khived at all. So a state 9 observation does not license
+   "past its listener" either: daemon A can bind, write pid p, crash before
+   cleanup, leave a socket that refuses connections, and the OS can reuse p for
+   an unrelated live process. This document already says elsewhere that a live
+   pid may belong to an unrelated long-lived process; the withdrawn clause
+   forgot it.
+
+Neither state licenses a trajectory reading, then, and these exit codes are
+normative for supervisors. **The codes in the table below are UNCHANGED and
+remain what implementations follow.** What is open is their justification, and
+it is tracked here rather than asserted. Resolving it is deliberately out of
+scope for this amendment: the classification is already the improvement over the
+code, and inventing a second mechanism to replace a refuted one, in the round
+that refuted it, is how the first one got here.
 
 **Codes are numeric and distinct, not merely "nonzero".** A supervisor and an
 end-to-end test both need to tell these apart, and "nonzero" is a class, not a
@@ -517,7 +545,7 @@ old value reads a retired code rather than silently inheriting a reused one.
 | 9   | Connection refused, pid live                      | `ECONNREFUSED`, pid running                                                                                                                                          | Refuse; name the pid                                                                                                                                                                                   | 4    |
 | 10  | Connection refused, no live listener              | `ECONNREFUSED`, and the recorded pid is not running OR no usable pid record exists (file absent, empty, or not parseable as a pid)                                   | Clean up and bind                                                                                                                                                                                      | —    |
 | 11  | No socket, no live pid                            | socket absent, and the recorded pid is not running OR no usable pid record exists (file absent, empty, or not parseable as a pid) — the same predicate state 10 uses | Clean up and bind                                                                                                                                                                                      | —    |
-| 12  | No socket, pid live, FOREIGN pid                  | socket absent, pid running, and the pid is NOT this process                                                                                                          | Refuse; name the pid AND its command line                                                                                                                                                              | 0    |
+| 12  | No socket, pid live, incumbency not permitted     | socket absent, pid running, and EITHER the pid is not this process OR same-process incumbency is not permitted                                                       | Refuse; name the pid AND its command line                                                                                                                                                              | 0    |
 | 12s | No socket, pid live, THIS process                 | socket absent, pid running, the pid IS this process, and same-process incumbency is permitted                                                                        | `MayBind` — boot has not lost the fence to anyone, so it proceeds to bind                                                                                                                              | —    |
 | 13  | Other connect error (`EACCES`, `ENOTSOCK`, …)     | connect fails, not refused                                                                                                                                           | Refuse; name the errno. Never retry, kill, or spawn (Amendment 4)                                                                                                                                      | 0    |
 | 14  | Namespace mismatch (**defensive**, not reachable) | connect ok, `namespace_mismatch` — no conforming daemon sets this since ADR-096 Fork 1, and a peer old enough to set it fails the version check first                | Refuse; name both namespaces. Never unlink, never replace                                                                                                                                              | 0    |
@@ -542,7 +570,9 @@ order:
 
 1. No socket → state 11 if there is no live recorded pid; otherwise state 12s
    if that pid is this process and same-process incumbency is permitted, else
-   state 12.
+   state 12. That `else` is exhaustive by construction, and state 12's predicate
+   admits everything it carries: the foreign-pid case, and the same-process case
+   where incumbency is not permitted.
 2. Connect fails → state 9, 10, or 13, by errno and pid record.
 3. Connect succeeds, nothing parseable within the deadline → state 7.
 4. Bytes returned that do not deserialize → state 8.
@@ -666,13 +696,15 @@ easy to invert:
   legitimate rather than an error. Blocking and re-probing belong to the
   client-side recoverer, never to daemon boot.
 
-  State 12 is transient — a peer between fork and bind — and an earlier draft of
-  this amendment classed refusals by transience, which put state 12 in the
-  retryable class and exited nonzero. It was wrong, and working out why is what
-  produced the rule now stated above: the resolver of state 12 is the _other_
-  process, which is already booting and will own the rendezvous. Restarting this
-  one cannot help, and a restart loop is the likely result. Exit 0 encodes
-  "someone else has this", not "nothing is wrong".
+  An earlier draft of this amendment classed refusals by transience, which put
+  state 12 in the retryable class and exited nonzero. It was wrong, and working
+  out why is what produced the rule now stated above: where the resolver is the
+  _other_ process, restarting this one cannot help, and a restart loop is the
+  likely result. Exit 0 encodes "someone else has this", not "nothing is wrong".
+  That same draft called state 12 transient, a peer between fork and bind. That
+  description is withdrawn for the reason recorded in the open note above, and
+  the exit code now rests on the class rule with its justification tracked as
+  open, not on that mechanism.
 
   **The refusal must name the pid AND its command line**, because the class rule
   has one failure mode and this is it. A pid file can outlive its writer and the
@@ -687,16 +719,30 @@ easy to invert:
   recycled pid. A refusal that prints the bare number leaves them with nothing to
   act on and no signal that anything is wrong.
 
-  **The same-process case is state 12s, not an exception buried in state 12.**
-  When the recorded pid is this process and same-process incumbency is
-  permitted, boot has not lost the fence to anyone — it IS the incumbent — so
-  the disposition is `MayBind` and there is no exit at all. An earlier draft
-  wrote that as a conditional clause inside state 12's disposition, which left
-  an implementer following the exit enumeration with no named outcome for it
-  while state 12's own exit 0 was correct only for the foreign-pid half. It is
-  its own row now, and the precedence names it. It remains the only state where
-  a live recorded pid yields `MayBind`, licensed solely by that pid being this
-  process.
+  **The same-process case splits on whether incumbency is permitted, and both
+  halves are classified.** When the recorded pid is this process and
+  same-process incumbency IS permitted, boot has not lost the fence to anyone —
+  it IS the incumbent — so the disposition is `MayBind`, there is no exit at
+  all, and that is state 12s. An earlier draft wrote that as a conditional
+  clause inside state 12's disposition, which left an implementer following the
+  exit enumeration with no named outcome for it; it is its own row now, and the
+  precedence names it.
+
+  When same-process incumbency is NOT permitted, the observation is state 12 and
+  refuses. **That is the production path**, not a corner: `run_daemon` is called
+  with `allow_same_process_incumbent = false`
+  (`crates/khive-runtime/src/daemon.rs:1327`; the `true` path at `:1348` is the
+  in-process test entry). A previous version of state 12's predicate required
+  the pid NOT be this process, which left that production-reachable observation
+  routed by precedence into a state whose own predicate it failed, with no
+  disposition and no exit code covering it — an unclassified observation inside
+  a table whose whole claim is that classification is closed. State 12's
+  predicate now admits it, and the disposition needs no special case: naming the
+  pid and its command line prints this process's own line, which is exactly the
+  tell an operator needs to see that boot refused itself rather than a stranger.
+
+  12s remains the only state in which a live recorded pid yields `MayBind`,
+  licensed solely by that pid being this process with incumbency permitted.
 
 ### Replacing a live incumbent — out of scope
 
