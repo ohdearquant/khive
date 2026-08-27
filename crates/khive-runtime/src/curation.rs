@@ -4138,11 +4138,26 @@ mod tests {
     /// landed). This test forces the interleaving with a `Barrier` — both
     /// readers are released together, so both `prepare_update_entity` calls
     /// observe the SAME pre-write revision (asserted below) — then commits
-    /// deterministically in a fixed A-then-B order. It reddens if the
-    /// `AND ?8 > updated_at` / `updated_at = ?13` predicate is dropped from
-    /// `entity_replace_if_unchanged_statement`: with an unconditional UPDATE
-    /// (or `entity_upsert_statement`), B's write would also return `true`
-    /// and `b` would be lost from the final properties.
+    /// deterministically in a fixed A-then-B order. It reddens if the guard
+    /// is dropped from `entity_replace_if_unchanged_statement` ENTIRELY: with
+    /// an unconditional UPDATE (or `entity_upsert_statement`), B's write would
+    /// also return `true` and `b` would be lost from the final properties.
+    ///
+    /// It does NOT redden on a single-conjunct removal, and that is measured,
+    /// not assumed: in this fixture `updated_at = ?13` and `?8 > updated_at`
+    /// are each independently sufficient to refuse B, so tautologizing either
+    /// one alone leaves this test green. Attribution to a specific conjunct
+    /// therefore comes from the isolating fixtures —
+    /// `entity_cas_refuses_a_replacement_revision_that_does_not_advance` for
+    /// the strict-advance conjunct, and
+    /// `production_update_entity_refuses_concurrent_stale_writer`, which does
+    /// redden on the `?13`/`?14` half alone.
+    ///
+    /// SCOPE: this exercises the STORE PRIMITIVE directly and never invokes
+    /// `update_entity`, so it stays green if the production caller is reverted
+    /// to an unconditional write. The wiring is covered separately by
+    /// `production_update_entity_refuses_concurrent_stale_writer`; both are
+    /// required, neither substitutes for the other.
     #[tokio::test]
     async fn concurrent_entity_property_patches_from_one_revision_only_one_survives() {
         let rt = Arc::new(rt());
@@ -4332,6 +4347,78 @@ mod tests {
         );
     }
 
+    /// Isolating fixture for the `AND ?8 > updated_at` conjunct of
+    /// `entity_replace_if_unchanged_statement`.
+    ///
+    /// The concurrent-race tests above cannot cover it: in their fixture the
+    /// revision guard (`updated_at = ?13`) and the strict-advance guard
+    /// (`?8 > updated_at`) are each independently sufficient to refuse the
+    /// losing writer, so neither test reddens when only one conjunct is
+    /// removed. Measured by mutation against this suite: tautologizing
+    /// `updated_at = ?13` + `deleted_at IS ?14` reddens only
+    /// `production_update_entity_refuses_concurrent_stale_writer`;
+    /// tautologizing `?8 > updated_at` alone reddened NOTHING in
+    /// `khive-runtime` before this test existed; only defeating all three at
+    /// once reddens the race tests. This test strips the second mechanism:
+    /// it supplies the CORRECT expected revision and deletion marker, so
+    /// `?13`/`?14` are satisfied by construction, and the ONLY thing that can
+    /// refuse the write is the strict-advance conjunct.
+    #[tokio::test]
+    async fn entity_cas_refuses_a_replacement_revision_that_does_not_advance() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "NonAdvancing",
+                None,
+                Some(serde_json::json!({"a": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let (mut replacement, _, _, expected_updated_at, expected_deleted_at) = rt
+            .prepare_update_entity(
+                &tok,
+                id,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"a": 1})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepare update");
+
+        // Force the replacement revision to EQUAL the stored one. `?13`/`?14`
+        // still match exactly, so this is not a stale-snapshot refusal — the
+        // only predicate that can reject it is `?8 > updated_at`.
+        replacement.updated_at = expected_updated_at;
+
+        let store = rt.entities(&tok).expect("entity store");
+        let committed = store
+            .replace_entity_if_unchanged(replacement, expected_updated_at, expected_deleted_at)
+            .await
+            .expect("CAS query");
+        assert!(
+            !committed,
+            "a replacement whose revision does not strictly advance past the stored one must \
+             be refused: without `?8 > updated_at` the CAS would accept a write that leaves \
+             `updated_at` unmoved, so a later writer holding the same snapshot would still \
+             see its expected revision match and overwrite this one"
+        );
+
+        let stored = rt.get_entity(&tok, id).await.expect("read back");
+        assert_eq!(
+            stored.properties,
+            Some(serde_json::json!({"a": 0})),
+            "the refused write must not have landed"
+        );
+    }
+
     /// Regression: the entity CAS requires the replacement revision to be
     /// STRICTLY greater than the stored one. If the replacement is computed
     /// as a raw `Utc::now()` read, a stored revision that is at or ahead of
@@ -4343,6 +4430,15 @@ mod tests {
     /// revision one full second into the future (far outside normal clock
     /// skew) and asserts the update still succeeds instead of surfacing a
     /// spurious conflict.
+    ///
+    /// SCOPE: this is a revision-clamp test, NOT CAS regression coverage. Its
+    /// assertion is that the write SUCCEEDS, which an unconditional UPDATE
+    /// also satisfies, so it stays green if the `updated_at = ?13` /
+    /// `?8 > updated_at` guard is dropped entirely. The guard's regression
+    /// coverage is
+    /// `concurrent_entity_property_patches_from_one_revision_only_one_survives`
+    /// (primitive) and `production_update_entity_refuses_concurrent_stale_writer`
+    /// (production wiring); do not count this test toward it.
     #[tokio::test]
     async fn update_entity_succeeds_when_stored_revision_is_ahead_of_wall_clock() {
         let rt = rt();

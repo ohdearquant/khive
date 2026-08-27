@@ -803,8 +803,6 @@ async fn run_pending_events_on_with_lease(
                             "anonymous:local".to_string()
                         }
                     });
-                #[cfg(test)]
-                race_seam::pause_before_finalize_read().await;
                 let claim =
                     match claim_pending_event(rt, ns_str, id, occurrence_id, &receipt_actor, lease)
                         .await
@@ -1215,6 +1213,16 @@ async fn run_pending_events_on_with_lease(
                 // process's own intervening writes have already landed —
                 // can distinguish "nothing else touched this row since I last
                 // looked" from a genuine concurrent writer.
+                //
+                // The race seam parks HERE, not before the claim: a test that
+                // pauses earlier lands its concurrent write before the
+                // candidate-page snapshot is taken, so the page already carries
+                // that write and the test passes whether finalization rebuilds
+                // from the stale page or from this fresh read. Parked here, the
+                // write is genuinely between the claim and this read, which is
+                // the only window that separates the two behaviours.
+                #[cfg(test)]
+                race_seam::pause_before_finalize_read().await;
                 let expected_properties = match current_note_properties_text(rt, ns_str, id).await {
                     Ok(Some(text)) => text,
                     Ok(None) => {
@@ -6439,10 +6447,13 @@ mod tests {
             }))
         };
 
-        // Block until the drain task has genuinely parked at the seam
-        // (before its candidate-page query), THEN write, THEN release it —
-        // guaranteeing the write lands strictly between the drain's
-        // page-query snapshot and its later fresh pre-finalize read.
+        // Block until the drain task has genuinely parked at the seam — which
+        // sits AFTER the candidate-page query and the claim, immediately
+        // before the fresh pre-finalize read — THEN write, THEN release it.
+        // That placement is what makes the write land strictly between the
+        // page-query snapshot and the fresh read: parked any earlier, the
+        // write would already be inside the page snapshot and the test would
+        // pass whether finalization used the stale page or the fresh read.
         gate.reached.wait().await;
 
         let mut writer = rt.sql().writer().await.expect("writer");

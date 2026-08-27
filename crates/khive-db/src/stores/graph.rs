@@ -408,11 +408,14 @@ pub fn edge_symmetric_update_inplace_statement(
 // Symmetric-relation update DML — atomic-only, commit-time self-guarding
 // variant (ADR-099 §B3).
 //
-// The four builders above are still what canonical `update_edge_symmetric_dml`
-// binds: it probes and branches synchronously INSIDE its own writer-task
-// transaction, with no other op interleaved between its probe and its write,
-// so its branch has no staleness exposure and is left untouched (control
-// group — canonical's tests must stay green).
+// Canonical `update_edge_symmetric_dml` binds the shared SQL constants above
+// directly, not the plan-shape builders — the builders are used by the atomic
+// prepare path. Canonical probes and branches synchronously INSIDE its own
+// writer-task transaction, with no other op interleaved between its probe and
+// its write, so the interleaving exposure the atomic path has does not arise
+// there. Canonical's absorption delete is nonetheless bound to the GUARDED
+// constant, because its snapshot is read before the transaction and can be
+// stale by the time the delete runs.
 //
 // The atomic path is structurally different: its conflict probe runs in the
 // async PREPARE phase, which for a multi-op `--atomic` unit completes for

@@ -7014,6 +7014,12 @@ mod tests {
     /// `updated_at = ?11 AND deleted_at IS ?12 AND ?6 > updated_at` predicate
     /// is dropped from `edge_replace_if_unchanged_statement`: B's write would
     /// then also return `true` and A's weight update would be lost.
+    ///
+    /// SCOPE: this exercises the STORE PRIMITIVE directly and never invokes
+    /// `update_edge`, so it stays green if the production caller is reverted
+    /// to an unconditional write. The wiring is covered separately by
+    /// `production_update_edge_non_symmetric_refuses_concurrent_stale_writer`;
+    /// both are required, neither substitutes for the other.
     #[tokio::test]
     async fn concurrent_edge_patches_from_one_revision_only_one_survives() {
         let rt = rt();

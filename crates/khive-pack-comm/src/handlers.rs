@@ -3482,6 +3482,12 @@ mod tests {
     /// `!... .unwrap()` assertion would fail to compile-flag the regression
     /// and the final `consecutive_failures`/`last_failure_at` assertions
     /// would observe B's fields instead of A's.
+    ///
+    /// SCOPE: this exercises the STORE PRIMITIVE directly and never invokes
+    /// `handle_heartbeat`, so it stays green if the handler is reverted to an
+    /// unconditional `upsert_note`. The wiring is covered separately by
+    /// `production_handle_heartbeat_refuses_concurrent_stale_writer`; both are
+    /// required, neither substitutes for the other.
     #[tokio::test]
     async fn concurrent_heartbeats_from_one_revision_only_one_survives() {
         let runtime = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
@@ -3712,6 +3718,15 @@ mod tests {
     /// `Utc::now().timestamp_micros()`, so forcing the stored snapshot ahead
     /// of wall-clock time reproduces both scenarios deterministically without
     /// a clock-injection seam.
+    ///
+    /// SCOPE: this is a revision-clamp test, NOT CAS regression coverage. Its
+    /// assertion is that the heartbeat write SUCCEEDS, which an unconditional
+    /// `upsert_note` also satisfies, so it stays green if the
+    /// `updated_at = ?13` / `?10 > updated_at` guard is dropped entirely. The
+    /// guard's regression coverage is
+    /// `concurrent_heartbeats_from_one_revision_only_one_survives` (primitive)
+    /// and `production_handle_heartbeat_refuses_concurrent_stale_writer`
+    /// (production wiring); do not count this test toward it.
     #[tokio::test]
     async fn handle_heartbeat_does_not_false_conflict_when_snapshot_is_ahead_of_wall_clock() {
         let runtime = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
