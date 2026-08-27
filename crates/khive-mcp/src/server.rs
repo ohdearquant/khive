@@ -7713,6 +7713,10 @@ mod request_read_cancellation_tests {
             "expected a JSON-RPC response for request id=1, got: {response}"
         );
 
+        // The obligation is discharged and the wire is quiet, but the pipe is
+        // still open — so only the timer can end this session now.
+        assert_idle_timer_was_armed(&root, idle_timeout).await;
+
         drop(client_write);
         let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
     }
@@ -7798,6 +7802,177 @@ mod request_read_cancellation_tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
     }
 
+    /// Positive oracle for the "does not cancel" tests.
+    ///
+    /// Each of those asserts a NON-event: that the idle timer did not fire
+    /// while something legitimate was in flight. A non-event passes just as
+    /// well against a build where the timer was never armed at all, so on its
+    /// own such a test cannot tell "correctly deferred" from "never
+    /// configured". This closes that hole from the other side: once whatever
+    /// was protecting the session is gone, the timer must actually close it —
+    /// **with the pipe still open**, so nothing but the timer can be what ended
+    /// the session. Call it before dropping the client side.
+    async fn assert_idle_timer_was_armed(
+        root: &tokio_util::sync::CancellationToken,
+        idle_timeout: Duration,
+    ) {
+        let deadline = std::time::Instant::now() + idle_timeout * 40 + Duration::from_secs(1);
+        while !root.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "the idle timer must close this session once nothing is protecting it, while the \
+             pipe is still open. Without this the non-cancellation assertion above would pass \
+             against a build whose idle timer was never armed."
+        );
+    }
+
+    /// Parks forever on the first call and answers every later one promptly,
+    /// so a test can produce out-of-order response completion: the request
+    /// admitted first stays outstanding while a later one completes.
+    #[derive(Clone)]
+    struct OutOfOrderProbeServer {
+        first_admitted: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl rmcp::ServerHandler for OutOfOrderProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let first_admitted = self.first_admitted.clone();
+            let calls = self.calls.clone();
+            async move {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    first_admitted.notify_one();
+                    // Never answers. This is the older obligation, and it is
+                    // the one whose TTL must govern when the session closes.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// High-severity regression: obligations must be retired by request id,
+    /// not oldest-first.
+    ///
+    /// rmcp spawns each handler and each response send independently, so a
+    /// newer request's response can finish before an older request's. Retiring
+    /// the oldest entry on any completion drops the *outstanding* request's
+    /// admission instant and leaves the *completed* one as the newest entry.
+    /// The freshness test then reads the completed request's timestamp, and the
+    /// idle close is deferred until that later instant ages out — so a handler
+    /// that never answers still delays reaping by the gap between the two
+    /// admissions, on top of the TTL. That is the leak the TTL closes,
+    /// reintroduced behind a timer.
+    ///
+    /// The fixture makes the gap the discriminator. Request 1 parks forever;
+    /// request 2 is admitted `ADMISSION_GAP` later and completes. Retiring by
+    /// id leaves request 1's instant, so the session closes at roughly
+    /// `OBLIGATION_TTL` after request 1. Retiring oldest-first leaves request
+    /// 2's, so it closes at roughly `ADMISSION_GAP + OBLIGATION_TTL`. The
+    /// assertion sits between the two, far enough from both that it measures
+    /// the guard rather than the scheduler.
+    #[tokio::test]
+    async fn stdio_idle_timeout_reaps_on_the_older_obligation_when_a_newer_one_completes_first() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use std::time::Instant;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const IDLE_TIMEOUT: Duration = Duration::from_millis(50);
+        // The gap must be SHORTER than the TTL, or request 1's obligation ages
+        // out and the session closes before request 2 is ever admitted.
+        const ADMISSION_GAP: Duration = Duration::from_millis(1500);
+        const OBLIGATION_TTL: Duration = Duration::from_millis(2000);
+        // Correct behaviour closes at ~2000ms after request 1; the defect
+        // closes at ~3500ms. 2750ms is the midpoint, 750ms clear of each.
+        const DISCRIMINATING_DEADLINE: Duration = Duration::from_millis(2750);
+
+        let first_admitted = Arc::new(tokio::sync::Notify::new());
+        let probe = OutOfOrderProbeServer {
+            first_admitted: first_admitted.clone(),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            Some(IDLE_TIMEOUT),
+            None,
+            Some(OBLIGATION_TTL),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (mut client_read, mut client_write) = tokio::io::split(client_io);
+
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write the request that will never be answered");
+        tokio::time::timeout(Duration::from_secs(2), first_admitted.notified())
+            .await
+            .expect("rmcp never admitted the first request handler");
+        let admitted_first = Instant::now();
+
+        tokio::time::sleep(ADMISSION_GAP).await;
+        assert!(
+            !root.is_cancelled(),
+            "the first obligation is still inside its TTL and must defer the idle close, \
+             otherwise the second request is never admitted and this test proves nothing"
+        );
+
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\",\"arguments\":{}}}\n",
+            )
+            .await
+            .expect("write the request that completes first");
+
+        // Read it, so the response WRITE finishes and its obligation is
+        // actually retired — handing the response to `send` is not enough.
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), client_read.read(&mut buf))
+            .await
+            .expect("the second handler never produced its response")
+            .expect("read error on the client side of the duplex pipe");
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("\"id\":2"),
+            "expected the SECOND request's response to arrive first, got: {response}"
+        );
+
+        let hard_deadline = Duration::from_secs(10);
+        while !root.is_cancelled() && admitted_first.elapsed() < hard_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "the session must close once the older obligation passes its TTL"
+        );
+        let closed_after = admitted_first.elapsed();
+        assert!(
+            closed_after < DISCRIMINATING_DEADLINE,
+            "the session must close on the OLDER obligation's TTL (~{}ms after its admission), \
+             not on the newer completed request's (~{}ms). Closed at {}ms, which means the \
+             completed request's admission instant was left in the queue and the outstanding \
+             one was dropped.",
+            OBLIGATION_TTL.as_millis(),
+            (ADMISSION_GAP + OBLIGATION_TTL).as_millis(),
+            closed_after.as_millis(),
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
     /// Regression: a request must stay "in flight" — and
     /// therefore protected from the idle-close branch — until its response
     /// has actually *finished writing*, not merely been handed to
@@ -7847,6 +8022,32 @@ mod request_read_cancellation_tests {
             !root.is_cancelled(),
             "an admitted request's still-undelivered response must not be read as an idle session"
         );
+
+        // Drain the response so the write completes and its obligation is
+        // retired. Nothing is protecting the session after that, and the pipe
+        // is still open, so the timer must be what closes it.
+        {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 4096];
+            let mut seen = String::new();
+            // Drain to the frame terminator, not to some substring inside the
+            // frame: `"id":1` lands in the first few bytes, and stopping there
+            // would leave the tail undrained, the write still pending, and the
+            // obligation therefore never retired.
+            while !seen.contains('\n') {
+                let n = tokio::time::timeout(Duration::from_secs(2), client_io.read(&mut buf))
+                    .await
+                    .expect("the backpressured response never drained")
+                    .expect("read error on the client side of the duplex pipe");
+                assert!(n > 0, "the pipe closed before the response fully drained");
+                seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            assert!(
+                seen.contains("\"id\":1"),
+                "the drained frame must be the response to the admitted request, got: {seen:?}"
+            );
+        }
+        assert_idle_timer_was_armed(&root, idle_timeout).await;
 
         drop(client_io);
         let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
@@ -8045,6 +8246,10 @@ mod request_read_cancellation_tests {
             collected.contains("\"id\":2"),
             "the fragmented second request must be reassembled and answered intact; got: {collected}"
         );
+
+        // Both obligations are discharged and the pipe is still open, so only
+        // the timer can end this session.
+        assert_idle_timer_was_armed(&root, idle_timeout).await;
 
         drop(client_write);
         let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;

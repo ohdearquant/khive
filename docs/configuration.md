@@ -313,10 +313,20 @@ is not: a supervised deployment, a CI harness, a batch runner.
 **Known gap.** The response-delivery deadline covers responses this transport
 writes. It does not cover parse-error responses, which the underlying line
 transport writes directly through its own framed writer without passing through
-the deadline. A peer that sends malformed input and then stops reading can
-leave that one write pending; with the idle timeout enabled it is bounded by
-the idle window, and with the idle timeout disabled it is not bounded. Closing
-that gap requires replacing or adapting the line transport and is tracked
+the deadline. A peer that sends malformed input and then stops reading can leave
+that one write pending.
+
+What bounds that pending write depends on what else the session has
+outstanding, and the idle window alone is not the answer:
+
+- Idle timeout disabled: nothing bounds it.
+- Idle timeout enabled, nothing else outstanding: the idle window bounds it.
+- Idle timeout enabled with a request still awaiting its response: the idle
+  close defers while that obligation is fresh, so the bound is the request
+  obligation TTL rather than the idle window. A peer can reach this deliberately
+  by admitting a request and then sending malformed input.
+
+Closing the gap requires replacing or adapting the line transport and is tracked
 separately.
 
 ## Troubleshooting a connect failure

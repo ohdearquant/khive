@@ -93,10 +93,20 @@ pub(crate) struct CancelOnEofTransport<T> {
     root: tokio_util::sync::CancellationToken,
     idle_timeout: Option<std::time::Duration>,
     response_deadline: Option<std::time::Duration>,
-    /// Admission instants of requests handed to rmcp whose response has not
-    /// finished writing. Ordered oldest-first; see the type doc for why the
-    /// instants matter and not just the count.
-    in_flight: Arc<Mutex<VecDeque<Instant>>>,
+    /// Requests handed to rmcp whose response has not finished writing, each
+    /// paired with the instant it was admitted. Ordered oldest-first; see the
+    /// type doc for why the instants matter and not just the count.
+    ///
+    /// Entries are keyed by request id because they are **not**
+    /// interchangeable. rmcp spawns each handler and each response send
+    /// independently, so a newer request's response can finish first. Retiring
+    /// the oldest entry on any completion would then drop a still-outstanding
+    /// request's admission and leave a *completed* one as the newest entry —
+    /// making the freshness test below read the completed request's timestamp
+    /// and defer past the older obligation's TTL. Removing the entry whose id
+    /// matches keeps `back()` the genuinely newest outstanding admission,
+    /// which is what the freshness rule assumes.
+    in_flight: Arc<Mutex<VecDeque<(rmcp::model::RequestId, Instant)>>>,
     /// How long an outstanding request keeps deferring the idle close. `None`
     /// defers without bound. See the type doc.
     obligation_ttl: Option<std::time::Duration>,
@@ -159,6 +169,16 @@ where
             item,
             rmcp::model::JsonRpcMessage::Response(_) | rmcp::model::JsonRpcMessage::Error(_)
         );
+        // Which obligation this write discharges. A `Response` always names
+        // its request. A `JsonRpcError` carries `Option<RequestId>`: the MCP
+        // spec omits the id when the server could not read it (parse error,
+        // invalid request), and such an error answers no admitted request, so
+        // it must retire nothing rather than retire an arbitrary one.
+        let retire_id: Option<rmcp::model::RequestId> = match &item {
+            rmcp::model::JsonRpcMessage::Response(response) => Some(response.id.clone()),
+            rmcp::model::JsonRpcMessage::Error(error) => error.id.clone(),
+            _ => None,
+        };
         let in_flight = self.in_flight.clone();
         let root = self.root.clone();
         let response_deadline = self.response_deadline;
@@ -184,15 +204,16 @@ where
                 },
                 _ => send.await,
             };
-            // Clear one obligation once the write is resolved either way — see
-            // the `in_flight` field doc for why a failed write must not be left
-            // permanently counted as pending. The oldest entry is dropped
-            // rather than this request's own: the entries are interchangeable
-            // for the freshness test the idle branch performs, and rmcp does
-            // not guarantee responses resolve in admission order.
-            if is_response {
+            // Clear THIS request's obligation once the write is resolved
+            // either way — see the `in_flight` field doc for why a failed
+            // write must not be left permanently counted as pending, and why
+            // the entry removed has to be the matching one rather than the
+            // oldest. An id-less error matches nothing and removes nothing.
+            if let Some(id) = retire_id {
                 if let Ok(mut q) = in_flight.lock() {
-                    q.pop_front();
+                    if let Some(position) = q.iter().position(|(entry, _)| *entry == id) {
+                        q.remove(position);
+                    }
                 }
             }
             result
@@ -234,7 +255,7 @@ where
                                 let fresh = in_flight
                                     .lock()
                                     .ok()
-                                    .and_then(|q| q.back().copied())
+                                    .and_then(|q| q.back().map(|(_, at)| *at))
                                     .is_some_and(|newest| match obligation_ttl {
                                         Some(ttl) => newest.elapsed() < ttl,
                                         None => true,
@@ -270,9 +291,9 @@ where
                     }
                     None => recv_fut.await,
                 };
-                if let Some(rmcp::model::JsonRpcMessage::Request(_)) = &message {
+                if let Some(rmcp::model::JsonRpcMessage::Request(request)) = &message {
                     if let Ok(mut q) = in_flight.lock() {
-                        q.push_back(Instant::now());
+                        q.push_back((request.id.clone(), Instant::now()));
                     }
                 }
                 if message.is_none() {
