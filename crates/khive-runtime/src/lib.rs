@@ -29,6 +29,7 @@ pub mod operations;
 pub mod pack;
 pub mod phase_events;
 pub mod portability;
+pub mod preference_verification;
 pub mod presentation;
 pub mod reference_resolution;
 pub mod reference_ring;
@@ -125,6 +126,7 @@ pub use pack::{
 };
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
+pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};
 pub use presentation::{
     apply_redundancy_drop, micros_to_iso, present, render_format, rfc3339_to_utc_micros,
     OutputFormat, PresentationMode,
