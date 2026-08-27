@@ -216,11 +216,20 @@ where
     /// disabled by default there is no later tick to notice. So the session
     /// would outlive the peer's ability to receive anything from it.
     ///
-    /// Gated on `is_response` deliberately. A response is the discharge of an
-    /// admitted obligation, so failing to write one means an admitted request
-    /// can never be answered on this session. Server-initiated requests carry
-    /// their own send accounting inside rmcp (`SendTaskResult::Request`), and
-    /// bringing them under this rule is a separate change.
+    /// **Every** failed outbound write cancels, not only a response. An
+    /// earlier version of this scoped the cancel to responses, on the ground
+    /// that a response discharges an admitted obligation while server-initiated
+    /// requests and notifications "carry their own send accounting inside rmcp
+    /// (`SendTaskResult::Request`)". That accounting exists and does not do
+    /// this job: on a failed request send, rmcp removes the caller's responder
+    /// and hands it `ServiceError::TransportSend`
+    /// (`rmcp-1.8.0`, `src/service.rs:1066-1073`); on a failed notification
+    /// send it does the same to the notification's responder (`:1074-1093`).
+    /// Neither branch breaks the serve loop, whose only exits are receive EOF,
+    /// token cancellation, and a send-task join error (`:1028-1062`). So a
+    /// failed request or notification write strands the session exactly as a
+    /// failed response did — the argument for the narrower rule pointed at a
+    /// mechanism without reading what it does, and is withdrawn.
     ///
     /// A failed write is reported once, here, whichever way it failed: the
     /// deadline arm's error names its own cause, so a second log line at the
@@ -261,20 +270,21 @@ where
                 _ => send.await,
             };
             // Either failure — the write outlived its deadline, or it resolved
-            // as an error — means this peer will not be receiving the answer to
-            // a request it was admitted to make. Close the session rather than
-            // fail one write and carry on; see the method doc for why the error
-            // case needs saying separately from the timeout case.
-            if is_response {
-                if let Err(error) = &result {
-                    tracing::warn!(
-                        %error,
-                        response_deadline_secs = response_deadline.map(|d| d.as_secs()),
-                        "stdio bridge could not deliver a response to its peer; closing this \
-                         session rather than leaving it alive with an unanswerable request"
-                    );
-                    root.cancel();
-                }
+            // as an error — means this peer is not receiving what the session
+            // just tried to send it, and rmcp will not close on its own behalf
+            // for any of the three message classes. Close here rather than fail
+            // one write and carry on; see the method doc for why this covers
+            // requests and notifications too, and why the error case needs
+            // saying separately from the timeout case.
+            if let Err(error) = &result {
+                tracing::warn!(
+                    %error,
+                    is_response,
+                    response_deadline_secs = response_deadline.map(|d| d.as_secs()),
+                    "stdio bridge could not deliver an outbound message to its peer; closing \
+                     this session rather than leaving it alive unable to answer"
+                );
+                root.cancel();
             }
             // Clear THIS request's obligation once the write is resolved
             // either way — see the `in_flight` field doc for why a failed

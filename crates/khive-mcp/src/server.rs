@@ -8150,12 +8150,23 @@ mod request_read_cancellation_tests {
         );
     }
 
-    /// Discriminating arm: the rule is scoped to responses on purpose, so a
-    /// failed NOTIFICATION write must leave the session alone. Without this,
-    /// the test above would also pass against a blanket cancel-on-any-write-
-    /// error, which is a wider change than the one being made.
+    /// A failed NOTIFICATION write closes the session too, and this test used
+    /// to assert the opposite. The rule was scoped to responses on the ground
+    /// that rmcp carried its own accounting for server-initiated messages. It
+    /// does carry accounting and the accounting does not close anything: a
+    /// failed notification send delivers `ServiceError::TransportSend` to the
+    /// notification's own responder (`rmcp-1.8.0` `src/service.rs:1074-1093`)
+    /// and a failed request send does the same to the caller's responder
+    /// (`:1066-1073`), while the serve loop's only exits are receive EOF, token
+    /// cancellation, and a send-task join error (`:1028-1062`). So the same
+    /// broken writer strands the session whatever class of message hit it.
+    ///
+    /// The discriminating arm is now
+    /// `notification_write_to_a_reading_peer_leaves_the_session_open`: without
+    /// it, this test would pass against a transport that cancelled on every
+    /// write, successful ones included.
     #[tokio::test]
-    async fn notification_write_that_fails_fast_leaves_the_session_open() {
+    async fn notification_write_that_fails_fast_also_closes_the_session() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use rmcp::transport::Transport;
 
@@ -8186,13 +8197,73 @@ mod request_read_cancellation_tests {
             ),
         });
 
-        let _ = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
             .await
-            .expect("a write to a closed pipe must fail fast, not wait out its deadline");
+            .expect("a write to a closed pipe must fail fast, not wait out its deadline")
+            .expect_err("a write to a closed pipe must not report success");
+
+        assert!(
+            !error.to_string().contains("deadline"),
+            "this must exercise the error path, not the deadline path: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "a notification that could not be written must close the session; rmcp hands the \
+             error to the notification's own responder and never breaks the serve loop"
+        );
+    }
+
+    /// Discriminating arm for the two fail-fast tests above. Without it, both
+    /// would pass against a transport that cancelled on every write rather than
+    /// on every FAILED write, which is a far worse rule than either.
+    #[tokio::test]
+    async fn notification_write_to_a_reading_peer_leaves_the_session_open() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+        use tokio::io::AsyncReadExt;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let (server_write, mut peer_read_side) = tokio::io::duplex(16 * 1024);
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        // This peer reads.
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let _ = peer_read_side.read(&mut buf).await;
+            buf
+        });
+
+        let message = rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            notification: rmcp::model::ServerNotification::ProgressNotification(
+                rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                    progress_token: rmcp::model::ProgressToken(
+                        rmcp::model::NumberOrString::Number(1),
+                    ),
+                    progress: 1.0,
+                    total: None,
+                    message: None,
+                }),
+            ),
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a reading peer must not hit the 2s test bound")
+            .expect("a write to a reading peer must succeed");
 
         assert!(
             !root.is_cancelled(),
-            "the cancel is scoped to responses; a failed notification must not close the session"
+            "a delivered notification must not close the session"
         );
+        let _ = reader.await;
     }
 }
