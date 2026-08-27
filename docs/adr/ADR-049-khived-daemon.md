@@ -427,7 +427,9 @@ retry of this process: an operator changing configuration, or another process
 resolving the rendezvous. Naming a possible resolver is not a finding that one
 exists. The code says only that the resolution lies outside this process. A
 refusal exits nonzero when the resolver IS a later retry of this process, so
-that a supervisor restart is the remedy.
+that under a supervisor configured to restart on nonzero a restart is the
+remedy. The codes are chosen for that policy; a supervisor configured otherwise
+reads them differently, and the choice is stated as a choice in Amendment 7.
 
 Transience is not the test. A rollout in which an older daemon answers the probe
 can last hours and still exits 0, because no number of restarts of this process
@@ -662,7 +664,8 @@ rule turns on who resolves the condition. A peer that published a
 identity positively. No number of restarts of this process changes what the
 incumbent echoes, so the resolver is an operator or the other process. An
 earlier draft folded both halves into state 5 and gave the pair exit 6, which
-told a supervisor to restart against a condition a restart cannot reach. The
+under the restart-on-nonzero policy tells a supervisor to restart against a
+condition a restart cannot reach. The
 reasoning is exactly the one already applied to an unequal
 `daemon_protocol_version` two steps earlier in the precedence: a positively
 refuted identity is not an unresolved one.
@@ -793,8 +796,8 @@ socket still exists, and no second listener was bound. A test that checks only
 the returned error passes while the socket is unlinked underneath a live
 process, which is precisely the failure being prevented. Each refuse state also
 asserts its exit code, since an otherwise-correct refusal carrying the wrong
-code either drives a supervisor restart loop or silently retires a retryable
-state.
+code either drives a restart loop under the restart-on-nonzero policy these
+codes are chosen for, or silently retires a retryable state.
 
 Where a state's test runs below process level, the exit code is asserted against
 the value the classification maps to rather than against a real process exit,
@@ -953,8 +956,12 @@ What the exit-code change does is raise the operational cost of omitting it.
 Under the restart-on-nonzero policy selected above, exit 0 makes the refusal
 terminal, so the message is the only channel the operator gets, and a refusal
 printing the bare number leaves them with nothing to act on. Under a policy that
-restarts on either status the message is no less necessary, because no restart
-of this process reaches the condition either way.
+restarts on either status the message is no less necessary: a restart may
+re-observe state 9, since the socket and the live pid can both be unchanged, but
+it cannot by itself establish who owns the rendezvous. That is Amendment 6's
+third fact and it is all that fact supports. Whether some restart eventually
+observes a different state depends on what happens outside this process, which
+is the point.
 
 ### Exit 4 is retired, not reused
 
