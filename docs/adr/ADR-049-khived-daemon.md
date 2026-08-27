@@ -698,6 +698,17 @@ writing this one and should not be rediscovered:
   name a testable substitute — never waive the element that detects the
   double-bind while still calling it mandatory.
 
+Two obligations belong to this classification contract rather than to the
+fixture recipe, and both are required here because their absence is what allowed
+the collapse this amendment corrects:
+
+- A test that starts a real live incumbent and drives each non-acknowledgement
+  class against it, asserting that startup never leaves two live daemons.
+
+Each state's guard carries a mutation control: defeat the guard, confirm that
+exactly that state's test fails, and restore from a snapshot rather than by
+reapplying an inverse edit.
+
 ### What is unchanged
 
 The convergence requirement, the client-side recoverer lock, the daemon-side
