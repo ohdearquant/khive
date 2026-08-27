@@ -25,9 +25,45 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{base_entity_rule_allows, canonical_edge_endpoints, endpoint_matches};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+/// Test-only pause point at the read/write boundary of a guarded
+/// read-modify-write, so a race between two concurrent callers of the same
+/// PRODUCTION entry point (not the underlying store primitive) can be
+/// reproduced deterministically instead of relying on scheduler luck or
+/// sleeps. A no-op unless the calling task runs inside
+/// `AFTER_READ_BARRIER.scope(...)`; production code never establishes that
+/// scope, so `pause_after_read` costs nothing outside these regression
+/// tests, and it does not exist at all in non-test builds.
+#[cfg(test)]
+pub(crate) mod race_seam {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    tokio::task_local! {
+        pub(crate) static AFTER_READ_BARRIER: Arc<Barrier>;
+    }
+
+    pub(crate) async fn pause_after_read() {
+        if let Ok(barrier) = AFTER_READ_BARRIER.try_with(Arc::clone) {
+            barrier.wait().await;
+        }
+    }
+}
+
 pub(crate) fn stale_note_snapshot_error(id: Uuid) -> RuntimeError {
     RuntimeError::Khive(KhiveError::conflict(format!(
         "note {id} changed concurrently after it was read; retry with fresh state"
+    )))
+}
+
+pub(crate) fn stale_entity_snapshot_error(id: Uuid) -> RuntimeError {
+    RuntimeError::Khive(KhiveError::conflict(format!(
+        "entity {id} changed concurrently after it was read; retry with fresh state"
+    )))
+}
+
+pub(crate) fn stale_edge_snapshot_error(id: Uuid) -> RuntimeError {
+    RuntimeError::Khive(KhiveError::conflict(format!(
+        "edge {id} changed concurrently after it was read; retry with fresh state"
     )))
 }
 
@@ -835,7 +871,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
         patch: EntityPatch,
-    ) -> RuntimeResult<(Entity, bool, Vec<&'static str>)> {
+    ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref name) = patch.name {
             crate::secret_gate::check(name)?;
@@ -854,6 +890,10 @@ impl KhiveRuntime {
             .get_entity(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
+        let expected_updated_at = entity.updated_at;
+        let expected_deleted_at = entity.deleted_at;
+        #[cfg(test)]
+        race_seam::pause_after_read().await;
 
         // ADR-014 tri-state: outer `None` = unchanged; `Some(None)` = explicit
         // clear (no vocabulary validation — there is no value to validate);
@@ -899,8 +939,26 @@ impl KhiveRuntime {
             changed_fields.push("entity_type");
         }
 
-        entity.updated_at = chrono::Utc::now().timestamp_micros();
-        Ok((entity, reindex_required, changed_fields))
+        // `updated_at` is also the optimistic-concurrency revision for
+        // full-entity replacement. Make it strictly advance even when two
+        // operations land inside one clock microsecond. Saturation is not a
+        // valid fallback: reusing i64::MAX would make the CAS accept a write
+        // without advancing its revision.
+        let minimum_updated_at = expected_updated_at.checked_add(1).ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "entity {id} updated_at is already at i64::MAX and cannot advance"
+            ))
+        })?;
+        entity.updated_at = chrono::Utc::now()
+            .timestamp_micros()
+            .max(minimum_updated_at);
+        Ok((
+            entity,
+            reindex_required,
+            changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+        ))
     }
 
     pub async fn update_entity(
@@ -921,11 +979,16 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
-        let (entity, reindex_required, changed_fields) =
+        let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
             self.prepare_update_entity(token, id, patch).await?;
 
         let store = self.entities(token)?;
-        store.upsert_entity(entity.clone()).await?;
+        let persisted = store
+            .replace_entity_if_unchanged(entity.clone(), expected_updated_at, expected_deleted_at)
+            .await?;
+        if !persisted {
+            return Err(stale_entity_snapshot_error(id));
+        }
 
         let embedding_report = if reindex_required {
             self.reindex_entity(token, &entity).await?
@@ -3616,6 +3679,8 @@ pub(crate) fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usiz
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
     use khive_storage::types::{Direction, TextFilter, TextQueryMode, TextSearchRequest};
@@ -4017,7 +4082,13 @@ mod tests {
             .await
             .unwrap();
 
-        let (prepared, reindex_required, changed_fields) = rt
+        let (
+            prepared,
+            reindex_required,
+            changed_fields,
+            _expected_updated_at,
+            _expected_deleted_at,
+        ) = rt
             .prepare_update_entity(
                 &tok,
                 entity.id,
@@ -4055,6 +4126,494 @@ mod tests {
             .await
             .expect_err("unregistered entity_type must be rejected");
         assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+    }
+
+    /// Regression for the entity lost-update race (khive #1753): two writers
+    /// read the same entity revision, then commit successive patches to
+    /// independent properties fields. Before the guarded
+    /// `replace_entity_if_unchanged` primitive, `update_entity_with_embedding_report`
+    /// wrote an unconditional `entity_upsert_statement`, so both patches
+    /// "succeeded" and the second silently discarded the first's field
+    /// (`a=1` was overwritten back to `a=0` when B's stale full-row replace
+    /// landed). This test forces the interleaving with a `Barrier` — both
+    /// readers are released together, so both `prepare_update_entity` calls
+    /// observe the SAME pre-write revision (asserted below) — then commits
+    /// deterministically in a fixed A-then-B order. It reddens if the guard
+    /// is dropped from `entity_replace_if_unchanged_statement` ENTIRELY: with
+    /// an unconditional UPDATE (or `entity_upsert_statement`), B's write would
+    /// also return `true` and `b` would be lost from the final properties.
+    ///
+    /// It does NOT redden when only `?8 > updated_at` is removed: with
+    /// `updated_at = ?13` intact, B is refused by the revision guard whatever
+    /// the clock did, so this fixture cannot see that conjunct disappear.
+    ///
+    /// It cannot ATTRIBUTE a failure to `updated_at = ?13` either, but for a
+    /// different reason, and the difference matters. Both racers take their
+    /// replacement revision from `prepare_update_entity`'s
+    /// `max(now_micros, expected + 1)` above; this test pins the two EXPECTED
+    /// revisions equal, never the two REPLACEMENT revisions. So with
+    /// `updated_at = ?13` removed, whether B is still refused depends on
+    /// whether B's wall-clock read happened to exceed A's committed revision.
+    /// That is a race, not a property of the fixture, and no single run of it
+    /// establishes either answer.
+    ///
+    /// Attribution therefore comes from fixtures that force the question:
+    /// `entity_cas_refuses_a_replacement_revision_that_does_not_advance` for
+    /// the strict-advance conjunct, and
+    /// `production_update_entity_refuses_concurrent_stale_writer` for the
+    /// production wiring. Making this fixture attribute as well would mean
+    /// pinning both replacement revisions to a common `expected + 1`; it is
+    /// deliberately left as a whole-guard test instead.
+    ///
+    /// SCOPE: this exercises the STORE PRIMITIVE directly and never invokes
+    /// `update_entity`, so it stays green if the production caller is reverted
+    /// to an unconditional write. The wiring is covered separately by
+    /// `production_update_entity_refuses_concurrent_stale_writer`; both are
+    /// required, neither substitutes for the other.
+    #[tokio::test]
+    async fn concurrent_entity_property_patches_from_one_revision_only_one_survives() {
+        let rt = Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "RaceTarget",
+                None,
+                Some(serde_json::json!({"a": 0, "b": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let reader_a = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                rt.prepare_update_entity(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"a": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            })
+        };
+        let reader_b = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                rt.prepare_update_entity(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"b": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            })
+        };
+
+        let (entity_a, _, _, expected_updated_at_a, expected_deleted_at_a) =
+            reader_a.await.unwrap().expect("reader A prepares");
+        let (entity_b, _, _, expected_updated_at_b, expected_deleted_at_b) =
+            reader_b.await.unwrap().expect("reader B prepares");
+        assert_eq!(
+            expected_updated_at_a, expected_updated_at_b,
+            "both readers must observe the same pre-write revision for this to be a real race"
+        );
+
+        let store = rt.entities(&tok).expect("entity store");
+        assert!(
+            store
+                .replace_entity_if_unchanged(entity_a, expected_updated_at_a, expected_deleted_at_a)
+                .await
+                .expect("writer A CAS query"),
+            "the first committer from a shared revision must win"
+        );
+        assert!(
+            !store
+                .replace_entity_if_unchanged(entity_b, expected_updated_at_b, expected_deleted_at_b)
+                .await
+                .expect("writer B CAS query"),
+            "the second committer from the SAME stale revision must be refused, not merged"
+        );
+
+        let final_entity = rt.get_entity(&tok, id).await.expect("read final entity");
+        assert_eq!(
+            final_entity.properties,
+            Some(serde_json::json!({"a": 1, "b": 0})),
+            "writer B's field must not be silently merged into the persisted row: {:?}",
+            final_entity.properties
+        );
+    }
+
+    /// Same race as `concurrent_entity_property_patches_from_one_revision_only_one_survives`,
+    /// but driven entirely through the PRODUCTION entry point
+    /// (`update_entity_with_embedding_report`) rather than the store's
+    /// `replace_entity_if_unchanged` primitive directly. This closes a gap
+    /// the primitive-level test cannot: it would still pass unchanged if the
+    /// production caller were reverted to an unconditional write, since it
+    /// never invokes that caller at all. Uses `race_seam::pause_after_read`
+    /// (test-only, compiled out of non-test builds) to force both concurrent
+    /// callers to observe the identical pre-write revision deterministically —
+    /// no sleeps, no reliance on scheduler ordering.
+    #[tokio::test]
+    async fn production_update_entity_refuses_concurrent_stale_writer() {
+        let rt = Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "ProductionRaceTarget",
+                None,
+                Some(serde_json::json!({"a": 0, "b": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let writer_a = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                rt.update_entity_with_embedding_report(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"a": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }))
+        };
+        let writer_b = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                rt.update_entity_with_embedding_report(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"b": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }))
+        };
+
+        let result_a = writer_a.await.expect("writer A task");
+        let result_b = writer_b.await.expect("writer B task");
+        let successes = [result_a.is_ok(), result_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one production caller must win the race; the other must be refused: \
+             a={result_a:?} b={result_b:?}"
+        );
+        let refused = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
+        match &refused {
+            Err(RuntimeError::Khive(khive_error)) => {
+                assert_eq!(
+                    khive_error.kind(),
+                    khive_types::ErrorKind::Conflict,
+                    "the losing production caller must surface a typed conflict, not \
+                     silently overwrite: {refused:?}"
+                );
+            }
+            other => panic!("expected a typed conflict error, got {other:?}"),
+        }
+
+        let final_entity = rt.get_entity(&tok, id).await.expect("read final entity");
+        assert_ne!(
+            final_entity.properties,
+            Some(serde_json::json!({"a": 1, "b": 1})),
+            "both racers' fields must never both land: that would mean the loser's stale \
+             write silently succeeded"
+        );
+    }
+
+    /// Isolating fixture for the `AND ?8 > updated_at` conjunct of
+    /// `entity_replace_if_unchanged_statement`.
+    ///
+    /// The concurrent-race tests above cannot cover it. What is measured, and
+    /// deterministic: tautologizing `?8 > updated_at` alone reddened NOTHING in
+    /// `khive-runtime` before this test existed, because the revision guard
+    /// (`updated_at = ?13`) refuses the losing writer on its own whatever the
+    /// clock did. Tautologizing `updated_at = ?13` + `deleted_at IS ?14`
+    /// reddens only `production_update_entity_refuses_concurrent_stale_writer`,
+    /// and defeating all three at once reddens the race tests.
+    ///
+    /// What is NOT claimed, because the fixture cannot support it: that the two
+    /// guards are each independently sufficient. The race fixture pins the two
+    /// racers' EXPECTED revisions equal but never their REPLACEMENT revisions,
+    /// which both come from `max(now, expected + 1)`. So with `updated_at = ?13`
+    /// removed, whether strict advance still refuses depends on which clock read
+    /// won — a race, not a property of the fixture. This test strips the second
+    /// mechanism by construction instead:
+    /// it supplies the CORRECT expected revision and deletion marker, so
+    /// `?13`/`?14` are satisfied by construction, and the ONLY thing that can
+    /// refuse the write is the strict-advance conjunct.
+    #[tokio::test]
+    async fn entity_cas_refuses_a_replacement_revision_that_does_not_advance() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "NonAdvancing",
+                None,
+                Some(serde_json::json!({"a": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let (mut replacement, _, _, expected_updated_at, expected_deleted_at) = rt
+            .prepare_update_entity(
+                &tok,
+                id,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"a": 1})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepare update");
+
+        // Force the replacement revision to EQUAL the stored one. `?13`/`?14`
+        // still match exactly, so this is not a stale-snapshot refusal — the
+        // only predicate that can reject it is `?8 > updated_at`.
+        replacement.updated_at = expected_updated_at;
+
+        let store = rt.entities(&tok).expect("entity store");
+        let committed = store
+            .replace_entity_if_unchanged(replacement, expected_updated_at, expected_deleted_at)
+            .await
+            .expect("CAS query");
+        assert!(
+            !committed,
+            "a replacement whose revision does not strictly advance past the stored one must \
+             be refused: without `?8 > updated_at` the CAS would accept a write that leaves \
+             `updated_at` unmoved, so a later writer holding the same snapshot would still \
+             see its expected revision match and overwrite this one"
+        );
+
+        let stored = rt.get_entity(&tok, id).await.expect("read back");
+        assert_eq!(
+            stored.properties,
+            Some(serde_json::json!({"a": 0})),
+            "the refused write must not have landed"
+        );
+    }
+
+    /// Isolating fixture for the `AND deleted_at IS ?14` conjunct of
+    /// `entity_replace_if_unchanged_statement`.
+    ///
+    /// The revision-based race fixtures cannot reach it, because a soft delete
+    /// does not move the revision: `entity_soft_delete_statement` is
+    /// `SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL` and never
+    /// touches `updated_at`. So a writer holding a pre-delete snapshot still has
+    /// the CORRECT expected revision after the row is tombstoned, and its
+    /// replacement revision still advances. Every conjunct except `?14` is
+    /// satisfied, and dropping `?14` would let that writer's `deleted_at = NULL`
+    /// land — resurrecting a tombstone, with no revision conflict anywhere to
+    /// signal it.
+    ///
+    /// This fixture does not merely claim that isolation, it asserts it: both
+    /// other conjuncts are checked against the post-delete row before the CAS
+    /// runs, so a future change that makes one of them refuse instead turns this
+    /// test red rather than silently converting it into a whole-guard test.
+    #[tokio::test]
+    async fn entity_cas_refuses_a_stale_replacement_that_would_resurrect_a_tombstone() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "Tombstoned",
+                None,
+                Some(serde_json::json!({"a": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        // Snapshot BEFORE the delete: this is the stale writer's view.
+        let (replacement, _, _, expected_updated_at, expected_deleted_at) = rt
+            .prepare_update_entity(
+                &tok,
+                id,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"a": 1})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepare update");
+        assert_eq!(
+            expected_deleted_at, None,
+            "fixture premise: the snapshot must be of a LIVE row"
+        );
+
+        rt.delete_entity(&tok, id, false)
+            .await
+            .expect("soft delete");
+
+        let store = rt.entities(&tok).expect("entity store");
+        let tombstoned = store
+            .get_entity_including_deleted(id)
+            .await
+            .expect("read tombstone")
+            .expect("row still present after soft delete");
+
+        // Prove the isolation rather than asserting it in prose. `?13` matches
+        // because the soft delete left the revision alone, and `?8 > updated_at`
+        // holds because the prepared replacement advanced past it. That leaves
+        // `deleted_at IS ?14` as the only conjunct able to refuse the write.
+        assert_eq!(
+            tombstoned.updated_at, expected_updated_at,
+            "fixture premise: soft delete must NOT move `updated_at`, otherwise \
+             `?13` would refuse and this stops being an isolating fixture"
+        );
+        assert!(
+            replacement.updated_at > tombstoned.updated_at,
+            "fixture premise: the replacement revision must still advance, \
+             otherwise `?8 > updated_at` would refuse and this stops being an \
+             isolating fixture"
+        );
+        assert!(
+            tombstoned.deleted_at.is_some(),
+            "fixture premise: the row must actually be tombstoned"
+        );
+
+        let committed = store
+            .replace_entity_if_unchanged(replacement, expected_updated_at, expected_deleted_at)
+            .await
+            .expect("CAS query");
+        assert!(
+            !committed,
+            "a replacement carrying a pre-delete snapshot must be refused after the row is \
+             soft-deleted: without `deleted_at IS ?14` it would write `deleted_at = NULL` over \
+             the tombstone and silently resurrect a deleted entity"
+        );
+
+        let after = store
+            .get_entity_including_deleted(id)
+            .await
+            .expect("read back")
+            .expect("row present");
+        assert!(
+            after.deleted_at.is_some(),
+            "the tombstone must survive the refused write"
+        );
+        assert_eq!(
+            after.properties,
+            Some(serde_json::json!({"a": 0})),
+            "the refused write must not have landed"
+        );
+    }
+
+    /// Regression: the entity CAS requires the replacement revision to be
+    /// STRICTLY greater than the stored one. If the replacement is computed
+    /// as a raw `Utc::now()` read, a stored revision that is at or ahead of
+    /// wall-clock time (a clock step backward, or — deterministically,
+    /// reproduced here — a stored revision manufactured slightly ahead of
+    /// "now") makes the new value fail to advance, and the CAS refuses a
+    /// write with NO concurrent writer involved at all. The fix must clamp
+    /// the replacement to `max(now, stored + 1)`; this test sets the stored
+    /// revision one full second into the future (far outside normal clock
+    /// skew) and asserts the update still succeeds instead of surfacing a
+    /// spurious conflict.
+    ///
+    /// SCOPE: this is a revision-clamp test, NOT CAS regression coverage. Its
+    /// assertion is that the write SUCCEEDS, which an unconditional UPDATE
+    /// also satisfies, so it stays green if the `updated_at = ?13` /
+    /// `?8 > updated_at` guard is dropped entirely. The guard's regression
+    /// coverage is
+    /// `concurrent_entity_property_patches_from_one_revision_only_one_survives`
+    /// (primitive) and `production_update_entity_refuses_concurrent_stale_writer`
+    /// (production wiring); do not count this test toward it.
+    #[tokio::test]
+    async fn update_entity_succeeds_when_stored_revision_is_ahead_of_wall_clock() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "FutureRevisionTarget",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let future_micros = chrono::Utc::now().timestamp_micros() + 1_000_000;
+        let pool = rt.backend().pool_arc();
+        let id_str = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().expect("writer connection");
+            guard
+                .execute(
+                    "UPDATE entities SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![future_micros, id_str],
+                )
+                .expect("force future revision")
+        })
+        .await
+        .expect("join");
+
+        let updated = rt
+            .update_entity(
+                &tok,
+                id,
+                EntityPatch {
+                    description: Some(Some("patched after a forced future revision".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect(
+                "update must succeed and advance past the stored revision, not report a \
+                 spurious conflict when nothing else wrote to this row",
+            );
+        assert!(updated.updated_at > future_micros);
     }
 
     #[tokio::test]
