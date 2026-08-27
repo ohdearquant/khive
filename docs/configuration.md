@@ -290,6 +290,59 @@ partial-override mode.
 
 ---
 
+## Stdio bridge session lifetime
+
+Three environment variables bound how long a stdio bridge session and its
+individual writes may live. They are read once at serve time.
+
+| Variable                               | Default      | Effect                                                                                                                                                                                                |
+| -------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`       | **disabled** | When set to a positive number, a session that receives no request for this many seconds closes, releasing its reader-pool admission and DB connection. `0`, absent, or unparsable leaves it disabled. |
+| `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`  | `300`        | The longest a single response write may stay pending before it is abandoned and the session closes. `0` is rejected at startup rather than treated as an opt-out.                                     |
+| `KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS` | `3600`       | How long an admitted request whose response has not been written keeps deferring the idle close. Only reached when the idle timeout is enabled. `0` restores an unbounded defer.                      |
+
+**Idle reaping is off by default, and that is deliberate.**
+[ADR-091](adr/ADR-091-wal-snapshot-lifetime.md) rejects closing long-lived
+reader sessions by age, on the ground that they are live clients and that
+bounding what they hold underneath them is the better fix. This transport has
+no signal separating an abandoned pipe from a live client that has simply not
+been asked anything, so enabling the idle timeout by default would reverse that
+decision. Turn it on where session churn is cheap and a pinned WAL connection
+is not: a supervised deployment, a CI harness, a batch runner.
+
+**A session also closes on a duplicate outstanding request id.** MCP requires a
+request id to be unused within a session, and this transport tracks outstanding
+requests by id in order to decide whether a quiet session still has work
+running. Two live requests sharing an id make that undecidable: a completing
+response could discharge either, and picking wrong either keeps a finished
+session alive indefinitely or closes a live one. The second such request is
+therefore refused and the session closes, with the id logged at `WARN`. A
+conforming client never reaches this.
+
+An id counts as outstanding for this purpose while its entry is still tracked,
+including after it has passed the obligation TTL. Ageing past that TTL means the
+request no longer defers the idle close; it does not mean the request finished,
+and the handler may well still be running. Reuse is refused in that state too.
+
+**Known gap.** The response-delivery deadline covers responses this transport
+writes. It does not cover parse-error responses, which the underlying line
+transport writes directly through its own framed writer without passing through
+the deadline. A peer that sends malformed input and then stops reading can leave
+that one write pending.
+
+What bounds that pending write depends on what else the session has
+outstanding, and the idle window alone is not the answer:
+
+- Idle timeout disabled: nothing bounds it.
+- Idle timeout enabled, nothing else outstanding: the idle window bounds it.
+- Idle timeout enabled with a request still awaiting its response: the idle
+  close defers while that obligation is fresh, so the bound is the request
+  obligation TTL rather than the idle window. A peer can reach this deliberately
+  by admitting a request and then sending malformed input.
+
+Closing the gap requires replacing or adapting the line transport and is tracked
+separately.
+
 ## Troubleshooting a connect failure
 
 **Symptom:** an MCP client (Claude Code, Claude Desktop, Codex, Gemini) reports

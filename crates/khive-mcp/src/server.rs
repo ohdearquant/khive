@@ -995,6 +995,129 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
     }
 }
 
+/// Optional idle timeout for a stdio bridge session: when configured, no
+/// request for this long and the session closes (see
+/// [`crate::transport::CancelOnEofTransport`]), releasing its reader-pool
+/// admission and DB connection — a client that comes back simply respawns the
+/// bridge, seamlessly from its perspective.
+/// This closes only a genuinely idle session: an admitted request with a
+/// response still being written — running long, or delivered slowly to a
+/// backpressured reader — defers the close rather than being cancelled out
+/// from under it, up to the separate response-delivery bound documented on
+/// [`stdio_bridge_response_deadline_from_env`].
+///
+/// **Off unless configured, and that is a deliberate reading of existing
+/// repository law rather than caution.** ADR-091 enumerates "kill long-lived
+/// reader sessions" among its rejected alternatives, on the ground that
+/// long-lived stdio sessions are live Claude Code instances and closing them
+/// by age is a worse user experience than bounding what they hold underneath
+/// them. Closing a session after an hour of quiet is that rejected policy
+/// whatever the mechanism, because this transport has no signal that
+/// separates an abandoned pipe from a live client that simply has not been
+/// asked anything. Defaulting it on would reverse an accepted decision from
+/// inside an unrelated change, so the default is off and turning it on is an
+/// operator's explicit act — a supervised deployment, a CI harness, or any
+/// context where session churn is cheap and a pinned WAL connection is not.
+/// Making it the default requires amending ADR-091, not a different number
+/// here.
+///
+/// Set `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS` to a positive number of seconds to
+/// enable it. `0`, absent, and unparsable all leave it disabled; unparsable
+/// falls back rather than panicking, matching this codebase's other
+/// `_from_env` helpers, and it falls back to *disabled* because a typo must
+/// never silently start closing live sessions. 3600 is the suggested value
+/// where it is wanted: long enough that ordinary gaps in a live session never
+/// trip it.
+fn stdio_bridge_idle_timeout_from_env() -> Option<std::time::Duration> {
+    let secs = std::env::var("KHIVE_BRIDGE_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// How long an admitted request whose response has not been written keeps
+/// deferring the idle close.
+///
+/// The idle check must not treat a session with work outstanding as idle, or
+/// it cancels a running handler out from under itself. But rmcp spawns each
+/// request handler and drops the join handle, so a handler that panics never
+/// reaches the response construction that would clear its obligation. Deferring
+/// on an outstanding obligation with no bound therefore hands any panicking
+/// handler the power to disable idle reaping for the life of the session — the
+/// exact unbounded lifetime the idle timeout exists to close, reintroduced
+/// through the guard that protects it.
+///
+/// This bound is separate from the idle window on purpose. Reusing the idle
+/// window would mean a handler that runs longer than one quiet window stops
+/// protecting its own session, which is the guarantee the obligation exists to
+/// provide. It is set far above any real handler and answers a different
+/// question: not "has this session been quiet" but "has this request been
+/// outstanding so long that its handler must be gone".
+///
+/// Overridable via `KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS`; `0` disables the
+/// bound, restoring the unbounded defer. An unparsable value falls back to the
+/// default. Default: 3600s.
+fn stdio_bridge_request_obligation_ttl_from_env() -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 3600;
+    let secs = std::env::var("KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// Response-delivery deadline for a stdio bridge session: the longest a
+/// single response write may stay pending before it is abandoned (see
+/// [`crate::transport::CancelOnEofTransport::send`]) and this session is
+/// closed. Independent of the idle timeout above — it bounds an admitted
+/// request's response write directly, rather than the gap between
+/// requests. Without this bound, a peer that admits a request and then
+/// stops reading its response — while leaving the pipe itself open — keeps
+/// that write pending forever, so the idle timeout would defer indefinitely
+/// (an in-flight response always defers idle-close) and the session would
+/// never be reaped.
+///
+/// Overridable via `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`, accepted range
+/// 1..=u64::MAX seconds. Unlike `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`, this bound
+/// cannot be disabled: `0` is a startup error naming the variable, the
+/// rejected value, and the accepted range, rather than a silent opt-out — a
+/// configuration that restores an unbounded pending write restores the
+/// defect this deadline exists to close (see the type doc above). An
+/// unparsable value falls back to the default rather than erroring, matching
+/// this codebase's other `_from_env` helpers. Default: 300s (5 minutes) —
+/// long enough that legitimately slow verbs and ordinary reader backpressure
+/// never trip it, short enough that a peer that has genuinely stopped
+/// reading does not pin the session's reader-pool admission / DB connection
+/// indefinitely.
+fn stdio_bridge_response_deadline_from_env() -> anyhow::Result<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 300;
+    let secs = match std::env::var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => secs,
+            Err(_) => DEFAULT_SECS,
+        },
+        Err(_) => DEFAULT_SECS,
+    };
+    if secs == 0 {
+        anyhow::bail!(
+            "KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 is not accepted: the response-delivery \
+             deadline cannot be disabled (a disabled deadline lets a peer that stops reading \
+             pin the bridge's response write forever). Set it to a positive number of seconds \
+             (accepted range: 1..=u64::MAX, default {DEFAULT_SECS})."
+        );
+    }
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 impl KhiveMcpServer {
     /// Build a server from `runtime.config().packs`. Errors if any pack is unknown or missing deps.
     ///
@@ -1409,13 +1532,18 @@ impl KhiveMcpServer {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
         let root = tokio_util::sync::CancellationToken::new();
+        let idle_timeout = stdio_bridge_idle_timeout_from_env();
+        let response_deadline = stdio_bridge_response_deadline_from_env()?;
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
-            crate::transport::CancelOnEofTransport::new(
+            crate::transport::CancelOnEofTransport::with_idle_timeout(
                 crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
                     read, write,
                 )),
                 root,
+                idle_timeout,
+                Some(response_deadline),
+                stdio_bridge_request_obligation_ttl_from_env(),
             )
         };
 
@@ -1454,9 +1582,13 @@ impl KhiveMcpServer {
 
         let root = tokio_util::sync::CancellationToken::new();
         let (read, write) = stdio();
-        let transport = crate::transport::CancelOnEofTransport::new(
+        let response_deadline = stdio_bridge_response_deadline_from_env()?;
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(read, write),
             root.clone(),
+            stdio_bridge_idle_timeout_from_env(),
+            Some(response_deadline),
+            stdio_bridge_request_obligation_ttl_from_env(),
         );
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
@@ -7330,9 +7462,12 @@ mod request_read_cancellation_tests {
         let root = tokio_util::sync::CancellationToken::new();
         let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
         let (read, write) = tokio::io::split(server_io);
-        let transport = crate::transport::CancelOnEofTransport::new(
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(read, write),
             root.clone(),
+            None,
+            None,
+            Some(Duration::from_secs(3600)),
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7368,6 +7503,374 @@ mod request_read_cancellation_tests {
         );
     }
 
+    /// An idle stdio bridge — pipe still open, no request sent — must
+    /// be reaped the same way a real EOF is, not held open indefinitely.
+    #[tokio::test]
+    async fn stdio_idle_timeout_cancels_root_without_eof() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let probe = EofProbeServer {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            Some(Duration::from_millis(50)),
+            None,
+            Some(Duration::from_secs(3600)),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        // Deliberately never write anything and never drop `client_io`: the
+        // pipe stays open exactly like an abandoned bridge's client — this
+        // must still be reaped once the idle timeout elapses.
+        let reason = tokio::time::timeout(Duration::from_secs(2), running.waiting())
+            .await
+            .expect("idle timeout never closed the session")
+            .expect("rmcp service task panicked");
+        assert!(
+            root.is_cancelled(),
+            "idle timeout must cancel the exact root token passed into rmcp"
+        );
+        assert!(
+            matches!(
+                reason,
+                rmcp::service::QuitReason::Closed | rmcp::service::QuitReason::Cancelled
+            ),
+            "unexpected rmcp quit reason after idle timeout: {reason:?}"
+        );
+        drop(client_io);
+    }
+
+    #[derive(Clone)]
+    struct SlowProbeServer {
+        started: Arc<tokio::sync::Notify>,
+        delay: Duration,
+    }
+
+    impl rmcp::ServerHandler for SlowProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let started = self.started.clone();
+            let delay = self.delay;
+            async move {
+                started.notify_one();
+                tokio::time::sleep(delay).await;
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// Regression: two outstanding obligations under one request id are
+    /// refused, not resolved by guessing.
+    ///
+    /// Retirement matches on request id, so two live entries sharing an id
+    /// make it ambiguous which one a completing response discharges — and both
+    /// resolutions are wrong in opposite directions. Removing the first match
+    /// can leave a *completed* request's instant as the newest entry, so the
+    /// freshness check defers past the older obligation's TTL: the unbounded
+    /// session this whole mechanism exists to close. Removing the last match
+    /// can leave the older instant, so the session closes out from under a
+    /// live handler. The transport cannot tell the two apart, so it refuses
+    /// the second admission instead.
+    ///
+    /// Idle reaping is off and the pipe is deliberately never closed, so the
+    /// refusal is the only thing that can end this session. A build that
+    /// admitted the duplicate would leave `root` uncancelled and this test
+    /// would exhaust its bound.
+    #[tokio::test]
+    async fn stdio_refuses_a_second_outstanding_obligation_under_one_request_id() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let first_admitted = Arc::new(tokio::sync::Notify::new());
+        let probe = OutOfOrderProbeServer {
+            first_admitted: first_admitted.clone(),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // No idle timer: only the duplicate-id refusal can close this.
+            None,
+            None,
+            Some(Duration::from_secs(3600)),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (_client_read, mut client_write) = tokio::io::split(client_io);
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
+                        \"params\":{\"name\":\"probe\",\"arguments\":{}}}\n";
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the first request");
+        tokio::time::timeout(Duration::from_secs(2), first_admitted.notified())
+            .await
+            .expect("rmcp never admitted the first request");
+
+        // Premise: id 1 is genuinely still outstanding. Without this the second
+        // request would just be a reuse after retirement, which is legitimate
+        // and not what this test is about.
+        assert_eq!(
+            obligations.lock().expect("obligation queue poisoned").len(),
+            1,
+            "fixture premise: the first request must still be outstanding when the duplicate \
+             arrives, otherwise nothing is ambiguous"
+        );
+        assert!(
+            !root.is_cancelled(),
+            "fixture premise: a single outstanding request must not have closed the session"
+        );
+
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the duplicate-id request");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "a second outstanding obligation under an id that already has one must close the \
+             session; admitting it leaves retirement to pick an entry arbitrarily, which \
+             corrupts the freshness check in one direction or the other"
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: an id whose obligation has gone STALE is still a duplicate.
+    ///
+    /// Staleness is a statement about the freshness check, not about the
+    /// handler: rmcp keeps a spawned handler alive independently of this
+    /// receive loop, so an entry past its TTL routinely names a request that
+    /// is still running and has simply not answered yet. If the staleness drop
+    /// runs before the duplicate scan, that entry is gone by the time the scan
+    /// looks, the reused id is admitted as a fresh obligation, and the first of
+    /// the two eventual responses retires the NEW entry by id match — leaving
+    /// the older live handler untracked and the idle branch free to close out
+    /// from under it. Scanning before pruning refuses the reuse instead.
+    ///
+    /// This is the arm the earlier ordering passed: the plain duplicate test
+    /// above uses an hour-long TTL, so its entry is never stale and the two
+    /// orderings are indistinguishable there.
+    ///
+    /// Idle reaping is off and the pipe is never closed, so the refusal is the
+    /// only thing that can end this session.
+    #[tokio::test]
+    async fn stdio_refuses_a_reused_id_whose_obligation_is_already_stale() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const OBLIGATION_TTL: Duration = Duration::from_millis(100);
+
+        let first_admitted = Arc::new(tokio::sync::Notify::new());
+        let probe = OutOfOrderProbeServer {
+            first_admitted: first_admitted.clone(),
+            // Parks forever on the first call: the handler outlives its TTL.
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // No idle timer: only the duplicate-id refusal can close this.
+            None,
+            None,
+            Some(OBLIGATION_TTL),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (_client_read, mut client_write) = tokio::io::split(client_io);
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
+                        \"params\":{\"name\":\"probe\",\"arguments\":{}}}\n";
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the first request");
+        tokio::time::timeout(Duration::from_secs(2), first_admitted.notified())
+            .await
+            .expect("rmcp never admitted the first request");
+
+        tokio::time::sleep(OBLIGATION_TTL * 3).await;
+
+        // Premise, asserted rather than assumed: the entry is still in the
+        // queue AND the transport's own freshness rule already calls it stale.
+        // Both halves matter — a test that only slept would pass against a
+        // build that pruned the entry, since an empty queue also admits the
+        // reuse without closing, which is the very defect under test.
+        {
+            let queue = obligations.lock().expect("obligation queue poisoned");
+            let (id, admitted_at) = queue
+                .front()
+                .expect(
+                    "fixture premise: the unanswered obligation must still be queued when the \
+                     reused id arrives; an empty queue means something pruned it and this test \
+                     can no longer distinguish the orderings",
+                )
+                .clone();
+            assert_eq!(
+                id,
+                rmcp::model::NumberOrString::Number(1),
+                "fixture premise: the queued entry must be the request under test"
+            );
+            assert!(
+                admitted_at.elapsed() >= OBLIGATION_TTL,
+                "fixture premise: the entry must already be STALE by the transport's own rule, \
+                 otherwise this is just the plain duplicate case"
+            );
+        }
+        assert!(
+            !root.is_cancelled(),
+            "fixture premise: a single outstanding request must not have closed the session"
+        );
+
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the request reusing the stale id");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "reusing an id whose obligation is stale but whose handler is still alive must close \
+             the session. Admitting it lets the first response retire the wrong entry, which \
+             leaves a live handler untracked and the idle close free to fire under it."
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: the obligation queue must not grow without bound.
+    ///
+    /// Retirement is keyed by request id, so it only ever removes the entry
+    /// whose response was actually written. A request that never produces one
+    /// — a handler that panics, a request the peer cancels — leaves its entry
+    /// behind. Under the earlier oldest-first retirement any completion
+    /// removed *some* entry, so the queue tracked admissions minus
+    /// completions; keying by id means an unanswered request now holds its
+    /// slot for the life of the session unless something drops it.
+    ///
+    /// Nothing here waits on the idle timer: it is disabled, so the only thing
+    /// that can bound this queue is the staleness drop.
+    #[tokio::test]
+    async fn stdio_obligation_queue_drops_entries_past_their_ttl() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const OBLIGATION_TTL: Duration = Duration::from_millis(100);
+        // Longer than the TTL, so every earlier admission is already stale by
+        // the time the next one arrives and the queue can never hold two.
+        const ADMISSION_GAP: Duration = Duration::from_millis(150);
+        const ADMISSIONS: u32 = 4;
+
+        let probe = SlowProbeServer {
+            started: Arc::new(tokio::sync::Notify::new()),
+            // Never answers, so nothing is ever retired by id.
+            delay: Duration::from_secs(3600),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // Idle reaping off: this test is about the queue, not the timer.
+            None,
+            None,
+            Some(OBLIGATION_TTL),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        for id in 1..=ADMISSIONS {
+            client_io
+                .write_all(
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\
+                         \"params\":{{\"name\":\"probe\",\"arguments\":{{}}}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            tokio::time::sleep(ADMISSION_GAP).await;
+        }
+
+        let outstanding = obligations.lock().expect("obligation queue poisoned").len();
+        assert!(
+            outstanding <= 1,
+            "an unanswered request must not hold its obligation slot past the TTL: after \
+             {ADMISSIONS} admissions spaced {}ms apart against a {}ms TTL the queue holds \
+             {outstanding} entries. Without the staleness drop it would hold {ADMISSIONS}, one \
+             per admission, and would keep growing for as long as the session lives.",
+            ADMISSION_GAP.as_millis(),
+            OBLIGATION_TTL.as_millis(),
+        );
+
+        drop(client_io);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Parks forever on the first call and answers every later one promptly,
+    /// so a test can produce out-of-order response completion: the request
+    /// admitted first stays outstanding while a later one completes.
+    #[derive(Clone)]
+    struct OutOfOrderProbeServer {
+        first_admitted: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl rmcp::ServerHandler for OutOfOrderProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let first_admitted = self.first_admitted.clone();
+            let calls = self.calls.clone();
+            async move {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    first_admitted.notify_one();
+                    // Never answers. This is the older obligation, and it is
+                    // the one whose TTL must govern when the session closes.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// Distinguishes handler behavior by tool name: `"slow"` blocks for
+    /// `slow_delay` (keeping `in_flight` above zero across several idle
+    /// windows), `"quick"` (or anything else) completes immediately — used
+    /// to admit a second request while the first is still running.
     #[tokio::test]
     async fn rmcp_cancellation_token_reaches_request_read_scope() {
         let token = tokio_util::sync::CancellationToken::new();
@@ -7449,5 +7952,39 @@ mod request_read_cancellation_tests {
                 );
             }
         }
+    }
+
+    // ── KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 must not disable the bound ──
+
+    /// The response-delivery deadline used to treat `0` as "disable
+    /// the bound", mirroring `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS=0`. Unlike the
+    /// idle timeout, an unbounded response-delivery deadline restores the
+    /// exact defect this deadline exists to close (a peer that admits a
+    /// request and stops reading pins the bridge's response write forever)
+    /// — so `0` is now a hard startup error instead of a supported opt-out.
+    #[test]
+    #[serial_test::serial]
+    fn response_deadline_from_env_rejects_zero() {
+        std::env::set_var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS", "0");
+        let result = stdio_bridge_response_deadline_from_env();
+        std::env::remove_var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS");
+
+        let error = result.expect_err(
+            "KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 must be rejected, not silently accepted \
+             as \"disable the bound\"",
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS"),
+            "error must name the offending variable: {rendered}"
+        );
+        assert!(
+            rendered.contains("=0"),
+            "error must name the rejected value: {rendered}"
+        );
+        assert!(
+            rendered.contains("1..=u64::MAX"),
+            "error must state the accepted range: {rendered}"
+        );
     }
 }
