@@ -56,7 +56,7 @@ windows-sys = { version = "0.61", features = [
 tokio = { workspace = true, features = ["full", "test-util"] }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype", "hooks", "limits", "functions"] }
 bytes = "1"
-khive-storage = { version = "0.8.0", path = "../khive-storage" }
+khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }
 khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
 uuid = { workspace = true }
 criterion = { workspace = true }
