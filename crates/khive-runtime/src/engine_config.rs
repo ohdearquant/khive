@@ -287,9 +287,11 @@ pub struct PackConfig {
     pub backend: String,
     /// Disable vector embedding for this pack's runtime: rows it writes get
     /// FTS and metadata only, no `vec_*` rows and no ANN participation. The
-    /// opt-out covers every write made through this pack's runtime, including
-    /// its `core()`-routed ones (`core()` inherits the runtime's embedder
-    /// set), so it fits packs whose rows are structural rather than
+    /// opt-out covers pack-owned writes on the pack's own backend; it does
+    /// NOT cover `core()`-routed concept writes, which embed with the MAIN
+    /// runtime's embedders (the boot path wires them in via
+    /// `with_core_embedders_from`) so the shared graph stays uniformly
+    /// searchable. Fits packs whose own rows are structural rather than
     /// retrieval targets (e.g. comm). Effective in multi-backend boot, where
     /// each pack gets its own runtime. Defaults to `false`.
     #[serde(default)]

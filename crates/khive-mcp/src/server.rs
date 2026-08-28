@@ -697,13 +697,17 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
         .collect();
     backend_rows.sort();
 
-    let mut pack_rows: Vec<(String, String)> = cfg
+    let mut pack_rows: Vec<(String, String, bool)> = cfg
         .packs
         .iter()
         .map(|(pack, pack_config)| {
             legacy_safe &= legacy_topology_component_is_safe(pack)
                 && legacy_topology_component_is_safe(&pack_config.backend);
-            (pack.clone(), pack_config.backend.clone())
+            (
+                pack.clone(),
+                pack_config.backend.clone(),
+                pack_config.no_embed,
+            )
         })
         .collect();
     pack_rows.sort();
@@ -719,7 +723,13 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .join(",");
         let pack_backends = pack_rows
             .iter()
-            .map(|(pack, backend)| format!("{pack}={backend}"))
+            .map(|(pack, backend, no_embed)| {
+                // `no_embed` changes runtime behavior (that pack's runtime
+                // carries zero embedders), so it must move the fingerprint;
+                // emitted only when set so pre-existing configs keep their id.
+                let no_embed = if *no_embed { ":no_embed" } else { "" };
+                format!("{pack}={backend}{no_embed}")
+            })
             .collect::<Vec<_>>()
             .join(",");
         (backends, pack_backends)
@@ -739,9 +749,10 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .join(",");
         let pack_backends = pack_rows
             .iter()
-            .map(|(pack, backend)| {
+            .map(|(pack, backend, no_embed)| {
+                let no_embed = if *no_embed { ":no_embed" } else { "" };
                 format!(
-                    "{}={}",
+                    "{}={}{no_embed}",
                     escape_topology_component(pack),
                     escape_topology_component(backend),
                 )
@@ -5844,6 +5855,58 @@ mod tests {
         assert!(
             config_id.ends_with(&expected_suffix),
             "delimiter-free topologies must retain their legacy fingerprint spelling; got {config_id}"
+        );
+    }
+
+    /// `no_embed` changes runtime behavior (that pack's runtime carries zero
+    /// embedders), so two configs differing only in it must not share a
+    /// `config_id` — a shared id would let a daemon serve a client whose
+    /// embedding policy it does not implement. Absent/false keeps the
+    /// pre-existing spelling so already-deployed configs keep their id.
+    #[test]
+    fn config_id_differs_when_pack_no_embed_differs() {
+        use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
+
+        let dir = tempfile::tempdir().expect("no_embed topology tempdir");
+        let main_path = dir.path().join("main.db");
+        let runtime = RuntimeConfig {
+            db_path: Some(main_path.clone()),
+            packs: vec!["comm".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let topology_for = |no_embed: bool| KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path.clone()),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            packs: std::collections::HashMap::from([(
+                "comm".to_string(),
+                PackConfig {
+                    backend: "main".to_string(),
+                    no_embed,
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+
+        let with_flag = compute_config_id(&runtime, Some(&topology_for(true)));
+        let without_flag = compute_config_id(&runtime, Some(&topology_for(false)));
+        assert_ne!(
+            with_flag, without_flag,
+            "configs differing only in no_embed must not share a config_id"
+        );
+        assert!(
+            with_flag.contains("comm=main:no_embed"),
+            "no_embed must appear in the pack fingerprint; got {with_flag}"
+        );
+        assert!(
+            without_flag.contains("comm=main]"),
+            "absent no_embed keeps the legacy pack spelling; got {without_flag}"
         );
     }
 

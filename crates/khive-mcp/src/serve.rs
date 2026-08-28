@@ -363,7 +363,7 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
     }
     if !admission.inbound_poll && !admission.outbound_delivery {
         tracing::info!(
-            "email channel loops: skipped (assigned comm and kg runtimes do not admit writes)"
+            "email channel loops: skipped (assigned comm runtime does not admit writes)"
         );
         return;
     }
@@ -1360,16 +1360,24 @@ fn log_eligible_poll_failure(
 
 /// True if a note's `delivered_at` property marks it as already delivered.
 ///
-/// Must match the `list` query predicate's null handling (`list.rs`): a
-/// present-but-null `delivered_at` is undelivered, not delivered. Checking
-/// `.is_some()` alone would treat an explicit null (e.g. left by a curation
-/// `update`) as delivered and strand the note in the outbox forever.
+/// Must match the outbox-scan pending predicate
+/// (`list_undelivered_outbound_messages`): a present-but-null `delivered_at`
+/// is undelivered, not delivered (checking `.is_some()` alone would treat an
+/// explicit null — e.g. left by a curation `update` — as delivered and strand
+/// the note in the outbox forever), and a terminal `properties.delivery`
+/// state (`"delivered"` / `"failed"`, ADR-122 §1) is not pending even when
+/// `delivered_at` is absent.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) -> bool {
-    props
+    let delivered_at_set = props
         .get("delivered_at")
         .map(|v| !v.is_null())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let terminal_delivery = props
+        .get("delivery")
+        .and_then(|v| v.as_str())
+        .is_some_and(|state| state == "delivered" || state == "failed");
+    delivered_at_set || terminal_delivery
 }
 
 /// Background task that delivers undelivered outbound email notes every 5 seconds.
@@ -1443,9 +1451,9 @@ async fn channel_outbox_once(
     // The generic wire `list` verb runs on the kg pack's runtime, which under
     // a `[packs.comm]` backend assignment is not the backend holding comm's
     // notes — the scan must use the comm-routed handle this loop was given.
-    // There is no recipient-prefix filter in the scan, so the `email:` prefix
-    // check (and a defensive re-check of direction/delivered) is applied
-    // per-note below.
+    // The `email:` prefix is applied INSIDE the scan (before its limit), so a
+    // backlog of another channel's pending rows cannot starve this one; the
+    // per-note checks below are defensive re-checks only.
     let token = match runtime.authorize(namespace.clone()) {
         Ok(token) => token,
         Err(error) => {
@@ -1454,7 +1462,7 @@ async fn channel_outbox_once(
         }
     };
     let notes = match runtime
-        .list_undelivered_outbound_messages(&token, 200)
+        .list_undelivered_outbound_messages(&token, Some("email:"), 200)
         .await
     {
         Ok(notes) => notes,
@@ -1492,11 +1500,33 @@ async fn channel_outbox_once(
             .unwrap_or(to_actor.as_str())
             .to_string();
         if !allowlist.is_empty() && !allowlist.contains(&recipient) {
-            tracing::warn!(
-                note_id = %note_id,
-                recipient = %recipient,
-                "outbox loop: recipient not in allowlist; skipping"
-            );
+            // ADR-122 §2: an allowlist rejection is a PERMANENT failure and
+            // must be recorded — skipping with only a log line leaves the row
+            // pending forever while the sender saw `ok: true`.
+            let failed_at = Utc::now().to_rfc3339();
+            let last_error = format!("recipient {recipient} not in outbound allowlist");
+            let mark_result = match uuid::Uuid::parse_str(&note_id) {
+                Ok(uuid) => runtime
+                    .mark_outbound_message_failed(&token, uuid, failed_at, last_error.clone())
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                    "note id {note_id} is not a valid UUID: {error}"
+                ))),
+            };
+            match mark_result {
+                Ok(_) => tracing::warn!(
+                    note_id = %note_id,
+                    recipient = %recipient,
+                    "outbox loop: recipient not in allowlist; recorded permanent failure"
+                ),
+                Err(error) => tracing::warn!(
+                    note_id = %note_id,
+                    recipient = %recipient,
+                    error = %error,
+                    "outbox loop: recipient not in allowlist; failed to record failure (will re-encounter)"
+                ),
+            }
             continue;
         }
 
@@ -1522,8 +1552,8 @@ async fn channel_outbox_once(
             .and_then(|value| value.as_str())
             .map(str::to_string);
 
-        // Mint-before-send through the KG runtime's owner-only path. Generic
-        // `update` correctly refuses caller patches to `external_id`.
+        // Mint-before-send through the comm-routed runtime's owner-only path.
+        // Generic `update` correctly refuses caller patches to `external_id`.
         let message_id = match props.get("external_id").and_then(|value| value.as_str()) {
             Some(external_id) if !external_id.is_empty() => external_id.to_string(),
             _ => {
@@ -1572,7 +1602,12 @@ async fn channel_outbox_once(
                 let delivered_at = Utc::now().to_rfc3339();
                 let delivered_result = match uuid::Uuid::parse_str(&note_id) {
                     Ok(uuid) => runtime
-                        .mark_outbound_message_delivered(&token, uuid, delivered_at)
+                        .mark_outbound_message_delivered(
+                            &token,
+                            uuid,
+                            delivered_at,
+                            Some(message_id.clone()),
+                        )
                         .await
                         .map(|_| ()),
                     Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
@@ -1604,8 +1639,8 @@ async fn channel_outbox_once(
 }
 
 /// Apply the same independent daemon/runtime admission as the email adapter:
-/// Telegram polling follows the comm runtime, while outbound delivery follows
-/// the kg runtime that must durably mark `delivered_at`.
+/// both Telegram polling and outbound delivery follow the comm runtime, which
+/// holds the message notes and durably marks delivery outcomes.
 #[cfg(feature = "channel-telegram")]
 fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
     let admission = channel_loop_plan(server, args);
@@ -1615,7 +1650,7 @@ fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) 
     }
     if !admission.inbound_poll && !admission.outbound_delivery {
         tracing::info!(
-            "telegram channel loops: skipped (assigned comm and kg runtimes do not admit writes)"
+            "telegram channel loops: skipped (assigned comm runtime does not admit writes)"
         );
         return;
     }
@@ -1854,7 +1889,7 @@ async fn telegram_outbox_loop(
             }
         };
         let notes = match runtime
-            .list_undelivered_outbound_messages(&token, 200)
+            .list_undelivered_outbound_messages(&token, Some("telegram:"), 200)
             .await
         {
             Ok(notes) => notes,
@@ -1904,7 +1939,7 @@ async fn telegram_outbox_loop(
                     let delivered_at = Utc::now().to_rfc3339();
                     let mark_result = match uuid::Uuid::parse_str(&note_id) {
                         Ok(uuid) => runtime
-                            .mark_outbound_message_delivered(&token, uuid, delivered_at)
+                            .mark_outbound_message_delivered(&token, uuid, delivered_at, None)
                             .await
                             .map(|_| ()),
                         Err(e) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
@@ -2732,6 +2767,15 @@ async fn build_registry_for_multi_backend_inner(
     )
     .await?;
 
+    // Built before the pack loop: secondary-pack runtimes capture the main
+    // runtime's embedder wiring so their `core()`-routed writes embed with
+    // main's models even when the pack itself is `no_embed`.
+    let default_runtime = KhiveRuntime::from_backend(main_backend.clone(), {
+        let mut cfg = base_config.clone();
+        cfg.backend_id = BackendId::main();
+        cfg
+    });
+
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
     for pack_name in pack_names {
@@ -2752,24 +2796,25 @@ async fn build_registry_for_multi_backend_inner(
         rt_config.backend_id = BackendId::new(backend_name);
         if no_embed {
             // `[packs.<name>] no_embed = true`: this pack's runtime gets zero
-            // embedders — its writes are FTS + metadata only, including
-            // core()-routed ones (core() inherits the runtime's embedder
-            // set). Clear both model fields together, same contract as
-            // `RuntimeConfig::no_embeddings`.
+            // embedders — pack-owned writes are FTS + metadata only. Clear
+            // both model fields together, same contract as
+            // `RuntimeConfig::no_embeddings`. `core()`-routed concept writes
+            // are NOT affected: `build_pack_runtime` hands every secondary
+            // pack the main runtime's embedder wiring for core().
             rt_config.embedding_model = None;
             rt_config.additional_embedding_models = Vec::new();
         }
         per_pack_runtimes_local.insert(
             pack_name.clone(),
-            build_pack_runtime(backend, backend_name, rt_config, &main_backend),
+            build_pack_runtime(
+                backend,
+                backend_name,
+                rt_config,
+                &main_backend,
+                &default_runtime,
+            ),
         );
     }
-
-    let default_runtime = KhiveRuntime::from_backend(main_backend.clone(), {
-        let mut cfg = base_config.clone();
-        cfg.backend_id = BackendId::main();
-        cfg
-    });
 
     // ADR-160 D3: resolve the config-selected `BlobStore` once, pair it with
     // exactly one aggregate hydration budget, and install the same immutable
@@ -3688,10 +3733,12 @@ fn build_pack_runtime(
     backend_name: &str,
     rt_config: RuntimeConfig,
     main_backend: &Arc<StorageBackend>,
+    main_runtime: &KhiveRuntime,
 ) -> KhiveRuntime {
     let rt = KhiveRuntime::from_backend(backend, rt_config);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
+            .with_core_embedders_from(main_runtime)
     } else {
         rt
     }
@@ -10805,11 +10852,21 @@ backend = "kg-backend"
                     .is_empty(),
                 "no_embed pack runtime must register zero embedders"
             );
+            let main_models = multi.per_pack_runtimes["kg"].registered_embedding_model_names();
             assert!(
-                !multi.per_pack_runtimes["kg"]
-                    .registered_embedding_model_names()
-                    .is_empty(),
+                !main_models.is_empty(),
                 "packs without no_embed must keep the configured embedders"
+            );
+            // The routing contract: no_embed strips the PACK's own writes
+            // only. core()-routed concept writes must embed with the main
+            // runtime's wiring, or a no_embed secondary pack would silently
+            // write unembedded entities into the shared graph.
+            assert_eq!(
+                multi.per_pack_runtimes["comm"]
+                    .core()
+                    .registered_embedding_model_names(),
+                main_models,
+                "no_embed pack's core() must carry the main runtime's embedders"
             );
         }
 
