@@ -1760,6 +1760,194 @@ impl KhiveRuntime {
             .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
     }
 
+    /// Non-wire outbox scan for the channel delivery loops.
+    ///
+    /// Pages newest-first through live `message` notes (the same order and
+    /// 10k scan cap as the generic `list` verb's filtered offset path) and
+    /// returns those with `properties.direction == "outbound"` that are still
+    /// pending delivery, capped at `limit`. Pending means `delivered_at` is
+    /// absent or null AND `properties.delivery` carries no terminal state
+    /// (`"delivered"` / `"failed"`, ADR-122 §1). When `to_prefix` is given,
+    /// only rows whose `properties.to_actor` starts with it are counted —
+    /// the channel predicate must run BEFORE the limit, otherwise a backlog
+    /// of another channel's pending rows starves this channel indefinitely.
+    /// This lives on the runtime rather than going through the wire registry
+    /// for the same reason as
+    /// [`Self::claim_outbound_message_external_id`]: the delivery loop must
+    /// scan the backend that actually holds comm's notes, and under a
+    /// `[packs.comm]` backend assignment that is not the backend serving the
+    /// generic kg verbs.
+    pub async fn list_undelivered_outbound_messages(
+        &self,
+        token: &NamespaceToken,
+        to_prefix: Option<&str>,
+        limit: u32,
+    ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
+        const PAGE_SIZE: u32 = 200;
+        const MAX_SCAN_TOTAL: u32 = 10_000;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut collected: Vec<khive_storage::note::Note> = Vec::new();
+        let mut db_offset: u32 = 0;
+        loop {
+            let remaining_scan = MAX_SCAN_TOTAL.saturating_sub(db_offset).min(PAGE_SIZE);
+            if remaining_scan == 0 {
+                break;
+            }
+            let page = self
+                .list_notes(token, Some("message"), remaining_scan, db_offset)
+                .await?;
+            let fetched = page.len() as u32;
+            for note in page {
+                if note.deleted_at.is_some() {
+                    continue;
+                }
+                let props = note.properties.as_ref().and_then(|v| v.as_object());
+                let outbound = props
+                    .and_then(|p| p.get("direction"))
+                    .and_then(|v| v.as_str())
+                    == Some("outbound");
+                if !outbound {
+                    continue;
+                }
+                if let Some(prefix) = to_prefix {
+                    let to_matches = props
+                        .and_then(|p| p.get("to_actor"))
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|actor| actor.starts_with(prefix));
+                    if !to_matches {
+                        continue;
+                    }
+                }
+                // Must match `note_already_delivered` in the delivery loop: a
+                // present-but-null `delivered_at` is undelivered, and a
+                // terminal `delivery` state ("delivered"/"failed") is not
+                // pending even without `delivered_at` (ADR-122 §1).
+                let delivered = props
+                    .and_then(|p| p.get("delivered_at"))
+                    .is_some_and(|v| !v.is_null());
+                if delivered {
+                    continue;
+                }
+                let terminal = props
+                    .and_then(|p| p.get("delivery"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|state| state == "delivered" || state == "failed");
+                if terminal {
+                    continue;
+                }
+                collected.push(note);
+                if collected.len() >= limit as usize {
+                    return Ok(collected);
+                }
+            }
+            if fetched < PAGE_SIZE {
+                break;
+            }
+            db_offset += fetched;
+        }
+        Ok(collected)
+    }
+
+    /// Assert that `id` names a live outbound `message` note, returning
+    /// `InvalidInput` otherwise. Guard shared by the delivery-outcome
+    /// markers: they take caller-supplied UUIDs, and the generic
+    /// `update_note` they patch through would happily stamp delivery
+    /// properties onto any note kind.
+    async fn assert_outbound_message(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<()> {
+        let note = self
+            .notes(token)?
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
+        if note.kind != "message" || note.deleted_at.is_some() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "note {id} is not a live message note (kind {})",
+                note.kind
+            )));
+        }
+        let outbound = note
+            .properties
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|p| p.get("direction"))
+            .and_then(|v| v.as_str())
+            == Some("outbound");
+        if !outbound {
+            return Err(RuntimeError::InvalidInput(format!(
+                "note {id} is not an outbound message"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Mark an outbound `message` note delivered by merging the ADR-122 §1
+    /// terminal-outcome properties (`delivery = "delivered"`, `delivered_at`,
+    /// and `transport_message_id` when the transport minted one), through the
+    /// same patch path the generic `update` verb uses (`delivered_at` is
+    /// deliberately not owner-established, pinned by
+    /// `generic_update_can_still_patch_delivered_at_on_message_note`).
+    /// Refuses (`InvalidInput`) unless `id` names a live outbound `message`
+    /// note. Non-wire companion to
+    /// [`Self::list_undelivered_outbound_messages`] so the delivery loop
+    /// writes the backend that holds the note.
+    pub async fn mark_outbound_message_delivered(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        delivered_at: String,
+        transport_message_id: Option<String>,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        self.assert_outbound_message(token, id).await?;
+        let mut props = serde_json::Map::new();
+        props.insert("delivery".into(), Value::String("delivered".into()));
+        props.insert("delivered_at".into(), Value::String(delivered_at));
+        if let Some(transport_message_id) = transport_message_id {
+            props.insert(
+                "transport_message_id".into(),
+                Value::String(transport_message_id),
+            );
+        }
+        self.update_note(
+            token,
+            id,
+            NotePatch {
+                properties: Some(Value::Object(props)),
+                ..NotePatch::default()
+            },
+        )
+        .await
+    }
+
+    /// Record a permanent delivery failure on an outbound `message` note:
+    /// `delivery = "failed"`, `failed_at`, `last_error` (ADR-122 §2 — an
+    /// allowlist rejection must be recorded, not skipped, or the row stays
+    /// pending forever while the caller saw `ok: true`). Refuses
+    /// (`InvalidInput`) unless `id` names a live outbound `message` note.
+    pub async fn mark_outbound_message_failed(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        failed_at: String,
+        last_error: String,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        self.assert_outbound_message(token, id).await?;
+        self.update_note(
+            token,
+            id,
+            NotePatch {
+                properties: Some(serde_json::json!({
+                    "delivery": "failed",
+                    "failed_at": failed_at,
+                    "last_error": last_error,
+                })),
+                ..NotePatch::default()
+            },
+        )
+        .await
+    }
+
     /// Merge `from_id` note into `into_id` note.
     ///
     /// Both notes must exist in the namespace and have the same `kind`. Content is merged
@@ -3694,6 +3882,236 @@ mod tests {
         let mut note = Note::new("local", "message", "hello");
         note.properties = Some(serde_json::json!({"direction": "outbound"}));
         note
+    }
+
+    /// Predicate + ordering contract of the non-wire outbox scan: outbound
+    /// with absent OR explicitly-null `delivered_at` is undelivered; a
+    /// non-null `delivered_at`, a terminal `delivery` state, an inbound row,
+    /// and a soft-deleted row are all excluded; results come newest-first
+    /// and respect `limit`; `limit=0` returns nothing.
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_predicate_and_order() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let mut undelivered_old = outbound_message_note();
+        undelivered_old.created_at -= 10;
+        let mut undelivered_null = outbound_message_note();
+        undelivered_null.properties =
+            Some(serde_json::json!({"direction": "outbound", "delivered_at": null}));
+        let mut delivered = outbound_message_note();
+        delivered.properties = Some(
+            serde_json::json!({"direction": "outbound", "delivered_at": "2026-08-28T00:00:00Z"}),
+        );
+        // ADR-122 terminal states without `delivered_at` are not pending.
+        let mut terminal_failed = outbound_message_note();
+        terminal_failed.properties = Some(
+            serde_json::json!({"direction": "outbound", "delivery": "failed", "last_error": "x"}),
+        );
+        let mut inbound = Note::new("local", "message", "inbound row");
+        inbound.properties = Some(serde_json::json!({"direction": "inbound"}));
+        let mut soft_deleted = outbound_message_note();
+        soft_deleted.deleted_at = Some(chrono::Utc::now().timestamp_micros());
+
+        let old_id = undelivered_old.id;
+        let null_id = undelivered_null.id;
+        for note in [
+            undelivered_old,
+            undelivered_null,
+            delivered,
+            terminal_failed,
+            inbound,
+            soft_deleted,
+        ] {
+            store.upsert_note(note).await.expect("seed note");
+        }
+
+        let hits = rt
+            .list_undelivered_outbound_messages(&tok, None, 200)
+            .await
+            .expect("scan succeeds");
+        let ids: Vec<_> = hits.iter().map(|n| n.id).collect();
+        assert_eq!(
+            ids,
+            vec![null_id, old_id],
+            "only the two undelivered outbound rows, newest-first"
+        );
+
+        let capped = rt
+            .list_undelivered_outbound_messages(&tok, None, 1)
+            .await
+            .expect("capped scan succeeds");
+        assert_eq!(
+            capped.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![null_id],
+            "limit truncates after the newest undelivered row"
+        );
+
+        let zero = rt
+            .list_undelivered_outbound_messages(&tok, None, 0)
+            .await
+            .expect("zero-limit scan succeeds");
+        assert!(zero.is_empty(), "limit=0 returns no rows, not one");
+    }
+
+    /// The channel prefix runs BEFORE the limit: a backlog of another
+    /// channel's pending rows must not consume the scan budget and starve
+    /// the requested channel (the pre-fix defect: filter-after-limit).
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_prefix_filters_before_limit() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        // Older email row behind three newer telegram rows.
+        let mut email = outbound_message_note();
+        email.created_at -= 100;
+        email.properties =
+            Some(serde_json::json!({"direction": "outbound", "to_actor": "email:a@b.c"}));
+        let email_id = email.id;
+        store.upsert_note(email).await.expect("seed email");
+        for _ in 0..3 {
+            let mut tg = outbound_message_note();
+            tg.properties =
+                Some(serde_json::json!({"direction": "outbound", "to_actor": "telegram:42"}));
+            store.upsert_note(tg).await.expect("seed telegram");
+        }
+
+        // With filter-after-limit this would return a telegram row (newest
+        // first) and the email loop would see nothing deliverable.
+        let hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("email:"), 1)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(
+            hits.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![email_id],
+            "prefix predicate applies before the limit"
+        );
+
+        let telegram_hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("telegram:"), 200)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(telegram_hits.len(), 3, "telegram prefix sees its own rows");
+    }
+
+    /// Terminal-outcome markers: `delivered` stamps the ADR-122 §1 property
+    /// set (with `transport_message_id` only when given), `failed` stamps
+    /// §2's permanent-failure set, and both refuse targets that are not live
+    /// outbound message notes.
+    #[tokio::test]
+    async fn outbound_delivery_markers_stamp_adr122_properties_and_validate_target() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let delivered_note = outbound_message_note();
+        let delivered_id = delivered_note.id;
+        let failed_note = outbound_message_note();
+        let failed_id = failed_note.id;
+        let mut inbound = Note::new("local", "message", "inbound row");
+        inbound.properties = Some(serde_json::json!({"direction": "inbound"}));
+        let inbound_id = inbound.id;
+        let wrong_kind = Note::new("local", "observation", "not a message");
+        let wrong_kind_id = wrong_kind.id;
+        for note in [delivered_note, failed_note] {
+            store.upsert_note(note).await.expect("seed note");
+        }
+        store.upsert_note(inbound).await.expect("seed inbound");
+        store
+            .upsert_note(wrong_kind)
+            .await
+            .expect("seed non-message");
+
+        let marked = rt
+            .mark_outbound_message_delivered(
+                &tok,
+                delivered_id,
+                "2026-08-28T00:00:00Z".to_string(),
+                Some("<mid@example>".to_string()),
+            )
+            .await
+            .expect("mark delivered succeeds");
+        let props = marked
+            .properties
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            props.get("delivery").and_then(|v| v.as_str()),
+            Some("delivered")
+        );
+        assert_eq!(
+            props.get("delivered_at").and_then(|v| v.as_str()),
+            Some("2026-08-28T00:00:00Z")
+        );
+        assert_eq!(
+            props.get("transport_message_id").and_then(|v| v.as_str()),
+            Some("<mid@example>")
+        );
+
+        let failed = rt
+            .mark_outbound_message_failed(
+                &tok,
+                failed_id,
+                "2026-08-28T00:00:01Z".to_string(),
+                "recipient not in allowlist".to_string(),
+            )
+            .await
+            .expect("mark failed succeeds");
+        let props = failed
+            .properties
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            props.get("delivery").and_then(|v| v.as_str()),
+            Some("failed")
+        );
+        assert_eq!(
+            props.get("failed_at").and_then(|v| v.as_str()),
+            Some("2026-08-28T00:00:01Z")
+        );
+        assert_eq!(
+            props.get("last_error").and_then(|v| v.as_str()),
+            Some("recipient not in allowlist")
+        );
+
+        // Both marked rows are now terminal: the scan must not return them.
+        let pending = rt
+            .list_undelivered_outbound_messages(&tok, None, 200)
+            .await
+            .expect("scan succeeds");
+        assert!(
+            pending.is_empty(),
+            "terminal rows left in scan: {:?}",
+            pending.iter().map(|n| n.id).collect::<Vec<_>>()
+        );
+
+        // Validation arms: inbound message and non-message kind both refuse.
+        for (id, label) in [(inbound_id, "inbound"), (wrong_kind_id, "non-message")] {
+            let err = rt
+                .mark_outbound_message_delivered(&tok, id, "t".to_string(), None)
+                .await
+                .expect_err(label);
+            assert!(
+                matches!(err, RuntimeError::InvalidInput(_)),
+                "{label}: expected InvalidInput, got {err:?}"
+            );
+            let err = rt
+                .mark_outbound_message_failed(&tok, id, "t".to_string(), "e".to_string())
+                .await
+                .expect_err(label);
+            assert!(
+                matches!(err, RuntimeError::InvalidInput(_)),
+                "{label}: expected InvalidInput, got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

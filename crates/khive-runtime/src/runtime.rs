@@ -145,6 +145,17 @@ pub use crate::config::{
 /// Composable runtime handle used by the MCP server.
 ///
 /// Wraps a `StorageBackend` and provides namespace-scoped accessor methods
+/// Snapshot of the main runtime's embedder wiring (registry handle, default
+/// name, and the config model fields the default-resolution path reads).
+/// Carried by secondary-pack runtimes; consumed by [`KhiveRuntime::core`].
+#[derive(Clone)]
+struct CoreEmbedderState {
+    registry: Arc<std::sync::RwLock<crate::embedder_registry::EmbedderRegistry>>,
+    default_embedder_name: Arc<str>,
+    embedding_model: Option<EmbeddingModel>,
+    additional_embedding_models: Vec<EmbeddingModel>,
+}
+
 /// for each storage capability, plus a lazily-loaded embedder.
 #[derive(Clone)]
 pub struct KhiveRuntime {
@@ -166,6 +177,13 @@ pub struct KhiveRuntime {
     /// construction; packs may add more via [`PackRuntime::register_embedders`].
     embedder_registry: Arc<std::sync::RwLock<crate::embedder_registry::EmbedderRegistry>>,
     default_embedder_name: Arc<str>,
+    /// The MAIN runtime's embedder wiring, carried by secondary-backend
+    /// runtimes so that `core()`-routed writes embed with the main runtime's
+    /// models even when this pack's own registry is empty (`no_embed`).
+    /// `None` on the main runtime, and on secondaries wired before the boot
+    /// path calls [`with_core_embedders_from`](Self::with_core_embedders_from)
+    /// — `core()` then falls back to this runtime's own embedder state.
+    core_embedders: Option<CoreEmbedderState>,
     /// Pack-extensible edge endpoint rules. Shared across clones
     /// via `Arc<RwLock<_>>`; installed once by the transport after the
     /// `VerbRegistry` is built. Empty until installed
@@ -343,6 +361,7 @@ impl KhiveRuntime {
             ann_fresh_tail_enabled,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
+            core_embedders: None,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
             valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
@@ -373,6 +392,26 @@ impl KhiveRuntime {
         self
     }
 
+    /// Carry the main runtime's embedder wiring for `core()`-routed writes.
+    ///
+    /// Boot-path companion to [`with_core_backend`](Self::with_core_backend).
+    /// Without it, `core()` shares this pack runtime's own embedder registry —
+    /// which under `[packs.<name>] no_embed = true` is empty, so core-routed
+    /// concept writes would silently skip embedding on the shared graph.
+    pub fn with_core_embedders_from(mut self, main: &KhiveRuntime) -> Self {
+        debug_assert!(
+            main.core_backend.is_none(),
+            "with_core_embedders_from takes the MAIN runtime"
+        );
+        self.core_embedders = Some(CoreEmbedderState {
+            registry: main.embedder_registry.clone(),
+            default_embedder_name: main.default_embedder_name.clone(),
+            embedding_model: main.config.embedding_model,
+            additional_embedding_models: main.config.additional_embedding_models.clone(),
+        });
+        self
+    }
+
     /// Return a runtime handle bound to the main (shared-graph) backend.
     ///
     /// When `self` is already the main runtime (`core_backend` is `None`),
@@ -394,17 +433,54 @@ impl KhiveRuntime {
     /// `RuntimeConfig` (a heap-allocated struct containing `Vec<String>` fields).
     pub fn core(&self) -> KhiveRuntime {
         match &self.core_backend {
-            None => self.clone(),
+            // A main-assigned pack runtime has no core pointer, but may still
+            // carry main's embedder wiring: with `no_embed` its OWN registry
+            // is empty, and core-routed concept writes must embed regardless
+            // of which backend the pack was assigned to.
+            None => match &self.core_embedders {
+                None => self.clone(),
+                Some(core_embedders) => {
+                    let mut core = self.clone();
+                    core.config.embedding_model = core_embedders.embedding_model;
+                    core.config.additional_embedding_models =
+                        core_embedders.additional_embedding_models.clone();
+                    core.embedder_registry = core_embedders.registry.clone();
+                    core.default_embedder_name = core_embedders.default_embedder_name.clone();
+                    core.core_embedders = None;
+                    core
+                }
+            },
             Some(main_arc) => {
                 let mut core_config = self.config.clone();
                 core_config.backend_id = BackendId::main();
+                // Core-routed writes embed with the MAIN runtime's wiring when
+                // the boot path supplied it (see `with_core_embedders_from`);
+                // both the registry handle and the config model fields must
+                // come from main, since default-model resolution reads
+                // `config.embedding_model` (`resolve_embedding_model`).
+                let (embedder_registry, default_embedder_name) = match &self.core_embedders {
+                    Some(core_embedders) => {
+                        core_config.embedding_model = core_embedders.embedding_model;
+                        core_config.additional_embedding_models =
+                            core_embedders.additional_embedding_models.clone();
+                        (
+                            core_embedders.registry.clone(),
+                            core_embedders.default_embedder_name.clone(),
+                        )
+                    }
+                    None => (
+                        self.embedder_registry.clone(),
+                        self.default_embedder_name.clone(),
+                    ),
+                };
                 KhiveRuntime {
                     backend: main_arc.clone(),
                     core_backend: None,
                     config: core_config,
                     ann_fresh_tail_enabled: self.ann_fresh_tail_enabled,
-                    embedder_registry: self.embedder_registry.clone(),
-                    default_embedder_name: self.default_embedder_name.clone(),
+                    embedder_registry,
+                    default_embedder_name,
+                    core_embedders: None,
                     edge_rules: self.edge_rules.clone(),
                     valid_entity_kinds: self.valid_entity_kinds.clone(),
                     valid_note_kinds: self.valid_note_kinds.clone(),
