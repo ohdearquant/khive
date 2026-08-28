@@ -1760,6 +1760,92 @@ impl KhiveRuntime {
             .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
     }
 
+    /// Non-wire outbox scan for the channel delivery loops.
+    ///
+    /// Pages newest-first through live `message` notes (the same order and
+    /// 10k scan cap as the generic `list` verb's filtered offset path) and
+    /// returns those with `properties.direction == "outbound"` whose
+    /// `delivered_at` is absent or null, capped at `limit`. This lives on the
+    /// runtime rather than going through the wire registry for the same
+    /// reason as [`Self::claim_outbound_message_external_id`]: the delivery
+    /// loop must scan the backend that actually holds comm's notes, and under
+    /// a `[packs.comm]` backend assignment that is not the backend serving
+    /// the generic kg verbs.
+    pub async fn list_undelivered_outbound_messages(
+        &self,
+        token: &NamespaceToken,
+        limit: u32,
+    ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
+        const PAGE_SIZE: u32 = 200;
+        const MAX_SCAN_TOTAL: u32 = 10_000;
+        let mut collected: Vec<khive_storage::note::Note> = Vec::new();
+        let mut db_offset: u32 = 0;
+        loop {
+            let remaining_scan = MAX_SCAN_TOTAL.saturating_sub(db_offset).min(PAGE_SIZE);
+            if remaining_scan == 0 {
+                break;
+            }
+            let page = self
+                .list_notes(token, Some("message"), remaining_scan, db_offset)
+                .await?;
+            let fetched = page.len() as u32;
+            for note in page {
+                if note.deleted_at.is_some() {
+                    continue;
+                }
+                let props = note.properties.as_ref().and_then(|v| v.as_object());
+                let outbound = props
+                    .and_then(|p| p.get("direction"))
+                    .and_then(|v| v.as_str())
+                    == Some("outbound");
+                if !outbound {
+                    continue;
+                }
+                // Must match `note_already_delivered` in the delivery loop: a
+                // present-but-null `delivered_at` is undelivered.
+                let delivered = props
+                    .and_then(|p| p.get("delivered_at"))
+                    .is_some_and(|v| !v.is_null());
+                if delivered {
+                    continue;
+                }
+                collected.push(note);
+                if collected.len() >= limit as usize {
+                    return Ok(collected);
+                }
+            }
+            if fetched < PAGE_SIZE {
+                break;
+            }
+            db_offset += fetched;
+        }
+        Ok(collected)
+    }
+
+    /// Mark an outbound `message` note delivered by merging
+    /// `properties.delivered_at`, through the same patch path the generic
+    /// `update` verb uses (`delivered_at` is deliberately not
+    /// owner-established, pinned by
+    /// `generic_update_can_still_patch_delivered_at_on_message_note`).
+    /// Non-wire companion to [`Self::list_undelivered_outbound_messages`] so
+    /// the delivery loop writes the backend that holds the note.
+    pub async fn mark_outbound_message_delivered(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        delivered_at: String,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        self.update_note(
+            token,
+            id,
+            NotePatch {
+                properties: Some(serde_json::json!({ "delivered_at": delivered_at })),
+                ..NotePatch::default()
+            },
+        )
+        .await
+    }
+
     /// Merge `from_id` note into `into_id` note.
     ///
     /// Both notes must exist in the namespace and have the same `kind`. Content is merged

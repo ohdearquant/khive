@@ -2219,6 +2219,7 @@ dependencies = [
  "criterion",
  "inventory",
  "khive-brain-core",
+ "khive-db",
  "khive-fold",
  "khive-fusion",
  "khive-pack-brain",

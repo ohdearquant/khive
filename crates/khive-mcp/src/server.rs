@@ -820,11 +820,13 @@ fn build_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>)
 /// Runtime-mode admission for transport background work.
 ///
 /// The inbound tasks dispatch only `comm.*` verbs (`comm.ingest`, heartbeat,
-/// and cursor operations), so their write authority is the comm pack's actual
-/// assigned runtime. The outbound tasks scan and mutate notes through the kg
-/// pack's generic `list`/`update` verbs, so they must not perform an external
-/// send unless that runtime can durably record the claim and `delivered_at`.
-/// Keeping the two decisions separate preserves mixed-backend topologies.
+/// and cursor operations), and the outbound tasks scan, claim, and mark
+/// outbound `message` notes through the runtime's non-wire owner-side APIs —
+/// both against the comm pack's actual assigned runtime, since under a
+/// `[packs.comm]` backend assignment that is the backend holding comm's
+/// rows. Neither loop may run unless that runtime can durably record its
+/// writes. The two decisions stay separate so a future topology can admit
+/// one direction without the other.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChannelLoopAdmission {
@@ -836,21 +838,18 @@ pub(crate) struct ChannelLoopAdmission {
 impl ChannelLoopAdmission {
     fn for_single_runtime(runtime: &KhiveRuntime, packs: &[String]) -> Self {
         let comm_loaded = packs.iter().any(|pack| pack == "comm");
-        let kg_loaded = packs.iter().any(|pack| pack == "kg");
         let writable = !runtime.is_read_only();
         Self {
             inbound_poll: comm_loaded && writable,
-            outbound_delivery: comm_loaded && kg_loaded && writable,
+            outbound_delivery: comm_loaded && writable,
         }
     }
 
-    pub(crate) fn for_pack_runtimes(
-        kg: Option<&KhiveRuntime>,
-        comm: Option<&KhiveRuntime>,
-    ) -> Self {
+    pub(crate) fn for_pack_runtimes(comm: Option<&KhiveRuntime>) -> Self {
+        let admitted = comm.is_some_and(|runtime| !runtime.is_read_only());
         Self {
-            inbound_poll: comm.is_some_and(|runtime| !runtime.is_read_only()),
-            outbound_delivery: comm.is_some() && kg.is_some_and(|runtime| !runtime.is_read_only()),
+            inbound_poll: admitted,
+            outbound_delivery: admitted,
         }
     }
 }
@@ -878,11 +877,13 @@ pub struct KhiveMcpServer {
     /// [`Self::from_registry`]/[`Self::from_registry_with_meta`] without an
     /// explicit [`Self::with_runtime`] call (test-only construction paths).
     runtime: Option<KhiveRuntime>,
-    /// Runtime that owns KG-routed outbox notes. The email loop's
-    /// `external_id` claim is deliberately non-wire, so it cannot rely on the
-    /// registry to route that one mutation. In a multi-backend topology this
-    /// may differ from `runtime` (the default backend); retaining the exact KG
-    /// runtime keeps list, owner claim, and delivered-at update on one store.
+    /// Runtime that owns the outbound `message` notes the delivery loops
+    /// scan, claim, and mark — the comm pack's assigned runtime. Every one of
+    /// those touches is deliberately non-wire (the generic verbs run on the
+    /// kg/main runtime, which under a `[packs.comm]` backend assignment does
+    /// not hold comm's rows). In a multi-backend topology this may differ
+    /// from `runtime` (the default backend); retaining the exact comm
+    /// runtime keeps scan, owner claim, and delivered-at update on one store.
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     channel_outbox_runtime: Option<KhiveRuntime>,
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
@@ -5784,6 +5785,7 @@ mod tests {
                 "knowledge".to_string(),
                 PackConfig {
                     backend: "archive".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -5828,6 +5830,7 @@ mod tests {
                 "kg".to_string(),
                 PackConfig {
                     backend: "main".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()

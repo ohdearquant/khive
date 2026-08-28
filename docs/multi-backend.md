@@ -123,6 +123,10 @@ path   = "~/.khive/records.db"
 # ── Per-pack routing ───────────────────────────────────────────────────────────
 # Packs not listed here fall back to "main".
 # The value of `backend` must match a [[backends]].name above.
+# `no_embed = true` additionally strips the embedder set from that pack's
+# runtime: its rows get FTS and metadata only — no vec_* rows, no ANN
+# participation. Use it for packs whose rows are structural rather than
+# retrieval targets (e.g. comm).
 
 [packs.records]           # hypothetical operator-supplied records pack
 backend = "records"
@@ -412,14 +416,14 @@ a writable main; conversely, a writable blob secondary beside a read-only main
 retains normal puts.
 
 Feature-enabled email and Telegram background work is also admitted by the
-runtime that serves each loop's verbs, not by `--daemon` alone. Inbound polling
-requires the assigned `comm` runtime to be writable because it dispatches
-`comm.ingest`, heartbeat, and cursor writes. Outbound delivery requires the
-assigned `kg` runtime to be writable because it uses generic `list`/`update` to
-claim and mark a message; otherwise no external send task starts, avoiding a
-send followed by an inevitably failed `delivered_at` write. These gates are
-independent, so a mixed topology can admit one direction without admitting the
-other.
+runtime that serves each loop's verbs, not by `--daemon` alone. Both
+directions key on the assigned `comm` runtime being writable: inbound polling
+dispatches `comm.ingest`, heartbeat, and cursor writes, and outbound delivery
+scans, claims, and marks outbound `message` notes through that runtime's
+non-wire owner-side APIs (the notes live on whatever backend `[packs.comm]`
+assigns, so the generic kg-routed `list`/`update` verbs cannot reach them).
+If the comm runtime is not writable, no external send task starts, avoiding a
+send followed by an inevitably failed `delivered_at` write.
 
 The explicit `read_only` value participates in the backend-topology portion of
 the warm-daemon `config_id`. In multi-backend configuration it must agree with

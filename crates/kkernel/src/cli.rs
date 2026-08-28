@@ -2095,6 +2095,7 @@ mod tests {
                     "session".to_string(),
                     PackConfig {
                         backend: "sessions".to_string(),
+                        no_embed: false,
                     },
                 );
                 m

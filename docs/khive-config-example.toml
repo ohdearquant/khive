@@ -203,9 +203,15 @@ fusion_weight = 0.5
 # Route an individual pack to a declared backend. Packs not listed here fall back to
 # `main`. The referenced backend must appear in [[backends]] above. Loadable packs:
 # kg, gtd, memory, brain, comm, schedule, knowledge, session, git, code.
+# Optional `no_embed = true` gives that pack's runtime zero embedders: its rows
+# get FTS + metadata only (no vec_* rows, no ANN).
 
 # [packs.knowledge]
 # backend = "knowledge"
+
+# [packs.comm]
+# backend = "comm"
+# no_embed = true
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Environment variables

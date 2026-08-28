@@ -457,7 +457,6 @@ fn spawn_email_channel_loops(
             let ingest_ns_clone = ingest_ns.clone();
             let default_actor_clone = default_actor.clone();
             let verb_reg_poll = verb_reg.clone();
-            let verb_reg_outbox = verb_reg.clone();
             let ingest_ns_outbox = ingest_ns.clone();
             let allowlist_clone = allowlist.clone();
             let mailbox_clone = mailbox.clone();
@@ -490,7 +489,6 @@ fn spawn_email_channel_loops(
                         Some(rt) => {
                             tokio::task::spawn(channel_outbox_loop(
                                 email_ch_clone,
-                                verb_reg_outbox,
                                 rt,
                                 ingest_ns_outbox,
                                 mailbox_clone,
@@ -500,8 +498,8 @@ fn spawn_email_channel_loops(
                         }
                         None => {
                             tracing::error!(
-                                "email outbox loop was NOT started: server has no KG-routed \
-                                 runtime handle, which the loop needs to claim external_id on \
+                                "email outbox loop was NOT started: server has no comm-routed \
+                                 runtime handle, which the loop needs to scan, claim, and mark \
                                  outbound notes; outbound mail will not be sent"
                             );
                         }
@@ -1381,18 +1379,18 @@ fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) ->
 /// `delivered_at` write causes a duplicate send on restart; the duplicate carries
 /// the same Message-ID so receiving MTAs typically collapse it.
 ///
-/// The `external_id` claim goes through `runtime`'s non-wire
-/// `claim_outbound_message_external_id` rather than a `registry.dispatch("update",
-/// ...)` call: `external_id` is one of the owner-established properties the
-/// generic `update` verb refuses to patch on a pack-owned note kind, so a caller
-/// patch through `dispatch` is rejected by design and would leave every note
-/// stuck retrying forever.
+/// Every storage touch (scan, `external_id` claim, `delivered_at` mark) goes
+/// through `runtime`'s non-wire owner-side APIs rather than
+/// `registry.dispatch(...)`: the generic wire verbs run on the kg pack's
+/// runtime, which under a `[packs.comm]` backend assignment is a different
+/// backend than the one holding comm's notes, and `external_id` is
+/// additionally one of the owner-established properties the generic `update`
+/// verb refuses to patch on a pack-owned note kind.
 ///
 /// Only compiled when the `channel-email` feature is enabled.
 #[cfg(feature = "channel-email")]
 async fn channel_outbox_loop(
     email_channel: std::sync::Arc<khive_channel_email::EmailChannel>,
-    registry: khive_runtime::VerbRegistry,
     runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
     mailbox: String,
@@ -1415,10 +1413,8 @@ async fn channel_outbox_loop(
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         channel_outbox_once(
             email_channel.as_ref(),
-            &registry,
             &runtime,
             &namespace,
-            &ingest_namespace,
             &mailbox,
             &domain,
             &allowlist,
@@ -1434,45 +1430,44 @@ async fn channel_outbox_loop(
 #[allow(clippy::too_many_arguments)]
 async fn channel_outbox_once(
     email_channel: &dyn khive_channel::Channel,
-    registry: &khive_runtime::VerbRegistry,
     runtime: &khive_runtime::KhiveRuntime,
     namespace: &khive_runtime::Namespace,
-    ingest_namespace: &str,
     mailbox: &str,
     domain: &str,
     allowlist: &[String],
 ) {
     use chrono::Utc;
     use khive_channel::ChannelEnvelope;
-    use serde_json::json;
 
-    // Query outbound messages via the registry. The note `list` handler applies
-    // the `direction` filter server-side (scanning up to its internal cap) and
-    // returns an `items` envelope of full note objects. There is no `delivered_at`
-    // or recipient-prefix filter, so the `email:` prefix and the
-    // already-delivered check are applied per-note below.
-    let list_params = json!({
-        "namespace": ingest_namespace,
-        "kind": "message",
-        "direction": "outbound",
-        "delivered": false,
-        "limit": 200,
-    });
-    let list_result = match registry.dispatch("list", list_params).await {
-        Ok(result) => result,
+    // Query outbound messages through the runtime's non-wire outbox scan.
+    // The generic wire `list` verb runs on the kg pack's runtime, which under
+    // a `[packs.comm]` backend assignment is not the backend holding comm's
+    // notes — the scan must use the comm-routed handle this loop was given.
+    // There is no recipient-prefix filter in the scan, so the `email:` prefix
+    // check (and a defensive re-check of direction/delivered) is applied
+    // per-note below.
+    let token = match runtime.authorize(namespace.clone()) {
+        Ok(token) => token,
         Err(error) => {
-            tracing::warn!(error = %error, "outbox loop: list failed");
+            tracing::warn!(error = %error, "outbox loop: namespace authorization failed");
             return;
         }
     };
-
-    let Some(notes) = list_result
-        .get("items")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return;
+    let notes = match runtime
+        .list_undelivered_outbound_messages(&token, 200)
+        .await
+    {
+        Ok(notes) => notes,
+        Err(error) => {
+            tracing::warn!(error = %error, "outbox loop: outbox scan failed");
+            return;
+        }
     };
-    for note_val in notes {
+    let notes: Vec<serde_json::Value> = notes
+        .iter()
+        .filter_map(|note| serde_json::to_value(note).ok())
+        .collect();
+    for note_val in &notes {
         let props = match note_val.get("properties") {
             Some(serde_json::Value::Object(properties)) => properties.clone(),
             _ => continue,
@@ -1534,18 +1529,11 @@ async fn channel_outbox_once(
             _ => {
                 let message_id = format!("<{note_id}@{domain}>");
                 let claim_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => match runtime.authorize(namespace.clone()) {
-                        Ok(token) => {
-                            runtime
-                                .claim_outbound_message_external_id(
-                                    &token,
-                                    uuid,
-                                    message_id.clone(),
-                                )
-                                .await
-                        }
-                        Err(error) => Err(error),
-                    },
+                    Ok(uuid) => {
+                        runtime
+                            .claim_outbound_message_external_id(&token, uuid, message_id.clone())
+                            .await
+                    }
                     Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
                         "note id {note_id} is not a valid UUID: {error}"
                     ))),
@@ -1582,17 +1570,16 @@ async fn channel_outbox_once(
         match email_channel.send(envelope).await {
             Ok(()) => {
                 let delivered_at = Utc::now().to_rfc3339();
-                match registry
-                    .dispatch(
-                        "update",
-                        json!({
-                            "namespace": ingest_namespace,
-                            "id": note_id,
-                            "properties": { "delivered_at": delivered_at },
-                        }),
-                    )
-                    .await
-                {
+                let delivered_result = match uuid::Uuid::parse_str(&note_id) {
+                    Ok(uuid) => runtime
+                        .mark_outbound_message_delivered(&token, uuid, delivered_at)
+                        .await
+                        .map(|_| ()),
+                    Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                        "note id {note_id} is not a valid UUID: {error}"
+                    ))),
+                };
+                match delivered_result {
                     Ok(_) => tracing::info!(
                         note_id = %note_id,
                         recipient = %recipient,
@@ -1668,7 +1655,7 @@ fn spawn_telegram_channel_loops(
             let ingest_ns = telegram_ingest_namespace_from_env();
 
             let verb_reg_poll = verb_reg.clone();
-            let verb_reg_outbox = verb_reg.clone();
+            let outbox_runtime = server.channel_outbox_runtime_clone();
             let ingest_ns_poll = ingest_ns.clone();
             let ingest_ns_outbox = ingest_ns.clone();
             let tg_ch_poll = Arc::clone(&tg_ch);
@@ -1690,12 +1677,23 @@ fn spawn_telegram_channel_loops(
                     tracing::info!("telegram channel polling loop started");
                 }
                 if admission.outbound_delivery {
-                    tokio::task::spawn(telegram_outbox_loop(
-                        tg_ch_outbox,
-                        verb_reg_outbox,
-                        ingest_ns_outbox,
-                    ));
-                    tracing::info!("telegram channel outbox loop started");
+                    match outbox_runtime {
+                        Some(rt) => {
+                            tokio::task::spawn(telegram_outbox_loop(
+                                tg_ch_outbox,
+                                rt,
+                                ingest_ns_outbox,
+                            ));
+                            tracing::info!("telegram channel outbox loop started");
+                        }
+                        None => {
+                            tracing::error!(
+                                "telegram outbox loop was NOT started: server has no \
+                                 comm-routed runtime handle, which the loop needs to scan and \
+                                 mark outbound notes; outbound telegram will not be sent"
+                            );
+                        }
+                    }
                 }
             });
             if !spawned {
@@ -1825,38 +1823,50 @@ async fn telegram_poll_loop(
 #[cfg(feature = "channel-telegram")]
 async fn telegram_outbox_loop(
     telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
-    registry: khive_runtime::VerbRegistry,
+    runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
 ) {
     use chrono::Utc;
     use khive_channel::{Channel, ChannelEnvelope};
-    use serde_json::json;
+
+    let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::error!(
+                namespace = %ingest_namespace,
+                error = %e,
+                "telegram outbox loop: ingest namespace does not parse; loop will not run"
+            );
+            return;
+        }
+    };
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        let list_params = json!({
-            "namespace": ingest_namespace,
-            "kind": "message",
-            "direction": "outbound",
-            "delivered": false,
-            "limit": 200,
-        });
-        let list_result = match registry.dispatch("list", list_params).await {
-            Ok(r) => r,
+        // Scan through the comm-routed runtime handle, not the wire `list`
+        // verb — see `channel_outbox_once` for the backend-routing rationale.
+        let token = match runtime.authorize(namespace.clone()) {
+            Ok(token) => token,
             Err(e) => {
-                tracing::warn!(error = %e, "telegram outbox loop: list failed");
+                tracing::warn!(error = %e, "telegram outbox loop: namespace authorization failed");
                 continue;
             }
         };
-
-        let notes = match list_result
-            .get("items")
-            .and_then(serde_json::Value::as_array)
+        let notes = match runtime
+            .list_undelivered_outbound_messages(&token, 200)
+            .await
         {
-            Some(arr) => arr.clone(),
-            None => continue,
+            Ok(notes) => notes,
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram outbox loop: outbox scan failed");
+                continue;
+            }
         };
+        let notes: Vec<serde_json::Value> = notes
+            .iter()
+            .filter_map(|note| serde_json::to_value(note).ok())
+            .collect();
 
         for note_val in notes {
             let props = match note_val.get("properties") {
@@ -1892,16 +1902,15 @@ async fn telegram_outbox_loop(
             match telegram_channel.send(env).await {
                 Ok(()) => {
                     let delivered_at = Utc::now().to_rfc3339();
-                    let mark_result = registry
-                        .dispatch(
-                            "update",
-                            json!({
-                                "namespace": ingest_namespace,
-                                "id": note_id,
-                                "properties": { "delivered_at": delivered_at },
-                            }),
-                        )
-                        .await;
+                    let mark_result = match uuid::Uuid::parse_str(&note_id) {
+                        Ok(uuid) => runtime
+                            .mark_outbound_message_delivered(&token, uuid, delivered_at)
+                            .await
+                            .map(|_| ()),
+                        Err(e) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                            "note id {note_id} is not a valid UUID: {e}"
+                        ))),
+                    };
                     match mark_result {
                         Ok(_) => {
                             tracing::info!(note_id = %note_id, "telegram outbox loop: delivered");
@@ -2726,8 +2735,8 @@ async fn build_registry_for_multi_backend_inner(
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
     for pack_name in pack_names {
-        let (backend_name, backend) = match khive_cfg.packs.get(pack_name.as_str()) {
-            None => (BackendId::MAIN, main_backend.clone()),
+        let (backend_name, backend, no_embed) = match khive_cfg.packs.get(pack_name.as_str()) {
+            None => (BackendId::MAIN, main_backend.clone(), false),
             Some(pack_cfg) => {
                 let backend_name = pack_cfg.backend.as_str();
                 let backend = backends.get(backend_name).cloned().ok_or_else(|| {
@@ -2736,11 +2745,20 @@ async fn build_registry_for_multi_backend_inner(
                         "[packs.{pack_name}].backend = {backend_name:?} references an unknown backend; defined backends: {defined}"
                     )
                 })?;
-                (backend_name, backend)
+                (backend_name, backend, pack_cfg.no_embed)
             }
         };
         let mut rt_config = base_config.clone();
         rt_config.backend_id = BackendId::new(backend_name);
+        if no_embed {
+            // `[packs.<name>] no_embed = true`: this pack's runtime gets zero
+            // embedders — its writes are FTS + metadata only, including
+            // core()-routed ones (core() inherits the runtime's embedder
+            // set). Clear both model fields together, same contract as
+            // `RuntimeConfig::no_embeddings`.
+            rt_config.embedding_model = None;
+            rt_config.additional_embedding_models = Vec::new();
+        }
         per_pack_runtimes_local.insert(
             pack_name.clone(),
             build_pack_runtime(backend, backend_name, rt_config, &main_backend),
@@ -3356,13 +3374,16 @@ pub fn build_server_from_multi_backend_registry(
 ) -> KhiveMcpServer {
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     let channel_loop_admission = crate::server::ChannelLoopAdmission::for_pack_runtimes(
-        multi.per_pack_runtimes.get("kg").map(Arc::as_ref),
         multi.per_pack_runtimes.get("comm").map(Arc::as_ref),
     );
+    // The delivery loops scan, claim, and mark outbound `message` notes, so
+    // they must hold the runtime that owns comm's rows — under a
+    // `[packs.comm]` backend assignment that is the comm pack's runtime, not
+    // the kg/main one (which would list an empty outbox forever).
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     let channel_outbox_runtime = multi
         .per_pack_runtimes
-        .get("kg")
+        .get("comm")
         .map(|runtime| runtime.as_ref().clone());
     // Wire the main backend's pool for background WAL checkpointing. The pool is
     // only present for file-backed databases; in-memory backends return None here
@@ -5553,6 +5574,7 @@ id = "lambda:project-actor"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -6743,6 +6765,7 @@ region = "us-east-1"
                 "blob".to_string(),
                 PackConfig {
                     backend: "blob-snapshot".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -6804,6 +6827,7 @@ region = "us-east-1"
                 "blob".to_string(),
                 PackConfig {
                     backend: "blob-writable".to_string(),
+                    no_embed: false,
                 },
             )]),
             storage: StorageSectionConfig {
@@ -6869,6 +6893,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -6958,12 +6983,14 @@ region = "us-east-1"
                     "kg".to_string(),
                     PackConfig {
                         backend: "direct".to_string(),
+                        no_embed: false,
                     },
                 );
                 m.insert(
                     "comm".to_string(),
                     PackConfig {
                         backend: "alias".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -7046,6 +7073,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -7103,6 +7131,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 packs
@@ -7487,6 +7516,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -7567,6 +7597,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -7694,6 +7725,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "archive".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -7752,6 +7784,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "archive".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -7915,6 +7948,7 @@ region = "us-east-1"
                 "comm".to_string(),
                 PackConfig {
                     backend: "comm-store".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -8027,6 +8061,7 @@ region = "us-east-1"
                 "comm".to_string(),
                 PackConfig {
                     backend: "comm-store".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -8059,8 +8094,9 @@ region = "us-east-1"
             "comm.ingest/cursor/heartbeat are backed by the read-only comm runtime"
         );
         assert!(
-            admission.outbound_delivery,
-            "list/update are backed by the writable kg runtime"
+            !admission.outbound_delivery,
+            "the outbox scan/claim/mark also run on the read-only comm runtime, so no \
+             external send task may start"
         );
         drop(server);
         #[cfg(unix)]
@@ -8097,9 +8133,9 @@ region = "us-east-1"
             "comm.ingest/cursor/heartbeat are backed by the writable comm runtime"
         );
         assert!(
-            !admission.outbound_delivery,
-            "a read-only kg runtime cannot durably claim or mark delivery, so no external send \
-             task may start"
+            admission.outbound_delivery,
+            "the outbox scan/claim/mark run on the writable comm runtime — a read-only kg/main \
+             no longer gates external sends"
         );
     }
 
@@ -8153,6 +8189,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "alias".to_string(),
+                        no_embed: false,
                     },
                 );
                 packs
@@ -8497,6 +8534,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -8562,6 +8600,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -8639,6 +8678,7 @@ region = "us-east-1"
             "comm".to_string(),
             PackConfig {
                 backend: "secondary".to_string(),
+                no_embed: false,
             },
         );
 
@@ -8735,6 +8775,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "second".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -10598,12 +10639,14 @@ backend = "kg-backend"
                         "kg".to_string(),
                         PackConfig {
                             backend: "kg-store".to_string(),
+                            no_embed: false,
                         },
                     ),
                     (
                         "comm".to_string(),
                         PackConfig {
                             backend: "kg-store".to_string(),
+                            no_embed: false,
                         },
                     ),
                 ]),
@@ -10625,7 +10668,7 @@ backend = "kg-backend"
             let registry = server.verb_registry_clone();
             let owner_runtime = server
                 .channel_outbox_runtime_clone()
-                .expect("email outbox must retain the KG-routed runtime");
+                .expect("email outbox must retain the comm-routed runtime");
             assert_eq!(owner_runtime.backend_id().as_str(), "kg-store");
 
             let send = registry
@@ -10648,10 +10691,8 @@ backend = "kg-backend"
             let namespace = Namespace::parse("local").unwrap();
             channel_outbox_once(
                 &channel,
-                &registry,
                 &owner_runtime,
                 &namespace,
-                "local",
                 "maintainer@example.com",
                 "example.com",
                 &["recipient@example.com".to_string()],
@@ -10694,6 +10735,213 @@ backend = "kg-backend"
                      FROM notes WHERE content = 'kg-secondary-outbox-probe' \
                        AND json_extract(properties, '$.direction') = 'outbound'",
                     [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(!external_id.is_empty());
+            assert!(!delivered_at.is_empty());
+        }
+
+        /// `[packs.<name>] no_embed = true` must strip the embedder set from
+        /// exactly that pack's runtime. Registration is config-driven and
+        /// lazy-loading, so the registered-name lists are observable without
+        /// any model files present. The kg runtime doubles as the must-match
+        /// control: same base config, embedders retained.
+        #[tokio::test]
+        #[serial]
+        async fn pack_no_embed_strips_embedders_from_that_runtime_only() {
+            let dir = tempfile::tempdir().unwrap();
+            let khive_cfg = KhiveConfig {
+                backends: vec![
+                    BackendConfig {
+                        name: BackendId::MAIN.to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(dir.path().join("main.db")),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                    BackendConfig {
+                        name: "comm-store".to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(dir.path().join("comm.db")),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                ],
+                packs: HashMap::from([(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "comm-store".to_string(),
+                        no_embed: true,
+                    },
+                )]),
+                ..KhiveConfig::default()
+            };
+
+            // Unlike the other fixtures, keep the default embedding model so
+            // the control arm has something to retain.
+            let base = RuntimeConfig {
+                packs: vec!["kg".to_string(), "comm".to_string()],
+                ..base_runtime_config_for_multi_backend()
+            };
+            let base = RuntimeConfig {
+                embedding_model: RuntimeConfig::default().embedding_model,
+                ..base
+            };
+            assert!(
+                base.embedding_model.is_some(),
+                "control arm needs a configured embedder"
+            );
+
+            let multi = build_registry_for_multi_backend_inner(base, &khive_cfg, None)
+                .await
+                .expect("no_embed topology must build");
+
+            assert!(
+                multi.per_pack_runtimes["comm"]
+                    .registered_embedding_model_names()
+                    .is_empty(),
+                "no_embed pack runtime must register zero embedders"
+            );
+            assert!(
+                !multi.per_pack_runtimes["kg"]
+                    .registered_embedding_model_names()
+                    .is_empty(),
+                "packs without no_embed must keep the configured embedders"
+            );
+        }
+
+        /// Two-backend regression for the comm split topology: comm assigned
+        /// its own backend while kg stays on main. The delivery loop's
+        /// non-wire scan/claim/mark must all land on the comm backend; the
+        /// generic wire `list` (kg/main-routed) cannot see the outbox at all,
+        /// which is exactly why the loop must not use it.
+        #[tokio::test]
+        #[serial]
+        async fn comm_secondary_runtime_owns_outbox_scan_claim_and_delivery_mark() {
+            let dir = tempfile::tempdir().unwrap();
+            let main_path = dir.path().join("main.db");
+            let comm_path = dir.path().join("comm-secondary.db");
+            let khive_cfg = KhiveConfig {
+                backends: vec![
+                    BackendConfig {
+                        name: BackendId::MAIN.to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(main_path.clone()),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                    BackendConfig {
+                        name: "comm-store".to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(comm_path.clone()),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                ],
+                packs: HashMap::from([(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "comm-store".to_string(),
+                        no_embed: false,
+                    },
+                )]),
+                ..KhiveConfig::default()
+            };
+
+            let multi = build_registry_for_multi_backend_inner(
+                base_runtime_config_for_multi_backend(),
+                &khive_cfg,
+                None,
+            )
+            .await
+            .expect("comm-secondary registry must build");
+            let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+            let registry = server.verb_registry_clone();
+            let owner_runtime = server
+                .channel_outbox_runtime_clone()
+                .expect("email outbox must retain the comm-routed runtime");
+            assert_eq!(owner_runtime.backend_id().as_str(), "comm-store");
+
+            let send = registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({
+                        "to": "email:recipient@example.com",
+                        "subject": "comm split outbox",
+                        "content": "comm-secondary-outbox-probe",
+                    }),
+                )
+                .await
+                .expect("comm.send must create the outbound row on the comm backend");
+            let note_id = send["full_id"]
+                .as_str()
+                .expect("comm.send returns full_id")
+                .to_string();
+
+            // The generic wire `list` runs on kg/main and must NOT see the
+            // outbox row — pinning the routing gap the non-wire scan closes.
+            let wire_list = registry
+                .dispatch(
+                    "list",
+                    serde_json::json!({
+                        "kind": "message",
+                        "direction": "outbound",
+                        "delivered": false,
+                        "limit": 200,
+                    }),
+                )
+                .await
+                .expect("generic list must succeed on main");
+            let wire_items = wire_list
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                wire_items.is_empty(),
+                "main-routed wire list must not see comm's outbox: {wire_list}"
+            );
+
+            let channel = RecordingChannel::default();
+            let namespace = Namespace::parse("local").unwrap();
+            channel_outbox_once(
+                &channel,
+                &owner_runtime,
+                &namespace,
+                "maintainer@example.com",
+                "example.com",
+                &["recipient@example.com".to_string()],
+            )
+            .await;
+            assert_eq!(
+                channel.sent.lock().unwrap().len(),
+                1,
+                "non-wire scan must find and deliver the comm-backend outbox row"
+            );
+
+            let main = rusqlite::Connection::open(&main_path).unwrap();
+            let main_count: i64 = main
+                .query_row(
+                    "SELECT COUNT(*) FROM notes WHERE content = 'comm-secondary-outbox-probe'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(main_count, 0, "main backend must not own the message");
+
+            let comm = rusqlite::Connection::open(&comm_path).unwrap();
+            let (external_id, delivered_at): (String, String) = comm
+                .query_row(
+                    "SELECT json_extract(properties, '$.external_id'), \
+                            json_extract(properties, '$.delivered_at') \
+                     FROM notes WHERE id = ?1 \
+                       AND json_extract(properties, '$.direction') = 'outbound'",
+                    [&note_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();

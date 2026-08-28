@@ -3857,6 +3857,7 @@ id = "lambda:fallback"
                     "session".to_string(),
                     PackConfig {
                         backend: "sessions".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -3969,6 +3970,7 @@ id = "lambda:fallback"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
