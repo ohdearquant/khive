@@ -3782,6 +3782,65 @@ mod tests {
         note
     }
 
+    /// Predicate + ordering contract of the non-wire outbox scan: outbound
+    /// with absent OR explicitly-null `delivered_at` is undelivered; a
+    /// non-null `delivered_at`, an inbound row, and a soft-deleted row are
+    /// all excluded; results come newest-first and respect `limit`.
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_predicate_and_order() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let mut undelivered_old = outbound_message_note();
+        undelivered_old.created_at -= 10;
+        let mut undelivered_null = outbound_message_note();
+        undelivered_null.properties =
+            Some(serde_json::json!({"direction": "outbound", "delivered_at": null}));
+        let mut delivered = outbound_message_note();
+        delivered.properties = Some(
+            serde_json::json!({"direction": "outbound", "delivered_at": "2026-08-28T00:00:00Z"}),
+        );
+        let mut inbound = Note::new("local", "message", "inbound row");
+        inbound.properties = Some(serde_json::json!({"direction": "inbound"}));
+        let mut soft_deleted = outbound_message_note();
+        soft_deleted.deleted_at = Some(chrono::Utc::now().timestamp_micros());
+
+        let old_id = undelivered_old.id;
+        let null_id = undelivered_null.id;
+        for note in [
+            undelivered_old,
+            undelivered_null,
+            delivered,
+            inbound,
+            soft_deleted,
+        ] {
+            store.upsert_note(note).await.expect("seed note");
+        }
+
+        let hits = rt
+            .list_undelivered_outbound_messages(&tok, 200)
+            .await
+            .expect("scan succeeds");
+        let ids: Vec<_> = hits.iter().map(|n| n.id).collect();
+        assert_eq!(
+            ids,
+            vec![null_id, old_id],
+            "only the two undelivered outbound rows, newest-first"
+        );
+
+        let capped = rt
+            .list_undelivered_outbound_messages(&tok, 1)
+            .await
+            .expect("capped scan succeeds");
+        assert_eq!(
+            capped.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![null_id],
+            "limit truncates after the newest undelivered row"
+        );
+    }
+
     #[tokio::test]
     async fn claim_outbound_message_external_id_sets_value_and_survives_readback() {
         let rt = rt();
