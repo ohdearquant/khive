@@ -1280,14 +1280,11 @@ impl EventStore for SqlEventStore {
             // carried no `LIMIT`, so it scanned the whole filtered set on every
             // paged read while the data query below fetches only
             // `offset + limit` rows — and on the merged event plane a single
-            // read paid it twice, once per underlying store. No caller reads
-            // `Page.total` on this path: both production callers
-            // (`khive-mcp::coordinator` and `khive-mcp::pending_events`) take
-            // `.items`, and the merged fold in `khive-runtime::events_split`
-            // propagates `None` rather than inventing a number. `Page.total`
-            // is `Option<u64>` precisely so a store may decline to compute it;
-            // `count_events` below remains for callers that genuinely want a
-            // cardinality.
+            // read paid it twice, once per underlying store. `Page.total` is
+            // `Option<u64>` precisely so a store may decline to compute it, and
+            // the merged fold in `khive-runtime::events_split` propagates `None`
+            // rather than inventing a number. `count_events` below remains for
+            // callers that genuinely want a cardinality.
             let (where_clause, filter_params) = build_event_filter_sql(conn, &namespace, &filter)?;
 
             let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
