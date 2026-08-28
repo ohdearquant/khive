@@ -3735,10 +3735,12 @@ fn build_pack_runtime(
     main_backend: &Arc<StorageBackend>,
     main_runtime: &KhiveRuntime,
 ) -> KhiveRuntime {
-    let rt = KhiveRuntime::from_backend(backend, rt_config);
+    // Every pack runtime carries main's embedder wiring for core(): a
+    // main-assigned pack has no core pointer, but with `no_embed` its own
+    // registry is empty and core-routed concept writes must still embed.
+    let rt = KhiveRuntime::from_backend(backend, rt_config).with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
-            .with_core_embedders_from(main_runtime)
     } else {
         rt
     }
@@ -10817,20 +10819,32 @@ backend = "kg-backend"
                         read_only: false,
                     },
                 ],
-                packs: HashMap::from([(
-                    "comm".to_string(),
-                    PackConfig {
-                        backend: "comm-store".to_string(),
-                        no_embed: true,
-                    },
-                )]),
+                packs: HashMap::from([
+                    (
+                        "comm".to_string(),
+                        PackConfig {
+                            backend: "comm-store".to_string(),
+                            no_embed: true,
+                        },
+                    ),
+                    // A MAIN-assigned no_embed pack: no core pointer, but its
+                    // core() must still carry main's embedders (a main
+                    // assignment used to skip the core-embedder wiring).
+                    (
+                        "gtd".to_string(),
+                        PackConfig {
+                            backend: BackendId::MAIN.to_string(),
+                            no_embed: true,
+                        },
+                    ),
+                ]),
                 ..KhiveConfig::default()
             };
 
             // Unlike the other fixtures, keep the default embedding model so
             // the control arm has something to retain.
             let base = RuntimeConfig {
-                packs: vec!["kg".to_string(), "comm".to_string()],
+                packs: vec!["kg".to_string(), "comm".to_string(), "gtd".to_string()],
                 ..base_runtime_config_for_multi_backend()
             };
             let base = RuntimeConfig {
@@ -10867,6 +10881,21 @@ backend = "kg-backend"
                     .registered_embedding_model_names(),
                 main_models,
                 "no_embed pack's core() must carry the main runtime's embedders"
+            );
+            // Same contract for a MAIN-assigned no_embed pack, whose runtime
+            // has no core pointer at all.
+            assert!(
+                multi.per_pack_runtimes["gtd"]
+                    .registered_embedding_model_names()
+                    .is_empty(),
+                "main-assigned no_embed pack runtime must register zero embedders"
+            );
+            assert_eq!(
+                multi.per_pack_runtimes["gtd"]
+                    .core()
+                    .registered_embedding_model_names(),
+                main_models,
+                "main-assigned no_embed pack's core() must carry the main runtime's embedders"
             );
         }
 

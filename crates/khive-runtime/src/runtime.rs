@@ -433,7 +433,23 @@ impl KhiveRuntime {
     /// `RuntimeConfig` (a heap-allocated struct containing `Vec<String>` fields).
     pub fn core(&self) -> KhiveRuntime {
         match &self.core_backend {
-            None => self.clone(),
+            // A main-assigned pack runtime has no core pointer, but may still
+            // carry main's embedder wiring: with `no_embed` its OWN registry
+            // is empty, and core-routed concept writes must embed regardless
+            // of which backend the pack was assigned to.
+            None => match &self.core_embedders {
+                None => self.clone(),
+                Some(core_embedders) => {
+                    let mut core = self.clone();
+                    core.config.embedding_model = core_embedders.embedding_model;
+                    core.config.additional_embedding_models =
+                        core_embedders.additional_embedding_models.clone();
+                    core.embedder_registry = core_embedders.registry.clone();
+                    core.default_embedder_name = core_embedders.default_embedder_name.clone();
+                    core.core_embedders = None;
+                    core
+                }
+            },
             Some(main_arc) => {
                 let mut core_config = self.config.clone();
                 core_config.backend_id = BackendId::main();

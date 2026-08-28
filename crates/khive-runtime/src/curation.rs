@@ -1855,11 +1855,7 @@ impl KhiveRuntime {
     /// markers: they take caller-supplied UUIDs, and the generic
     /// `update_note` they patch through would happily stamp delivery
     /// properties onto any note kind.
-    async fn assert_outbound_message(
-        &self,
-        token: &NamespaceToken,
-        id: Uuid,
-    ) -> RuntimeResult<()> {
+    async fn assert_outbound_message(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<()> {
         let note = self
             .notes(token)?
             .get_note(id)
@@ -4027,7 +4023,10 @@ mod tests {
             store.upsert_note(note).await.expect("seed note");
         }
         store.upsert_note(inbound).await.expect("seed inbound");
-        store.upsert_note(wrong_kind).await.expect("seed non-message");
+        store
+            .upsert_note(wrong_kind)
+            .await
+            .expect("seed non-message");
 
         let marked = rt
             .mark_outbound_message_delivered(
@@ -4038,8 +4037,15 @@ mod tests {
             )
             .await
             .expect("mark delivered succeeds");
-        let props = marked.properties.as_ref().and_then(|v| v.as_object()).unwrap();
-        assert_eq!(props.get("delivery").and_then(|v| v.as_str()), Some("delivered"));
+        let props = marked
+            .properties
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            props.get("delivery").and_then(|v| v.as_str()),
+            Some("delivered")
+        );
         assert_eq!(
             props.get("delivered_at").and_then(|v| v.as_str()),
             Some("2026-08-28T00:00:00Z")
@@ -4058,8 +4064,15 @@ mod tests {
             )
             .await
             .expect("mark failed succeeds");
-        let props = failed.properties.as_ref().and_then(|v| v.as_object()).unwrap();
-        assert_eq!(props.get("delivery").and_then(|v| v.as_str()), Some("failed"));
+        let props = failed
+            .properties
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            props.get("delivery").and_then(|v| v.as_str()),
+            Some("failed")
+        );
         assert_eq!(
             props.get("failed_at").and_then(|v| v.as_str()),
             Some("2026-08-28T00:00:01Z")

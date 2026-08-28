@@ -1193,7 +1193,7 @@ impl KhiveMcpServer {
         self
     }
 
-    /// Attach the exact KG-routed runtime that owns outbox note properties.
+    /// Attach the exact comm-routed runtime that owns outbox note properties.
     /// Multi-backend boot overrides the default-runtime fallback installed by
     /// [`Self::with_runtime`]; single-backend construction already points both
     /// handles at the same runtime.
