@@ -197,21 +197,7 @@ async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServe
     let mut permissions = std::fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o444);
     std::fs::set_permissions(&path, permissions).unwrap();
-    // Freeze lingering `-wal`/`-shm` sidecars left by the writable fixture's
-    // asynchronously closing connections; read-only admission rejects a
-    // writable `-shm` as potentially live.
-    for suffix in ["-wal", "-shm"] {
-        let mut name = path.file_name().expect("db file name").to_os_string();
-        name.push(suffix);
-        let sidecar = path.parent().expect("db parent dir").join(name);
-        if sidecar.exists() {
-            let mut sidecar_permissions = std::fs::metadata(&sidecar)
-                .expect("sidecar metadata")
-                .permissions();
-            sidecar_permissions.set_mode(0o444);
-            std::fs::set_permissions(&sidecar, sidecar_permissions).expect("freeze sidecar");
-        }
-    }
+    khive_storage::test_support::freeze_snapshot_sidecars(&path);
 
     let runtime = KhiveRuntime::new(config)
         .expect("normal boot must detect and validate the read-only snapshot");

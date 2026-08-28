@@ -2197,18 +2197,7 @@ mod tests {
         // A lingering writable `-shm` from the writable fixture's asynchronous
         // connection close is rejected by read-only admission as potentially
         // live; freeze any sidecars into the documented frozen-snapshot form.
-        for suffix in ["-wal", "-shm"] {
-            let mut name = path.file_name().expect("db file name").to_os_string();
-            name.push(suffix);
-            let sidecar = path.parent().expect("db parent dir").join(name);
-            if sidecar.exists() {
-                let mut sidecar_permissions = std::fs::metadata(&sidecar)
-                    .expect("sidecar metadata")
-                    .permissions();
-                sidecar_permissions.set_mode(0o444);
-                std::fs::set_permissions(&sidecar, sidecar_permissions).expect("freeze sidecar");
-            }
-        }
+        khive_storage::test_support::freeze_snapshot_sidecars(&path);
 
         let read_only_config = RuntimeConfig {
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
@@ -2255,21 +2244,7 @@ mod tests {
         };
         KhiveRuntime::new(config.clone()).expect("create migrated database");
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["-wal", "-shm"] {
-                let mut name = path.file_name().expect("db file name").to_os_string();
-                name.push(suffix);
-                let sidecar = path.parent().expect("db parent dir").join(name);
-                if sidecar.exists() {
-                    let mut permissions = std::fs::metadata(&sidecar)
-                        .expect("sidecar metadata")
-                        .permissions();
-                    permissions.set_mode(0o444);
-                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-                }
-            }
-        }
+        khive_storage::test_support::freeze_snapshot_sidecars(&path);
 
         let runtime = KhiveRuntime::new_readonly(config).expect("explicit read-only boot");
         assert!(runtime.is_read_only());
@@ -2360,21 +2335,7 @@ mod tests {
         };
         KhiveRuntime::new(config.clone()).expect("create migrated database");
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["-wal", "-shm"] {
-                let mut name = path.file_name().expect("db file name").to_os_string();
-                name.push(suffix);
-                let sidecar = path.parent().expect("db parent dir").join(name);
-                if sidecar.exists() {
-                    let mut permissions = std::fs::metadata(&sidecar)
-                        .expect("sidecar metadata")
-                        .permissions();
-                    permissions.set_mode(0o444);
-                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-                }
-            }
-        }
+        khive_storage::test_support::freeze_snapshot_sidecars(&path);
         let runtime = KhiveRuntime::new_readonly(config).expect("read-only boot");
         assert!(runtime.is_read_only());
         (dir, runtime)

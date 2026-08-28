@@ -3322,21 +3322,7 @@ mod tests {
 
         // Freeze the WAL sidecars the writable runtime left behind — the
         // read-only opener refuses a snapshot with a writable -shm.
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["-wal", "-shm"] {
-                let mut name = main_db.file_name().expect("db file name").to_os_string();
-                name.push(suffix);
-                let sidecar = main_db.parent().expect("db parent dir").join(name);
-                if sidecar.exists() {
-                    let mut permissions = std::fs::metadata(&sidecar)
-                        .expect("sidecar metadata")
-                        .permissions();
-                    permissions.set_mode(0o444);
-                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-                }
-            }
-        }
+        khive_storage::test_support::freeze_snapshot_sidecars(&main_db);
 
         let split_config = |db: PathBuf| RuntimeConfig {
             db_path: Some(main_db.clone()),
@@ -3378,21 +3364,7 @@ mod tests {
                 .await
                 .expect("seed lane row");
         }
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["-wal", "-shm"] {
-                let mut name = events_db.file_name().expect("db file name").to_os_string();
-                name.push(suffix);
-                let sidecar = events_db.parent().expect("db parent dir").join(name);
-                if sidecar.exists() {
-                    let mut permissions = std::fs::metadata(&sidecar)
-                        .expect("sidecar metadata")
-                        .permissions();
-                    permissions.set_mode(0o444);
-                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-                }
-            }
-        }
+        khive_storage::test_support::freeze_snapshot_sidecars(&events_db);
         let store = ro.events(&token).expect("events store with lane present");
         let count = store
             .count_events(EventFilter::default())

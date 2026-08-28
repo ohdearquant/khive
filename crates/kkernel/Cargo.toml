@@ -66,6 +66,7 @@ rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 # armed-capture hook while the release dependency above stays untouched.
 khive-mcp = { version = "0.8.0", path = "../khive-mcp", features = ["test-forward-seam"] }
 khive-gate-rego = { version = "0.8.0", path = "../khive-gate-rego" }
+khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }
 
 [features]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).

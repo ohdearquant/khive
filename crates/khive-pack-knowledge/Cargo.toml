@@ -38,7 +38,7 @@ libc = { workspace = true }
 [dev-dependencies]
 khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
 khive-pack-brain = { version = "0.8.0", path = "../khive-pack-brain" }
-khive-storage = { version = "0.8.0", path = "../khive-storage" }
+khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 criterion = { workspace = true }
