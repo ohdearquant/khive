@@ -316,6 +316,13 @@ pub struct RuntimeConfig {
     /// resolves once to the host's local IANA zone (falling back to UTC when
     /// the host zone cannot be determined) via [`resolve_default_display_timezone`].
     pub display_timezone: chrono_tz::Tz,
+    /// Events-daemon split (ADR-170). `None` = legacy behavior: events persist
+    /// in the main store. `Some` routes event persistence to the events database —
+    /// forwarded over the events daemon socket in daemon deployments, opened
+    /// directly in embedded/one-shot contexts. Populated by the transport
+    /// hosts (khive-mcp serve, kkernel exec); tests and in-memory runtimes
+    /// leave it `None`.
+    pub events_split: Option<crate::events_split::EventsSplitConfig>,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -401,6 +408,7 @@ impl Default for RuntimeConfig {
             actor_id,
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             display_timezone: resolve_default_display_timezone(),
+            events_split: None,
         }
     }
 }
@@ -981,9 +989,13 @@ mod resolve_project_actor_id_tests {
         let path = write_toml(&dir, "[actor]\nid = \"\"\n");
 
         let err = resolve_project_actor_id(Some(&path)).expect_err("invalid actor.id must error");
+        let root = match &err {
+            crate::engine_config::ConfigError::InFile { source, .. } => source.as_ref(),
+            other => other,
+        };
         assert!(
             matches!(
-                err,
+                root,
                 crate::engine_config::ConfigError::InvalidActorId { .. }
             ),
             "expected InvalidActorId, got {err:?}"

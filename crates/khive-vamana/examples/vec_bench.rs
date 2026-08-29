@@ -1355,7 +1355,7 @@ fn main() {
     // ─── Build caveats ─────────────────────────────────────────────────────
 
     let mut caveats: Vec<String> = vec![
-        format!("{fit_note}"),
+        fit_note.clone(),
         "GT recomputed by brute-force L2 on each subset (provided GT indexes full base — invalid for subsets)".into(),
         "build exponent is Omega(N) floor — sublinear claim is query+update only".into(),
         "latency measured warm-cache on single-node; cold-cache latency is higher".into(),

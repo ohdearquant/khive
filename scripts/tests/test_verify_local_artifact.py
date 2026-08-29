@@ -1172,7 +1172,7 @@ class MakefileGateContractTests(unittest.TestCase):
             "verify-local-artifact: validate-make-inputs build-local\n", self.makefile
         )
         self.assertIn("local: verify-local-artifact\n", self.makefile)
-        self.assertIn("LOCAL_VERB_FLOOR := 90", self.makefile)
+        self.assertIn("LOCAL_VERB_FLOOR := 98", self.makefile)
 
         local_recipe = self.makefile[self.makefile.index("local: verify-local-artifact") :]
         self.assertNotIn("cargo build", local_recipe)
@@ -1196,6 +1196,39 @@ class MakefileGateContractTests(unittest.TestCase):
         self.assertLess(copy, staged_check)
         self.assertLess(staged_check, install)
         self.assertLess(install, daemon_stop)
+
+    def test_full_packs_names_every_pack_build_local_links(self) -> None:
+        """The verification gate must probe every pack the artifact ships.
+
+        `build-local` selects optional pack features and `verify-local-artifact`
+        probes only the packs `FULL_PACKS` names. A pack that is linked but not
+        named is not merely unprobed: its verbs are in the artifact and absent
+        from the count the floor is compared against, so losing all of them can
+        still clear the floor. Deriving the expectation from the feature list
+        keeps the two from drifting apart again.
+        """
+        packs_line = re.search(r"^FULL_PACKS := (.+)$", self.makefile, re.MULTILINE)
+        self.assertIsNotNone(packs_line, "FULL_PACKS assignment not found in Makefile")
+        named = set(packs_line.group(1).split(","))
+        self.assertTrue(named, "FULL_PACKS parsed as empty")
+
+        features = re.search(r"^\s*--features (\S+) \\$", self.makefile, re.MULTILINE)
+        self.assertIsNotNone(features, "build-local --features line not found")
+        linked = {
+            feature.removeprefix("pack-")
+            for feature in features.group(1).split(",")
+            if feature.startswith("pack-")
+        }
+        self.assertTrue(
+            linked, "no pack-* features parsed from build-local; the regex is stale"
+        )
+
+        self.assertEqual(
+            set(),
+            linked - named,
+            "build-local links pack(s) that FULL_PACKS does not name, so the "
+            "verification gate cannot see their verbs",
+        )
 
     def test_fleet_targets_split_build_verification_from_verification_only(self) -> None:
         self.assertIn("fleet-build: verify-local-artifact\n", self.makefile)

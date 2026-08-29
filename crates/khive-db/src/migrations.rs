@@ -151,6 +151,14 @@ const V21_ATTACHMENT_FENCES_UP: &str = include_str!("../sql/021-attachments-b-cl
 /// Core schema version reserved for ADR-121's attachments-first cutover.
 pub const ATTACHMENT_CUTOVER_VERSION: u32 = 21;
 
+/// The latest schema version this build's migration chain produces.
+///
+/// Terminal-version assertions belong on this, not on a hardcoded number:
+/// a literal decays into a wrong claim the next time a migration is added.
+pub fn latest_schema_version() -> u32 {
+    MIGRATIONS.last().map(|m| m.version).unwrap_or(0)
+}
+
 /// DDL for the `ann_write_log` delta table.
 ///
 /// Shared between migration V11 and the belt-and-suspenders creation in
@@ -432,12 +440,15 @@ pub fn attachment_cutover_status(
             }
         }
         Some((state, Some(_))) if state == "complete" => {
-            if version == ATTACHMENT_CUTOVER_VERSION {
+            // Later migrations (V22+) are recorded on top of a completed
+            // cutover in the normal course; only a ledger BELOW V21 beside a
+            // complete marker is an impossible pair.
+            if version >= ATTACHMENT_CUTOVER_VERSION {
                 validate_complete_attachment_schema(conn)?;
                 Ok(AttachmentCutoverStatus::Complete)
             } else {
                 Err(SqliteError::InvalidData(format!(
-                    "attachment cutover is complete but schema ledger is at V{version}, expected V{ATTACHMENT_CUTOVER_VERSION}"
+                    "attachment cutover is complete but schema ledger is at V{version}, below V{ATTACHMENT_CUTOVER_VERSION}"
                 )))
             }
         }
@@ -996,10 +1007,7 @@ pub fn inspect_schema_is_current(path: &std::path::Path) -> Result<u32, SqliteEr
 /// exact match performs no writes.
 pub fn validate_schema_is_current(conn: &Connection) -> Result<u32, SqliteError> {
     let current_version = read_schema_version(conn)?;
-    let latest_version = MIGRATIONS
-        .last()
-        .map(|migration| migration.version)
-        .unwrap_or(0);
+    let latest_version = latest_schema_version();
 
     if current_version < latest_version {
         return Err(SqliteError::InvalidData(format!(
@@ -1022,7 +1030,10 @@ pub fn validate_schema_is_current(conn: &Connection) -> Result<u32, SqliteError>
     // must not accept a history that ordinary boot would reject merely because
     // it cannot repair it in place.
     validate_applied_migration_ledger(conn, current_version)?;
-    if current_version == ATTACHMENT_CUTOVER_VERSION
+    // `>=`, not `==`: later migrations (V22+) record on top of a completed
+    // cutover, and a ledger at the latest version must not exempt the
+    // physical cutover state from validation.
+    if current_version >= ATTACHMENT_CUTOVER_VERSION
         && attachment_cutover_status(conn)? != AttachmentCutoverStatus::Complete
     {
         return Err(SqliteError::InvalidData(
@@ -1192,7 +1203,7 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     // pre-consolidation V2..V22 ledger — or was written by a newer build. Either
     // way the baseline schema would be silently skipped, leaving the process on a
     // stale schema. Fail loudly instead of corrupting silently.
-    let latest_version = MIGRATIONS.last().map(|m| m.version).unwrap_or(0);
+    let latest_version = latest_schema_version();
     if current_version > latest_version {
         return Err(SqliteError::InvalidData(format!(
             "database schema version {current_version} is ahead of the latest known migration \

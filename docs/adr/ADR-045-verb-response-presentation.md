@@ -99,7 +99,7 @@ handler. Handlers MUST NOT inspect or branch on the mode.
 | ------------------------------------ | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | UUID                                 | `"a1b2c3d4-e5f6-7890-abcd-ef1234567890"` (36 chars) | `"a1b2c3d4"` (8 chars — first segment), except strict round-trip fields remain canonical                                                                |
 | Timestamp (ISO-8601)                 | `"2026-05-23T16:18:15.234567Z"` (27 chars)          | `"2026-05-23T16:18"` (16 chars — minute granularity) OR relative `"3m ago"` if < 24h (sampled once per `present_response()` call — see §Implementation) |
-| Empty string `""`                    | included                                            | dropped                                                                                                                                                 |
+| Empty string `""`                    | included                                            | dropped, except under a record's `properties` object (Amendment 3)                                                                                      |
 | Empty array `[]`                     | included                                            | dropped                                                                                                                                                 |
 | Empty object `{}`                    | included                                            | dropped                                                                                                                                                 |
 | `null` field                         | included                                            | dropped (except lifecycle markers — see below)                                                                                                          |
@@ -618,6 +618,35 @@ that advertises either name. This amendment aligns the normative text with that 
 **both `presentation` and `presentation_per_op` are RESERVED at the request-envelope level
 and CANNOT be used as verb argument names.** The reserved-name list is a closed set owned
 by this ADR; adding a third envelope field reserves its name here first.
+
+## Amendment 3 (2026-08-24): caller-owned property strings survive agent-mode empty-drop
+
+The agent-mode economy table above drops the empty string unconditionally.
+That rule conflates two different kinds of emptiness. Presentation filler —
+a handler field that happens to be empty — carries no information and is
+correctly dropped. A key under a record's `properties` object exists only
+because a caller wrote it, so an empty string there is data: it is what
+distinguishes "this property was set to empty" from "this property is absent
+or was deleted". Under the unamended rule, the echo of an update that sets a
+property to `""` omits the key entirely, and the caller reads a successful
+write as a deletion (issue #1995).
+
+**The rule as amended: in Agent mode, empty strings nested under a record's
+`properties` object are preserved; the empty-string drop continues to apply
+everywhere else.** The token-economy rationale is unaffected — these keys
+appear only when a caller wrote them, so nothing machine-generated is
+reintroduced. This amendment changes the normative rule; the
+presentation-layer implementation change is tracked by issue #1995 and lands
+separately, citing this amendment.
+
+Scope note, stated rather than implied: empty arrays and empty objects under
+`properties` are still dropped. They have the same set-versus-absent
+ambiguity in principle; a caller that needs to distinguish those cases reads
+`presentation=verbose`, which remains lossless. `format` alone does not
+restore them: the presentation transform runs before format rendering, so
+`format=json` under the default Agent presentation serializes the
+already-transformed value. Extending the carve-out to container values is a
+separate decision that amends this paragraph.
 
 ## References
 

@@ -116,7 +116,11 @@ draft readable two incompatible ways.
 **Scope of that clause, which an earlier draft got wrong by stating it without qualification.** It
 binds unconditionally for **obligation-bearing rows** (accounting, authorization, security audit):
 such a dispatch never returns success without its row committed, and a persistent commit failure
-fails it.
+fails it. Amendment 1 below carves out one narrow, named exception to this binding: for the
+`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` read set, and only when the row's own commit did not
+happen because the audit lane's admission was transiently exhausted or the caller's bounded wait
+for it elapsed (never a persistent commit failure), the dispatch reports its already-computed
+result without waiting on that row.
 
 For **pure observability rows** it binds on the success path only. The dispatch waits for the batch
 in the normal case — so observability rows are batched, share the acquisition reduction, and are
@@ -350,8 +354,11 @@ prerequisite before any consumer may depend on the row for a resource-usage outc
 
 Under D1 this is satisfied by the ordinary path rather than by an exemption from it: a dispatch
 already waits for its batch to commit, and for this class D1's waiting clause binds
-unconditionally — the observability carve-out does not reach an accounting-bearing row. An earlier
-draft achieved the same property by
+unconditionally — the observability carve-out does not reach an accounting-bearing row. (Amendment
+1's admission-pressure exception is a separate, narrower carve-out than the observability one: it
+applies only to the named allowlisted read verbs and only to the two transient admission-pressure
+terminal reasons, never to a persistent commit failure.) An earlier draft achieved the same
+property by
 excluding accounting rows from batching altogether, which would have removed the acquisition
 reduction in exactly the high-concurrency deployment that motivates this record, since under
 ADR-103 the usage object rides _every_ per-dispatch audit row. Stating the obligation instead of
@@ -609,3 +616,65 @@ at the production seam.
 
 **Sample audit events.** Rejected: sampling changes what the audit trail means, and under ADR-103
 it would change what usage gets accounted.
+
+## Amendment 1 (2026-08-26): A Named, Bounded Exception to D4/INV-1 for Admission-Pressure Reads
+
+**Status**: Accepted, implemented alongside PR #2228 (khive#2147/khive#2217/khive#2208).
+
+D2 states: _"A dispatch must not report success when the record that accounts for, authorizes, or
+audits it did not commit"_ (`ADR-133:297-298`), and D4/INV-1 states the same as a system-wide
+invariant: _"Accounting-, authorization-, and security-audit-bearing records are written exactly
+once: never dropped, never volatile at return, never falsely acknowledged, never duplicated"_
+(`ADR-133:436-438`), with failure mode 3 named explicitly as _"**Falsely acknowledged** — the
+operation reports success when the record did not commit"_ (`ADR-133:375`).
+
+This amendment qualifies both sentences for one narrow, named case: the eleven read verbs on
+`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` (`crates/khive-runtime/src/pack.rs`; the full list and
+rationale are in ADR-103 Amendment 3), and only when the row's own commit did not resolve before
+the dispatch returned because the audit lane's admission was transiently exhausted or the caller's
+bounded wait for it elapsed — `AuditTerminalReason::QueueAdmissionExhausted` or
+`AdmissionDeadlineExpired`, never a persistent commit failure. For that verb set and those two
+terminal reasons, the dispatch reports its already-computed successful read result without waiting
+on its own audit/accounting row. The two reasons are not the same fact, though, and this amendment
+does not treat them as one:
+
+- **`QueueAdmissionExhausted`** — the row was refused before it could be enqueued. It never shares a
+  generation with anyone and will never commit. This is exactly failure mode 3 (falsely
+  acknowledged) for an accounting-bearing row: the dispatch reports success and the record is a
+  confirmed, terminal non-commit.
+- **`AdmissionDeadlineExpired`** — the row was already enqueued when the caller's bounded wait
+  elapsed. It is not dropped: the generation driver still commits or terminally fails it,
+  independently of the caller's timeout, so at the moment the dispatch returns its outcome is
+  unresolved rather than known-lost. This amendment permits the dispatch to return before that
+  resolution is known, which is still a departure from D2/D4's "must not report success before
+  commit" language, but it is a weaker claim than failure mode 3 as originally defined — the record
+  is not (yet) known false, only not yet confirmed.
+
+Both are counted on separate diagnostics counters precisely so an operator can tell a confirmed
+loss from an unresolved one — see ADR-103 Amendment 3.
+
+**Why this is a scoped exception and not a reopening of D4/INV-1 generally:**
+
+- It applies to reads only. A read verb performs no domain write; the value being protected by
+  D2's "must not report success" rule is the accounting record of work already done, not
+  correctness of a mutation. Losing that accounting record loses a count, not state.
+- It applies to two specific terminal reasons, not persistent store failure. A persistently
+  failing store still fails these dispatches exactly as D2 requires for any other
+  accounting-bearing row — the exception exists only for the audit lane's own transient
+  admission pressure, not for durability loss.
+- It is opt-in per verb, fail-closed by default (`VerbRegistry::admission_degrade_safe`): an
+  unclassified or newly added Assertive handler is NOT eligible until someone deliberately reviews
+  it and adds it to the allowlist, preserving D5/INV-2's "unclassified resolves to the stricter
+  handling" posture for everything not on the list.
+- The resulting loss is counted, not silent — see ADR-103 Amendment 3's diagnostics requirement.
+
+**What does not change:** D4/INV-1 continues to hold without qualification for every write, every
+non-allowlisted Assertive handler, gate-denial rows, unknown-verb rows, and `git.digest` receipts.
+D2's "must not report success" sentence is unqualified for a persistent commit failure on any row,
+including the eleven allowlisted verbs — the exception is admission pressure specifically, not
+store failure generally.
+
+This amendment does not revisit "Split the audit row so accounting lives in its own record" from
+Alternatives considered above — that remains rejected for the reasons stated there (a migration,
+and it breaks the response/audit-payload identity property). The accepted trade here is a bounded,
+measured undercount over that redesign.

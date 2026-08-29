@@ -197,21 +197,7 @@ async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServe
     let mut permissions = std::fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o444);
     std::fs::set_permissions(&path, permissions).unwrap();
-    // Freeze lingering `-wal`/`-shm` sidecars left by the writable fixture's
-    // asynchronously closing connections; read-only admission rejects a
-    // writable `-shm` as potentially live.
-    for suffix in ["-wal", "-shm"] {
-        let mut name = path.file_name().expect("db file name").to_os_string();
-        name.push(suffix);
-        let sidecar = path.parent().expect("db parent dir").join(name);
-        if sidecar.exists() {
-            let mut sidecar_permissions = std::fs::metadata(&sidecar)
-                .expect("sidecar metadata")
-                .permissions();
-            sidecar_permissions.set_mode(0o444);
-            std::fs::set_permissions(&sidecar, sidecar_permissions).expect("freeze sidecar");
-        }
-    }
+    khive_storage::test_support::freeze_snapshot_sidecars(&path);
 
     let runtime = KhiveRuntime::new(config)
         .expect("normal boot must detect and validate the read-only snapshot");
@@ -1889,6 +1875,28 @@ impl khive_types::Pack for ErrorInjectPack {
             category: VerbCategory::Assertive,
             params: &[],
         },
+        HandlerDef {
+            name: "storage_admission_timeout",
+            description: "returns a typed storage-admission timeout error",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "read_tx_age_evicted",
+            description: "returns a typed cached-reader read-transaction age eviction error",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "read_tx_age_eviction_cleanup_failed",
+            description: "returns a typed cached-reader read-transaction age eviction error \
+                whose cleanup rollback was denied or failed",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
     ];
 }
 
@@ -1935,6 +1943,31 @@ impl PackRuntime for ErrorInjectPack {
         if verb == "writer_task_busy" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 },
+            ));
+        }
+        if verb == "storage_admission_timeout" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::AdmissionTimeout {
+                    operation: "sql_bridge.writer_handle".into(),
+                    timeout_ms: 30_000,
+                },
+            ));
+        }
+        if verb == "read_tx_age_evicted" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::ReadTransactionAgeEvicted {
+                    operation: "sql_bridge.cached_reader".into(),
+                    max_age_secs: 120,
+                },
+            ));
+        }
+        if verb == "read_tx_age_eviction_cleanup_failed" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::ReadTransactionAgeEvictionCleanupFailed {
+                    operation: "sql_bridge.cached_reader".into(),
+                    max_age_secs: 120,
+                    message: "rollback failed: disk I/O error".into(),
+                },
             ));
         }
         let err = KhiveError::unavailable("downstream service offline")
@@ -2146,6 +2179,125 @@ async fn writer_task_busy_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
             "retry_after_ms": serde_json::Value::Null,
         }),
         "BEGIN contention must remain distinguishable and safely retryable"
+    );
+
+    Ok(())
+}
+
+/// A bounded storage-admission wait (reader/writer handle slot or pooled
+/// reader checkout) that elapsed acquired nothing and started nothing, so it
+/// must cross the MCP boundary as a retryable `unavailable` — never as the
+/// caller's invalid input.
+#[tokio::test]
+async fn storage_admission_timeout_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "storage_admission_timeout()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "storage_admission_timeout",
+            "stage": "storage_admission_timeout",
+            "message": "storage: admission timeout during sql_bridge.writer_handle after 30000ms",
+            "retryable": true,
+            "timeout_ms": 30_000,
+            "capability": serde_json::Value::Null,
+            "operation": "sql_bridge.writer_handle",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
+        }),
+        "an admission deadline that expired before acquisition must stay a retryable resource failure on the wire"
+    );
+
+    Ok(())
+}
+
+/// #1846 / PR #2229 follow-up: a cached read-only transaction evicted for
+/// pinning a WAL snapshot past `read_tx_max_age` must remain a
+/// machine-detectable retryable failure once it crosses the normal MCP
+/// dispatch boundary — not just at the direct `StorageError::is_retryable()`
+/// call site. Without `RuntimeError::retryable_failure_context()` special-
+/// casing `StorageError::ReadTransactionAgeEvicted`, this would flatten to
+/// `runtime_error_value`'s plain-string fallback and lose `retryable: true`.
+#[tokio::test]
+async fn read_tx_age_evicted_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "read_tx_age_evicted()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "read_tx_age_evicted",
+            "stage": "read_tx_age_evicted",
+            "message": "storage: cached read-only transaction exceeded the maximum read-transaction age (120s) during sql_bridge.cached_reader and was rolled back; retry to open a fresh read snapshot",
+            "retryable": true,
+            "timeout_ms": 120_000,
+            "capability": "sql",
+            "operation": "sql_bridge.cached_reader",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
+        }),
+        "a read-age eviction must stay a caller-visible retryable unavailable on the wire"
+    );
+
+    Ok(())
+}
+
+/// PR #2229 round-2 follow-up: a cached read-only transaction's age-eviction
+/// rollback can also be denied or fail outright rather than cleanly
+/// restoring autocommit. That cleanup-failure outcome must reach the MCP
+/// wire as the same retryable `read_tx_age_evicted` stage as a clean
+/// eviction — not fall back to `runtime_error_value`'s plain-string
+/// classification, which is what happens if the production branch regresses
+/// to generic `StorageError::Transaction`.
+#[tokio::test]
+async fn read_tx_age_eviction_cleanup_failure_survives_storage_runtime_and_mcp_wire(
+) -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "read_tx_age_eviction_cleanup_failed()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "read_tx_age_evicted",
+            "stage": "read_tx_age_evicted",
+            "message": "storage: cached read-only transaction exceeded the maximum read-transaction age (120s) during sql_bridge.cached_reader but could not be cleanly rolled back (rollback failed: disk I/O error); the connection was discarded, retry to open a fresh read snapshot",
+            "retryable": true,
+            "timeout_ms": 120_000,
+            "capability": "sql",
+            "operation": "sql_bridge.cached_reader",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
+        }),
+        "a denied/failed cleanup rollback must stay a caller-visible retryable unavailable on \
+         the wire, distinguishable in the message from a clean eviction"
     );
 
     Ok(())
@@ -4174,8 +4326,12 @@ fn actor_invalid_config_id_fails_at_load() {
     .unwrap();
 
     let err = KhiveConfig::load(Some(&path)).expect_err("invalid actor.id must fail at load");
+    let root = match &err {
+        ConfigError::InFile { source, .. } => source.as_ref(),
+        other => other,
+    };
     assert!(
-        matches!(err, ConfigError::InvalidActorId { .. }),
+        matches!(root, ConfigError::InvalidActorId { .. }),
         "expected ConfigError::InvalidActorId, got {err:?}"
     );
 }
@@ -4195,8 +4351,12 @@ fn actor_empty_string_id_fails_at_load() {
     .unwrap();
 
     let err = KhiveConfig::load(Some(&path)).expect_err("empty actor.id must fail at load");
+    let root = match &err {
+        ConfigError::InFile { source, .. } => source.as_ref(),
+        other => other,
+    };
     assert!(
-        matches!(err, ConfigError::InvalidActorId { .. }),
+        matches!(root, ConfigError::InvalidActorId { .. }),
         "expected ConfigError::InvalidActorId for empty string, got {err:?}"
     );
 }

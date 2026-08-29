@@ -600,3 +600,117 @@ never specify `substrate` directly.
 - ADR-016: Request DSL — verb surface that exposes curation to agents.
 - ADR-101: KG Change-Set Model — full preimages for destructive merge operations.
 - ADR-038: Events — event substrate for audit trail.
+
+## Amendment — Refusable stale-snapshot curation (#1753)
+
+This amendment qualifies the following accepted text:
+
+> “**Patch semantics, not replace.** Updates express intent (change this field) rather than
+> forcing fetch-modify-write round trips.”
+
+and the update validation steps:
+
+> “6. Persist via upsert_entity.”
+
+> “5. Persist via upsert_edge with DO UPDATE semantics (ADR-009).”
+
+### Decision
+
+Curation updates retain patch semantics, validation, property merging, tag replacement, edge
+relation validation, and index-maintenance behavior. The persistence failure mode changes for a
+caller whose patch was derived from a stale full-row snapshot: the caller receives a distinct
+optimistic-concurrency conflict instead of silently overwriting the newer row.
+
+For the six production-graph sites in scope, a full-row replacement carries the revision read
+before patch application into the shared guarded store operation. The operation succeeds only if
+the row still has that revision and deletion state and the replacement revision strictly advances
+it. A conflict performs no curation update; the caller must fetch current state and explicitly
+choose whether to reapply, merge, or abandon the requested patch. A stale full row is never
+blindly retried, and the write queue is not treated as a substitute for this guard.
+
+The patch is still interpreted exactly as documented: entity properties are merged at the top
+level with patch values winning, nested objects at patched keys are replaced rather than
+recursively merged, and tags are replaced when supplied. Edge properties retain their documented
+wholesale replacement semantics (`docs/adr/ADR-014-curation-operations.md:80-101`; edge write
+application at `crates/khive-runtime/src/operations.rs:5701-5704`). A guarded refusal changes the
+failure mode, not these patch semantics. Merge policy, description `content_strategy`, edge
+natural-key handling, validation ordering, audit meaning for successful operations, and
+post-transaction reindex behavior are not changed. In particular, this amendment does not change
+merge behavior; it makes stale curation updates refusable.
+
+### Current behavior being corrected
+
+The entity curation preparation reads the entity, applies the patch, and regenerates its revision
+(`crates/khive-runtime/src/curation.rs:852-903`); the current write then calls the unguarded
+`upsert_entity` (`crates/khive-runtime/src/curation.rs:918-928`). The non-symmetric edge curation
+likewise reads the edge and applies the patch (`crates/khive-runtime/src/operations.rs:5662-5704`)
+before calling unguarded `upsert_edge` (`crates/khive-runtime/src/operations.rs:5811-5816`).
+Those paths are the full-row stale-snapshot cases addressed here.
+
+The existing note curation path is already refusable: it rechecks the snapshot and calls
+`replace_note_if_unchanged`, refusing a changed row rather than persisting stale derivations
+(`crates/khive-runtime/src/curation.rs:1587-1623`). This amendment does not weaken or replace that
+behavior.
+
+### Caller contract
+
+Callers of the affected curation operations must handle the typed conflict response as a normal
+concurrency outcome. They must not interpret it as proof that the record never existed, and they
+must not resubmit the stale full row without a fresh read. A caller that wants a merged result must
+read the current record, recompute the documented patch or merge from that state, and submit the
+new revision as a new guarded attempt.
+
+The conflict travels on the existing error taxonomy rather than a new one. A refused write returns
+`ErrorKind::Conflict`, which serializes as `kind: "conflict"` and carries HTTP status 409. That
+taxonomy is closed, so the value is stable across versions and both in-process and over-the-wire
+callers may branch on it directly rather than parsing message text. This is why the wire surface is
+unchanged: the distinction a caller needs already existed, and no new error kind is added. Note that
+the guarded entity and edge paths reach it through `KhiveError::conflict`, not through
+`StorageError::Conflict`, which the note path used; a reader searching only for the latter will
+conclude no typed conflict is produced.
+
+### Scope
+
+This change covers these eight production-graph sites:
+
+1. Runtime entity curation (`crates/khive-runtime/src/curation.rs:853-928`).
+2. Runtime non-symmetric edge curation (`crates/khive-runtime/src/operations.rs:5662-5816`).
+3. Runtime symmetric edge curation (`crates/khive-runtime/src/operations.rs:5559-5639,5747-5771`),
+   which replaces both directed rows in place.
+4. Atomic entity plans (`crates/khive-runtime/src/atomic_prepare.rs:804-892`).
+5. Atomic non-symmetric edge plans (`crates/khive-runtime/src/atomic_prepare.rs:863-1050`).
+6. Atomic symmetric edge plans (`crates/khive-runtime/src/atomic_prepare.rs:1000-1040`).
+7. `comm.heartbeat` channel-health persistence (`crates/khive-pack-comm/src/handlers.rs:2321-2411`;
+   dispatch at `crates/khive-pack-comm/src/pack.rs:291-292`).
+8. Scheduled-event finalization (`crates/khive-mcp/src/pending_events.rs:1113-1128,2149-2213`),
+   covering every finalization branch rather than the normal dispatch path alone.
+
+Sites 3 and 6 are the symmetric edge paths. They are in scope because they replace rows through the
+same unguarded full-row statement (`crates/khive-db/src/stores/graph.rs:303-306`, whose `WHERE`
+clause pins only namespace and id) as the non-symmetric paths. Excluding them would leave the
+contract stated here true of one edge path and false of the other, which is not a contract.
+
+Site 8 covers all six finalization branches, not only the normal one. The pre-action, error, missed
+and non-action branches finalize on claim identity alone; the guard stated here binds the serialized
+properties snapshot as well, because a claim token is an ownership fence and not a content fence, so
+a property writer landing between claim and finalization is otherwise overwritten while the
+finalizer reports success.
+
+The 19 code-map sites in `khive-pack-code` are not covered by this amendment. They are tracked
+separately in public issue #2231.
+
+### Rejected alternatives
+
+The following do not satisfy the curation contract and are rejected:
+
+- Relying only on the write queue, because the entity store's writer-task routing
+  (`crates/khive-db/src/stores/entity.rs:182-205`) is separate from its entity reader
+  (`crates/khive-db/src/stores/entity.rs:726-742`) and therefore does not protect the read
+  snapshot that produced the replacement.
+- Blind retry of a stale row, because it converts a detected conflict back into a silent
+  last-writer-wins overwrite.
+- Unconditional `SET properties = ?` for a document race, because a complete stale document can
+  still erase a concurrent change even when the SQL is described as a patch.
+
+No open design question remains within this curation amendment. The intended patch and merge
+semantics remain fixed; only stale full-row persistence becomes explicitly refusable.

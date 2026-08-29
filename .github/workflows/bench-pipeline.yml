@@ -29,6 +29,9 @@ on:
       - "scripts/perf/bench_pipeline_daemon.py"
       - ".github/workflows/bench-pipeline.yml"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
