@@ -294,12 +294,11 @@ impl SqliteSparseStore {
                 StorageCapability::Sparse,
                 op,
                 move |scope| {
-                    let mut guard = pool
-                        .reader_until(|| scope.should_stop())
-                        .map_err(|e| map_sqlite_err(e, op))?
-                        .ok_or_else(|| StorageError::Timeout {
-                            operation: op.into(),
-                        })?;
+                    let mut guard = pool.resolve_reader_checkout(
+                        StorageCapability::Sparse,
+                        op,
+                        pool.reader_until(|| scope.should_stop()),
+                    )?;
                     scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
                 },
             )
@@ -516,6 +515,9 @@ impl SqliteSparseStore {
                     ));
                 }
 
+                // `as_chunks` is unstable on stable; keep `chunks_exact`
+                // until it lands.
+                #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
                 let stored_values: Vec<f32> = values_blob
                     .chunks_exact(4)
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))

@@ -4,6 +4,7 @@ import {
   isAllowedShowcaseAsset,
   normalizeRepositoryUrl,
   resolveShowcaseRepository,
+  SHOWCASE_REGISTRY,
 } from "@/lib/showcase-registry";
 
 describe("showcase registry", () => {
@@ -14,6 +15,29 @@ describe("showcase registry", () => {
     if (result.status === "hit") {
       expect(result.entry.id).toBe("github.com/ohdearquant/khive");
       expect(result.normalizedUrl).toBe("https://github.com/ohdearquant/khive");
+    }
+  });
+
+  it("derives the lookup token from analysisId instead of a duplicated alias", () => {
+    const registry = [{
+      id: "github.com/example/repository",
+      canonicalUrl: "https://github.com/example/repository",
+      aliases: ["https://github.com/example/repository"],
+      analysisId: "configured-analysis",
+    }] as const;
+
+    const result = resolveShowcaseRepository("configured-analysis", registry);
+
+    expect(result.status).toBe("hit");
+    if (result.status === "hit") {
+      expect(result.entry).toBe(registry[0]);
+      expect(result.normalizedUrl).toBe("https://github.com/example/repository");
+    }
+  });
+
+  it("does not duplicate static analysis IDs in the hand-maintained alias list", () => {
+    for (const entry of SHOWCASE_REGISTRY) {
+      if (entry.analysisId) expect(entry.aliases).not.toContain(entry.analysisId);
     }
   });
 

@@ -37,6 +37,7 @@ describe("repository showcase", () => {
       repository: bundle.meta.repository.canonical_url,
       snapshotSha: bundle.meta.snapshot.head_sha,
       modulePath: pool.source_path,
+      moduleId: null,
       view: "dependency_topology",
     });
     window.history.replaceState(null, "", direct);
@@ -61,6 +62,9 @@ describe("repository showcase", () => {
     });
     expect(breadcrumb).toHaveTextContent(`${bundle.meta.repository.owner}/${bundle.meta.repository.name}`);
     expect(breadcrumb).toHaveTextContent(pool.source_path);
+    expect(new URL(window.location.href).searchParams.get("module_id")).toBe(
+      pool.id,
+    );
 
     const pushState = vi.spyOn(window.history, "pushState");
     const search = screen.getByRole("searchbox", { name: "Find a module or path" });
@@ -74,6 +78,9 @@ describe("repository showcase", () => {
     );
     expect(new URL(window.location.href).searchParams.get("module")).toBe(
       writer.source_path,
+    );
+    expect(new URL(window.location.href).searchParams.get("module_id")).toBe(
+      writer.id,
     );
     expect(pushState).toHaveBeenCalledTimes(1);
 
@@ -126,6 +133,7 @@ describe("repository showcase", () => {
       repository: bundle.meta.repository.canonical_url,
       snapshotSha: bundle.meta.snapshot.head_sha,
       modulePath: "crates/not-captured/src/missing.rs",
+      moduleId: null,
       view: "dependency_topology",
     });
     window.history.replaceState(null, "", unresolvedRestore);
@@ -143,6 +151,56 @@ describe("repository showcase", () => {
     // CPU contention pushed it past the default 5s timeout, so this needs headroom.
   }, 20_000);
 
+  it("round-trips the exact module when source paths are shared", async () => {
+    const bundle = structuredClone(golden());
+    const [first, selected] = bundle.graph.modules.items;
+    expect(first).toBeDefined();
+    expect(selected).toBeDefined();
+    selected.source_path = first.source_path;
+
+    const direct = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: bundle.meta.snapshot.head_sha,
+      modulePath: selected.source_path,
+      moduleId: selected.id,
+      view: "dependency_topology",
+    });
+    expect(direct.searchParams.get("module_id")).toBe(selected.id);
+    window.history.replaceState(null, "", direct);
+
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+    writeText.mockClear();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const inspector = container.querySelector<HTMLElement>(
+      "[data-module-inspector]",
+    )!;
+
+    await waitFor(() =>
+      expect(within(inspector).getByRole("heading", { level: 3 }))
+        .toHaveTextContent(selected.source_path)
+    );
+    expect(inspector.querySelector("header p")).toHaveTextContent(
+      selected.module_path,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Copy investigation link" }),
+    );
+    const copied = new URL(writeText.mock.calls.at(-1)?.[0] as string);
+    expect(copied.searchParams.get("module")).toBe(selected.source_path);
+    expect(copied.searchParams.get("module_id")).toBe(selected.id);
+
+    window.history.replaceState(null, "", copied);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await waitFor(() =>
+      expect(inspector.querySelector("header p")).toHaveTextContent(
+        selected.module_path,
+      )
+    );
+  });
+
   it("keeps stale and missing deep-link evidence explicit and recoverable", async () => {
     const bundle = golden();
     const missingPath = "crates/not-captured/src/missing.rs";
@@ -150,6 +208,7 @@ describe("repository showcase", () => {
       repository: bundle.meta.repository.canonical_url,
       snapshotSha: "0000000000000000000000000000000000000000",
       modulePath: missingPath,
+      moduleId: null,
       view: "scorecard",
     });
     window.history.replaceState(null, "", direct);
@@ -237,6 +296,7 @@ describe("repository showcase", () => {
       repository: bundle.meta.repository.canonical_url,
       snapshotSha: staleSha,
       modulePath: bundle.graph.modules.items[0].source_path,
+      moduleId: bundle.graph.modules.items[0].id,
       view: "scorecard",
     });
     window.history.replaceState(null, "", direct);
@@ -364,7 +424,7 @@ describe("repository showcase", () => {
     expect(within(inspector).getByRole("heading", { name: bundle.capability.labels.metrics.commits })).toBeVisible();
 
     await user.type(within(triage).getByRole("searchbox", { name: "Find a module or path" }), "pool.rs");
-    const poolResult = within(triage).getByRole("button", { name: /inspect .*pool\.rs/i });
+    const poolResult = within(triage).getAllByRole("button", { name: /inspect .*pool\.rs/i })[0];
     await user.click(poolResult);
     expect(within(inspector).getByRole("heading", { level: 3 }).textContent).toContain("pool.rs");
 
@@ -516,7 +576,7 @@ describe("repository showcase", () => {
     expect(inspector).toHaveTextContent(/inspector sampled/i);
 
     const cycleSection = within(inspector).getByText(cycle.id).closest("section")!;
-    await user.click(within(cycleSection).getByRole("button", { name: peer.source_path }));
+    await user.click(within(cycleSection).getByRole("button", { name: `Inspect ${peer.source_path}` }));
     expect(within(inspector).getByRole("heading", { level: 3 })).toHaveTextContent(peer.source_path);
   });
 
@@ -745,6 +805,7 @@ describe("repository showcase", () => {
         repository: bundle.meta.repository.canonical_url,
         snapshotSha: bundle.meta.snapshot.head_sha,
         modulePath: moduleNode.source_path,
+        moduleId: moduleNode.id,
         view: "history_structure_navigation",
       }),
     );
@@ -821,6 +882,127 @@ describe("repository showcase", () => {
     await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
     expect(screen.getByText(/Contract-owned median 4\.0/)).toBeVisible();
   });
+
+  it("renders readable chart scales and keeps hotspot bubbles inside the plot", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(
+      container.querySelector('[data-view-id="hotspot_quadrant"]')!,
+    );
+    const hotspot = container.querySelector<SVGSVGElement>(
+      'svg[data-visualization="hotspot"]',
+    )!;
+    const xTicks = Array.from(
+      hotspot.querySelectorAll<SVGTextElement>('[data-axis-tick="hotspot-x"]'),
+    );
+    const yTicks = Array.from(
+      hotspot.querySelectorAll<SVGTextElement>('[data-axis-tick="hotspot-y"]'),
+    );
+    expect(xTicks.length).toBeGreaterThanOrEqual(2);
+    expect(yTicks.length).toBeGreaterThanOrEqual(2);
+    expect(xTicks[0]).toHaveAttribute("data-axis-value", "0");
+    expect(yTicks[0]).toHaveAttribute("data-axis-value", "0");
+
+    const bubbles = Array.from(
+      hotspot.querySelectorAll<SVGCircleElement>(".repo-chart-dot"),
+    );
+    expect(bubbles.length).toBeGreaterThan(0);
+    for (const bubble of bubbles) {
+      const x = Number(bubble.getAttribute("cx"));
+      const radius = Number(bubble.getAttribute("r"));
+      expect(x - radius).toBeGreaterThanOrEqual(10);
+      expect(x + radius).toBeLessThanOrEqual(100);
+    }
+
+    await user.click(
+      container.querySelector('[data-view-id="cadence_timeline"]')!,
+    );
+    const cadence = container.querySelector<SVGSVGElement>(
+      'svg[data-visualization="cadence"]',
+    )!;
+    const valueTicks = Array.from(
+      cadence.querySelectorAll<SVGTextElement>('[data-axis-tick="cadence-y"]'),
+    );
+    expect(valueTicks.length).toBeGreaterThanOrEqual(2);
+    expect(valueTicks[0]).toHaveAttribute("data-axis-value", "0");
+
+    const weekTicks = Array.from(
+      cadence.querySelectorAll<SVGTextElement>('[data-axis-tick="cadence-week"]'),
+    );
+    const cadenceRows = bundle.aggregates.cadence_timeline.commits.items;
+    expect(weekTicks.length).toBeGreaterThanOrEqual(2);
+    expect(weekTicks[0]).toHaveAttribute(
+      "data-axis-value",
+      cadenceRows[0].week_start,
+    );
+    expect(weekTicks.at(-1)).toHaveAttribute(
+      "data-axis-value",
+      cadenceRows.at(-1)?.week_start,
+    );
+    expect(weekTicks.every((tick) => tick.textContent?.trim())).toBe(true);
+  });
+
+  it("renders data states instead of invented chart scales for empty pages", async () => {
+    const bundle = structuredClone(golden());
+    const emptyPage = {
+      items: [],
+      total_count: { status: "available", value: 0 },
+      bound: { kind: "all", max_items: 50000, order: "fixture" },
+      truncated: false,
+      disclosure: { status: "complete" },
+    };
+    bundle.aggregates.hotspot_quadrant.data = structuredClone(emptyPage) as never;
+    bundle.aggregates.cadence_timeline.commits = structuredClone(emptyPage) as never;
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(container.querySelector('[data-view-id="hotspot_quadrant"]')!);
+    expect(container.querySelector('svg[data-visualization="hotspot"]')).toBeNull();
+    expect(screen.getAllByText(/No .* rows/).length).toBeGreaterThan(0);
+
+    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+    expect(container.querySelector('svg[data-visualization="cadence"]')).toBeNull();
+  });
+
+  it("renders data states instead of invented chart scales for unavailable pages", async () => {
+    const bundle = structuredClone(golden());
+    const unavailablePage = {
+      items: [],
+      total_count: { status: "unavailable", reason: "fixture omitted" },
+      bound: { kind: "all", max_items: 50000, order: "fixture" },
+      truncated: false,
+      disclosure: { status: "unavailable", reason: "fixture omitted" },
+    };
+    bundle.aggregates.hotspot_quadrant.data = structuredClone(unavailablePage) as never;
+    bundle.aggregates.cadence_timeline.commits = structuredClone(unavailablePage) as never;
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+
+    await user.click(container.querySelector('[data-view-id="hotspot_quadrant"]')!);
+    expect(container.querySelector('svg[data-visualization="hotspot"]')).toBeNull();
+
+    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+    expect(container.querySelector('svg[data-visualization="cadence"]')).toBeNull();
+  });
+
+  it.each(["2026-99-99", "2026-02-30"])(
+    "falls back to the raw week value for schema-shaped but invalid date %s",
+    async (weekStart) => {
+      const bundle = structuredClone(golden());
+      bundle.aggregates.cadence_timeline.commits.items[0].week_start = weekStart;
+      const user = userEvent.setup();
+      const { container } = render(<RepoShowcase bundle={bundle} />);
+
+      await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+      const firstTick = container.querySelector<SVGTextElement>(
+        '[data-axis-tick="cadence-week"]',
+      );
+      expect(firstTick).toHaveAttribute("data-axis-value", weekStart);
+      expect(firstTick?.textContent).toBe(weekStart);
+    },
+  );
 
   it("surfaces a section's own truncation disclosure", () => {
     const bundle = structuredClone(golden());
@@ -1025,6 +1207,59 @@ describe("repository showcase", () => {
 
     const overcrowded = Array.from(coordinateCounts.entries()).filter(([, count]) => count > 2);
     expect(overcrowded).toEqual([]);
+  });
+
+  it("uses compact labels in dense graphs and prints each hidden-coupling support value", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    const moduleNodes = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        ".repo-graph-node[data-module-node]",
+      ),
+    );
+    expect(moduleNodes.length).toBeGreaterThan(24);
+    const packageNodes = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        ".repo-graph-node[data-package-node]",
+      ),
+    );
+    expect(packageNodes.length).toBeGreaterThan(1);
+    const compactNodes = [...packageNodes, ...moduleNodes];
+    expect(compactNodes.every((node) => node.classList.contains("compact-label")))
+      .toBe(true);
+    for (const node of compactNodes) {
+      expect(node.style.width).toBe("26px");
+      expect(node).toHaveAccessibleName();
+      // Compact mode hides only the text labels; the kind icon must stay
+      // in the markup as the node's remaining visible identity.
+      expect(node.querySelector(".repo-node-kind-icon")).not.toBeNull();
+    }
+
+    await user.click(moduleNodes[0]);
+    expect(moduleNodes[0]).not.toHaveClass("compact-label");
+    expect(Number.parseFloat(moduleNodes[0].style.width)).toBeGreaterThanOrEqual(
+      92,
+    );
+
+    await user.click(
+      container.querySelector('[data-view-id="hidden_coupling"]')!,
+    );
+    const values = Array.from(
+      container.querySelectorAll<HTMLElement>("[data-support-value]"),
+    );
+    expect(values).toHaveLength(
+      Math.min(200, bundle.aggregates.hidden_coupling.data.items.length),
+    );
+    const expected = bundle.aggregates.hidden_coupling.data.items
+      .slice(0, values.length)
+      .map((row) =>
+        new Intl.NumberFormat("en", {
+          style: "percent",
+          maximumFractionDigits: 1,
+        }).format(row.support <= 1 ? row.support : row.support / 100)
+      );
+    expect(values.map((value) => value.textContent)).toEqual(expected);
   });
 
   it("keeps every structure-graph card footprint inside a 300px mobile stage", () => {
