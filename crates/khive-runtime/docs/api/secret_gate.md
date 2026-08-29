@@ -261,13 +261,15 @@ while the surrounding prose is preserved. Spans are discovered left to right aga
 text via `scan_from`: each scan advances a `from` cursor past the previous span but always
 evaluates trigger context over the full input. This closes the entropy-context gap — a
 high-entropy value whose only trigger word sits to the left of an earlier-redacted secret is
-still detected, because the trigger window is never sliced away. The known-prefix detectors (real
-API keys: `sk-ant-`, `sk-proj-`, `AKIA`/`ASIA`, GitHub, Stripe, …) are context-free and matched the
-same way. Masking limits cumulative suffix bytes submitted to the full detector set to 2 MiB; the
-first sweep is always allowed for larger or multibyte callers. If dense credential-shaped input
-reaches that work budget with text remaining, the last confirmed secret span is extended through
-the rest of the input. This fail-closed tail redaction bounds suffix-scan work without allowing an
-unscanned credential to survive.
+still detected, because the trigger window is never sliced away. The entropy detector tokenizes
+the full input once per masking call, then uses the first token at or after the cursor on each
+pass; the known-prefix detectors (real API keys: `sk-ant-`, `sk-proj-`, `AKIA`/`ASIA`, GitHub,
+Stripe, …) remain context-free and scan the suffix. Masking limits cumulative suffix bytes
+submitted to those repeated detector sweeps to 2 MiB; the first sweep is always allowed for
+larger or multibyte callers. If dense credential-shaped input reaches that work budget with text
+remaining, the last confirmed secret span is extended through the rest of the input. This
+fail-closed tail redaction bounds repeated scan work without allowing an unscanned credential to
+survive.
 
 ## trigger_words
 
