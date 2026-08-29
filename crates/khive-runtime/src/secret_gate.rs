@@ -654,7 +654,10 @@ fn find_bare_sk_token(text: &str) -> Option<&str> {
         }
 
         let token_start = token.as_ptr() as usize - base;
-        from = token_start + token.len();
+        // Suppress only this `sk-` occurrence. The same whitespace-delimited
+        // token may contain a later generic key glued after punctuation, and
+        // advancing past the whole token would hide it from the fallback.
+        from = token_start + "sk-".len();
     }
     None
 }
@@ -2193,6 +2196,26 @@ mod tests {
             scan_match(&content).expect("later generic sk key must remain detectable");
         assert_eq!(matched, generic_key);
         assert_eq!(detector, "openai-api-key");
+    }
+
+    #[test]
+    fn glued_short_specialized_prefix_does_not_hide_later_generic_key() {
+        let generic_key = format!("sk-{}A", "A1".repeat(21));
+        let content = format!("sk-proj-X,{generic_key}");
+
+        assert!(
+            check(&content).is_err(),
+            "a generic key after a rejected vendor prefix must remain blocked"
+        );
+        let masked = mask_secrets(&content).into_owned();
+        assert!(
+            !masked.contains(&generic_key),
+            "the later generic key must not survive masking: {masked}"
+        );
+        assert!(
+            masked.contains(REDACTION_MARKER),
+            "the later generic key must be replaced: {masked}"
+        );
     }
 
     #[test]
