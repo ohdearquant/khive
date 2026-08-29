@@ -472,9 +472,9 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "khive-bm25"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "khive-score",
@@ -1799,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "khive-brain-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "khive-changeset"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "khive-types",
  "proptest",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1839,7 +1839,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel-email"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-imap",
  "async-native-tls",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel-telegram"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "khive-db"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1911,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fold"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fusion"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "khive-score",
@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "khive-types",
@@ -1947,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate-rego"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "khive-gate",
  "khive-types",
@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "khive-hnsw"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "khive-fold",
@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "khive-mcp"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-agent"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-blob"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2059,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-brain"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2086,7 +2086,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-code"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-comm"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-formal"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-git"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-gtd"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2190,7 +2190,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-kg"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2212,13 +2212,14 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-knowledge"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
  "criterion",
  "inventory",
  "khive-brain-core",
+ "khive-db",
  "khive-fold",
  "khive-fusion",
  "khive-pack-brain",
@@ -2242,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-memory"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2274,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-moodboard"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2301,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-schedule"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2324,7 +2325,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-session"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2344,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-template"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2357,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "khive-pack-workspace"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -2374,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "khive-quant"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "rand 0.8.7",
@@ -2383,7 +2384,7 @@ dependencies = [
 
 [[package]]
 name = "khive-query"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2393,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "khive-repo-showcase"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "hex",
@@ -2410,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "khive-request"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2420,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "khive-retrieval"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2449,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "khive-runtime"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2487,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "khive-score"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "khive-types",
@@ -2497,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "khive-storage"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2512,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "khive-text"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "rust-stemmers",
@@ -2521,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "khive-types"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2530,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "khive-vamana"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -2551,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "khive-vcs"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2572,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "khive-vcs-adapters"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "khive-types",
@@ -2584,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "khive-wire-protocol"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2593,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "kkernel"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",

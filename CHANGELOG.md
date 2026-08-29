@@ -7,22 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-27
+
 ### Added
 
-- ADR-149 Moodboard pairwise preference learning: actor-attributed randomized
-  serve/judgment events, deterministic grouped logistic BCE training,
-  temperature/tie calibration, and BlobStore-backed `lattice-fann` model
-  serialization/inference through four opt-in `moodboard.*` verbs.
-- Deterministic GQL `SKIP` paging with structured `has_more`/`next_offset`
-  continuation metadata for result sets beyond the query page bound (#1601).
+- Dedicated events daemon: the events plane is split from the main request path
+  onto its own versioned transport, with independent routing and configuration
+  (ADR-170).
+- Content-addressed attachments: a new `attachments` table with durable claim
+  fences and a phase-gated garbage collector that refuses to delete blobs still
+  referenced by an active sweep (ADR-121, ADR-160).
+- `BlobStore::get_bounded_verified` — blob reads that are both size-bounded and
+  digest-verified on the read path (ADR-160 phase 1).
+- `comm.inbox` bounded long-polling via `wait_ms`, `since`/`before` time-window
+  filters, sender and recipient filters (`from_actor`, `from_prefix`,
+  `exclude_from_actor`, `to_actor`), `subject_contains`/`content_contains`
+  matching, projection via `fields`, and projected sent-message history via
+  `box="sent"`.
 - `comm.mark_read(ids=[...], atomic=false)` as the canonical bulk mark-read
   surface, with an opt-in all-or-nothing transaction and the released
   `comm.read(id|ids)` forms retained for compatibility. This closes #1387's
   residual scope after #1572 shipped best-effort bulk read marking and ADR-057
   superseded its original namespace/legacy-recipient assumptions (#1387).
-- `whoami` verb (kg pack, bare name): reports the caller's actor reference,
-  write namespace, and read-visible namespace set already resolved by the
-  runtime for the current request.
+- Deterministic GQL `SKIP` paging with structured `has_more`/`next_offset`
+  continuation metadata for result sets beyond the query page bound (#1601).
+- Semantic review workbench with a dedicated review contract, `khive.review.v1`
+  (ADR-145).
+- Service provenance and kind classification for entities (ADR-167),
+  `person`→`org` and `org`→`org` edge pairs, and entity-tag filtering.
+- Recall pipeline: `created_after`/`created_before` windows, multi-model vector
+  fusion, a weighted feature-combination reranker on the main recall path,
+  exposed `top_k`/`fusion_strategy`/`score_floor` knobs, and an
+  `IdentityReranker` plus cross-encoder re-export seam.
+- Dual embedding model registry, MiniLM alongside paraphrase (ADR-043), an ANN
+  consumer-pending write log with a model-sequence index, and the
+  `KHIVE_ANN_FRESH_TAIL` knob.
+- Code pack L2 symbol-tier scanner and call-graph ingest, preserving ingest
+  provenance and coverage.
+- Remaining request-surface parameter additions, each optional:
+  `brain.auto_feedback(target_id)`, the exact full UUID or compact id of the one
+  result being judged, required when `signal` is supplied and required to occur
+  exactly once in `results`; `search(source)`, filtering by exact retrieval
+  source (`text` | `vector` | `both`) inside a bounded candidate window before
+  the caller limit, where `both` means the hit received text and vector
+  contributions; `list(session_id, observed, selected)` for `kind="event"`,
+  filtering events by exact full session UUID and by events that observed or
+  selected every listed exact full UUID, with short-prefix resolution rejected
+  because it can miss or be ambiguous; `comm.thread(fields)`, the message-field
+  projection already shared with `comm.inbox`, rejecting unknown fields;
+  `code.ingest(tiers)`, selecting any of `l1` | `l1.5` | `l2`; and
+  `update(entity_type)`, setting a registered entity type validated against the
+  entity kind's closed vocabulary and reindexed.
+- A precisely specified, supervisor-readable daemon exit-code contract (ADR-049
+  Amendments 4-7). This contract is new rather than changed: v0.7.0 carried no
+  exit-code table, no emitted set and no reserved set.
+- Writer and storage observability: an append-only writer-timeout event sink
+  with a liveness heartbeat, slow writer-stage timing sinks that record queued-
+  write latency rather than only failures, and writer-contention plus
+  WAL/checkpoint diagnostics.
+- Recoverable `git.digest` receipts.
+- Moodboard pack: visual-asset ingest and exact descriptor-space retrieval
+  (ADR-148), plus actor-scoped calibrated pairwise preference learning
+  (ADR-149) — actor-attributed randomized serve and judgment events,
+  deterministic grouped logistic BCE training, temperature and tie calibration,
+  and `lattice-fann` model serialization and inference. The pack registers seven
+  verbs: `moodboard.ingest`, `.search`, `.serve`, `.judge`, `.preference`,
+  `.train_preference`, `.model`. It is not in the default pack set and must be
+  selected explicitly via `KHIVE_PACKS` or `--pack`.
 
 ### Changed
 
@@ -31,6 +82,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--config`/`KHIVE_CONFIG` path does not exist, instead of resolving to
   `None` and falling through to discovery. This matches the explicit-tier
   contract of the database-anchored config loader (ADR-035).
+- Daemon recovery is gated and fail-closed, and hung SQLite reads are now
+  interrupted rather than blocking indefinitely.
+- `query` takes `page_size` for the result-page bound, with a minimum of 1, a
+  default of 500 and a hard cap of 10 000. The former `limit` is retained as a
+  deprecated alias and is mutually exclusive with `page_size`; a `LIMIT` in the
+  query text composes as the smaller of the two bounds.
+- Schema migrations advance from V16 to V20, plus a coordinated V21 attachments
+  cutover. V21 is deliberately not an ordinary versioned migration: it is
+  applied through a coordinated path (`ATTACHMENT_CUTOVER_VERSION = 21`), so a
+  database at V20 records V21 only once that cutover completes.
+
+### Breaking (Rust crates)
+
+Source-breaking for callers of the published crates. Neither is on a wire
+format, so MCP clients are unaffected; only code compiling against
+`khive-storage`/`khive-types` needs to change.
+
+The version number carries this signal on purpose: under Cargo's semver rules a
+`0.x` minor bump is the breaking bump for `0.x` crates, so `0.7 → 0.8` is what a
+dependent's resolver reads as incompatible.
+
+- `BlobStore::get` — removed, superseded by `BlobStore::get_bounded_verified`,
+  which bounds the read and verifies the digest on the read path. Callers move
+  to the new method; there is no deprecated shim.
+- `Entity::with_content_ref` — removed builder method. The public `content_ref`
+  field itself remains, so construction through the field is unaffected.
+
+### Removed
+
+An on-disk schema change, listed separately from the API breaks above because it
+is a different kind of removal with a different consequence.
+
+- The legacy `entities.content_ref` column, retired by the V21 attachments
+  cutover. This one is on-disk rather than an API change, and readers are
+  unaffected: `content_ref` was already computed as a subquery over the
+  `attachments` table before V21 ran, so consumers were being served from the
+  new table already. What it does change is rollback — see the migration note
+  below.
+
+### Migration note — V21 is forward-only
+
+A database that has run V21 cannot be served by a v0.7.0 binary. Pin `v0.7.0`
+before upgrading if you need to roll back.
+
+V21 does not discard data it cannot account for. The drop is issued inside the
+coordinated cutover transaction and only after a universal validation pass: any
+entity carrying a `content_ref` without an exactly-matching attachment row
+aborts the migration with an `InvalidData` error. The migration refuses rather
+than dropping.
+
+## [0.7.0] - 2026-08-02
+
+This release was tagged without a changelog entry. The entry below records the
+one item that was pending in `[Unreleased]` at the tag; for the full contents
+see the `v0.6.0...v0.7.0` comparison.
+
+### Added
+
+- `whoami` verb (kg pack, bare name): reports the caller's actor reference,
+  write namespace, and read-visible namespace set already resolved by the
+  runtime for the current request.
 
 ## [0.5.0] - 2026-07-13
 

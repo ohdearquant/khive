@@ -17,6 +17,7 @@ use crate::error::SqliteError;
 use crate::writer_task::WriterTaskHandle;
 use khive_storage::error::StorageError;
 use khive_storage::tx_registry::{DbIdentity, TxOrigin};
+use khive_storage::StorageCapability;
 
 const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
@@ -280,6 +281,16 @@ pub struct PoolConfig {
     ///
     /// Overridable via `KHIVE_WRITE_ADMISSION_DEADLINE_MS`.
     pub write_admission_deadline_ms: u64,
+    /// Maximum age an explicit cached-reader read transaction
+    /// (`sql_bridge`'s `BEGIN`-then-reuse path) may reach before its next use
+    /// is refused and it is rolled back instead of extending its WAL
+    /// snapshot further (#1846). Shares `KHIVE_TX_MAX_AGE_SECS` with the
+    /// ADR-091 Plank 1 visibility sweep in `checkpoint.rs` so one knob
+    /// governs both when an operator is warned about a stale reader and when
+    /// that reader's snapshot is actually released.
+    ///
+    /// Overridable via `KHIVE_TX_MAX_AGE_SECS`. Default: 120 seconds.
+    pub read_tx_max_age: Duration,
 }
 
 /// ADR-131 Decision 2's validated range for `write_admission_deadline_ms`.
@@ -332,6 +343,11 @@ impl Default for PoolConfig {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DEFAULT_WRITE_ADMISSION_DEADLINE_MS),
+            read_tx_max_age: crate::checkpoint::tx_age_thresholds_from_env(
+                Duration::from_secs(30),
+                Duration::from_secs(120),
+            )
+            .1,
         }
     }
 }
@@ -1075,6 +1091,60 @@ impl ConnectionPool {
     /// Return the pool configuration.
     pub fn config(&self) -> &PoolConfig {
         &self.config
+    }
+
+    /// The typed admission failure for a pooled reader checkout that
+    /// exhausted `checkout_timeout`: no reader was acquired, so the
+    /// operation never started and a retry cannot duplicate a side effect.
+    pub(crate) fn reader_admission_timeout(&self, operation: &'static str) -> StorageError {
+        StorageError::AdmissionTimeout {
+            operation: operation.into(),
+            timeout_ms: u64::try_from(self.config.checkout_timeout.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Resolve a [`Self::reader_until`] outcome into a checked-out guard or
+    /// the canonical refusal. This is the single home of the checkout
+    /// tri-state; call sites must not re-derive any arm of it:
+    ///
+    /// - `Ok(Some)` — a reader was checked out.
+    /// - `Ok(None)` — `should_stop()` fired: the request was cancelled or hit
+    ///   its deadline before checkout. NOT an admission wait, so it maps to
+    ///   the non-retryable [`StorageError::Timeout`] — emitting the retryable
+    ///   `AdmissionTimeout` here would invite an immediate retry of a request
+    ///   its caller already abandoned, into a possibly saturated pool.
+    /// - `Err` carrying the pool's own `SQLITE_BUSY` — `reader_until` executes
+    ///   no SQL, so the only `SQLITE_BUSY` it can produce is
+    ///   [`pool_exhausted_error`], raised when `checkout_timeout` elapses with
+    ///   no reader available. A genuine admission wait that ended before any
+    ///   work began maps to the retryable [`StorageError::AdmissionTimeout`].
+    /// - any other `Err` (e.g. [`Self::ensure_pooled_writer_active`] returning
+    ///   `InvalidData` for a retired pooled writer) — an opaque driver failure
+    ///   under the caller's capability, non-retryable.
+    pub(crate) fn resolve_reader_checkout<'p>(
+        &self,
+        capability: StorageCapability,
+        operation: &'static str,
+        outcome: Result<Option<ReaderGuard<'p>>, SqliteError>,
+    ) -> Result<ReaderGuard<'p>, StorageError> {
+        match outcome {
+            Ok(Some(guard)) => Ok(guard),
+            Ok(None) => Err(StorageError::Timeout {
+                operation: operation.into(),
+            }),
+            Err(error) => {
+                let is_pool_exhausted = matches!(
+                    &error,
+                    SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                        if code.code == rusqlite::ErrorCode::DatabaseBusy
+                );
+                if is_pool_exhausted {
+                    Err(self.reader_admission_timeout(operation))
+                } else {
+                    Err(StorageError::driver(capability, operation, error))
+                }
+            }
+        }
     }
 
     /// Pool-wide permits for file-backed raw-SQL reader opens and active reads.
@@ -3876,5 +3946,69 @@ mod tests {
         let (identity_again, canonical_again) = mint_db_identity(&db_path).unwrap();
         assert_eq!(identity, identity_again);
         assert_eq!(canonical, canonical_again);
+    }
+
+    /// The checkout tri-state, arm by arm, at its single home. Each refusal
+    /// arm asserts the classification it must NOT collapse into, because the
+    /// historical defect was exactly a pairwise swap: cancellation surfaced as
+    /// the retryable `AdmissionTimeout` while genuine pool exhaustion surfaced
+    /// as a non-retryable `Driver` failure.
+    #[test]
+    fn resolve_reader_checkout_maps_each_arm_distinctly() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        let guard = pool
+            .resolve_reader_checkout(
+                StorageCapability::Sql,
+                "arm_checked_out",
+                pool.reader_until(|| false),
+            )
+            .expect("an uncontended checkout must pass the guard through");
+        drop(guard);
+
+        let Err(cancelled) =
+            pool.resolve_reader_checkout(StorageCapability::Sql, "arm_cancelled", Ok(None))
+        else {
+            panic!("a cancelled checkout must be refused");
+        };
+        assert!(
+            matches!(cancelled, StorageError::Timeout { .. }),
+            "cancellation/deadline before checkout must be the non-retryable \
+             Timeout, got {cancelled:?}"
+        );
+
+        let Err(exhausted) = pool.resolve_reader_checkout(
+            StorageCapability::Sql,
+            "arm_exhausted",
+            Err(pool_exhausted_error(Duration::from_millis(5), 1)),
+        ) else {
+            panic!("an exhausted checkout must be refused");
+        };
+        assert!(
+            matches!(exhausted, StorageError::AdmissionTimeout { .. }),
+            "the pool's own SQLITE_BUSY (checkout_timeout exhausted) must be \
+             the retryable AdmissionTimeout, got {exhausted:?}"
+        );
+
+        let Err(opaque) = pool.resolve_reader_checkout(
+            StorageCapability::Entities,
+            "arm_driver",
+            Err(SqliteError::InvalidData("retired pooled writer".into())),
+        ) else {
+            panic!("an opaque checkout error must be refused");
+        };
+        assert!(
+            matches!(
+                &opaque,
+                StorageError::Driver { capability, .. }
+                    if *capability == StorageCapability::Entities
+            ),
+            "any other checkout error must stay a non-retryable Driver failure \
+             under the caller's capability, got {opaque:?}"
+        );
     }
 }
