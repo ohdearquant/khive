@@ -301,7 +301,7 @@ are read once at serve time.
 | `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`        | **disabled** | When set to a positive number, a session that receives no request for this many seconds closes, releasing its reader-pool admission and DB connection. `0`, absent, or unparsable leaves it disabled. |
 | `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`   | `300`        | The longest a single response write may stay pending before it is abandoned and the session closes. `0` is rejected at startup rather than treated as an opt-out.                                     |
 | `KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS`  | `3600`       | How long an admitted request whose response has not been written keeps deferring the idle close. Only reached when the idle timeout is enabled. `0` restores an unbounded defer.                      |
-| `KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS` | `1024`       | Maximum requests admitted to rmcp while their responses remain outstanding. A full session closes before another handler is spawned. `0` or an unparsable value uses the default.                 |
+| `KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS` | `1024`       | Maximum requests admitted to rmcp while their responses remain outstanding. A full session closes before another handler is spawned. `0` or an unparsable value uses the default.                     |
 
 **Idle reaping is off by default, and that is deliberate.**
 [ADR-091](adr/ADR-091-wal-snapshot-lifetime.md) rejects closing long-lived
