@@ -1014,6 +1014,26 @@ old path occurs in the same subphase that closes its last consumer.
 - Gate allow precedes the operation; Gate deny or infrastructure error never invokes the handler;
   visible scope does not become a by-ID namespace wall.
 
+##### Amendment 1 — the legacy preference verifier is inverted behind a trait
+
+`khive-pack-moodboard` is now an optional crate dependency rather than an unconditional one, so
+the cutover can no longer call into the pack directly. The legacy preference verification step
+moves behind `LegacyPreferenceVerifier` in `khive-runtime` (sealed; the moodboard pack is its one
+implementor), and the cutover holds it as `Option`, `Some` only when the build compiled the
+`pack-moodboard` feature. Detection is unaffected and stays in core: the legacy row count is a
+plain `SELECT COUNT(*)` over `entities` using no moodboard types.
+
+This splits the bullet above reading "an upgrade with moodboard disabled still migrates legacy
+models" into two cases, because "disabled" now has two meanings. A build that **compiled** the
+pack but does not **select** it at runtime through `KHIVE_PACKS`/`--pack` behaves exactly as that
+bullet states: the verifier is installed, and legacy models migrate. A build **compiled without**
+the feature has no verifier at all, and there the cutover **fails closed** — it refuses with an
+error naming the legacy count rather than completing V21 and dropping `entities.content_ref`
+while unmigrated models remain on disk. Silently proceeding would be data loss, so the operator
+is told to rebuild with the feature enabled, migrate, and retry boot. When the legacy count is
+zero, which is the overwhelmingly common case, the absent verifier is irrelevant and boot is
+unchanged.
+
 ### Embedding identity and migration
 
 - Moodboard canonical descriptor bytes, fingerprint, model key, response, and table selection are

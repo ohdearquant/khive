@@ -36,10 +36,13 @@ use test_harness::{
 
 // ── local-dispatch fallback telemetry ─────────────────────────────────────────
 //
-// Every path below that returns `None` (or is matched as a fallback outcome)
+// Each recordable fallback path below (the paths through `fallback_or_reject`)
 // means the caller silently dispatches locally instead of via the warm daemon.
+// Intentional local bypasses such as the `KHIVE_NO_DAEMON` opt-out are outside
+// this telemetry set by design.
 // A silent fallback is the bug this instrumentation exists to surface: it must
-// always be loud (a structured WARN) and counted. These are process-global
+// always be loud (a structured fallback event — WARN, or ERROR for
+// strict-mode illegitimate reasons) and counted. These are process-global
 // production counters (not `#[cfg(test)]`-gated like the instrumentation seams
 // above) — they realize the metric `khive_daemon_fallback_total{reason}`; a
 // future metrics-export slice can read them without touching call sites.
@@ -85,9 +88,13 @@ impl FallbackReason {
         }
     }
 
-    /// Legitimacy tier used by the `KHIVE_DAEMON_STRICT` graduated fail-loud
-    /// policy (SPEC_DRAFT §3 D2). Only `Illegitimate` reasons are elevated by
-    /// strict mode; the other two tiers are always quiet, regardless of mode.
+    /// Legitimacy tier used only by the `daemon_fallback` event-level policy
+    /// (see `crates/khive-mcp/docs/api/daemon-lifecycle.md` §"Strict-mode
+    /// fallback accounting"; the graduated tiers themselves come from ADR-049
+    /// Amendment 2). Every tier increments its per-reason counter and emits
+    /// exactly one `daemon_fallback` event: WARN normally, escalated to ERROR
+    /// plus `FALLBACK_STRICT_VIOLATIONS` only for `Illegitimate` reasons in
+    /// strict mode.
     fn severity(self) -> FallbackSeverity {
         match self {
             // A real misconfiguration: the client and daemon should have
@@ -114,7 +121,7 @@ impl FallbackReason {
 }
 
 /// Legitimacy tier for a [`FallbackReason`], keyed by the graduated fail-loud
-/// policy in SPEC_DRAFT §3 D2. See [`FallbackReason::severity`] for the
+/// policy in ADR-049 Amendment 2. See [`FallbackReason::severity`] for the
 /// per-variant mapping and its rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FallbackSeverity {
@@ -123,18 +130,24 @@ enum FallbackSeverity {
     Illegitimate,
     /// Historical rollout-transient telemetry tier. These outcomes are now
     /// terminal after a real write, but remain in the closed metrics vocabulary.
-    /// Never elevated, in strict mode or otherwise.
+    /// Never elevated past the WARN-level event, in strict mode or otherwise.
     RolloutTransient,
-    /// No daemon to forward to at all. Never elevated — this is the
-    /// ADR-049-mandated safety net, not a bug.
+    /// No daemon to forward to at all. Never elevated past the WARN-level
+    /// event — this is the ADR-049-mandated safety-net telemetry tier, not a
+    /// signal that strict mode permits local fallback.
     NoDaemon,
 }
 
-/// `KHIVE_DAEMON_STRICT=1` elevates `Illegitimate`-severity fallbacks to an
-/// error-level event (D2-R1, see [`record_fallback`]) and rejects the
-/// request outright instead of completing it locally (#947, see
-/// `fallback_or_reject`). Plain opt-in, default OFF — no hosted-vs-local
-/// auto-detection exists in this codebase. See
+/// `KHIVE_DAEMON_STRICT=1` has two independent effects:
+///
+/// - Behavior: [`fallback_or_reject`] rejects every [`FallbackReason`] instead
+///   of completing the request locally, regardless of severity (#947).
+/// - Telemetry: [`record_fallback`] elevates only `Illegitimate` reasons to an
+///   error-level event with the violation counter (D2-R1); the other severity
+///   tiers remain WARN-level `daemon_fallback` events and do not increment
+///   `FALLBACK_STRICT_VIOLATIONS`.
+///
+/// Plain opt-in, default OFF — no hosted-vs-local auto-detection exists. See
 /// `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 fn is_daemon_strict_mode() -> bool {
     env_truthy("KHIVE_DAEMON_STRICT")

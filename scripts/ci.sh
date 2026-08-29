@@ -295,7 +295,14 @@ phase_no_default_features() {
 
 phase_release() {
     echo "=== Build (release) ==="
-    cargo build --workspace --release
+    # pack-formal is an optional dependency, so a default build does not link it.
+    # smoke_test.py's formal section spawns the binary with `--pack formal` to
+    # cover the pack's additive EntityOfType endpoint rules, and an unlinked pack
+    # is UnknownPack at startup, not a skip. Link it here so that coverage
+    # survives. pack-moodboard is deliberately NOT linked: it registers verbs,
+    # and test_documented_verb_counts.py asserts the verb surface in this same
+    # phase.
+    cargo build --workspace --release --features kkernel/pack-formal
 }
 
 phase_contract_tests() {

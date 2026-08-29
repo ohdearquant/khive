@@ -171,12 +171,11 @@ impl SqlAttachmentStore {
                 StorageCapability::Attachments,
                 operation,
                 move |scope| {
-                    let mut guard = pool
-                        .reader_until(|| scope.should_stop())
-                        .map_err(|error| map_sqlite_err(error, operation))?
-                        .ok_or_else(|| StorageError::Timeout {
-                            operation: operation.into(),
-                        })?;
+                    let mut guard = pool.resolve_reader_checkout(
+                        StorageCapability::Attachments,
+                        operation,
+                        pool.reader_until(|| scope.should_stop()),
+                    )?;
                     scope.run_pooled_reader(&mut guard, |conn| {
                         f(conn).map_err(|error| map_err(error, operation))
                     })

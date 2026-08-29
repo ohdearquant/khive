@@ -102,8 +102,29 @@ pub enum AuditTerminalReason {
     PreflightRejected,
     /// The batch is `Closing` or `Closed`; new admission is refused.
     AdmissionClosed,
-    /// `AuditBatchConfig::max_pending_rows` was reached.
+    /// `AuditBatchConfig::max_pending_rows` was reached before this row was
+    /// enqueued. The row was never counted as submitted and never shared a
+    /// generation with anyone — safe to retry, and doing so applies the
+    /// obligation at most once.
     QueueAdmissionExhausted,
+    /// The row was already enqueued (counted in `submitted_rows`) when this
+    /// caller's `AuditBatchConfig::admission_deadline` elapsed waiting for
+    /// its generation's outcome. Unlike [`Self::QueueAdmissionExhausted`],
+    /// the row was not refused: by the moment the deadline fires it may
+    /// still be sitting in `state.pending`, or the driver may have already
+    /// drained it into an in-flight generation — either way it remains
+    /// enqueued and unresolved, and is committed (or terminally failed) by
+    /// the generation driver independently of this caller's timeout, so the
+    /// caller cannot tell from this reason alone whether the row eventually
+    /// committed, or even which of those two states it was in when the
+    /// deadline elapsed. Retrying is only safe for an idempotent caller —
+    /// the prior submission may still land. When this reason degrades an
+    /// admission-degrade-safe read's own audit obligation, it is counted
+    /// separately from [`Self::QueueAdmissionExhausted`] — see
+    /// `pack::audit_admission_unresolved_obligation_count` — precisely
+    /// because a row counted here may still commit, unlike one refused
+    /// before enqueue.
+    AdmissionDeadlineExpired,
     /// A row shared this generation's id with a previously stored row whose
     /// columns or observation projection did not match exactly.
     IdentityConflict,
@@ -147,8 +168,11 @@ pub enum AuditCommitOutcome {
 }
 
 /// Production-visible snapshot of [`AuditBatch::health_metrics`]. See there
-/// for field semantics; mirrors `khive_db::diagnostics::RuntimeAuditBatchMetrics`
-/// one-for-one so the registry owner can convert without loss.
+/// for field semantics. `khive_db::diagnostics::RuntimeAuditBatchMetrics` carries
+/// these three fields plus `admission_refused_obligations` and
+/// `admission_unresolved_obligations`, which are sourced from process-wide
+/// counters outside `AuditBatch` rather than from this struct — see
+/// `VerbRegistry::audit_batch_metrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditBatchHealthMetrics {
     pub flush_failures: u64,
@@ -363,6 +387,13 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
         StorageError::WriteQueueFull { .. } | StorageError::WriterTaskBusy { .. } => {
             RetryDecision::Retry
         }
+        // Transient availability conditions, not judgments on the batch. The
+        // events-daemon forwarding lane (ADR-170) reports an unreachable or
+        // stalled daemon as `Pool`/`Timeout`; the direct SQL path reports
+        // acquisition pressure the same way. Both are exactly what the
+        // configured bounded retries exist for — treating them as terminal
+        // would abandon a generation on the first blip of a daemon restart.
+        StorageError::Pool { .. } | StorageError::Timeout { .. } => RetryDecision::Retry,
         StorageError::WriterTaskTerminated { request_state } => match request_state {
             WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack => {
                 RetryDecision::Retry
@@ -662,7 +693,13 @@ impl AuditBatchControl for AuditBatch {
         match tokio::time::timeout(self.config.admission_deadline, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_recv_error)) => Err(AuditTerminalReason::DriverJoinLost),
-            Err(_elapsed) => Err(AuditTerminalReason::QueueAdmissionExhausted),
+            // The row was already pushed onto `state.pending` above (and
+            // `submitted_rows` incremented) before this wait began — this is
+            // a deadline elapsing on an enqueued row, not a queue-full
+            // refusal, so it gets its own terminal reason (khive#2117,
+            // khive#2208). The row is left in place for the driver to drain;
+            // this arm performs no removal.
+            Err(_elapsed) => Err(AuditTerminalReason::AdmissionDeadlineExpired),
         }
     }
 

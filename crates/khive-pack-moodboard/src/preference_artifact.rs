@@ -1,12 +1,14 @@
 //! Authenticated preference-model artifact verification shared by serving and boot cutover.
 
-use khive_runtime::{BlobHydrator, RuntimeError};
+use khive_runtime::{BlobHydrator, LegacyPreferenceVerifier, RuntimeError};
 use khive_storage::blob::ContentRef;
 use khive_storage::event::Event;
 use khive_storage::types::{PageRequest, SqlRow, SqlStatement, SqlValue};
 use khive_storage::SqlAccess;
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 use uuid::Uuid;
+
+pub use khive_runtime::VerifiedModelNetworkAttachment;
 
 use crate::preference::{
     deserialize_fann, sha256_hex, validate_loaded_bundle, ModelBundle, PreferenceScope,
@@ -134,14 +136,6 @@ pub(crate) fn verify_preference_network(
         ));
     }
     deserialize_fann(network_bytes)
-}
-
-/// One authenticated network role for the attachment cutover coordinator.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedModelNetworkAttachment {
-    pub model_id: Uuid,
-    pub network_content_ref: ContentRef,
-    pub size_bytes: u64,
 }
 
 /// Count every legacy preference-model candidate, including soft-deleted rows.
@@ -463,6 +457,26 @@ pub async fn verify_legacy_preference_attachments(
         }
     }
     Ok(verified_rows)
+}
+
+/// [`LegacyPreferenceVerifier`] implementation delegating to
+/// [`verify_legacy_preference_attachments`], so `khive-mcp`'s V21 cutover can
+/// authenticate legacy moodboard evidence without depending on this crate
+/// directly.
+#[derive(Debug, Default)]
+pub struct MoodboardLegacyPreferenceVerifier;
+
+impl khive_runtime::preference_verification::sealed::Sealed for MoodboardLegacyPreferenceVerifier {}
+
+#[async_trait::async_trait]
+impl LegacyPreferenceVerifier for MoodboardLegacyPreferenceVerifier {
+    async fn verify_legacy_preference_attachments(
+        &self,
+        sql: &dyn SqlAccess,
+        hydrator: &BlobHydrator,
+    ) -> Result<Vec<VerifiedModelNetworkAttachment>, RuntimeError> {
+        verify_legacy_preference_attachments(sql, hydrator).await
+    }
 }
 
 #[cfg(test)]

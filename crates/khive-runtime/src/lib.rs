@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod error;
+pub mod events_split;
 pub mod fusion;
 pub mod graph_traversal;
 mod note_store_guard;
@@ -28,6 +29,7 @@ pub mod operations;
 pub mod pack;
 pub mod phase_events;
 pub mod portability;
+pub mod preference_verification;
 pub mod presentation;
 pub mod reference_resolution;
 pub mod reference_ring;
@@ -57,7 +59,7 @@ pub use atomic_runner::{
     CommittedPostCommitEffects,
 };
 pub use blob::{
-    resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, VerifiedBlob,
+    resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, GovernedBlobError, VerifiedBlob,
     DEFAULT_BLOB_HYDRATION_BYTES,
 };
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
@@ -111,8 +113,8 @@ pub use operations::{
 };
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
-    hex_prefix_to_uuid_pattern, merge_entry_metadata, EdgeEndpointKind, EntityCreateSpec, LinkSpec,
-    NoteSearchHit, QueryResult, Resolved,
+    hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, EdgeEndpointKind,
+    EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
@@ -124,6 +126,7 @@ pub use pack::{
 };
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
+pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};
 pub use presentation::{
     apply_redundancy_drop, micros_to_iso, present, render_format, rfc3339_to_utc_micros,
     OutputFormat, PresentationMode,

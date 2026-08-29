@@ -13,11 +13,15 @@ export interface ExecResult {
  * Execute a command and return its exit code, stdout, and stderr.
  * Does not throw on non-zero exit — callers decide how to handle failures.
  */
-export async function exec(cmd: string[]): Promise<ExecResult> {
+export async function exec(
+  cmd: string[],
+  env?: Record<string, string>,
+): Promise<ExecResult> {
   const command = new Deno.Command(cmd[0], {
     args: cmd.slice(1),
     stdout: "piped",
     stderr: "piped",
+    ...(env ? { env, clearEnv: true } : {}),
   });
   const output = await command.output();
   return {
