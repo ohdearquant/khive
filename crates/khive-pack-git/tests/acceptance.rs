@@ -6163,19 +6163,56 @@ async fn ingest_commit_lookup_failure_is_reported_in_band_after_walk_start() {
     write(&repo, "README.md", "hello\n");
     commit(&repo, &["README.md"], "Initial commit");
 
-    // The comm external-id index evaluates json_extract over properties on
-    // every insert, so a malformed-JSON row cannot land while it exists.
-    // Drop it (test database only) so the sabotage row is storable; the
-    // lookup's own json_extract then fails at query time, mid-walk.
+    // SQLite evaluates an index expression on every insert, and `json_extract`
+    // raises on invalid JSON — so a malformed-JSON row cannot land while ANY
+    // index evaluates `json_extract` over `notes.properties`.
+    //
+    // Dropping one such index BY NAME is structurally fragile: this test used
+    // to name `idx_comm_message_external_id` alone, and any later migration
+    // adding a second json-evaluating index on `notes` silently re-imposes the
+    // constraint, failing this test with a bare "malformed JSON" from an insert
+    // that looks unrelated to the migration that caused it. Drop the CLASS
+    // instead (test database only) — enumerate the json-evaluating indexes on
+    // `notes` and drop every one. The lookup's own `json_extract` then still
+    // fails at query time, mid-walk, which is the behaviour under test.
+    let json_indexes = {
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("sql reader");
+        reader
+            .query_all(SqlStatement {
+                sql: "SELECT name FROM sqlite_master \
+                      WHERE type = 'index' AND tbl_name = 'notes' \
+                        AND sql LIKE '%json_extract%'"
+                    .into(),
+                params: vec![],
+                label: Some("test_list_json_indexes_on_notes".into()),
+            })
+            .await
+            .expect("list json-evaluating indexes on notes")
+    };
+    // Empty is not clean: if the enumeration silently returned nothing, the
+    // sabotage row below would insert for the wrong reason and this test would
+    // pass while asserting nothing.
+    assert!(
+        !json_indexes.is_empty(),
+        "expected at least one json-evaluating index on notes; an empty result \
+         means the enumeration is broken, not that the schema has none"
+    );
+
     let mut writer = rt.sql().writer().await.expect("writer");
-    writer
-        .execute(SqlStatement {
-            sql: "DROP INDEX IF EXISTS idx_comm_message_external_id".into(),
-            params: vec![],
-            label: Some("test_drop_json_index".into()),
-        })
-        .await
-        .expect("drop json-evaluating index");
+    for row in &json_indexes {
+        let Some(SqlValue::Text(name)) = row.get("name") else {
+            panic!("sqlite_master.name must be text");
+        };
+        writer
+            .execute(SqlStatement {
+                sql: format!("DROP INDEX IF EXISTS {name}"),
+                params: vec![],
+                label: Some("test_drop_json_index".into()),
+            })
+            .await
+            .expect("drop json-evaluating index");
+    }
     writer
         .execute(SqlStatement {
             sql: "INSERT INTO notes(id, namespace, kind, content, properties, created_at, updated_at) \
