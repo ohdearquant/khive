@@ -912,27 +912,8 @@ mod tests {
     use super::*;
     use khive_storage::types::{SqlStatement, SqlValue};
 
-    /// A writable fixture backend can leave `-wal`/`-shm` sidecars behind at
-    /// scope drop (their owning connection closes asynchronously), and
-    /// read-only admission rejects a writable `-shm` as potentially live.
-    /// Freeze any lingering sidecars so the reopened path is the documented
-    /// frozen-snapshot form: read-only `-wal` plus read-only `-shm`.
     #[cfg(unix)]
-    fn freeze_snapshot_sidecars(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        for suffix in ["-wal", "-shm"] {
-            let mut name = path.file_name().expect("db file name").to_os_string();
-            name.push(suffix);
-            let sidecar = path.parent().expect("db parent dir").join(name);
-            if sidecar.exists() {
-                let mut permissions = std::fs::metadata(&sidecar)
-                    .expect("sidecar metadata")
-                    .permissions();
-                permissions.set_mode(0o444);
-                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-            }
-        }
-    }
+    use khive_storage::test_support::freeze_snapshot_sidecars;
 
     #[cfg(unix)]
     #[tokio::test]

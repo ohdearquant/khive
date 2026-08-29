@@ -11,6 +11,7 @@ import {
 
 const repository = "https://github.com/ohdearquant/khive";
 const snapshotSha = "0123456789abcdef0123456789abcdef01234567";
+const moduleId = "khive:module:sha256:0123456789abcdef";
 
 describe("repository investigation location", () => {
   it("accepts a curated repository alias and stores its canonical URL", () => {
@@ -29,6 +30,7 @@ describe("repository investigation location", () => {
         repository,
         snapshotSha,
         modulePath: "crates/space & signals/src/lib.rs",
+        moduleId,
         view,
       };
 
@@ -54,6 +56,7 @@ describe("repository investigation location", () => {
       "repo",
     ],
     ["duplicate module", "module=crates%2Fa.rs&module=crates%2Fb.rs", "module"],
+    ["duplicate module id", "module_id=one&module_id=two", "module_id"],
     ["malformed snapshot", "at=abc123", "at"],
     ["unknown view", "view=everything", "view"],
     ["absolute module path", "module=%2Fetc%2Fpasswd", "module"],
@@ -61,6 +64,10 @@ describe("repository investigation location", () => {
     ["empty path segment", "module=crates%2F%2Fsecret.rs", "module"],
     ["empty module", "module=", "module"],
     ["overlong module", `module=${"a".repeat(1025)}`, "module"],
+    ["empty module id", "module_id=", "module_id"],
+    ["overlong module id", `module_id=${"a".repeat(1025)}`, "module_id"],
+    ["query-delimiter module id", "module_id=khive%3Fmodule", "module_id"],
+    ["fragment-delimiter module id", "module_id=khive%23module", "module_id"],
   ])(
     "rejects %s without accepting the ambiguous value",
     (_name, search, parameter) => {
@@ -77,6 +84,8 @@ describe("repository investigation location", () => {
         ? "snapshotSha"
         : parameter === "module"
         ? "modulePath"
+        : parameter === "module_id"
+        ? "moduleId"
         : "view";
       expect(parsed.location[property]).toBeNull();
     },
@@ -116,6 +125,7 @@ describe("repository investigation location", () => {
         repository,
         snapshotSha,
         modulePath: "crates/khive-db/src/pool.rs",
+        moduleId,
         view: "dependency_topology",
       },
     );
@@ -123,7 +133,9 @@ describe("repository investigation location", () => {
     expect(url.search).toBe(
       `?repo=${
         encodeURIComponent(repository)
-      }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=dependency_topology`,
+      }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&module_id=${
+        encodeURIComponent(moduleId)
+      }&view=dependency_topology`,
     );
     expect(url.searchParams.has("keep")).toBe(false);
   });
@@ -137,6 +149,7 @@ describe("repository investigation location", () => {
         repository,
         snapshotSha,
         modulePath: null,
+        moduleId: null,
         view: "scorecard",
       },
     );
@@ -156,6 +169,7 @@ describe("repository investigation location", () => {
         repository,
         snapshotSha,
         modulePath: null,
+        moduleId: null,
         view: "scorecard",
       },
     );
@@ -173,6 +187,7 @@ describe("repository investigation location", () => {
         repository,
         snapshotSha,
         modulePath: "crates/khive-db/src/pool.rs",
+        moduleId,
         view: "dependency_topology",
       },
     );
@@ -184,7 +199,9 @@ describe("repository investigation location", () => {
     expect(url.search).toBe(
       `?repo=${
         encodeURIComponent(repository)
-      }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=dependency_topology`,
+      }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&module_id=${
+        encodeURIComponent(moduleId)
+      }&view=dependency_topology`,
     );
   });
 
@@ -194,6 +211,7 @@ describe("repository investigation location", () => {
         "https://forge.example/group/repo?access_token=not-a-real-secret#token-fragment",
       snapshotSha,
       modulePath: "crates/khive-db/src/pool.rs",
+      moduleId,
       view: "dependency_topology",
     });
 
@@ -215,6 +233,7 @@ describe("repository investigation location", () => {
         repository,
         snapshotSha,
         modulePath,
+        moduleId: null,
         view: "dependency_topology",
       });
 

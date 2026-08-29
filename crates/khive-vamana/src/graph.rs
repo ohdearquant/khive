@@ -1834,7 +1834,7 @@ mod tests {
             .with_search_list_size(1);
         let codec = GsSq8Codec::train_flat(&vectors, dim);
         let mut encoded = codec.encode_flat_par(&vectors, dim);
-        encoded.truncate(0); // malformed: expected 2 encoded rows, actual 0
+        encoded.clear(); // malformed: expected 2 encoded rows, actual 0
 
         let result = std::panic::catch_unwind(|| {
             VamanaGraph::build_sq8(&vectors, CodesView::Owned(&encoded), &codec, &cfg)

@@ -29,6 +29,10 @@ use serial_test::serial;
 
 struct FakeStore {
     fail_next: AtomicUsize,
+    /// Armed N times: the next N `append_events_idempotent` calls fail with
+    /// `StorageError::Pool` — the shape the ADR-170 forwarding lane reports
+    /// for an unreachable events daemon.
+    fail_pool_next: AtomicUsize,
     calls: AtomicU64,
     rows: Mutex<Vec<Event>>,
     /// Armed once: the next `append_events_idempotent` call commits its rows
@@ -42,6 +46,7 @@ impl FakeStore {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             fail_next: AtomicUsize::new(0),
+            fail_pool_next: AtomicUsize::new(0),
             calls: AtomicU64::new(0),
             rows: Mutex::new(Vec::new()),
             ambiguous_ack_once: std::sync::atomic::AtomicBool::new(false),
@@ -98,6 +103,13 @@ impl EventStore for FakeStore {
         if self.fail_next.load(Ordering::SeqCst) > 0 {
             self.fail_next.fetch_sub(1, Ordering::SeqCst);
             return Err(StorageError::WriterTaskBusy { timeout_ms: 1 });
+        }
+        if self.fail_pool_next.load(Ordering::SeqCst) > 0 {
+            self.fail_pool_next.fetch_sub(1, Ordering::SeqCst);
+            return Err(StorageError::Pool {
+                operation: "append_events_idempotent".into(),
+                message: "events daemon unreachable (simulated transient outage)".into(),
+            });
         }
         let ambiguous = self
             .ambiguous_ack_once
@@ -301,6 +313,29 @@ async fn d1_retry_table_uses_typed_request_state() {
         store.calls.load(Ordering::SeqCst),
         2,
         "one failure then one successful retry"
+    );
+}
+
+/// A transient forwarding failure (`StorageError::Pool`, the shape the
+/// ADR-170 events-daemon lane reports while the daemon restarts) must use the
+/// configured bounded retries, not abandon the generation on first failure.
+#[serial]
+#[tokio::test]
+async fn d1_transient_forwarding_failure_is_retried_not_terminal() {
+    let store = FakeStore::new();
+    store.fail_pool_next.store(1, Ordering::SeqCst);
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let outcome = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(outcome, Ok(AuditCommitOutcome::Committed));
+    assert_eq!(
+        store.calls.load(Ordering::SeqCst),
+        2,
+        "one transient Pool failure then one successful retry"
     );
 }
 
@@ -624,4 +659,140 @@ async fn d1c_ambiguous_ack_retry_persists_exactly_one_accounting_row() {
         2,
         "one ambiguous attempt, then one retry that observes the row already committed"
     );
+}
+
+/// khive#2117/khive#2208: `QueueAdmissionExhausted` must mean only the
+/// pre-enqueue refusal — `state.pending.len() >= max_pending_rows` — never
+/// the deadline-elapsed case covered by the next test. A row refused here
+/// was never pushed onto `state.pending` and never incremented
+/// `submitted_rows`, so retrying it applies the obligation at most once.
+///
+/// The armed sleep fault holds the supervisor inside its first (and only)
+/// generation for the test's duration, so nothing ever drains
+/// `state.pending` after the one-row capacity fills — the refusal below is
+/// deterministic, not a timing race against the driver.
+#[serial]
+#[tokio::test]
+async fn queue_admission_exhausted_row_is_never_enqueued() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(
+        store.clone(),
+        AuditBatchConfig {
+            max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
+            ..AuditBatchConfig::default()
+        },
+    );
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let occupant_batch = batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.occupant"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    // Let the supervisor drain the occupant row into the armed sleep,
+    // freeing `state.pending` back to 0 before the fill row claims the
+    // configured one-row capacity.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let filler_batch = batch.clone();
+    let filler = tokio::spawn(async move {
+        filler_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.filler"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let before = batch.test_snapshot();
+    let refused = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.refused"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(refused, Err(AuditTerminalReason::QueueAdmissionExhausted));
+    let after = batch.test_snapshot();
+    assert_eq!(
+        after.submitted_rows, before.submitted_rows,
+        "a queue-full refusal must never increment submitted_rows — the row was never enqueued"
+    );
+    assert_eq!(
+        after.pending_rows, before.pending_rows,
+        "a queue-full refusal must not grow state.pending"
+    );
+
+    // Safe to retry: refused again, deterministically, with no side effect
+    // from the first refusal.
+    let retried = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.refused"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(retried, Err(AuditTerminalReason::QueueAdmissionExhausted));
+
+    drop(occupant);
+    drop(filler);
+}
+
+/// khive#2117/khive#2208: a caller whose `admission_deadline` elapses on a
+/// row that was already enqueued gets a distinct reason from queue-full —
+/// `AdmissionDeadlineExpired` — and the row itself is left in
+/// `state.pending`/`submitted_rows` exactly as if the caller had not timed
+/// out, because the generation driver (once it eventually runs) drains and
+/// commits it independently of this caller's wait. The two prior assertions
+/// against `queue_admission_exhausted_row_is_never_enqueued` above are the
+/// negative space this test fills in: same seam, opposite enqueue outcome.
+#[serial]
+#[tokio::test]
+async fn admission_deadline_expired_row_stays_enqueued() {
+    let store = FakeStore::new();
+    let batch = AuditBatch::new(
+        store.clone(),
+        AuditBatchConfig {
+            admission_deadline: std::time::Duration::from_millis(30),
+            ..AuditBatchConfig::default()
+        },
+    );
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let occupant_batch = batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.occupant"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    // Let the supervisor drain the occupant row into the armed sleep before
+    // this test's row is submitted, so the row below is the one waiting
+    // behind the stuck generation rather than racing to be drained itself.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let before = batch.test_snapshot();
+    let stuck = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.stuck"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(stuck, Err(AuditTerminalReason::AdmissionDeadlineExpired));
+    let after = batch.test_snapshot();
+    assert_eq!(
+        after.submitted_rows,
+        before.submitted_rows + 1,
+        "a deadline-expired row WAS enqueued and counted — unlike a queue-full refusal"
+    );
+    assert_eq!(
+        after.pending_rows,
+        before.pending_rows + 1,
+        "the row remains queued after the caller's own wait times out; the driver, not this \
+         arm, is responsible for eventually draining it"
+    );
+
+    drop(occupant);
 }

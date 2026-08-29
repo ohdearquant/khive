@@ -1,5 +1,6 @@
 export const SHOWCASE_ASSET_PREFIX = "/showcase/";
 export const REPOSITORY_URL_LIMIT = 2_048;
+const SHOWCASE_ANALYSIS_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 
 export type ShowcaseRegistryEntry = Readonly<{
   id: string;
@@ -19,7 +20,6 @@ export const SHOWCASE_REGISTRY: readonly ShowcaseRegistryEntry[] = [
     id: "github.com/ohdearquant/khive",
     canonicalUrl: "https://github.com/ohdearquant/khive",
     aliases: [
-      "khive",
       "https://github.com/ohdearquant/khive",
       "http://github.com/ohdearquant/khive",
       "https://www.github.com/ohdearquant/khive",
@@ -162,7 +162,9 @@ export function resolveShowcaseRepository(
 ): ShowcaseLookup {
   const candidate = input.trim();
   for (const entry of registry) {
-    if (!entry.aliases.includes(candidate)) continue;
+    const analysisIdMatches = isShowcaseAnalysisId(entry.analysisId) &&
+      entry.analysisId === candidate;
+    if (!analysisIdMatches && !entry.aliases.includes(candidate)) continue;
 
     const canonical = normalizeRepositoryUrl(entry.canonicalUrl);
     if (canonical.ok) {
@@ -198,6 +200,9 @@ export function isAllowedShowcaseAsset(
 export function isAllowedShowcaseAnalysis(
   entry: ShowcaseRegistryEntry,
 ): entry is ShowcaseRegistryEntry & Readonly<{ analysisId: string }> {
-  return typeof entry.analysisId === "string" &&
-    /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(entry.analysisId);
+  return isShowcaseAnalysisId(entry.analysisId);
+}
+
+export function isShowcaseAnalysisId(value: unknown): value is string {
+  return typeof value === "string" && SHOWCASE_ANALYSIS_ID.test(value);
 }
