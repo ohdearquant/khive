@@ -2350,6 +2350,111 @@ async fn search_basic_returns_ranked_results() {
 }
 
 #[tokio::test]
+async fn search_body_lines_distinguishes_filled_atom_from_stub() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "body-lines-filled",
+                    "name": "Body Lines Filled",
+                    "content": "coveragebodysignal filled description covering concepts techniques algorithms implementations applications use cases design patterns retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline",
+                    "finalized": true
+                },
+                {
+                    "slug": "body-lines-stub",
+                    "name": "Body Lines Stub",
+                    "content": "coveragebodysignal stub description covering concepts techniques algorithms implementations applications use cases design patterns retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline",
+                    "finalized": true
+                },
+                {
+                    "slug": "body-lines-newline",
+                    "name": "Body Lines Newline",
+                    "content": "coveragebodysignal newline convention atom covering terminal newline and blank interior line counting for the aggregate body size signal across stored sections in search results",
+                    "finalized": true
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("seed matching atoms");
+
+    f.dispatch(
+        "knowledge.edit",
+        json!({
+            "id": "body-lines-filled",
+            "sections": [
+                {
+                    "section_type": "overview",
+                    "content": "First overview line explains the filled atom with enough detail for section validation.\nSecond overview line adds retrieval, indexing, and ranking details for the body.\nThird overview line completes the substantive atom body used by coverage tooling."
+                },
+                {
+                    "section_type": "examples",
+                    "content": "First example line demonstrates a realistic filled knowledge atom for callers.\nSecond example line provides another concrete body line for the size signal."
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("add filled atom sections");
+
+    f.dispatch(
+        "knowledge.edit",
+        json!({
+            "id": "body-lines-newline",
+            "sections": [
+                {
+                    "section_type": "overview",
+                    "content": "First convention line before a deliberately blank interior line in this section.\n\nThird visible line ends the section with a terminal newline that must not count.\n"
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("add newline-convention atom section");
+
+    let response = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "coveragebodysignal", "rerank": false }),
+        )
+        .await
+        .expect("search matching atoms");
+    let results = response["results"].as_array().expect("results array");
+    let filled = results
+        .iter()
+        .find(|result| result["slug"] == "body-lines-filled")
+        .expect("filled atom result");
+    let stub = results
+        .iter()
+        .find(|result| result["slug"] == "body-lines-stub")
+        .expect("stub atom result");
+
+    assert_eq!(
+        filled["body_lines"].as_u64(),
+        Some(5),
+        "filled atom must expose its aggregate section line count: {filled}"
+    );
+    assert_eq!(
+        stub["body_lines"].as_u64(),
+        Some(0),
+        "sectionless atom must expose a zero body line count: {stub}"
+    );
+
+    let newline = results
+        .iter()
+        .find(|result| result["slug"] == "body-lines-newline")
+        .expect("newline-convention atom result");
+    assert_eq!(
+        newline["body_lines"].as_u64(),
+        Some(3),
+        "str::lines() convention: a terminal newline adds no line and a blank \
+         interior line counts (line, blank, line = 3): {newline}"
+    );
+}
+
+#[tokio::test]
 async fn search_exact_name_bonus_surfaces_exact_match_first() {
     let f = pack(rt());
     seed_search_corpus(&f).await;
