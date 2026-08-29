@@ -479,6 +479,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "string",
                 required: false,
                 description: "Registered entity type to set (entities only). The value is validated against the entity kind's closed vocabulary and reindexed.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -656,6 +657,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "string",
                 required: false,
                 description: "Filter by exact retrieval source: text | vector | both. Applied before the caller limit inside a bounded candidate window; both means the final hit received both text and vector contributions.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "min_score",
