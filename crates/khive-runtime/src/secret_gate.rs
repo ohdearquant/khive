@@ -196,6 +196,18 @@ fn scan_json_value(value: &serde_json::Value) -> RuntimeResult<()> {
 /// Marker substituted for a detected secret span by [`mask_secrets`].
 const REDACTION_MARKER: &str = "***MASKED***";
 
+/// Maximum cumulative suffix bytes submitted to the per-pass detector sweeps while masking
+/// one input. Entropy tokens are materialized once per masking call, so this budget covers
+/// the repeated suffix scans that remain after each confirmed match. It permits two full-size
+/// passes over the 1 MiB ASCII log-input case; the first pass is always allowed for larger or
+/// multibyte callers. Once exhausted, the remainder is redacted wholesale.
+const MAX_MASK_SCAN_WORK_BYTES: usize = MAX_LOG_TEXT_MASK_INPUT_CHARS * 2;
+
+#[cfg(test)]
+thread_local! {
+    static ENTROPY_TOKENIZATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Return the LEFTMOST secret in `text` as `(matched_slice, detector)`.
 ///
 /// The matched slice borrows from `text`, so the caller can recover its byte
@@ -208,7 +220,8 @@ const REDACTION_MARKER: &str = "***MASKED***";
 /// lower-priority detector (e.g. an `sk-ant-` key sitting to the left of a
 /// `ghp_` token). Both detector layers are folded through [`keep_leftmost`].
 fn scan_match(text: &str) -> Option<(&str, &'static str)> {
-    scan_from(text, 0)
+    let tokens = tokenize_entropy_tokens(text);
+    scan_from(text, 0, &tokens)
 }
 
 /// Like [`scan_match`], but only returns secrets whose span starts at or after
@@ -217,8 +230,13 @@ fn scan_match(text: &str) -> Option<(&str, &'static str)> {
 /// entropy token is detected even when its only trigger word sits to the left of
 /// an already-redacted earlier secret. Layer-1 known patterns are context-free,
 /// so scanning the `&text[from..]` suffix is equivalent; offsets recovered via
-/// pointer arithmetic against the original `text` base stay absolute.
-fn scan_from(text: &str, from: usize) -> Option<(&str, &'static str)> {
+/// pointer arithmetic against the original `text` base stay absolute. The
+/// pre-tokenized entropy view is shared by all passes.
+fn scan_from<'a>(
+    text: &'a str,
+    from: usize,
+    tokens: &[(usize, &'a str)],
+) -> Option<(&'a str, &'static str)> {
     let base = text.as_ptr() as usize;
     // Layer 1: known prefix / shape patterns. Context-free → suffix scan; the
     // returned slice still borrows from the same allocation, so its absolute
@@ -227,7 +245,8 @@ fn scan_from(text: &str, from: usize) -> Option<(&str, &'static str)> {
     // Layer 2: entropy heuristic on long tokens near trigger words. Evaluated
     // over the full text (so left-of-`from` trigger words count) but only tokens
     // at offset >= from are returned; kept only if left of the best known match.
-    keep_leftmost(&mut best, check_entropy_heuristic(text, from), base);
+    // The token vector is shared by every masking pass.
+    keep_leftmost(&mut best, check_entropy_heuristic(text, from, tokens), base);
     best
 }
 
@@ -271,17 +290,51 @@ fn scan(text: &str) -> Option<SecretMatch> {
 /// an allocation. Spans are discovered left to right against the ORIGINAL text,
 /// always evaluating trigger context over the full input — a high-entropy value
 /// whose only trigger word sits to the left of an earlier-redacted secret is
-/// still detected. See `docs/api/secret_gate.md#mask_secrets` for the scan-cursor
-/// mechanics.
+/// still detected. Cumulative suffix-scan work is capped; when dense input
+/// exhausts the cap after a match, that match is extended through the remaining
+/// text so unscanned credentials cannot survive. See
+/// `docs/api/secret_gate.md#mask_secrets` for the scan-cursor mechanics.
 pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
+    let (spans, _scan_work_bytes) = collect_mask_spans(text);
+    if spans.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in spans {
+        // Spans are non-overlapping and ascending (each starts at/after the prior
+        // `end`); `max(cursor)` is a defensive guard, never load-bearing.
+        let start = start.max(cursor);
+        out.push_str(&text[cursor..start]);
+        out.push_str(REDACTION_MARKER);
+        cursor = end.max(cursor);
+    }
+    out.push_str(&text[cursor..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Collect absolute byte spans to redact and report cumulative suffix bytes scanned.
+/// Exhausting the work budget extends the last confirmed secret span through the input tail.
+fn collect_mask_spans(text: &str) -> (Vec<(usize, usize)>, usize) {
     let base = text.as_ptr() as usize;
+    let tokens = tokenize_entropy_tokens(text);
     // Collect every secret span (absolute byte offsets into `text`) before
     // writing any output, so trigger-context detection always sees the original
     // string rather than the suffix after the previous redaction.
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut from = 0;
+    let mut scan_work_bytes = 0usize;
     while from < text.len() {
-        match scan_from(text, from) {
+        let suffix_len = text.len() - from;
+        let next_scan_work = scan_work_bytes.saturating_add(suffix_len);
+        if scan_work_bytes > 0 && next_scan_work > MAX_MASK_SCAN_WORK_BYTES {
+            // Every previous sweep ended at a confirmed match; extending that
+            // redaction through the remaining tail is fail-closed.
+            spans.last_mut().expect("a prior scan found a span").1 = text.len();
+            break;
+        }
+        scan_work_bytes = next_scan_work;
+        match scan_from(text, from, &tokens) {
             Some((sub, _detector)) => {
                 let start = sub.as_ptr() as usize - base;
                 // The prefix detectors return whitespace-delimited tokens, so a
@@ -303,21 +356,7 @@ pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
             None => break,
         }
     }
-    if spans.is_empty() {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for (start, end) in spans {
-        // Spans are non-overlapping and ascending (each starts at/after the prior
-        // `end`); `max(cursor)` is a defensive guard, never load-bearing.
-        let start = start.max(cursor);
-        out.push_str(&text[cursor..start]);
-        out.push_str(REDACTION_MARKER);
-        cursor = end.max(cursor);
-    }
-    out.push_str(&text[cursor..]);
-    std::borrow::Cow::Owned(out)
+    (spans, scan_work_bytes)
 }
 
 /// Maximum characters of raw error text admitted to the masking pass.
@@ -836,25 +875,41 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
     i
 }
 
-/// `from` restricts which tokens may be RETURNED (only those starting at or
-/// after `from`), but the trigger-context window is still computed over the full
-/// `text`. This lets [`mask_secrets`] advance past an earlier redaction without
-/// losing a trigger word that sat to the left of it.
-fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static str)> {
+/// Tokenize the full input once for the entropy detector. The returned offsets
+/// are absolute offsets into `text` and remain valid for every scan cursor.
+fn tokenize_entropy_tokens(text: &str) -> Vec<(usize, &str)> {
+    #[cfg(test)]
+    ENTROPY_TOKENIZATION_COUNT.with(|count| count.set(count.get() + 1));
+
     // Tokenize into maximal ASCII non-whitespace runs; non-ASCII chars are also
     // delimiters (see docs/api/secret_gate.md#module-level-detection-algorithm,
     // "non-ASCII token delimiting"). Identical to `split_ascii_whitespace` on
     // pure-ASCII input.
-    let tokens: Vec<(usize, &str)> = text
-        .split(|c: char| c.is_ascii_whitespace() || !c.is_ascii())
+    text.split(|c: char| c.is_ascii_whitespace() || !c.is_ascii())
         .filter(|t| !t.is_empty())
         .map(|t| {
             let offset = t.as_ptr() as usize - text.as_ptr() as usize;
             (offset, t)
         })
-        .collect();
+        .collect()
+}
 
-    for (idx, &(tok_offset, raw_token)) in tokens.iter().enumerate() {
+/// `from` restricts which tokens may be RETURNED (only those starting at or
+/// after `from`), but the trigger-context window is still computed over the full
+/// `text`. This lets [`mask_secrets`] advance past an earlier redaction without
+/// losing a trigger word that sat to the left of it.
+fn check_entropy_heuristic<'a>(
+    text: &'a str,
+    from: usize,
+    tokens: &[(usize, &'a str)],
+) -> Option<(&'a str, &'static str)> {
+    let first_token = tokens.partition_point(|&(_, raw_token)| {
+        let token = strip_delimiters(raw_token);
+        let token_offset = token.as_ptr() as usize - text.as_ptr() as usize;
+        token_offset < from
+    });
+
+    for (idx, &(tok_offset, raw_token)) in tokens.iter().enumerate().skip(first_token) {
         // Strip common delimiters that wrap the actual value.
         let token = strip_delimiters(raw_token);
         // Only RETURN tokens at or after `from` (already-redacted spans lie
@@ -976,7 +1031,7 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             // docs/api/secret_gate.md#check_entropy_heuristic--per-token-flagging-sequence
             // for the exact guarantee and its accepted residual (same-uid-host) limits.
             if !vcs_reference_exempt && tokens.len() > 1 {
-                let fragments = bridge_fragment_chain(&tokens, text, idx);
+                let fragments = bridge_fragment_chain(tokens, text, idx);
                 if fragments.len() > 1 {
                     let hex_probe = fragments.join(" ");
                     if contains_normalized_hex_credential(&hex_probe) {
@@ -4287,6 +4342,57 @@ mod tests {
         );
         assert!(masked.starts_with("first "), "prose preserved: {masked}");
         assert!(masked.ends_with(" end"), "prose preserved: {masked}");
+    }
+
+    #[test]
+    fn mask_secrets_public_api_redacts_unscanned_dense_tail() {
+        let token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let segment = format!("{token} keep ");
+        // Keep this fixture independent of implementation-only constants: the
+        // pre-bound implementation must compile with the test present.
+        let line = segment.repeat(512);
+        assert!(
+            line.len() >= 20_000,
+            "fixture must exceed the cumulative scan-work threshold"
+        );
+
+        let masked = mask_secrets(&line);
+        assert!(
+            !masked.contains(token),
+            "no credential may survive fail-closed tail redaction"
+        );
+        assert!(
+            masked.matches("***MASKED***").count() < line.matches(token).count(),
+            "the public masker must redact the unscanned tail wholesale"
+        );
+        assert!(
+            masked.ends_with("***MASKED***"),
+            "the fail-closed tail redaction must reach the end of the public result"
+        );
+    }
+
+    // White-box complement only: the public test above is the independent
+    // guard for the fail-closed work bound.
+    #[test]
+    fn mask_secrets_tokenizes_concentrated_tail_once() {
+        let token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let prefix = "clean ".repeat(1_000_000 / "clean ".len());
+        let tail: String = (0..200).map(|_| format!("{token} ")).collect();
+        let line = format!("{prefix}{tail}");
+        assert_eq!(line.matches(token).count(), 200);
+
+        ENTROPY_TOKENIZATION_COUNT.with(|count| count.set(0));
+        let masked = mask_secrets(&line);
+        let tokenization_count = ENTROPY_TOKENIZATION_COUNT.with(|count| count.get());
+
+        assert!(
+            !masked.contains(token),
+            "the public masker must redact every concentrated-tail credential"
+        );
+        assert_eq!(
+            tokenization_count, 1,
+            "the full input token vector must be built once, not once per tail credential"
+        );
     }
 
     #[test]
