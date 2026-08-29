@@ -290,6 +290,97 @@ partial-override mode.
 
 ---
 
+## Stdio bridge session lifetime
+
+Four environment variables bound how long a stdio bridge session and its
+individual writes may live, or how many requests it can admit at once. They
+are read once at serve time.
+
+| Variable                                | Default      | Effect                                                                                                                                                                                                |
+| --------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`        | **disabled** | When set to a positive number, a session that receives no request for this many seconds closes, releasing its reader-pool admission and DB connection. `0`, absent, or unparsable leaves it disabled. |
+| `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`   | `300`        | The longest a single response write may stay pending before it is abandoned and the session closes. `0` is rejected at startup rather than treated as an opt-out.                                     |
+| `KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS`  | `3600`       | How long an admitted request whose response has not been written keeps deferring the idle close. Only reached when the idle timeout is enabled. `0` restores an unbounded defer.                      |
+| `KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS` | `1024`       | Maximum requests admitted to rmcp while their responses remain outstanding. A full session closes before another handler is spawned. `0` or an unparsable value uses the default.                     |
+
+**Idle reaping is off by default, and that is deliberate.**
+[ADR-091](adr/ADR-091-wal-snapshot-lifetime.md) rejects closing long-lived
+reader sessions by age, on the ground that they are live clients and that
+bounding what they hold underneath them is the better fix. This transport has
+no signal separating an abandoned pipe from a live client that has simply not
+been asked anything, so enabling the idle timeout by default would reverse that
+decision. Turn it on where session churn is cheap and a pinned WAL connection
+is not: a supervised deployment, a CI harness, a batch runner.
+
+The outstanding-request limit applies per stdio session and is independent of
+the idle and response deadlines. The default of 1024 allows ordinary
+concurrent MCP traffic while ensuring that a peer that stops reading cannot
+make the session's handler and request-obligation state grow without bound.
+Raise or lower it with `KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS` when the
+deployment's concurrency and memory budget require a different bound.
+
+**A session also closes on a duplicate outstanding request id.** MCP requires a
+request id to be unused within a session, and this transport tracks outstanding
+requests by id in order to decide whether a quiet session still has work
+running. Two live requests sharing an id make that undecidable: a completing
+response could discharge either, and picking wrong either keeps a finished
+session alive indefinitely or closes a live one. The second such request is
+therefore refused and the session closes, with the id logged at `WARN`. A
+conforming client never reaches this.
+
+An id counts as outstanding for this purpose while its entry is still tracked,
+including after it has passed the obligation TTL. Ageing past that TTL means the
+request no longer defers the idle close; it does not mean the request finished,
+and the handler may well still be running. Reuse is refused in that state too.
+
+**A session also closes when an outbound message cannot be written at all.** A
+write that fails is the same fact as one that outlives its deadline: the peer is
+not receiving what the session tried to send it. It is worth stating separately
+because the deadline does not cover it. The deadline bounds a write left
+_pending_, which is what a peer that stops reading with its pipe still open
+produces; a peer that closes the side it reads from fails the write immediately
+instead, well inside any deadline.
+
+This applies to responses, server-initiated requests and notifications alike.
+The underlying library does not close the session for any of them: a failed send
+is reported to whoever was awaiting that particular message, and its serve loop
+exits only on receive EOF, cancellation, or a task join error. A session left
+running against a writer that cannot write is one that will never answer
+anything, so the transport ends it here. A write that succeeds changes nothing.
+
+One narrow class of write error is excepted: an error saying the operation was
+interrupted and may simply be repeated, on a message that is not a response. The
+writer behind such an error is still usable, so ending the session would trade
+one lost message for a session that could have gone on serving. The message is
+still lost, and for these classes the error still reaches whoever was awaiting
+it. Only the session survives.
+
+A response gets no such exception, however healthy the writer is. When a
+response cannot be written, the failure is recorded on the server side and
+nothing is sent to the client, which is left waiting on an answer that will not
+arrive and has no way to tell that from a slow one. Ending the session is what
+turns that into an end-of-input the client can act on, so an interrupted
+response closes the session exactly as any other failed response does.
+
+**Known gap.** The response-delivery deadline covers responses this transport
+writes. It does not cover parse-error responses, which the underlying line
+transport writes directly through its own framed writer without passing through
+the deadline. A peer that sends malformed input and then stops reading can leave
+that one write pending.
+
+What bounds that pending write depends on what else the session has
+outstanding, and the idle window alone is not the answer:
+
+- Idle timeout disabled: nothing bounds it.
+- Idle timeout enabled, nothing else outstanding: the idle window bounds it.
+- Idle timeout enabled with a request still awaiting its response: the idle
+  close defers while that obligation is fresh, so the bound is the request
+  obligation TTL rather than the idle window. A peer can reach this deliberately
+  by admitting a request and then sending malformed input.
+
+Closing the gap requires replacing or adapting the line transport and is tracked
+separately.
+
 ## Troubleshooting a connect failure
 
 **Symptom:** an MCP client (Claude Code, Claude Desktop, Codex, Gemini) reports

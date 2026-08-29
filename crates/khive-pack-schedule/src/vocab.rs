@@ -1,6 +1,6 @@
 //! Schedule pack vocabulary — handler definitions, param schemas, and auxiliary SQL.
 
-use khive_types::{HandlerDef, ParamDef, Visibility};
+use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
 /// Pack-auxiliary indexes for agenda scans and creator-provenance lookup.
 ///
@@ -33,18 +33,21 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                 param_type: "string",
                 required: true,
                 description: "Reminder message. Must not be empty.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "at",
                 param_type: "string",
                 required: true,
                 description: "Trigger time in RFC 3339 format (e.g. \"2026-06-01T09:00:00Z\"). Must not be empty.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "repeat",
                 param_type: "string",
                 required: false,
                 description: "Recurrence: \"daily\" | \"weekly\" | \"monthly\". Cron expressions are rejected because the executor cannot advance them safely.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -79,6 +82,7 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                                its own `at`, separate from and independent of this verb's `at` \
                                below; see the handler description for the full worked \
                                example). Must not be empty.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "at",
@@ -88,12 +92,14 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                                when THIS schedule fires and `action` gets dispatched. This is \
                                independent of any `at` the nested `action` verb itself \
                                requires (see the handler description). Must not be empty.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "repeat",
                 param_type: "string",
                 required: false,
                 description: "Recurrence: \"daily\" | \"weekly\" | \"monthly\". Cron expressions are rejected because the executor cannot advance them safely.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -108,18 +114,21 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                 param_type: "string",
                 required: false,
                 description: "Start of time window in RFC 3339 format. Omit to start from earliest pending event.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "to",
                 param_type: "string",
                 required: false,
                 description: "End of time window in RFC 3339 format. Omit to include all future events.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "limit",
                 param_type: "integer",
                 required: false,
                 description: "Max events to return. Default 20, max 200.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -134,6 +143,7 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
             required: true,
             description: "Complete UUID or unique 8+ hex prefix of the scheduled event to cancel. \
                           Prefix resolution searches the caller's primary namespace.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
 ];

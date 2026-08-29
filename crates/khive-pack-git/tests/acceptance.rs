@@ -3712,7 +3712,18 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     // Mirrors `ingest.rs`'s private `PAGE_LIMIT` -- `gh {pr,issue} list
     // --search` never returns more than this many results per page.
     const PAGE_LIMIT: usize = 1000;
-    const CREDENTIAL: &str = "sk-ant-api03-FAKE1234567890FAKE1234567890FAKE1234567890FAKE";
+    const CREDENTIAL: &str = concat!(
+        "sk-ant-api03-",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "AA"
+    );
 
     let mut issues: Vec<Value> = (1..PAGE_LIMIT)
         .map(|i| {
@@ -3847,7 +3858,18 @@ async fn pr_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     std::fs::create_dir_all(&log_dir).expect("mk log dir");
 
     const PAGE_LIMIT: usize = 1000;
-    const CREDENTIAL: &str = "sk-ant-api03-FAKE0987654321FAKE0987654321FAKE0987654321FAKE";
+    const CREDENTIAL: &str = concat!(
+        "sk-ant-api03-",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "AA"
+    );
 
     let mut prs: Vec<Value> = (1..PAGE_LIMIT)
         .map(|i| {
@@ -5354,6 +5376,18 @@ async fn digest_verb_sources_stopped_early_on_budget_exhaustion() {
         .expect("digest ok");
 
     assert_eq!(resp["commits_ingested"].as_u64().unwrap(), 1);
+    assert_eq!(resp["max_items_requested"], 1);
+    assert_eq!(resp["max_items_effective"], 1);
+    assert!(
+        resp["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| !warning
+                .as_str()
+                .is_some_and(|text| text.contains("max_items"))),
+        "an in-range budget must not produce a clamp warning: {resp:?}"
+    );
     assert!(
         !resp["done"].as_bool().unwrap(),
         "budget exhausted with commits unwalked: {resp:?}"
@@ -6765,6 +6799,17 @@ async fn digest_verb_max_items_negative_and_zero_clamp_to_one() {
             1,
             "max_items={requested} must clamp to the lower bound (1 item this call): {resp:?}"
         );
+        assert_eq!(resp["max_items_requested"], requested);
+        assert_eq!(resp["max_items_effective"], 1);
+        let expected_warning = format!("max_items request {requested} was clamped to 1");
+        assert!(
+            resp["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str() == Some(expected_warning.as_str())),
+            "the report must disclose the lower-bound clamp: {resp:?}"
+        );
         assert!(
             !resp["done"].as_bool().unwrap(),
             "2 commits remain after a 1-item pass: {resp:?}"
@@ -6790,6 +6835,16 @@ async fn digest_verb_max_items_above_cap_clamps_to_two_thousand() {
         .await
         .expect("digest ok");
     assert_eq!(resp["commits_ingested"].as_u64().unwrap(), 1);
+    assert_eq!(resp["max_items_requested"], 2001);
+    assert_eq!(resp["max_items_effective"], 2000);
+    assert!(
+        resp["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str() == Some("max_items request 2001 was clamped to 2000")),
+        "the report must disclose the clamp: {resp:?}"
+    );
     assert!(
         resp["done"].as_bool().unwrap(),
         "a single-commit repo finishes in one call however large max_items clamps to: {resp:?}"

@@ -23,8 +23,8 @@ use super::scoring::{
 };
 use super::util::{
     atom_embed_text, atom_from_row, compose_item_char_cost, deser, domain_from_row,
-    estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_str, sql_err,
-    status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
+    estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_i64, row_str,
+    sql_err, status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
     D_SUGGEST_RERANK_ALPHA, MIN_TERM_LEN,
 };
 use super::vamana;
@@ -1145,6 +1145,20 @@ fn attach_lexical_timeout_degradation(out: &mut Value) {
     out["degraded"]["lexical_timeout"] = json!(true);
 }
 
+/// Flag that the best-effort body-line aggregate hit the request read
+/// deadline after the search itself completed. The ranked hits are kept and
+/// their atom rows report `body_lines: null`; the timeout degrades metadata,
+/// it never fails the verb outright.
+fn attach_body_lines_timeout_degradation(out: &mut Value) {
+    if !out
+        .get("degraded")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        out["degraded"] = json!({});
+    }
+    out["degraded"]["body_lines_timeout"] = json!(true);
+}
+
 struct EligibleAnnSearchState {
     hits: Vec<ScoredHit>,
     availability: AnnAvailability,
@@ -1433,6 +1447,78 @@ async fn load_domain_member_token_sizes(
     }
 
     Ok(sizes)
+}
+
+/// Body-line metadata is best-effort: a request read-deadline timeout on
+/// either the reader checkout or the aggregate query returns `Ok(None)` —
+/// the already-ranked hits report `body_lines: null` with a degradation
+/// flag instead of the whole search failing. Non-timeout storage errors
+/// still propagate.
+///
+/// The line count follows `str::lines()` semantics: a terminal newline does
+/// not add a line, blank interior lines count, and empty content is 0.
+async fn load_atom_body_line_counts(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    atom_ids: &[String],
+) -> Result<Option<HashMap<String, usize>>, RuntimeError> {
+    let mut counts: HashMap<String, usize> = atom_ids.iter().map(|id| (id.clone(), 0)).collect();
+    if atom_ids.is_empty() {
+        return Ok(Some(counts));
+    }
+
+    let placeholders = atom_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(atom_ids.iter().cloned().map(SqlValue::Text));
+
+    let sql = runtime.sql();
+    let mut reader = match sql.reader().await {
+        Ok(reader) => reader,
+        Err(e) if is_timeout(&e) => return Ok(None),
+        Err(e) => return Err(sql_err("search body line count reader", e)),
+    };
+    let rows = match reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT atom_id, \
+                        SUM(CASE WHEN content = '' THEN 0 \
+                                 ELSE length(content) \
+                                      - length(replace(content, char(10), '')) \
+                                      + (CASE WHEN substr(content, -1) = char(10) \
+                                              THEN 0 ELSE 1 END) \
+                            END) AS body_lines \
+                 FROM knowledge_sections \
+                 WHERE namespace = ?1 AND atom_id IN ({placeholders}) \
+                 GROUP BY atom_id"
+            ),
+            params,
+            label: None,
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) if is_timeout(&e) => return Ok(None),
+        Err(e) => return Err(sql_err("search body line count query", e)),
+    };
+
+    for row in rows {
+        let Some(atom_id) = row_str(&row, "atom_id") else {
+            continue;
+        };
+        let Some(body_lines) = row_i64(&row, "body_lines") else {
+            continue;
+        };
+        if let Ok(body_lines) = usize::try_from(body_lines) {
+            counts.insert(atom_id, body_lines);
+        }
+    }
+
+    Ok(Some(counts))
 }
 
 async fn rerank_text_items(
@@ -1919,14 +2005,40 @@ impl KnowledgeHandlers {
         enforce_min_score_floor(&mut hits, min_score);
         hits.truncate(limit);
 
+        let atom_ids: Vec<String> = hits
+            .iter()
+            .filter(|hit| !hit.is_domain)
+            .map(|hit| hit.id.clone())
+            .collect();
+        let mut body_lines_timed_out = false;
+        let body_line_counts = if lexical_timed_out {
+            None
+        } else {
+            match load_atom_body_line_counts(runtime, &ns, &atom_ids).await? {
+                Some(counts) => Some(counts),
+                None => {
+                    body_lines_timed_out = true;
+                    None
+                }
+            }
+        };
+
         let results: Vec<Value> = hits
             .iter()
             .map(|h| {
+                let body_lines = if h.is_domain {
+                    None
+                } else {
+                    body_line_counts
+                        .as_ref()
+                        .and_then(|counts| counts.get(&h.id).copied())
+                };
                 json!({
                     "id": h.id,
                     "slug": h.slug,
                     "name": h.name,
                     "content": h.content,
+                    "body_lines": body_lines,
                     "tags": h.tags,
                     "status": h.status,
                     "finalized": h.finalized,
@@ -1944,11 +2056,14 @@ impl KnowledgeHandlers {
         if lexical_timed_out {
             attach_lexical_timeout_degradation(&mut out);
         }
+        if body_lines_timed_out {
+            attach_body_lines_timeout_degradation(&mut out);
+        }
         attach_hydration_degradation(&mut out, hydration_failures);
-        // A lexical-stage timeout already committed this call to a degraded
-        // response (never a verb-level error, issue #1930) — re-checking the
-        // same expired deadline here would discard it.
-        if !lexical_timed_out {
+        // A lexical-stage or body-line-stage timeout already committed this
+        // call to a degraded response (never a verb-level error, issue #1930)
+        // — re-checking the same expired deadline here would discard it.
+        if !lexical_timed_out && !body_lines_timed_out {
             khive_storage::ensure_request_read_active("knowledge.search")?;
         }
         Ok(out)
@@ -3311,5 +3426,35 @@ mod tests {
         for (a, b) in after.iter().zip(before.iter()) {
             assert_eq!(a.score, b.score);
         }
+    }
+
+    /// Body-line metadata is best-effort: a read-deadline timeout during the
+    /// aggregate lookup degrades to `Ok(None)` (rendered as `body_lines:
+    /// null` plus a degradation flag by the handler) instead of failing an
+    /// already-ranked search with an `Internal` error.
+    #[tokio::test]
+    async fn body_line_counts_degrade_to_none_under_expired_read_deadline() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let atom_ids = vec!["10000000-0000-0000-0000-000000000001".to_owned()];
+
+        let degraded = khive_storage::scope_request_read_deadline(
+            std::time::Duration::ZERO,
+            load_atom_body_line_counts(&runtime, "local", &atom_ids),
+        )
+        .await;
+        assert!(
+            matches!(degraded, Ok(None)),
+            "an expired read deadline must degrade body-line metadata to \
+             None, never error the search; got {degraded:?}"
+        );
+
+        let healthy = load_atom_body_line_counts(&runtime, "local", &atom_ids)
+            .await
+            .expect("undeadlined lookup must succeed");
+        assert_eq!(
+            healthy.and_then(|counts| counts.get(&atom_ids[0]).copied()),
+            Some(0),
+            "control: without a deadline the lookup returns real counts"
+        );
     }
 }
