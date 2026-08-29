@@ -387,7 +387,7 @@ pub enum FilterOp {
     /// Matches rows where the JSON field is absent or explicitly JSON `null`,
     /// while constraining its index key to the empty recipient key. This is
     /// the index-friendly legacy-recipient partition used with
-    /// [`EqOrMissingIndexed`].
+    /// [`FilterOp::EqOrMissingIndexed`].
     JsonTypeMissingOrNullIndexed,
     /// Matches rows where a JSON text field equals the value, while treating
     /// every missing or non-text value as that same value. The SQL adapter
@@ -631,7 +631,7 @@ pub trait NoteStore: Send + Sync + 'static {
     ) -> StorageResult<Page<Note>>;
     /// Count several filtered note populations in one consistent backend
     /// snapshot. Backends that cannot provide that guarantee must return
-    /// [`StorageError::Unsupported`] rather than composing independent
+    /// [`crate::StorageError::Unsupported`] rather than composing independent
     /// queries or treating an absent page total as zero. SQL backends should
     /// override this operation so callers can retain separate index-friendly
     /// predicates without racing between their counts.
