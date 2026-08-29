@@ -2294,11 +2294,11 @@ fn transactional_write_refreshes_writer_task_after_construction_outside_runtime(
 
 /// The comm unread probe (badge count + inbox unread listing) must be served
 /// by `idx_notes_unread_probe_recipient`, so its work scales with the unread set, not
-/// total mailbox size. That only holds because `JsonTypeNeMissing` inlines
-/// its json_type value as a validated literal: the control below proves the
-/// same predicate with a bound parameter is NOT served by the index (the
-/// planner cannot prove implication from an unknown parameter), which is the
-/// mailbox-proportional regression this test pins against.
+/// total mailbox size. The assertions below are the actual discriminator: the
+/// generated WHERE SQL contains the literal form and `JsonTypeNeMissing` contributes
+/// no bind parameter. The plan before and after dropping the index is only an
+/// index-presence control. This does not cover portability to SQLite builds where a
+/// bound predicate blocks partial-index implication.
 #[tokio::test]
 async fn unread_probe_query_uses_partial_index() {
     use khive_storage::note::PropertyFilter as NotePropFilter;
@@ -2369,10 +2369,16 @@ async fn unread_probe_query_uses_partial_index() {
         where_sql.contains("json_type(properties, '$.read') != 'true'"),
         "JsonTypeNeMissing must inline the validated json_type literal, got:\n{where_sql}"
     );
+    let mut filter_without_json_type = filter.clone();
+    filter_without_json_type
+        .property_filters
+        .retain(|property| !matches!(property.op, FilterOp::JsonTypeNeMissing));
+    let (_, params_without_json_type) =
+        build_note_filter_where("default", &filter_without_json_type).unwrap();
     assert_eq!(
         params.len(),
-        4,
-        "JsonTypeNeMissing must not add a bind parameter; expected namespace, kind, direction, and recipient binds"
+        params_without_json_type.len(),
+        "JsonTypeNeMissing must not add a bind parameter"
     );
 
     let reader = pool.reader().unwrap();
