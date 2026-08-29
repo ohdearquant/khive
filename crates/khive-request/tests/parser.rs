@@ -666,6 +666,21 @@ fn unclosed_call_reports_its_opening_byte_after_long_input() {
 }
 
 #[test]
+fn unclosed_call_reports_the_delimiter_not_preceding_whitespace() {
+    // Whitespace is permitted between the verb and its opening delimiter. The reported
+    // offset must be the delimiter's own byte, not the first byte skipped to reach it.
+    let src = "comm.send  \n (to=\"x\", content=\"ok\"";
+    let opening = src.find('(').expect("call opening delimiter");
+    assert!(opening > src.find("send").expect("verb") + "send".len());
+
+    let message = parse_request(src).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        format!("unclosed call starting at byte {opening}; expected ')'"),
+    );
+}
+
+#[test]
 fn unterminated_string_rejected() {
     let err = parse_request(r#"gtd.assign(title="oops)"#).unwrap_err();
     assert!(matches!(err, DslError::UnclosedString { .. }));

@@ -114,6 +114,10 @@ impl<'a> Parser<'a> {
                 return Err(DslError::UnsupportedVerbNesting { pos: self.pos });
             }
         }
+        // Record the opening delimiter itself, not the whitespace that may precede it:
+        // `expect_char` skips whitespace before matching, so capturing `pos` first would
+        // report a byte offset ahead of the construct the error names.
+        self.skip_ws();
         let call_start = self.pos;
         self.expect_char('(')?;
         self.skip_ws();
