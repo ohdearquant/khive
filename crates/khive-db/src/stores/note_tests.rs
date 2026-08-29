@@ -2360,6 +2360,21 @@ async fn unread_probe_query_uses_partial_index() {
     let (where_sql, params) = build_note_filter_where("default", &filter).unwrap();
     let sql =
         format!("SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT 1001");
+
+    // The partial-index implication depends on this operand being an SQL
+    // literal, not a bound value. Assert the generated statement and its
+    // bind list directly; a plan assertion alone can pass on SQLite builds
+    // that replan after binding.
+    assert!(
+        where_sql.contains("json_type(properties, '$.read') != 'true'"),
+        "JsonTypeNeMissing must inline the validated json_type literal, got:\n{where_sql}"
+    );
+    assert_eq!(
+        params.len(),
+        4,
+        "JsonTypeNeMissing must not add a bind parameter; expected namespace, kind, direction, and recipient binds"
+    );
+
     let reader = pool.reader().unwrap();
     let plan = |sql: &str, params: &[Box<dyn rusqlite::types::ToSql>]| -> String {
         let mut stmt = reader

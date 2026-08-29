@@ -487,32 +487,22 @@ pub trait NoteStore: Send + Sync + 'static {
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
     /// Count several filtered note populations in one consistent backend
-    /// snapshot. SQL backends should override this operation so callers can
-    /// retain separate index-friendly predicates without racing between
-    /// their counts. The compatibility default preserves the trait contract
-    /// for custom stores but does not provide cross-query snapshot isolation.
+    /// snapshot. Backends that cannot provide that guarantee must return
+    /// [`StorageError::Unsupported`] rather than composing independent
+    /// queries or treating an absent page total as zero. SQL backends should
+    /// override this operation so callers can retain separate index-friendly
+    /// predicates without racing between their counts.
     async fn count_notes_filtered_in_snapshot(
         &self,
-        namespace: &str,
-        filters: &[NoteFilter],
+        _namespace: &str,
+        _filters: &[NoteFilter],
     ) -> StorageResult<Vec<u64>> {
-        let mut counts = Vec::with_capacity(filters.len());
-        for filter in filters {
-            counts.push(
-                self.query_notes_filtered(
-                    namespace,
-                    filter,
-                    PageRequest {
-                        limit: 0,
-                        offset: 0,
-                    },
-                )
-                .await?
-                .total
-                .unwrap_or(0),
-            );
-        }
-        Ok(counts)
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "count_notes_filtered_in_snapshot".into(),
+            message: "this backend does not implement snapshot-consistent filtered note counts"
+                .into(),
+        })
     }
     /// Resolve a note id to its immutable insertion sequence.
     async fn note_sequence(&self, _id: Uuid) -> StorageResult<Option<i64>> {
