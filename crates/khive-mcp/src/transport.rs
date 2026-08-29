@@ -40,9 +40,7 @@ struct OutstandingRequest {
 
 impl OutstandingRequests {
     fn admit(&mut self, id: RequestId, admitted_at: Instant, capacity: usize) -> bool {
-        #[cfg(test)]
-        self.record_operation();
-        if self.entries.contains_key(&id) || self.entries.len() >= capacity {
+        if self.contains(&id) || self.entries.len() >= capacity {
             return false;
         }
 
@@ -169,6 +167,7 @@ struct ObligationRetirementGuard {
     in_flight: Arc<Mutex<OutstandingRequests>>,
     id: Option<RequestId>,
     obligation_ttl: Option<std::time::Duration>,
+    root: tokio_util::sync::CancellationToken,
 }
 
 impl ObligationRetirementGuard {
@@ -176,9 +175,19 @@ impl ObligationRetirementGuard {
         let Some(id) = self.id.take() else {
             return;
         };
-        if let Ok(mut outstanding) = self.in_flight.lock() {
-            outstanding.retire(&id);
-            outstanding.drop_stale(self.obligation_ttl);
+        match self.in_flight.lock() {
+            Ok(mut outstanding) => {
+                outstanding.retire(&id);
+                outstanding.drop_stale(self.obligation_ttl);
+            }
+            Err(_) => {
+                tracing::error!(
+                    request_id = ?id,
+                    "stdio bridge outstanding-request tracker is poisoned during retirement; \
+                     cancelling the session rather than losing the obligation"
+                );
+                self.root.cancel();
+            }
         }
     }
 }
@@ -441,6 +450,69 @@ mod outstanding_request_tests {
             large_retirement,
         );
     }
+
+    fn poison_tracker(tracker: &Arc<Mutex<OutstandingRequests>>) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tracker
+                .lock()
+                .expect("tracker mutex must initially be healthy");
+            panic!("deliberately poison the tracker mutex");
+        }));
+        assert!(
+            result.is_err(),
+            "the poisoning fixture must panic while holding the mutex"
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_tracker_fails_closed_on_admission_and_retirement() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport as _;
+        use tokio::io::AsyncWriteExt;
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(4096);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let mut transport = CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            None,
+            None,
+        );
+        let tracker = transport.in_flight_handle();
+        poison_tracker(&tracker);
+
+        client_io
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe","arguments":{}}}
+"#,
+            )
+            .await
+            .expect("write the request used to exercise poisoned admission");
+
+        assert!(
+            transport.receive().await.is_none(),
+            "poisoned admission must return transport EOF instead of handing the request to rmcp"
+        );
+        assert!(
+            root.is_cancelled(),
+            "poisoned admission must cancel the rmcp root token"
+        );
+
+        let retirement_root = tokio_util::sync::CancellationToken::new();
+        let mut retirement = ObligationRetirementGuard {
+            in_flight: tracker,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            obligation_ttl: None,
+            root: retirement_root.clone(),
+        };
+        retirement.retire();
+        assert!(
+            retirement_root.is_cancelled(),
+            "poisoned retirement must cancel the session instead of consuming the id silently"
+        );
+    }
 }
 
 /// Whether a failed outbound write names an operation that may simply be
@@ -559,6 +631,7 @@ where
             in_flight,
             id: Some(id),
             obligation_ttl,
+            root: root.clone(),
         });
         let send = self.inner.send(item);
         async move {
@@ -668,14 +741,26 @@ where
                                 // stale and none of it is evidence of life. See
                                 // the type doc for why a bare count cannot be
                                 // trusted here.
-                                let fresh = in_flight
-                                    .lock()
-                                    .ok()
-                                    .and_then(|q| q.newest_admitted_at())
-                                    .is_some_and(|newest| match obligation_ttl {
-                                        Some(ttl) => newest.elapsed() < ttl,
-                                        None => true,
-                                    });
+                                let (fresh, has_outstanding) = match in_flight.lock() {
+                                    Ok(q) => {
+                                        let fresh = q
+                                            .newest_admitted_at()
+                                            .is_some_and(|newest| match obligation_ttl {
+                                                Some(ttl) => newest.elapsed() < ttl,
+                                                None => true,
+                                            });
+                                        (fresh, !q.is_empty())
+                                    }
+                                    Err(_) => {
+                                        tracing::error!(
+                                            "stdio bridge outstanding-request tracker is \
+                                             poisoned during idle handling; cancelling the \
+                                             session"
+                                        );
+                                        root.cancel();
+                                        return None;
+                                    }
+                                };
                                 if fresh {
                                     tracing::debug!(
                                         idle_timeout_secs = timeout.as_secs(),
@@ -685,7 +770,7 @@ where
                                     );
                                     continue;
                                 }
-                                if in_flight.lock().is_ok_and(|q| !q.is_empty()) {
+                                if has_outstanding {
                                     tracing::warn!(
                                         idle_timeout_secs = timeout.as_secs(),
                                         obligation_ttl_secs =
@@ -740,16 +825,28 @@ where
                 let mut duplicate_id = None;
                 let mut capacity_exceeded = false;
                 if let Some(rmcp::model::JsonRpcMessage::Request(request)) = &message {
-                    if let Ok(mut q) = in_flight.lock() {
-                        if q.contains(&request.id) {
-                            duplicate_id = Some(request.id.clone());
-                        } else {
-                            q.drop_stale(obligation_ttl);
-                            capacity_exceeded = !q.admit(
-                                request.id.clone(),
-                                Instant::now(),
-                                max_outstanding_requests,
+                    match in_flight.lock() {
+                        Ok(mut q) => {
+                            if q.contains(&request.id) {
+                                duplicate_id = Some(request.id.clone());
+                            } else {
+                                q.drop_stale(obligation_ttl);
+                                capacity_exceeded = !q.admit(
+                                    request.id.clone(),
+                                    Instant::now(),
+                                    max_outstanding_requests,
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                request_id = ?request.id,
+                                "stdio bridge outstanding-request tracker is poisoned during \
+                                 admission; cancelling the session rather than admitting \
+                                 untracked work"
                             );
+                            root.cancel();
+                            return None;
                         }
                     }
                 }
