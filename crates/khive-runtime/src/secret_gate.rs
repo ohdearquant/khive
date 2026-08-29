@@ -246,11 +246,7 @@ fn scan_from<'a>(
     // over the full text (so left-of-`from` trigger words count) but only tokens
     // at offset >= from are returned; kept only if left of the best known match.
     // The token vector is shared by every masking pass.
-    keep_leftmost(
-        &mut best,
-        check_entropy_heuristic(text, from, tokens),
-        base,
-    );
+    keep_leftmost(&mut best, check_entropy_heuristic(text, from, tokens), base);
     best
 }
 
