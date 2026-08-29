@@ -1060,9 +1060,9 @@ mod tests {
     #[test]
     fn atom_name_with_fake_openai_key_is_blocked() {
         // A credential accidentally used as an atom name — must be blocked.
-        let name = "sk-proj-FAKEKEY0000000000000000000000000000000000"; // gitleaks:allow
+        let name = format!("sk-proj-{}", "A".repeat(80));
         assert!(
-            check(name).is_err(),
+            check(&name).is_err(),
             "atom name containing fake OpenAI key must be blocked"
         );
     }

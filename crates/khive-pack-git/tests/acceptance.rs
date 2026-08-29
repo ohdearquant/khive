@@ -3712,7 +3712,18 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     // Mirrors `ingest.rs`'s private `PAGE_LIMIT` -- `gh {pr,issue} list
     // --search` never returns more than this many results per page.
     const PAGE_LIMIT: usize = 1000;
-    const CREDENTIAL: &str = "sk-ant-api03-FAKE1234567890FAKE1234567890FAKE1234567890FAKE";
+    const CREDENTIAL: &str = concat!(
+        "sk-ant-api03-",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "AA"
+    );
 
     let mut issues: Vec<Value> = (1..PAGE_LIMIT)
         .map(|i| {
@@ -3847,7 +3858,18 @@ async fn pr_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     std::fs::create_dir_all(&log_dir).expect("mk log dir");
 
     const PAGE_LIMIT: usize = 1000;
-    const CREDENTIAL: &str = "sk-ant-api03-FAKE0987654321FAKE0987654321FAKE0987654321FAKE";
+    const CREDENTIAL: &str = concat!(
+        "sk-ant-api03-",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "AA"
+    );
 
     let mut prs: Vec<Value> = (1..PAGE_LIMIT)
         .map(|i| {

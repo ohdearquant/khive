@@ -32,11 +32,14 @@ through to explicit detection instead of being silently allowed.
   whitespace. The literal-prefix checks (Layer 1) treat any non-ASCII-alphanumeric char (CJK,
   accented text, emoji) as a token boundary, so a known-prefix secret is caught whether the
   adjacent non-ASCII sits before the prefix (`数据AKIA…`) or after it (`AKIA…数据`).
-- Known provider prefixes (Layer 1) require the configured minimum token length and reject one
-  narrow filename shape: after the prefix, a payload ending in `.py`, `.rs`, `.ts`, `.js`, `.sh`,
-  `.md`, `.toml`, or `.json` is treated as a source filename only when its stem contains lowercase
-  ASCII letters, contains at least one filename separator, and otherwise consists solely of
-  lowercase letters plus `_`, `-`, `/`, and `.`. This admits ordinary names such as
+- Known provider prefixes (Layer 1) require the configured minimum token length. Fine-grained
+  GitHub PATs require 93 total characters, OpenAI project keys require 88, and Anthropic keys
+  require 108. A registered `sk-` vendor prefix remains governed by its specific threshold rather
+  than falling through to the generic `sk-` detector. Prefix detectors also reject one narrow
+  filename shape: after the prefix, a payload ending in `.py`, `.rs`, `.ts`, `.js`, `.sh`, `.md`,
+  `.toml`, or `.json` is treated as a source filename only when its stem contains lowercase ASCII
+  letters, contains at least one filename separator, and otherwise consists solely of lowercase
+  letters plus `_`, `-`, `/`, and `.`. This admits ordinary names such as
   `vercel_deployment_monitor.py`. An uppercase letter, digit, or separator-free payload is
   independent value-shape evidence and preserves the prefix match even when the token ends in a
   source extension. Markdown/prose punctuation around the filename is ignored. This check only
