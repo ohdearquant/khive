@@ -55,15 +55,24 @@ entity/note branches' `merge_properties`).
 
 DML shape:
 
-- non-symmetric relation: a single `edge_upsert_statement` call on the patched `Edge` — the same
-  builder `update_edge`'s own non-symmetric branch calls via `graph.upsert_edge(edge.clone())`
-  (`khive-db::stores::graph::SqlGraphStore::upsert_edge`), so parity is exact by construction.
-- symmetric relation (`competes_with`, `composed_with`): `update_edge` does NOT use the upsert
-  builder here, because `upsert_edge` resolves `ON CONFLICT(namespace, id)` first and cannot
-  detect a natural-key collision with a _different_ id. Canonical (`update_edge_symmetric_dml`)
-  runs a conflict probe and branches in Rust inside a single uninterrupted transaction, which is
-  safe there. This atomic path cannot do that (see the in-source invariant note on
-  `prepare_update_edge`).
+- non-symmetric relation: a single guarded `edge_replace_if_unchanged_statement` call on the
+  patched `Edge`, carrying an `AffectedRowGuard::exactly(1)` — the same CAS shape `update_edge`'s
+  own non-symmetric branch runs via `graph.replace_edge_if_unchanged(edge.clone(), expected_updated_at,
+  expected_deleted_at)` (`khive-db::stores::graph::SqlGraphStore::replace_edge_if_unchanged`). Both
+  sides bind the fetched snapshot's `updated_at`/`deleted_at` as the CAS fence and advance
+  `updated_at` to `max(now, snapshot + 1µs)` so the replacement revision strictly increases even
+  inside one clock microsecond; zero affected rows means a concurrent writer moved the edge between
+  read and write, and the caller must roll back rather than silently overwrite it.
+- symmetric relation (`competes_with`, `composed_with`): neither side uses the upsert builder here,
+  because `upsert_edge` resolves `ON CONFLICT(namespace, id)` first and cannot detect a natural-key
+  collision with a _different_ id. Canonical (`update_edge_symmetric_dml`) runs a conflict probe and
+  branches in Rust inside a single uninterrupted transaction, which is safe there. This atomic path
+  cannot do that (see the in-source invariant note on `prepare_update_edge`), so it always emits
+  both `edge_symmetric_delete_if_conflict_statement` and
+  `edge_symmetric_absorb_or_update_inplace_statement`, each carrying its own commit-time predicate
+  bound to the fetched snapshot's `updated_at`/`deleted_at`: a conflicting canonical survivor alone
+  is not sufficient grounds to delete the non-canonical row if that row changed since the snapshot
+  was read.
 
 ## event_append_statements
 
