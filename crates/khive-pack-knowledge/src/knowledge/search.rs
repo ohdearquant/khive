@@ -389,6 +389,31 @@ struct FtsFetchOutcome {
     timed_out: bool,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct FtsTestDeadlineAdvance {
+    after_completed_terms: usize,
+    by: std::time::Duration,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static FTS_TEST_DEADLINE_ADVANCE: FtsTestDeadlineAdvance;
+}
+
+#[cfg(test)]
+async fn advance_fts_test_deadline_after_term(completed_terms: usize) {
+    let advance_by = FTS_TEST_DEADLINE_ADVANCE
+        .try_with(|control| {
+            (completed_terms == control.after_completed_terms).then_some(control.by)
+        })
+        .ok()
+        .flatten();
+    if let Some(advance_by) = advance_by {
+        tokio::time::advance(advance_by).await;
+    }
+}
+
 fn is_timeout(e: &khive_storage::StorageError) -> bool {
     matches!(e, khive_storage::StorageError::Timeout { .. })
 }
@@ -491,6 +516,8 @@ async fn fetch_fts_candidates(
         };
 
         per_term_rows.push(rows.iter().filter_map(atom_from_row).collect());
+        #[cfg(test)]
+        advance_fts_test_deadline_after_term(per_term_rows.len()).await;
     }
 
     let max_term_rows = per_term_rows.iter().map(Vec::len).max().unwrap_or(0);
@@ -2549,7 +2576,18 @@ impl KnowledgeHandlers {
                 // response instead of aborting the whole compose — the
                 // finalized atom/section body above is still a valid,
                 // useful briefing even without the supplementary KG section.
-                match search_kg_entities(runtime, token, &ns, &raw_query, KG_BLEND_CAP, floor).await
+                // KG entities live on the core (main) backend; on a
+                // secondary-assigned pack runtime this search would silently
+                // blend against an empty graph (ADR-073).
+                match search_kg_entities(
+                    &runtime.core(),
+                    token,
+                    &ns,
+                    &raw_query,
+                    KG_BLEND_CAP,
+                    floor,
+                )
+                .await
                 {
                     Ok(kg_hits) => {
                         let remaining_budget = char_budget.saturating_sub(body_used);
@@ -2730,94 +2768,105 @@ mod tests {
         );
     }
 
-    /// Issue #1930: under a read deadline the total lexical work exceeds, the
-    /// pre-fix query shape (single OR-joined FTS5 MATCH, `ORDER BY bm25(...)`
-    /// over the entire match set, `LIMIT` applied only after that sort) fails
-    /// all-or-nothing with a hard `StorageError::Timeout` (old-red), while the
-    /// per-term fetch this file now ships (`fetch_fts_candidates`) never
-    /// errors: it observes the deadline between bounded per-term queries and
-    /// returns whatever candidates completed terms produced, with
-    /// `timed_out` reporting whether the deadline cut the fetch short
-    /// (new-green). The contract under test is degrade-not-error, not raw
-    /// speed: on a corpus where every term must be queried (no starvation),
-    /// full per-term coverage costs about as much as the OR-joined sort, so a
-    /// wall-clock A/B is not a stable property — deadline observability and
-    /// partial results are.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn per_term_fetch_degrades_under_deadline_where_or_joined_query_errors() {
+    /// Issue #1930: the old OR-joined query returned an all-or-nothing error
+    /// when it crossed the request deadline. The per-term fetch must instead
+    /// keep candidates from a completed term and report `timed_out`. Paused
+    /// Tokio time and the test-only per-term deadline control place expiry
+    /// exactly between two queries, so the assertion never depends on corpus
+    /// work taking longer than a machine-specific wall-clock budget.
+    ///
+    /// Scope: this covers the per-term BOUNDARY only. Advancing only the
+    /// async clock means the post-boundary term is refused by the
+    /// pre-registration deadline check, never by an in-flight SQLite
+    /// interrupt — that path has its own wall-clock test below. The old
+    /// wall-clock old-query oracle (running the pre-fix OR-joined SQL over
+    /// this corpus against a tuned budget) is deliberately retired with the
+    /// machine-timing flake it depended on; the all-or-nothing behavior of a
+    /// single statement crossing its deadline is what the in-flight test
+    /// below pins.
+    #[tokio::test(start_paused = true)]
+    async fn per_term_fetch_degrades_at_controlled_deadline_boundary() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-        const N: u32 = 200_000;
+        const N: u32 = 1_000;
         const VOCAB: u32 = 20;
         seed_low_overlap_corpus(&runtime, N, VOCAB).await;
 
-        let query = "term0 term1 term2 term3 term4 term5 term6 term7";
-        // Measured on this corpus/query shape the OR-joined query takes
-        // ~770-790ms, so 650ms keeps old-red red on this machine and redder on
-        // slower runners. The new-shape assertions below do not depend on
-        // which side of the deadline a runner lands.
+        let query = "term0 term1";
         let deadline = std::time::Duration::from_millis(650);
 
-        // OLD shape: exactly the pre-fix query text — one OR-joined MATCH,
-        // ordered by bm25 over the whole match set, LIMIT applied last.
-        let old_match_expr = fts5_candidate_expression(query);
-        let old_sql = "SELECT a.* FROM fts_knowledge \
-             JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
-             WHERE fts_knowledge MATCH ?1 \
-               AND fts_knowledge.namespace = ?2 \
-               AND a.namespace = ?2 \
-               AND a.deleted_at IS NULL \
-             ORDER BY bm25(fts_knowledge), a.slug \
-             LIMIT ?3"
-            .to_string();
-        let old_result = khive_storage::scope_request_read_deadline(deadline, async {
+        let new_result = khive_storage::scope_request_read_deadline(
+            deadline,
+            FTS_TEST_DEADLINE_ADVANCE.scope(
+                FtsTestDeadlineAdvance {
+                    after_completed_terms: 1,
+                    by: deadline,
+                },
+                fetch_fts_candidates(&runtime, "local", query, None, &[], &[], CANDIDATE_POOL),
+            ),
+        )
+        .await;
+        let outcome = new_result.expect(
+            "the per-term fetch must return partial degradation when the controlled deadline \
+             expires between term queries",
+        );
+        assert!(
+            outcome.timed_out,
+            "the controlled deadline must be observed"
+        );
+        assert!(
+            !outcome.atoms.is_empty(),
+            "candidates from the completed term must survive degradation"
+        );
+        assert!(
+            outcome.atoms.len() <= CANDIDATE_POOL,
+            "partial pool must respect the fetch cap; got {}",
+            outcome.atoms.len()
+        );
+    }
+
+    /// Companion to the boundary test above: prove that a wall-clock
+    /// deadline expiring during this pack's read path surfaces the typed
+    /// `StorageError::Timeout` — never an untyped error — end to end through
+    /// the runtime's reader surface. The statement is structurally slow (a
+    /// 1000^3 cross join — billions of row operations on any machine), so
+    /// the deadline expires long before it could complete.
+    ///
+    /// Scope: which arm of the deadline machinery fires is scheduling-
+    /// dependent — the deadline can latch at reader checkout, at read
+    /// registration, or mid-statement via the progress handler — and every
+    /// arm must yield the same typed timeout, which is exactly this test's
+    /// assertion. The mid-statement arm specifically (progress-handler
+    /// interrupt of an executing statement, proven by a probe that counts
+    /// progress callbacks) is deterministically covered where the mechanism
+    /// lives: `request_deadline_interrupts_statement_without_outer_timeout`
+    /// in `crates/khive-db/src/sql_bridge.rs`, whose probe assertion fails
+    /// if SQLite work never started. This test does not re-prove the
+    /// in-flight arm; it pins the pack-visible contract over all arms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wall_clock_deadline_on_pack_read_path_surfaces_typed_timeout() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let deadline = std::time::Duration::from_millis(50);
+        let result = khive_storage::scope_request_read_deadline(deadline, async {
             let sql = runtime.sql();
             let mut reader = sql.reader().await.expect("reader");
             reader
                 .query_all(SqlStatement {
-                    sql: old_sql,
-                    params: vec![
-                        SqlValue::Text(old_match_expr),
-                        SqlValue::Text("local".into()),
-                        SqlValue::Integer(CANDIDATE_POOL as i64),
-                    ],
-                    label: None,
+                    sql: "WITH RECURSIVE numbers(value) AS (\
+                          SELECT 1 UNION ALL SELECT value + 1 FROM numbers WHERE value < 1000\
+                          ) SELECT SUM(a.value * b.value * c.value) \
+                          FROM numbers AS a CROSS JOIN numbers AS b CROSS JOIN numbers AS c"
+                        .into(),
+                    params: vec![],
+                    label: Some("knowledge-deadline-probe".into()),
                 })
                 .await
         })
         .await;
         assert!(
-            matches!(old_result, Err(khive_storage::StorageError::Timeout { .. })),
-            "old-red: the pre-fix OR-joined/bm25-then-limit query must exceed a {deadline:?} \
-             budget over a {N}-row low-overlap corpus; got {old_result:?}"
+            matches!(result, Err(khive_storage::StorageError::Timeout { .. })),
+            "a read crossing the wall-clock deadline must surface the typed \
+             timeout whichever deadline arm fires; got {result:?}"
         );
-
-        // NEW shape: the shipped per-term fetch, same corpus/query/deadline.
-        // Reverting the fix (restoring the single `?`-propagated OR-joined
-        // query) turns this back into an `Err` and reddens the expect below.
-        let new_result = khive_storage::scope_request_read_deadline(deadline, async {
-            fetch_fts_candidates(&runtime, "local", query, None, &[], &[], CANDIDATE_POOL).await
-        })
-        .await;
-        let outcome = new_result.expect(
-            "new-green: the per-term fetch must degrade, never error, under a deadline the \
-             OR-joined query hard-fails on",
-        );
-        if outcome.timed_out {
-            // The deadline cut the per-term loop short: acceptable on any
-            // runner speed — the verb-visible contract is partial candidates
-            // plus the timeout flag, not an error. Completed terms' rows (if
-            // any finished) are already merged.
-            assert!(
-                outcome.atoms.len() <= CANDIDATE_POOL,
-                "partial pool must respect the fetch cap; got {}",
-                outcome.atoms.len()
-            );
-        } else {
-            assert!(
-                !outcome.atoms.is_empty(),
-                "a fetch that beat the deadline must return real candidates"
-            );
-        }
     }
 
     /// Issue #1930 rework: the per-term loop used to `break` as soon as the

@@ -181,6 +181,11 @@ impl NoteStore for PolicyEnforcingNoteStore {
         self.inner.upsert_note(note).await
     }
 
+    async fn insert_note_if_absent(&self, note: Note) -> StorageResult<bool> {
+        reject_if_forged_message_note(&note, "insert_note_if_absent")?;
+        self.inner.insert_note_if_absent(note).await
+    }
+
     async fn replace_note_if_unchanged(
         &self,
         note: Note,

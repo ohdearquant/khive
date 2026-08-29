@@ -313,8 +313,10 @@ test("keeps the structure inspector legible across desktop and mobile", async ({
 
   await page.getByRole("combobox", { name: /Package · Structure graph/ })
     .selectOption({ label: "khive-db" });
+  // Graph node buttons carry an explicit aria-label ("Module: <path>"),
+  // which overrides the content-derived accessible name.
   await page.getByRole("button", {
-    name: "Concept Module stores::graph",
+    name: "Module: stores::graph",
     exact: true,
   }).click();
 
