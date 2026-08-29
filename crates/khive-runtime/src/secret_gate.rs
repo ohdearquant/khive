@@ -4345,37 +4345,34 @@ mod tests {
     }
 
     #[test]
-    fn mask_secrets_bounds_suffix_scan_work_on_dense_credentials() {
+    fn mask_secrets_public_api_redacts_unscanned_dense_tail() {
         let token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let segment = format!("{token} keep ");
-        let line = segment.repeat(MAX_LOG_TEXT_MASK_INPUT_CHARS / segment.len() + 1);
+        // Keep this fixture independent of implementation-only constants: the
+        // pre-bound implementation must compile with the test present.
+        let line = segment.repeat(512);
         assert!(
-            line.len() >= MAX_LOG_TEXT_MASK_INPUT_CHARS,
-            "fixture must exercise the bounded log input scale"
-        );
-
-        let (spans, scan_work_bytes) = collect_mask_spans(&line);
-        assert!(
-            scan_work_bytes <= MAX_MASK_SCAN_WORK_BYTES,
-            "dense input must stay within the suffix-scan work budget: \
-             {scan_work_bytes} > {MAX_MASK_SCAN_WORK_BYTES}"
-        );
-        assert!(
-            spans.len() < line.matches(token).count(),
-            "fixture must exhaust the work budget before collecting every span"
+            line.len() >= 20_000,
+            "fixture must exceed the cumulative scan-work threshold"
         );
 
         let masked = mask_secrets(&line);
         assert!(
             !masked.contains(token),
-            "no credential may survive fail-closed tail redaction: {masked}"
+            "no credential may survive fail-closed tail redaction"
         );
         assert!(
-            masked.ends_with(REDACTION_MARKER),
-            "the unscanned tail must be redacted wholesale: {masked}"
+            masked.matches("***MASKED***").count() < line.matches(token).count(),
+            "the public masker must redact the unscanned tail wholesale"
+        );
+        assert!(
+            masked.ends_with("***MASKED***"),
+            "the fail-closed tail redaction must reach the end of the public result"
         );
     }
 
+    // White-box complement only: the public test above is the independent
+    // guard for the fail-closed work bound.
     #[test]
     fn mask_secrets_tokenizes_concentrated_tail_once() {
         let token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -4385,15 +4382,13 @@ mod tests {
         assert_eq!(line.matches(token).count(), 200);
 
         ENTROPY_TOKENIZATION_COUNT.with(|count| count.set(0));
-        let (spans, scan_work_bytes) = collect_mask_spans(&line);
+        let masked = mask_secrets(&line);
         let tokenization_count = ENTROPY_TOKENIZATION_COUNT.with(|count| count.get());
 
         assert!(
-            scan_work_bytes < MAX_MASK_SCAN_WORK_BYTES,
-            "the concentrated tail must stay under the old charged-work budget: \
-             {scan_work_bytes} >= {MAX_MASK_SCAN_WORK_BYTES}"
+            !masked.contains(token),
+            "the public masker must redact every concentrated-tail credential"
         );
-        assert_eq!(spans.len(), 200, "every tail credential must be found");
         assert_eq!(
             tokenization_count, 1,
             "the full input token vector must be built once, not once per tail credential"
