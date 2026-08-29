@@ -55,7 +55,7 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 # lattice-embed and lattice-fann require Rust 1.93, setting the workspace MSRV.
 # The previous 1.91 floor came from floor_char_boundary use (issue #398).

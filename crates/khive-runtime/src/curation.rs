@@ -25,9 +25,45 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{base_entity_rule_allows, canonical_edge_endpoints, endpoint_matches};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+/// Test-only pause point at the read/write boundary of a guarded
+/// read-modify-write, so a race between two concurrent callers of the same
+/// PRODUCTION entry point (not the underlying store primitive) can be
+/// reproduced deterministically instead of relying on scheduler luck or
+/// sleeps. A no-op unless the calling task runs inside
+/// `AFTER_READ_BARRIER.scope(...)`; production code never establishes that
+/// scope, so `pause_after_read` costs nothing outside these regression
+/// tests, and it does not exist at all in non-test builds.
+#[cfg(test)]
+pub(crate) mod race_seam {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    tokio::task_local! {
+        pub(crate) static AFTER_READ_BARRIER: Arc<Barrier>;
+    }
+
+    pub(crate) async fn pause_after_read() {
+        if let Ok(barrier) = AFTER_READ_BARRIER.try_with(Arc::clone) {
+            barrier.wait().await;
+        }
+    }
+}
+
 pub(crate) fn stale_note_snapshot_error(id: Uuid) -> RuntimeError {
     RuntimeError::Khive(KhiveError::conflict(format!(
         "note {id} changed concurrently after it was read; retry with fresh state"
+    )))
+}
+
+pub(crate) fn stale_entity_snapshot_error(id: Uuid) -> RuntimeError {
+    RuntimeError::Khive(KhiveError::conflict(format!(
+        "entity {id} changed concurrently after it was read; retry with fresh state"
+    )))
+}
+
+pub(crate) fn stale_edge_snapshot_error(id: Uuid) -> RuntimeError {
+    RuntimeError::Khive(KhiveError::conflict(format!(
+        "edge {id} changed concurrently after it was read; retry with fresh state"
     )))
 }
 
@@ -85,12 +121,18 @@ impl EmbeddingModelPlan {
 /// For `tags` — replace semantics: `Some(vec)` sets tags to exactly `vec`. To add
 /// a tag without losing existing tags, read the entity first, push the new tag,
 /// and pass the full list back.
+///
+/// For `entity_type` — ADR-014 tri-state: `None` leaves the current type
+/// unchanged, `Some(None)` explicitly clears it, and `Some(Some(value))`
+/// validates and normalizes `value` through the installed entity-type
+/// registry.
 #[derive(Clone, Debug, Default)]
 pub struct EntityPatch {
     pub name: Option<String>,
     pub description: Option<Option<String>>,
     pub properties: Option<Value>,
     pub tags: Option<Vec<String>>,
+    pub entity_type: Option<Option<String>>,
 }
 
 /// Policy used when deduplicating two entities.
@@ -816,11 +858,12 @@ impl KhiveRuntime {
     /// Patch-style entity update.
     ///
     /// Only fields set to `Some(_)` are changed. Re-indexes FTS5 (and vectors if configured)
-    /// when `name` or `description` changes; skips re-indexing for property/tag-only patches.
+    /// when `name`, `description`, or `entity_type` changes; skips re-indexing for
+    /// property/tag-only patches.
     ///
     /// Returns `RuntimeError::NotFound` if the entity does not exist or belongs to a different
     /// namespace. Namespace isolation is enforced at the runtime layer.
-    /// Computes the patched `Entity`, `text_changed`, and `changed_fields` without
+    /// Computes the patched `Entity`, `reindex_required`, and `changed_fields` without
     /// writing anything, so both the normal write path and the atomic-prepare path
     /// share one source of truth for what a patched entity looks like.
     pub(crate) async fn prepare_update_entity(
@@ -828,7 +871,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         id: Uuid,
         patch: EntityPatch,
-    ) -> RuntimeResult<(Entity, bool, Vec<&'static str>)> {
+    ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref name) = patch.name {
             crate::secret_gate::check(name)?;
@@ -847,17 +890,33 @@ impl KhiveRuntime {
             .get_entity(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
+        let expected_updated_at = entity.updated_at;
+        let expected_deleted_at = entity.deleted_at;
+        #[cfg(test)]
+        race_seam::pause_after_read().await;
 
-        let mut text_changed = false;
+        // ADR-014 tri-state: outer `None` = unchanged; `Some(None)` = explicit
+        // clear (no vocabulary validation — there is no value to validate);
+        // `Some(Some(raw))` = set, validated and normalized.
+        let validated_entity_type = match &patch.entity_type {
+            Some(None) => Some(None),
+            Some(Some(raw)) => Some(Some(
+                self.validate_entity_type_for_kind(&entity.kind, Some(raw))?
+                    .expect("set branch always yields a normalized value"),
+            )),
+            None => None,
+        };
+
+        let mut reindex_required = false;
         let mut changed_fields: Vec<&'static str> = Vec::new();
 
         if let Some(name) = patch.name {
-            text_changed |= entity.name != name;
+            reindex_required |= entity.name != name;
             entity.name = name;
             changed_fields.push("name");
         }
         if let Some(desc_patch) = patch.description {
-            text_changed |= entity.description != desc_patch;
+            reindex_required |= entity.description != desc_patch;
             entity.description = desc_patch;
             changed_fields.push("description");
         }
@@ -874,9 +933,32 @@ impl KhiveRuntime {
             entity.tags = tags;
             changed_fields.push("tags");
         }
+        if let Some(entity_type) = validated_entity_type {
+            reindex_required |= entity.entity_type != entity_type;
+            entity.entity_type = entity_type;
+            changed_fields.push("entity_type");
+        }
 
-        entity.updated_at = chrono::Utc::now().timestamp_micros();
-        Ok((entity, text_changed, changed_fields))
+        // `updated_at` is also the optimistic-concurrency revision for
+        // full-entity replacement. Make it strictly advance even when two
+        // operations land inside one clock microsecond. Saturation is not a
+        // valid fallback: reusing i64::MAX would make the CAS accept a write
+        // without advancing its revision.
+        let minimum_updated_at = expected_updated_at.checked_add(1).ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "entity {id} updated_at is already at i64::MAX and cannot advance"
+            ))
+        })?;
+        entity.updated_at = chrono::Utc::now()
+            .timestamp_micros()
+            .max(minimum_updated_at);
+        Ok((
+            entity,
+            reindex_required,
+            changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+        ))
     }
 
     pub async fn update_entity(
@@ -897,13 +979,18 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
-        let (entity, text_changed, changed_fields) =
+        let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
             self.prepare_update_entity(token, id, patch).await?;
 
         let store = self.entities(token)?;
-        store.upsert_entity(entity.clone()).await?;
+        let persisted = store
+            .replace_entity_if_unchanged(entity.clone(), expected_updated_at, expected_deleted_at)
+            .await?;
+        if !persisted {
+            return Err(stale_entity_snapshot_error(id));
+        }
 
-        let embedding_report = if text_changed {
+        let embedding_report = if reindex_required {
             self.reindex_entity(token, &entity).await?
         } else {
             crate::retrieval::EmbeddingTruncationReport::default()
@@ -1671,6 +1758,194 @@ impl KhiveRuntime {
             .get_note(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))
+    }
+
+    /// Non-wire outbox scan for the channel delivery loops.
+    ///
+    /// Pages newest-first through live `message` notes (the same order and
+    /// 10k scan cap as the generic `list` verb's filtered offset path) and
+    /// returns those with `properties.direction == "outbound"` that are still
+    /// pending delivery, capped at `limit`. Pending means `delivered_at` is
+    /// absent or null AND `properties.delivery` carries no terminal state
+    /// (`"delivered"` / `"failed"`, ADR-122 §1). When `to_prefix` is given,
+    /// only rows whose `properties.to_actor` starts with it are counted —
+    /// the channel predicate must run BEFORE the limit, otherwise a backlog
+    /// of another channel's pending rows starves this channel indefinitely.
+    /// This lives on the runtime rather than going through the wire registry
+    /// for the same reason as
+    /// [`Self::claim_outbound_message_external_id`]: the delivery loop must
+    /// scan the backend that actually holds comm's notes, and under a
+    /// `[packs.comm]` backend assignment that is not the backend serving the
+    /// generic kg verbs.
+    pub async fn list_undelivered_outbound_messages(
+        &self,
+        token: &NamespaceToken,
+        to_prefix: Option<&str>,
+        limit: u32,
+    ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
+        const PAGE_SIZE: u32 = 200;
+        const MAX_SCAN_TOTAL: u32 = 10_000;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut collected: Vec<khive_storage::note::Note> = Vec::new();
+        let mut db_offset: u32 = 0;
+        loop {
+            let remaining_scan = MAX_SCAN_TOTAL.saturating_sub(db_offset).min(PAGE_SIZE);
+            if remaining_scan == 0 {
+                break;
+            }
+            let page = self
+                .list_notes(token, Some("message"), remaining_scan, db_offset)
+                .await?;
+            let fetched = page.len() as u32;
+            for note in page {
+                if note.deleted_at.is_some() {
+                    continue;
+                }
+                let props = note.properties.as_ref().and_then(|v| v.as_object());
+                let outbound = props
+                    .and_then(|p| p.get("direction"))
+                    .and_then(|v| v.as_str())
+                    == Some("outbound");
+                if !outbound {
+                    continue;
+                }
+                if let Some(prefix) = to_prefix {
+                    let to_matches = props
+                        .and_then(|p| p.get("to_actor"))
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|actor| actor.starts_with(prefix));
+                    if !to_matches {
+                        continue;
+                    }
+                }
+                // Must match `note_already_delivered` in the delivery loop: a
+                // present-but-null `delivered_at` is undelivered, and a
+                // terminal `delivery` state ("delivered"/"failed") is not
+                // pending even without `delivered_at` (ADR-122 §1).
+                let delivered = props
+                    .and_then(|p| p.get("delivered_at"))
+                    .is_some_and(|v| !v.is_null());
+                if delivered {
+                    continue;
+                }
+                let terminal = props
+                    .and_then(|p| p.get("delivery"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|state| state == "delivered" || state == "failed");
+                if terminal {
+                    continue;
+                }
+                collected.push(note);
+                if collected.len() >= limit as usize {
+                    return Ok(collected);
+                }
+            }
+            if fetched < PAGE_SIZE {
+                break;
+            }
+            db_offset += fetched;
+        }
+        Ok(collected)
+    }
+
+    /// Assert that `id` names a live outbound `message` note, returning
+    /// `InvalidInput` otherwise. Guard shared by the delivery-outcome
+    /// markers: they take caller-supplied UUIDs, and the generic
+    /// `update_note` they patch through would happily stamp delivery
+    /// properties onto any note kind.
+    async fn assert_outbound_message(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<()> {
+        let note = self
+            .notes(token)?
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
+        if note.kind != "message" || note.deleted_at.is_some() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "note {id} is not a live message note (kind {})",
+                note.kind
+            )));
+        }
+        let outbound = note
+            .properties
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|p| p.get("direction"))
+            .and_then(|v| v.as_str())
+            == Some("outbound");
+        if !outbound {
+            return Err(RuntimeError::InvalidInput(format!(
+                "note {id} is not an outbound message"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Mark an outbound `message` note delivered by merging the ADR-122 §1
+    /// terminal-outcome properties (`delivery = "delivered"`, `delivered_at`,
+    /// and `transport_message_id` when the transport minted one), through the
+    /// same patch path the generic `update` verb uses (`delivered_at` is
+    /// deliberately not owner-established, pinned by
+    /// `generic_update_can_still_patch_delivered_at_on_message_note`).
+    /// Refuses (`InvalidInput`) unless `id` names a live outbound `message`
+    /// note. Non-wire companion to
+    /// [`Self::list_undelivered_outbound_messages`] so the delivery loop
+    /// writes the backend that holds the note.
+    pub async fn mark_outbound_message_delivered(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        delivered_at: String,
+        transport_message_id: Option<String>,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        self.assert_outbound_message(token, id).await?;
+        let mut props = serde_json::Map::new();
+        props.insert("delivery".into(), Value::String("delivered".into()));
+        props.insert("delivered_at".into(), Value::String(delivered_at));
+        if let Some(transport_message_id) = transport_message_id {
+            props.insert(
+                "transport_message_id".into(),
+                Value::String(transport_message_id),
+            );
+        }
+        self.update_note(
+            token,
+            id,
+            NotePatch {
+                properties: Some(Value::Object(props)),
+                ..NotePatch::default()
+            },
+        )
+        .await
+    }
+
+    /// Record a permanent delivery failure on an outbound `message` note:
+    /// `delivery = "failed"`, `failed_at`, `last_error` (ADR-122 §2 — an
+    /// allowlist rejection must be recorded, not skipped, or the row stays
+    /// pending forever while the caller saw `ok: true`). Refuses
+    /// (`InvalidInput`) unless `id` names a live outbound `message` note.
+    pub async fn mark_outbound_message_failed(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        failed_at: String,
+        last_error: String,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        self.assert_outbound_message(token, id).await?;
+        self.update_note(
+            token,
+            id,
+            NotePatch {
+                properties: Some(serde_json::json!({
+                    "delivery": "failed",
+                    "failed_at": failed_at,
+                    "last_error": last_error,
+                })),
+                ..NotePatch::default()
+            },
+        )
+        .await
     }
 
     /// Merge `from_id` note into `into_id` note.
@@ -3592,6 +3867,8 @@ pub(crate) fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usiz
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
     use khive_storage::types::{Direction, TextFilter, TextQueryMode, TextSearchRequest};
@@ -3605,6 +3882,236 @@ mod tests {
         let mut note = Note::new("local", "message", "hello");
         note.properties = Some(serde_json::json!({"direction": "outbound"}));
         note
+    }
+
+    /// Predicate + ordering contract of the non-wire outbox scan: outbound
+    /// with absent OR explicitly-null `delivered_at` is undelivered; a
+    /// non-null `delivered_at`, a terminal `delivery` state, an inbound row,
+    /// and a soft-deleted row are all excluded; results come newest-first
+    /// and respect `limit`; `limit=0` returns nothing.
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_predicate_and_order() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let mut undelivered_old = outbound_message_note();
+        undelivered_old.created_at -= 10;
+        let mut undelivered_null = outbound_message_note();
+        undelivered_null.properties =
+            Some(serde_json::json!({"direction": "outbound", "delivered_at": null}));
+        let mut delivered = outbound_message_note();
+        delivered.properties = Some(
+            serde_json::json!({"direction": "outbound", "delivered_at": "2026-08-28T00:00:00Z"}),
+        );
+        // ADR-122 terminal states without `delivered_at` are not pending.
+        let mut terminal_failed = outbound_message_note();
+        terminal_failed.properties = Some(
+            serde_json::json!({"direction": "outbound", "delivery": "failed", "last_error": "x"}),
+        );
+        let mut inbound = Note::new("local", "message", "inbound row");
+        inbound.properties = Some(serde_json::json!({"direction": "inbound"}));
+        let mut soft_deleted = outbound_message_note();
+        soft_deleted.deleted_at = Some(chrono::Utc::now().timestamp_micros());
+
+        let old_id = undelivered_old.id;
+        let null_id = undelivered_null.id;
+        for note in [
+            undelivered_old,
+            undelivered_null,
+            delivered,
+            terminal_failed,
+            inbound,
+            soft_deleted,
+        ] {
+            store.upsert_note(note).await.expect("seed note");
+        }
+
+        let hits = rt
+            .list_undelivered_outbound_messages(&tok, None, 200)
+            .await
+            .expect("scan succeeds");
+        let ids: Vec<_> = hits.iter().map(|n| n.id).collect();
+        assert_eq!(
+            ids,
+            vec![null_id, old_id],
+            "only the two undelivered outbound rows, newest-first"
+        );
+
+        let capped = rt
+            .list_undelivered_outbound_messages(&tok, None, 1)
+            .await
+            .expect("capped scan succeeds");
+        assert_eq!(
+            capped.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![null_id],
+            "limit truncates after the newest undelivered row"
+        );
+
+        let zero = rt
+            .list_undelivered_outbound_messages(&tok, None, 0)
+            .await
+            .expect("zero-limit scan succeeds");
+        assert!(zero.is_empty(), "limit=0 returns no rows, not one");
+    }
+
+    /// The channel prefix runs BEFORE the limit: a backlog of another
+    /// channel's pending rows must not consume the scan budget and starve
+    /// the requested channel (the pre-fix defect: filter-after-limit).
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_prefix_filters_before_limit() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        // Older email row behind three newer telegram rows.
+        let mut email = outbound_message_note();
+        email.created_at -= 100;
+        email.properties =
+            Some(serde_json::json!({"direction": "outbound", "to_actor": "email:a@b.c"}));
+        let email_id = email.id;
+        store.upsert_note(email).await.expect("seed email");
+        for _ in 0..3 {
+            let mut tg = outbound_message_note();
+            tg.properties =
+                Some(serde_json::json!({"direction": "outbound", "to_actor": "telegram:42"}));
+            store.upsert_note(tg).await.expect("seed telegram");
+        }
+
+        // With filter-after-limit this would return a telegram row (newest
+        // first) and the email loop would see nothing deliverable.
+        let hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("email:"), 1)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(
+            hits.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![email_id],
+            "prefix predicate applies before the limit"
+        );
+
+        let telegram_hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("telegram:"), 200)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(telegram_hits.len(), 3, "telegram prefix sees its own rows");
+    }
+
+    /// Terminal-outcome markers: `delivered` stamps the ADR-122 §1 property
+    /// set (with `transport_message_id` only when given), `failed` stamps
+    /// §2's permanent-failure set, and both refuse targets that are not live
+    /// outbound message notes.
+    #[tokio::test]
+    async fn outbound_delivery_markers_stamp_adr122_properties_and_validate_target() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let delivered_note = outbound_message_note();
+        let delivered_id = delivered_note.id;
+        let failed_note = outbound_message_note();
+        let failed_id = failed_note.id;
+        let mut inbound = Note::new("local", "message", "inbound row");
+        inbound.properties = Some(serde_json::json!({"direction": "inbound"}));
+        let inbound_id = inbound.id;
+        let wrong_kind = Note::new("local", "observation", "not a message");
+        let wrong_kind_id = wrong_kind.id;
+        for note in [delivered_note, failed_note] {
+            store.upsert_note(note).await.expect("seed note");
+        }
+        store.upsert_note(inbound).await.expect("seed inbound");
+        store
+            .upsert_note(wrong_kind)
+            .await
+            .expect("seed non-message");
+
+        let marked = rt
+            .mark_outbound_message_delivered(
+                &tok,
+                delivered_id,
+                "2026-08-28T00:00:00Z".to_string(),
+                Some("<mid@example>".to_string()),
+            )
+            .await
+            .expect("mark delivered succeeds");
+        let props = marked
+            .properties
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            props.get("delivery").and_then(|v| v.as_str()),
+            Some("delivered")
+        );
+        assert_eq!(
+            props.get("delivered_at").and_then(|v| v.as_str()),
+            Some("2026-08-28T00:00:00Z")
+        );
+        assert_eq!(
+            props.get("transport_message_id").and_then(|v| v.as_str()),
+            Some("<mid@example>")
+        );
+
+        let failed = rt
+            .mark_outbound_message_failed(
+                &tok,
+                failed_id,
+                "2026-08-28T00:00:01Z".to_string(),
+                "recipient not in allowlist".to_string(),
+            )
+            .await
+            .expect("mark failed succeeds");
+        let props = failed
+            .properties
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            props.get("delivery").and_then(|v| v.as_str()),
+            Some("failed")
+        );
+        assert_eq!(
+            props.get("failed_at").and_then(|v| v.as_str()),
+            Some("2026-08-28T00:00:01Z")
+        );
+        assert_eq!(
+            props.get("last_error").and_then(|v| v.as_str()),
+            Some("recipient not in allowlist")
+        );
+
+        // Both marked rows are now terminal: the scan must not return them.
+        let pending = rt
+            .list_undelivered_outbound_messages(&tok, None, 200)
+            .await
+            .expect("scan succeeds");
+        assert!(
+            pending.is_empty(),
+            "terminal rows left in scan: {:?}",
+            pending.iter().map(|n| n.id).collect::<Vec<_>>()
+        );
+
+        // Validation arms: inbound message and non-message kind both refuse.
+        for (id, label) in [(inbound_id, "inbound"), (wrong_kind_id, "non-message")] {
+            let err = rt
+                .mark_outbound_message_delivered(&tok, id, "t".to_string(), None)
+                .await
+                .expect_err(label);
+            assert!(
+                matches!(err, RuntimeError::InvalidInput(_)),
+                "{label}: expected InvalidInput, got {err:?}"
+            );
+            let err = rt
+                .mark_outbound_message_failed(&tok, id, "t".to_string(), "e".to_string())
+                .await
+                .expect_err(label);
+            assert!(
+                matches!(err, RuntimeError::InvalidInput(_)),
+                "{label}: expected InvalidInput, got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3961,6 +4468,593 @@ mod tests {
         assert_eq!(updated.name, "OriginalName");
         assert_eq!(updated.description.as_deref(), Some("new desc"));
         assert_eq!(updated.properties, Some(serde_json::json!({"k":"v"})));
+    }
+
+    #[tokio::test]
+    async fn update_entity_type_patch_validates_preserves_fields_and_requires_reindex() {
+        let rt = rt();
+        rt.install_entity_type_validator(std::sync::Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            let normalized = raw.trim().to_ascii_lowercase();
+            if kind == "concept" && normalized == "algorithm" {
+                Ok(Some(normalized))
+            } else {
+                Err(RuntimeError::InvalidInput(format!(
+                    "unknown entity_type {raw:?} for {kind:?}; valid: algorithm"
+                )))
+            }
+        }));
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "HistoricalAlgorithm",
+                Some("keep description"),
+                Some(serde_json::json!({"type": "algorithm", "keep": true})),
+                vec!["keep-tag".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let (
+            prepared,
+            reindex_required,
+            changed_fields,
+            _expected_updated_at,
+            _expected_deleted_at,
+        ) = rt
+            .prepare_update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    entity_type: Some(Some(" Algorithm ".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("registered entity_type must validate");
+
+        assert_eq!(prepared.entity_type.as_deref(), Some("algorithm"));
+        assert_eq!(prepared.name, "HistoricalAlgorithm");
+        assert_eq!(prepared.description.as_deref(), Some("keep description"));
+        assert_eq!(
+            prepared.properties,
+            Some(serde_json::json!({"type": "algorithm", "keep": true}))
+        );
+        assert_eq!(prepared.tags, vec!["keep-tag"]);
+        assert!(
+            reindex_required,
+            "changing entity_type must request the normal entity reindex path"
+        );
+        assert_eq!(changed_fields, vec!["entity_type"]);
+
+        let err = rt
+            .prepare_update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    entity_type: Some(Some("not_registered".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("unregistered entity_type must be rejected");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)), "error: {err}");
+    }
+
+    /// Regression for the entity lost-update race (khive #1753): two writers
+    /// read the same entity revision, then commit successive patches to
+    /// independent properties fields. Before the guarded
+    /// `replace_entity_if_unchanged` primitive, `update_entity_with_embedding_report`
+    /// wrote an unconditional `entity_upsert_statement`, so both patches
+    /// "succeeded" and the second silently discarded the first's field
+    /// (`a=1` was overwritten back to `a=0` when B's stale full-row replace
+    /// landed). This test forces the interleaving with a `Barrier` — both
+    /// readers are released together, so both `prepare_update_entity` calls
+    /// observe the SAME pre-write revision (asserted below) — then commits
+    /// deterministically in a fixed A-then-B order. It reddens if the guard
+    /// is dropped from `entity_replace_if_unchanged_statement` ENTIRELY: with
+    /// an unconditional UPDATE (or `entity_upsert_statement`), B's write would
+    /// also return `true` and `b` would be lost from the final properties.
+    ///
+    /// It does NOT redden when only `?8 > updated_at` is removed: with
+    /// `updated_at = ?13` intact, B is refused by the revision guard whatever
+    /// the clock did, so this fixture cannot see that conjunct disappear.
+    ///
+    /// It cannot ATTRIBUTE a failure to `updated_at = ?13` either, but for a
+    /// different reason, and the difference matters. Both racers take their
+    /// replacement revision from `prepare_update_entity`'s
+    /// `max(now_micros, expected + 1)` above; this test pins the two EXPECTED
+    /// revisions equal, never the two REPLACEMENT revisions. So with
+    /// `updated_at = ?13` removed, whether B is still refused depends on
+    /// whether B's wall-clock read happened to exceed A's committed revision.
+    /// That is a race, not a property of the fixture, and no single run of it
+    /// establishes either answer.
+    ///
+    /// Attribution therefore comes from fixtures that force the question:
+    /// `entity_cas_refuses_a_replacement_revision_that_does_not_advance` for
+    /// the strict-advance conjunct, and
+    /// `production_update_entity_refuses_concurrent_stale_writer` for the
+    /// production wiring. Making this fixture attribute as well would mean
+    /// pinning both replacement revisions to a common `expected + 1`; it is
+    /// deliberately left as a whole-guard test instead.
+    ///
+    /// SCOPE: this exercises the STORE PRIMITIVE directly and never invokes
+    /// `update_entity`, so it stays green if the production caller is reverted
+    /// to an unconditional write. The wiring is covered separately by
+    /// `production_update_entity_refuses_concurrent_stale_writer`; both are
+    /// required, neither substitutes for the other.
+    #[tokio::test]
+    async fn concurrent_entity_property_patches_from_one_revision_only_one_survives() {
+        let rt = Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "RaceTarget",
+                None,
+                Some(serde_json::json!({"a": 0, "b": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let reader_a = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                rt.prepare_update_entity(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"a": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            })
+        };
+        let reader_b = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                rt.prepare_update_entity(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"b": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            })
+        };
+
+        let (entity_a, _, _, expected_updated_at_a, expected_deleted_at_a) =
+            reader_a.await.unwrap().expect("reader A prepares");
+        let (entity_b, _, _, expected_updated_at_b, expected_deleted_at_b) =
+            reader_b.await.unwrap().expect("reader B prepares");
+        assert_eq!(
+            expected_updated_at_a, expected_updated_at_b,
+            "both readers must observe the same pre-write revision for this to be a real race"
+        );
+
+        let store = rt.entities(&tok).expect("entity store");
+        assert!(
+            store
+                .replace_entity_if_unchanged(entity_a, expected_updated_at_a, expected_deleted_at_a)
+                .await
+                .expect("writer A CAS query"),
+            "the first committer from a shared revision must win"
+        );
+        assert!(
+            !store
+                .replace_entity_if_unchanged(entity_b, expected_updated_at_b, expected_deleted_at_b)
+                .await
+                .expect("writer B CAS query"),
+            "the second committer from the SAME stale revision must be refused, not merged"
+        );
+
+        let final_entity = rt.get_entity(&tok, id).await.expect("read final entity");
+        assert_eq!(
+            final_entity.properties,
+            Some(serde_json::json!({"a": 1, "b": 0})),
+            "writer B's field must not be silently merged into the persisted row: {:?}",
+            final_entity.properties
+        );
+    }
+
+    /// Same race as `concurrent_entity_property_patches_from_one_revision_only_one_survives`,
+    /// but driven entirely through the PRODUCTION entry point
+    /// (`update_entity_with_embedding_report`) rather than the store's
+    /// `replace_entity_if_unchanged` primitive directly. This closes a gap
+    /// the primitive-level test cannot: it would still pass unchanged if the
+    /// production caller were reverted to an unconditional write, since it
+    /// never invokes that caller at all. Uses `race_seam::pause_after_read`
+    /// (test-only, compiled out of non-test builds) to force both concurrent
+    /// callers to observe the identical pre-write revision deterministically —
+    /// no sleeps, no reliance on scheduler ordering.
+    #[tokio::test]
+    async fn production_update_entity_refuses_concurrent_stale_writer() {
+        let rt = Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "ProductionRaceTarget",
+                None,
+                Some(serde_json::json!({"a": 0, "b": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let writer_a = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                rt.update_entity_with_embedding_report(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"a": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }))
+        };
+        let writer_b = {
+            let rt = Arc::clone(&rt);
+            let tok = tok.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                rt.update_entity_with_embedding_report(
+                    &tok,
+                    id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"b": 1})),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }))
+        };
+
+        let result_a = writer_a.await.expect("writer A task");
+        let result_b = writer_b.await.expect("writer B task");
+        let successes = [result_a.is_ok(), result_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one production caller must win the race; the other must be refused: \
+             a={result_a:?} b={result_b:?}"
+        );
+        let refused = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
+        match &refused {
+            Err(RuntimeError::Khive(khive_error)) => {
+                assert_eq!(
+                    khive_error.kind(),
+                    khive_types::ErrorKind::Conflict,
+                    "the losing production caller must surface a typed conflict, not \
+                     silently overwrite: {refused:?}"
+                );
+            }
+            other => panic!("expected a typed conflict error, got {other:?}"),
+        }
+
+        let final_entity = rt.get_entity(&tok, id).await.expect("read final entity");
+        assert_ne!(
+            final_entity.properties,
+            Some(serde_json::json!({"a": 1, "b": 1})),
+            "both racers' fields must never both land: that would mean the loser's stale \
+             write silently succeeded"
+        );
+    }
+
+    /// Isolating fixture for the `AND ?8 > updated_at` conjunct of
+    /// `entity_replace_if_unchanged_statement`.
+    ///
+    /// The concurrent-race tests above cannot cover it. What is measured, and
+    /// deterministic: tautologizing `?8 > updated_at` alone reddened NOTHING in
+    /// `khive-runtime` before this test existed, because the revision guard
+    /// (`updated_at = ?13`) refuses the losing writer on its own whatever the
+    /// clock did. Tautologizing `updated_at = ?13` + `deleted_at IS ?14`
+    /// reddens only `production_update_entity_refuses_concurrent_stale_writer`,
+    /// and defeating all three at once reddens the race tests.
+    ///
+    /// What is NOT claimed, because the fixture cannot support it: that the two
+    /// guards are each independently sufficient. The race fixture pins the two
+    /// racers' EXPECTED revisions equal but never their REPLACEMENT revisions,
+    /// which both come from `max(now, expected + 1)`. So with `updated_at = ?13`
+    /// removed, whether strict advance still refuses depends on which clock read
+    /// won — a race, not a property of the fixture. This test strips the second
+    /// mechanism by construction instead:
+    /// it supplies the CORRECT expected revision and deletion marker, so
+    /// `?13`/`?14` are satisfied by construction, and the ONLY thing that can
+    /// refuse the write is the strict-advance conjunct.
+    #[tokio::test]
+    async fn entity_cas_refuses_a_replacement_revision_that_does_not_advance() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "NonAdvancing",
+                None,
+                Some(serde_json::json!({"a": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let (mut replacement, _, _, expected_updated_at, expected_deleted_at) = rt
+            .prepare_update_entity(
+                &tok,
+                id,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"a": 1})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepare update");
+
+        // Force the replacement revision to EQUAL the stored one, then PROVE the
+        // isolation rather than asserting it in prose. Reading the row back is
+        // what makes `?13` and `?14` observed facts here instead of values
+        // carried out of `prepare_update_entity`'s setup read.
+        replacement.updated_at = expected_updated_at;
+
+        let store = rt.entities(&tok).expect("entity store");
+        let stored = store
+            .get_entity_including_deleted(id)
+            .await
+            .expect("read stored row")
+            .expect("row present before CAS");
+        assert_eq!(
+            stored.updated_at, expected_updated_at,
+            "fixture premise: nothing moved the stored revision between prepare and CAS, \
+             otherwise `?13` would refuse and this stops being an isolating fixture"
+        );
+        assert_eq!(
+            stored.deleted_at, expected_deleted_at,
+            "fixture premise: the stored deletion marker must still equal the snapshot's, \
+             otherwise `deleted_at IS ?14` would refuse and this stops being an isolating \
+             fixture"
+        );
+        assert_eq!(
+            replacement.updated_at, stored.updated_at,
+            "fixture premise: the replacement revision must NOT advance past the stored one, \
+             which is the single condition under test"
+        );
+
+        let committed = store
+            .replace_entity_if_unchanged(replacement, expected_updated_at, expected_deleted_at)
+            .await
+            .expect("CAS query");
+        assert!(
+            !committed,
+            "a replacement whose revision does not strictly advance past the stored one must \
+             be refused: without `?8 > updated_at` the CAS would accept a write that leaves \
+             `updated_at` unmoved, so a later writer holding the same snapshot would still \
+             see its expected revision match and overwrite this one"
+        );
+
+        let stored = rt.get_entity(&tok, id).await.expect("read back");
+        assert_eq!(
+            stored.properties,
+            Some(serde_json::json!({"a": 0})),
+            "the refused write must not have landed"
+        );
+    }
+
+    /// Isolating fixture for the `AND deleted_at IS ?14` conjunct of
+    /// `entity_replace_if_unchanged_statement`.
+    ///
+    /// The revision-based race fixtures cannot reach it, because a soft delete
+    /// does not move the revision: `entity_soft_delete_statement` is
+    /// `SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL` and never
+    /// touches `updated_at`. So a writer holding a pre-delete snapshot still has
+    /// the CORRECT expected revision after the row is tombstoned, and its
+    /// replacement revision still advances. Every conjunct except `?14` is
+    /// satisfied, and dropping `?14` would let that writer's `deleted_at = NULL`
+    /// land — resurrecting a tombstone, with no revision conflict anywhere to
+    /// signal it.
+    ///
+    /// This fixture does not merely claim that isolation, it asserts it: both
+    /// other conjuncts are checked against the post-delete row before the CAS
+    /// runs, so a future change that makes one of them refuse instead turns this
+    /// test red rather than silently converting it into a whole-guard test.
+    #[tokio::test]
+    async fn entity_cas_refuses_a_stale_replacement_that_would_resurrect_a_tombstone() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "Tombstoned",
+                None,
+                Some(serde_json::json!({"a": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        // Snapshot BEFORE the delete: this is the stale writer's view.
+        let (replacement, _, _, expected_updated_at, expected_deleted_at) = rt
+            .prepare_update_entity(
+                &tok,
+                id,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"a": 1})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepare update");
+        assert_eq!(
+            expected_deleted_at, None,
+            "fixture premise: the snapshot must be of a LIVE row"
+        );
+
+        rt.delete_entity(&tok, id, false)
+            .await
+            .expect("soft delete");
+
+        let store = rt.entities(&tok).expect("entity store");
+        let tombstoned = store
+            .get_entity_including_deleted(id)
+            .await
+            .expect("read tombstone")
+            .expect("row still present after soft delete");
+
+        // Prove the isolation rather than asserting it in prose. `?13` matches
+        // because the soft delete left the revision alone, and `?8 > updated_at`
+        // holds because the prepared replacement advanced past it. That leaves
+        // `deleted_at IS ?14` as the only conjunct able to refuse the write.
+        assert_eq!(
+            tombstoned.updated_at, expected_updated_at,
+            "fixture premise: soft delete must NOT move `updated_at`, otherwise \
+             `?13` would refuse and this stops being an isolating fixture"
+        );
+        assert!(
+            replacement.updated_at > tombstoned.updated_at,
+            "fixture premise: the replacement revision must still advance, \
+             otherwise `?8 > updated_at` would refuse and this stops being an \
+             isolating fixture"
+        );
+        assert!(
+            tombstoned.deleted_at.is_some(),
+            "fixture premise: the row must actually be tombstoned"
+        );
+
+        let committed = store
+            .replace_entity_if_unchanged(replacement, expected_updated_at, expected_deleted_at)
+            .await
+            .expect("CAS query");
+        assert!(
+            !committed,
+            "a replacement carrying a pre-delete snapshot must be refused after the row is \
+             soft-deleted: without `deleted_at IS ?14` it would write `deleted_at = NULL` over \
+             the tombstone and silently resurrect a deleted entity"
+        );
+
+        let after = store
+            .get_entity_including_deleted(id)
+            .await
+            .expect("read back")
+            .expect("row present");
+        assert!(
+            after.deleted_at.is_some(),
+            "the tombstone must survive the refused write"
+        );
+        assert_eq!(
+            after.properties,
+            Some(serde_json::json!({"a": 0})),
+            "the refused write must not have landed"
+        );
+    }
+
+    /// Regression: the entity CAS requires the replacement revision to be
+    /// STRICTLY greater than the stored one. If the replacement is computed
+    /// as a raw `Utc::now()` read, a stored revision that is at or ahead of
+    /// wall-clock time (a clock step backward, or — deterministically,
+    /// reproduced here — a stored revision manufactured slightly ahead of
+    /// "now") makes the new value fail to advance, and the CAS refuses a
+    /// write with NO concurrent writer involved at all. The fix must clamp
+    /// the replacement to `max(now, stored + 1)`; this test sets the stored
+    /// revision one full second into the future (far outside normal clock
+    /// skew) and asserts the update still succeeds instead of surfacing a
+    /// spurious conflict.
+    ///
+    /// SCOPE: this is a revision-clamp test, NOT CAS regression coverage. Its
+    /// assertion is that the write SUCCEEDS, which an unconditional UPDATE
+    /// also satisfies, so it stays green if the `updated_at = ?13` /
+    /// `?8 > updated_at` guard is dropped entirely. The guard's regression
+    /// coverage is
+    /// `concurrent_entity_property_patches_from_one_revision_only_one_survives`
+    /// (primitive) and `production_update_entity_refuses_concurrent_stale_writer`
+    /// (production wiring); do not count this test toward it.
+    #[tokio::test]
+    async fn update_entity_succeeds_when_stored_revision_is_ahead_of_wall_clock() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "FutureRevisionTarget",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        let future_micros = chrono::Utc::now().timestamp_micros() + 1_000_000;
+        let pool = rt.backend().pool_arc();
+        let id_str = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.writer().expect("writer connection");
+            guard
+                .execute(
+                    "UPDATE entities SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![future_micros, id_str],
+                )
+                .expect("force future revision")
+        })
+        .await
+        .expect("join");
+
+        let updated = rt
+            .update_entity(
+                &tok,
+                id,
+                EntityPatch {
+                    description: Some(Some("patched after a forced future revision".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect(
+                "update must succeed and advance past the stored revision, not report a \
+                 spurious conflict when nothing else wrote to this row",
+            );
+        assert!(updated.updated_at > future_micros);
     }
 
     #[tokio::test]

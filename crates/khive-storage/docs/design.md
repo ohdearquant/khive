@@ -121,7 +121,8 @@ Key design constraints:
   implemented.
 - `StorageError::Driver` wraps backend-specific errors.
 - `StorageError::NotFound` / `AlreadyExists` for ID-based lookups.
-- Pool, Timeout, Transaction errors are retryable (`is_retryable() == true`).
+- Pool, Timeout, AdmissionTimeout, Transaction errors are retryable
+  (`is_retryable() == true`).
 
 ## Consistency Notes
 

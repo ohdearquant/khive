@@ -4,7 +4,12 @@
 
 import { assertEquals } from "@std/assert";
 import { computeLog } from "./log.ts";
-import { exec } from "../lib/git.ts";
+import { exec as rawExec } from "../lib/git.ts";
+import { isolatedTestEnv } from "../tests/helpers.ts";
+
+// Harness git calls run under the isolated env so host configuration
+// (global hooks, command-scope injection) cannot affect the fixtures.
+const exec = (cmd: string[]) => rawExec(cmd, isolatedTestEnv());
 
 // ─── Test harness ─────────────────────────────────────────────────────────────
 

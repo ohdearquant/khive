@@ -129,6 +129,13 @@ const DRAIN_BATCH_CAP: usize = 256;
 /// writer thread's lifetime at startup, and a no-op when unset.
 const WRITE_DELAY_MS_OVERRIDE_ENV: &str = "KHIVE_WRITER_TIMEOUT_SINK_WRITE_DELAY_MS";
 
+/// Test-harness-only synchronization point for proving that pool construction
+/// does not wait for the sink writer. When set to a directory, the writer
+/// creates `reached`, waits for `release`, then creates `resumed` before its
+/// first sink filesystem operation. The hook is inert unless Cargo's
+/// [`TEST_HARNESS_ENV`] marker is also present.
+const STARTUP_BARRIER_DIR_ENV: &str = "KHIVE_WRITER_TIMEOUT_SINK_STARTUP_BARRIER_DIR";
+
 /// Caller-experienced write latency at or above this bound produces a
 /// `slow_write` sink row. Exists because the ADR-136 write queue converts
 /// what used to be a caller-visible admission FAILURE (a `timeout` row) into
@@ -748,6 +755,8 @@ fn writer_thread_loop(
         return;
     }
 
+    pause_at_startup_barrier_for_test();
+
     // Retention is owned by the writer thread, run once per process
     // lifetime, after the publication gate above and before the first
     // file open — see `prune_expired_sink_files` and the module docs.
@@ -880,6 +889,22 @@ fn write_delay_from_env() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::ZERO)
+}
+
+fn pause_at_startup_barrier_for_test() {
+    if std::env::var(TEST_HARNESS_ENV).as_deref() != Ok("1") {
+        return;
+    }
+    let Some(dir) = std::env::var_os(STARTUP_BARRIER_DIR_ENV).map(PathBuf::from) else {
+        return;
+    };
+    if std::fs::write(dir.join("reached"), b"reached").is_err() {
+        return;
+    }
+    while !dir.join("release").exists() {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let _ = std::fs::write(dir.join("resumed"), b"resumed");
 }
 
 /// Initialize the process-global sink on first call from a writable file-backed
