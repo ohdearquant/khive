@@ -234,6 +234,14 @@ pub enum FilterOp {
     /// Matches rows where the JSON field equals the value OR the field is absent/NULL.
     /// Used for properties that may be missing in legacy rows (e.g. `$.read`).
     EqOrMissing,
+    /// Matches a non-empty textual value using an indexable
+    /// `ifnull(json_extract(...), '')` expression. Missing values map to the
+    /// empty string and therefore do not match the non-empty values for which
+    /// this operator is intended (the comm unread count handles legacy rows
+    /// separately).
+    EqOrMissingIndexed,
+    /// Matches rows where the JSON field is absent or SQL-NULL.
+    JsonTypeMissing,
     /// Matches rows where a JSON text field equals the value, while treating
     /// every missing or non-text value as that same value. The SQL adapter
     /// emits `CASE WHEN json_type(...) = 'text' THEN json_extract(...) ELSE

@@ -790,37 +790,15 @@ fn build_note_filter_where(
             FilterOp::EqOrMissing => {
                 let expr = json_extract_expr(&pf.json_path);
                 params.push(sql_value_param(&pf.value)?);
-                // `ifnull(expr, '')` collapses the missing case into the
-                // empty string so the whole match-or-missing disjunction
-                // becomes IN ranges over ONE indexable expression: the
-                // recipient-scoped unread-probe index
-                // (`idx_notes_unread_probe_recipient`) carries this exact
-                // expression as a key column, so recipient scoping happens
-                // inside the index instead of row-by-row across every
-                // actor's unread rows.
-                //
-                // This widens the op by exactly one shape: a row whose
-                // property is PRESENT and an empty string now matches, where
-                // `expr = ? OR expr IS NULL` did not. No verb can write that
-                // shape -- `to_actor`/`from_actor` are rejected empty at
-                // send (`validate_actor_label`) and at ingest, and
-                // `priority` is closed to p0..p3 (`is_valid_priority`, at
-                // `task_create` and at the filter). So the widening reaches
-                // only legacy and direct-store rows, the same population
-                // `EqOrMissing` exists for.
-                //
-                // For such a gtd row the widened filter AGREES with
-                // `priority_rank`, which already ranks an empty priority as
-                // the p2 default. It does not agree with `render_task`,
-                // which renders the stored empty string verbatim, so a
-                // `priority="p2"` filter can return a legacy row that
-                // renders with an empty priority. That divergence between
-                // the two gtd read paths predates this change and is not
-                // resolved here.
                 conditions.push(format!(
-                    "ifnull({expr}, '') IN (?{n}, '')",
+                    "({expr} = ?{n} OR {expr} IS NULL)",
                     n = params.len()
                 ));
+            }
+            FilterOp::EqOrMissingIndexed => {
+                let expr = json_extract_expr(&pf.json_path);
+                params.push(sql_value_param(&pf.value)?);
+                conditions.push(format!("ifnull({expr}, '') = ?{}", params.len()));
             }
             FilterOp::TextEqOrNonText => {
                 let expr = json_extract_expr(&pf.json_path);
@@ -835,6 +813,10 @@ fn build_note_filter_where(
                 let type_expr = json_type_expr(&pf.json_path);
                 params.push(sql_value_param(&pf.value)?);
                 conditions.push(format!("{type_expr} = ?{}", params.len()));
+            }
+            FilterOp::JsonTypeMissing => {
+                let type_expr = json_type_expr(&pf.json_path);
+                conditions.push(format!("{type_expr} IS NULL"));
             }
             FilterOp::JsonTypeNeMissing => {
                 let type_expr = json_type_expr(&pf.json_path);
@@ -892,8 +874,10 @@ fn build_note_filter_where(
                     FilterOp::Gt => ">",
                     FilterOp::Gte => ">=",
                     FilterOp::EqOrMissing
+                    | FilterOp::EqOrMissingIndexed
                     | FilterOp::TextEqOrNonText
                     | FilterOp::JsonTypeEq
+                    | FilterOp::JsonTypeMissing
                     | FilterOp::JsonTypeNeMissing
                     | FilterOp::In(_)
                     | FilterOp::NotInOrMissing(_) => {

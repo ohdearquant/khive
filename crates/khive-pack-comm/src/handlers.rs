@@ -857,7 +857,7 @@ async fn count_unread_messages(
     namespace: &str,
     caller_actor: &str,
 ) -> Result<u64, RuntimeError> {
-    let property_filters = vec![
+    let base_filters = vec![
         PropertyFilter {
             json_path: "$.direction".to_string(),
             op: FilterOp::Eq,
@@ -868,37 +868,50 @@ async fn count_unread_messages(
             op: FilterOp::JsonTypeNeMissing,
             value: SqlValue::Text("true".to_string()),
         },
-        // ADR-057 Q3: EqOrMissing so legacy to_actor-less messages still count
-        // (same visibility rule `inbox` applies).
-        PropertyFilter {
-            json_path: "$.to_actor".to_string(),
-            op: FilterOp::EqOrMissing,
-            value: SqlValue::Text(caller_actor.to_string()),
-        },
     ];
-
-    let filter = NoteFilter {
-        kind: Some("message".to_string()),
-        property_filters,
-        order_by: None,
-        ..Default::default()
+    let count_filter = |op| {
+        let mut property_filters = base_filters.clone();
+        property_filters.push(PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op,
+            value: SqlValue::Text(caller_actor.to_string()),
+        });
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters,
+            order_by: None,
+            ..Default::default()
+        }
     };
-    // A bounded fetch, not an aggregate: `query_notes_filtered_bounded`
-    // reads at most cap + 1 rows and runs no `COUNT(*)`, so the worst-case
-    // work per call is fixed by the cap and independent of backlog size. An
-    // exact count here would pay backlog-proportional work on every poll —
-    // the unread badge needs fidelity near zero, not at pathological backlog
-    // sizes, so a backlog at or past the cap reports the cap itself
-    // (documented as "at least this many").
-    let rows = store
-        .query_notes_filtered_bounded(namespace, &filter, UNREAD_COUNT_SCAN_CAP)
-        .await?;
-    Ok(rows.len().min(UNREAD_COUNT_SCAN_CAP as usize) as u64)
+    // Count addressed rows through the recipient-keyed partial index, then
+    // add legacy rows whose addressee is absent. Both populations are
+    // unread-only, so neither query scans read or deleted mailbox history.
+    let exact = store
+        .query_notes_filtered(
+            namespace,
+            &count_filter(FilterOp::EqOrMissingIndexed),
+            PageRequest {
+                limit: 0,
+                offset: 0,
+            },
+        )
+        .await?
+        .total
+        .unwrap_or(0);
+    let legacy = store
+        .query_notes_filtered(
+            namespace,
+            &count_filter(FilterOp::JsonTypeMissing),
+            PageRequest {
+                limit: 0,
+                offset: 0,
+            },
+        )
+        .await?
+        .total
+        .unwrap_or(0);
+    Ok(exact + legacy)
 }
-
-/// Upper bound on the unread-count scan (`count_unread_messages`). At or
-/// past this backlog the reported `unread_count` saturates at the bound.
-const UNREAD_COUNT_SCAN_CAP: u32 = 1_000;
 
 /// `read` — mark a message as read.
 pub(crate) async fn handle_read(

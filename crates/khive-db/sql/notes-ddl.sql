@@ -29,9 +29,10 @@ CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
 -- JsonTypeNeMissing filter op generates (with the json_type value inlined
 -- as a literal -- a bound parameter cannot prove implication at plan time),
 -- and its third key column is the exact `ifnull(...)` expression the
--- EqOrMissing filter op generates for the recipient, so the planner serves
--- unread scans from only the caller's own unread rows (plus legacy
--- recipient-less rows): work is proportional to the caller's unread set,
+-- EqOrMissingIndexed filter op generates for the recipient, so the planner serves
+-- unread scans from only the caller's own unread rows. Generic EqOrMissing
+-- remains available for legacy recipient-less visibility: work is proportional
+-- to the unread set,
 -- never to other actors' backlog and never to total mailbox size. The
 -- superseded recipient-blind shape is dropped by name (a no-op once gone).
 DROP INDEX IF EXISTS idx_notes_unread_probe;

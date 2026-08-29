@@ -1018,6 +1018,57 @@ fn make_note_with_props(
 }
 
 #[tokio::test]
+async fn eq_or_missing_does_not_match_present_empty_string() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+    use khive_storage::types::{PageRequest, SqlValue};
+
+    let store = setup_memory_store();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "present empty",
+            serde_json::json!({"to_actor": ""}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "absent",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op: FilterOp::EqOrMissing,
+            value: SqlValue::Text("actor:a".to_string()),
+        }],
+        ..Default::default()
+    };
+    let page = store
+        .query_notes_filtered(
+            "default",
+            &filter,
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.total, Some(1));
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].content, "absent");
+}
+
+#[tokio::test]
 async fn test_filtered_namespace_and_kind_isolation() {
     let store = setup_memory_store();
     use khive_storage::note::PropertyFilter as NotePropFilter;
@@ -2174,7 +2225,7 @@ async fn unread_probe_query_uses_partial_index() {
             },
             NotePropFilter {
                 json_path: "$.to_actor".to_string(),
-                op: FilterOp::EqOrMissing,
+                op: FilterOp::EqOrMissingIndexed,
                 value: SqlValue::Text("actor:a".to_string()),
             },
         ],
@@ -2236,7 +2287,7 @@ async fn unread_probe_query_uses_partial_index() {
 /// The unread probe's work must scale with the CALLER's unread set, not
 /// with other recipients' backlog: the recipient key column on
 /// `idx_notes_unread_probe_recipient` (the exact `ifnull(...)` expression
-/// EqOrMissing generates) lets the planner exclude other actors' rows
+/// EqOrMissingIndexed generates) lets the planner exclude other actors' rows
 /// inside the index. Grow an irrelevant recipient's unread backlog 10x and
 /// assert the probe's VM step count stays flat — a recipient-blind scan
 /// (the shape this test pins against) grows those steps roughly 10x.
@@ -2309,7 +2360,7 @@ async fn unread_probe_work_is_bounded_by_callers_own_unread_rows() {
             },
             NotePropFilter {
                 json_path: "$.to_actor".to_string(),
-                op: FilterOp::EqOrMissing,
+                op: FilterOp::EqOrMissingIndexed,
                 value: SqlValue::Text("actor:a".to_string()),
             },
         ],

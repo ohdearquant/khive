@@ -10269,6 +10269,43 @@ async fn i1931_inbox_unread_count_is_mailbox_wide() {
     }
 }
 
+#[tokio::test]
+async fn i1931_inbox_unread_count_does_not_saturate_at_old_probe_cap() {
+    let backend = shared_backend();
+    let (_registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, rt_b) = build_actor_registry(backend, "lambda:b");
+
+    let token_b = rt_b
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize actor b");
+    let store_b = rt_b.notes(&token_b).expect("notes store");
+    let notes = (0..1_001)
+        .map(|index| {
+            Note::new("local", "message", format!("unread {index}")).with_properties(
+                serde_json::json!({
+                    "direction": "inbound",
+                    "to_actor": "lambda:b",
+                }),
+            )
+        })
+        .collect();
+    let summary = store_b
+        .upsert_notes(notes)
+        .await
+        .expect("seed unread mailbox");
+    assert_eq!(summary.failed, 0, "unread seed failures: {summary:?}");
+
+    let inbox = registry_b
+        .dispatch("comm.inbox", serde_json::json!({ "limit": 1 }))
+        .await
+        .expect("inbox succeeds");
+    assert_eq!(inbox["count"], 1);
+    assert_eq!(
+        inbox["unread_count"], 1_001,
+        "unread_count must remain exact beyond the removed probe cap"
+    );
+}
+
 /// `limit=0` is the count-only inbox path: it returns no message payloads but still reports the caller's real unread total.
 #[tokio::test]
 async fn i66_inbox_limit_zero_carries_real_unread_count() {

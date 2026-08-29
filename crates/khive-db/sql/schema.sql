@@ -229,7 +229,7 @@ CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
 -- Kept in sync with notes-ddl.sql (see the rationale there): partial
 -- unread-probe index whose WHERE clause byte-matches the inlined
 -- JsonTypeNeMissing predicate and whose recipient key column byte-matches
--- the EqOrMissing `ifnull(...)` expression.
+-- the EqOrMissingIndexed `ifnull(...)` expression.
 DROP INDEX IF EXISTS idx_notes_unread_probe;
 CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient
     ON notes(namespace, kind,
