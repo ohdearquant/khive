@@ -1183,6 +1183,68 @@ async fn get_rejects_ambiguous_prefix_across_distinct_knowledge_records() {
 }
 
 #[tokio::test]
+async fn get_prefix_range_preserves_boundaries_ambiguity_and_not_found() {
+    const IDS: [&str; 4] = [
+        "0abcdefe-ffff-4fff-8fff-ffffffffffff",
+        "0abcdeff-0000-4000-8000-000000000001",
+        "0abcdeff-1000-4000-8000-000000000002",
+        "0abcdf00-0000-4000-8000-000000000003",
+    ];
+
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let statements = IDS
+        .iter()
+        .enumerate()
+        .map(|(index, id)| SqlStatement {
+            sql: "INSERT INTO knowledge_atoms \
+                  (id, namespace, slug, name, content, created_at, updated_at) \
+                  VALUES (?1, 'local', ?2, ?3, 'range control content', 1, 1)"
+                .into(),
+            params: vec![
+                SqlValue::Text((*id).into()),
+                SqlValue::Text(format!("range-control-{index}")),
+                SqlValue::Text(format!("Range Control {index}")),
+            ],
+            label: Some("test.knowledge_get.range_control".into()),
+        })
+        .collect();
+    let mut writer = runtime.sql().writer().await.expect("knowledge writer");
+    writer
+        .execute_batch(statements)
+        .await
+        .expect("seed range controls");
+    drop(writer);
+
+    let unique = f
+        .dispatch("knowledge.get", json!({ "id": "0abcdeff0" }))
+        .await
+        .expect("ninth compact digit must exclude adjacent UUIDs");
+    assert_eq!(unique["id"], IDS[1]);
+
+    let ambiguous = f
+        .dispatch("knowledge.get", json!({ "id": "0abcdeff" }))
+        .await
+        .expect_err("both UUIDs inside the eight-digit range must be ambiguous");
+    assert!(
+        matches!(
+            ambiguous,
+            RuntimeError::AmbiguousPrefix { ref matches, .. } if matches.len() == 2
+        ),
+        "the two in-range records must remain ambiguous: {ambiguous:?}"
+    );
+
+    let missing = f
+        .dispatch("knowledge.get", json!({ "id": "0abcdeff2" }))
+        .await
+        .expect_err("adjacent UUIDs must not become prefix hits");
+    assert!(
+        matches!(missing, RuntimeError::InvalidInput(ref message) if message.contains("no knowledge record matches prefix")),
+        "a range containing only adjacent UUIDs must remain not found: {missing:?}"
+    );
+}
+
+#[tokio::test]
 async fn get_by_id_is_namespace_agnostic_and_loads_sections_from_stored_namespace() {
     let f = pack(rt());
     let foreign_namespace = "identifier-contract-foreign";
@@ -1840,6 +1902,7 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
     let rt = KhiveRuntime::new(RuntimeConfig {
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
         db_path: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
@@ -3998,6 +4061,7 @@ mod kg_blend {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -4628,6 +4692,7 @@ mod kg_blend {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),

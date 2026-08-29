@@ -6,11 +6,40 @@ import { join } from "@std/path";
 import { assertEquals, assertMatch } from "@std/assert";
 
 const CLI_ENTRY = new URL("../main.ts", import.meta.url).pathname;
+const NULL_DEVICE = Deno.build.os === "windows" ? "NUL" : "/dev/null";
 
 export interface CliResult {
   code: number;
   stdout: string;
   stderr: string;
+}
+
+export function isolatedTestEnv(
+  base: Record<string, string> = Deno.env.toObject(),
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(base)) {
+    // Command-scope config (GIT_CONFIG_COUNT/KEY_*/VALUE_* and the older
+    // GIT_CONFIG_PARAMETERS list) bypasses the global/system file overrides
+    // below, and GIT_TEMPLATE_DIR can seed hooks at `git init` — drop every
+    // inherited config-injection variable.
+    if (
+      key === "GIT_CONFIG_COUNT" ||
+      key === "GIT_CONFIG_PARAMETERS" ||
+      key === "GIT_TEMPLATE_DIR" ||
+      key.startsWith("GIT_CONFIG_KEY_") ||
+      key.startsWith("GIT_CONFIG_VALUE_")
+    ) {
+      continue;
+    }
+    env[key] = value;
+  }
+  return {
+    ...env,
+    NO_COLOR: "1",
+    GIT_CONFIG_GLOBAL: NULL_DEVICE,
+    GIT_CONFIG_SYSTEM: NULL_DEVICE,
+  };
 }
 
 /**
@@ -22,7 +51,10 @@ export async function runCli(args: string[]): Promise<CliResult> {
     args: ["run", "--allow-all", CLI_ENTRY, ...args],
     stdout: "piped",
     stderr: "piped",
-    env: { ...Deno.env.toObject(), NO_COLOR: "1" },
+    // clearEnv keeps Deno from merging the parent environment back in —
+    // without it, inherited GIT_CONFIG_PARAMETERS survives the sanitized map.
+    clearEnv: true,
+    env: isolatedTestEnv(),
   });
   const { code, stdout, stderr } = await cmd.output();
   return {
@@ -102,24 +134,31 @@ edge_relations:
  */
 export async function makeTempRepo(): Promise<TempRepo> {
   const root = await Deno.makeTempDir({ prefix: "khive_test_" });
+  const env = isolatedTestEnv();
 
   // Init git repo
   await new Deno.Command("git", {
     args: ["init", root],
     stdout: "null",
     stderr: "null",
+    clearEnv: true,
+    env,
   }).output();
 
   await new Deno.Command("git", {
     args: ["-C", root, "config", "user.email", "test@test.com"],
     stdout: "null",
     stderr: "null",
+    clearEnv: true,
+    env,
   }).output();
 
   await new Deno.Command("git", {
     args: ["-C", root, "config", "user.name", "Test"],
     stdout: "null",
     stderr: "null",
+    clearEnv: true,
+    env,
   }).output();
 
   // Create .khive/kg/ structure
@@ -134,12 +173,16 @@ export async function makeTempRepo(): Promise<TempRepo> {
     args: ["-C", root, "add", "-A"],
     stdout: "null",
     stderr: "null",
+    clearEnv: true,
+    env,
   }).output();
 
   await new Deno.Command("git", {
     args: ["-C", root, "commit", "-m", "init", "--no-gpg-sign"],
     stdout: "null",
     stderr: "null",
+    clearEnv: true,
+    env,
   }).output();
 
   return {
@@ -157,7 +200,8 @@ export async function runCliIn(cwd: string, args: string[]): Promise<CliResult> 
     cwd,
     stdout: "piped",
     stderr: "piped",
-    env: { ...Deno.env.toObject(), NO_COLOR: "1" },
+    clearEnv: true,
+    env: isolatedTestEnv(),
   });
   const { code, stdout, stderr } = await cmd.output();
   return {
