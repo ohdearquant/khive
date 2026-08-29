@@ -292,14 +292,16 @@ partial-override mode.
 
 ## Stdio bridge session lifetime
 
-Three environment variables bound how long a stdio bridge session and its
-individual writes may live. They are read once at serve time.
+Four environment variables bound how long a stdio bridge session and its
+individual writes may live, or how many requests it can admit at once. They
+are read once at serve time.
 
 | Variable                               | Default      | Effect                                                                                                                                                                                                |
 | -------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`       | **disabled** | When set to a positive number, a session that receives no request for this many seconds closes, releasing its reader-pool admission and DB connection. `0`, absent, or unparsable leaves it disabled. |
 | `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`  | `300`        | The longest a single response write may stay pending before it is abandoned and the session closes. `0` is rejected at startup rather than treated as an opt-out.                                     |
 | `KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS` | `3600`       | How long an admitted request whose response has not been written keeps deferring the idle close. Only reached when the idle timeout is enabled. `0` restores an unbounded defer.                      |
+| `KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS`| `1024`       | Maximum requests admitted to rmcp while their responses remain outstanding. A full session closes before another handler is spawned. `0` or an unparsable value uses the default.                 |
 
 **Idle reaping is off by default, and that is deliberate.**
 [ADR-091](adr/ADR-091-wal-snapshot-lifetime.md) rejects closing long-lived
@@ -309,6 +311,13 @@ no signal separating an abandoned pipe from a live client that has simply not
 been asked anything, so enabling the idle timeout by default would reverse that
 decision. Turn it on where session churn is cheap and a pinned WAL connection
 is not: a supervised deployment, a CI harness, a batch runner.
+
+The outstanding-request limit applies per stdio session and is independent of
+the idle and response deadlines. The default of 1024 allows ordinary
+concurrent MCP traffic while ensuring that a peer that stops reading cannot
+make the session's handler and request-obligation state grow without bound.
+Raise or lower it with `KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS` when the
+deployment's concurrency and memory budget require a different bound.
 
 **A session also closes on a duplicate outstanding request id.** MCP requires a
 request id to be unused within a session, and this transport tracks outstanding

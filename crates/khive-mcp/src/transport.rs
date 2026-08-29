@@ -5,13 +5,156 @@
 //! transports (e.g. Streamable HTTP) register with [`TransportRegistry::register`]
 //! before serving, so the serve path never hard-codes a transport enum.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
 
 use crate::server::KhiveMcpServer;
+
+type RequestId = rmcp::model::RequestId;
+
+/// Outstanding request obligations in admission order.
+///
+/// The map makes duplicate detection and retirement O(1) on average. Each
+/// entry also links its predecessor and successor, so the linked ordering
+/// structure makes stale-obligation expiry deadline-ordered without requiring
+/// a linear scan when a response retires a newer request.
+#[derive(Default)]
+pub(crate) struct OutstandingRequests {
+    entries: HashMap<RequestId, OutstandingRequest>,
+    oldest: Option<RequestId>,
+    newest: Option<RequestId>,
+}
+
+struct OutstandingRequest {
+    admitted_at: Instant,
+    previous: Option<RequestId>,
+    next: Option<RequestId>,
+}
+
+impl OutstandingRequests {
+    fn admit(&mut self, id: RequestId, admitted_at: Instant, capacity: usize) -> bool {
+        if self.entries.contains_key(&id) || self.entries.len() >= capacity {
+            return false;
+        }
+
+        let previous = self.newest.clone();
+        if let Some(previous_id) = previous.as_ref() {
+            self.entries
+                .get_mut(previous_id)
+                .expect("newest obligation must remain in the map")
+                .next = Some(id.clone());
+        } else {
+            self.oldest = Some(id.clone());
+        }
+        self.newest = Some(id.clone());
+        self.entries.insert(
+            id,
+            OutstandingRequest {
+                admitted_at,
+                previous,
+                next: None,
+            },
+        );
+        true
+    }
+
+    fn contains(&self, id: &RequestId) -> bool {
+        self.entries.contains_key(id)
+    }
+
+    fn retire(&mut self, id: &RequestId) {
+        let Some(obligation) = self.entries.remove(id) else {
+            return;
+        };
+
+        if let Some(previous_id) = obligation.previous.as_ref() {
+            self.entries
+                .get_mut(previous_id)
+                .expect("previous obligation must remain in the map")
+                .next = obligation.next.clone();
+        } else {
+            self.oldest = obligation.next.clone();
+        }
+
+        if let Some(next_id) = obligation.next.as_ref() {
+            self.entries
+                .get_mut(next_id)
+                .expect("next obligation must remain in the map")
+                .previous = obligation.previous.clone();
+        } else {
+            self.newest = obligation.previous;
+        }
+    }
+
+    fn drop_stale(&mut self, obligation_ttl: Option<std::time::Duration>) {
+        let Some(ttl) = obligation_ttl else {
+            return;
+        };
+
+        while let Some(oldest_id) = self.oldest.clone() {
+            let stale = self
+                .entries
+                .get(&oldest_id)
+                .is_some_and(|obligation| obligation.admitted_at.elapsed() >= ttl);
+            if !stale {
+                break;
+            }
+            self.retire(&oldest_id);
+        }
+    }
+
+    fn newest_admitted_at(&self) -> Option<Instant> {
+        self.newest
+            .as_ref()
+            .and_then(|id| self.entries.get(id))
+            .map(|obligation| obligation.admitted_at)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn front(&self) -> Option<(RequestId, Instant)> {
+        self.oldest.as_ref().and_then(|id| {
+            self.entries
+                .get(id)
+                .map(|obligation| (id.clone(), obligation.admitted_at))
+        })
+    }
+}
+
+struct ObligationRetirementGuard {
+    in_flight: Arc<Mutex<OutstandingRequests>>,
+    id: Option<RequestId>,
+    obligation_ttl: Option<std::time::Duration>,
+}
+
+impl ObligationRetirementGuard {
+    fn retire(&mut self) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        if let Ok(mut outstanding) = self.in_flight.lock() {
+            outstanding.retire(&id);
+            outstanding.drop_stale(self.obligation_ttl);
+        }
+    }
+}
+
+impl Drop for ObligationRetirementGuard {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
 
 /// Cancels rmcp's root service token before reporting transport EOF — and,
 /// with an idle timeout configured, before reporting a synthetic EOF when no
@@ -104,14 +247,18 @@ pub(crate) struct CancelOnEofTransport<T> {
     /// request's admission and leave a *completed* one as the newest entry —
     /// making the freshness test below read the completed request's timestamp
     /// and defer past the older obligation's TTL. Removing the entry whose id
-    /// matches keeps `back()` the genuinely newest outstanding admission,
+    /// matches keeps the linked list's newest entry genuinely outstanding,
     /// which is what the freshness rule assumes.
     ///
     /// Because retirement is keyed, a request that never produces a response
     /// would hold its entry for the life of the session. Entries past
-    /// `obligation_ttl` are therefore dropped whenever this queue is touched;
-    /// see [`drop_stale_obligations`].
-    in_flight: Arc<Mutex<VecDeque<(rmcp::model::RequestId, Instant)>>>,
+    /// `obligation_ttl` are therefore dropped whenever this tracker is
+    /// touched.
+    in_flight: Arc<Mutex<OutstandingRequests>>,
+    /// Maximum number of requests admitted to rmcp without a completed
+    /// response. Reaching this bound closes the session before another
+    /// handler can be spawned.
+    max_outstanding_requests: usize,
     /// How long an outstanding request keeps deferring the idle close. `None`
     /// defers without bound. See the type doc.
     obligation_ttl: Option<std::time::Duration>,
@@ -133,6 +280,7 @@ impl<T> CancelOnEofTransport<T> {
     /// bound, which is only safe where `idle_timeout` is also `None`, because
     /// a handler that panics never produces the response that would clear the
     /// obligation (see the type doc).
+    #[cfg(test)]
     pub(crate) fn with_idle_timeout(
         inner: T,
         root: tokio_util::sync::CancellationToken,
@@ -140,51 +288,63 @@ impl<T> CancelOnEofTransport<T> {
         response_deadline: Option<std::time::Duration>,
         obligation_ttl: Option<std::time::Duration>,
     ) -> Self {
+        Self::with_idle_timeout_and_max_outstanding(
+            inner,
+            root,
+            idle_timeout,
+            response_deadline,
+            obligation_ttl,
+            DEFAULT_MAX_OUTSTANDING_REQUESTS,
+        )
+    }
+
+    pub(crate) fn with_idle_timeout_and_max_outstanding(
+        inner: T,
+        root: tokio_util::sync::CancellationToken,
+        idle_timeout: Option<std::time::Duration>,
+        response_deadline: Option<std::time::Duration>,
+        obligation_ttl: Option<std::time::Duration>,
+        max_outstanding_requests: usize,
+    ) -> Self {
+        assert!(
+            max_outstanding_requests > 0,
+            "maximum outstanding requests must be positive"
+        );
         Self {
             inner,
             root,
             idle_timeout,
             response_deadline,
-            in_flight: Arc::new(Mutex::new(VecDeque::new())),
+            in_flight: Arc::new(Mutex::new(OutstandingRequests::default())),
+            max_outstanding_requests,
             obligation_ttl,
         }
     }
 
-    /// The obligation queue, for tests that need to observe its size.
+    /// The outstanding-obligation tracker, for tests that need to observe it.
     #[cfg(test)]
-    pub(crate) fn in_flight_handle(
-        &self,
-    ) -> Arc<Mutex<VecDeque<(rmcp::model::RequestId, Instant)>>> {
+    pub(crate) fn in_flight_handle(&self) -> Arc<Mutex<OutstandingRequests>> {
         self.in_flight.clone()
     }
 }
 
-/// Drops obligations that are already past their TTL.
-///
-/// An entry older than `obligation_ttl` is, by this transport's own rule, no
-/// longer evidence of life: the freshness check will not defer on it. Keeping
-/// it buys nothing, and keeping it *forever* is a real cost, because
-/// retirement is keyed by request id and so only ever removes the entry whose
-/// response was actually written. A request that never produces one — a
-/// handler that panics, a request the peer cancels — would otherwise hold its
-/// entry for the life of the session, and a long-lived session accumulates one
-/// per such request without bound.
-///
-/// Entries are pushed in admission order, so the stale ones are a prefix.
-///
-/// With no TTL configured there is no notion of staleness and nothing is
-/// dropped. That is the configuration which already restores the unbounded
-/// defer (see the type doc), so it is unbounded in the same way for the same
-/// reason.
-fn drop_stale_obligations(
-    queue: &mut VecDeque<(rmcp::model::RequestId, Instant)>,
-    obligation_ttl: Option<std::time::Duration>,
-) {
-    let Some(ttl) = obligation_ttl else {
-        return;
-    };
-    while queue.front().is_some_and(|(_, at)| at.elapsed() >= ttl) {
-        queue.pop_front();
+/// Default per-session cap for requests whose responses have not finished
+/// writing. The server can raise or lower it through its environment setting.
+pub(crate) const DEFAULT_MAX_OUTSTANDING_REQUESTS: usize = 1024;
+
+#[cfg(test)]
+mod outstanding_request_tests {
+    use super::*;
+
+    #[test]
+    fn outstanding_request_tracker_rejects_admission_past_capacity() {
+        let mut outstanding = OutstandingRequests::default();
+        let admitted_at = Instant::now();
+
+        assert!(outstanding.admit(rmcp::model::RequestId::Number(1), admitted_at, 2,));
+        assert!(outstanding.admit(rmcp::model::RequestId::Number(2), admitted_at, 2,));
+        assert!(!outstanding.admit(rmcp::model::RequestId::Number(3), admitted_at, 2,));
+        assert_eq!(outstanding.len(), 2);
     }
 }
 
@@ -300,8 +460,16 @@ where
         let root = self.root.clone();
         let response_deadline = self.response_deadline;
         let obligation_ttl = self.obligation_ttl;
+        let retirement = retire_id.map(|id| ObligationRetirementGuard {
+            in_flight,
+            id: Some(id),
+            obligation_ttl,
+        });
         let send = self.inner.send(item);
         async move {
+            // The guard retires the matching id both after a resolved write and
+            // if rmcp cancels/drops this send future before it resolves.
+            let _retirement = retirement;
             let result = match (is_response, response_deadline) {
                 (true, Some(deadline)) => match tokio::time::timeout(deadline, send).await {
                     Ok(result) => result,
@@ -349,19 +517,6 @@ where
                     root.cancel();
                 }
             }
-            // Clear THIS request's obligation once the write is resolved
-            // either way — see the `in_flight` field doc for why a failed
-            // write must not be left permanently counted as pending, and why
-            // the entry removed has to be the matching one rather than the
-            // oldest. An id-less error matches nothing and removes nothing.
-            if let Ok(mut q) = in_flight.lock() {
-                if let Some(id) = retire_id {
-                    if let Some(position) = q.iter().position(|(entry, _)| *entry == id) {
-                        q.remove(position);
-                    }
-                }
-                drop_stale_obligations(&mut q, obligation_ttl);
-            }
             result
         }
     }
@@ -374,6 +529,7 @@ where
         let idle_timeout = self.idle_timeout;
         let in_flight = self.in_flight.clone();
         let obligation_ttl = self.obligation_ttl;
+        let max_outstanding_requests = self.max_outstanding_requests;
         async move {
             // Created once and reused across every retry below: `select!`ing
             // a *fresh* `self.inner.receive()` each time the idle sleep wins
@@ -420,7 +576,7 @@ where
                                 let fresh = in_flight
                                     .lock()
                                     .ok()
-                                    .and_then(|q| q.back().map(|(_, at)| *at))
+                                    .and_then(|q| q.newest_admitted_at())
                                     .is_some_and(|newest| match obligation_ttl {
                                         Some(ttl) => newest.elapsed() < ttl,
                                         None => true,
@@ -487,13 +643,18 @@ where
                 // nothing a conforming peer can notice, because an id whose
                 // response WAS written is not in the queue at all.
                 let mut duplicate_id = None;
+                let mut capacity_exceeded = false;
                 if let Some(rmcp::model::JsonRpcMessage::Request(request)) = &message {
                     if let Ok(mut q) = in_flight.lock() {
-                        if q.iter().any(|(entry, _)| *entry == request.id) {
+                        if q.contains(&request.id) {
                             duplicate_id = Some(request.id.clone());
                         } else {
-                            drop_stale_obligations(&mut q, obligation_ttl);
-                            q.push_back((request.id.clone(), Instant::now()));
+                            q.drop_stale(obligation_ttl);
+                            capacity_exceeded = !q.admit(
+                                request.id.clone(),
+                                Instant::now(),
+                                max_outstanding_requests,
+                            );
                         }
                     }
                 }
@@ -503,6 +664,14 @@ where
                         "stdio bridge received a request whose id already has an outstanding \
                          obligation; the response could not be attributed to either, so this \
                          session is closed rather than left with corrupt lifetime accounting"
+                    );
+                    root.cancel();
+                    return None;
+                }
+                if capacity_exceeded {
+                    tracing::warn!(
+                        max_outstanding_requests,
+                        "stdio bridge reached its outstanding request limit; closing the session"
                     );
                     root.cancel();
                     return None;

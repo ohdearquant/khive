@@ -1087,6 +1087,23 @@ fn stdio_bridge_request_obligation_ttl_from_env() -> Option<std::time::Duration>
     }
 }
 
+/// Maximum number of requests a stdio bridge admits to rmcp while their
+/// responses are still outstanding. A full session is closed before another
+/// handler is spawned, bounding the per-session handler and obligation state.
+///
+/// Overridable via `KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS`. Values must be
+/// positive; `0`, an unparsable value, or a value too large for this platform
+/// falls back to the default. Default: 1024, enough for ordinary concurrent
+/// MCP traffic while keeping a peer that stops reading from growing the
+/// session without limit.
+fn stdio_bridge_max_outstanding_requests_from_env() -> usize {
+    std::env::var("KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(crate::transport::DEFAULT_MAX_OUTSTANDING_REQUESTS)
+}
+
 /// Response-delivery deadline for a stdio bridge session: the longest a
 /// single response write may stay pending before it is abandoned (see
 /// [`crate::transport::CancelOnEofTransport::send`]) and this session is
@@ -1546,9 +1563,10 @@ impl KhiveMcpServer {
         let root = tokio_util::sync::CancellationToken::new();
         let idle_timeout = stdio_bridge_idle_timeout_from_env();
         let response_deadline = stdio_bridge_response_deadline_from_env()?;
+        let max_outstanding_requests = stdio_bridge_max_outstanding_requests_from_env();
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
-            crate::transport::CancelOnEofTransport::with_idle_timeout(
+            crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
                 crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
                     read, write,
                 )),
@@ -1556,6 +1574,7 @@ impl KhiveMcpServer {
                 idle_timeout,
                 Some(response_deadline),
                 stdio_bridge_request_obligation_ttl_from_env(),
+                max_outstanding_requests,
             )
         };
 
@@ -1595,13 +1614,15 @@ impl KhiveMcpServer {
         let root = tokio_util::sync::CancellationToken::new();
         let (read, write) = stdio();
         let response_deadline = stdio_bridge_response_deadline_from_env()?;
-        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
-            AsyncRwTransport::new_server(read, write),
-            root.clone(),
-            stdio_bridge_idle_timeout_from_env(),
-            Some(response_deadline),
-            stdio_bridge_request_obligation_ttl_from_env(),
-        );
+        let transport =
+            crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
+                AsyncRwTransport::new_server(read, write),
+                root.clone(),
+                stdio_bridge_idle_timeout_from_env(),
+                Some(response_deadline),
+                stdio_bridge_request_obligation_ttl_from_env(),
+                stdio_bridge_max_outstanding_requests_from_env(),
+            );
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
         Ok(())
@@ -7889,6 +7910,63 @@ mod request_read_cancellation_tests {
              per admission, and would keep growing for as long as the session lives.",
             ADMISSION_GAP.as_millis(),
             OBLIGATION_TTL.as_millis(),
+        );
+
+        drop(client_io);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: a peer that keeps sending requests without consuming
+    /// responses cannot make the transport's outstanding state grow without
+    /// limit. The third request is rejected before rmcp can spawn its handler.
+    #[tokio::test]
+    async fn stdio_closes_when_outstanding_request_limit_is_reached() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const MAX_OUTSTANDING: usize = 2;
+        let probe = SlowProbeServer {
+            started: Arc::new(tokio::sync::Notify::new()),
+            delay: Duration::from_secs(3600),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport =
+            crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
+                AsyncRwTransport::new_server(server_read, server_write),
+                root.clone(),
+                None,
+                None,
+                Some(Duration::from_secs(3600)),
+                MAX_OUTSTANDING,
+            );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        for id in 1..=MAX_OUTSTANDING + 1 {
+            let request = format!(
+                "{}\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {"name": "probe", "arguments": {}}
+                })
+            );
+            client_io
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), root.cancelled())
+            .await
+            .expect("the transport must close after reaching its admission limit");
+        assert_eq!(
+            obligations.lock().expect("obligation queue poisoned").len(),
+            MAX_OUTSTANDING,
+            "the rejected request must not enter the outstanding tracker"
         );
 
         drop(client_io);
