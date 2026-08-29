@@ -1031,7 +1031,7 @@ fn check_entropy_heuristic<'a>(
             // docs/api/secret_gate.md#check_entropy_heuristic--per-token-flagging-sequence
             // for the exact guarantee and its accepted residual (same-uid-host) limits.
             if !vcs_reference_exempt && tokens.len() > 1 {
-                let fragments = bridge_fragment_chain(&tokens, text, idx);
+                let fragments = bridge_fragment_chain(tokens, text, idx);
                 if fragments.len() > 1 {
                     let hex_probe = fragments.join(" ");
                     if contains_normalized_hex_credential(&hex_probe) {
