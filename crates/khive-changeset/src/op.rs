@@ -228,7 +228,9 @@ pub enum UpdatePatch {
     Edge(EdgePatch),
 }
 
-/// Entity fields to mutate; absent means unchanged and `Some(None)` clears description.
+/// Entity fields to mutate; absent means unchanged and `Some(None)` clears
+/// a nullable field (ADR-014 tri-state, applied to `description` and
+/// `entity_type`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntityPatch {
@@ -240,6 +242,8 @@ pub struct EntityPatch {
     pub properties: Option<BTreeMap<String, PropertyValue>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_opt")]
+    pub entity_type: Option<Option<String>>,
 }
 
 /// Note fields to mutate; nested options distinguish unchanged, clear, and set.
@@ -350,6 +354,8 @@ pub struct EntityPreimage {
     pub properties: Option<BTreeMap<String, PropertyValue>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_opt")]
+    pub entity_type: Option<Option<String>>,
 }
 
 /// Prior note values for exactly the fields touched by [`NotePatch`].
@@ -410,6 +416,11 @@ fn validate_update_congruence(
                 pre.properties.is_some(),
             )?;
             check_touched("tags", p.tags.is_some(), pre.tags.is_some())?;
+            check_touched(
+                "entity_type",
+                p.entity_type.is_some(),
+                pre.entity_type.is_some(),
+            )?;
             Ok(())
         }
         (UpdatePatch::Note(p), UpdatePreimage::Note(pre)) => {
@@ -838,12 +849,14 @@ mod tests {
                 description: None,
                 properties: None,
                 tags: None,
+                entity_type: None,
             }),
             UpdatePreimage::Entity(EntityPreimage {
                 name: None,
                 description: None,
                 properties: None,
                 tags: None,
+                entity_type: None,
             }),
         );
         assert!(result.is_err());

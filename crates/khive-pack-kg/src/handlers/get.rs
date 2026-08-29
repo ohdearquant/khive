@@ -3,6 +3,7 @@
 use std::str::FromStr;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -213,8 +214,32 @@ impl KgPack {
 
     /// Fetch an event by ID without a namespace predicate (ADR-007 Rev 6 pattern).
     /// Only for by-ID `get`; event `list`/`query` surfaces must keep namespace scoping.
+    ///
+    /// When the events-daemon split (ADR-170) is active, the audit-batch
+    /// lane's rows live only in the sidecar events database, so a miss on
+    /// the legacy `events` table falls through to a read-only lookup there;
+    /// otherwise a sidecar-only event would be reported as not found.
     async fn get_event_unfiltered_by_id(&self, id: Uuid) -> Result<Option<Event>, RuntimeError> {
-        let sql = self.runtime.sql();
+        if let Some(event) = self
+            .get_event_unfiltered_via(self.runtime.sql(), id)
+            .await?
+        {
+            return Ok(Some(event));
+        }
+        let Some(sidecar) = self.runtime.events_sidecar_sql_read_only()? else {
+            return Ok(None);
+        };
+        self.get_event_unfiltered_via(sidecar, id).await
+    }
+
+    /// One unfiltered by-ID event lookup against a specific SQL store (the
+    /// legacy backend or the events-split sidecar; both carry the same
+    /// `events` schema).
+    async fn get_event_unfiltered_via(
+        &self,
+        sql: Arc<dyn khive_storage::SqlAccess>,
+        id: Uuid,
+    ) -> Result<Option<Event>, RuntimeError> {
         let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
         let row = reader
             .query_row(SqlStatement {

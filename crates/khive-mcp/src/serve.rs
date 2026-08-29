@@ -363,7 +363,7 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
     }
     if !admission.inbound_poll && !admission.outbound_delivery {
         tracing::info!(
-            "email channel loops: skipped (assigned comm and kg runtimes do not admit writes)"
+            "email channel loops: skipped (assigned comm runtime does not admit writes)"
         );
         return;
     }
@@ -388,6 +388,28 @@ fn start_daemon_components_if_daemon(
 ) -> usize {
     if !args.daemon {
         return 0;
+    }
+    // ADR-170: the main daemon supervises the events daemon — spawn it when
+    // the events socket is unreachable, respawn if it dies. Both paths come
+    // from the server's own resolved events-split config, so the supervised
+    // daemon and the forwarding clients cannot anchor at diverging paths;
+    // a socket is present exactly when this host upgraded to forwarding
+    // (`enable_events_forwarding_for_daemon`), and the `KHIVE_EVENTS_SPLIT=0`
+    // kill-switch already produced no split at resolution.
+    // A read-only deployment never supervises an events daemon: the
+    // supervised process opens the events sidecar writable, which would
+    // create and schema-initialize it on this deployment's behalf. The
+    // runtime side independently refuses to forward writes when its backend
+    // is read-only, so the two guards fail safe together.
+    #[cfg(unix)]
+    if server.default_runtime_is_read_only() {
+        tracing::info!("read-only deployment: events daemon supervision skipped");
+    } else if let Some(split) = server.events_split_config() {
+        if let Some(socket) = split.socket_path.clone() {
+            khive_runtime::daemon::track_background_task(
+                khive_runtime::events_split::supervise_events_daemon(split.db_path.clone(), socket),
+            );
+        }
     }
     crate::components::start_daemon_components_with_schedule(server, schedule_rt)
 }
@@ -435,7 +457,6 @@ fn spawn_email_channel_loops(
             let ingest_ns_clone = ingest_ns.clone();
             let default_actor_clone = default_actor.clone();
             let verb_reg_poll = verb_reg.clone();
-            let verb_reg_outbox = verb_reg.clone();
             let ingest_ns_outbox = ingest_ns.clone();
             let allowlist_clone = allowlist.clone();
             let mailbox_clone = mailbox.clone();
@@ -468,7 +489,6 @@ fn spawn_email_channel_loops(
                         Some(rt) => {
                             tokio::task::spawn(channel_outbox_loop(
                                 email_ch_clone,
-                                verb_reg_outbox,
                                 rt,
                                 ingest_ns_outbox,
                                 mailbox_clone,
@@ -478,8 +498,8 @@ fn spawn_email_channel_loops(
                         }
                         None => {
                             tracing::error!(
-                                "email outbox loop was NOT started: server has no KG-routed \
-                                 runtime handle, which the loop needs to claim external_id on \
+                                "email outbox loop was NOT started: server has no comm-routed \
+                                 runtime handle, which the loop needs to scan, claim, and mark \
                                  outbound notes; outbound mail will not be sent"
                             );
                         }
@@ -1340,16 +1360,24 @@ fn log_eligible_poll_failure(
 
 /// True if a note's `delivered_at` property marks it as already delivered.
 ///
-/// Must match the `list` query predicate's null handling (`list.rs`): a
-/// present-but-null `delivered_at` is undelivered, not delivered. Checking
-/// `.is_some()` alone would treat an explicit null (e.g. left by a curation
-/// `update`) as delivered and strand the note in the outbox forever.
+/// Must match the outbox-scan pending predicate
+/// (`list_undelivered_outbound_messages`): a present-but-null `delivered_at`
+/// is undelivered, not delivered (checking `.is_some()` alone would treat an
+/// explicit null — e.g. left by a curation `update` — as delivered and strand
+/// the note in the outbox forever), and a terminal `properties.delivery`
+/// state (`"delivered"` / `"failed"`, ADR-122 §1) is not pending even when
+/// `delivered_at` is absent.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) -> bool {
-    props
+    let delivered_at_set = props
         .get("delivered_at")
         .map(|v| !v.is_null())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let terminal_delivery = props
+        .get("delivery")
+        .and_then(|v| v.as_str())
+        .is_some_and(|state| state == "delivered" || state == "failed");
+    delivered_at_set || terminal_delivery
 }
 
 /// Background task that delivers undelivered outbound email notes every 5 seconds.
@@ -1359,18 +1387,18 @@ fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) ->
 /// `delivered_at` write causes a duplicate send on restart; the duplicate carries
 /// the same Message-ID so receiving MTAs typically collapse it.
 ///
-/// The `external_id` claim goes through `runtime`'s non-wire
-/// `claim_outbound_message_external_id` rather than a `registry.dispatch("update",
-/// ...)` call: `external_id` is one of the owner-established properties the
-/// generic `update` verb refuses to patch on a pack-owned note kind, so a caller
-/// patch through `dispatch` is rejected by design and would leave every note
-/// stuck retrying forever.
+/// Every storage touch (scan, `external_id` claim, `delivered_at` mark) goes
+/// through `runtime`'s non-wire owner-side APIs rather than
+/// `registry.dispatch(...)`: the generic wire verbs run on the kg pack's
+/// runtime, which under a `[packs.comm]` backend assignment is a different
+/// backend than the one holding comm's notes, and `external_id` is
+/// additionally one of the owner-established properties the generic `update`
+/// verb refuses to patch on a pack-owned note kind.
 ///
 /// Only compiled when the `channel-email` feature is enabled.
 #[cfg(feature = "channel-email")]
 async fn channel_outbox_loop(
     email_channel: std::sync::Arc<khive_channel_email::EmailChannel>,
-    registry: khive_runtime::VerbRegistry,
     runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
     mailbox: String,
@@ -1393,10 +1421,8 @@ async fn channel_outbox_loop(
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         channel_outbox_once(
             email_channel.as_ref(),
-            &registry,
             &runtime,
             &namespace,
-            &ingest_namespace,
             &mailbox,
             &domain,
             &allowlist,
@@ -1412,45 +1438,44 @@ async fn channel_outbox_loop(
 #[allow(clippy::too_many_arguments)]
 async fn channel_outbox_once(
     email_channel: &dyn khive_channel::Channel,
-    registry: &khive_runtime::VerbRegistry,
     runtime: &khive_runtime::KhiveRuntime,
     namespace: &khive_runtime::Namespace,
-    ingest_namespace: &str,
     mailbox: &str,
     domain: &str,
     allowlist: &[String],
 ) {
     use chrono::Utc;
     use khive_channel::ChannelEnvelope;
-    use serde_json::json;
 
-    // Query outbound messages via the registry. The note `list` handler applies
-    // the `direction` filter server-side (scanning up to its internal cap) and
-    // returns an `items` envelope of full note objects. There is no `delivered_at`
-    // or recipient-prefix filter, so the `email:` prefix and the
-    // already-delivered check are applied per-note below.
-    let list_params = json!({
-        "namespace": ingest_namespace,
-        "kind": "message",
-        "direction": "outbound",
-        "delivered": false,
-        "limit": 200,
-    });
-    let list_result = match registry.dispatch("list", list_params).await {
-        Ok(result) => result,
+    // Query outbound messages through the runtime's non-wire outbox scan.
+    // The generic wire `list` verb runs on the kg pack's runtime, which under
+    // a `[packs.comm]` backend assignment is not the backend holding comm's
+    // notes — the scan must use the comm-routed handle this loop was given.
+    // The `email:` prefix is applied INSIDE the scan (before its limit), so a
+    // backlog of another channel's pending rows cannot starve this one; the
+    // per-note checks below are defensive re-checks only.
+    let token = match runtime.authorize(namespace.clone()) {
+        Ok(token) => token,
         Err(error) => {
-            tracing::warn!(error = %error, "outbox loop: list failed");
+            tracing::warn!(error = %error, "outbox loop: namespace authorization failed");
             return;
         }
     };
-
-    let Some(notes) = list_result
-        .get("items")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return;
+    let notes = match runtime
+        .list_undelivered_outbound_messages(&token, Some("email:"), 200)
+        .await
+    {
+        Ok(notes) => notes,
+        Err(error) => {
+            tracing::warn!(error = %error, "outbox loop: outbox scan failed");
+            return;
+        }
     };
-    for note_val in notes {
+    let notes: Vec<serde_json::Value> = notes
+        .iter()
+        .filter_map(|note| serde_json::to_value(note).ok())
+        .collect();
+    for note_val in &notes {
         let props = match note_val.get("properties") {
             Some(serde_json::Value::Object(properties)) => properties.clone(),
             _ => continue,
@@ -1475,11 +1500,33 @@ async fn channel_outbox_once(
             .unwrap_or(to_actor.as_str())
             .to_string();
         if !allowlist.is_empty() && !allowlist.contains(&recipient) {
-            tracing::warn!(
-                note_id = %note_id,
-                recipient = %recipient,
-                "outbox loop: recipient not in allowlist; skipping"
-            );
+            // ADR-122 §2: an allowlist rejection is a PERMANENT failure and
+            // must be recorded — skipping with only a log line leaves the row
+            // pending forever while the sender saw `ok: true`.
+            let failed_at = Utc::now().to_rfc3339();
+            let last_error = format!("recipient {recipient} not in outbound allowlist");
+            let mark_result = match uuid::Uuid::parse_str(&note_id) {
+                Ok(uuid) => runtime
+                    .mark_outbound_message_failed(&token, uuid, failed_at, last_error.clone())
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                    "note id {note_id} is not a valid UUID: {error}"
+                ))),
+            };
+            match mark_result {
+                Ok(_) => tracing::warn!(
+                    note_id = %note_id,
+                    recipient = %recipient,
+                    "outbox loop: recipient not in allowlist; recorded permanent failure"
+                ),
+                Err(error) => tracing::warn!(
+                    note_id = %note_id,
+                    recipient = %recipient,
+                    error = %error,
+                    "outbox loop: recipient not in allowlist; failed to record failure (will re-encounter)"
+                ),
+            }
             continue;
         }
 
@@ -1505,25 +1552,18 @@ async fn channel_outbox_once(
             .and_then(|value| value.as_str())
             .map(str::to_string);
 
-        // Mint-before-send through the KG runtime's owner-only path. Generic
-        // `update` correctly refuses caller patches to `external_id`.
+        // Mint-before-send through the comm-routed runtime's owner-only path.
+        // Generic `update` correctly refuses caller patches to `external_id`.
         let message_id = match props.get("external_id").and_then(|value| value.as_str()) {
             Some(external_id) if !external_id.is_empty() => external_id.to_string(),
             _ => {
                 let message_id = format!("<{note_id}@{domain}>");
                 let claim_result = match uuid::Uuid::parse_str(&note_id) {
-                    Ok(uuid) => match runtime.authorize(namespace.clone()) {
-                        Ok(token) => {
-                            runtime
-                                .claim_outbound_message_external_id(
-                                    &token,
-                                    uuid,
-                                    message_id.clone(),
-                                )
-                                .await
-                        }
-                        Err(error) => Err(error),
-                    },
+                    Ok(uuid) => {
+                        runtime
+                            .claim_outbound_message_external_id(&token, uuid, message_id.clone())
+                            .await
+                    }
                     Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
                         "note id {note_id} is not a valid UUID: {error}"
                     ))),
@@ -1560,17 +1600,21 @@ async fn channel_outbox_once(
         match email_channel.send(envelope).await {
             Ok(()) => {
                 let delivered_at = Utc::now().to_rfc3339();
-                match registry
-                    .dispatch(
-                        "update",
-                        json!({
-                            "namespace": ingest_namespace,
-                            "id": note_id,
-                            "properties": { "delivered_at": delivered_at },
-                        }),
-                    )
-                    .await
-                {
+                let delivered_result = match uuid::Uuid::parse_str(&note_id) {
+                    Ok(uuid) => runtime
+                        .mark_outbound_message_delivered(
+                            &token,
+                            uuid,
+                            delivered_at,
+                            Some(message_id.clone()),
+                        )
+                        .await
+                        .map(|_| ()),
+                    Err(error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                        "note id {note_id} is not a valid UUID: {error}"
+                    ))),
+                };
+                match delivered_result {
                     Ok(_) => tracing::info!(
                         note_id = %note_id,
                         recipient = %recipient,
@@ -1595,8 +1639,8 @@ async fn channel_outbox_once(
 }
 
 /// Apply the same independent daemon/runtime admission as the email adapter:
-/// Telegram polling follows the comm runtime, while outbound delivery follows
-/// the kg runtime that must durably mark `delivered_at`.
+/// both Telegram polling and outbound delivery follow the comm runtime, which
+/// holds the message notes and durably marks delivery outcomes.
 #[cfg(feature = "channel-telegram")]
 fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
     let admission = channel_loop_plan(server, args);
@@ -1606,7 +1650,7 @@ fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) 
     }
     if !admission.inbound_poll && !admission.outbound_delivery {
         tracing::info!(
-            "telegram channel loops: skipped (assigned comm and kg runtimes do not admit writes)"
+            "telegram channel loops: skipped (assigned comm runtime does not admit writes)"
         );
         return;
     }
@@ -1646,7 +1690,7 @@ fn spawn_telegram_channel_loops(
             let ingest_ns = telegram_ingest_namespace_from_env();
 
             let verb_reg_poll = verb_reg.clone();
-            let verb_reg_outbox = verb_reg.clone();
+            let outbox_runtime = server.channel_outbox_runtime_clone();
             let ingest_ns_poll = ingest_ns.clone();
             let ingest_ns_outbox = ingest_ns.clone();
             let tg_ch_poll = Arc::clone(&tg_ch);
@@ -1668,12 +1712,23 @@ fn spawn_telegram_channel_loops(
                     tracing::info!("telegram channel polling loop started");
                 }
                 if admission.outbound_delivery {
-                    tokio::task::spawn(telegram_outbox_loop(
-                        tg_ch_outbox,
-                        verb_reg_outbox,
-                        ingest_ns_outbox,
-                    ));
-                    tracing::info!("telegram channel outbox loop started");
+                    match outbox_runtime {
+                        Some(rt) => {
+                            tokio::task::spawn(telegram_outbox_loop(
+                                tg_ch_outbox,
+                                rt,
+                                ingest_ns_outbox,
+                            ));
+                            tracing::info!("telegram channel outbox loop started");
+                        }
+                        None => {
+                            tracing::error!(
+                                "telegram outbox loop was NOT started: server has no \
+                                 comm-routed runtime handle, which the loop needs to scan and \
+                                 mark outbound notes; outbound telegram will not be sent"
+                            );
+                        }
+                    }
                 }
             });
             if !spawned {
@@ -1803,38 +1858,50 @@ async fn telegram_poll_loop(
 #[cfg(feature = "channel-telegram")]
 async fn telegram_outbox_loop(
     telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
-    registry: khive_runtime::VerbRegistry,
+    runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
 ) {
     use chrono::Utc;
     use khive_channel::{Channel, ChannelEnvelope};
-    use serde_json::json;
+
+    let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::error!(
+                namespace = %ingest_namespace,
+                error = %e,
+                "telegram outbox loop: ingest namespace does not parse; loop will not run"
+            );
+            return;
+        }
+    };
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        let list_params = json!({
-            "namespace": ingest_namespace,
-            "kind": "message",
-            "direction": "outbound",
-            "delivered": false,
-            "limit": 200,
-        });
-        let list_result = match registry.dispatch("list", list_params).await {
-            Ok(r) => r,
+        // Scan through the comm-routed runtime handle, not the wire `list`
+        // verb — see `channel_outbox_once` for the backend-routing rationale.
+        let token = match runtime.authorize(namespace.clone()) {
+            Ok(token) => token,
             Err(e) => {
-                tracing::warn!(error = %e, "telegram outbox loop: list failed");
+                tracing::warn!(error = %e, "telegram outbox loop: namespace authorization failed");
                 continue;
             }
         };
-
-        let notes = match list_result
-            .get("items")
-            .and_then(serde_json::Value::as_array)
+        let notes = match runtime
+            .list_undelivered_outbound_messages(&token, Some("telegram:"), 200)
+            .await
         {
-            Some(arr) => arr.clone(),
-            None => continue,
+            Ok(notes) => notes,
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram outbox loop: outbox scan failed");
+                continue;
+            }
         };
+        let notes: Vec<serde_json::Value> = notes
+            .iter()
+            .filter_map(|note| serde_json::to_value(note).ok())
+            .collect();
 
         for note_val in notes {
             let props = match note_val.get("properties") {
@@ -1870,16 +1937,15 @@ async fn telegram_outbox_loop(
             match telegram_channel.send(env).await {
                 Ok(()) => {
                     let delivered_at = Utc::now().to_rfc3339();
-                    let mark_result = registry
-                        .dispatch(
-                            "update",
-                            json!({
-                                "namespace": ingest_namespace,
-                                "id": note_id,
-                                "properties": { "delivered_at": delivered_at },
-                            }),
-                        )
-                        .await;
+                    let mark_result = match uuid::Uuid::parse_str(&note_id) {
+                        Ok(uuid) => runtime
+                            .mark_outbound_message_delivered(&token, uuid, delivered_at, None)
+                            .await
+                            .map(|_| ()),
+                        Err(e) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                            "note id {note_id} is not a valid UUID: {e}"
+                        ))),
+                    };
                     match mark_result {
                         Ok(_) => {
                             tracing::info!(note_id = %note_id, "telegram outbox loop: delivered");
@@ -2494,7 +2560,7 @@ async fn schema_admin_requires_blob_hydrator(backend: Arc<StorageBackend>) -> an
     }
 
     Ok(
-        khive_pack_moodboard::legacy_preference_model_count(backend.sql().as_ref())
+        crate::attachment_cutover::legacy_preference_model_count(backend.sql().as_ref())
             .await
             .context("count legacy moodboard models before resolving blob storage")?
             != 0,
@@ -2515,6 +2581,33 @@ async fn prepare_configured_storage_topology(
     // read-only/read-write alias topology without creating a partial set of
     // database files.
     validate_effective_backend_alias_modes(&effective_backends)?;
+
+    // ADR-170: the events split must anchor beside the store that actually
+    // holds this deployment's data. The resolver derived it from
+    // `base_config.db_path`, which for declared-backend configs is the
+    // materialized `$HOME/.khive/khive.db` default rather than the declared
+    // main backend — re-anchor beside main's declared file here, preserving
+    // the resolver/daemon-host mode decision (direct vs forwarding) by
+    // re-deriving the socket beside the moved events db. An in-memory main
+    // (including a force-memory override) carries no event-plane split.
+    if let Some(split) = base_config.events_split.take() {
+        let main_path = effective_backends
+            .iter()
+            .find(|b| b.name == BackendId::MAIN && b.kind == BackendKind::Sqlite)
+            .and_then(|b| b.path.as_ref());
+        if let Some(main_path) = main_path {
+            let expanded = khive_runtime::expand_tilde(main_path);
+            let db_path = khive_runtime::events_split::events_db_path_beside(&expanded);
+            let socket_path = split
+                .socket_path
+                .is_some()
+                .then(|| khive_runtime::events_split::events_socket_path_beside(&db_path));
+            base_config.events_split = Some(khive_runtime::events_split::EventsSplitConfig {
+                db_path,
+                socket_path,
+            });
+        }
+    }
 
     // Open each declared backend, deduplicating SQLite backends by canonical
     // path (ADR-028 §8). Schema preparation is deliberately deferred until
@@ -2616,27 +2709,27 @@ async fn prepare_configured_storage_topology(
         // selection required for verified migration must fail without leaving
         // a new incomplete marker. The blob pack's backend mode governs
         // read-only wrapping during serving boot.
-        let blob_runtime_read_only = if base_config.packs.iter().any(|pack| pack == "blob") {
+        let blob_governing_backend = if base_config.packs.iter().any(|pack| pack == "blob") {
             match khive_cfg.packs.get("blob") {
                 Some(pack) => backends
                     .get(pack.backend.as_str())
+                    .cloned()
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "[packs.blob].backend = {:?} references an unknown backend",
                             pack.backend
                         )
-                    })?
-                    .is_read_only(),
-                None => main_backend.is_read_only(),
+                    })?,
+                None => main_backend.clone(),
             }
         } else {
-            main_backend.is_read_only()
+            main_backend.clone()
         };
         resolve_blob_hydrator_for_boot(
             &base_config,
             khive_cfg,
             main_backend.as_ref(),
-            blob_runtime_read_only,
+            blob_governing_backend.as_ref(),
         )?
     } else {
         None
@@ -2644,6 +2737,7 @@ async fn prepare_configured_storage_topology(
     crate::attachment_cutover::coordinate_attachment_cutover(
         Arc::clone(&main_backend),
         shared_hydrator.clone(),
+        crate::attachment_cutover::legacy_preference_verifier(),
     )
     .await?;
 
@@ -2673,11 +2767,20 @@ async fn build_registry_for_multi_backend_inner(
     )
     .await?;
 
+    // Built before the pack loop: secondary-pack runtimes capture the main
+    // runtime's embedder wiring so their `core()`-routed writes embed with
+    // main's models even when the pack itself is `no_embed`.
+    let default_runtime = KhiveRuntime::from_backend(main_backend.clone(), {
+        let mut cfg = base_config.clone();
+        cfg.backend_id = BackendId::main();
+        cfg
+    });
+
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
     for pack_name in pack_names {
-        let (backend_name, backend) = match khive_cfg.packs.get(pack_name.as_str()) {
-            None => (BackendId::MAIN, main_backend.clone()),
+        let (backend_name, backend, no_embed) = match khive_cfg.packs.get(pack_name.as_str()) {
+            None => (BackendId::MAIN, main_backend.clone(), false),
             Some(pack_cfg) => {
                 let backend_name = pack_cfg.backend.as_str();
                 let backend = backends.get(backend_name).cloned().ok_or_else(|| {
@@ -2686,31 +2789,46 @@ async fn build_registry_for_multi_backend_inner(
                         "[packs.{pack_name}].backend = {backend_name:?} references an unknown backend; defined backends: {defined}"
                     )
                 })?;
-                (backend_name, backend)
+                (backend_name, backend, pack_cfg.no_embed)
             }
         };
         let mut rt_config = base_config.clone();
         rt_config.backend_id = BackendId::new(backend_name);
+        if no_embed {
+            // `[packs.<name>] no_embed = true`: this pack's runtime gets zero
+            // embedders — pack-owned writes are FTS + metadata only. Clear
+            // both model fields together, same contract as
+            // `RuntimeConfig::no_embeddings`. `core()`-routed concept writes
+            // are NOT affected: `build_pack_runtime` hands every secondary
+            // pack the main runtime's embedder wiring for core().
+            rt_config.embedding_model = None;
+            rt_config.additional_embedding_models = Vec::new();
+        }
         per_pack_runtimes_local.insert(
             pack_name.clone(),
-            build_pack_runtime(backend, backend_name, rt_config, &main_backend),
+            build_pack_runtime(
+                backend,
+                backend_name,
+                rt_config,
+                &main_backend,
+                &default_runtime,
+            ),
         );
     }
-
-    let default_runtime = KhiveRuntime::from_backend(main_backend.clone(), {
-        let mut cfg = base_config.clone();
-        cfg.backend_id = BackendId::main();
-        cfg
-    });
 
     // ADR-160 D3: resolve the config-selected `BlobStore` once, pair it with
     // exactly one aggregate hydration budget, and install the same immutable
     // hydrator `Arc` on every runtime handle this boot produces. `core()`
     // clones share each runtime's one-shot slot, so they see this same pair.
     if let Some(hydrator) = shared_hydrator {
-        default_runtime.install_blob_hydrator(Arc::clone(&hydrator))?;
+        // The shared install: the hydrator's mode was decided above from the
+        // blob pack's backend, and the receiving handles legitimately mix
+        // modes (a writable blob secondary beside a read-only main is a
+        // documented topology), so each handle's own domain-store mode must
+        // not gate this install.
+        default_runtime.install_shared_blob_hydrator(Arc::clone(&hydrator))?;
         for rt in per_pack_runtimes_local.values() {
-            rt.install_blob_hydrator(Arc::clone(&hydrator))?;
+            rt.install_shared_blob_hydrator(Arc::clone(&hydrator))?;
         }
     }
 
@@ -2981,6 +3099,13 @@ pub async fn build_server_with_explicit_namespace(
         },
         brain_profile: args.brain_profile.clone(),
     })?;
+    let config = {
+        let mut config = config;
+        if args.daemon {
+            enable_events_forwarding_for_daemon(&mut config);
+        }
+        config
+    };
 
     // Regression fence: `config.db_path` must agree with what the canonical
     // resolver derives from this same `--db` input, or `config_id` (computed
@@ -3294,13 +3419,16 @@ pub fn build_server_from_multi_backend_registry(
 ) -> KhiveMcpServer {
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     let channel_loop_admission = crate::server::ChannelLoopAdmission::for_pack_runtimes(
-        multi.per_pack_runtimes.get("kg").map(Arc::as_ref),
         multi.per_pack_runtimes.get("comm").map(Arc::as_ref),
     );
+    // The delivery loops scan, claim, and mark outbound `message` notes, so
+    // they must hold the runtime that owns comm's rows — under a
+    // `[packs.comm]` backend assignment that is the comm pack's runtime, not
+    // the kg/main one (which would list an empty outbox forever).
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     let channel_outbox_runtime = multi
         .per_pack_runtimes
-        .get("kg")
+        .get("comm")
         .map(|runtime| runtime.as_ref().clone());
     // Wire the main backend's pool for background WAL checkpointing. The pool is
     // only present for file-backed databases; in-memory backends return None here
@@ -3453,14 +3581,25 @@ fn resolve_blob_hydrator_for_boot(
     config: &RuntimeConfig,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
-    read_only: bool,
+    governing_backend: &StorageBackend,
 ) -> anyhow::Result<Option<Arc<BlobHydrator>>> {
-    match khive_runtime::resolve_blob_store_for_mode(khive_cfg, backend, read_only) {
-        Ok(store) => Ok(Some(Arc::new(BlobHydrator::new(
-            store,
-            config.blob_hydration_bytes,
-        )?))),
-        Err(error) if khive_cfg.storage.blob.is_none() => {
+    // Resolution and construction are fused inside the runtime so the mode
+    // is DERIVED from the governing backend's own access mode (the backend
+    // the blob pack maps to, ADR-160 D3) rather than declared here, and the
+    // hydrator comes back stamped as governed — the only kind the shared
+    // install seam accepts. Read-only derivation opens an existing root and
+    // never creates one; the extra wrap over an already-wrapped store is
+    // documented harmless (reads delegate, mutators refuse).
+    match BlobHydrator::resolve_for_governing_backend(
+        khive_cfg,
+        backend,
+        governing_backend,
+        config.blob_hydration_bytes,
+    ) {
+        Ok(hydrator) => Ok(Some(Arc::new(hydrator))),
+        Err(khive_runtime::GovernedBlobError::Resolve(error))
+            if khive_cfg.storage.blob.is_none() =>
+        {
             tracing::debug!(
                 error = %error,
                 "no usable BlobStore for this backend and no [storage.blob] configured; \
@@ -3486,15 +3625,12 @@ pub async fn build_single_backend_runtime(
     let backend = Arc::new(open_single_backend(&config)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
-    let hydrator = resolve_blob_hydrator_for_boot(
-        &config,
-        khive_cfg,
-        backend.as_ref(),
-        backend.is_read_only(),
-    )?;
+    let hydrator =
+        resolve_blob_hydrator_for_boot(&config, khive_cfg, backend.as_ref(), backend.as_ref())?;
     crate::attachment_cutover::coordinate_attachment_cutover(
         Arc::clone(&backend),
         hydrator.clone(),
+        crate::attachment_cutover::legacy_preference_verifier(),
     )
     .await?;
 
@@ -3533,12 +3669,16 @@ async fn prepare_single_backend_for_schema_admin(
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator = if schema_admin_requires_blob_hydrator(Arc::clone(&backend)).await? {
-        resolve_blob_hydrator_for_boot(config, khive_cfg, backend.as_ref(), backend.is_read_only())?
+        resolve_blob_hydrator_for_boot(config, khive_cfg, backend.as_ref(), backend.as_ref())?
     } else {
         None
     };
-    crate::attachment_cutover::coordinate_attachment_cutover(Arc::clone(&backend), hydrator)
-        .await?;
+    crate::attachment_cutover::coordinate_attachment_cutover(
+        Arc::clone(&backend),
+        hydrator,
+        crate::attachment_cutover::legacy_preference_verifier(),
+    )
+    .await?;
     Ok(backend)
 }
 
@@ -3559,14 +3699,22 @@ async fn prepare_core_schema_for_boot(
 /// application-assisted V21 attachment cutover. Production host boot should use
 /// [`build_single_backend_runtime`], [`build_server`], or the async multi-backend
 /// builders instead. Calling this helper is sound only when `backend` is the
-/// runtime's backend and its attachment-cutover status is already `Complete`.
+/// runtime's backend and its attachment-cutover status is already `Complete`;
+/// the same-backend precondition is now enforced by identity rather than
+/// documented, since the resolved mode derives from `backend` and a mismatch
+/// would silently resolve the wrong store mode for the receiving runtime.
 pub fn install_resolved_blob_store(
     rt: &KhiveRuntime,
     khive_cfg: &KhiveConfig,
     backend: &StorageBackend,
 ) -> anyhow::Result<Option<Arc<BlobHydrator>>> {
-    let hydrator =
-        resolve_blob_hydrator_for_boot(rt.config(), khive_cfg, backend, rt.is_read_only())?;
+    if !std::ptr::eq(rt.backend(), backend) {
+        anyhow::bail!(
+            "install_resolved_blob_store requires the runtime's own backend: the supplied \
+             backend reference is not the runtime's"
+        );
+    }
+    let hydrator = resolve_blob_hydrator_for_boot(rt.config(), khive_cfg, backend, backend)?;
     if let Some(hydrator) = hydrator.as_ref() {
         rt.install_blob_hydrator(Arc::clone(hydrator))?;
     }
@@ -3585,8 +3733,12 @@ fn build_pack_runtime(
     backend_name: &str,
     rt_config: RuntimeConfig,
     main_backend: &Arc<StorageBackend>,
+    main_runtime: &KhiveRuntime,
 ) -> KhiveRuntime {
-    let rt = KhiveRuntime::from_backend(backend, rt_config);
+    // Every pack runtime carries main's embedder wiring for core(): a
+    // main-assigned pack has no core pointer, but with `no_embed` its own
+    // registry is empty and core-routed concept writes must still embed.
+    let rt = KhiveRuntime::from_backend(backend, rt_config).with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
     } else {
@@ -3896,9 +4048,50 @@ pub fn resolve_runtime_config_with_db_anchor(
         resolved
     };
 
+    // ADR-170: events-daemon split. Every file-backed resolution routes event
+    // persistence to the events database beside the main store, in DIRECT
+    // mode: this resolver serves one-shot hosts (`kkernel exec`, `reindex`,
+    // ingest) and tests, which have no events daemon to talk to. Resident
+    // daemon hosts upgrade the resolved config to socket forwarding
+    // themselves — see [`enable_events_forwarding_for_daemon`] — because
+    // only they supervise an events daemon at the derived socket.
+    // In-memory resolutions (tests) keep the legacy main-store event plane.
+    // `KHIVE_EVENTS_SPLIT=0` is the deployment kill-switch back to legacy.
+    let resolved = {
+        let mut resolved = resolved;
+        let kill_switch = std::env::var("KHIVE_EVENTS_SPLIT").is_ok_and(|v| v.trim() == "0");
+        if !kill_switch {
+            if let Some(main_db) = resolved.db_path.as_deref() {
+                resolved.events_split = Some(khive_runtime::events_split::EventsSplitConfig {
+                    db_path: khive_runtime::events_split::events_db_path_beside(main_db),
+                    socket_path: None,
+                });
+            }
+        }
+        resolved
+    };
+
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
     // config-file (tier-2) so that a project or global TOML always wins over the env var.
     Ok((apply_env_brain_profile(resolved), db_anchor))
+}
+
+/// Upgrade a resolved config's event plane from direct (embedded) mode to
+/// socket forwarding — the resident-daemon half of the ADR-170 split.
+///
+/// `resolve_runtime_config_with_db_anchor` always resolves the event plane in
+/// direct mode because most of its callers (one-shot CLI, tests) have no
+/// events daemon. The two daemon hosts (`build_server_with_explicit_namespace`
+/// under `--daemon`, and `kkernel mcp`'s multi-backend arm) call this after
+/// resolution; they are exactly the processes that also supervise an events
+/// daemon at the derived socket (`start_daemon_components_if_daemon`), so the
+/// socket this routes to is the one that same host keeps alive.
+pub fn enable_events_forwarding_for_daemon(config: &mut RuntimeConfig) {
+    if let Some(split) = config.events_split.as_mut() {
+        split.socket_path = Some(khive_runtime::events_split::events_socket_path_beside(
+            &split.db_path,
+        ));
+    }
 }
 
 /// Apply `KHIVE_BRAIN_PROFILE` env var as the tier-3 fallback for `brain_profile`.
@@ -4083,25 +4276,8 @@ mod tests {
         );
     }
 
-    // Freeze lingering `-wal`/`-shm` sidecars left by a writable fixture whose
-    // connections close asynchronously; read-only admission rejects a writable
-    // `-shm` as potentially live.
     #[cfg(unix)]
-    fn freeze_snapshot_sidecars(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        for suffix in ["-wal", "-shm"] {
-            let mut name = path.file_name().expect("db file name").to_os_string();
-            name.push(suffix);
-            let sidecar = path.parent().expect("db parent dir").join(name);
-            if sidecar.exists() {
-                let mut permissions = std::fs::metadata(&sidecar)
-                    .expect("sidecar metadata")
-                    .permissions();
-                permissions.set_mode(0o444);
-                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-            }
-        }
-    }
+    use khive_storage::test_support::freeze_snapshot_sidecars;
     use serial_test::serial;
     use std::io::Write;
 
@@ -4248,6 +4424,70 @@ mod tests {
         })
         .expect("resolve config")
         .packs
+    }
+
+    /// ADR-170 host-class contract: the shared resolver must emit the events
+    /// split in DIRECT mode (socket-less), because most of its callers —
+    /// one-shot CLI hosts and every test that builds a server — have no
+    /// events daemon to forward to. A resolver that emits a socket here
+    /// routes those hosts' events at a daemon that does not exist: appends
+    /// are silently dropped and synchronous provenance reads fail closed
+    /// (measured: the schedule drain refused to dispatch a due event).
+    /// Resident daemon hosts get forwarding only through the explicit
+    /// upgrade, at a socket derived beside the events db (never a global
+    /// socket, which would cross-wire a second database's events).
+    #[test]
+    #[serial]
+    fn resolver_emits_direct_events_mode_and_daemon_upgrade_derives_socket_beside_db() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("khive.db");
+        let mut resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(db.to_str().expect("utf8")),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(kg_test_packs()),
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        let split = resolved
+            .events_split
+            .as_ref()
+            .expect("file-backed resolution must configure the events split");
+        // The sidecar derives from the full main-db file name with the
+        // parent canonicalized (macOS temp dirs live behind /var symlinks).
+        let dir_real = dir.path().canonicalize().expect("canonicalize temp dir");
+        assert_eq!(split.db_path, dir_real.join("khive.db.events.db"));
+        assert_eq!(
+            split.socket_path, None,
+            "the shared resolver must emit direct mode; only daemon hosts upgrade"
+        );
+
+        enable_events_forwarding_for_daemon(&mut resolved);
+        let split = resolved.events_split.as_ref().expect("split still set");
+        assert_eq!(
+            split.socket_path.as_deref(),
+            Some(dir_real.join("khive.db.events.sock").as_path()),
+            "daemon upgrade must derive the socket beside the events db, not globally"
+        );
+
+        // In-memory resolutions carry no event-plane split at all.
+        let in_memory = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(kg_test_packs()),
+            brain_profile: None,
+        })
+        .expect("resolve in-memory config");
+        assert!(in_memory.events_split.is_none());
     }
 
     #[test]
@@ -5383,6 +5623,7 @@ id = "lambda:project-actor"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -6115,6 +6356,64 @@ region = "us-east-1"
         );
     }
 
+    /// A read-only runtime resolving an EXISTING blob root must be able to
+    /// install it for bounded reads: the boot helper's hydrator carries its
+    /// mode from construction, so the runtime's read-only install seam
+    /// accepts it, serves reads, and refuses mutation. Without the
+    /// mode-aware construction, the install refuses the hydrator the boot
+    /// just resolved and a read-only snapshot cannot serve blobs at all.
+    #[tokio::test]
+    #[serial]
+    async fn install_resolved_blob_store_read_only_runtime_gets_bounded_reads() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        use khive_storage::BlobStore as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let main_path = dir.path().join("snapshot.db");
+        prepare_current_snapshot_source(&main_path);
+
+        // Seed an existing root while writable; the read-only boot below
+        // must open it without creating anything.
+        let blob_root = dir.path().join("blobs");
+        let seeded = {
+            let seed_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_root.clone(), 0).expect("seed store");
+            seed_store.put(b"seed".to_vec()).await.expect("seed put")
+        };
+
+        let khive_cfg = KhiveConfig {
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::Fs {
+                    root: Some(blob_root.display().to_string()),
+                    floor_bytes: Some(0),
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let backend =
+            Arc::new(StorageBackend::sqlite_read_only(&main_path).expect("read-only backend"));
+        assert!(backend.is_read_only());
+        let runtime = khive_runtime::KhiveRuntime::from_backend(
+            Arc::clone(&backend),
+            base_runtime_config_for_multi_backend(),
+        );
+        assert!(runtime.is_read_only());
+
+        let _hydrator = install_resolved_blob_store(&runtime, &khive_cfg, backend.as_ref())
+            .expect("a read-only runtime must install its resolved existing root")
+            .expect("the configured root resolves to a store");
+
+        let installed = runtime.blob_store().expect("installed store");
+        assert!(
+            installed.exists(&seeded).await.expect("exists"),
+            "bounded reads must be served from the existing root"
+        );
+        let err = installed
+            .put(b"post".to_vec())
+            .await
+            .expect_err("mutation must refuse on the read-only snapshot");
+        assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
     /// Positive counterpart to `multi_backend_boot_wires_configured_s3_blob_store`:
     /// with valid (dummy) AWS credentials present, the multi-backend startup
     /// path must resolve the configured `S3BlobStore` once (`:1567`) and
@@ -6160,6 +6459,9 @@ region = "us-east-1"
         }
     }
 
+    // Requires the "moodboard" pack name to be registered, which only
+    // happens when the optional khive-pack-moodboard crate is linked in.
+    #[cfg(feature = "pack-moodboard")]
     #[tokio::test]
     async fn multi_backend_boot_shares_one_hydrator_across_default_core_blob_and_moodboard() {
         let blob_root = tempfile::tempdir().expect("blob root");
@@ -6512,6 +6814,7 @@ region = "us-east-1"
                 "blob".to_string(),
                 PackConfig {
                     backend: "blob-snapshot".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -6573,6 +6876,7 @@ region = "us-east-1"
                 "blob".to_string(),
                 PackConfig {
                     backend: "blob-writable".to_string(),
+                    no_embed: false,
                 },
             )]),
             storage: StorageSectionConfig {
@@ -6638,6 +6942,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -6727,12 +7032,14 @@ region = "us-east-1"
                     "kg".to_string(),
                     PackConfig {
                         backend: "direct".to_string(),
+                        no_embed: false,
                     },
                 );
                 m.insert(
                     "comm".to_string(),
                     PackConfig {
                         backend: "alias".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -6815,6 +7122,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -6872,6 +7180,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 packs
@@ -7256,6 +7565,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -7336,6 +7646,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -7463,6 +7774,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "archive".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -7521,6 +7833,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "archive".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -7684,6 +7997,7 @@ region = "us-east-1"
                 "comm".to_string(),
                 PackConfig {
                     backend: "comm-store".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -7796,6 +8110,7 @@ region = "us-east-1"
                 "comm".to_string(),
                 PackConfig {
                     backend: "comm-store".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -7828,8 +8143,9 @@ region = "us-east-1"
             "comm.ingest/cursor/heartbeat are backed by the read-only comm runtime"
         );
         assert!(
-            admission.outbound_delivery,
-            "list/update are backed by the writable kg runtime"
+            !admission.outbound_delivery,
+            "the outbox scan/claim/mark also run on the read-only comm runtime, so no \
+             external send task may start"
         );
         drop(server);
         #[cfg(unix)]
@@ -7866,9 +8182,9 @@ region = "us-east-1"
             "comm.ingest/cursor/heartbeat are backed by the writable comm runtime"
         );
         assert!(
-            !admission.outbound_delivery,
-            "a read-only kg runtime cannot durably claim or mark delivery, so no external send \
-             task may start"
+            admission.outbound_delivery,
+            "the outbox scan/claim/mark run on the writable comm runtime — a read-only kg/main \
+             no longer gates external sends"
         );
     }
 
@@ -7922,6 +8238,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "alias".to_string(),
+                        no_embed: false,
                     },
                 );
                 packs
@@ -8266,6 +8583,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -8331,6 +8649,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -8408,6 +8727,7 @@ region = "us-east-1"
             "comm".to_string(),
             PackConfig {
                 backend: "secondary".to_string(),
+                no_embed: false,
             },
         );
 
@@ -8504,6 +8824,7 @@ region = "us-east-1"
                     "comm".to_string(),
                     PackConfig {
                         backend: "second".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -10367,12 +10688,14 @@ backend = "kg-backend"
                         "kg".to_string(),
                         PackConfig {
                             backend: "kg-store".to_string(),
+                            no_embed: false,
                         },
                     ),
                     (
                         "comm".to_string(),
                         PackConfig {
                             backend: "kg-store".to_string(),
+                            no_embed: false,
                         },
                     ),
                 ]),
@@ -10394,7 +10717,7 @@ backend = "kg-backend"
             let registry = server.verb_registry_clone();
             let owner_runtime = server
                 .channel_outbox_runtime_clone()
-                .expect("email outbox must retain the KG-routed runtime");
+                .expect("email outbox must retain the comm-routed runtime");
             assert_eq!(owner_runtime.backend_id().as_str(), "kg-store");
 
             let send = registry
@@ -10417,10 +10740,8 @@ backend = "kg-backend"
             let namespace = Namespace::parse("local").unwrap();
             channel_outbox_once(
                 &channel,
-                &registry,
                 &owner_runtime,
                 &namespace,
-                "local",
                 "maintainer@example.com",
                 "example.com",
                 &["recipient@example.com".to_string()],
@@ -10463,6 +10784,250 @@ backend = "kg-backend"
                      FROM notes WHERE content = 'kg-secondary-outbox-probe' \
                        AND json_extract(properties, '$.direction') = 'outbound'",
                     [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(!external_id.is_empty());
+            assert!(!delivered_at.is_empty());
+        }
+
+        /// `[packs.<name>] no_embed = true` must strip the embedder set from
+        /// exactly that pack's runtime. Registration is config-driven and
+        /// lazy-loading, so the registered-name lists are observable without
+        /// any model files present. The kg runtime doubles as the must-match
+        /// control: same base config, embedders retained.
+        #[tokio::test]
+        #[serial]
+        async fn pack_no_embed_strips_embedders_from_that_runtime_only() {
+            let dir = tempfile::tempdir().unwrap();
+            let khive_cfg = KhiveConfig {
+                backends: vec![
+                    BackendConfig {
+                        name: BackendId::MAIN.to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(dir.path().join("main.db")),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                    BackendConfig {
+                        name: "comm-store".to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(dir.path().join("comm.db")),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                ],
+                packs: HashMap::from([
+                    (
+                        "comm".to_string(),
+                        PackConfig {
+                            backend: "comm-store".to_string(),
+                            no_embed: true,
+                        },
+                    ),
+                    // A MAIN-assigned no_embed pack: no core pointer, but its
+                    // core() must still carry main's embedders (a main
+                    // assignment used to skip the core-embedder wiring).
+                    (
+                        "gtd".to_string(),
+                        PackConfig {
+                            backend: BackendId::MAIN.to_string(),
+                            no_embed: true,
+                        },
+                    ),
+                ]),
+                ..KhiveConfig::default()
+            };
+
+            // Unlike the other fixtures, keep the default embedding model so
+            // the control arm has something to retain.
+            let base = RuntimeConfig {
+                packs: vec!["kg".to_string(), "comm".to_string(), "gtd".to_string()],
+                ..base_runtime_config_for_multi_backend()
+            };
+            let base = RuntimeConfig {
+                embedding_model: RuntimeConfig::default().embedding_model,
+                ..base
+            };
+            assert!(
+                base.embedding_model.is_some(),
+                "control arm needs a configured embedder"
+            );
+
+            let multi = build_registry_for_multi_backend_inner(base, &khive_cfg, None)
+                .await
+                .expect("no_embed topology must build");
+
+            assert!(
+                multi.per_pack_runtimes["comm"]
+                    .registered_embedding_model_names()
+                    .is_empty(),
+                "no_embed pack runtime must register zero embedders"
+            );
+            let main_models = multi.per_pack_runtimes["kg"].registered_embedding_model_names();
+            assert!(
+                !main_models.is_empty(),
+                "packs without no_embed must keep the configured embedders"
+            );
+            // The routing contract: no_embed strips the PACK's own writes
+            // only. core()-routed concept writes must embed with the main
+            // runtime's wiring, or a no_embed secondary pack would silently
+            // write unembedded entities into the shared graph.
+            assert_eq!(
+                multi.per_pack_runtimes["comm"]
+                    .core()
+                    .registered_embedding_model_names(),
+                main_models,
+                "no_embed pack's core() must carry the main runtime's embedders"
+            );
+            // Same contract for a MAIN-assigned no_embed pack, whose runtime
+            // has no core pointer at all.
+            assert!(
+                multi.per_pack_runtimes["gtd"]
+                    .registered_embedding_model_names()
+                    .is_empty(),
+                "main-assigned no_embed pack runtime must register zero embedders"
+            );
+            assert_eq!(
+                multi.per_pack_runtimes["gtd"]
+                    .core()
+                    .registered_embedding_model_names(),
+                main_models,
+                "main-assigned no_embed pack's core() must carry the main runtime's embedders"
+            );
+        }
+
+        /// Two-backend regression for the comm split topology: comm assigned
+        /// its own backend while kg stays on main. The delivery loop's
+        /// non-wire scan/claim/mark must all land on the comm backend; the
+        /// generic wire `list` (kg/main-routed) cannot see the outbox at all,
+        /// which is exactly why the loop must not use it.
+        #[tokio::test]
+        #[serial]
+        async fn comm_secondary_runtime_owns_outbox_scan_claim_and_delivery_mark() {
+            let dir = tempfile::tempdir().unwrap();
+            let main_path = dir.path().join("main.db");
+            let comm_path = dir.path().join("comm-secondary.db");
+            let khive_cfg = KhiveConfig {
+                backends: vec![
+                    BackendConfig {
+                        name: BackendId::MAIN.to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(main_path.clone()),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                    BackendConfig {
+                        name: "comm-store".to_string(),
+                        kind: BackendKind::Sqlite,
+                        path: Some(comm_path.clone()),
+                        cache_mb: None,
+                        journal_mode: None,
+                        read_only: false,
+                    },
+                ],
+                packs: HashMap::from([(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "comm-store".to_string(),
+                        no_embed: false,
+                    },
+                )]),
+                ..KhiveConfig::default()
+            };
+
+            let multi = build_registry_for_multi_backend_inner(
+                base_runtime_config_for_multi_backend(),
+                &khive_cfg,
+                None,
+            )
+            .await
+            .expect("comm-secondary registry must build");
+            let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+            let registry = server.verb_registry_clone();
+            let owner_runtime = server
+                .channel_outbox_runtime_clone()
+                .expect("email outbox must retain the comm-routed runtime");
+            assert_eq!(owner_runtime.backend_id().as_str(), "comm-store");
+
+            let send = registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({
+                        "to": "email:recipient@example.com",
+                        "subject": "comm split outbox",
+                        "content": "comm-secondary-outbox-probe",
+                    }),
+                )
+                .await
+                .expect("comm.send must create the outbound row on the comm backend");
+            let note_id = send["full_id"]
+                .as_str()
+                .expect("comm.send returns full_id")
+                .to_string();
+
+            // The generic wire `list` runs on kg/main and must NOT see the
+            // outbox row — pinning the routing gap the non-wire scan closes.
+            let wire_list = registry
+                .dispatch(
+                    "list",
+                    serde_json::json!({
+                        "kind": "message",
+                        "direction": "outbound",
+                        "delivered": false,
+                        "limit": 200,
+                    }),
+                )
+                .await
+                .expect("generic list must succeed on main");
+            let wire_items = wire_list
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                wire_items.is_empty(),
+                "main-routed wire list must not see comm's outbox: {wire_list}"
+            );
+
+            let channel = RecordingChannel::default();
+            let namespace = Namespace::parse("local").unwrap();
+            channel_outbox_once(
+                &channel,
+                &owner_runtime,
+                &namespace,
+                "maintainer@example.com",
+                "example.com",
+                &["recipient@example.com".to_string()],
+            )
+            .await;
+            assert_eq!(
+                channel.sent.lock().unwrap().len(),
+                1,
+                "non-wire scan must find and deliver the comm-backend outbox row"
+            );
+
+            let main = rusqlite::Connection::open(&main_path).unwrap();
+            let main_count: i64 = main
+                .query_row(
+                    "SELECT COUNT(*) FROM notes WHERE content = 'comm-secondary-outbox-probe'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(main_count, 0, "main backend must not own the message");
+
+            let comm = rusqlite::Connection::open(&comm_path).unwrap();
+            let (external_id, delivered_at): (String, String) = comm
+                .query_row(
+                    "SELECT json_extract(properties, '$.external_id'), \
+                            json_extract(properties, '$.delivered_at') \
+                     FROM notes WHERE id = ?1 \
+                       AND json_extract(properties, '$.direction') = 'outbound'",
+                    [&note_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();

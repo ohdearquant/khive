@@ -1119,38 +1119,56 @@ fn compare_existing_judgment(
     Ok(())
 }
 
+/// Load every persisted judgment for `token`'s actor.
+///
+/// `MAX_TRAINING_EVENTS` (50,000) exceeds the events daemon's per-request
+/// page cap (`khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS`, 4,096),
+/// so the snapshot cannot be a single wide `query_events` call in daemon mode
+/// — the daemon refuses any page above its cap outright. The snapshot is
+/// instead collected by cursor-walking transport-cap-sized pages (see
+/// [`collect_judgment_events_cursor_walk`]).
+///
+/// Read consistency: the single-query form this replaces was one stable
+/// SQLite read snapshot, immune to a concurrently appended judgment shifting
+/// later pages. A cursor walk instead issues one independent page read per
+/// step against a live event plane: a judgment appended concurrently with
+/// the walk may land before or after the cursor depending on timing and be
+/// included or excluded accordingly. It is never double-counted — the
+/// boundary-microsecond dedup in the walk prevents that — but two
+/// back-to-back `moodboard.train_preference` calls can now observe slightly
+/// different snapshots if judgments are being appended between them. The
+/// `MAX_TRAINING_EVENTS` ceiling below still bounds the total independent of
+/// this window.
 async fn load_judgment_snapshot(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
 ) -> Result<Vec<(i64, JudgmentRecord)>, RuntimeError> {
     let store = runtime.events(token)?;
-    // One storage query is one stable SQLite read snapshot. Offset paging would
-    // permit a newly appended event to shift later pages and cause duplication
-    // or omission, so the hard ceiling is also the single-query limit.
-    let page = store
-        .query_events(
-            EventFilter {
-                verbs: vec![JUDGMENT_RECORD_VERB.to_string()],
-                actors: vec![actor_label(token)],
-                ..Default::default()
-            },
-            PageRequest {
-                offset: 0,
-                limit: (MAX_TRAINING_EVENTS + 1) as u32,
-            },
-        )
-        .await?;
-    if page
-        .total
-        .is_some_and(|total| total > MAX_TRAINING_EVENTS as u64)
-        || page.items.len() > MAX_TRAINING_EVENTS
-    {
+    let base_filter = EventFilter {
+        verbs: vec![JUDGMENT_RECORD_VERB.to_string()],
+        actors: vec![actor_label(token)],
+        ..Default::default()
+    };
+    let total = store.count_events(base_filter.clone()).await?;
+    if total > MAX_TRAINING_EVENTS as u64 {
+        return Err(RuntimeError::InvalidInput(format!(
+            "moodboard.train_preference actor judgment snapshot exceeds {MAX_TRAINING_EVENTS} records"
+        )));
+    }
+    let events = collect_judgment_events_cursor_walk(
+        store.as_ref(),
+        &base_filter,
+        khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS,
+        (MAX_TRAINING_EVENTS + 1) as u64,
+    )
+    .await?;
+    if events.len() > MAX_TRAINING_EVENTS {
         return Err(RuntimeError::InvalidInput(format!(
             "moodboard.train_preference actor judgment snapshot exceeds {MAX_TRAINING_EVENTS} records"
         )));
     }
     let mut records = Vec::new();
-    for event in page.items {
+    for event in events {
         let valid_envelope = has_success_entity_envelope(&event, token);
         let record: JudgmentRecord = serde_json::from_value(event.payload).map_err(|error| {
             RuntimeError::Internal(format!(
@@ -1183,6 +1201,118 @@ async fn load_judgment_snapshot(
     }
     records.sort_by_key(|(_, record)| record.judgment_id);
     Ok(records)
+}
+
+/// Collect up to `max_rows` events for `base_filter` by walking a strict
+/// descending `before` cursor at `offset: 0`, requesting at most `page_size`
+/// (clamped to the events-daemon transport cap) rows per query — the same
+/// technique `khive-pack-brain`'s `collect_events_cursor_walk` uses for its
+/// split-store reads (duplicated here rather than shared: that helper is
+/// crate-private to `khive-pack-brain`).
+///
+/// `before` is a strict `created_at <` bound, so stepping the cursor to the
+/// last row's timestamp would drop rows sharing that microsecond beyond the
+/// page edge. Step to `last.created_at + 1` instead — which re-admits the
+/// boundary microsecond — and drop the re-read rows by id. Aggregation is
+/// order-independent here (the caller re-sorts by `judgment_id`), so
+/// delivery order across pages does not matter; each row must simply arrive
+/// exactly once. A timestamp tie run wider than the transport cap cannot be
+/// paged past (widening the page is refused by the daemon) and is reported
+/// as a typed error rather than looping.
+async fn collect_judgment_events_cursor_walk(
+    store: &dyn khive_storage::event::EventStore,
+    base_filter: &EventFilter,
+    page_size: u32,
+    max_rows: u64,
+) -> Result<Vec<Event>, RuntimeError> {
+    let cap = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS;
+    let mut items: Vec<Event> = Vec::new();
+    let mut cursor: Option<i64> = base_filter.before;
+    let mut boundary_at: Option<i64> = None;
+    let mut boundary_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut fetch_limit = page_size.clamp(1, cap);
+    while (items.len() as u64) < max_rows {
+        let mut filter = base_filter.clone();
+        filter.before = cursor;
+        let page = store
+            .query_events(
+                filter,
+                PageRequest {
+                    offset: 0,
+                    limit: fetch_limit,
+                },
+            )
+            .await?;
+        let fetched = page.items.len() as u64;
+        let fresh: Vec<Event> = page
+            .items
+            .into_iter()
+            .filter(|event| !boundary_ids.contains(&event.id))
+            .collect();
+        if fresh.is_empty() {
+            if fetched < u64::from(fetch_limit) {
+                // The store returned everything under the cursor and all of
+                // it was already collected: the window is exhausted.
+                break;
+            }
+            // A full page of already-collected boundary rows: the tie run at
+            // this microsecond fills the page. Widen and re-read — but only
+            // up to the transport cap, past which the daemon refuses the
+            // request.
+            if fetch_limit >= cap {
+                let boundary = boundary_at.ok_or_else(|| {
+                    RuntimeError::Internal(
+                        "moodboard judgment cursor walk saw duplicate rows before any boundary"
+                            .to_string(),
+                    )
+                })?;
+                let mut ge_boundary = base_filter.clone();
+                ge_boundary.after = boundary.checked_sub(1).or(base_filter.after);
+                let ge_total = store.count_events(ge_boundary).await?;
+                if ge_total == items.len() as u64 {
+                    cursor = Some(boundary);
+                    continue;
+                }
+                return Err(RuntimeError::InvalidInput(format!(
+                    "moodboard.train_preference cannot page this actor's judgment snapshot: \
+                     more than {fetch_limit} judgments share one created_at microsecond, which \
+                     exceeds the event transport's page cap"
+                )));
+            }
+            fetch_limit = fetch_limit.saturating_mul(2).min(cap);
+            continue;
+        }
+        // Pages come back created_at DESC, so the last fresh row carries the
+        // new boundary microsecond.
+        let boundary = fresh
+            .last()
+            .map(|event| event.created_at)
+            .expect("fresh is non-empty");
+        if boundary_at != Some(boundary) {
+            boundary_ids.clear();
+            boundary_at = Some(boundary);
+        }
+        boundary_ids.extend(
+            fresh
+                .iter()
+                .filter(|event| event.created_at == boundary)
+                .map(|event| event.id),
+        );
+        items.extend(fresh);
+        cursor = if boundary == i64::MAX {
+            cursor
+        } else {
+            Some(boundary + 1)
+        };
+        if fetched < u64::from(fetch_limit) {
+            break;
+        }
+    }
+    // A page may carry the collection past `max_rows`; the bound is a row
+    // budget, so surplus rows from the final page are dropped rather than
+    // returned over-budget.
+    items.truncate(usize::try_from(max_rows).unwrap_or(usize::MAX));
+    Ok(items)
 }
 
 fn require_blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, RuntimeError> {
@@ -1551,10 +1681,12 @@ mod tests {
 
     use super::*;
     use crate::preference::{
-        materialize_fann, pair_split, CalibrationProvenance, FannProvenance, OptimizerProvenance,
-        PairKey, SplitCounts, TestMetrics, TrainingProvenance, FANN_CRATE_VERSION, FANN_FORMAT,
-        FEATURE_SCHEMA_CANONICAL_JSON, MODEL_FAMILY, OPTIMIZER_BACKTRACKING_IDENTITY,
-        PAIR_SPLIT_REVISION, TIE_BAND_RULE_IDENTITY, TRAINING_REVISION,
+        materialize_fann, pair_split, CalibrationProvenance, DataSplit, FannProvenance,
+        OptimizerProvenance, PairKey, SplitCounts, TestMetrics, TrainingProvenance,
+        FANN_CRATE_VERSION, FANN_FORMAT, FEATURE_SCHEMA_CANONICAL_JSON, MIN_CAL_DECISIVE_GROUPS,
+        MIN_CAL_TIE_GROUPS, MIN_TEST_DECISIVE_GROUPS, MIN_TRAIN_DECISIVE_GROUPS, MODEL_FAMILY,
+        OPTIMIZER_BACKTRACKING_IDENTITY, PAIR_SPLIT_REVISION, TIE_BAND_RULE_IDENTITY,
+        TRAINING_REVISION,
     };
 
     #[derive(Debug)]
@@ -1603,6 +1735,7 @@ mod tests {
         RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: Some(db_path.to_path_buf()),
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1655,6 +1788,212 @@ mod tests {
         }
         drop(writer);
         backend
+    }
+
+    /// Build one intrinsically valid judgment record for `scope`, using real
+    /// UUIDv4 serve/occurrence ids, a `judgment_id_for`-derived judgment id,
+    /// and `side_randomization`-derived provenance — the identity fields
+    /// `load_judgment_snapshot`'s round trip enforces, which
+    /// `crate::preference::tests::sufficient_records` skips because it feeds
+    /// `fit_preference_bounded` directly rather than round-tripping through
+    /// the event store.
+    fn synthetic_judgment_record(
+        scope: &PreferenceScope,
+        lower: &str,
+        upper: &str,
+        choice: JudgmentChoice,
+        left_wins: bool,
+    ) -> JudgmentRecord {
+        let serve_id = Uuid::new_v4();
+        let randomization = side_randomization(serve_id);
+        let (left_index, right_index) = if randomization.swap_applied {
+            (1u8, 0u8)
+        } else {
+            (0u8, 1u8)
+        };
+        let mut left_features = [0.5f32; FEATURE_COUNT];
+        let mut right_features = [0.5f32; FEATURE_COUNT];
+        if choice != JudgmentChoice::Tie {
+            left_features[0] = if left_wins { 0.9 } else { 0.1 };
+            right_features[0] = if left_wins { 0.1 } else { 0.9 };
+        }
+        JudgmentRecord {
+            schema_version: JUDGMENT_SCHEMA_VERSION.to_string(),
+            judgment_id: judgment_id_for(serve_id),
+            serve_id,
+            scope: scope.clone(),
+            source_report_sha256: "c".repeat(64),
+            left: ResultOccurrence {
+                result_occurrence_id: Uuid::new_v4(),
+                source_candidate_index: left_index,
+                asset_id: Uuid::new_v4(),
+                content_ref: lower.to_string(),
+                source_rank: Some(1),
+                features: left_features,
+            },
+            right: ResultOccurrence {
+                result_occurrence_id: Uuid::new_v4(),
+                source_candidate_index: right_index,
+                asset_id: Uuid::new_v4(),
+                content_ref: upper.to_string(),
+                source_rank: Some(2),
+                features: right_features,
+            },
+            selection: SelectionProvenance {
+                policy_revision: "cursor-walk-fixture-v1".to_string(),
+                pair_propensity: Some(0.5),
+                candidate_pool_sha256: Some("d".repeat(64)),
+            },
+            presentation: PresentationProvenance {
+                preference_probability_shown: false,
+                source_rank_shown: false,
+                served_preference_model_id: None,
+            },
+            randomization,
+            choice,
+            reason_code: None,
+            response_ms: Some(100),
+        }
+    }
+
+    /// Generate a full valid judgment population for `scope`: enough
+    /// decisive train/calibration/test pairs and calibration ties to clear
+    /// `train_model`'s support gates, continued past those minimums until at
+    /// least `target_total` records exist.
+    fn synthetic_training_population(
+        scope: &PreferenceScope,
+        target_total: usize,
+    ) -> Vec<JudgmentRecord> {
+        let targets: BTreeMap<DataSplit, usize> = BTreeMap::from([
+            (DataSplit::Train, MIN_TRAIN_DECISIVE_GROUPS),
+            (DataSplit::Calibration, MIN_CAL_DECISIVE_GROUPS),
+            (DataSplit::Test, MIN_TEST_DECISIVE_GROUPS),
+        ]);
+        let mut counts: BTreeMap<DataSplit, usize> = BTreeMap::from([
+            (DataSplit::Train, 0usize),
+            (DataSplit::Calibration, 0usize),
+            (DataSplit::Test, 0usize),
+        ]);
+        let mut cal_ties = 0usize;
+        let mut records = Vec::new();
+        let mut index = 0u64;
+        while records.len() < target_total
+            || counts.iter().any(|(split, count)| *count < targets[split])
+            || cal_ties < MIN_CAL_TIE_GROUPS
+        {
+            let lower = sha256_hex(format!("cursor-walk-lower-{index}").as_bytes());
+            let upper = sha256_hex(format!("cursor-walk-upper-{index}").as_bytes());
+            let pair = PairKey::new(&lower, &upper);
+            let split = pair_split(scope, &pair);
+            let left_wins = index.is_multiple_of(2);
+            let choice = if left_wins {
+                JudgmentChoice::Left
+            } else {
+                JudgmentChoice::Right
+            };
+            records.push(synthetic_judgment_record(
+                scope, &lower, &upper, choice, left_wins,
+            ));
+            *counts.get_mut(&split).expect("split counted above") += 1;
+            if split == DataSplit::Calibration && cal_ties < MIN_CAL_TIE_GROUPS {
+                records.push(synthetic_judgment_record(
+                    scope,
+                    &lower,
+                    &upper,
+                    JudgmentChoice::Tie,
+                    left_wins,
+                ));
+                cal_ties += 1;
+            }
+            index += 1;
+        }
+        records
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn train_preference_snapshot_pages_a_population_above_the_daemon_page_cap() {
+        // Regression for the MAJOR finding fixed alongside this test:
+        // `load_judgment_snapshot` used to request `MAX_TRAINING_EVENTS + 1`
+        // (50,001) rows in one `query_events` call, which the events daemon
+        // refuses outright above `MAX_QUERY_EVENTS_PAGE_ROWS` (4,096) rows.
+        // Seed a population above that page cap but comfortably below
+        // `MAX_TRAINING_EVENTS`, and prove the cursor-walking snapshot load
+        // still assembles every judgment exactly once and that training
+        // still succeeds on the assembled data.
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.db");
+        let runtime = persistent_runtime(&db_path, "alice");
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let store = runtime.events(&token).unwrap();
+
+        let scope = PreferenceScope {
+            namespace: token.namespace().as_str().to_string(),
+            actor_kind: token.actor().kind.clone(),
+            actor_id: token.actor().id.clone(),
+            board_entity_id: Uuid::from_u128(0xB0A2D),
+            board_id: "a".repeat(64),
+            model_key: "moodboard_cursor_walk_fixture".to_string(),
+            descriptor_fingerprint: "b".repeat(64),
+            feature_schema_id: feature_schema_id().to_string(),
+        };
+        let page_cap = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS as usize;
+        let target_total = page_cap + 137;
+        assert!(
+            target_total < MAX_TRAINING_EVENTS,
+            "fixture must stay under the training ceiling"
+        );
+
+        let population = synthetic_training_population(&scope, target_total);
+        assert!(
+            population.len() > page_cap,
+            "fixture must exceed the daemon's page cap to exercise paging: {} rows",
+            population.len()
+        );
+        let mut expected_ids = std::collections::HashSet::new();
+        let mut events = Vec::with_capacity(population.len());
+        for record in &population {
+            expected_ids.insert(record.judgment_id);
+            let payload = serde_json::to_value(record).unwrap();
+            let mut event = Event::new(
+                token.namespace().as_str(),
+                JUDGMENT_RECORD_VERB,
+                EventKind::FeedbackExplicit,
+                SubstrateKind::Entity,
+                actor_label(&token),
+            )
+            .with_target(record.scope.board_entity_id)
+            .with_aggregate("moodboard_judgment", record.serve_id)
+            .with_payload(payload)
+            .with_payload_schema_version(1);
+            event.id = record.judgment_id;
+            events.push(event);
+        }
+        store
+            .append_events(events)
+            .await
+            .expect("seed judgment population");
+
+        let records = load_judgment_snapshot(&runtime, &token)
+            .await
+            .expect("a population above the page cap but under MAX_TRAINING_EVENTS must load");
+        assert_eq!(
+            records.len(),
+            population.len(),
+            "every seeded judgment must be collected exactly once across pages"
+        );
+        let collected_ids: std::collections::HashSet<Uuid> = records
+            .iter()
+            .map(|(_, record)| record.judgment_id)
+            .collect();
+        assert_eq!(
+            collected_ids, expected_ids,
+            "no judgment may be missing or duplicated across paged reads"
+        );
+
+        let permit = acquire_train_permit().expect("gate is free");
+        fit_preference_bounded(permit, records, scope)
+            .await
+            .expect("training must succeed once the paged snapshot is assembled");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

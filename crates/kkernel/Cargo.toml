@@ -12,31 +12,31 @@ categories.workspace = true
 description = "khive kernel — stdio MCP server binary and admin CLI (sync, pack introspection, db ops)"
 
 [dependencies]
-khive-runtime = { version = "0.7.0", path = "../khive-runtime" }
-khive-mcp = { version = "0.7.0", path = "../khive-mcp" }
-khive-score = { version = "0.7.0", path = "../khive-score" }
-khive-db = { version = "0.7.0", path = "../khive-db" }
-khive-storage = { version = "0.7.0", path = "../khive-storage" }
-khive-types = { version = "0.7.0", path = "../khive-types" }
-khive-vcs = { version = "0.7.0", path = "../khive-vcs" }
-khive-vcs-adapters = { version = "0.7.0", path = "../khive-vcs-adapters" }
-khive-pack-kg = { version = "0.7.0", path = "../khive-pack-kg" }
-khive-pack-gtd = { version = "0.7.0", path = "../khive-pack-gtd" }
-khive-pack-memory = { version = "0.7.0", path = "../khive-pack-memory" }
-khive-pack-brain = { version = "0.7.0", path = "../khive-pack-brain" }
-khive-pack-comm = { version = "0.7.0", path = "../khive-pack-comm" }
-khive-pack-schedule = { version = "0.7.0", path = "../khive-pack-schedule" }
-khive-pack-formal = { version = "0.7.0", path = "../khive-pack-formal" }
-khive-pack-code = { version = "0.7.0", path = "../khive-pack-code" }
-khive-pack-knowledge = { version = "0.7.0", path = "../khive-pack-knowledge" }
-khive-pack-session = { version = "0.7.0", path = "../khive-pack-session" }
-khive-pack-git = { version = "0.7.0", path = "../khive-pack-git" }
-khive-pack-blob = { version = "0.7.0", path = "../khive-pack-blob" }
-khive-pack-moodboard = { version = "0.7.0", path = "../khive-pack-moodboard" }
-khive-pack-workspace = { version = "0.7.0", path = "../khive-pack-workspace" }
-khive-request = { version = "0.7.0", path = "../khive-request" }
-khive-changeset = { version = "0.7.0", path = "../khive-changeset" }
-khive-repo-showcase = { version = "0.7.0", path = "../khive-repo-showcase" }
+khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
+khive-mcp = { version = "0.8.0", path = "../khive-mcp" }
+khive-score = { version = "0.8.0", path = "../khive-score" }
+khive-db = { version = "0.8.0", path = "../khive-db" }
+khive-storage = { version = "0.8.0", path = "../khive-storage" }
+khive-types = { version = "0.8.0", path = "../khive-types" }
+khive-vcs = { version = "0.8.0", path = "../khive-vcs" }
+khive-vcs-adapters = { version = "0.8.0", path = "../khive-vcs-adapters" }
+khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
+khive-pack-gtd = { version = "0.8.0", path = "../khive-pack-gtd" }
+khive-pack-memory = { version = "0.8.0", path = "../khive-pack-memory" }
+khive-pack-brain = { version = "0.8.0", path = "../khive-pack-brain" }
+khive-pack-comm = { version = "0.8.0", path = "../khive-pack-comm" }
+khive-pack-schedule = { version = "0.8.0", path = "../khive-pack-schedule" }
+khive-pack-formal = { version = "0.8.0", path = "../khive-pack-formal", optional = true }
+khive-pack-code = { version = "0.8.0", path = "../khive-pack-code" }
+khive-pack-knowledge = { version = "0.8.0", path = "../khive-pack-knowledge" }
+khive-pack-session = { version = "0.8.0", path = "../khive-pack-session" }
+khive-pack-git = { version = "0.8.0", path = "../khive-pack-git" }
+khive-pack-blob = { version = "0.8.0", path = "../khive-pack-blob" }
+khive-pack-moodboard = { version = "0.8.0", path = "../khive-pack-moodboard", optional = true }
+khive-pack-workspace = { version = "0.8.0", path = "../khive-pack-workspace" }
+khive-request = { version = "0.8.0", path = "../khive-request" }
+khive-changeset = { version = "0.8.0", path = "../khive-changeset" }
+khive-repo-showcase = { version = "0.8.0", path = "../khive-repo-showcase" }
 lru = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -64,8 +64,9 @@ rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 # Re-declares the [dependencies] khive-mcp with test instrumentation enabled:
 # Cargo unifies features across the build graph, so test builds see the
 # armed-capture hook while the release dependency above stays untouched.
-khive-mcp = { version = "0.7.0", path = "../khive-mcp", features = ["test-forward-seam"] }
-khive-gate-rego = { version = "0.7.0", path = "../khive-gate-rego" }
+khive-mcp = { version = "0.8.0", path = "../khive-mcp", features = ["test-forward-seam"] }
+khive-gate-rego = { version = "0.8.0", path = "../khive-gate-rego" }
+khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }
 
 [features]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).
@@ -74,6 +75,15 @@ bench-embedder = ["khive-mcp/bench-embedder"]
 channel-email = ["khive-mcp/channel-email"]
 # Pass-through: enables the Telegram Bot API polling + outbox loop. Inert without KHIVE_TELEGRAM_* env vars.
 channel-telegram = ["khive-mcp/channel-telegram"]
+# Links the opt-in khive-pack-formal crate (typed edge endpoint rules for six
+# formal-math concept subtypes; pure ontology, no verbs). Not in the default
+# pack set — off by default.
+pack-formal = ["khive-pack-formal"]
+# Pass-through, plus links kkernel's own force-link reference: enables the
+# opt-in, experimental khive-pack-moodboard crate. Not in the default pack
+# set — off by default. See khive-mcp/Cargo.toml's pack-moodboard feature
+# for what leaving this off does to the V21 attachment cutover.
+pack-moodboard = ["khive-mcp/pack-moodboard", "khive-pack-moodboard"]
 
 [[bin]]
 name = "kkernel"
