@@ -1272,19 +1272,7 @@ mod tests {
         // inspection below accepts only the frozen snapshot form.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["-wal", "-shm"] {
-                let mut name = path.file_name().expect("db file name").to_os_string();
-                name.push(suffix);
-                let sidecar = path.parent().expect("db parent dir").join(name);
-                if sidecar.exists() {
-                    let mut permissions = std::fs::metadata(&sidecar)
-                        .expect("sidecar metadata")
-                        .permissions();
-                    permissions.set_mode(0o444);
-                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-                }
-            }
+            khive_storage::test_support::freeze_snapshot_sidecars(&path);
         }
         let before = std::fs::read(&path).expect("read db before check");
         // strict passes only when the db is already current — proves the read sees V1.
@@ -2107,6 +2095,7 @@ mod tests {
                     "session".to_string(),
                     PackConfig {
                         backend: "sessions".to_string(),
+                        no_embed: false,
                     },
                 );
                 m

@@ -39,12 +39,14 @@ mod _pack_links {
     use khive_pack_brain::BrainPack as _;
     use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
+    #[cfg(feature = "pack-formal")]
     use khive_pack_formal::FormalPack as _;
     use khive_pack_git::GitPack as _;
     use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
     use khive_pack_knowledge::KnowledgePack as _;
     use khive_pack_memory::MemoryPack as _;
+    #[cfg(feature = "pack-moodboard")]
     use khive_pack_moodboard::MoodboardPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;

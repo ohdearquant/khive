@@ -2576,7 +2576,18 @@ impl KnowledgeHandlers {
                 // response instead of aborting the whole compose — the
                 // finalized atom/section body above is still a valid,
                 // useful briefing even without the supplementary KG section.
-                match search_kg_entities(runtime, token, &ns, &raw_query, KG_BLEND_CAP, floor).await
+                // KG entities live on the core (main) backend; on a
+                // secondary-assigned pack runtime this search would silently
+                // blend against an empty graph (ADR-073).
+                match search_kg_entities(
+                    &runtime.core(),
+                    token,
+                    &ns,
+                    &raw_query,
+                    KG_BLEND_CAP,
+                    floor,
+                )
+                .await
                 {
                     Ok(kg_hits) => {
                         let remaining_budget = char_budget.saturating_sub(body_used);

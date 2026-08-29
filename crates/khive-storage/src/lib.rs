@@ -15,6 +15,8 @@ pub mod request_context;
 pub mod sparse;
 pub mod sql;
 pub mod telemetry;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod text;
 pub mod tx_registry;
 pub mod types;
