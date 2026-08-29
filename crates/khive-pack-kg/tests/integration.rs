@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
+use khive_runtime::presentation::{present, PresentationMode};
 use khive_runtime::{
     arm_prefix_resolve_fail_scoped, EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken,
     ParamDef, RuntimeError, VerbCategory, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
@@ -14644,4 +14645,55 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
              {writer_contention:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn update_empty_string_property_survives_agent_echo_and_readback() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Empty property update target",
+                "properties": {"summary": "before"}
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"].as_str().expect("created id").to_string();
+
+    let updated = pack
+        .dispatch("update", json!({"id": id, "properties": {"summary": ""}}))
+        .await
+        .expect("empty-string property update must succeed");
+    assert_eq!(
+        updated["properties"]["summary"],
+        json!(""),
+        "canonical update response must reflect the stored empty string"
+    );
+
+    let fetched = pack
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("readback must succeed");
+    assert_eq!(
+        fetched["properties"]["summary"],
+        json!(""),
+        "canonical readback must retain the empty string"
+    );
+
+    let agent_echo = present(updated, PresentationMode::Agent, 0);
+    assert_eq!(
+        agent_echo["properties"]["summary"],
+        json!(""),
+        "Agent update echo must not render the property as deleted: {agent_echo}"
+    );
+
+    let agent_readback = present(fetched, PresentationMode::Agent, 0);
+    assert_eq!(
+        agent_readback["properties"]["summary"],
+        json!(""),
+        "Agent readback must retain the same empty-string value: {agent_readback}"
+    );
 }
