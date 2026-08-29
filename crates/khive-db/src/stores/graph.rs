@@ -127,6 +127,64 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
     }
 }
 
+/// Full-edge compare-and-swap update used after caller-side normalization
+/// was derived from a read snapshot. Unlike [`edge_upsert_statement`], this
+/// never inserts and cannot overwrite a row whose revision or deletion
+/// marker moved after the snapshot was read. The replacement revision must
+/// also be strictly greater than the persisted snapshot revision; equality
+/// is a refused CAS, never a successful write with an unchanged concurrency
+/// token. Mirrors `note_replace_if_unchanged_statement`
+/// (`crates/khive-db/src/stores/note.rs`). `created_at` is deliberately
+/// excluded from the `SET` list, matching the note/entity siblings — a
+/// replacement never rewrites the row's original creation time.
+pub fn edge_replace_if_unchanged_statement(
+    edge: &Edge,
+    expected_updated_at: DateTime<Utc>,
+    expected_deleted_at: Option<DateTime<Utc>>,
+) -> SqlStatement {
+    let (source_id, target_id) =
+        canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+    let metadata_str = edge
+        .metadata
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    SqlStatement {
+        sql: "UPDATE graph_edges SET \
+                namespace = ?1, source_id = ?2, target_id = ?3, relation = ?4, weight = ?5, \
+                updated_at = ?6, deleted_at = ?7, metadata = ?8, target_backend = ?9 \
+              WHERE id = ?10 AND updated_at = ?11 AND deleted_at IS ?12 \
+                AND ?6 > updated_at"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(edge.namespace.clone()),
+            SqlValue::Text(source_id.to_string()),
+            SqlValue::Text(target_id.to_string()),
+            SqlValue::Text(edge.relation.to_string()),
+            SqlValue::Float(edge.weight),
+            SqlValue::Integer(edge.updated_at.timestamp_micros()),
+            match edge.deleted_at {
+                Some(t) => SqlValue::Integer(t.timestamp_micros()),
+                None => SqlValue::Null,
+            },
+            match metadata_str {
+                Some(m) => SqlValue::Text(m),
+                None => SqlValue::Null,
+            },
+            match &edge.target_backend {
+                Some(b) => SqlValue::Text(b.clone()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(Uuid::from(edge.id).to_string()),
+            SqlValue::Integer(expected_updated_at.timestamp_micros()),
+            match expected_deleted_at {
+                Some(value) => SqlValue::Integer(value.timestamp_micros()),
+                None => SqlValue::Null,
+            },
+        ],
+        label: Some("edge-replace-if-unchanged".to_string()),
+    }
+}
+
 /// The atomic `link` op's variant of [`edge_upsert_statement`] (ADR-099
 /// §B3). Shares the SAME
 /// `EDGE_NATURAL_KEY_CONFLICT_SET` conflict-arm text — the two builders
@@ -242,10 +300,34 @@ pub const EDGE_SYMMETRIC_CONFLICT_PROBE_SQL: &str = "SELECT id FROM graph_edges 
 pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL: &str =
     "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2";
 
+/// Canonical `update_edge`'s guarded variant of
+/// [`EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL`]: `?3`/`?4` pin the fetched
+/// snapshot's `updated_at`/`deleted_at` so a writer whose edge changed
+/// concurrently after it read that snapshot cannot delete the row out from
+/// under the concurrent write, even though a canonical survivor genuinely
+/// exists at the natural key. Zero affected rows means stale, not
+/// "no conflict" — the caller has already confirmed a conflicting canonical
+/// row exists before running this statement. Deliberately a DIFFERENT
+/// constant from the unguarded one above: merge's predicate-based rewrites
+/// (`khive-runtime::curation`) intentionally keep running the unguarded form
+/// inside their own single writer transaction and must not be changed to
+/// bind this one.
+pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL: &str =
+    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2 \
+     AND updated_at = ?3 AND deleted_at IS ?4";
+
+/// Case (a) update, guarded on the fetched snapshot's revision and deletion
+/// marker: `?9`/`?10` pin `updated_at`/`deleted_at` as read, and `?5 >
+/// updated_at` requires the replacement revision to strictly advance —
+/// mirroring `edge_replace_if_unchanged_statement`'s guard so the symmetric
+/// path cannot silently overwrite a concurrent writer's change between the
+/// snapshot read and this write.
 pub const EDGE_SYMMETRIC_UPDATE_INPLACE_SQL: &str = "UPDATE graph_edges SET \
      source_id = ?1, target_id = ?2, relation = ?3, \
      weight = ?4, updated_at = ?5, metadata = ?6 \
-     WHERE namespace = ?7 AND id = ?8";
+     WHERE namespace = ?7 AND id = ?8 \
+       AND updated_at = ?9 AND deleted_at IS ?10 \
+       AND ?5 > updated_at";
 
 /// Plan-shape builder for [`EDGE_SYMMETRIC_CONFLICT_PROBE_SQL`] — the
 /// async prepare-time conflict probe.
@@ -283,7 +365,8 @@ pub fn edge_symmetric_delete_noncanonical_statement(namespace: &str, id: Uuid) -
 }
 
 /// Plan-shape builder for [`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`] —
-/// case (a): no conflict, update the requested row in place.
+/// case (a): no conflict, update the requested row in place, guarded on the
+/// fetched snapshot's revision and deletion marker.
 #[allow(clippy::too_many_arguments)]
 pub fn edge_symmetric_update_inplace_statement(
     namespace: &str,
@@ -294,6 +377,8 @@ pub fn edge_symmetric_update_inplace_statement(
     weight: f64,
     updated_at_micros: i64,
     metadata: Option<&str>,
+    expected_updated_at_micros: i64,
+    expected_deleted_at_micros: Option<i64>,
 ) -> SqlStatement {
     SqlStatement {
         sql: EDGE_SYMMETRIC_UPDATE_INPLACE_SQL.to_string(),
@@ -309,6 +394,11 @@ pub fn edge_symmetric_update_inplace_statement(
             },
             SqlValue::Text(namespace.to_string()),
             SqlValue::Text(id.to_string()),
+            SqlValue::Integer(expected_updated_at_micros),
+            match expected_deleted_at_micros {
+                Some(value) => SqlValue::Integer(value),
+                None => SqlValue::Null,
+            },
         ],
         label: Some("edge-symmetric-update-inplace".to_string()),
     }
@@ -318,11 +408,14 @@ pub fn edge_symmetric_update_inplace_statement(
 // Symmetric-relation update DML — atomic-only, commit-time self-guarding
 // variant (ADR-099 §B3).
 //
-// The four builders above are still what canonical `update_edge_symmetric_dml`
-// binds: it probes and branches synchronously INSIDE its own writer-task
-// transaction, with no other op interleaved between its probe and its write,
-// so its branch has no staleness exposure and is left untouched (control
-// group — canonical's tests must stay green).
+// Canonical `update_edge_symmetric_dml` binds the shared SQL constants above
+// directly, not the plan-shape builders — the builders are used by the atomic
+// prepare path. Canonical probes and branches synchronously INSIDE its own
+// writer-task transaction, with no other op interleaved between its probe and
+// its write, so the interleaving exposure the atomic path has does not arise
+// there. Canonical's absorption delete is nonetheless bound to the GUARDED
+// constant, because its snapshot is read before the transaction and can be
+// stale by the time the delete runs.
 //
 // The atomic path is structurally different: its conflict probe runs in the
 // async PREPARE phase, which for a multi-op `--atomic` unit completes for
@@ -343,7 +436,14 @@ pub fn edge_symmetric_update_inplace_statement(
 //
 // 1. [`edge_symmetric_delete_if_conflict_statement`]: deletes the requested
 //    (non-canonical) row IF AND ONLY IF a differently-id'd canonical row
-//    exists at the target natural key at THIS moment (guard: 0 or 1 rows).
+//    exists at the target natural key at THIS moment AND the row's own
+//    `updated_at`/`deleted_at` still match the snapshot this plan was built
+//    from (guard: 0 or 1 rows) — a plan built from a since-changed snapshot
+//    must not delete the row just because some other, unrelated conflict
+//    happens to exist; the second statement's own commit-time predicate
+//    (below) then sees `changes() = 0` and fails its `exactly(1)` guard,
+//    aborting the whole atomic unit rather than silently absorbing a
+//    concurrent writer's change.
 // 2. [`edge_symmetric_absorb_or_update_inplace_statement`]: a single
 //    `UPDATE` that no longer trusts an `id = ?2 OR natural-key` predicate
 //    (ADR-099 §B3 — that predicate could
@@ -397,16 +497,20 @@ pub fn edge_symmetric_update_inplace_statement(
 // a value computed before the
 // SAME atomic unit's other ops have run is not a fact this plan can stand
 // behind, so result rendering no longer trusts it.
+#[allow(clippy::too_many_arguments)]
 pub fn edge_symmetric_delete_if_conflict_statement(
     namespace: &str,
     id: Uuid,
     canon_src: Uuid,
     canon_tgt: Uuid,
     relation: EdgeRelation,
+    expected_updated_at_micros: i64,
+    expected_deleted_at_micros: Option<i64>,
 ) -> SqlStatement {
     SqlStatement {
         sql: "DELETE FROM graph_edges \
               WHERE namespace = ?1 AND id = ?2 \
+                AND updated_at = ?6 AND deleted_at IS ?7 \
                 AND EXISTS ( \
                   SELECT 1 FROM graph_edges \
                   WHERE namespace = ?1 AND source_id = ?3 AND target_id = ?4 \
@@ -419,11 +523,24 @@ pub fn edge_symmetric_delete_if_conflict_statement(
             SqlValue::Text(canon_src.to_string()),
             SqlValue::Text(canon_tgt.to_string()),
             SqlValue::Text(relation.to_string()),
+            SqlValue::Integer(expected_updated_at_micros),
+            match expected_deleted_at_micros {
+                Some(value) => SqlValue::Integer(value),
+                None => SqlValue::Null,
+            },
         ],
         label: Some("edge-symmetric-delete-if-conflict".to_string()),
     }
 }
 
+/// `?10`/`?11` pin the fetched snapshot's `updated_at`/`deleted_at` and
+/// `?7 > updated_at` requires the replacement revision to strictly advance —
+/// guarding the in-place arm (`id = ?2`) against a concurrent writer that
+/// changed the row between the snapshot read and this statement. The
+/// absorbed arm (a differently-id'd canonical row) is intentionally left
+/// unguarded on revision: per ADR-039 DO NOTHING it self-assigns every
+/// column, so it is a no-op write regardless of the survivor's current
+/// state.
 #[allow(clippy::too_many_arguments)]
 pub fn edge_symmetric_absorb_or_update_inplace_statement(
     namespace: &str,
@@ -435,6 +552,8 @@ pub fn edge_symmetric_absorb_or_update_inplace_statement(
     updated_at_micros: i64,
     metadata: Option<&str>,
     target_backend: Option<&str>,
+    expected_updated_at_micros: i64,
+    expected_deleted_at_micros: Option<i64>,
 ) -> SqlStatement {
     SqlStatement {
         sql: "UPDATE graph_edges SET \
@@ -448,7 +567,8 @@ pub fn edge_symmetric_absorb_or_update_inplace_statement(
               target_backend = CASE WHEN id = ?2 THEN ?9 ELSE target_backend END \
               WHERE namespace = ?1 \
                 AND ( \
-                  (id = ?2 AND changes() = 0) \
+                  (id = ?2 AND changes() = 0 AND updated_at = ?10 AND deleted_at IS ?11 \
+                      AND ?7 > updated_at) \
                   OR (source_id = ?3 AND target_id = ?4 AND relation = ?5 \
                       AND id != ?2 AND changes() = 1) \
                 )"
@@ -467,6 +587,11 @@ pub fn edge_symmetric_absorb_or_update_inplace_statement(
             },
             match target_backend {
                 Some(b) => SqlValue::Text(b.to_string()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(expected_updated_at_micros),
+            match expected_deleted_at_micros {
+                Some(value) => SqlValue::Integer(value),
                 None => SqlValue::Null,
             },
         ],
@@ -597,12 +722,11 @@ impl SqlGraphStore {
                 StorageCapability::Graph,
                 op,
                 move |scope| {
-                    let mut guard = pool
-                        .reader_until(|| scope.should_stop())
-                        .map_err(|e| map_sqlite_err(e, op))?
-                        .ok_or_else(|| StorageError::Timeout {
-                            operation: op.into(),
-                        })?;
+                    let mut guard = pool.resolve_reader_checkout(
+                        StorageCapability::Graph,
+                        op,
+                        pool.reader_until(|| scope.should_stop()),
+                    )?;
                     scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
                 },
             )
@@ -1364,6 +1488,22 @@ impl GraphStore for SqlGraphStore {
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn replace_edge_if_unchanged(
+        &self,
+        edge: Edge,
+        expected_updated_at: DateTime<Utc>,
+        expected_deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, StorageError> {
+        let statement =
+            edge_replace_if_unchanged_statement(&edge, expected_updated_at, expected_deleted_at);
+        self.with_writer("replace_edge_if_unchanged", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }

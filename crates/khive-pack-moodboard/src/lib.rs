@@ -24,7 +24,7 @@ use model::VisionModelState;
 
 pub use preference_artifact::{
     legacy_preference_model_count, verify_legacy_preference_attachments,
-    VerifiedModelNetworkAttachment,
+    MoodboardLegacyPreferenceVerifier, VerifiedModelNetworkAttachment,
 };
 
 pub(crate) const PACK_NAME: &str = "moodboard";

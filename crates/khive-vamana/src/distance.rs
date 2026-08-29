@@ -16,7 +16,11 @@ pub(crate) fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     let mut s6 = 0.0f32;
     let mut s7 = 0.0f32;
 
+    // `as_chunks` (clippy's suggested replacement) is unstable on the stable
+    // toolchain this crate builds with; keep `chunks_exact` until it lands.
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     let chunks_a = a.chunks_exact(8);
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     let chunks_b = b.chunks_exact(8);
     let rem_a = chunks_a.remainder();
     let rem_b = chunks_b.remainder();

@@ -134,6 +134,10 @@ pub struct CheckpointCounters {
     pub checkpoint_lifecycle_append_attempts: u64,
     pub checkpoint_lifecycle_append_failures: u64,
     pub checkpoint_lifecycle_enqueue_drops: u64,
+    /// Cached-reader read transactions rolled back on reuse for exceeding
+    /// `read_tx_max_age` (#1846) — the count of WAL snapshots actually
+    /// released by that bound, not merely logged as stale.
+    pub read_tx_max_age_evictions: u64,
 }
 
 /// Snapshot the process-global ADR-091 counters.
@@ -152,6 +156,7 @@ pub fn checkpoint_counters() -> CheckpointCounters {
         checkpoint_lifecycle_append_attempts: checkpoint::checkpoint_lifecycle_append_attempts(),
         checkpoint_lifecycle_append_failures: checkpoint::checkpoint_lifecycle_append_failures(),
         checkpoint_lifecycle_enqueue_drops: checkpoint::checkpoint_lifecycle_enqueue_drops(),
+        read_tx_max_age_evictions: checkpoint::read_tx_max_age_evictions(),
     }
 }
 
@@ -215,13 +220,11 @@ fn wal_sidecar_path(db_path: &Path) -> PathBuf {
 /// WAL-pin attribution: who currently holds the database open, and how
 /// complete that answer is.
 ///
-/// Field names and shape mirror the reference diagnostics surface this was
-/// ported from, so external consumers parsing this payload keep working.
-/// This tree's `khive-db` lacks a read-only sidecar enumeration primitive
-/// (see the module docs), so the sidecar-derived fields below are always
-/// empty here. `status`, `status_reasons`, and the tagged `census` field are
-/// the authoritative completeness contract. The older sibling booleans and
-/// PID arrays remain as a compatibility projection.
+/// `status`, `status_reasons`, and the tagged `census` field are the
+/// authoritative wire contract. The older sibling booleans and PID arrays
+/// remain available to Rust callers but are not serialized. This tree's
+/// `khive-db` lacks a read-only sidecar enumeration primitive (see the module
+/// docs), so the sidecar-derived fields below are always empty here.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WalPinAttribution {
     /// Authoritative quality of the complete attribution answer.
@@ -235,9 +238,13 @@ pub struct WalPinAttribution {
     pub available: bool,
     pub unavailable_reason: Option<String>,
     /// OS-derived census of every PID holding the DB file open.
+    #[serde(skip_serializing)]
     pub census_holder_pids: Vec<u32>,
+    #[serde(skip_serializing)]
     pub census_uninspectable_pids: Vec<u32>,
+    #[serde(skip_serializing)]
     pub census_truncated: bool,
+    #[serde(skip_serializing)]
     pub census_is_complete: bool,
     /// Always empty in this port — see the module docs.
     pub reporting: Vec<WalPinHolder>,
@@ -507,6 +514,37 @@ pub struct WriterContentionDiagnostics {
     pub audit_degraded: Option<bool>,
     /// Why `audit_degraded` is unavailable to this caller.
     pub audit_degraded_unavailable_reason: Option<String>,
+    /// Per-dispatch audit rows for an explicitly allowlisted, domain-write-free
+    /// read verb (`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`) that were
+    /// **refused before they could be enqueued** on the audit lane
+    /// (`AuditTerminalReason::QueueAdmissionExhausted`) while the dispatch
+    /// still reported its own successful result (ADR-103 Amendment 3, ADR-133
+    /// Amendment 1). This is a confirmed, terminal accounting loss: the row
+    /// never shared a generation with anyone and will never commit, so it
+    /// undercounts `brain.event_counts`'s cost totals for exactly the rows
+    /// counted here. Disjoint from `audit_degraded_rows` (a different reason:
+    /// persistent commit failure of a pure-observability row, not admission
+    /// pressure) and from `audit_admission_unresolved_obligations` (a row that
+    /// was enqueued and may still commit). `None` under the same conditions as
+    /// `audit_batch_flush_failures`.
+    pub audit_admission_refused_obligations: Option<u64>,
+    /// Why `audit_admission_refused_obligations` is unavailable to this caller.
+    pub audit_admission_refused_obligations_unavailable_reason: Option<String>,
+    /// Per-dispatch audit rows for an explicitly allowlisted, domain-write-free
+    /// read verb (`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`) that were
+    /// **already enqueued but had not resolved when the caller's admission
+    /// wait deadline elapsed** (`AuditTerminalReason::AdmissionDeadlineExpired`)
+    /// while the dispatch still reported its own successful result (ADR-103
+    /// Amendment 3, ADR-133 Amendment 1). Unlike
+    /// `audit_admission_refused_obligations`, a row counted here is not a
+    /// confirmed loss — it may still be committed by the generation driver
+    /// independently of the caller's timeout — so this field is an upper
+    /// bound on the eventual undercount, not the undercount itself. `None`
+    /// under the same conditions as `audit_batch_flush_failures`.
+    pub audit_admission_unresolved_obligations: Option<u64>,
+    /// Why `audit_admission_unresolved_obligations` is unavailable to this
+    /// caller.
+    pub audit_admission_unresolved_obligations_unavailable_reason: Option<String>,
 }
 
 /// Process-wide audit-batch health counters, supplied by the runtime layer
@@ -522,6 +560,18 @@ pub struct RuntimeAuditBatchMetrics {
     pub degraded_rows: u64,
     /// Monotonic process-lifetime degradation flag.
     pub degraded: bool,
+    /// Admission-degrade-safe read verbs' audit rows refused before enqueue
+    /// under transient audit-lane admission pressure (ADR-103 Amendment 3,
+    /// ADR-133 Amendment 1) — a confirmed, terminal accounting loss. Disjoint
+    /// from `degraded_rows` and from `admission_unresolved_obligations`.
+    pub admission_refused_obligations: u64,
+    /// Admission-degrade-safe read verbs' audit rows that were already
+    /// enqueued but had not resolved when the caller's admission wait
+    /// deadline elapsed (ADR-103 Amendment 3, ADR-133 Amendment 1). Not a
+    /// confirmed loss — the row may still commit — so this is an upper bound
+    /// on the eventual undercount. Disjoint from `degraded_rows` and from
+    /// `admission_refused_obligations`.
+    pub admission_unresolved_obligations: u64,
 }
 
 impl WriterContentionDiagnostics {
@@ -559,6 +609,18 @@ impl WriterContentionDiagnostics {
                 .flatten(),
             audit_degraded: runtime_audit_batch_metrics.map(|m| m.degraded),
             audit_degraded_unavailable_reason: runtime_audit_batch_metrics
+                .is_none()
+                .then(unavailable_reason)
+                .flatten(),
+            audit_admission_refused_obligations: runtime_audit_batch_metrics
+                .map(|m| m.admission_refused_obligations),
+            audit_admission_refused_obligations_unavailable_reason: runtime_audit_batch_metrics
+                .is_none()
+                .then(unavailable_reason)
+                .flatten(),
+            audit_admission_unresolved_obligations: runtime_audit_batch_metrics
+                .map(|m| m.admission_unresolved_obligations),
+            audit_admission_unresolved_obligations_unavailable_reason: runtime_audit_batch_metrics
                 .is_none()
                 .then(unavailable_reason)
                 .flatten(),
@@ -1081,6 +1143,8 @@ mod tests {
                 flush_failures: 3,
                 degraded_rows: 7,
                 degraded: true,
+                admission_refused_obligations: 5,
+                admission_unresolved_obligations: 2,
             }),
         )
         .await
@@ -1095,6 +1159,46 @@ mod tests {
             .is_none());
         assert_eq!(with_control.writer_contention.audit_degraded_rows, Some(7));
         assert_eq!(with_control.writer_contention.audit_degraded, Some(true));
+        assert_eq!(
+            with_control
+                .writer_contention
+                .audit_admission_refused_obligations,
+            Some(5),
+            "an operator must be able to read the admission-refused obligation count from \
+             db_diagnostics without a test-only feature gate (ADR-103 Amendment 3)"
+        );
+        assert!(with_control
+            .writer_contention
+            .audit_admission_refused_obligations_unavailable_reason
+            .is_none());
+        assert_eq!(
+            with_control
+                .writer_contention
+                .audit_admission_unresolved_obligations,
+            Some(2),
+            "an operator must be able to distinguish enqueued-but-unresolved rows from \
+             confirmed-refused rows (ADR-103 Amendment 3)"
+        );
+        assert!(with_control
+            .writer_contention
+            .audit_admission_unresolved_obligations_unavailable_reason
+            .is_none());
+        assert!(without_control
+            .writer_contention
+            .audit_admission_refused_obligations
+            .is_none());
+        assert!(without_control
+            .writer_contention
+            .audit_admission_refused_obligations_unavailable_reason
+            .is_some());
+        assert!(without_control
+            .writer_contention
+            .audit_admission_unresolved_obligations
+            .is_none());
+        assert!(without_control
+            .writer_contention
+            .audit_admission_unresolved_obligations_unavailable_reason
+            .is_some());
 
         // Existing fields must be unaffected by the new ones — additive, not
         // a reshuffle.
@@ -1294,6 +1398,7 @@ mod tests {
             "checkpoint_lifecycle_append_attempts",
             "checkpoint_lifecycle_append_failures",
             "checkpoint_lifecycle_enqueue_drops",
+            "read_tx_max_age_evictions",
         ] {
             assert!(counters.get(key).is_some(), "counter {key} must be present");
         }
@@ -1428,6 +1533,7 @@ mod tests {
             checkpoint_lifecycle_append_attempts: 0,
             checkpoint_lifecycle_append_failures: 0,
             checkpoint_lifecycle_enqueue_drops: 0,
+            read_tx_max_age_evictions: 0,
         };
         let json = serde_json::to_value(counters).expect("serializes");
         assert!(json["last_observed_wal_pages"].is_null());
@@ -1512,6 +1618,36 @@ mod tests {
             json.get("sidecar_entries_cleanup_would_reap").is_none(),
             "a skipped enumeration must omit sidecar_entries_cleanup_would_reap, not fabricate 0"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_pin_census_serializes_only_under_the_nested_carrier() {
+        let pin = wal_pin_attribution_from_census(crate::walpin::CensusResult {
+            holders: std::collections::HashSet::from([41, 7]),
+            uninspectable_pids: vec![99],
+            truncated: true,
+        });
+
+        let json = serde_json::to_value(pin).expect("attribution serializes");
+        assert_eq!(json["census"]["holder_pids"], serde_json::json!([7, 41]));
+        assert_eq!(
+            json["census"]["uninspectable_pids"],
+            serde_json::json!([99])
+        );
+        assert_eq!(json["census"]["truncated"], true);
+
+        for duplicate in [
+            "census_holder_pids",
+            "census_uninspectable_pids",
+            "census_truncated",
+            "census_is_complete",
+        ] {
+            assert!(
+                json.get(duplicate).is_none(),
+                "wal_pin.{duplicate} must not duplicate wal_pin.census: {json}"
+            );
+        }
     }
 
     /// A missing configured path must never be created by a diagnostic
