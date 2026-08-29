@@ -276,11 +276,26 @@ pub struct BackendConfig {
 /// ```toml
 /// [packs.knowledge]
 /// backend = "knowledge"
+///
+/// [packs.comm]
+/// backend = "comm"
+/// no_embed = true
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct PackConfig {
     /// Backend name this pack is assigned to. Must match a `[[backends]].name`.
     pub backend: String,
+    /// Disable vector embedding for this pack's runtime: rows it writes get
+    /// FTS and metadata only, no `vec_*` rows and no ANN participation. The
+    /// opt-out covers pack-owned writes on the pack's own backend; it does
+    /// NOT cover `core()`-routed concept writes, which embed with the MAIN
+    /// runtime's embedders (the boot path wires them in via
+    /// `with_core_embedders_from`) so the shared graph stays uniformly
+    /// searchable. Fits packs whose own rows are structural rather than
+    /// retrieval targets (e.g. comm). Effective in multi-backend boot, where
+    /// each pack gets its own runtime. Defaults to `false`.
+    #[serde(default)]
+    pub no_embed: bool,
 }
 
 // ---- Blob store config (ADR-111 Amendment 2) ----

@@ -697,13 +697,17 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
         .collect();
     backend_rows.sort();
 
-    let mut pack_rows: Vec<(String, String)> = cfg
+    let mut pack_rows: Vec<(String, String, bool)> = cfg
         .packs
         .iter()
         .map(|(pack, pack_config)| {
             legacy_safe &= legacy_topology_component_is_safe(pack)
                 && legacy_topology_component_is_safe(&pack_config.backend);
-            (pack.clone(), pack_config.backend.clone())
+            (
+                pack.clone(),
+                pack_config.backend.clone(),
+                pack_config.no_embed,
+            )
         })
         .collect();
     pack_rows.sort();
@@ -719,7 +723,13 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .join(",");
         let pack_backends = pack_rows
             .iter()
-            .map(|(pack, backend)| format!("{pack}={backend}"))
+            .map(|(pack, backend, no_embed)| {
+                // `no_embed` changes runtime behavior (that pack's runtime
+                // carries zero embedders), so it must move the fingerprint;
+                // emitted only when set so pre-existing configs keep their id.
+                let no_embed = if *no_embed { ":no_embed" } else { "" };
+                format!("{pack}={backend}{no_embed}")
+            })
             .collect::<Vec<_>>()
             .join(",");
         (backends, pack_backends)
@@ -739,9 +749,10 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .join(",");
         let pack_backends = pack_rows
             .iter()
-            .map(|(pack, backend)| {
+            .map(|(pack, backend, no_embed)| {
+                let no_embed = if *no_embed { ":no_embed" } else { "" };
                 format!(
-                    "{}={}",
+                    "{}={}{no_embed}",
                     escape_topology_component(pack),
                     escape_topology_component(backend),
                 )
@@ -820,11 +831,13 @@ fn build_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>)
 /// Runtime-mode admission for transport background work.
 ///
 /// The inbound tasks dispatch only `comm.*` verbs (`comm.ingest`, heartbeat,
-/// and cursor operations), so their write authority is the comm pack's actual
-/// assigned runtime. The outbound tasks scan and mutate notes through the kg
-/// pack's generic `list`/`update` verbs, so they must not perform an external
-/// send unless that runtime can durably record the claim and `delivered_at`.
-/// Keeping the two decisions separate preserves mixed-backend topologies.
+/// and cursor operations), and the outbound tasks scan, claim, and mark
+/// outbound `message` notes through the runtime's non-wire owner-side APIs —
+/// both against the comm pack's actual assigned runtime, since under a
+/// `[packs.comm]` backend assignment that is the backend holding comm's
+/// rows. Neither loop may run unless that runtime can durably record its
+/// writes. The two decisions stay separate so a future topology can admit
+/// one direction without the other.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChannelLoopAdmission {
@@ -836,21 +849,18 @@ pub(crate) struct ChannelLoopAdmission {
 impl ChannelLoopAdmission {
     fn for_single_runtime(runtime: &KhiveRuntime, packs: &[String]) -> Self {
         let comm_loaded = packs.iter().any(|pack| pack == "comm");
-        let kg_loaded = packs.iter().any(|pack| pack == "kg");
         let writable = !runtime.is_read_only();
         Self {
             inbound_poll: comm_loaded && writable,
-            outbound_delivery: comm_loaded && kg_loaded && writable,
+            outbound_delivery: comm_loaded && writable,
         }
     }
 
-    pub(crate) fn for_pack_runtimes(
-        kg: Option<&KhiveRuntime>,
-        comm: Option<&KhiveRuntime>,
-    ) -> Self {
+    pub(crate) fn for_pack_runtimes(comm: Option<&KhiveRuntime>) -> Self {
+        let admitted = comm.is_some_and(|runtime| !runtime.is_read_only());
         Self {
-            inbound_poll: comm.is_some_and(|runtime| !runtime.is_read_only()),
-            outbound_delivery: comm.is_some() && kg.is_some_and(|runtime| !runtime.is_read_only()),
+            inbound_poll: admitted,
+            outbound_delivery: admitted,
         }
     }
 }
@@ -878,11 +888,13 @@ pub struct KhiveMcpServer {
     /// [`Self::from_registry`]/[`Self::from_registry_with_meta`] without an
     /// explicit [`Self::with_runtime`] call (test-only construction paths).
     runtime: Option<KhiveRuntime>,
-    /// Runtime that owns KG-routed outbox notes. The email loop's
-    /// `external_id` claim is deliberately non-wire, so it cannot rely on the
-    /// registry to route that one mutation. In a multi-backend topology this
-    /// may differ from `runtime` (the default backend); retaining the exact KG
-    /// runtime keeps list, owner claim, and delivered-at update on one store.
+    /// Runtime that owns the outbound `message` notes the delivery loops
+    /// scan, claim, and mark — the comm pack's assigned runtime. Every one of
+    /// those touches is deliberately non-wire (the generic verbs run on the
+    /// kg/main runtime, which under a `[packs.comm]` backend assignment does
+    /// not hold comm's rows). In a multi-backend topology this may differ
+    /// from `runtime` (the default backend); retaining the exact comm
+    /// runtime keeps scan, owner claim, and delivered-at update on one store.
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     channel_outbox_runtime: Option<KhiveRuntime>,
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
@@ -1304,7 +1316,7 @@ impl KhiveMcpServer {
         self
     }
 
-    /// Attach the exact KG-routed runtime that owns outbox note properties.
+    /// Attach the exact comm-routed runtime that owns outbox note properties.
     /// Multi-backend boot overrides the default-runtime fallback installed by
     /// [`Self::with_runtime`]; single-backend construction already points both
     /// handles at the same runtime.
@@ -4002,25 +4014,8 @@ mod tests {
         }
     }
 
-    // Freeze lingering `-wal`/`-shm` sidecars left by a writable fixture whose
-    // connections close asynchronously; read-only admission rejects a writable
-    // `-shm` as potentially live.
     #[cfg(unix)]
-    fn freeze_snapshot_sidecars(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        for suffix in ["-wal", "-shm"] {
-            let mut name = path.file_name().expect("db file name").to_os_string();
-            name.push(suffix);
-            let sidecar = path.parent().expect("db parent dir").join(name);
-            if sidecar.exists() {
-                let mut permissions = std::fs::metadata(&sidecar)
-                    .expect("sidecar metadata")
-                    .permissions();
-                permissions.set_mode(0o444);
-                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-            }
-        }
-    }
+    use khive_storage::test_support::freeze_snapshot_sidecars;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -5933,6 +5928,7 @@ mod tests {
                 "knowledge".to_string(),
                 PackConfig {
                     backend: "archive".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -5977,6 +5973,7 @@ mod tests {
                 "kg".to_string(),
                 PackConfig {
                     backend: "main".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -5990,6 +5987,58 @@ mod tests {
         assert!(
             config_id.ends_with(&expected_suffix),
             "delimiter-free topologies must retain their legacy fingerprint spelling; got {config_id}"
+        );
+    }
+
+    /// `no_embed` changes runtime behavior (that pack's runtime carries zero
+    /// embedders), so two configs differing only in it must not share a
+    /// `config_id` — a shared id would let a daemon serve a client whose
+    /// embedding policy it does not implement. Absent/false keeps the
+    /// pre-existing spelling so already-deployed configs keep their id.
+    #[test]
+    fn config_id_differs_when_pack_no_embed_differs() {
+        use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
+
+        let dir = tempfile::tempdir().expect("no_embed topology tempdir");
+        let main_path = dir.path().join("main.db");
+        let runtime = RuntimeConfig {
+            db_path: Some(main_path.clone()),
+            packs: vec!["comm".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let topology_for = |no_embed: bool| KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path.clone()),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            packs: std::collections::HashMap::from([(
+                "comm".to_string(),
+                PackConfig {
+                    backend: "main".to_string(),
+                    no_embed,
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+
+        let with_flag = compute_config_id(&runtime, Some(&topology_for(true)));
+        let without_flag = compute_config_id(&runtime, Some(&topology_for(false)));
+        assert_ne!(
+            with_flag, without_flag,
+            "configs differing only in no_embed must not share a config_id"
+        );
+        assert!(
+            with_flag.contains("comm=main:no_embed"),
+            "no_embed must appear in the pack fingerprint; got {with_flag}"
+        );
+        assert!(
+            without_flag.contains("comm=main]"),
+            "absent no_embed keeps the legacy pack spelling; got {without_flag}"
         );
     }
 

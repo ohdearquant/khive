@@ -159,8 +159,12 @@ impl KnowledgePack {
             }
         }
 
+        // Concept entities are linkable graph rows and must live on the core
+        // (main) backend even when the pack is assigned a secondary backend
+        // (ADR-073; same seam as the session pack's ADR-083 §4 fix).
         let entity = self
             .runtime
+            .core()
             .create_entity(
                 token,
                 "concept",
@@ -191,12 +195,14 @@ impl KnowledgePack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: CiteParams = deser(params)?;
-        let concept_id = resolve_uuid(&p.concept_id, &self.runtime, token).await?;
-        let source_id = resolve_uuid(&p.source_id, &self.runtime, token).await?;
+        // Concepts and their sources live on the core graph, so both prefix
+        // resolution and the edge write must target the core backend (ADR-073).
+        let core = self.runtime.core();
+        let concept_id = resolve_uuid(&p.concept_id, &core, token).await?;
+        let source_id = resolve_uuid(&p.source_id, &core, token).await?;
         let weight = p.weight.unwrap_or(1.0).clamp(0.0, 1.0);
 
-        let edge = self
-            .runtime
+        let edge = core
             .link(
                 token,
                 concept_id,
@@ -224,6 +230,10 @@ impl KnowledgePack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: TopicParams = deser(params)?;
+        // Concept entities live on the core graph (see handle_learn); every
+        // read in this handler must go through the core backend or a
+        // secondary-assigned pack would list/search an empty graph (ADR-073).
+        let core = self.runtime.core();
         let limit = p.limit.unwrap_or(20).min(100);
         // Normalise domain filter to lowercase for case-insensitive matching.
         let domain_filter = p
@@ -237,8 +247,7 @@ impl KnowledgePack {
             // We fetch limit*4 candidates to give the domain filter enough to work with.
             // `total` = post-filter count of the candidate window (bounded by limit*4),
             // NOT a true corpus count — see doc comment above.
-            let hits = self
-                .runtime
+            let hits = core
                 .hybrid_search(
                     token,
                     query,
@@ -255,8 +264,7 @@ impl KnowledgePack {
             // unified item shape (K-2) and apply the domain filter reliably.
             let hit_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
             let entity_map: std::collections::HashMap<Uuid, _> = if !hit_ids.is_empty() {
-                self.runtime
-                    .get_entities_by_ids(token, &hit_ids)
+                core.get_entities_by_ids(token, &hit_ids)
                     .await?
                     .into_iter()
                     .map(|e| (e.id, e))
@@ -307,13 +315,11 @@ impl KnowledgePack {
             // Listing path: DB-level domain filter via tags_any avoids silent
             // truncation (K-3).  `count_entities_tagged` gives the pre-limit
             // match count for `total` (K-6).
-            let total = self
-                .runtime
+            let total = core
                 .count_entities_tagged(token, Some("concept"), domain_filter.as_deref())
                 .await?;
 
-            let entities = self
-                .runtime
+            let entities = core
                 .list_entities_tagged(token, Some("concept"), domain_filter.as_deref(), limit, 0)
                 .await?;
 
@@ -559,6 +565,125 @@ mod tests {
 
     use crate::knowledge::section_feedback::on_section_feedback;
     use crate::KnowledgePack;
+
+    /// A runtime shaped like a `[packs.knowledge]` backend assignment: bound
+    /// to a secondary `knowledge` backend with the shared-graph main backend
+    /// reachable only through `core()`. Both backends are fresh in-memory
+    /// databases with migrations applied (same construction as the session
+    /// pack's ADR-083 §4 regression tests).
+    fn secondary_backend_runtime() -> KhiveRuntime {
+        use std::sync::Arc;
+
+        let make_backend = || {
+            let backend = khive_db::StorageBackend::memory().expect("in-memory backend");
+            {
+                let mut writer = backend.pool().try_writer().expect("writer");
+                khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+            }
+            Arc::new(backend)
+        };
+        let main_backend = make_backend();
+        let knowledge_backend = make_backend();
+
+        let mut config = khive_runtime::RuntimeConfig::no_embeddings();
+        config.packs = vec!["kg".to_string()];
+        config.backend_id = khive_runtime::BackendId::new("knowledge");
+
+        KhiveRuntime::from_backend(knowledge_backend, config).with_core_backend(main_backend)
+    }
+
+    /// ADR-073 regression: the concept tier (`learn`/`cite`/`topic`) must
+    /// read and write the core graph. On a secondary-assigned runtime,
+    /// pre-fix behavior wrote the concept entity into the pack's own backend
+    /// — self-consistent from inside the pack, but invisible to kg and lost
+    /// to every core-graph consumer.
+    #[tokio::test]
+    async fn concept_tier_routes_through_core_on_secondary_backend() {
+        let rt = secondary_backend_runtime();
+        let pack = KnowledgePack::new(rt.clone());
+        let registry = VerbRegistryBuilder::new()
+            .build()
+            .expect("empty registry builds");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let learned = pack
+            .dispatch(
+                "knowledge.learn",
+                json!({ "name": "core-routing probe", "content": "concept body", "domain": "retrieval" }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("learn succeeds");
+        let concept_id: Uuid = learned["full_id"]
+            .as_str()
+            .expect("full_id")
+            .parse()
+            .expect("uuid");
+
+        // The entity must exist on the core graph...
+        let on_core = rt
+            .core()
+            .get_entities_by_ids(&token, &[concept_id])
+            .await
+            .expect("core read succeeds");
+        assert_eq!(
+            on_core.len(),
+            1,
+            "learn must write the concept entity to the core (main) backend"
+        );
+        // ...and must NOT have been written into the pack's secondary backend.
+        let on_secondary = rt
+            .get_entities_by_ids(&token, &[concept_id])
+            .await
+            .expect("secondary read succeeds");
+        assert!(
+            on_secondary.is_empty(),
+            "concept entity must not land on the knowledge backend"
+        );
+
+        // cite: prefix resolution and the edge write share the core seam.
+        // The source is a document entity on the core graph (the shape cite
+        // links against in production).
+        let source = rt
+            .core()
+            .create_entity(
+                &token,
+                "document",
+                None,
+                "source paper",
+                Some("source body"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("source document entity");
+        let source_id = source.id.to_string();
+        pack.dispatch(
+            "knowledge.cite",
+            json!({ "concept_id": concept_id.to_string(), "source_id": source_id }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("cite must resolve both core-side entities and write the edge");
+
+        // topic (listing mode) reads through core and must see the concepts.
+        let topics = pack
+            .dispatch(
+                "knowledge.topic",
+                json!({ "domain": "retrieval" }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("topic succeeds");
+        assert_eq!(
+            topics["total"].as_u64(),
+            Some(1),
+            "topic must list the core-side concept: {topics}"
+        );
+    }
 
     /// Regression: handle_topic's entity lookup must never panic when an entity_id
     /// is absent from the map.
