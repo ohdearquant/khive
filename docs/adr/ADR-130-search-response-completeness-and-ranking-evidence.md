@@ -126,7 +126,9 @@ operation MUST return:
 - `ok=false`;
 - no successful `result` field;
 - `error.kind="search_incomplete"`;
-- `error.retryable=false`;
+- `error.retryable=false` — **amended: see Amendment 2**, which makes this
+  conditional on every failed leg having timed out. `false` remains the default
+  and the value required whenever that condition does not hold;
 - `error.missing_backends` as a sorted, deduplicated, non-empty array;
 - `error.message` stating that no-match was not established.
 
@@ -210,9 +212,22 @@ times, turn 50 logical searches per second into as many as 150 attempts per
 second for the duration of the outage. `error.retryable=false` reduces that risk
 but cannot eliminate it for clients that ignore the field.
 
+**Amended: see Amendment 2.** The prohibition on automatic retry is narrowed to
+the cases where a retry cannot succeed, and the admission requirements above are
+promoted from a condition on opt-in retries to a precondition for advertising
+retryability at all. The arithmetic in this section is not disputed by that
+amendment; Amendment 2 §3 addresses it directly, including why the concession in
+the last sentence above is load-bearing against this section's own conclusion.
+
 ## Wire examples
 
 ### Degraded-empty
+
+**Amended: see Amendment 2 §5.** This example types a leg as `backend_error`
+while its own message reports a timeout, so as written it does not survive
+Amendment 2's two-value `kind` vocabulary. Amendment 2 §5 carries the corrected
+form for the all-timeout case; the example below remains correct for a genuine
+`backend_error`, with a message that does not describe a timeout.
 
 ```json
 {
@@ -358,7 +373,9 @@ before/after golden results over the existing normalization and squash paths.
 receive additive fields in v0.8.0 but must migrate off `score`. Strict readers
 need schema updates in v0.8.0. Generic error-retry callers MUST honour
 `error.retryable=false`. Verified by the release-gated schema fixtures and the
-retry-policy row in Verification.
+retry-policy row in Verification. **Amended: see Amendment 2** — callers must
+now honour the field's value rather than a constant, and a caller that acts on
+`retryable=true` must also honour `retry_after_ms`.
 
 ## Supersession
 
@@ -452,7 +469,10 @@ retry-policy row in Verification.
 6. Schema and help snapshots, plus strict and tolerant JSON consumer fixtures.
 7. Knowledge-pack before/after golden results proving no semantic drift.
 8. Retry-policy tests proving `search_incomplete` is not retried by default;
-   generic error-retry client behaviour is covered by this row.
+   generic error-retry client behaviour is covered by this row. **Amended: see
+   Amendment 2 §6** — the default is unchanged, but a test asserting
+   `retryable` is *always* `false` now contradicts the record; assert the
+   default and the all-timeout case separately.
 9. Compatibility-alias contract tests: `partial=true` present beside every
    `status="partial"` success and absent on `complete` in v0.8.0.
 10. Frame-budget omission tests in verbose and agent modes asserting the full
@@ -474,7 +494,9 @@ retry-policy row in Verification.
 
 Every incomplete multi-backend search MUST carry `backend_errors`, an object
 keyed by exactly the same sorted backend ids retained in `missing_backends`.
-Each value is `{kind: "backend_error", message: <captured cause>}`. A partial
+Each value is `{kind: "backend_error", message: <captured cause>}` — **amended:
+Amendment 2 replaces this single constant with a closed two-value vocabulary**.
+A partial
 success carries it beside `result`; degraded-empty `search_incomplete` carries
 it inside `error`. Complete searches omit it. Presentation and frame-budget
 omission preserve the diagnostics at the same location.
@@ -497,6 +519,173 @@ bounded aggregate warning for omitted causes.
 This amendment is additive. It does not change completeness, retry, filtering,
 or ranking semantics; it supplies bounded evidence for the already-declared
 degradation state.
+
+## Amendment 2 (2026-08-29): cause classification and server-paced retry
+
+Unlike Amendment 1, **this amendment does change retry semantics.** Decision §1
+requires `error.retryable=false` unconditionally, and Decision §6 forbids
+automatic retry. This amendment makes retryability conditional on cause. It
+therefore has to answer Decision §6's argument rather than restate the benefit,
+and §3 does that.
+
+Section numbers in this amendment are ambiguous without a qualifier, because the
+body and the amendment both number from 1. Throughout: **"Decision §N" means the
+original section N under `## Decision`**; a bare "§N" means section N of this
+amendment.
+
+### 1. Cause classification
+
+Amendment 1 fixes each `backend_errors` value to
+`{kind: "backend_error", message: <captured cause>}` — a single constant, not a
+vocabulary. `kind` becomes a closed vocabulary of exactly two values:
+
+- `timeout` — the leg exceeded a deadline, whether the coordinator's outer
+  fan-out deadline or a typed runtime deadline. Classification MUST be
+  structural. It MUST NOT be derived by matching text in a rendered message.
+- `backend_error` — every other failure.
+
+Classification MUST be computed **before** Amendment 1's diagnostic truncation,
+so an omitted cause cannot change it. Amendment 1's parity, masking, capping and
+budget rules are unchanged and apply to both values.
+
+This also corrects an inconsistency in this record's own degraded-empty wire
+example, whose cause reads
+`{"kind": "backend_error", "message": "backend search timed out after 5000ms"}`.
+That is supporting evidence that the single-constant vocabulary was already
+carrying two meanings; it is not the argument for changing retryability.
+
+### 2. Conditional retryability
+
+`error.retryable` MAY be `true` only when **every** retained and omitted failed
+leg classified as `timeout`. Any mixed or non-timeout failure keeps it `false`.
+Because the classification precedes truncation, this holds over the full failure
+set rather than the retained sample.
+
+When `retryable=true`, the error object MUST additionally carry
+`retry_after_ms`, a positive integer. Clients MUST NOT reissue before it
+elapses.
+
+### 3. Why Decision §6's arithmetic does not forbid this
+
+Decision §6 is correct that a naive client multiplies load against an already-failing
+backend, and its arithmetic stands: ten callers at five searches per second,
+retrying three times, can turn 50 logical searches per second into 150 attempts
+per second. That figure is not disputed here. What follows is why conditional
+retryability does not produce it.
+
+**The arithmetic assumes immediate retry.** The 150/sec figure holds only if the
+three retries are issued without delay, so that attempts for one logical request
+overlap. Under §4's mandatory backoff the retries for a request failing at *t*
+are issued at increasing offsets, so the additional attempts are spread across
+the backoff window and decay rather than tripling the instantaneous rate. With
+`retry_after_ms` the server — which is the party that knows it is degraded —
+sets that pace directly, instead of the client choosing it.
+
+**A boolean was never the load control.** Decision §6 concedes the decisive point itself:
+`retryable=false` "reduces that risk but cannot eliminate it for clients that
+ignore the field." The client in the amplification scenario is precisely a
+client that retries every `ok=false` — that is, one ignoring the field. Against
+that client the flag's value is inert, so the protection Decision §6 attributes to
+`retryable=false` is unavailable exactly where it is needed. Meanwhile the cost
+of the unconditional `false` falls entirely on **well-behaved** clients, the ones
+that honour the field: they are told not to retry a timeout that would likely
+have succeeded. The current contract's benefit lands on nobody and its cost lands
+on the compliant.
+
+**Under §4 the outage case gets strictly better, not worse.** Circuit-breaker
+admission opens after consecutive timeouts and suppresses attempts *including
+first attempts*. During the sustained outage Decision §6 describes, offered load therefore
+falls **below** the 50/sec baseline, whereas today it stays at 50/sec plus
+whatever the field-ignoring clients add. Conditional retryability paired with
+admission control bounds the outage case better than an unconditional `false`
+paired with nothing.
+
+**What this amendment does not claim.** It does not claim typed causes are more
+accurate and therefore justify retrying; accuracy is true and does not answer
+Decision §6. It does not claim clients will comply. Compliance is why §4 puts the
+pacing obligation on the server through `retry_after_ms` rather than resting on
+client goodwill.
+
+### 4. Admission control is mandatory, not advisory
+
+`retryable=true` does not mean "retry now"; it means a retry could succeed. The
+obligations below fall on two different parties, and the amendment is unsound if
+they are read as one, so each is stated with its actor.
+
+**The client that acts on `retryable=true`** MUST implement all three:
+
+- **Bounded budget** — a maximum attempt count per logical request, documented
+  by the client's retry policy.
+- **Backoff** — exponentially increasing delays with jitter, never a fixed
+  interval, and never shorter than the `retry_after_ms` the server supplied.
+- **Circuit breaking** — consecutive timeouts open a breaker that suppresses
+  further requests to that backend, **first attempts included**, until a probe
+  succeeds. This is the clause that makes the outage case in §3 improve rather
+  than merely hold: the breaker removes offered load that the current contract
+  does not touch.
+
+**The surface that emits `retryable=true`** MUST NOT do so unless it publishes,
+in the retry documentation Decision §6 already requires, the budget, the backoff
+schedule and the breaker threshold that a conforming client is expected to apply
+— and MUST emit a `retry_after_ms` that is meaningful for its own degraded
+state rather than a fixed constant. A surface that cannot publish all three MUST
+keep `retryable=false`, which remains the default and the safe value.
+
+The asymmetry is deliberate. The server cannot enforce client backoff, so this
+amendment does not claim it can. What the server controls is (a) whether it
+advertises retryability at all, (b) the pace it names in `retry_after_ms`, and
+(c) whether a conforming client has a policy to conform to. Those are the levers
+assigned above; a non-conforming client is handled by §3's observation that such
+a client already ignores the field today.
+
+### 5. Wire example — degraded-empty, all legs timed out
+
+This supersedes the degraded-empty example under "Wire examples" for the
+all-timeout case. That example remains correct for a `backend_error` cause,
+except that its message text should not describe a timeout.
+
+```json
+{
+  "ok": false,
+  "tool": "search",
+  "error": {
+    "kind": "search_incomplete",
+    "message": "No-match was not established because selected backends failed.",
+    "retryable": true,
+    "retry_after_ms": 2000,
+    "missing_backends": ["main"],
+    "backend_errors": {
+      "main": {
+        "kind": "timeout",
+        "message": "backend search timed out after 5000ms"
+      }
+    }
+  }
+}
+```
+
+With one leg timing out and another failing for any other reason, `retryable` is
+`false` and `retry_after_ms` is absent.
+
+`retry_after_ms` is deliberately not equal to the leg's deadline here. It is the
+server's estimate of when a retry could succeed, not a restatement of how long
+the failed attempt took; the two are unrelated quantities and an example showing
+them equal would read as a rule that they must be.
+
+### 6. Verification
+
+- A degraded-empty response whose legs all timed out reports `retryable=true`
+  with a positive `retry_after_ms`; one with any non-timeout leg reports `false`.
+- Classification survives truncation: a failure set whose only non-timeout cause
+  is omitted by Amendment 1's budget still reports `retryable=false`.
+- Classification is structural — a `backend_error` whose message contains the
+  word "timeout" is not reclassified.
+- `kind` admits exactly the two values; any other value is rejected.
+- A surface that emits `retryable=true` without publishing the budget, backoff
+  schedule and breaker threshold required by §4 fails review.
+- `retry_after_ms` is derived from the surface's own degraded state; a fixed
+  compile-time constant fails review, because a constant returns the pacing
+  decision to the client and §3's argument rests on the server holding it.
 
 ## References
 
