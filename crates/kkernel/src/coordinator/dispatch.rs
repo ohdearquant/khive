@@ -689,15 +689,23 @@ impl SubstrateCoordinator {
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
                     Ok(Ok(note_hits)) => {
-                        let note_hits: Vec<NoteSearchHit> =
-                            note_hits.into_iter().take(limit as usize).collect();
+                        let filtered_note_hits: Vec<NoteSearchHit> = note_hits
+                            .iter()
+                            .filter(|hit| {
+                                request
+                                    .source()
+                                    .is_none_or(|expected| hit.source == expected)
+                            })
+                            .take(limit as usize)
+                            .cloned()
+                            .collect();
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
-                            note_hits: note_hits.clone(),
+                            note_hits,
                             error: None,
                         };
-                        return (vec![], note_hits, vec![backend_result]);
+                        return (vec![], filtered_note_hits, vec![backend_result]);
                     }
                     Ok(Err(e)) => {
                         let backend_result = BackendSearchResult {
@@ -752,14 +760,23 @@ impl SubstrateCoordinator {
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
                     Ok(Ok(hits)) => {
-                        let hits: Vec<SearchHit> = hits.into_iter().take(limit as usize).collect();
+                        let filtered_hits: Vec<SearchHit> = hits
+                            .iter()
+                            .filter(|hit| {
+                                request
+                                    .source()
+                                    .is_none_or(|expected| hit.source == expected)
+                            })
+                            .take(limit as usize)
+                            .cloned()
+                            .collect();
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
-                            hits: hits.clone(),
+                            hits,
                             note_hits: vec![],
                             error: None,
                         };
-                        return (hits, vec![], vec![backend_result]);
+                        return (filtered_hits, vec![], vec![backend_result]);
                     }
                     Ok(Err(e)) => {
                         let backend_result = BackendSearchResult {
@@ -1043,8 +1060,10 @@ impl SubstrateCoordinator {
             }
         }
 
-        let merged_entities = rrf_merge_entity_hits(entity_ranked_lists, limit as usize);
-        let merged_notes = rrf_merge_note_hits(note_ranked_lists, limit as usize);
+        let merged_entities =
+            rrf_merge_entity_hits_filtered(entity_ranked_lists, limit as usize, request.source());
+        let merged_notes =
+            rrf_merge_note_hits_filtered(note_ranked_lists, limit as usize, request.source());
         (merged_entities, merged_notes, per_backend)
     }
 }
@@ -1080,7 +1099,7 @@ fn backend_search_timeout_ms() -> u64 {
 /// never out-fuse a rank-1 singleton that only one backend saw — truncating
 /// to `limit` per backend removes it before the merge ever sees it.
 /// `request.candidate_limit()` already widens the per-backend fetch for
-/// property/tag filter recall; this widens further (bounded) so unfiltered
+/// request-filter recall; this widens further (bounded) so unfiltered
 /// fan-out searches get the same fairness. The caller's `limit` is applied
 /// exactly once, after the RRF merge (`rrf_merge_entity_hits` /
 /// `rrf_merge_note_hits`).
@@ -1107,7 +1126,16 @@ struct RrfMergeBucket {
 }
 
 /// Merge multiple ranked entity hit lists via Reciprocal Rank Fusion (k=60).
+#[cfg(test)]
 pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
+    rrf_merge_entity_hits_filtered(lists, limit, None)
+}
+
+fn rrf_merge_entity_hits_filtered(
+    lists: Vec<Vec<SearchHit>>,
+    limit: usize,
+    source_filter: Option<SearchSource>,
+) -> Vec<SearchHit> {
     const K: f64 = 60.0;
 
     let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
@@ -1133,15 +1161,19 @@ pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) ->
 
     let mut merged: Vec<SearchHit> = scores
         .into_iter()
-        .map(|(id, bucket)| {
+        .filter_map(|(id, bucket)| {
+            let source = bucket.source.expect("each bucket gets a source");
+            if source_filter.is_some_and(|expected| source != expected) {
+                return None;
+            }
             let det_score = DeterministicScore::from_f64(bucket.score);
-            SearchHit {
+            Some(SearchHit {
                 entity_id: id,
                 score: det_score,
-                source: bucket.source.expect("each bucket gets a source"),
+                source,
                 title: bucket.title,
                 snippet: bucket.snippet,
-            }
+            })
         })
         .collect();
 
@@ -1151,9 +1183,18 @@ pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) ->
 }
 
 /// Merge multiple ranked note hit lists via Reciprocal Rank Fusion (k=60).
+#[cfg(test)]
 pub(super) fn rrf_merge_note_hits(
     lists: Vec<Vec<NoteSearchHit>>,
     limit: usize,
+) -> Vec<NoteSearchHit> {
+    rrf_merge_note_hits_filtered(lists, limit, None)
+}
+
+fn rrf_merge_note_hits_filtered(
+    lists: Vec<Vec<NoteSearchHit>>,
+    limit: usize,
+    source_filter: Option<SearchSource>,
 ) -> Vec<NoteSearchHit> {
     const K: f64 = 60.0;
 
@@ -1180,15 +1221,19 @@ pub(super) fn rrf_merge_note_hits(
 
     let mut merged: Vec<NoteSearchHit> = scores
         .into_iter()
-        .map(|(id, bucket)| {
+        .filter_map(|(id, bucket)| {
+            let source = bucket.source.expect("each bucket gets a source");
+            if source_filter.is_some_and(|expected| source != expected) {
+                return None;
+            }
             let det_score = DeterministicScore::from_f64(bucket.score);
-            NoteSearchHit {
+            Some(NoteSearchHit {
                 note_id: id,
                 score: det_score,
-                source: bucket.source.expect("each bucket gets a source"),
+                source,
                 title: bucket.title,
                 snippet: bucket.snippet,
-            }
+            })
         })
         .collect();
 

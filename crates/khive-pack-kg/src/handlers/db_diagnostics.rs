@@ -7,6 +7,63 @@ use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 use super::common::{deser, DbDiagnosticsParams};
 use crate::KgPack;
 
+fn annotate_graph_edge_integrity(report: &mut Value) {
+    let Some(integrity) = report
+        .get_mut("graph_edge_integrity")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(graph_rows) = integrity.get("graph_edges_rows").and_then(Value::as_i64) else {
+        return;
+    };
+    let Some(seq_rows) = integrity
+        .get("graph_edges_seq_rows")
+        .and_then(Value::as_i64)
+    else {
+        return;
+    };
+    let pre_v14_duplicates = integrity
+        .get("pre_v14_duplicate_edge_state_detected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let delta = seq_rows - graph_rows;
+    let relationship = match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => "ledger_ahead_consistent_with_hard_deletes",
+        std::cmp::Ordering::Equal => "equal",
+        // A pre-V14 duplicate-ID state legitimately holds more edge rows than
+        // ledger rows (two namespaces sharing one edge UUID), so it is a
+        // known legacy condition, not an unexplained deficit.
+        std::cmp::Ordering::Less if pre_v14_duplicates => {
+            "ledger_behind_pre_v14_duplicate_edge_state"
+        }
+        std::cmp::Ordering::Less => "ledger_behind_unexpected",
+    };
+
+    integrity.insert(
+        "graph_edges_rows_scope".into(),
+        serde_json::json!({
+            "namespaces": "all",
+            "rows": "live_and_soft_deleted",
+        }),
+    );
+    integrity.insert(
+        "graph_edges_seq_rows_scope".into(),
+        serde_json::json!({
+            "namespaces": "all",
+            "rows": "inserted_ids_retained_after_hard_delete",
+        }),
+    );
+    integrity.insert(
+        "graph_edges_seq_minus_graph_edges".into(),
+        Value::from(delta),
+    );
+    integrity.insert(
+        "graph_edges_seq_relationship".into(),
+        Value::from(relationship),
+    );
+}
+
 impl KgPack {
     /// Writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics
     /// (ADR-091/ADR-135 operator surface): aggregate and class-specific writer
@@ -33,7 +90,87 @@ impl KgPack {
             .runtime
             .db_diagnostics_with_audit_metrics(registry.audit_batch_metrics())
             .await?;
-        serde_json::to_value(&report)
-            .map_err(|e| RuntimeError::Internal(format!("db_diagnostics: serialize: {e}")))
+        let mut value = serde_json::to_value(&report)
+            .map_err(|e| RuntimeError::Internal(format!("db_diagnostics: serialize: {e}")))?;
+        annotate_graph_edge_integrity(&mut value);
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::annotate_graph_edge_integrity;
+
+    #[test]
+    fn graph_edge_integrity_explains_retained_delete_history() {
+        let mut report = json!({
+            "graph_edge_integrity": {
+                "graph_edges_rows": 3,
+                "graph_edges_seq_rows": 5,
+            }
+        });
+
+        annotate_graph_edge_integrity(&mut report);
+
+        let integrity = &report["graph_edge_integrity"];
+        assert_eq!(
+            integrity["graph_edges_rows_scope"],
+            json!({"namespaces": "all", "rows": "live_and_soft_deleted"})
+        );
+        assert_eq!(
+            integrity["graph_edges_seq_rows_scope"],
+            json!({
+                "namespaces": "all",
+                "rows": "inserted_ids_retained_after_hard_delete",
+            })
+        );
+        assert_eq!(integrity["graph_edges_seq_minus_graph_edges"], 2);
+        assert_eq!(
+            integrity["graph_edges_seq_relationship"],
+            "ledger_ahead_consistent_with_hard_deletes"
+        );
+    }
+
+    #[test]
+    fn graph_edge_integrity_marks_a_ledger_deficit_unexpected() {
+        let mut report = json!({
+            "graph_edge_integrity": {
+                "graph_edges_rows": 3,
+                "graph_edges_seq_rows": 2,
+            }
+        });
+
+        annotate_graph_edge_integrity(&mut report);
+
+        let integrity = &report["graph_edge_integrity"];
+        assert_eq!(integrity["graph_edges_seq_minus_graph_edges"], -1);
+        assert_eq!(
+            integrity["graph_edges_seq_relationship"],
+            "ledger_behind_unexpected"
+        );
+    }
+
+    #[test]
+    fn graph_edge_integrity_classifies_pre_v14_duplicate_state_as_legacy() {
+        // Mirrors the khive-db regression fixture: two graph_edges rows share
+        // one ledger row and the report flags the pre-V14 duplicate state.
+        let mut report = json!({
+            "graph_edge_integrity": {
+                "graph_edges_rows": 2,
+                "graph_edges_seq_rows": 1,
+                "pre_v14_duplicate_edge_state_detected": true,
+            }
+        });
+
+        annotate_graph_edge_integrity(&mut report);
+
+        let integrity = &report["graph_edge_integrity"];
+        assert_eq!(integrity["graph_edges_seq_minus_graph_edges"], -1);
+        assert_eq!(
+            integrity["graph_edges_seq_relationship"],
+            "ledger_behind_pre_v14_duplicate_edge_state"
+        );
     }
 }

@@ -28,6 +28,7 @@ export interface RepositoryEvidence {
 
 export interface RepositoryAttentionSignal {
   id: string;
+  analysisId?: string;
   kind: RepositorySignalKind;
   classification: RepositorySignalClassification;
   title: string;
@@ -532,6 +533,7 @@ function buildCycleSignal(
   );
   return {
     id: `dependency-cycle:${cycle.id}`,
+    analysisId: cycle.id,
     kind: "dependency_cycle",
     classification: "observed",
     title:
@@ -551,7 +553,7 @@ function buildCycleSignal(
       {
         label: bundle.capability.views.dependency_topology.label,
         value:
-          `${cycle.id}; ${cycle.module_ids.length} ${bundle.capability.labels.node_types.module.toLocaleLowerCase()} records`,
+          `${cycle.module_ids.length} ${bundle.capability.labels.node_types.module.toLocaleLowerCase()} records`,
       },
       sourceRoleEvidence(),
       pageEvidence("Coverage", analysis.cycles, bundle.capability.labels),

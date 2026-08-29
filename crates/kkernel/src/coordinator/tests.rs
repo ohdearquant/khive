@@ -135,9 +135,11 @@ fn validated_search_reconciles_compatible_granular_kind_fields() {
         "query": "typed request",
         "entity_kind": "concept",
         "entity_type": "algorithm",
+        "source": "text",
     }));
     assert_eq!(entity.kind_filter(), Some("concept"));
     assert_eq!(entity.entity_type(), Some("algorithm"));
+    assert_eq!(entity.source(), Some(SearchSource::Text));
 
     let note = validated_kg_search(serde_json::json!({
         "kind": "observation",
@@ -369,6 +371,71 @@ async fn fan_out_search_single_backend_returns_hits() {
     assert!(!hits.is_empty(), "should find the entity");
     assert_eq!(per_backend.len(), 1, "single backend report");
     assert!(per_backend[0].error.is_none(), "no error");
+}
+
+#[tokio::test]
+async fn fan_out_search_single_backend_applies_source_filter_before_limit() {
+    let coord = SubstrateCoordinator::single(memory_runtime());
+    let ns = Namespace::local();
+    let runtime = coord.primary_runtime().expect("single primary runtime");
+    let token = runtime.authorize(ns.clone()).expect("authorize local");
+
+    runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "SingleBackendSourceEntity",
+            Some("single backend source filter entity probe"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create source-filter entity");
+    runtime
+        .create_note(
+            &token,
+            "observation",
+            Some("SingleBackendSourceNote"),
+            "single backend source filter note probe",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create source-filter note");
+
+    let entity_request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "SingleBackendSourceEntity",
+        "source": "vector",
+        "limit": 1,
+    }));
+    let (entity_hits, _, entity_backends) = coord.fan_out_search(&entity_request, &ns).await;
+    assert!(
+        entity_hits.is_empty(),
+        "single-backend entity results must apply source=vector before limit"
+    );
+    assert!(
+        entity_backends[0].error.is_none(),
+        "source filtering must not turn into a backend error"
+    );
+
+    let note_request = validated_kg_search(serde_json::json!({
+        "kind": "note",
+        "query": "SingleBackendSourceNote",
+        "source": "vector",
+        "limit": 1,
+    }));
+    let (_, note_hits, note_backends) = coord.fan_out_search(&note_request, &ns).await;
+    assert!(
+        note_hits.is_empty(),
+        "single-backend note results must apply source=vector before limit"
+    );
+    assert!(
+        note_backends[0].error.is_none(),
+        "source filtering must not turn into a backend error"
+    );
 }
 
 #[tokio::test]
@@ -1011,6 +1078,112 @@ async fn fan_out_search_with_visibility_multi_backend_finds_extra_namespace_row(
     assert!(
         narrow_hits.is_empty(),
         "primary-only visibility (no widening) must not see the tenant-b row"
+    );
+}
+
+#[tokio::test]
+async fn fan_out_search_applies_source_filter_before_rrf_and_limit() {
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("alpha"), memory_runtime());
+    registry.register(BackendId::new("beta"), memory_runtime());
+
+    let vector_entity = Uuid::from_u128(1);
+    let cross_source_entity = Uuid::from_u128(2);
+    let text_entity = Uuid::from_u128(3);
+    let mut entity_overrides = std::collections::HashMap::new();
+    entity_overrides.insert(
+        "alpha".to_string(),
+        vec![
+            search_hit(vector_entity, SearchSource::Vector),
+            search_hit(cross_source_entity, SearchSource::Text),
+            search_hit(text_entity, SearchSource::Text),
+        ],
+    );
+    entity_overrides.insert(
+        "beta".to_string(),
+        vec![
+            search_hit(vector_entity, SearchSource::Vector),
+            search_hit(cross_source_entity, SearchSource::Vector),
+            search_hit(Uuid::from_u128(4), SearchSource::Text),
+        ],
+    );
+    let entity_coord =
+        SubstrateCoordinator::new(registry).with_entity_hits_override(entity_overrides);
+    let entity_request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "overridden",
+        "source": "text",
+        "limit": 1,
+    }));
+
+    let (entity_hits, _, _) = entity_coord
+        .fan_out_search(&entity_request, &Namespace::local())
+        .await;
+    assert_eq!(
+        entity_hits
+            .iter()
+            .map(|hit| hit.entity_id)
+            .collect::<Vec<_>>(),
+        vec![text_entity],
+        "filtering must drop the top vector hit and the cross-backend Both hit before limit"
+    );
+
+    let both_request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "overridden",
+        "source": "both",
+        "limit": 1,
+    }));
+    let (both_hits, _, _) = entity_coord
+        .fan_out_search(&both_request, &Namespace::local())
+        .await;
+    assert_eq!(
+        both_hits
+            .iter()
+            .map(|hit| hit.entity_id)
+            .collect::<Vec<_>>(),
+        vec![cross_source_entity],
+        "a text hit on one backend and vector hit on another has final source=both"
+    );
+
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("alpha"), memory_runtime());
+    registry.register(BackendId::new("beta"), memory_runtime());
+    let vector_note = Uuid::from_u128(5);
+    let cross_source_note = Uuid::from_u128(6);
+    let text_note = Uuid::from_u128(7);
+    let mut note_overrides = std::collections::HashMap::new();
+    note_overrides.insert(
+        "alpha".to_string(),
+        vec![
+            note_search_hit(vector_note, SearchSource::Vector),
+            note_search_hit(cross_source_note, SearchSource::Text),
+            note_search_hit(text_note, SearchSource::Text),
+        ],
+    );
+    note_overrides.insert(
+        "beta".to_string(),
+        vec![
+            note_search_hit(vector_note, SearchSource::Vector),
+            note_search_hit(cross_source_note, SearchSource::Vector),
+            note_search_hit(Uuid::from_u128(8), SearchSource::Text),
+        ],
+    );
+    let note_coord = SubstrateCoordinator::new(registry).with_note_hits_override(note_overrides);
+    let note_request = validated_kg_search(serde_json::json!({
+        "kind": "note",
+        "query": "overridden",
+        "source": "text",
+        "limit": 1,
+    }));
+
+    let (_, note_hits, _) = note_coord
+        .fan_out_search(&note_request, &Namespace::local())
+        .await;
+    assert_eq!(
+        note_hits.iter().map(|hit| hit.note_id).collect::<Vec<_>>(),
+        vec![text_note],
+        "note filtering must preserve final-source semantics before limit"
     );
 }
 
