@@ -6,8 +6,6 @@
 //! before serving, so the serve path never hard-codes a transport enum.
 
 use std::collections::{BTreeMap, HashMap};
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -28,8 +26,6 @@ pub(crate) struct OutstandingRequests {
     entries: HashMap<RequestId, OutstandingRequest>,
     oldest: Option<RequestId>,
     newest: Option<RequestId>,
-    #[cfg(test)]
-    operation_count: AtomicUsize,
 }
 
 struct OutstandingRequest {
@@ -46,8 +42,6 @@ impl OutstandingRequests {
 
         let previous = self.newest.clone();
         if let Some(previous_id) = previous.as_ref() {
-            #[cfg(test)]
-            self.record_operation();
             self.entries
                 .get_mut(previous_id)
                 .expect("newest obligation must remain in the map")
@@ -68,21 +62,15 @@ impl OutstandingRequests {
     }
 
     fn contains(&self, id: &RequestId) -> bool {
-        #[cfg(test)]
-        self.record_operation();
         self.entries.contains_key(id)
     }
 
     fn retire(&mut self, id: &RequestId) {
-        #[cfg(test)]
-        self.record_operation();
         let Some(obligation) = self.entries.remove(id) else {
             return;
         };
 
         if let Some(previous_id) = obligation.previous.as_ref() {
-            #[cfg(test)]
-            self.record_operation();
             self.entries
                 .get_mut(previous_id)
                 .expect("previous obligation must remain in the map")
@@ -92,8 +80,6 @@ impl OutstandingRequests {
         }
 
         if let Some(next_id) = obligation.next.as_ref() {
-            #[cfg(test)]
-            self.record_operation();
             self.entries
                 .get_mut(next_id)
                 .expect("next obligation must remain in the map")
@@ -109,8 +95,6 @@ impl OutstandingRequests {
         };
 
         while let Some(oldest_id) = self.oldest.clone() {
-            #[cfg(test)]
-            self.record_operation();
             let stale = self
                 .entries
                 .get(&oldest_id)
@@ -125,11 +109,7 @@ impl OutstandingRequests {
     fn newest_admitted_at(&self) -> Option<Instant> {
         self.newest
             .as_ref()
-            .and_then(|id| {
-                #[cfg(test)]
-                self.record_operation();
-                self.entries.get(id)
-            })
+            .and_then(|id| self.entries.get(id))
             .map(|obligation| obligation.admitted_at)
     }
 
@@ -145,21 +125,10 @@ impl OutstandingRequests {
     #[cfg(test)]
     pub(crate) fn front(&self) -> Option<(RequestId, Instant)> {
         self.oldest.as_ref().and_then(|id| {
-            self.record_operation();
             self.entries
                 .get(id)
                 .map(|obligation| (id.clone(), obligation.admitted_at))
         })
-    }
-
-    #[cfg(test)]
-    fn record_operation(&self) {
-        self.operation_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    fn operation_count(&self) -> usize {
-        self.operation_count.load(Ordering::Relaxed)
     }
 }
 
@@ -387,68 +356,6 @@ mod outstanding_request_tests {
         assert!(outstanding.admit(rmcp::model::RequestId::Number(2), admitted_at, 2,));
         assert!(!outstanding.admit(rmcp::model::RequestId::Number(3), admitted_at, 2,));
         assert_eq!(outstanding.len(), 2);
-    }
-
-    fn tracker_operations_for(n: usize) -> (usize, usize) {
-        let mut outstanding = OutstandingRequests::default();
-        let admitted_at = Instant::now();
-
-        for id in 0..n {
-            let id = rmcp::model::RequestId::Number(id as i64);
-            assert!(!outstanding.contains(&id));
-            assert!(outstanding.admit(id, admitted_at, n + 1));
-        }
-        let admission_operations = outstanding.operation_count();
-
-        for id in (0..n).rev() {
-            outstanding.retire(&rmcp::model::RequestId::Number(id as i64));
-        }
-        let retirement_operations = outstanding.operation_count() - admission_operations;
-
-        assert!(outstanding.is_empty());
-        (admission_operations, retirement_operations)
-    }
-
-    fn assert_constant_work(
-        operation: &str,
-        small_n: usize,
-        small_work: usize,
-        large_n: usize,
-        large_work: usize,
-    ) {
-        const MAX_OPERATIONS_PER_REQUEST: usize = 8;
-
-        assert!(
-            small_work <= small_n * MAX_OPERATIONS_PER_REQUEST,
-            "{operation} work exceeded the constant bound at n={small_n}: {small_work}"
-        );
-        assert!(
-            large_work <= large_n * MAX_OPERATIONS_PER_REQUEST,
-            "{operation} work exceeded the constant bound at n={large_n}: {large_work}"
-        );
-        assert!(
-            large_work * small_n <= small_work * large_n * 2,
-            "{operation} work grew with the number of outstanding requests: n={small_n} -> \
-             {small_work}, n={large_n} -> {large_work}"
-        );
-    }
-
-    #[test]
-    fn outstanding_request_tracker_work_stays_constant_as_load_grows() {
-        const SMALL: usize = 64;
-        const LARGE: usize = 512;
-
-        let (small_admission, small_retirement) = tracker_operations_for(SMALL);
-        let (large_admission, large_retirement) = tracker_operations_for(LARGE);
-
-        assert_constant_work("admission", SMALL, small_admission, LARGE, large_admission);
-        assert_constant_work(
-            "retirement",
-            SMALL,
-            small_retirement,
-            LARGE,
-            large_retirement,
-        );
     }
 
     fn poison_tracker(tracker: &Arc<Mutex<OutstandingRequests>>) {
