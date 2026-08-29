@@ -24,6 +24,26 @@ CREATE INDEX IF NOT EXISTS idx_notes_namespace ON notes(namespace);
 CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(namespace, kind);
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
 
+-- Partial index for the unread-message probe (comm unread badge + inbox
+-- unread listing). Its WHERE clause is the exact predicate the
+-- JsonTypeNeMissing filter op generates (with the json_type value inlined
+-- as a literal -- a bound parameter cannot prove implication at plan time),
+-- and its third key column is the exact `ifnull(...)` expression the
+-- EqOrMissingIndexed filter op generates for the recipient, so the planner serves
+-- unread scans from only the caller's own unread rows. Generic EqOrMissing
+-- remains available for legacy recipient-less visibility: work is proportional
+-- to the unread set,
+-- never to other actors' backlog and never to total mailbox size. The
+-- superseded recipient-blind shape is dropped by name (a no-op once gone).
+DROP INDEX IF EXISTS idx_notes_unread_probe;
+CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient
+    ON notes(namespace, kind,
+             ifnull(json_extract(properties, '$.to_actor'), ''),
+             created_at DESC, id ASC)
+    WHERE (json_type(properties, '$.read') IS NULL
+           OR json_type(properties, '$.read') != 'true')
+      AND deleted_at IS NULL;
+
 -- Durable, non-reusing sequence for notes (khive #827). Kept in sync with
 -- `sql/007-notes-seq.sql` (the versioned-migration copy) — see that file for
 -- the full rationale. Duplicated here, belt-and-suspenders style, because

@@ -555,7 +555,13 @@ pub(crate) async fn handle_inbox(
 
     if raw_limit == 0 {
         let unread_count = if mailbox == "inbox" {
-            count_unread_messages(runtime, token, &token.actor().id).await?
+            let store = runtime.notes(token)?;
+            count_unread_messages(
+                store.as_ref(),
+                token.namespace().as_str(),
+                &token.actor().id,
+            )
+            .await?
         } else {
             0
         };
@@ -661,6 +667,7 @@ pub(crate) async fn handle_inbox(
         query_inbox_response(
             store,
             namespace,
+            &caller_actor,
             &filter,
             &p,
             before_micros,
@@ -727,6 +734,7 @@ where
 async fn query_inbox_response(
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
+    caller_actor: &str,
     filter: &NoteFilter,
     params: &InboxParams,
     before_micros: Option<i64>,
@@ -801,16 +809,9 @@ async fn query_inbox_response(
         messages.truncate(limit);
     }
     let count = messages.len();
-    // #66: cheap derived stat over the page already fetched above — no extra
-    // DB round-trip. The count is inbox-only: sent rows have no recipient read
-    // state and report zero. For inbox `status="unread"`, this equals `count`;
-    // for `"read"`/`"all"`, it counts unread rows in this page (not a global
-    // total — `comm.unread` is the verb for that).
+    // This is a mailbox-wide signal; page and status filters only shape `messages`.
     let unread_count = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
-        messages
-            .iter()
-            .filter(|m| !m["read"].as_bool().unwrap_or(false))
-            .count()
+        count_unread_messages(store, namespace, caller_actor).await?
     } else {
         0
     };
@@ -837,14 +838,6 @@ async fn query_inbox_response(
 
 /// `unread` — count-only view of the caller's unread inbound messages (#66):
 /// same filter stack as `inbox(status="unread")`.
-///
-/// `NoteStore` has no filtered `COUNT(*)` projection (only `count_notes`,
-/// which counts a whole namespace/kind with no property filter) — adding one
-/// is an OSS `khive-storage` change, out of scope here. This pages through
-/// `query_notes_filtered` the same way `handle_inbox`'s `#493` from_actor/
-/// from_prefix path already does, summing page lengths instead of fetching a
-/// bounded `limit` of full payloads — heavier than a real `COUNT(*)` but
-/// correct, and consistent with the pagination style already in this file.
 pub(crate) async fn handle_unread(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -852,17 +845,19 @@ pub(crate) async fn handle_unread(
 ) -> Result<Value, RuntimeError> {
     let _: UnreadParams = deser(params)?;
     let caller_actor = token.actor().id.clone();
-    let count = count_unread_messages(runtime, token, &caller_actor).await?;
+    let store = runtime.notes(token)?;
+    let count =
+        count_unread_messages(store.as_ref(), token.namespace().as_str(), &caller_actor).await?;
 
     Ok(json!({ "count": count, "actor": caller_actor }))
 }
 
 async fn count_unread_messages(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
+    store: &dyn khive_storage::NoteStore,
+    namespace: &str,
     caller_actor: &str,
 ) -> Result<u64, RuntimeError> {
-    let property_filters = vec![
+    let base_filters = vec![
         PropertyFilter {
             json_path: "$.direction".to_string(),
             op: FilterOp::Eq,
@@ -873,46 +868,40 @@ async fn count_unread_messages(
             op: FilterOp::JsonTypeNeMissing,
             value: SqlValue::Text("true".to_string()),
         },
-        // ADR-057 Q3: EqOrMissing so legacy to_actor-less messages still count
-        // (same visibility rule `inbox` applies).
-        PropertyFilter {
-            json_path: "$.to_actor".to_string(),
-            op: FilterOp::EqOrMissing,
-            value: SqlValue::Text(caller_actor.to_string()),
-        },
     ];
-
-    let filter = NoteFilter {
-        kind: Some("message".to_string()),
-        property_filters,
-        order_by: None,
-        ..Default::default()
-    };
-    let store = runtime.notes(token)?;
-
-    const PAGE_SIZE: u32 = 200;
-    let mut count: u64 = 0;
-    let mut db_offset: u32 = 0;
-    loop {
-        let page = store
-            .query_notes_filtered(
-                token.namespace().as_str(),
-                &filter,
-                PageRequest {
-                    limit: PAGE_SIZE,
-                    offset: db_offset.into(),
-                },
-            )
-            .await?;
-        let fetched = page.items.len() as u32;
-        count += u64::from(fetched);
-        if fetched < PAGE_SIZE {
-            break;
+    let count_filter = |op| {
+        let mut property_filters = base_filters.clone();
+        property_filters.push(PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op,
+            value: SqlValue::Text(caller_actor.to_string()),
+        });
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters,
+            order_by: None,
+            ..Default::default()
         }
-        db_offset += PAGE_SIZE;
-    }
-
-    Ok(count)
+    };
+    // Count the disjoint addressed and legacy-recipient partitions in one
+    // storage snapshot. Both predicates retain the recipient key expression
+    // required by idx_notes_unread_probe_recipient; the legacy partition's
+    // empty key includes both absent and explicit JSON-null recipients.
+    let counts = store
+        .count_notes_filtered_in_snapshot(
+            namespace,
+            &[
+                count_filter(FilterOp::EqOrMissingIndexed),
+                count_filter(FilterOp::JsonTypeMissingOrNullIndexed),
+            ],
+        )
+        .await?;
+    let [exact, legacy] = counts.as_slice() else {
+        return Err(RuntimeError::Internal(
+            "comm.unread: storage returned an invalid partition count vector".into(),
+        ));
+    };
+    Ok(exact + legacy)
 }
 
 /// `read` — mark a message as read.
