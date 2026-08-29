@@ -6,7 +6,7 @@
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::blob::ContentRef;
 use khive_storage::types::{Direction, PageRequest, TraversalOptions, TraversalRequest};
-use khive_storage::{BlobStore, EdgeRelation, Event, EventFilter};
+use khive_storage::{BlobStore, EdgeRelation, Event, EventFilter, NewAttachment};
 use khive_types::{EventKind, SubstrateKind};
 use uuid::Uuid;
 
@@ -68,7 +68,7 @@ async fn entity_create_with_properties_and_tags() {
 }
 
 #[tokio::test]
-async fn entity_create_with_content_ref_roundtrip() {
+async fn entity_create_with_content_attachment_roundtrip() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -80,7 +80,7 @@ async fn entity_create_with_content_ref_roundtrip() {
     let content_ref = blob_store.put(b"asset bytes".to_vec()).await.unwrap();
 
     let entity = rt
-        .create_entity_with_content_ref(
+        .create_entity_with_attachments(
             &tok,
             "artifact",
             Some("visual_asset"),
@@ -88,7 +88,12 @@ async fn entity_create_with_content_ref_roundtrip() {
             None,
             None,
             vec![],
-            &content_ref,
+            vec![NewAttachment {
+                role: "content".to_string(),
+                content_ref: content_ref.clone(),
+                media_type: None,
+                size_bytes: Some(11),
+            }],
         )
         .await
         .unwrap();
@@ -98,7 +103,7 @@ async fn entity_create_with_content_ref_roundtrip() {
 }
 
 #[tokio::test]
-async fn entity_create_with_content_ref_rejects_unpublished_blob() {
+async fn entity_create_with_content_attachment_rejects_unpublished_blob() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -109,7 +114,7 @@ async fn entity_create_with_content_ref_rejects_unpublished_blob() {
     let missing = ContentRef::from_digest_bytes(&[7; 32]);
 
     let error = rt
-        .create_entity_with_content_ref(
+        .create_entity_with_attachments(
             &tok,
             "artifact",
             Some("visual_asset"),
@@ -117,7 +122,12 @@ async fn entity_create_with_content_ref_rejects_unpublished_blob() {
             None,
             None,
             vec![],
-            &missing,
+            vec![NewAttachment {
+                role: "content".to_string(),
+                content_ref: missing,
+                media_type: None,
+                size_bytes: None,
+            }],
         )
         .await
         .expect_err("unpublished ref must fail");
@@ -1929,6 +1939,8 @@ async fn file_backed_runtime_persists() {
     {
         let config = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1953,6 +1965,8 @@ async fn file_backed_runtime_persists() {
     {
         let config = RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: Some(path.clone()),
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2575,6 +2589,8 @@ mod embedder_registry_tests {
     fn memory_rt_no_model() -> KhiveRuntime {
         KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -2728,6 +2744,8 @@ mod embedder_registry_tests {
         use khive_runtime::RuntimeConfig;
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: chrono_tz::Tz::UTC,
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),

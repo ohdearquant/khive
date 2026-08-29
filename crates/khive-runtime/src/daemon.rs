@@ -317,7 +317,7 @@ fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> {
 /// `getpeereid(2)` on macOS/BSD, `SO_PEERCRED` on Linux. Both report the peer's
 /// credentials as recorded by the kernel at connect time.
 #[cfg(unix)]
-fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
 
@@ -396,7 +396,7 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 /// multiple uids needs a code change and a gated ADR — which is precisely the
 /// decision that should be impossible to make by accident.
 #[cfg(unix)]
-fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
+pub(crate) fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
     peer == daemon_euid
 }
 
@@ -842,15 +842,15 @@ impl Drop for BackgroundTaskGuard {
     }
 }
 
-/// Spawn a fire-and-forget background task that daemon shutdown's `drain()`
-/// waits for, instead of a bare `tokio::spawn` that a SIGTERM can abort
-/// mid-flight with no trace. Only the enqueue (an atomic increment) is
-/// synchronous on the caller's path — the future itself still runs fully
-/// off-path, unawaited. The decrement happens via `BackgroundTaskGuard`'s
-/// `Drop`, so a panic inside `fut` still restores the count.
-pub fn track_background_task<F>(fut: F)
+/// Spawn a task that daemon shutdown's `drain()` waits for and return its join
+/// handle. Retaining the handle lets boot coordinators form an explicit barrier;
+/// dropping it deliberately detaches the task while the background counter still
+/// keeps daemon drain aware of its lifetime. The decrement happens via
+/// `BackgroundTaskGuard`'s `Drop`, including panic and cancellation paths.
+pub fn spawn_tracked_task<F, T>(fut: F) -> tokio::task::JoinHandle<T>
 where
-    F: std::future::Future<Output = ()> + Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
 {
     background_tasks().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let guard = BackgroundTaskGuard {
@@ -858,8 +858,19 @@ where
     };
     tokio::spawn(async move {
         let _guard = guard;
-        fut.await;
-    });
+        fut.await
+    })
+}
+
+/// Spawn a fire-and-forget task through [`spawn_tracked_task`].
+///
+/// Callers that need a boot or shutdown barrier should retain and await the
+/// returned handle from [`spawn_tracked_task`] instead of detaching it here.
+pub fn track_background_task<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    drop(spawn_tracked_task(fut));
 }
 
 /// Current count of in-flight tasks started via [`track_background_task`].
@@ -1360,7 +1371,7 @@ pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> any
 /// umask-default 0755 stays acceptable; shared sticky directories like
 /// `/tmp` do not.
 #[cfg(unix)]
-fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn ensure_socket_dir_is_trusted(parent: &std::path::Path) -> anyhow::Result<()> {
     // SAFETY: `geteuid` is always successful and takes no arguments.
     let daemon_euid = unsafe { libc::geteuid() } as u32;
 
@@ -2168,13 +2179,6 @@ mod tests {
             _bytes: Vec<u8>,
         ) -> khive_storage::StorageResult<khive_storage::ContentRef> {
             panic!("put is not used by the hydration drain test")
-        }
-
-        async fn get(
-            &self,
-            _content_ref: &khive_storage::ContentRef,
-        ) -> khive_storage::StorageResult<Vec<u8>> {
-            panic!("legacy get must not service hydration")
         }
 
         async fn get_bounded_verified(

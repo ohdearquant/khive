@@ -1,10 +1,12 @@
 # khive repository atlas + KG Studio
 
-The default route is ADR-147's static-first repository showcase. Entering a public
-repository URL performs a local lookup against the curated set; a hit renders the exact
-checked-in `khive.repo.v1` golden bytes, and a miss performs no clone, forge request, or
-server-side execution. The original ADR-145 semantic review workbench remains available
-at `/review`.
+The default route is ADR-147's catalog-driven repository showcase. The browser first
+discovers configured DB-backed analyses, merges them with its curated static set by
+normalized repository URL, and offers the result in a native repository selector.
+Entering a public repository URL still performs a local lookup only: a miss performs no
+clone, forge request, or server-side execution. If the catalog is absent or unhealthy,
+the curated checked-in `khive.repo.v1` golden remains usable and the degraded state is
+visible. The original ADR-145 semantic review workbench remains available at `/review`.
 
 The repository showcase renders all ten ADR-147 views at their declared granularity:
 structure, history navigation, dependency topology, hotspots, hidden coupling, treemap,
@@ -112,6 +114,26 @@ both be unique; one invalid entry makes the entire catalog unavailable. The cata
 sorted by analysis ID and exposes only those two public fields. It does not scan the
 analysis root or read a report.
 
+A repository URL is normalized before it is compared or stored, and normalization is
+deliberately strict about what a path segment may contain. A segment must survive a
+re-parse of the canonical URL unchanged, which rejects any character that is structural
+in a URL path — an encoded `/`, `\`, `?` or `#` — however many layers of encoding it
+arrives under. As a consequence a **literal percent in a repository name is refused**,
+because the canonical form joins decoded segments without re-encoding them and a bare `%`
+is ambiguous under that join. No major forge permits `%` in a repository name, so this
+costs nothing in practice, and it keeps the rule statable: no literal percent. A URL that
+is validly encoded but does not normalize to a stable value — a doubled `.git` suffix, for
+instance — is refused separately, and says so.
+
+The default page consumes this catalog before resolving its initial `repo=` location.
+Configured entries appear in **Repository analysis** and resolve to their opaque report
+route. The browser accepts only the exact bounded v1 envelope. A catalog 404 means
+static-only operation; transport, server, or validation failures produce a disclosed
+degraded state while keeping curated static entries usable. Configured and static
+entries with the same normalized URL are one selection: the DB snapshot is preferred,
+and only its 404 may use the approved static asset. A 5xx, invalid bundle, provenance or
+repository mismatch never falls back. A configured-only 404 is shown as an honest miss.
+
 Both API routes require `Authorization: Bearer $KHIVE_SHOWCASE_ACCESS_TOKEN` on every
 request, checked in constant time. To use the DB-backed setup through the showcase UI,
 supply the same token to your own browser session before loading a repository:
@@ -148,7 +170,7 @@ containment and file identity after opening and reads at most 8 MiB plus one sen
 byte.
 
 This is a pinned DB-backed snapshot, not a live mutable query and not arbitrary URL
-ingest. See ADR-147 Amendments 1–2 and the repository-showcase CLI guide.
+ingest. See ADR-147 Amendments 1–4 and the repository-showcase CLI guide.
 
 ## Adapter boundary
 

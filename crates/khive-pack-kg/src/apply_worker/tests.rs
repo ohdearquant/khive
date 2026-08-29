@@ -231,6 +231,7 @@ async fn changeset_adapter_builds_atomic_plans_for_supported_proposal_writes() {
                     description: None,
                     properties: None,
                     tags: None,
+                    entity_type: None,
                 },
             },
             "update",
@@ -297,6 +298,7 @@ async fn apply_worker_atomic_update_preserves_explicit_description_clear() {
             description: Some(None),
             properties: None,
             tags: None,
+            entity_type: None,
         },
     };
     seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
@@ -340,6 +342,7 @@ async fn apply_worker_returns_atomic_update_truncation_report() {
             description: Some(Some("x".repeat(MAX_TEXT_BYTES + 1))),
             properties: None,
             tags: None,
+            entity_type: None,
         },
     };
     seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
@@ -383,6 +386,7 @@ async fn committed_post_commit_failure_stays_applying_and_is_not_replayed() {
                 description: None,
                 properties: None,
                 tags: None,
+                entity_type: None,
             },
         },
     )

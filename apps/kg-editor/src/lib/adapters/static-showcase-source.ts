@@ -41,11 +41,12 @@ export async function loadStaticShowcaseBundle(
   entry: ShowcaseRegistryEntry,
   fetchBundle: ShowcaseFetch = fetch,
 ): Promise<RepoBundle> {
-  if (!isAllowedShowcaseAsset(entry.assetPath)) {
+  const assetPath = entry.assetPath;
+  if (!isAllowedShowcaseAsset(assetPath)) {
     throw new Error("The curated registry referenced an unapproved showcase asset.");
   }
 
-  const response = await fetchBundle(entry.assetPath, {
+  const response = await fetchBundle(assetPath, {
     cache: "force-cache",
     credentials: "same-origin",
     redirect: "error",

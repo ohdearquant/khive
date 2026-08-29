@@ -1,6 +1,7 @@
 use super::*;
 use crate::migrations::run_migrations;
 use crate::pool::PoolConfig;
+use khive_storage::{Attachment, AttachmentSubstrate, ContentRef};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -12,10 +13,27 @@ fn setup_pool() -> Arc<ConnectionPool> {
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .unwrap();
     }
     pool
 }
+
+const TEST_ATTACHMENTS_DDL: &str = r#"
+CREATE TABLE attachments (
+    record_uuid TEXT NOT NULL,
+    substrate   TEXT NOT NULL CHECK (substrate IN ('entity', 'note')),
+    role        TEXT NOT NULL,
+    content_ref TEXT NOT NULL,
+    media_type  TEXT,
+    size_bytes  INTEGER,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (record_uuid, role)
+);
+CREATE INDEX idx_attachments_content_ref ON attachments(content_ref);
+"#;
 
 fn setup_memory_store() -> SqlEntityStore {
     SqlEntityStore::new(setup_pool(), false)
@@ -42,6 +60,18 @@ fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
         merged_into: None,
         merge_event_id: None,
         content_ref: None,
+    }
+}
+
+fn content_attachment(record_uuid: Uuid, digest: &str) -> Attachment {
+    Attachment {
+        record_uuid,
+        substrate: AttachmentSubstrate::Entity,
+        role: "content".to_string(),
+        content_ref: ContentRef::from_hex(digest).expect("canonical content ref"),
+        media_type: Some("application/octet-stream".to_string()),
+        size_bytes: Some(42),
+        created_at: 123,
     }
 }
 
@@ -1077,7 +1107,10 @@ async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .unwrap();
     }
 
     let store = SqlEntityStore::new(Arc::clone(&pool), true);
@@ -1151,7 +1184,10 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .unwrap();
     }
 
     // Three independent stores over the same pool, each resolving the
@@ -1209,7 +1245,10 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .unwrap();
         crate::stores::note::ensure_notes_schema(writer.conn()).unwrap();
         crate::stores::graph::ensure_graph_schema(writer.conn()).unwrap();
     }
@@ -1365,7 +1404,10 @@ async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .unwrap();
     }
 
     let store = Arc::new(SqlEntityStore::new(Arc::clone(&pool), true));
@@ -1442,17 +1484,20 @@ async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
     assert_eq!(fetched.unwrap().name, "RoPE");
 }
 
-// ── content_ref (khive#292) ─────────────────────────────────────────────────
+// ── attachment-backed content_ref projection ───────────────────────────────
 
 #[tokio::test]
 async fn test_content_ref_roundtrip() {
     let store = setup_memory_store();
 
     let digest = "a".repeat(64);
-    let entity = Entity::new("default", "document", "SourcePdf").with_content_ref(digest.clone());
+    let entity = Entity::new("default", "document", "SourcePdf");
     let id = entity.id;
 
-    store.upsert_entity(entity).await.unwrap();
+    store
+        .upsert_entity_with_attachments(entity, vec![content_attachment(id, &digest)])
+        .await
+        .unwrap();
 
     let fetched = store.get_entity(id).await.unwrap().unwrap();
     assert_eq!(fetched.content_ref, Some(digest));
@@ -1474,8 +1519,12 @@ async fn test_content_ref_defaults_to_none() {
 async fn test_content_ref_survives_query_entities() {
     let store = setup_memory_store_ns("blob_ns");
     let digest = "b".repeat(64);
-    let entity = Entity::new("blob_ns", "document", "QueriedPdf").with_content_ref(digest.clone());
-    store.upsert_entity(entity).await.unwrap();
+    let entity = Entity::new("blob_ns", "document", "QueriedPdf");
+    let id = entity.id;
+    store
+        .upsert_entity_with_attachments(entity, vec![content_attachment(id, &digest)])
+        .await
+        .unwrap();
 
     let page = store
         .query_entities("blob_ns", EntityFilter::default(), PageRequest::default())
@@ -1486,22 +1535,98 @@ async fn test_content_ref_survives_query_entities() {
 }
 
 #[tokio::test]
-async fn test_content_ref_survives_batch_upsert() {
+async fn entity_upserts_ignore_the_response_only_content_ref_projection() {
     let store = setup_memory_store();
     let digest = "c".repeat(64);
-    let entities = vec![
-        Entity::new("default", "document", "Batch1").with_content_ref(digest.clone()),
-        Entity::new("default", "document", "Batch2"),
-    ];
+    let mut projected = Entity::new("default", "document", "Batch1");
+    projected.content_ref = Some(digest);
+    let entities = vec![projected, Entity::new("default", "document", "Batch2")];
     let ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
 
     let summary = store.upsert_entities(entities).await.unwrap();
     assert_eq!(summary.affected, 2);
 
     let with_ref = store.get_entity(ids[0]).await.unwrap().unwrap();
-    assert_eq!(with_ref.content_ref, Some(digest));
+    assert_eq!(with_ref.content_ref, None);
     let without_ref = store.get_entity(ids[1]).await.unwrap().unwrap();
     assert_eq!(without_ref.content_ref, None);
+}
+
+#[tokio::test]
+async fn entity_and_multiple_attachments_roll_back_as_one_unit() {
+    let pool = setup_pool();
+    let store = SqlEntityStore::new(pool.clone(), false);
+    let entity = Entity::new("default", "document", "Atomic");
+    let id = entity.id;
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_second_attachment BEFORE INSERT ON attachments \
+             WHEN NEW.role = 'reject' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+    let mut rejected = content_attachment(id, &"d".repeat(64));
+    rejected.role = "reject".to_string();
+
+    store
+        .upsert_entity_with_attachments(
+            entity,
+            vec![content_attachment(id, &"c".repeat(64)), rejected],
+        )
+        .await
+        .expect_err("second attachment failure must abort the unit");
+
+    assert!(store.get_entity(id).await.unwrap().is_none());
+    let count: i64 = pool
+        .reader()
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM attachments WHERE record_uuid = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn entity_soft_delete_retains_attachments_and_hard_delete_removes_them() {
+    let pool = setup_pool();
+    let store = SqlEntityStore::new(pool.clone(), false);
+    let entity = Entity::new("default", "document", "Delete");
+    let id = entity.id;
+    store
+        .upsert_entity_with_attachments(entity, vec![content_attachment(id, &"e".repeat(64))])
+        .await
+        .unwrap();
+
+    assert!(store.delete_entity(id, DeleteMode::Soft).await.unwrap());
+    let retained: i64 = pool
+        .reader()
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM attachments WHERE record_uuid = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 1);
+
+    assert!(store.delete_entity(id, DeleteMode::Hard).await.unwrap());
+    let removed: i64 = pool
+        .reader()
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM attachments WHERE record_uuid = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(removed, 0);
 }
 
 /// #1656: a seek-cursor walk with an active `kind` filter must return every
@@ -1589,7 +1714,10 @@ fn batch_write_refreshes_writer_task_after_construction_outside_runtime() {
     );
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .unwrap();
     }
     let store = Arc::new(SqlEntityStore::new(Arc::clone(&pool), true));
 
@@ -1644,4 +1772,62 @@ fn batch_write_refreshes_writer_task_after_construction_outside_runtime() {
                 "batch write bypassed the queue after construction cached no runtime handle"
             );
         });
+}
+
+/// Both refusal arms of the pooled-reader checkout, exercised through a typed
+/// store. The typed-store paths previously inverted the pair: genuine pool
+/// exhaustion surfaced as a non-retryable Driver failure while a cancelled
+/// request surfaced as the retryable AdmissionTimeout — so a saturated read
+/// was never retried and an abandoned one was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_entity_read_classifies_exhaustion_and_cancellation_distinctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = PoolConfig {
+        path: Some(dir.path().join("entity_checkout_classes.db")),
+        max_readers: 1,
+        checkout_timeout: Duration::from_millis(200),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+        .unwrap();
+    // `is_file_backed = false` over a file pool forces the pooled-reader
+    // branch, so the checkout contends on the single pooled reader held below.
+    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+    let held_reader = pool.reader().expect("hold the sole pooled reader");
+
+    // Admission expiry with no cancellation: `checkout_timeout` runs to
+    // exhaustion and must surface as the retryable AdmissionTimeout.
+    let exhausted = store.get_entity(Uuid::new_v4()).await.unwrap_err();
+    assert!(
+        matches!(exhausted, StorageError::AdmissionTimeout { .. }),
+        "pool exhaustion through a typed store must be the retryable \
+         AdmissionTimeout, got {exhausted:?}"
+    );
+
+    // Cancellation before checkout: must return promptly as the non-retryable
+    // Timeout, never AdmissionTimeout, and never wait out `checkout_timeout`.
+    let cancel_store = SqlEntityStore::new(Arc::clone(&pool), false);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let waiting = tokio::spawn(khive_storage::scope_request_read_cancellation(
+        cancel_rx,
+        async move { cancel_store.get_entity(Uuid::new_v4()).await },
+    ));
+    tokio::task::yield_now().await;
+    cancel_tx.send(true).unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_millis(100), waiting)
+        .await
+        .expect("cancelled checkout waited for the pool checkout timeout")
+        .expect("checkout task panicked")
+        .unwrap_err();
+    assert!(
+        matches!(cancelled, StorageError::Timeout { .. }),
+        "cancellation before checkout through a typed store must be the \
+         non-retryable Timeout, got {cancelled:?}"
+    );
+
+    drop(held_reader);
 }

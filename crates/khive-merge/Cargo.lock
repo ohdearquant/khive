@@ -255,6 +255,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono-tz"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
+dependencies = [
+ "chrono",
+ "phf",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -493,7 +503,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1165,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "khive-db"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1194,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fold"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1208,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fusion"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "khive-score",
  "serde",
@@ -1217,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "khive-types",
@@ -1228,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "khive-merge"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "khive-runtime",
@@ -1242,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "khive-query"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "khive-types",
  "thiserror",
@@ -1250,11 +1260,13 @@ dependencies = [
 
 [[package]]
 name = "khive-runtime"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "chrono-tz",
+ "iana-time-zone",
  "inventory",
  "khive-db",
  "khive-fold",
@@ -1282,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "khive-score"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "khive-types",
  "serde",
@@ -1290,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "khive-storage"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1305,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "khive-types"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "serde",
@@ -1571,6 +1583,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "phf"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
+dependencies = [
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1693,7 +1723,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1869,7 +1899,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1928,7 +1958,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2134,6 +2164,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "siphasher"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2241,7 +2277,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2758,7 +2794,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

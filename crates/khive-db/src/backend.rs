@@ -1,8 +1,9 @@
 //! Concrete storage backend providing capability traits.
 //!
 //! `StorageBackend` owns a `ConnectionPool` and provides factory methods for all
-//! capability traits (`GraphStore`, `NoteStore`, `EventStore`, `VectorStore`,
-//! `TextSearch`, `SqlAccess`). File-backed for production; in-memory for tests.
+//! ten capability traits (`SqlAccess`, `NoteStore`, `EntityStore`, `GraphStore`,
+//! `EventStore`, `VectorStore`, `SparseStore`, `TextSearch`, `BlobStore`, and
+//! `AttachmentStore`). File-backed for production; in-memory for tests.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,7 +14,7 @@ use rusqlite::OptionalExtension;
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::sql_bridge::SqlBridge;
-use crate::stores::{agents, blob, entity, event, graph, note, sparse, text, vectors};
+use crate::stores::{agents, attachment, blob, entity, event, graph, note, sparse, text, vectors};
 
 fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, SqliteError> {
     conn.query_row(
@@ -202,17 +203,137 @@ impl StorageBackend {
 
     /// Prepare the core schema for runtime boot.
     ///
-    /// Writable backends apply pending migrations. Read-only backends perform
-    /// a query-only compatibility check and require the snapshot to be at this
-    /// build's exact latest schema version.
+    /// Writable backends acquire the canonical database-GC owner before the
+    /// writer, apply the ordinary versioned prefix, and may finish V21 only
+    /// through its zero-legacy-reference fast path. A legacy V20 database
+    /// remains at V20 for the async host's application-assisted attachment
+    /// cutover; this method alone is not a serving boot gate.
+    /// Read-only backends perform a query-only compatibility check and require
+    /// the snapshot to be at this build's exact latest schema version.
     pub fn prepare_core_schema(&self) -> Result<u32, SqliteError> {
         if self.is_read_only() {
             let reader = self.pool.reader()?;
             crate::migrations::validate_schema_is_current(reader.conn())
         } else {
+            let latest = crate::migrations::MIGRATIONS
+                .last()
+                .map(|migration| migration.version)
+                .unwrap_or(0);
+            {
+                let reader = self.pool.reader()?;
+                let current = crate::migrations::read_schema_version(reader.conn())?;
+                if current >= latest {
+                    return crate::migrations::validate_schema_is_current(reader.conn());
+                }
+            }
+            let owner = crate::stores::blob::acquire_database_gc_owner_for_path_blocking(
+                self.pool.canonical_path().map(Path::to_path_buf),
+            )
+            .map_err(|error| {
+                SqliteError::InvalidData(format!(
+                    "failed to acquire database GC owner before schema preparation: {error}"
+                ))
+            })?;
             let mut writer = self.pool.try_writer()?;
-            crate::migrations::run_migrations(writer.conn_mut())
+            crate::migrations::run_migrations_with_database_gc_owner(writer.conn_mut(), &owner)
         }
+    }
+
+    /// Inspect the coordinated V21 attachment cutover state.
+    pub fn attachment_cutover_status(
+        &self,
+    ) -> Result<crate::migrations::AttachmentCutoverStatus, SqliteError> {
+        if self.is_read_only() {
+            let reader = self.pool.reader()?;
+            crate::migrations::attachment_cutover_status(reader.conn())
+        } else {
+            let writer = self.pool.try_writer()?;
+            crate::migrations::attachment_cutover_status(writer.conn())
+        }
+    }
+
+    fn require_attachment_cutover_owner(
+        &self,
+        owner: &crate::stores::blob::DatabaseGcOwnerGuard,
+    ) -> Result<(), SqliteError> {
+        let sql = self.sql();
+        let backend_path = sql.database_path();
+        if owner.database_path() != backend_path.as_deref() {
+            return Err(SqliteError::InvalidData(format!(
+                "attachment cutover GC owner targets {:?}, but this backend is {:?}",
+                owner.database_path(),
+                backend_path.as_deref()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Commit resumable V21 stage 1 while the caller owns this database's GC
+    /// protocol. The owner must remain live through verified application
+    /// backfill and finalization.
+    pub fn stage_attachment_cutover(
+        &self,
+        owner: &crate::stores::blob::DatabaseGcOwnerGuard,
+    ) -> Result<(), SqliteError> {
+        self.require_attachment_cutover_owner(owner)?;
+        if self.is_read_only() {
+            return Err(SqliteError::InvalidData(
+                "cannot stage attachment cutover on a read-only backend".into(),
+            ));
+        }
+        let mut writer = self.pool.try_writer()?;
+        crate::migrations::stage_attachment_cutover(writer.conn_mut())
+    }
+
+    /// Atomically publish a verified batch of pack-owned attachment roles.
+    pub fn apply_verified_attachments(
+        &self,
+        owner: &crate::stores::blob::DatabaseGcOwnerGuard,
+        attachments: &[khive_storage::Attachment],
+    ) -> Result<(), SqliteError> {
+        self.require_attachment_cutover_owner(owner)?;
+        if self.is_read_only() {
+            return Err(SqliteError::InvalidData(
+                "cannot apply verified attachments on a read-only backend".into(),
+            ));
+        }
+        let mut writer = self.pool.try_writer()?;
+        let tx = writer
+            .conn_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for attachment in attachments {
+            attachment
+                .validate()
+                .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
+            crate::migrations::apply_generic_verified_attachment(
+                &tx,
+                &attachment.record_uuid.to_string(),
+                attachment.substrate.as_str(),
+                &attachment.role,
+                &attachment.content_ref,
+                attachment.media_type.as_deref(),
+                attachment.size_bytes,
+                attachment.created_at,
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically swap GC liveness/fences to attachments, remove the legacy
+    /// entity column, and record V21 while the canonical owner is held.
+    pub fn finalize_attachment_cutover(
+        &self,
+        owner: &crate::stores::blob::DatabaseGcOwnerGuard,
+    ) -> Result<(), SqliteError> {
+        self.require_attachment_cutover_owner(owner)?;
+        if self.is_read_only() {
+            return Err(SqliteError::InvalidData(
+                "cannot finalize attachment cutover on a read-only backend".into(),
+            ));
+        }
+        let mut writer = self.pool.try_writer()?;
+        crate::migrations::finalize_attachment_cutover(writer.conn_mut())
     }
 
     /// Get an EntityStore. Applies the entities DDL if not already present.
@@ -240,6 +361,19 @@ impl StorageBackend {
         }
 
         Ok(Arc::new(entity::SqlEntityStore::new(
+            Arc::clone(&self.pool),
+            self.is_file_backed,
+        )))
+    }
+
+    /// Get the role-keyed attachment store.
+    ///
+    /// Unlike the legacy capability accessors, this does not install DDL on
+    /// demand. The coordinated V21 core cutover owns creation of the table,
+    /// reference fences, GC liveness swap, and removal of the legacy entity
+    /// column as one boot-gated operation.
+    pub fn attachments(&self) -> Result<Arc<dyn khive_storage::AttachmentStore>, SqliteError> {
+        Ok(Arc::new(attachment::SqlAttachmentStore::new(
             Arc::clone(&self.pool),
             self.is_file_backed,
         )))
@@ -778,27 +912,8 @@ mod tests {
     use super::*;
     use khive_storage::types::{SqlStatement, SqlValue};
 
-    /// A writable fixture backend can leave `-wal`/`-shm` sidecars behind at
-    /// scope drop (their owning connection closes asynchronously), and
-    /// read-only admission rejects a writable `-shm` as potentially live.
-    /// Freeze any lingering sidecars so the reopened path is the documented
-    /// frozen-snapshot form: read-only `-wal` plus read-only `-shm`.
     #[cfg(unix)]
-    fn freeze_snapshot_sidecars(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        for suffix in ["-wal", "-shm"] {
-            let mut name = path.file_name().expect("db file name").to_os_string();
-            name.push(suffix);
-            let sidecar = path.parent().expect("db parent dir").join(name);
-            if sidecar.exists() {
-                let mut permissions = std::fs::metadata(&sidecar)
-                    .expect("sidecar metadata")
-                    .permissions();
-                permissions.set_mode(0o444);
-                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-            }
-        }
-    }
+    use khive_storage::test_support::freeze_snapshot_sidecars;
 
     #[cfg(unix)]
     #[tokio::test]
@@ -1446,7 +1561,13 @@ mod tests {
         let store = backend.blob_store(None, Some(0)).unwrap();
         let bytes = b"backend-level blob roundtrip".to_vec();
         let content_ref = store.put(bytes.clone()).await.unwrap();
-        assert_eq!(store.get(&content_ref).await.unwrap(), bytes);
+        assert_eq!(
+            store
+                .get_bounded_verified(&content_ref, bytes.len() as u64)
+                .await
+                .unwrap(),
+            bytes
+        );
     }
 
     #[test]

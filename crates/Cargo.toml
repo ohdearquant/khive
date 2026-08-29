@@ -55,7 +55,7 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 # lattice-embed and lattice-fann require Rust 1.93, setting the workspace MSRV.
 # The previous 1.91 floor came from floor_char_boundary use (issue #398).
@@ -86,6 +86,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"

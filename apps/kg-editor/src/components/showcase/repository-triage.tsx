@@ -18,7 +18,7 @@ import {
   Signpost,
   Users,
 } from "@/icons";
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState, type RefObject } from "react";
 
 import { DataState } from "@/components/data-state";
 import {
@@ -29,6 +29,7 @@ import {
   type RepositorySignal,
 } from "@/lib/repository-brief";
 import type { RepoBundle, RepoModule, ViewId } from "@/lib/repo-bundle";
+import { moduleInspectLabel } from "@/lib/repo-bundle";
 
 import styles from "./repository-triage.module.css";
 
@@ -36,7 +37,8 @@ export type RepositoryTriageProps = Readonly<{
   bundle: RepoBundle;
   onOpenAnalysis: (view: ViewId) => void;
   selectedModuleId: string | null;
-  onSelectModule: (moduleId: string) => void;
+  onInspectModule: (moduleId: string) => void;
+  moduleInspectorRef: RefObject<HTMLElement | null>;
   unresolvedModule: Readonly<{ path: string; reason: string }> | null;
   onRecoverModule: () => void;
   canRecoverModule: boolean;
@@ -134,11 +136,13 @@ function Classification({
 
 function ModuleButton({
   module,
+  moduleById,
   selected,
   detail,
   onSelect,
 }: {
   module: RepoModule;
+  moduleById: ReadonlyMap<string, RepoModule>;
   selected: boolean;
   detail: string;
   onSelect: () => void;
@@ -148,7 +152,7 @@ function ModuleButton({
       type="button"
       className={styles.moduleButton}
       data-module-id={module.id}
-      aria-label={`Inspect ${module.source_path}`}
+      aria-label={moduleInspectLabel(moduleById, module)}
       aria-controls="repository-module-inspector"
       aria-pressed={selected}
       onClick={onSelect}
@@ -169,7 +173,8 @@ export function RepositoryTriage({
   bundle,
   onOpenAnalysis,
   selectedModuleId,
-  onSelectModule,
+  onInspectModule,
+  moduleInspectorRef,
   unresolvedModule,
   onRecoverModule,
   canRecoverModule,
@@ -188,7 +193,6 @@ export function RepositoryTriage({
       new Map(bundle.graph.packages.items.map((item) => [item.id, item])),
     [bundle.graph.packages.items],
   );
-  const inspectorRef = useRef<HTMLElement>(null);
   const [query, setQuery] = useState("");
   const selectedInsight = useMemo(
     () =>
@@ -205,29 +209,11 @@ export function RepositoryTriage({
   const searchResults = searchMatches.items;
   const searchTruncated = searchMatches.total > searchResults.length;
 
-  function focusInspector() {
-    const inspector = inspectorRef.current;
-    if (!inspector) return;
-    inspector.focus({ preventScroll: true });
-    const reduceMotion = window.matchMedia?.(
-      "(prefers-reduced-motion: reduce)",
-    ).matches ?? false;
-    inspector.scrollIntoView?.({
-      behavior: reduceMotion ? "auto" : "smooth",
-      block: "start",
-    });
-  }
-
-  function selectModule(moduleId: string) {
-    onSelectModule(moduleId);
-    focusInspector();
-  }
-
   function selectSignal(signal: RepositorySignal) {
     const moduleId = signal.moduleIds.find((candidate) =>
       moduleById.has(candidate)
     );
-    if (moduleId) selectModule(moduleId);
+    if (moduleId) onInspectModule(moduleId);
   }
 
   return (
@@ -343,9 +329,10 @@ export function RepositoryTriage({
                         <ModuleButton
                           key={module.id}
                           module={module}
+                          moduleById={moduleById}
                           selected={module.id === selectedModuleId}
                           detail={`${module.language} · ${module.module_path}`}
-                          onSelect={() => selectModule(module.id)}
+                          onSelect={() => onInspectModule(module.id)}
                         />
                       ))
                     )
@@ -381,11 +368,12 @@ export function RepositoryTriage({
                               </span>
                               <ModuleButton
                                 module={moduleNode}
+                                moduleById={moduleById}
                                 selected={moduleNode.id === selectedModuleId}
                                 detail={`${bundle.capability.views.api_surface.label} · ${
                                   formatNumber(entry.dependentCount)
                                 } ${labels.metrics.dependent_count} · ${entry.modulePath}`}
-                                onSelect={() => selectModule(moduleNode.id)}
+                                onSelect={() => onInspectModule(moduleNode.id)}
                               />
                             </div>
                           );
@@ -459,6 +447,14 @@ export function RepositoryTriage({
                     </div>
                     <h4>{signal.title}</h4>
                     <p>{signal.summary}</p>
+                    {signal.analysisId && (
+                      <code
+                        className={styles.analysisId}
+                        title={signal.analysisId}
+                      >
+                        {signal.analysisId}
+                      </code>
+                    )}
                     <strong className={styles.why}>
                       {signal.whyItMatters}
                     </strong>
@@ -474,6 +470,7 @@ export function RepositoryTriage({
                       {inspectionTarget && (
                         <button
                           type="button"
+                          aria-label={moduleInspectLabel(moduleById, inspectionTarget)}
                           onClick={() => selectSignal(signal)}
                         >
                           Inspect {inspectionTarget.source_path}
@@ -527,7 +524,7 @@ export function RepositoryTriage({
         <aside
           className={styles.inspector}
           id="repository-module-inspector"
-          ref={inspectorRef}
+          ref={moduleInspectorRef}
           aria-label={`${moduleLabel} evidence`}
           data-module-inspector
           aria-live="polite"
@@ -637,7 +634,8 @@ export function RepositoryTriage({
                               <li key={module.id}>
                                 <button
                                   type="button"
-                                  onClick={() => selectModule(module.id)}
+                                  aria-label={moduleInspectLabel(moduleById, module)}
+                                  onClick={() => onInspectModule(module.id)}
                                 >
                                   {module.source_path}
                                 </button>
@@ -667,7 +665,8 @@ export function RepositoryTriage({
                                 <li key={module.id}>
                                   <button
                                     type="button"
-                                    onClick={() => selectModule(module.id)}
+                                    aria-label={moduleInspectLabel(moduleById, module)}
+                                    onClick={() => onInspectModule(module.id)}
                                   >
                                     {module.source_path}
                                   </button>
@@ -692,14 +691,14 @@ export function RepositoryTriage({
                     <h4>{bundle.capability.views.dependency_topology.label}</h4>
                     <ul>
                       {selectedInsight.topology.cycles.map((cycle) => (
-                        <li key={cycle.id}>
-                          <code>{cycle.id}</code>
+                        <li className={styles.cycleItem} key={cycle.id}>
                           <span className={styles.memberLinks}>
                             SCC members: {cycle.modules.map((module, index) => (
                               <span key={module.id}>
                                 <button
                                   type="button"
-                                  onClick={() => selectModule(module.id)}
+                                  aria-label={moduleInspectLabel(moduleById, module)}
+                                  onClick={() => onInspectModule(module.id)}
                                 >
                                   {module.source_path}
                                 </button>
@@ -707,6 +706,12 @@ export function RepositoryTriage({
                               </span>
                             ))}
                           </span>
+                          <code
+                            className={styles.cycleIdentifier}
+                            title={cycle.id}
+                          >
+                            {cycle.id}
+                          </code>
                         </li>
                       ))}
                     </ul>
@@ -731,7 +736,8 @@ export function RepositoryTriage({
                           <li key={coupling.module.id}>
                             <button
                               type="button"
-                              onClick={() => selectModule(coupling.module.id)}
+                              aria-label={moduleInspectLabel(moduleById, coupling.module)}
+                              onClick={() => onInspectModule(coupling.module.id)}
                             >
                               {coupling.module.source_path}
                             </button>
@@ -845,10 +851,7 @@ export function RepositoryTriage({
                 message={unresolvedModule.reason}
                 action={{
                   label: "Open recommended module",
-                  onClick: () => {
-                    onRecoverModule();
-                    focusInspector();
-                  },
+                  onClick: onRecoverModule,
                 }}
               />
             )

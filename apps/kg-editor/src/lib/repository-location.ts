@@ -1,4 +1,10 @@
 import type { ViewId } from "@/lib/repo-bundle";
+import {
+  normalizeRepositoryUrl,
+  resolveShowcaseRepository,
+  SHOWCASE_REGISTRY,
+  type ShowcaseRegistryEntry,
+} from "@/lib/showcase-registry";
 
 export const REPOSITORY_VIEW_IDS = [
   "structure_graph",
@@ -13,11 +19,17 @@ export const REPOSITORY_VIEW_IDS = [
   "scorecard",
 ] as const satisfies readonly ViewId[];
 
-const LOCATION_PARAMETERS = ["repo", "at", "module", "view"] as const;
+const LOCATION_PARAMETERS = [
+  "repo",
+  "at",
+  "module",
+  "module_id",
+  "view",
+] as const;
 const VIEW_IDS = new Set<string>(REPOSITORY_VIEW_IDS);
 const SNAPSHOT_SHA = /^[0-9a-f]{40}$/;
 const MODULE_PATH_LIMIT = 1_024;
-const REPOSITORY_URL_LIMIT = 2_048;
+const MODULE_ID_LIMIT = 1_024;
 
 type LocationParameter = (typeof LOCATION_PARAMETERS)[number];
 
@@ -25,6 +37,7 @@ export type RepositoryLocation = Readonly<{
   repository: string | null;
   snapshotSha: string | null;
   modulePath: string | null;
+  moduleId: string | null;
   view: ViewId | null;
 }>;
 
@@ -39,22 +52,8 @@ export type ParsedRepositoryLocation = Readonly<{
 }>;
 
 export function publicRepositoryUrlIssue(value: string): string | null {
-  if (value.length > REPOSITORY_URL_LIMIT) {
-    return "The repository URL is too long.";
-  }
-  try {
-    const repository = new URL(value);
-    if (
-      (repository.protocol !== "https:" && repository.protocol !== "http:") ||
-      repository.username ||
-      repository.password
-    ) {
-      return "The repository must be a public HTTP or HTTPS URL.";
-    }
-  } catch {
-    return "The repository must be a public HTTP or HTTPS URL.";
-  }
-  return null;
+  const normalized = normalizeRepositoryUrl(value);
+  return normalized.ok ? null : normalized.reason;
 }
 
 export function addressableModulePathIssue(value: string): string | null {
@@ -101,14 +100,15 @@ function singleParameter(
 function parseRepository(
   value: string | null,
   issues: RepositoryLocationIssue[],
+  registry: readonly ShowcaseRegistryEntry[],
 ): string | null {
   if (value == null) return null;
-  const message = publicRepositoryUrlIssue(value);
-  if (message) {
-    issues.push({ parameter: "repo", message });
+  const lookup = resolveShowcaseRepository(value, registry);
+  if (lookup.status === "invalid") {
+    issues.push({ parameter: "repo", message: lookup.reason });
     return null;
   }
-  return value;
+  return lookup.normalizedUrl;
 }
 
 function parseSnapshotSha(
@@ -139,6 +139,34 @@ function parseModulePath(
   return value;
 }
 
+// URL delimiters are excluded from the identifier contract itself (not just
+// the share-URL boundary) so every bundle-accepted module ID is representable
+// in an investigation link: an ID the share URL would have to omit is
+// rejected at validation instead of silently losing exact identity.
+export function addressableModuleIdIssue(value: string): string | null {
+  if (
+    value.length === 0 ||
+    value.length > MODULE_ID_LIMIT ||
+    /[?#\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    return "The module identifier must be a non-empty bounded printable value without URL delimiters.";
+  }
+  return null;
+}
+
+function parseModuleId(
+  value: string | null,
+  issues: RepositoryLocationIssue[],
+): string | null {
+  if (value == null) return null;
+  const message = addressableModuleIdIssue(value);
+  if (message) {
+    issues.push({ parameter: "module_id", message });
+    return null;
+  }
+  return value;
+}
+
 function parseView(
   value: string | null,
   issues: RepositoryLocationIssue[],
@@ -154,58 +182,66 @@ function parseView(
   return value as ViewId;
 }
 
-export function parseRepositoryLocation(url: URL): ParsedRepositoryLocation {
+export function parseRepositoryLocation(
+  url: URL,
+  registry: readonly ShowcaseRegistryEntry[] = SHOWCASE_REGISTRY,
+): ParsedRepositoryLocation {
   const issues: RepositoryLocationIssue[] = [];
   const repository = singleParameter(url, "repo", issues);
   const snapshotSha = singleParameter(url, "at", issues);
   const modulePath = singleParameter(url, "module", issues);
+  const moduleId = singleParameter(url, "module_id", issues);
   const view = singleParameter(url, "view", issues);
 
   return {
     location: {
-      repository: parseRepository(repository, issues),
+      repository: parseRepository(repository, issues, registry),
       snapshotSha: parseSnapshotSha(snapshotSha, issues),
       modulePath: parseModulePath(modulePath, issues),
+      moduleId: parseModuleId(moduleId, issues),
       view: parseView(view, issues),
     },
     issues,
   };
 }
 
+// Investigation URLs are copied to the clipboard and written to browser
+// history, so they carry ONLY the five parameters this app defines. A page
+// URL that arrived with an unrelated query parameter or fragment — a
+// credential such as ?access_token=..., a fragment-borne secret, a tracker
+// value — is never copied forward: the URL is rebuilt from the origin and
+// path only, and every other parameter and the hash are discarded.
 export function repositoryLocationUrl(
   base: URL,
   location: RepositoryLocation,
 ): URL {
-  const url = new URL(base);
+  const url = new URL(base.origin + base.pathname);
+  const values: Record<LocationParameter, string | null> = {
+    repo: location.repository ? repositoryOriginAndPathname(location.repository) : null,
+    at: location.snapshotSha,
+    module: location.modulePath,
+    module_id: location.moduleId,
+    view: location.view,
+  };
   for (const parameter of LOCATION_PARAMETERS) {
-    url.searchParams.delete(parameter);
+    const value = values[parameter];
+    if (value) url.searchParams.append(parameter, value);
   }
-  if (location.repository) url.searchParams.append("repo", location.repository);
-  if (location.snapshotSha) url.searchParams.append("at", location.snapshotSha);
-  if (location.modulePath) {
-    url.searchParams.append("module", location.modulePath);
-  }
-  if (location.view) url.searchParams.append("view", location.view);
   return url;
 }
 
 /**
- * The shareable form of an investigation URL. A share link leaves the
- * browser, so it carries ONLY the investigation parameters: every foreign
- * query parameter and the URL fragment are dropped rather than copied,
- * because the current address bar can hold values that must not be
- * disclosed to a link recipient (tokens, authorization codes, tracker
- * state). `repositoryLocationUrl` stays the in-browser history form, which
- * preserves foreign parameters locally.
- *
- * The boundary also applies to the parameter VALUES, not just the
- * parameter names: a validated repository URL may legitimately carry a
- * query string or fragment (deep-link support keeps them in-browser), so
- * the shared copy is normalized to origin + pathname; a module path
- * carrying a URL query or fragment delimiter is omitted entirely rather
- * than encoded into the value, because encoding preserves — not redacts —
- * whatever the delimiter introduced. `at` and `view` need no value
- * boundary: their parse contracts are a 40-hex SHA and a closed id set.
+ * The shareable form of an investigation URL. `repositoryLocationUrl`
+ * already discards every foreign query parameter and the fragment, but a
+ * validated repository URL may legitimately carry a query string or
+ * fragment of its OWN (deep-link support keeps those in-browser), so this
+ * boundary also applies to the parameter VALUES, not just the parameter
+ * names: the shared repository value is normalized to origin + pathname,
+ * and a module path or identifier carrying a URL query or fragment delimiter
+ * is omitted entirely rather than encoded into the value, because encoding
+ * preserves — not redacts — whatever the delimiter introduced. `at` and
+ * `view` need no value boundary: their parse contracts are a 40-hex SHA and
+ * a closed id set.
  */
 export function investigationShareUrl(
   base: URL,
@@ -213,18 +249,21 @@ export function investigationShareUrl(
 ): URL {
   const url = new URL(`${base.origin}${base.pathname}`);
   if (location.repository) {
-    const repository = shareSafeRepository(location.repository);
+    const repository = repositoryOriginAndPathname(location.repository);
     if (repository) url.searchParams.append("repo", repository);
   }
   if (location.snapshotSha) url.searchParams.append("at", location.snapshotSha);
   if (location.modulePath && !/[?#]/u.test(location.modulePath)) {
     url.searchParams.append("module", location.modulePath);
   }
+  if (location.moduleId && !/[?#]/u.test(location.moduleId)) {
+    url.searchParams.append("module_id", location.moduleId);
+  }
   if (location.view) url.searchParams.append("view", location.view);
   return url;
 }
 
-function shareSafeRepository(value: string): string | null {
+function repositoryOriginAndPathname(value: string): string | null {
   try {
     const repository = new URL(value);
     return `${repository.origin}${repository.pathname}`;

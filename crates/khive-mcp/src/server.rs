@@ -590,8 +590,36 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     } else {
         format!("{:?}", config.backend_id)
     };
+    // `display_timezone` is part of daemon identity, not merely of rendering
+    // (ADR-169). `gtd.assign` anchors a date-only `due` through
+    // `config.display_timezone` and PERSISTS the resulting instant, so two
+    // runtimes differing only in this field are not interchangeable: a warm
+    // daemon reused across them writes an instant that is wrong by the offset
+    // between the zones, silently and durably.
+    //
+    // Included unconditionally rather than only when non-default. The default
+    // is the HOST's zone, not UTC, so "differs from the default" is itself a
+    // host-dependent predicate and would make identity depend on where the
+    // fingerprint was computed.
+    //
+    // The cost, stated as it actually happens: a daemon already warm when this
+    // lands keeps the identity it computed at startup, so a client built from
+    // this code sends an ID that daemon does not recognise. The daemon answers
+    // `config_mismatch` and the client falls back to LOCAL dispatch. It does
+    // not respawn — `FallbackReason::ConfigMismatch` is classified
+    // `FallbackSeverity::Illegitimate`, and the kill-and-respawn path
+    // (#644/#539) governs the protocol/parse reasons, not this one. So until
+    // that daemon is restarted, every request pays a failed forwarding round
+    // trip and loses the daemon's warm indexes and embedders, and each one
+    // increments a counter documented as never expected on a correctly
+    // configured fleet.
+    //
+    // Spelled out because "the daemon takes a new identity" invites the reading
+    // that it restarts itself. It does not, and nothing here makes it: this is
+    // a one-time operational cost that ends when the daemon is restarted, by
+    // whoever restarts it.
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}];git_write={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}];git_write={};display_tz={}",
         packs.join(","),
         db,
         primary,
@@ -601,6 +629,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         backend,
         outbound.join(","),
         git_write,
+        config.display_timezone.name(),
     );
 
     // Fold backend topology when non-empty so two configs differing only in
@@ -668,13 +697,17 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
         .collect();
     backend_rows.sort();
 
-    let mut pack_rows: Vec<(String, String)> = cfg
+    let mut pack_rows: Vec<(String, String, bool)> = cfg
         .packs
         .iter()
         .map(|(pack, pack_config)| {
             legacy_safe &= legacy_topology_component_is_safe(pack)
                 && legacy_topology_component_is_safe(&pack_config.backend);
-            (pack.clone(), pack_config.backend.clone())
+            (
+                pack.clone(),
+                pack_config.backend.clone(),
+                pack_config.no_embed,
+            )
         })
         .collect();
     pack_rows.sort();
@@ -690,7 +723,13 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .join(",");
         let pack_backends = pack_rows
             .iter()
-            .map(|(pack, backend)| format!("{pack}={backend}"))
+            .map(|(pack, backend, no_embed)| {
+                // `no_embed` changes runtime behavior (that pack's runtime
+                // carries zero embedders), so it must move the fingerprint;
+                // emitted only when set so pre-existing configs keep their id.
+                let no_embed = if *no_embed { ":no_embed" } else { "" };
+                format!("{pack}={backend}{no_embed}")
+            })
             .collect::<Vec<_>>()
             .join(",");
         (backends, pack_backends)
@@ -710,9 +749,10 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .join(",");
         let pack_backends = pack_rows
             .iter()
-            .map(|(pack, backend)| {
+            .map(|(pack, backend, no_embed)| {
+                let no_embed = if *no_embed { ":no_embed" } else { "" };
                 format!(
-                    "{}={}",
+                    "{}={}{no_embed}",
                     escape_topology_component(pack),
                     escape_topology_component(backend),
                 )
@@ -791,11 +831,13 @@ fn build_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>)
 /// Runtime-mode admission for transport background work.
 ///
 /// The inbound tasks dispatch only `comm.*` verbs (`comm.ingest`, heartbeat,
-/// and cursor operations), so their write authority is the comm pack's actual
-/// assigned runtime. The outbound tasks scan and mutate notes through the kg
-/// pack's generic `list`/`update` verbs, so they must not perform an external
-/// send unless that runtime can durably record the claim and `delivered_at`.
-/// Keeping the two decisions separate preserves mixed-backend topologies.
+/// and cursor operations), and the outbound tasks scan, claim, and mark
+/// outbound `message` notes through the runtime's non-wire owner-side APIs —
+/// both against the comm pack's actual assigned runtime, since under a
+/// `[packs.comm]` backend assignment that is the backend holding comm's
+/// rows. Neither loop may run unless that runtime can durably record its
+/// writes. The two decisions stay separate so a future topology can admit
+/// one direction without the other.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChannelLoopAdmission {
@@ -807,21 +849,18 @@ pub(crate) struct ChannelLoopAdmission {
 impl ChannelLoopAdmission {
     fn for_single_runtime(runtime: &KhiveRuntime, packs: &[String]) -> Self {
         let comm_loaded = packs.iter().any(|pack| pack == "comm");
-        let kg_loaded = packs.iter().any(|pack| pack == "kg");
         let writable = !runtime.is_read_only();
         Self {
             inbound_poll: comm_loaded && writable,
-            outbound_delivery: comm_loaded && kg_loaded && writable,
+            outbound_delivery: comm_loaded && writable,
         }
     }
 
-    pub(crate) fn for_pack_runtimes(
-        kg: Option<&KhiveRuntime>,
-        comm: Option<&KhiveRuntime>,
-    ) -> Self {
+    pub(crate) fn for_pack_runtimes(comm: Option<&KhiveRuntime>) -> Self {
+        let admitted = comm.is_some_and(|runtime| !runtime.is_read_only());
         Self {
-            inbound_poll: comm.is_some_and(|runtime| !runtime.is_read_only()),
-            outbound_delivery: comm.is_some() && kg.is_some_and(|runtime| !runtime.is_read_only()),
+            inbound_poll: admitted,
+            outbound_delivery: admitted,
         }
     }
 }
@@ -849,11 +888,13 @@ pub struct KhiveMcpServer {
     /// [`Self::from_registry`]/[`Self::from_registry_with_meta`] without an
     /// explicit [`Self::with_runtime`] call (test-only construction paths).
     runtime: Option<KhiveRuntime>,
-    /// Runtime that owns KG-routed outbox notes. The email loop's
-    /// `external_id` claim is deliberately non-wire, so it cannot rely on the
-    /// registry to route that one mutation. In a multi-backend topology this
-    /// may differ from `runtime` (the default backend); retaining the exact KG
-    /// runtime keeps list, owner claim, and delivered-at update on one store.
+    /// Runtime that owns the outbound `message` notes the delivery loops
+    /// scan, claim, and mark — the comm pack's assigned runtime. Every one of
+    /// those touches is deliberately non-wire (the generic verbs run on the
+    /// kg/main runtime, which under a `[packs.comm]` backend assignment does
+    /// not hold comm's rows). In a multi-backend topology this may differ
+    /// from `runtime` (the default backend); retaining the exact comm
+    /// runtime keeps scan, owner claim, and delivered-at update on one store.
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     channel_outbox_runtime: Option<KhiveRuntime>,
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
@@ -968,6 +1009,12 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
 
 impl KhiveMcpServer {
     /// Build a server from `runtime.config().packs`. Errors if any pack is unknown or missing deps.
+    ///
+    /// This constructor assumes the supplied runtime's database is already at a
+    /// complete V21 attachment cutover. It intentionally performs no migration
+    /// or blob-evidence verification. Production hosts opening a database should
+    /// use the async builders in [`crate::serve`] and reserve this constructor for
+    /// already-prepared runtimes and tests.
     // The error variant intentionally carries the runtime so callers can recover.
     #[allow(clippy::result_large_err)]
     pub fn new(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
@@ -978,6 +1025,8 @@ impl KhiveMcpServer {
     }
 
     /// Build a server with an explicit pack list (strict — fails on unknown names).
+    ///
+    /// The same already-prepared-runtime precondition as [`Self::new`] applies.
     // The error variant intentionally carries the runtime by value so callers
     // can recover and retry. Boxing would force every recovery path through a
     // deref for no real benefit.
@@ -1144,7 +1193,7 @@ impl KhiveMcpServer {
         self
     }
 
-    /// Attach the exact KG-routed runtime that owns outbox note properties.
+    /// Attach the exact comm-routed runtime that owns outbox note properties.
     /// Multi-backend boot overrides the default-runtime fallback installed by
     /// [`Self::with_runtime`]; single-backend construction already points both
     /// handles at the same runtime.
@@ -1263,6 +1312,26 @@ impl KhiveMcpServer {
     }
 
     /// Fingerprint of the runtime config this server's registry was built for.
+    /// The resolved events-split config of the default-backend runtime, if
+    /// any (ADR-170). Daemon supervision derives the events daemon's
+    /// db/socket from this exact value so the supervised daemon and the
+    /// forwarding clients cannot anchor at diverging paths.
+    pub(crate) fn events_split_config(
+        &self,
+    ) -> Option<&khive_runtime::events_split::EventsSplitConfig> {
+        self.runtime
+            .as_ref()
+            .and_then(|rt| rt.config().events_split.as_ref())
+    }
+
+    /// Whether the default-backend runtime is read-only. Daemon supervision
+    /// asks this before spawning an events daemon: the supervised daemon
+    /// opens the events sidecar writable, which a read-only deployment must
+    /// never cause (ADR-170).
+    pub(crate) fn default_runtime_is_read_only(&self) -> bool {
+        self.runtime.as_ref().is_some_and(|rt| rt.is_read_only())
+    }
+
     pub fn config_id(&self) -> &str {
         &self.config_id
     }
@@ -2208,6 +2277,7 @@ fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
         StorageCapability::Sparse => "sparse",
         StorageCapability::Text => "text",
         StorageCapability::Blob => "blob",
+        StorageCapability::Attachments => "attachments",
     }
 }
 
@@ -3812,25 +3882,8 @@ mod tests {
         }
     }
 
-    // Freeze lingering `-wal`/`-shm` sidecars left by a writable fixture whose
-    // connections close asynchronously; read-only admission rejects a writable
-    // `-shm` as potentially live.
     #[cfg(unix)]
-    fn freeze_snapshot_sidecars(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        for suffix in ["-wal", "-shm"] {
-            let mut name = path.file_name().expect("db file name").to_os_string();
-            name.push(suffix);
-            let sidecar = path.parent().expect("db parent dir").join(name);
-            if sidecar.exists() {
-                let mut permissions = std::fs::metadata(&sidecar)
-                    .expect("sidecar metadata")
-                    .permissions();
-                permissions.set_mode(0o444);
-                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-            }
-        }
-    }
+    use khive_storage::test_support::freeze_snapshot_sidecars;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -4025,6 +4078,72 @@ mod tests {
             compute_config_id_with_ann_fresh_tail(&config, None, true),
             compute_config_id_with_ann_fresh_tail(&config, None, false),
             "opposite fresh-tail policies must not share one warm daemon"
+        );
+    }
+
+    /// `gtd.assign` anchors a date-only `due` through `display_timezone` and
+    /// PERSISTS the resulting instant, so a warm daemon reused across two
+    /// runtimes differing only in that field writes an instant wrong by the
+    /// offset between the zones. Identity must separate them.
+    #[test]
+    fn config_id_differs_when_display_timezone_differs() {
+        // One base, cloned, for the reason spelled out on the test below — and
+        // it matters MORE here. This assertion is `assert_ne!`, so the shared
+        // environment racing between two constructor calls would make it pass
+        // by producing two different `db_path`s, which is a pass that would
+        // survive deleting the fix this test exists to hold.
+        let base = RuntimeConfig::no_embeddings();
+        let utc = RuntimeConfig {
+            display_timezone: "UTC".parse().expect("UTC is a known IANA zone"),
+            events_split: None,
+            ..base.clone()
+        };
+        let new_york = RuntimeConfig {
+            display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            events_split: None,
+            ..base
+        };
+
+        assert_ne!(
+            compute_config_id_with_runtime_policies(&utc, None, true, false),
+            compute_config_id_with_runtime_policies(&new_york, None, true, false),
+            "runtimes differing only in display_timezone must not share one warm daemon: \
+             a reused daemon would anchor date-only due values in the wrong zone and \
+             persist the wrong instant"
+        );
+    }
+
+    /// The other direction, so the assertion above cannot pass for an
+    /// incidental reason: identical zones must still collapse to one identity.
+    #[test]
+    fn config_id_matches_when_display_timezone_matches() {
+        // ONE base, cloned — not two constructor calls. `RuntimeConfig::default`
+        // reads `HOME` to build `db_path`, and `db_path` is folded into the id,
+        // so two calls read that variable at two different instants. Other
+        // tests in this binary set and restore `HOME` around their own work
+        // (`config_id_matches_for_tilde_and_equivalent_absolute_db_override` is
+        // one, and it matches the same `config_id` filter), and tests run in
+        // parallel threads against one process-global environment. A mutation
+        // landing between the two calls gave the two configs different paths
+        // and reddened this test for a reason that has nothing to do with
+        // timezones. Cloning one base removes the window: whatever `HOME` is,
+        // both sides read the same one.
+        let base = RuntimeConfig::no_embeddings();
+        let a = RuntimeConfig {
+            display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            events_split: None,
+            ..base.clone()
+        };
+        let b = RuntimeConfig {
+            display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            events_split: None,
+            ..base
+        };
+
+        assert_eq!(
+            compute_config_id_with_runtime_policies(&a, None, true, false),
+            compute_config_id_with_runtime_policies(&b, None, true, false),
+            "identical runtimes must share one warm daemon"
         );
     }
 
@@ -5232,20 +5351,45 @@ mod tests {
 
     #[test]
     fn auto_rendered_batch_stays_within_daemon_frame_cap() {
-        let mut leaves = serde_json::Map::new();
-        for index in 0..80_000 {
-            leaves.insert(format!("k{index}"), json!(0));
-        }
-        let result = nest_object(60, Value::Object(leaves));
+        // Auto renders a single record as compact JSON, so a lone object can
+        // no longer balloon past its compact form (the kv-block renderer is
+        // gone). The remaining inflation mode is a sparse record array: the
+        // table materializes the full column set for every row, so records
+        // with disjoint key sets inflate quadratically. The fixture sits
+        // where the compact envelope fits the budget but the rendered table
+        // exceeds the daemon frame, which is exactly the fallback under test.
+        // Sized to the smallest sparse array whose render exceeds the frame
+        // with margin: 400 rows × 8000 columns ≈ 3.2M cells at ~3 bytes of
+        // separator each ≈ 9.6MB rendered vs the 8MB frame. Larger fixtures
+        // (600×20 keys/row was 7.2M cells) only slow the suite.
+        let records: Vec<Value> = (0..400)
+            .map(|record_index| {
+                let mut record = serde_json::Map::new();
+                for key_index in 0..20 {
+                    record.insert(format!("r{record_index}k{key_index}"), json!(1));
+                }
+                Value::Object(record)
+            })
+            .collect();
+        let result = json!({ "items": records });
         let envelope = parallel_batch_envelope(vec![json!({
             "ok": true,
             "tool": "probe",
-            "result": result,
+            "result": result.clone(),
         })]);
         let compact_bytes = serde_json::to_vec(&envelope)
             .expect("compact envelope")
             .len();
         assert!(compact_bytes < BATCH_RESPONSE_BUDGET_BYTES);
+        // Precondition: the rendered form alone must exceed the daemon frame,
+        // otherwise this fixture no longer exercises the fallback.
+        let rendered_probe_bytes =
+            render_format(result, OutputFormat::Auto, PresentationMode::Agent).len();
+        assert!(
+            rendered_probe_bytes > khive_runtime::daemon::MAX_FRAME_BYTES,
+            "fixture drifted: rendered entry ({rendered_probe_bytes} bytes) \
+             no longer exceeds the daemon frame"
+        );
 
         let rendered = render_result(
             envelope,
@@ -5653,6 +5797,7 @@ mod tests {
                 "knowledge".to_string(),
                 PackConfig {
                     backend: "archive".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -5697,6 +5842,7 @@ mod tests {
                 "kg".to_string(),
                 PackConfig {
                     backend: "main".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -5710,6 +5856,58 @@ mod tests {
         assert!(
             config_id.ends_with(&expected_suffix),
             "delimiter-free topologies must retain their legacy fingerprint spelling; got {config_id}"
+        );
+    }
+
+    /// `no_embed` changes runtime behavior (that pack's runtime carries zero
+    /// embedders), so two configs differing only in it must not share a
+    /// `config_id` — a shared id would let a daemon serve a client whose
+    /// embedding policy it does not implement. Absent/false keeps the
+    /// pre-existing spelling so already-deployed configs keep their id.
+    #[test]
+    fn config_id_differs_when_pack_no_embed_differs() {
+        use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
+
+        let dir = tempfile::tempdir().expect("no_embed topology tempdir");
+        let main_path = dir.path().join("main.db");
+        let runtime = RuntimeConfig {
+            db_path: Some(main_path.clone()),
+            packs: vec!["comm".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let topology_for = |no_embed: bool| KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path.clone()),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            packs: std::collections::HashMap::from([(
+                "comm".to_string(),
+                PackConfig {
+                    backend: "main".to_string(),
+                    no_embed,
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+
+        let with_flag = compute_config_id(&runtime, Some(&topology_for(true)));
+        let without_flag = compute_config_id(&runtime, Some(&topology_for(false)));
+        assert_ne!(
+            with_flag, without_flag,
+            "configs differing only in no_embed must not share a config_id"
+        );
+        assert!(
+            with_flag.contains("comm=main:no_embed"),
+            "no_embed must appear in the pack fingerprint; got {with_flag}"
+        );
+        assert!(
+            without_flag.contains("comm=main]"),
+            "absent no_embed keeps the legacy pack spelling; got {without_flag}"
         );
     }
 

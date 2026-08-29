@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod error;
+pub mod events_split;
 pub mod fusion;
 pub mod graph_traversal;
 mod note_store_guard;
@@ -28,6 +29,7 @@ pub mod operations;
 pub mod pack;
 pub mod phase_events;
 pub mod portability;
+pub mod preference_verification;
 pub mod presentation;
 pub mod reference_resolution;
 pub mod reference_ring;
@@ -37,6 +39,7 @@ pub mod retrieval;
 pub mod runtime;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
+pub mod time_anchor;
 pub use khive_storage::usage;
 pub mod validation;
 
@@ -56,7 +59,7 @@ pub use atomic_runner::{
     CommittedPostCommitEffects,
 };
 pub use blob::{
-    resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, VerifiedBlob,
+    resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, GovernedBlobError, VerifiedBlob,
     DEFAULT_BLOB_HYDRATION_BYTES,
 };
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
@@ -105,13 +108,13 @@ pub use objectives::{
 #[cfg(any(test, feature = "fault-injection"))]
 pub use operations::{
     arm_entity_compensation_fail_scoped, arm_fts_fail_many_partial_scoped,
-    arm_fts_fail_many_scoped, arm_fts_fail_scoped, arm_rollback_cleanup_fail,
-    arm_vector_fail_after, arm_vector_fail_scoped, FaultInjectionArm,
+    arm_fts_fail_many_scoped, arm_fts_fail_scoped, arm_prefix_resolve_fail_scoped,
+    arm_rollback_cleanup_fail, arm_vector_fail_after, arm_vector_fail_scoped, FaultInjectionArm,
 };
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
-    hex_prefix_to_uuid_pattern, merge_entry_metadata, EdgeEndpointKind, EntityCreateSpec, LinkSpec,
-    NoteSearchHit, QueryResult, Resolved,
+    hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, EdgeEndpointKind,
+    EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
@@ -123,8 +126,10 @@ pub use pack::{
 };
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
+pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};
 pub use presentation::{
-    apply_redundancy_drop, micros_to_iso, present, render_format, OutputFormat, PresentationMode,
+    apply_redundancy_drop, micros_to_iso, present, render_format, rfc3339_to_utc_micros,
+    OutputFormat, PresentationMode,
 };
 pub use reference_resolution::{resolve_reference, ReferenceCandidate, ReferenceResolution};
 pub use reference_ring::{ReferenceRing, RingEntry};

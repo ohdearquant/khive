@@ -456,18 +456,57 @@ Rejected.
 ### Neutral
 
 - **`khive-db` largely unchanged** — adds `sqlite_read_only` + `apply_pragma` helpers.
-- **`khive-runtime` simpler** — `RuntimeConfig` shrinks; constructor becomes
-  `from_backend`; no embedder field (ADR-031).
+- **`khive-runtime` backend assembly is explicit** — `RuntimeConfig` remains a
+  host-builder input, while an already-opened backend can be assembled only
+  after schema and application-assisted cutover coordination. ADR-031 owns the
+  embedder-registry evolution.
 - **Verb dispatch unchanged** — verb→pack mapping resolved at pack construction.
 - **MCP wire protocol unchanged** — clients see the same verbs; backend assignment is
   invisible.
 
 ## Migration
 
-Single-backend users get auto-upgraded: the built-in default config produces one
-`[[backends.main]]` entry pointing at the existing `~/.khive/khive.db`. Existing data is
-unchanged. Existing `KhiveRuntime::new(RuntimeConfig)` deprecated but retained for tests;
-new code uses `from_backend`.
+When `[[backends]]` is empty, the supported async single-backend host builder
+opens the database selected by `RuntimeConfig::db_path` (defaulting to
+`~/.khive/khive.db`), applies the ordinary schema prefix, and completes the
+boot-gated V21 attachment cutover before exposing a runtime. With declared
+backends, the async multi-backend builder inventories every distinct secondary
+before coordinating V21 on canonical `main`.
+
+The explicit schema-admin surface uses the same resolved topology without
+constructing pack runtimes. `kkernel db migrate` and `kkernel db check` load an
+explicit/discovered config; omitting `--backend` targets the configured set,
+while `--backend <name>` selects a declared target. Migration deduplicates
+physical aliases and advances distinct secondaries before `main`; a selected
+`main` or physical alias retains those prerequisites. The admin configuration
+clears packs and embedders, so it applies no pack-auxiliary DDL, while retaining
+the blob configuration used only when authenticated legacy V20 moodboard
+evidence requires hydration. Exact-current admin paths and migrations without
+legacy moodboard model evidence do not resolve a BlobStore.
+`db check` is the read-only projection of the same target plan: `main` or its
+SQLite alias includes every secondary prerequisite; an independent secondary
+remains a single target.
+With no declared topology, the commands use implicit `main` at
+`--db`/`KHIVE_DB` or the default path.
+The pure planner rejects conflicting `read_only` declarations for any physical
+SQLite alias before a selected migration can open a database. `--db :memory:`
+instead makes every configured name a distinct ephemeral backend, so only the
+literal `main` name retains the full prerequisite plan. Reported prerequisite
+status follows physical backend identity; every alias of the selected main is a
+target, not a prerequisite.
+The Phase-4b V21 path remains subject to ADR-160's separately released Phase-4a
+GC gate and mandatory fleet convergence/drain. Before cutover, Phase-4a
+application-serving/read-write processes must also be quiesced or unable to
+access the database; GC-only compatibility with completed V21 is not general
+serving compatibility. The Phase-4b fleet starts only after the planned
+topology validates exact-current.
+
+`KhiveRuntime::new(RuntimeConfig)` remains a direct constructor for tests and
+fresh/already-current single-backend databases; it refuses a legacy database
+that needs application-assisted cutover. `from_backend` is a low-level assembly
+seam for an already-prepared backend, not production migration or boot guidance;
+fallible single-backend host assembly uses `from_prepared_backend` after
+coordination.
 
 ADR-029's `target_backend` column on `graph_edges` adds a nullable column with no data
 churn for single-backend deployments.

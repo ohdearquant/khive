@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
+use khive_storage::attachment::{Attachment, AttachmentSubstrate};
 use khive_storage::entity::{Entity, EntityFilter};
-use khive_storage::error::StorageError;
+use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
 };
@@ -18,7 +19,8 @@ use khive_storage::StorageCapability;
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
-use crate::writer_task::WriterTaskHandle;
+use crate::stores::attachment::{attachment_upsert_statement, delete_record_attachments_statement};
+use crate::writer_task::{execute_wrapped_transaction, WriterTaskHandle};
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Entities, op, e)
@@ -29,6 +31,14 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
 }
 
 const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
+
+const ENTITY_SELECT_COLUMNS: &str =
+    "entities.id, entities.namespace, entities.kind, entities.entity_type, entities.name, \
+     entities.description, entities.properties, entities.tags, entities.created_at, \
+     entities.updated_at, entities.deleted_at, entities.merged_into, entities.merge_event_id, \
+     (SELECT attachment.content_ref FROM attachments AS attachment \
+      WHERE attachment.record_uuid = entities.id \
+        AND attachment.substrate = 'entity' AND attachment.role = 'content') AS content_ref";
 
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut)
@@ -54,8 +64,8 @@ pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
     SqlStatement {
         sql: "INSERT OR REPLACE INTO entities \
               (id, namespace, kind, entity_type, name, description, properties, tags, \
-               created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+               created_at, updated_at, deleted_at, merged_into, merge_event_id) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
             .to_string(),
         params: vec![
             SqlValue::Text(entity.id.to_string()),
@@ -89,12 +99,75 @@ pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
                 Some(u) => SqlValue::Text(u.to_string()),
                 None => SqlValue::Null,
             },
-            match &entity.content_ref {
-                Some(c) => SqlValue::Text(c.clone()),
+        ],
+        label: Some("entity-upsert".to_string()),
+    }
+}
+
+/// Full-entity compare-and-swap update used after caller-side normalization
+/// was derived from a read snapshot. Unlike [`entity_upsert_statement`], this
+/// never inserts and cannot overwrite a row whose revision or deletion
+/// marker moved after the snapshot was read. The replacement revision must
+/// also be strictly greater than the persisted snapshot revision; equality
+/// is a refused CAS, never a successful write with an unchanged concurrency
+/// token. Mirrors `note_replace_if_unchanged_statement`
+/// (`crates/khive-db/src/stores/note.rs`).
+pub fn entity_replace_if_unchanged_statement(
+    entity: &Entity,
+    expected_updated_at: i64,
+    expected_deleted_at: Option<i64>,
+) -> SqlStatement {
+    let properties_str = entity
+        .properties
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let tags_str = serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
+    SqlStatement {
+        sql: "UPDATE entities SET \
+                namespace = ?1, kind = ?2, entity_type = ?3, name = ?4, description = ?5, \
+                properties = ?6, tags = ?7, updated_at = ?8, deleted_at = ?9, \
+                merged_into = ?10, merge_event_id = ?11 \
+              WHERE id = ?12 AND updated_at = ?13 AND deleted_at IS ?14 \
+                AND ?8 > updated_at"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(entity.namespace.clone()),
+            SqlValue::Text(entity.kind.clone()),
+            match &entity.entity_type {
+                Some(t) => SqlValue::Text(t.clone()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(entity.name.clone()),
+            match &entity.description {
+                Some(d) => SqlValue::Text(d.clone()),
+                None => SqlValue::Null,
+            },
+            match properties_str {
+                Some(p) => SqlValue::Text(p),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(tags_str),
+            SqlValue::Integer(entity.updated_at),
+            match entity.deleted_at {
+                Some(d) => SqlValue::Integer(d),
+                None => SqlValue::Null,
+            },
+            match entity.merged_into {
+                Some(u) => SqlValue::Text(u.to_string()),
+                None => SqlValue::Null,
+            },
+            match entity.merge_event_id {
+                Some(u) => SqlValue::Text(u.to_string()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(entity.id.to_string()),
+            SqlValue::Integer(expected_updated_at),
+            match expected_deleted_at {
+                Some(value) => SqlValue::Integer(value),
                 None => SqlValue::Null,
             },
         ],
-        label: Some("entity-upsert".to_string()),
+        label: Some("entity-replace-if-unchanged".to_string()),
     }
 }
 
@@ -211,6 +284,56 @@ impl SqlEntityStore {
         .map_err(|e| StorageError::driver(StorageCapability::Entities, op, e))?
     }
 
+    /// Route multi-statement entity mutations through one write transaction.
+    /// The writer task already supplies that transaction; the direct fallback
+    /// opens and closes its own fail-closed `BEGIN IMMEDIATE` unit.
+    async fn with_writer_tx<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        if let Some(writer_task) = self.current_writer_task(op)? {
+            return writer_task
+                .send_bounded(move |conn| f(conn).map_err(|error| map_err(error, op)))
+                .await;
+        }
+
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteEntity);
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || {
+            let guard = pool
+                .try_writer()
+                .map_err(|error| map_sqlite_err(error, op))?;
+            let conn = guard.conn();
+            if !conn.is_autocommit() {
+                pool.retire_pooled_writer(conn);
+                return Err(StorageError::WriterTaskTerminated {
+                    request_state: WriterTaskRequestState::SideEffectsUnknown,
+                });
+            }
+            if let Err(begin_error) = conn.execute_batch("BEGIN IMMEDIATE") {
+                if !conn.is_autocommit() {
+                    pool.retire_pooled_writer(conn);
+                    return Err(StorageError::WriterTaskTerminated {
+                        request_state: WriterTaskRequestState::SideEffectsUnknown,
+                    });
+                }
+                return Err(map_err(begin_error, op));
+            }
+
+            let (result, terminal_state) = execute_wrapped_transaction(conn, op, move |conn| {
+                f(conn).map_err(|error| map_err(error, op))
+            });
+            if terminal_state.is_some() {
+                pool.retire_pooled_writer(conn);
+            }
+            result
+        })
+        .await
+        .map_err(|error| StorageError::driver(StorageCapability::Entities, op, error))?
+    }
+
     async fn with_reader<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -236,12 +359,11 @@ impl SqlEntityStore {
                 StorageCapability::Entities,
                 op,
                 move |scope| {
-                    let mut guard = pool
-                        .reader_until(|| scope.should_stop())
-                        .map_err(|e| map_sqlite_err(e, op))?
-                        .ok_or_else(|| StorageError::Timeout {
-                            operation: op.into(),
-                        })?;
+                    let mut guard = pool.resolve_reader_checkout(
+                        StorageCapability::Entities,
+                        op,
+                        pool.reader_until(|| scope.should_stop()),
+                    )?;
                     scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
                 },
             )
@@ -353,8 +475,8 @@ fn batch_upsert_entities(
         match conn.execute(
             "INSERT OR REPLACE INTO entities \
              (id, namespace, kind, entity_type, name, description, properties, tags, \
-              created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              created_at, updated_at, deleted_at, merged_into, merge_event_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 id_str,
                 &entity.namespace,
@@ -369,7 +491,6 @@ fn batch_upsert_entities(
                 entity.deleted_at,
                 merged_into_str,
                 merge_event_id_str,
-                entity.content_ref,
             ],
         ) {
             Ok(_) => affected += 1,
@@ -585,6 +706,47 @@ impl EntityStore for SqlEntityStore {
         .await
     }
 
+    async fn upsert_entity_with_attachments(
+        &self,
+        entity: Entity,
+        attachments: Vec<Attachment>,
+    ) -> Result<(), StorageError> {
+        let entity_id = entity.id;
+        let entity_statement = entity_upsert_statement(&entity);
+        let mut attachment_statements = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            attachment.validate()?;
+            if attachment.record_uuid != entity_id
+                || attachment.substrate != AttachmentSubstrate::Entity
+            {
+                return Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Attachments,
+                    operation: "upsert_entity_with_attachments".into(),
+                    message: format!(
+                        "attachment {} must target entity {entity_id}",
+                        attachment.role
+                    ),
+                });
+            }
+            attachment_statements.push(attachment_upsert_statement(&attachment)?);
+        }
+
+        self.with_writer_tx("upsert_entity_with_attachments", move |conn| {
+            let mut entity_stmt = conn.prepare(&entity_statement.sql)?;
+            bind_params(&mut entity_stmt, &entity_statement.params)?;
+            entity_stmt.raw_execute()?;
+            drop(entity_stmt);
+
+            for statement in attachment_statements {
+                let mut stmt = conn.prepare(&statement.sql)?;
+                bind_params(&mut stmt, &statement.params)?;
+                stmt.raw_execute()?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn upsert_entities(
         &self,
         entities: Vec<Entity>,
@@ -628,15 +790,34 @@ impl EntityStore for SqlEntityStore {
         .await
     }
 
+    async fn replace_entity_if_unchanged(
+        &self,
+        entity: Entity,
+        expected_updated_at: i64,
+        expected_deleted_at: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        let statement = entity_replace_if_unchanged_statement(
+            &entity,
+            expected_updated_at,
+            expected_deleted_at,
+        );
+        self.with_writer("replace_entity_if_unchanged", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
+        })
+        .await
+    }
+
     async fn get_entity(&self, id: Uuid) -> Result<Option<Entity>, StorageError> {
         let id_str = id.to_string();
 
         self.with_reader("get_entity", move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref \
-                 FROM entities WHERE id = ?1 AND deleted_at IS NULL",
-            )?;
+            let sql = format!(
+                "SELECT {ENTITY_SELECT_COLUMNS} FROM entities \
+                 WHERE entities.id = ?1 AND entities.deleted_at IS NULL"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_entity(row)?)),
@@ -672,11 +853,20 @@ impl EntityStore for SqlEntityStore {
                 .await
             }
             DeleteMode::Hard => {
-                let statement = entity_hard_delete_statement(id);
-                self.with_writer("delete_entity_hard", move |conn| {
-                    let mut stmt = conn.prepare(&statement.sql)?;
-                    bind_params(&mut stmt, &statement.params)?;
-                    Ok(stmt.raw_execute()? > 0)
+                let entity_statement = entity_hard_delete_statement(id);
+                let attachment_statement =
+                    delete_record_attachments_statement(id, AttachmentSubstrate::Entity);
+                self.with_writer_tx("delete_entity_hard", move |conn| {
+                    let mut entity_stmt = conn.prepare(&entity_statement.sql)?;
+                    bind_params(&mut entity_stmt, &entity_statement.params)?;
+                    let deleted = entity_stmt.raw_execute()? > 0;
+                    drop(entity_stmt);
+                    if deleted {
+                        let mut attachment_stmt = conn.prepare(&attachment_statement.sql)?;
+                        bind_params(&mut attachment_stmt, &attachment_statement.params)?;
+                        attachment_stmt.raw_execute()?;
+                    }
+                    Ok(deleted)
                 })
                 .await
             }
@@ -769,8 +959,7 @@ impl EntityStore for SqlEntityStore {
             let limit_idx = data_params.len() - 1;
             let offset_idx = data_params.len();
 
-            let columns = "id, namespace, kind, entity_type, name, description, properties, tags, \
-                           created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref";
+            let columns = ENTITY_SELECT_COLUMNS;
             let data_sql = if filter.names_ci.is_empty() {
                 format!(
                     "SELECT {columns} FROM entities{where_sql} \
@@ -832,8 +1021,7 @@ impl EntityStore for SqlEntityStore {
             params.push(Box::new(probe_limit_i64));
             let limit_idx = params.len();
 
-            let columns = "id, namespace, kind, entity_type, name, description, properties, tags, \
-                           created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref";
+            let columns = ENTITY_SELECT_COLUMNS;
             // CROSS JOIN is load-bearing for the unfiltered walk: SQLite must
             // drive the query from the sequence INTEGER PRIMARY KEY range
             // instead of scanning the namespace index and sorting all matches
@@ -881,11 +1069,9 @@ impl EntityStore for SqlEntityStore {
         let id_str = id.to_string();
 
         self.with_reader("get_entity_including_deleted", move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref \
-                 FROM entities WHERE id = ?1",
-            )?;
+            let sql =
+                format!("SELECT {ENTITY_SELECT_COLUMNS} FROM entities WHERE entities.id = ?1");
+            let mut stmt = conn.prepare(&sql)?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_entity(row)?)),

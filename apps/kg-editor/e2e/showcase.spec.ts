@@ -1,4 +1,66 @@
+import { readFileSync } from "node:fs";
+
 import { expect, test } from "@playwright/test";
+
+const goldenShowcase = JSON.parse(readFileSync(
+  new URL("../../../docs/schemas/examples/khive-repo-v1-khive.json", import.meta.url),
+  "utf8",
+)) as { meta: { repository: { canonical_url: string } } };
+
+test("discovers and switches to a configured DB-backed repository analysis", async ({ page }) => {
+  const analysisId = "dynamic-e2e";
+  const canonicalUrl = "https://github.com/example/dynamic-e2e";
+  const dynamicBundle = structuredClone(goldenShowcase);
+  dynamicBundle.meta.repository.canonical_url = canonicalUrl;
+  let releaseReport = () => {};
+  const reportGate = new Promise<void>((resolveReport) => {
+    releaseReport = resolveReport;
+  });
+
+  await page.route(/\/api\/showcase\/analyses\/?$/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        schema_version: "khive.showcase.catalog.v1",
+        entries: [{ analysis_id: analysisId, canonical_url: canonicalUrl }],
+      }),
+    });
+  });
+  await page.route(`**/api/showcase/analyses/${analysisId}`, async (route) => {
+    await reportGate;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: {
+        "x-khive-analysis-id": analysisId,
+        "x-khive-analysis-source": "khive-db-snapshot",
+      },
+      body: JSON.stringify(dynamicBundle),
+    });
+  });
+
+  await page.goto("/");
+  const selector = page.getByRole("combobox", { name: "Repository analysis" });
+  await expect(selector).toBeVisible();
+  await expect(page.getByRole("status", { name: "Repository catalog status" }))
+    .toHaveText("1 configured repository analysis discovered.");
+  await expect(page.getByLabel("Analysis source"))
+    .toHaveText("curated static fallback");
+
+  await selector.selectOption(`analysis:${analysisId}`);
+  await expect(selector).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator(".repo-result")).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByRole("status", { name: "Repository analysis status" }))
+    .toContainText(`Opening ${canonicalUrl}`);
+  releaseReport();
+
+  await expect(page.locator(".repo-overview")).toBeVisible();
+  await expect(selector).toHaveAttribute("aria-busy", "false");
+  await expect(page.getByLabel("Public repository URL")).toHaveValue(canonicalUrl);
+  await expect(page.getByLabel("Analysis source")).toHaveText("khive DB snapshot");
+  await expect(page).toHaveURL(new RegExp(`repo=${encodeURIComponent(canonicalUrl)}`));
+});
 
 test("dogfoods every repository analysis from the curated static bundle", async ({ page }) => {
   const consoleErrors: string[] = [];
@@ -94,7 +156,8 @@ test("restores a shared investigation and follows browser back and forward", asy
   );
 
   await page.getByRole("searchbox", { name: "Find a module or path" }).fill(writer);
-  await page.getByRole("button", { name: `Inspect ${writer}` }).click();
+  await page.getByLabel("Module search results")
+    .getByRole("button", { name: `Inspect ${writer}` }).click();
   await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(writer);
   await expect(page).toHaveURL(new RegExp(`module=${encodeURIComponent(writer)}`));
 
@@ -158,6 +221,135 @@ test("navigates from module to analysis using only the command palette", async (
   await expect(page).toHaveURL(/view=api_surface/);
   await expect(page).toHaveURL(new RegExp(`module=${encodeURIComponent(writer)}`));
   await expect(page.locator("[data-repository-dashboard]")).toBeFocused();
+});
+
+test("drills from analysis results into the shared inspector and browser history", async ({ page }) => {
+  await page.goto("/");
+  const panel = page.locator(".repo-view-panel");
+  const inspector = page.locator("[data-module-inspector]");
+
+  await page.locator('[data-view-id="api_surface"]').click();
+  const apiResult = panel.locator(
+    'button[aria-label^="Inspect "][aria-pressed="false"]',
+  ).first();
+  const apiLabel = await apiResult.getAttribute("aria-label");
+  const apiPath = apiLabel?.replace(/^Inspect /, "");
+  expect(apiPath).toBeTruthy();
+  await apiResult.press("Enter");
+  await expect(inspector).toBeFocused();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(apiPath!);
+  await expect(page).toHaveURL(/view=api_surface/);
+  await expect(page).toHaveURL(new RegExp(`module=${encodeURIComponent(apiPath!)}`));
+
+  await page.locator('[data-view-id="structure_treemap"]').click();
+  const treemapResult = panel.locator(
+    'button[aria-label^="Inspect "][aria-pressed="false"]',
+  ).first();
+  const treemapLabel = await treemapResult.getAttribute("aria-label");
+  const treemapPath = treemapLabel?.replace(/^Inspect /, "");
+  expect(treemapPath).toBeTruthy();
+  await treemapResult.press("Enter");
+  await expect(inspector).toBeFocused();
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(
+    treemapPath!,
+  );
+  await expect(page).toHaveURL(/view=structure_treemap/);
+
+  await page.goBack();
+  await expect(page.locator('[data-view-id="structure_treemap"]')).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(apiPath!);
+  await page.goBack();
+  await expect(page.locator('[data-view-id="api_surface"]')).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(inspector.getByRole("heading", { level: 3 })).toHaveText(apiPath!);
+});
+
+test("uses the structure lens to verify a hidden khive-db boundary", async ({ page }) => {
+  const graphImplementation = "crates/khive-db/src/stores/graph.rs";
+  await page.goto("/");
+
+  const toolbar = page.locator(".repo-graph-toolbar");
+  await toolbar.getByRole("combobox", { name: /Package · Structure graph/ })
+    .selectOption({ label: "khive-db" });
+  await toolbar.getByRole("radio", { name: "Hidden coupling" }).check();
+
+  const lens = page.getByRole("region", { name: "Hidden coupling lens" });
+  await expect(lens).toContainText("20 of 70 captured visible pairs shown");
+  await expect(lens).toContainText("365-day analysis window");
+  await expect(lens).toContainText("1,000 captured of 104,263 declared");
+  await expect(page.locator("[data-coupling-overlay]")).toHaveCount(20);
+
+  const graphPair = lens.getByRole("button", {
+    name:
+      "Focus coupling candidate between crates/khive-db/src/stores/graph_tests.rs and crates/khive-db/src/stores/graph.rs",
+  });
+  await graphPair.press("Enter");
+  await expect(lens).toContainText("No captured direct dependency edge");
+  await expect(page.locator("[data-coupling-overlay].selected")).toHaveCount(1);
+  expect(await page.locator(".repo-graph-node.context-dimmed").count())
+    .toBeGreaterThan(0);
+
+  await graphPair.locator("..").getByRole("button", {
+    name: `Inspect ${graphImplementation}`,
+  })
+    .press("Enter");
+  await expect(page.locator("[data-module-inspector]")).toBeFocused();
+  await expect(page.locator("[data-module-inspector]").getByRole("heading", {
+    level: 3,
+  })).toHaveText(graphImplementation);
+  await expect(page).toHaveURL(/view=structure_graph/);
+  await expect(page).toHaveURL(
+    new RegExp(`module=${encodeURIComponent(graphImplementation)}`),
+  );
+});
+
+test("keeps the structure inspector legible across desktop and mobile", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByRole("combobox", { name: /Package · Structure graph/ })
+    .selectOption({ label: "khive-db" });
+  // Graph node buttons carry an explicit aria-label ("Module: <path>"),
+  // which overrides the content-derived accessible name.
+  await page.getByRole("button", {
+    name: "Module: stores::graph",
+    exact: true,
+  }).click();
+
+  const heading = page.locator(".repo-inspector-heading");
+  await expect(heading.getByText("stores::graph", { exact: true })).toBeVisible();
+  await expect(heading.getByText("crates/khive-db/src/stores/graph.rs", { exact: true }))
+    .toBeVisible();
+
+  const measure = () => heading.evaluate((element) => {
+    const moduleName = element.querySelector("strong");
+    const sourcePath = element.querySelector("code");
+    if (!moduleName || !sourcePath) throw new Error("graph inspector heading is incomplete");
+    return {
+      moduleNameFits: moduleName.scrollWidth <= moduleName.clientWidth,
+      sourcePathFits: sourcePath.scrollWidth <= sourcePath.clientWidth,
+      sourcePathOverflowWrap: getComputedStyle(sourcePath).overflowWrap,
+      documentFits: document.documentElement.scrollWidth === document.documentElement.clientWidth,
+    };
+  });
+
+  expect(await measure()).toMatchObject({
+    moduleNameFits: true,
+    sourcePathFits: true,
+    documentFits: true,
+  });
+
+  await page.setViewportSize({ width: 375, height: 812 });
+  expect(await measure()).toEqual({
+    moduleNameFits: true,
+    sourcePathFits: true,
+    sourcePathOverflowWrap: "anywhere",
+    documentFits: true,
+  });
 });
 
 test("a valid repository miss stays local and renders an honest state", async ({ page }) => {

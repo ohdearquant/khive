@@ -22,11 +22,17 @@ use uuid::Uuid;
 // ---- Factory helpers ----
 
 fn memory_backend() -> StorageBackend {
-    StorageBackend::memory().expect("in-memory backend")
+    let backend = StorageBackend::memory().expect("in-memory backend");
+    backend
+        .prepare_core_schema()
+        .expect("prepare in-memory core schema");
+    backend
 }
 
 fn file_backend(dir: &tempfile::TempDir, name: &str) -> StorageBackend {
-    StorageBackend::sqlite(dir.path().join(name)).expect("file backend")
+    let backend = StorageBackend::sqlite(dir.path().join(name)).expect("file backend");
+    backend.prepare_core_schema().expect("prepare file schema");
+    backend
 }
 
 // ---- SqlAccess contract ----

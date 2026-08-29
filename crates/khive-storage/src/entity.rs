@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::attachment::Attachment;
 use crate::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, StorageResult,
 };
@@ -29,11 +30,11 @@ pub struct Entity {
     pub merged_into: Option<Uuid>,
     /// Opaque event ID for the merge that tombstoned this entity.
     pub merge_event_id: Option<Uuid>,
-    /// Content-addressed reference into a `BlobStore` (khive#292), stored as
-    /// the raw hex digest string. `None` when this entity has no attached
-    /// binary payload. Storage does not validate that the referenced blob
-    /// actually exists — callers publish the blob before setting this field
-    /// (see `docs/adr` BlobStore ADR "publish-then-reference" ordering).
+    /// Read-only compatibility projection of attachment role `"content"`.
+    ///
+    /// Entity writes ignore this field. Callers publish content through the
+    /// attachment substrate; reads populate it so existing response payloads
+    /// keep their `content_ref` field during the coordinated cutover.
     pub content_ref: Option<String>,
 }
 
@@ -61,12 +62,6 @@ impl Entity {
             merge_event_id: None,
             content_ref: None,
         }
-    }
-
-    /// Set the content-addressed blob reference (khive#292).
-    pub fn with_content_ref(mut self, content_ref: impl Into<String>) -> Self {
-        self.content_ref = Some(content_ref.into());
-        self
     }
 
     /// Set the pack-governed entity subtype token.
@@ -136,8 +131,45 @@ pub struct EntityFilter {
 pub trait EntityStore: Send + Sync + 'static {
     /// Insert or update a single entity.
     async fn upsert_entity(&self, entity: Entity) -> StorageResult<()>;
+    /// Atomically insert/update an entity and all supplied attachment roles.
+    async fn upsert_entity_with_attachments(
+        &self,
+        _entity: Entity,
+        _attachments: Vec<Attachment>,
+    ) -> StorageResult<()> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Attachments,
+            operation: "upsert_entity_with_attachments".into(),
+            message: "this backend does not implement atomic entity attachment publication".into(),
+        })
+    }
     /// Insert or update a batch of entities.
     async fn upsert_entities(&self, entities: Vec<Entity>) -> StorageResult<BatchWriteSummary>;
+    /// Replace an entity only when the persisted row still matches the
+    /// caller's read snapshot.
+    ///
+    /// `expected_updated_at` is the snapshot revision and
+    /// `expected_deleted_at` closes the soft-delete race. The replacement
+    /// entity's `updated_at` must be strictly greater than that persisted
+    /// revision. Returns `false` when the row disappeared, changed, or was
+    /// supplied a non-advancing replacement revision. This is the full-entity
+    /// compare-and-swap seam used when a caller derives coupled fields from
+    /// that snapshot before persistence — mirrors
+    /// [`crate::NoteStore::replace_note_if_unchanged`]. The default returns
+    /// `Unsupported` rather than falling back to an unguarded upsert and
+    /// reintroducing the stale-snapshot race.
+    async fn replace_entity_if_unchanged(
+        &self,
+        _entity: Entity,
+        _expected_updated_at: i64,
+        _expected_deleted_at: Option<i64>,
+    ) -> StorageResult<bool> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Entities,
+            operation: "replace_entity_if_unchanged".into(),
+            message: "this backend does not implement guarded entity replacement".into(),
+        })
+    }
     /// Fetch an entity by UUID, returning `None` if absent.
     async fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>>;
     /// Delete an entity by UUID using the specified delete mode.

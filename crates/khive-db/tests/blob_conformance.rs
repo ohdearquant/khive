@@ -56,15 +56,6 @@ impl BlobStore for FixtureBlobStore {
         Ok(content_ref)
     }
 
-    async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
-        self.objects
-            .lock()
-            .unwrap()
-            .get(content_ref)
-            .map(|(_, body)| body.clone())
-            .ok_or_else(|| Self::not_found(content_ref))
-    }
-
     async fn get_bounded_verified(
         &self,
         content_ref: &ContentRef,
@@ -159,7 +150,19 @@ impl BlobStore for FixtureBlobStore {
     }
 }
 
-async fn assert_conforms(store: Arc<dyn BlobStore>) {
+/// What a conforming backend's `orphan_sweep` must return. Only
+/// `FsBlobStore` gets the `TypedUnsupported` exception (ADR-111 §8: it has
+/// no epoch capability of its own in this compatibility release). Every
+/// other backend still implements a real caller-snapshot sweep and must
+/// keep returning a real report -- a regression that widens the exception
+/// to a backend that still retains real sweep behavior must fail here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrphanSweepExpectation {
+    RealReport,
+    TypedUnsupported,
+}
+
+async fn assert_conforms(store: Arc<dyn BlobStore>, orphan_sweep: OrphanSweepExpectation) {
     let bytes = b"khive blob conformance suite".to_vec();
 
     // put is dedup-idempotent: two puts of the same bytes return the same
@@ -173,9 +176,6 @@ async fn assert_conforms(store: Arc<dyn BlobStore>) {
         store.size(&ref_a).await.expect("size"),
         Some(bytes.len() as u64)
     );
-
-    let round_tripped = store.get(&ref_a).await.expect("get");
-    assert_eq!(round_tripped, bytes);
 
     // ADR-160 D2: the required whole-buffer read succeeds exactly at the
     // caller's actual-byte limit and returns only digest-verified bytes.
@@ -224,10 +224,9 @@ async fn assert_conforms(store: Arc<dyn BlobStore>) {
         }) if observed_at_least >= 1
     ));
 
-    // A content ref that was never written does not exist and 404s on get.
+    // A content ref that was never written does not exist and refuses a read.
     let never_written = ContentRef::from_digest_bytes(&[0xAB; 32]);
     assert!(!store.exists(&never_written).await.expect("exists (absent)"));
-    assert!(store.get(&never_written).await.is_err());
     assert!(matches!(
         store
             .get_bounded_verified(&never_written, MAX_BLOB_WHOLE_BYTES)
@@ -245,15 +244,36 @@ async fn assert_conforms(store: Arc<dyn BlobStore>) {
     ));
 
     // orphan_sweep dry-run against an empty live set reports would_delete
-    // for the object we just wrote, without touching it.
-    let sweep = store
-        .orphan_sweep(&BlobOrphanSweepConfig {
-            live_refs: Default::default(),
-            dry_run: true,
-        })
-        .await
-        .expect("orphan_sweep dry-run");
-    assert!(sweep.would_delete >= 1);
+    // for the object we just wrote, without touching it -- unless this
+    // backend disables the caller-snapshot API outright in favor of a
+    // database-coordinated sweep (`FsBlobStore` in this compatibility
+    // release: ADR-111 §8, it has no epoch capability of its own), in which
+    // case a typed `Unsupported` refusal is the conforming outcome instead.
+    // Every other backend still implements a real sweep and must keep
+    // returning a real, validated report -- a regression to `Unsupported`
+    // there is not a conforming outcome. Either way nothing is touched.
+    match (
+        orphan_sweep,
+        store
+            .orphan_sweep(&BlobOrphanSweepConfig {
+                live_refs: Default::default(),
+                dry_run: true,
+            })
+            .await,
+    ) {
+        (OrphanSweepExpectation::RealReport, Ok(sweep)) => assert!(sweep.would_delete >= 1),
+        (OrphanSweepExpectation::RealReport, Err(other)) => {
+            panic!("this backend must retain a real orphan_sweep report, got: {other:?}")
+        }
+        (OrphanSweepExpectation::TypedUnsupported, Err(StorageError::Unsupported { .. })) => {}
+        (OrphanSweepExpectation::TypedUnsupported, Ok(sweep)) => panic!(
+            "this backend is expected to refuse orphan_sweep with typed Unsupported, \
+             got a real report instead: {sweep:?}"
+        ),
+        (OrphanSweepExpectation::TypedUnsupported, Err(other)) => {
+            panic!("unexpected orphan_sweep error: {other:?}")
+        }
+    }
     assert!(store
         .exists(&ref_a)
         .await
@@ -272,7 +292,7 @@ async fn assert_conforms(store: Arc<dyn BlobStore>) {
 #[tokio::test]
 async fn scripted_fixture_blob_store_conforms() {
     let store: Arc<dyn BlobStore> = Arc::new(FixtureBlobStore::default());
-    assert_conforms(store).await;
+    assert_conforms(store, OrphanSweepExpectation::RealReport).await;
 }
 
 #[tokio::test]
@@ -361,7 +381,7 @@ async fn fs_blob_store_conforms() {
             .expect("FsBlobStore::new")
             .with_orphan_sweep_grace(std::time::Duration::ZERO),
     );
-    assert_conforms(store).await;
+    assert_conforms(store, OrphanSweepExpectation::TypedUnsupported).await;
 }
 
 #[tokio::test]
@@ -385,7 +405,7 @@ async fn s3_blob_store_conforms_against_a_live_endpoint() {
         .with_prefix(format!("conformance-{}", uuid::Uuid::new_v4()));
     let store: Arc<dyn BlobStore> =
         Arc::new(S3BlobStore::new(config).expect("S3BlobStore::new against MinIO"));
-    assert_conforms(store).await;
+    assert_conforms(store, OrphanSweepExpectation::RealReport).await;
 }
 
 /// ADR-111 Amendment 2: `orphan_sweep`'s `ListObjectsV2`

@@ -100,6 +100,9 @@ fn invalid_note_kind_op(id: &str) -> String {
 
 /// A `create` op for a `concept` entity carrying `entity_type` (the field
 /// H1's fix now projects into `entities.ndjson`).
+///
+/// Only used by the `pack-formal`-gated test below.
+#[cfg(feature = "pack-formal")]
 fn typed_concept_create_op(id: &str, name: &str, entity_type: &str) -> String {
     serde_json::json!({
         "op": "create",
@@ -136,6 +139,8 @@ fn described_concept_create_op(id: &str, name: &str, description: &str) -> Strin
     .to_string()
 }
 
+/// Only used by the `pack-formal`-gated test below.
+#[cfg(feature = "pack-formal")]
 fn link_op(id: &str, source: &str, target: &str, relation: &str) -> String {
     serde_json::json!({
         "op": "link",
@@ -373,6 +378,13 @@ fn kg_commit_fails_loud_on_malformed_changeset() {
 /// `entities.ndjson` the `edge-endpoint-types` rule reads. Before this fix
 /// both endpoints projected as plain `concept` with no `entity_type`, so the
 /// pack rule never matched and this change-set was wrongly rejected.
+///
+/// Requires `khive-pack-formal` to be linked into the `kkernel` binary this
+/// test shells out to: `edge_endpoint_types` reads pack-declared `EDGE_RULES`
+/// from every pack the binary links, independent of runtime pack selection,
+/// so the formal-only endpoint pairing only validates when the optional
+/// `pack-formal` feature is on.
+#[cfg(feature = "pack-formal")]
 #[test]
 fn kg_commit_lands_formal_typed_endpoint_with_edge_endpoint_types_enabled() {
     let repo = TempDir::new().expect("repo tmp");

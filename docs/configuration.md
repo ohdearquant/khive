@@ -333,6 +333,24 @@ permissions on the socket/config paths).
 
 ---
 
+## `[display]` — rendering timezone (ADR-169)
+
+`[display] timezone` names the IANA zone (e.g. `"America/New_York"`) khive
+anchors date-only input to. Absent → the host's local zone, resolved once and
+falling back to UTC when it cannot be determined. An unrecognized zone name is
+a config-load error, not a silent fallback.
+
+Storage stays instant-based regardless of this setting: a date-only value like
+`gtd.assign(due="2026-08-23")` is anchored to midnight in the configured zone
+and stored with that zone's UTC offset (e.g. `2026-08-23T00:00:00-04:00` for a
+caller anchored at UTC-4) rather than midnight UTC. A value that already
+carries an explicit offset or `Z` is unaffected. See
+[ADR-169](adr/ADR-169-timezone-correct-timestamps.md) for the full decision
+record, including which rendering-surface work this setting does and does not
+cover yet.
+
+---
+
 ## References
 
 - [docs/khive-config-example.toml](khive-config-example.toml): full annotated

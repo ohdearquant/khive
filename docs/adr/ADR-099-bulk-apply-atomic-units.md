@@ -792,3 +792,102 @@ Mutation-sensitive tests pin the decision:
 
 This operator-only CLI flag does not change the MCP/HTTP/raw DSL wire protocol, its 1 MiB limit,
 or the additive typed Rust host API stability statement in Amendment 3.
+
+## Amendment — Revision guards on prepared full-row plans (#1753)
+
+This amendment qualifies the following accepted rule:
+
+> “**Affected-row guards wherever prepare assumed row existence.** Any plan statement whose
+> prepare-time validation asserted that a target row exists ... carries an expected-effect guard
+> checked in apply.”
+
+It also clarifies the relationship between that rule and the existing plan statement contract:
+
+> “a present `guard` is checked against the affected-row count of applying `statement` alone.”
+
+### Current gap
+
+The current `PlanStatement` guard checks only the affected-row count of its own statement
+(`crates/khive-runtime/src/atomic_plan.rs:26-39,58-63`). The entity update plan currently emits an
+unconditional full entity upsert with `AffectedRowGuard::exactly(1)`
+(`crates/khive-runtime/src/atomic_prepare.rs:887-892`). The non-symmetric edge update plan does
+the same with a full edge upsert (`crates/khive-runtime/src/atomic_prepare.rs:1043-1050`). Those
+upserts can affect exactly one row even when the row changed after preparation: the entity SQL is
+an unconditional `INSERT OR REPLACE` (`crates/khive-db/src/stores/entity.rs:57-82`), and the edge
+SQL has unconditional conflict-update arms (`crates/khive-db/src/stores/graph.rs:90-124`). Thus
+`AffectedRowGuard::exactly(1)` is satisfied by a blind overwrite; it does not currently prove that
+the plan's read revision is still current.
+
+### Decision
+
+Prepared full-row entity and edge replacement plans carry the read revision captured during the
+prepare pass, together with the expected deletion state where applicable. Their apply statements
+use the shared guarded replacement operations from ADR-009. The in-transaction predicate checks
+the target id, expected revision, and expected deletion state, and requires the replacement
+revision to strictly advance the expected revision.
+
+`AffectedRowGuard::exactly(1)` remains an execution-effect guard on the guarded statement. It is
+not the concurrency predicate and is not removed; it now verifies that the guarded replacement
+actually matched one row. Zero affected rows means the row moved under the plan (it disappeared,
+its revision or deletion state changed, or the replacement revision did not advance). That plan
+operation fails with the distinct storage conflict result, its SAVEPOINT is rolled back, and the
+whole atomic unit rolls back. No blind retry is performed inside the atomic runner.
+
+This closes the gap between ADR-099's existing requirement for in-transaction predicate guards
+and the prior implementation. It does not replace predicate-based plans: whenever a write's scope
+depends on current state, the plan still evaluates that scope inside the transaction so earlier
+operations in the same unit remain visible (`docs/adr/ADR-099-bulk-apply-atomic-units.md:196-201`).
+
+### Atomic behavior that does not change
+
+The two-phase prepare/commit structure, synchronous-DML requirement inside `atomic_unit`,
+per-operation SAVEPOINTs, whole-file rollback, admissible-verb rules, response envelope, op-count
+guard, post-commit side effects, and non-atomic bulk-apply behavior are unchanged. The MCP
+`request` wire contract is unchanged. Predicate-based merge rewrites continue to be evaluated in
+the transaction; this amendment adds revision predicates to full-row replacements and does not
+turn them into prepare-time row lists.
+
+### Scope
+
+This change covers these eight production-graph sites:
+
+1. Runtime entity curation (`crates/khive-runtime/src/curation.rs:853-928`).
+2. Runtime non-symmetric edge curation (`crates/khive-runtime/src/operations.rs:5662-5816`).
+3. Runtime symmetric edge curation (`crates/khive-runtime/src/operations.rs:5559-5639,5747-5771`),
+   which replaces both directed rows in place.
+4. Atomic entity plans (`crates/khive-runtime/src/atomic_prepare.rs:804-892`).
+5. Atomic non-symmetric edge plans (`crates/khive-runtime/src/atomic_prepare.rs:863-1050`).
+6. Atomic symmetric edge plans (`crates/khive-runtime/src/atomic_prepare.rs:1000-1040`).
+7. `comm.heartbeat` channel-health persistence (`crates/khive-pack-comm/src/handlers.rs:2321-2411`;
+   dispatch at `crates/khive-pack-comm/src/pack.rs:291-292`).
+8. Scheduled-event finalization (`crates/khive-mcp/src/pending_events.rs:1113-1128,2149-2213`),
+   covering every finalization branch rather than the normal dispatch path alone.
+
+Sites 3 and 6 are the symmetric edge paths. They are in scope because they replace rows through the
+same unguarded full-row statement (`crates/khive-db/src/stores/graph.rs:303-306`, whose `WHERE`
+clause pins only namespace and id) as the non-symmetric paths. Excluding them would leave the
+contract stated here true of one edge path and false of the other, which is not a contract.
+
+Site 8 covers all six finalization branches, not only the normal one. The pre-action, error, missed
+and non-action branches finalize on claim identity alone; the guard stated here binds the serialized
+properties snapshot as well, because a claim token is an ownership fence and not a content fence, so
+a property writer landing between claim and finalization is otherwise overwritten while the
+finalizer reports success.
+
+The 19 code-map sites in `khive-pack-code` are not covered by this amendment. They are tracked
+separately in public issue #2231.
+
+### Explicitly rejected approaches
+
+- Relying on the write queue alone is rejected: the entity store routes writes through the
+  pool-wide writer task (`crates/khive-db/src/stores/entity.rs:182-205`) while entity reads use a
+  separate reader (`crates/khive-db/src/stores/entity.rs:726-742`), so it cannot bind a
+  prepare-time read to a later write.
+- Blind retry of a stale row is rejected: it would allow the same stale plan to overwrite the
+  intervening update after the conflict was detected.
+- Unconditional `SET properties = ?` for a document race is rejected: it does not carry the
+  expected revision and therefore leaves the lost-update window intact.
+
+No open design question remains within this atomic-unit amendment. The affected-row guard remains
+an effect check, the revision predicate becomes the stale-plan check, and a zero-row guarded apply
+is a unit failure with rollback.

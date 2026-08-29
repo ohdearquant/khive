@@ -20,7 +20,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_storage::types::SqlValue;
-use khive_storage::{EdgeRelation, SqlStatement};
+use khive_storage::{AttachmentSubstrate, EdgeRelation, SqlStatement};
 use khive_types::{EventKind, SubstrateKind};
 
 use crate::atomic_plan::{
@@ -37,15 +37,17 @@ use crate::operations::{
 };
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+use khive_db::stores::attachment::delete_record_attachments_statement;
 use khive_db::stores::entity::{
-    entity_hard_delete_statement, entity_soft_delete_statement, entity_upsert_statement,
+    entity_hard_delete_statement, entity_replace_if_unchanged_statement,
+    entity_soft_delete_statement, entity_upsert_statement,
 };
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{
     edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
-    edge_soft_delete_statement, edge_symmetric_absorb_or_update_inplace_statement,
-    edge_symmetric_delete_if_conflict_statement, edge_upsert_statement,
+    edge_replace_if_unchanged_statement, edge_soft_delete_statement,
+    edge_symmetric_absorb_or_update_inplace_statement, edge_symmetric_delete_if_conflict_statement,
     purge_incident_edges_statement,
 };
 use khive_db::stores::note::{
@@ -102,6 +104,23 @@ fn optional_create_string(args: &Value, key: &str) -> RuntimeResult<Option<Strin
     match obj(args)?.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{key} must be a string or null, got: {other}"
+        ))),
+    }
+}
+
+/// ADR-014 tri-state patch for entity `entity_type`, read from raw JSON to
+/// mirror `UpdateParams.entity_type`'s `tri_string` deserializer (the
+/// kkernel `--atomic` seam deserializes through that struct first, so the
+/// two surfaces cannot diverge): key absent -> `None` (unchanged), key
+/// present as `null` -> `Some(None)` (explicit clear), key present as a
+/// string -> `Some(Some(s))` (set); any other JSON type -> a hard error.
+fn optional_entity_type_patch(args: &Value, key: &str) -> RuntimeResult<Option<Option<String>>> {
+    match obj(args)?.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(value)) => Ok(Some(Some(value.clone()))),
         Some(other) => Err(RuntimeError::InvalidInput(format!(
             "{key} must be a string or null, got: {other}"
         ))),
@@ -597,7 +616,7 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
             } else {
                 None
             };
-            (bad, "name, description, tags, properties")
+            (bad, "name, description, tags, properties, entity_type")
         }
         "note" => {
             let bad = if present("description") {
@@ -608,6 +627,10 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
                 Some("relation")
             } else if present("weight") {
                 Some("weight")
+            } else if o.contains_key("entity_type") {
+                // ADR-014 tri-state: a PRESENT key (including JSON `null`,
+                // the explicit clear) is inapplicable to notes.
+                Some("entity_type")
             } else {
                 None
             };
@@ -631,6 +654,10 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
                 Some("salience")
             } else if present("decay_factor") {
                 Some("decay_factor")
+            } else if o.contains_key("entity_type") {
+                // ADR-014 tri-state: a PRESENT key (including JSON `null`,
+                // the explicit clear) is inapplicable to edges.
+                Some("entity_type")
             } else {
                 None
             };
@@ -813,13 +840,16 @@ pub async fn prepare_update(
             // Decide step lives in curation.rs's `prepare_update_entity` —
             // the SAME function canonical `update_entity` calls. Only the
             // arg-extraction (raw JSON -> `EntityPatch`) and the plan-shape
-            // wiring (domain object -> `PlanStatement` via the shared
-            // `entity_upsert_statement` builder) are atomic-path-specific.
+            // wiring are atomic-path-specific: the domain object becomes a
+            // `PlanStatement` via `entity_replace_if_unchanged_statement`,
+            // whose CAS predicate binds the snapshot's revision and deletion
+            // marker, under an exactly-one affected-row guard.
             reject_inapplicable_update_fields(args, "entity")?;
             let name = entity_name_patch(args)?;
             let description = optional_string_patch(args, "description")?;
             let properties = optional_properties(args, "properties")?;
             let tags = optional_tags(args)?;
+            let entity_type = optional_entity_type_patch(args, "entity_type")?;
 
             prepare_update_entity_plan(
                 runtime,
@@ -830,6 +860,7 @@ pub async fn prepare_update(
                     description,
                     properties,
                     tags,
+                    entity_type,
                 },
             )
             .await
@@ -874,10 +905,14 @@ pub async fn prepare_update_entity_plan(
     id: Uuid,
     patch: crate::curation::EntityPatch,
 ) -> RuntimeResult<AtomicOpPlan> {
-    let (entity, text_changed, changed_fields) =
+    let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
         runtime.prepare_update_entity(token, id, patch).await?;
     let mut statements = vec![PlanStatement {
-        statement: entity_upsert_statement(&entity),
+        statement: entity_replace_if_unchanged_statement(
+            &entity,
+            expected_updated_at,
+            expected_deleted_at,
+        ),
         guard: Some(AffectedRowGuard::exactly(1)),
     }];
     statements.extend(event_append_statements(
@@ -892,7 +927,7 @@ pub async fn prepare_update_entity_plan(
             "changed_fields": changed_fields,
         }),
     )?);
-    let post_commit = if text_changed {
+    let post_commit = if reindex_required {
         PostCommitEffect::ReindexEntity { entity_id: id }
     } else {
         PostCommitEffect::None
@@ -931,6 +966,9 @@ async fn prepare_update_edge(
     args: &Value,
 ) -> RuntimeResult<AtomicOpPlan> {
     reject_inapplicable_update_fields(args, "edge")?;
+
+    let expected_updated_at = edge.updated_at;
+    let expected_deleted_at = edge.deleted_at;
 
     let relation_raw = optional_str(args, "relation");
     let weight = optional_f64(args, "weight")?;
@@ -992,6 +1030,21 @@ async fn prepare_update_edge(
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_default());
 
+        // `updated_at` must strictly advance past the snapshot even when two
+        // operations land inside one clock microsecond; saturating to
+        // i64::MAX would let the CAS accept a write without advancing its
+        // revision, so that is not a valid fallback (mirrors the note path).
+        let minimum_updated_at_micros = expected_updated_at
+            .timestamp_micros()
+            .checked_add(1)
+            .ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "edge {id} updated_at is already at i64::MAX and cannot advance"
+                ))
+            })?;
+        let symmetric_updated_at_micros = now.timestamp_micros().max(minimum_updated_at_micros);
+        let expected_deleted_at_micros = expected_deleted_at.map(|v| v.timestamp_micros());
+
         statements.push(PlanStatement {
             statement: edge_symmetric_delete_if_conflict_statement(
                 &namespace,
@@ -999,6 +1052,8 @@ async fn prepare_update_edge(
                 canon_src,
                 canon_tgt,
                 edge.relation,
+                expected_updated_at.timestamp_micros(),
+                expected_deleted_at_micros,
             ),
             guard: Some(AffectedRowGuard {
                 expected_min: 0,
@@ -1013,9 +1068,11 @@ async fn prepare_update_edge(
                 canon_tgt,
                 edge.relation,
                 edge.weight,
-                now.timestamp_micros(),
+                symmetric_updated_at_micros,
                 metadata_str.as_deref(),
                 edge.target_backend.as_deref(),
+                expected_updated_at.timestamp_micros(),
+                expected_deleted_at_micros,
             ),
             guard: Some(AffectedRowGuard::exactly(1)),
         });
@@ -1031,11 +1088,36 @@ async fn prepare_update_edge(
             relation: edge.relation,
         });
     } else {
-        // Non-symmetric: bit-for-bit the same builder `graph.upsert_edge`
-        // calls — see doc comment above.
-        edge.updated_at = now;
+        // Non-symmetric: guarded replace of the read snapshot rather than
+        // `graph.upsert_edge`'s unconditional natural-key upsert — a zero
+        // affected-row result now means a concurrent writer moved this edge
+        // between PREPARE and commit, and the atomic unit must roll back
+        // instead of silently overwriting it.
+        //
+        // `updated_at` must strictly advance past the snapshot even when two
+        // operations land inside one clock microsecond; saturating to
+        // i64::MAX would let the CAS accept a write without advancing its
+        // revision, so that is not a valid fallback (mirrors the note path).
+        let minimum_updated_at_micros = expected_updated_at
+            .timestamp_micros()
+            .checked_add(1)
+            .ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "edge {id} updated_at is already at i64::MAX and cannot advance"
+                ))
+            })?;
+        let now_micros = now.timestamp_micros().max(minimum_updated_at_micros);
+        edge.updated_at = chrono::DateTime::from_timestamp_micros(now_micros).ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "edge {id}: computed updated_at {now_micros} is not a valid timestamp"
+            ))
+        })?;
         statements.push(PlanStatement {
-            statement: edge_upsert_statement(&edge),
+            statement: edge_replace_if_unchanged_statement(
+                &edge,
+                expected_updated_at,
+                expected_deleted_at,
+            ),
             guard: Some(AffectedRowGuard::exactly(1)),
         });
     }
@@ -1135,10 +1217,19 @@ pub async fn prepare_delete(
             // khive-db's own `SqlEntityStore::delete_entity` calls — no DML
             // text is hand-duplicated here.
             let mut statements = if hard {
-                vec![PlanStatement {
-                    statement: entity_hard_delete_statement(id),
-                    guard: Some(AffectedRowGuard::exactly(1)),
-                }]
+                vec![
+                    PlanStatement {
+                        statement: delete_record_attachments_statement(
+                            id,
+                            AttachmentSubstrate::Entity,
+                        ),
+                        guard: None,
+                    },
+                    PlanStatement {
+                        statement: entity_hard_delete_statement(id),
+                        guard: Some(AffectedRowGuard::exactly(1)),
+                    },
+                ]
             } else {
                 let deleted_at = chrono::Utc::now().timestamp_micros();
                 vec![PlanStatement {
@@ -1220,10 +1311,19 @@ pub async fn prepare_delete(
             // `note_hard_delete_statement` are the SAME khive-db builders
             // khive-db's own `SqlNoteStore::delete_note` calls.
             let mut statements = if hard {
-                vec![PlanStatement {
-                    statement: note_hard_delete_statement(id),
-                    guard: Some(AffectedRowGuard::exactly(1)),
-                }]
+                vec![
+                    PlanStatement {
+                        statement: delete_record_attachments_statement(
+                            id,
+                            AttachmentSubstrate::Note,
+                        ),
+                        guard: None,
+                    },
+                    PlanStatement {
+                        statement: note_hard_delete_statement(id),
+                        guard: Some(AffectedRowGuard::exactly(1)),
+                    },
+                ]
             } else {
                 let deleted_at = chrono::Utc::now().timestamp_micros();
                 vec![PlanStatement {
@@ -1818,6 +1918,72 @@ mod tests {
             "message must explain the namespace-scoping consequence, not just restate the \
              rule; got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn atomic_update_entity_type_persists_patch_and_schedules_reindex() {
+        let runtime = scratch_runtime();
+        runtime.install_entity_type_validator(std::sync::Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            let normalized = raw.trim().to_ascii_lowercase();
+            if kind == "concept" && normalized == "algorithm" {
+                Ok(Some(normalized))
+            } else {
+                Err(RuntimeError::InvalidInput(format!(
+                    "unknown entity_type {raw:?} for {kind:?}; valid: algorithm"
+                )))
+            }
+        }));
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut entity = khive_storage::Entity::new("local", "concept", "AtomicHistorical");
+        entity.description = Some("keep description".to_string());
+        entity.properties = Some(json!({"type": "algorithm", "keep": true}));
+        entity.tags = vec!["keep-tag".to_string()];
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": entity_id.to_string(), "entity_type": " Algorithm "}),
+            None,
+        )
+        .await
+        .expect("atomic prepare must accept a registered entity_type");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("atomic update must run");
+        let post_commit = match outcome {
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        assert_eq!(
+            post_commit.as_slice(),
+            &[PostCommitEffect::ReindexEntity { entity_id }],
+            "entity_type patch must schedule the normal entity reindex path"
+        );
+
+        let updated = runtime
+            .get_entity(&token, entity_id)
+            .await
+            .expect("read updated entity");
+        assert_eq!(updated.entity_type.as_deref(), Some("algorithm"));
+        assert_eq!(updated.name, "AtomicHistorical");
+        assert_eq!(updated.description.as_deref(), Some("keep description"));
+        assert_eq!(
+            updated.properties,
+            Some(json!({"type": "algorithm", "keep": true}))
+        );
+        assert_eq!(updated.tags, vec!["keep-tag"]);
     }
 
     /// Symmetric note-substrate case: `description` and `tags` are
@@ -3350,6 +3516,412 @@ mod tests {
         assert_eq!(events.len(), 1);
     }
 
+    /// Regression for khive #1753: an entity atomic update plan is prepared
+    /// from one revision, a concurrent (out-of-plan) writer advances the row
+    /// past that revision before the plan commits, and the plan's guarded
+    /// `entity_replace_if_unchanged_statement` must then affect zero rows —
+    /// which `AffectedRowGuard::exactly(1)` must turn into a whole-unit
+    /// rollback, not a silent overwrite of the concurrent writer's change.
+    /// Before threading the expected revision into the plan's `WHERE`
+    /// predicate, this plan used the unconditional `entity_upsert_statement`,
+    /// which always affects exactly 1 row regardless of staleness — the
+    /// guard could never fire and this test would redden (the outcome would
+    /// be `Committed`, and the concurrent writer's `name` change would be
+    /// lost under the stale plan's `description`-only patch).
+    #[tokio::test]
+    async fn atomic_entity_update_plan_stale_revision_rolls_back_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entity = runtime
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "StaleEntityPlanTarget",
+                None,
+                Some(json!({"a": 0})),
+                vec![],
+            )
+            .await
+            .expect("seed entity");
+        let id = entity.id;
+
+        // PREPARE time: build the plan from the current (soon-to-be-stale)
+        // revision.
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": id.to_string(), "description": "from the stale plan"}),
+            None,
+        )
+        .await
+        .expect("prepare update entity plan");
+
+        // Read the plan's OWN bound values, so the isolation below is
+        // derived from the plan rather than assumed about it. Per
+        // `entity_replace_if_unchanged_statement`, `?8` (index 7) is the
+        // replacement revision, `?12` (index 11) the target id, `?13`
+        // (index 12) the expected revision, and `?14` (index 13) the
+        // expected deletion marker.
+        let (planned_replacement, plan_target_id, plan_expected, plan_expected_deleted) = {
+            let statements = match &plan {
+                AtomicOpPlan::Update(p) => p.statements.clone(),
+                other => panic!("expected an Update plan, got {other:?}"),
+            };
+            // Locate by LABEL, never by the guard text. A locator keyed on
+            // `?8 > updated_at` would stop finding the statement in exactly the
+            // mutation run that deletes that conjunct, so the arm would report
+            // on this fixture's locator instead of on the guard.
+            let cas = statements
+                .iter()
+                .find(|s| s.statement.label.as_deref() == Some("entity-replace-if-unchanged"))
+                .expect("the plan must carry the guarded entity replacement");
+            let read = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Integer(v) => *v,
+                other => panic!("param {i} must be an integer revision, got {other:?}"),
+            };
+            let read_marker = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Null => None,
+                SqlValue::Integer(v) => Some(*v),
+                other => panic!("param {i} must be a deletion marker, got {other:?}"),
+            };
+            let read_text = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Text(v) => v.clone(),
+                other => panic!("param {i} must be a text id, got {other:?}"),
+            };
+            (read(7), read_text(11), read(12), read_marker(13))
+        };
+        // The identity conjunct, on the same footing as the revision and the
+        // deletion marker. `id = ?12` is live in the same UPDATE, so a plan
+        // that bound any other row's id would affect zero rows and roll the
+        // unit back for a reason this test does not name — an outcome
+        // indistinguishable from the one it does name.
+        assert_eq!(
+            plan_target_id,
+            id.to_string(),
+            "fixture premise: the plan's `?12` must be the row under test, otherwise \
+             `id = ?12` refuses on identity and the rollback stops being attributable to \
+             the expected-revision guard"
+        );
+
+        // A concurrent writer commits BEFORE the plan runs, advancing the
+        // row's revision past what the plan's guard expects.
+        runtime
+            .update_entity(
+                &token,
+                id,
+                crate::curation::EntityPatch {
+                    name: Some("ConcurrentWriterWon".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("concurrent writer update");
+
+        // Pin the stored revision one microsecond BELOW the plan's replacement.
+        // This is what makes the test specific to the guard it names. Both the
+        // plan and the concurrent writer derive their revision from
+        // `max(now, expected + 1)`, so left alone the concurrent write lands at
+        // or past the plan's own replacement and BOTH conjuncts refuse — the
+        // test would then stay green if either guard were deleted. Pinning
+        // leaves `?8 > updated_at` satisfied, so it cannot be the refuser,
+        // while `updated_at = ?13` is violated, which is the single condition
+        // this test names. The shape is reachable in production whenever the
+        // concurrent writer's clock trails the preparing writer's.
+        let stored_pinned = planned_replacement - 1;
+        assert_ne!(
+            stored_pinned, plan_expected,
+            "fixture premise: the pinned revision must differ from the plan's expected \
+             revision, otherwise `updated_at = ?13` would MATCH and nothing would refuse \
+             the plan"
+        );
+        {
+            let mut writer = runtime.sql().writer().await.expect("writer");
+            let affected = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE entities SET updated_at = ?1 WHERE id = ?2".to_string(),
+                    params: vec![
+                        SqlValue::Integer(stored_pinned),
+                        SqlValue::Text(id.to_string()),
+                    ],
+                    label: Some("test-pin-stored-revision".to_string()),
+                })
+                .await
+                .expect("pin the stored revision");
+            assert_eq!(affected, 1, "the pin must touch exactly the seeded row");
+        }
+        assert!(
+            planned_replacement > stored_pinned,
+            "fixture premise: the plan's replacement must still strictly advance past the \
+             stored revision, otherwise `?8 > updated_at` would refuse and this stops being \
+             a test of the expected-revision guard"
+        );
+        // The remaining non-target conjunct. `deleted_at IS ?14` is live in the
+        // same UPDATE, so without this read the fixture would stay green if the
+        // deletion marker were the actual refuser — the refusal would look
+        // identical. Read the row as it stands at DML time, after both the
+        // concurrent writer and the pin.
+        {
+            let stored = runtime
+                .get_entity_including_deleted(&token, id)
+                .await
+                .expect("read the stored row")
+                .expect("the seeded row is present before the plan runs");
+            assert_eq!(
+                stored.updated_at, stored_pinned,
+                "fixture premise: the pin must be what the guard reads, so the stored \
+                 revision is the pinned value and nothing re-advanced it"
+            );
+            assert_eq!(
+                stored.deleted_at, plan_expected_deleted,
+                "fixture premise: the stored deletion marker must MATCH the plan's `?14`, \
+                 otherwise `deleted_at IS ?14` refuses too and this stops being a test of \
+                 the expected-revision guard alone"
+            );
+        }
+
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("the seam call itself must not error; the unit rolls back cleanly");
+        match outcome {
+            crate::atomic_runner::AtomicRunOutcome::RolledBack {
+                failed_op_index,
+                failure,
+            } => {
+                assert_eq!(
+                    failed_op_index, 0,
+                    "the sole op's guard must be the one that fails"
+                );
+                // Attribution rather than inference. The premises above
+                // establish that every non-target conjunct holds; this names
+                // the statement that actually refused. Without it a unit that
+                // rolled back at some other statement reads identically from
+                // the outside, which is the whole failure mode those premises
+                // were approximating.
+                assert_eq!(
+                    failure,
+                    crate::atomic_runner::AtomicOpFailure::GuardFailed {
+                        statement_label: Some("entity-replace-if-unchanged".to_string()),
+                        expected: crate::atomic_plan::AffectedRowGuard::exactly(1),
+                        observed: 0,
+                    },
+                    "the guarded entity replacement must be the statement whose guard refused"
+                );
+            }
+            other => panic!(
+                "a stale entity plan must roll back, not silently overwrite the concurrent \
+                 writer's change: {other:?}"
+            ),
+        }
+
+        let after = runtime.get_entity(&token, id).await.expect("get_entity");
+        assert_eq!(
+            after.name, "ConcurrentWriterWon",
+            "the concurrent writer's committed name must survive the rolled-back stale plan"
+        );
+        assert_eq!(
+            after.description, None,
+            "the stale plan's description patch must NOT have landed"
+        );
+    }
+
+    /// Edge counterpart of `atomic_entity_update_plan_stale_revision_rolls_back_unit`:
+    /// a non-symmetric edge atomic update plan prepared from one revision
+    /// must roll back the whole unit when a concurrent writer advances the
+    /// row first, rather than silently overwriting that writer's change.
+    #[tokio::test]
+    async fn atomic_edge_update_plan_stale_revision_rolls_back_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "StaleEdgePlanA");
+        let b = khive_storage::Entity::new("local", "concept", "StaleEdgePlanB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        let edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .expect("seed edge");
+        let edge_id = Uuid::from(edge.id);
+
+        // PREPARE time: build the plan from the current (soon-to-be-stale)
+        // revision.
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": edge_id.to_string(), "properties": {"note": "from the stale plan"}}),
+            None,
+        )
+        .await
+        .expect("prepare update edge plan");
+
+        // Read the plan's OWN bound values, so the isolation below is
+        // derived from the plan rather than assumed about it. Per
+        // `edge_replace_if_unchanged_statement`, `?6` (index 5) is the
+        // replacement revision, `?10` (index 9) the target id, `?11`
+        // (index 10) the expected revision, and `?12` (index 11) the expected
+        // deletion marker.
+        let (planned_replacement, plan_target_id, plan_expected, plan_expected_deleted) = {
+            let statements = match &plan {
+                AtomicOpPlan::Update(p) => p.statements.clone(),
+                other => panic!("expected an Update plan, got {other:?}"),
+            };
+            // Locate by LABEL, never by the guard text — see the entity sibling
+            // above: a locator keyed on the conjunct disappears in exactly the
+            // mutation run that deletes it.
+            let cas = statements
+                .iter()
+                .find(|s| s.statement.label.as_deref() == Some("edge-replace-if-unchanged"))
+                .expect("the plan must carry the guarded edge replacement");
+            let read = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Integer(v) => *v,
+                other => panic!("param {i} must be an integer revision, got {other:?}"),
+            };
+            let read_marker = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Null => None,
+                SqlValue::Integer(v) => Some(*v),
+                other => panic!("param {i} must be a deletion marker, got {other:?}"),
+            };
+            let read_text = |i: usize| match &cas.statement.params[i] {
+                SqlValue::Text(v) => v.clone(),
+                other => panic!("param {i} must be a text id, got {other:?}"),
+            };
+            (read(5), read_text(9), read(10), read_marker(11))
+        };
+        // The identity conjunct, for the same reason as the entity sibling:
+        // `id = ?10` is live in the same UPDATE and a misbound target refuses
+        // indistinguishably.
+        assert_eq!(
+            plan_target_id,
+            edge_id.to_string(),
+            "fixture premise: the plan's `?10` must be the edge under test, otherwise \
+             `id = ?10` refuses on identity and the rollback stops being attributable to \
+             the expected-revision guard"
+        );
+
+        // A concurrent writer commits BEFORE the plan runs, advancing the
+        // row's revision past what the plan's guard expects.
+        runtime
+            .update_edge(
+                &token,
+                edge_id,
+                crate::curation::EdgePatch {
+                    weight: Some(0.75),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("concurrent writer update");
+
+        // Pin the stored revision one microsecond BELOW the plan's replacement,
+        // for the same reason as the entity sibling above: both the plan and
+        // the concurrent writer derive their revision from
+        // `max(now, expected + 1)`, so left alone BOTH conjuncts refuse and the
+        // test would stay green if either guard were deleted. Pinning leaves
+        // `?6 > updated_at` satisfied, so it cannot be the refuser, while
+        // `updated_at = ?11` is violated — the single condition this test names.
+        let stored_pinned = planned_replacement - 1;
+        assert_ne!(
+            stored_pinned, plan_expected,
+            "fixture premise: the pinned revision must differ from the plan's expected \
+             revision, otherwise `updated_at = ?11` would MATCH and nothing would refuse \
+             the plan"
+        );
+        {
+            let mut writer = runtime.sql().writer().await.expect("writer");
+            let affected = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE graph_edges SET updated_at = ?1 WHERE id = ?2".to_string(),
+                    params: vec![
+                        SqlValue::Integer(stored_pinned),
+                        SqlValue::Text(edge_id.to_string()),
+                    ],
+                    label: Some("test-pin-stored-revision".to_string()),
+                })
+                .await
+                .expect("pin the stored revision");
+            assert_eq!(affected, 1, "the pin must touch exactly the seeded edge");
+        }
+        assert!(
+            planned_replacement > stored_pinned,
+            "fixture premise: the plan's replacement must still strictly advance past the \
+             stored revision, otherwise `?6 > updated_at` would refuse and this stops being \
+             a test of the expected-revision guard"
+        );
+        // The remaining non-target conjunct, for the same reason as the entity
+        // sibling: `deleted_at IS ?12` is live in the same UPDATE and would
+        // produce an indistinguishable refusal.
+        {
+            let stored = runtime
+                .get_edge_including_deleted(&token, edge_id)
+                .await
+                .expect("read the stored edge")
+                .expect("the seeded edge is present before the plan runs");
+            assert_eq!(
+                stored.updated_at.timestamp_micros(),
+                stored_pinned,
+                "fixture premise: the pin must be what the guard reads, so the stored \
+                 revision is the pinned value and nothing re-advanced it"
+            );
+            assert_eq!(
+                stored.deleted_at.map(|d| d.timestamp_micros()),
+                plan_expected_deleted,
+                "fixture premise: the stored deletion marker must MATCH the plan's `?12`, \
+                 otherwise `deleted_at IS ?12` refuses too and this stops being a test of \
+                 the expected-revision guard alone"
+            );
+        }
+
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("the seam call itself must not error; the unit rolls back cleanly");
+        match outcome {
+            crate::atomic_runner::AtomicRunOutcome::RolledBack {
+                failed_op_index,
+                failure,
+            } => {
+                assert_eq!(
+                    failed_op_index, 0,
+                    "the sole op's guard must be the one that fails"
+                );
+                // Attribution rather than inference — see the entity sibling.
+                assert_eq!(
+                    failure,
+                    crate::atomic_runner::AtomicOpFailure::GuardFailed {
+                        statement_label: Some("edge-replace-if-unchanged".to_string()),
+                        expected: crate::atomic_plan::AffectedRowGuard::exactly(1),
+                        observed: 0,
+                    },
+                    "the guarded edge replacement must be the statement whose guard refused"
+                );
+            }
+            other => panic!(
+                "a stale edge plan must roll back, not silently overwrite the concurrent \
+                 writer's change: {other:?}"
+            ),
+        }
+
+        let after = runtime
+            .get_edge(&token, edge_id)
+            .await
+            .expect("get_edge")
+            .expect("edge still exists");
+        assert!(
+            (after.weight - 0.75).abs() < 0.001,
+            "the concurrent writer's committed weight must survive the rolled-back stale plan: {after:?}"
+        );
+        assert!(
+            after.metadata.is_none(),
+            "the stale plan's properties patch must NOT have landed: {after:?}"
+        );
+    }
+
     /// A soft-deleted surviving canonical row must not be resurrected by a
     /// conflicting symmetric-relation update (ADR-039 DO NOTHING; khive#1213):
     /// the requested edge is still deleted (conflict absorbed), but the
@@ -3514,6 +4086,367 @@ mod tests {
         assert_eq!(
             canonical_after.weight, 0.6,
             "the pre-existing canonical row must never have been touched by the aborted update"
+        );
+    }
+
+    /// The symmetric absorption delete's atomic commit-time statement
+    /// (`edge_symmetric_delete_if_conflict_statement`) must refuse a plan
+    /// built from a since-changed snapshot, exactly like the non-symmetric
+    /// `atomic_edge_update_plan_stale_revision_rolls_back_unit` case above —
+    /// even though a genuine canonical survivor exists at the target natural
+    /// key. `E`'s own revision changes (via an unrelated production
+    /// `update_edge` call) AFTER `prepare_update` captured its snapshot but
+    /// BEFORE the plan runs; the whole atomic unit must roll back rather than
+    /// silently absorbing `E` into the survivor and discarding the
+    /// concurrent write.
+    #[tokio::test]
+    async fn atomic_update_edge_symmetric_absorption_plan_stale_revision_rolls_back_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "StaleAbsorbA");
+        let b = khive_storage::Entity::new("local", "concept", "StaleAbsorbB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        // The pre-existing canonical row this plan will try to absorb into.
+        let canonical_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .expect("seed canonical edge");
+        let canonical_id = Uuid::from(canonical_edge.id);
+
+        // E: the requested edge under test.
+        let requested_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .expect("seed requested edge");
+        let requested_id = Uuid::from(requested_edge.id);
+
+        // PREPARE time: build the plan from the current (soon-to-be-stale)
+        // revision.
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": requested_id.to_string(), "relation": "competes_with", "weight": 0.9}),
+            None,
+        )
+        .await
+        .expect("prepare update edge (symmetric absorption)");
+
+        // A concurrent writer commits BEFORE the plan runs, advancing E's
+        // revision past what the plan's guard expects. Relation stays
+        // `extends` (non-symmetric), so this lands via the already-guarded
+        // replace path — independent of the absorption bug under test.
+        let concurrent = runtime
+            .update_edge(
+                &token,
+                requested_id,
+                crate::curation::EdgePatch {
+                    weight: Some(0.77),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("concurrent writer update");
+        assert!((concurrent.weight - 0.77).abs() < 1e-9);
+
+        // Statement 2's in-place arm carries a strict-advance conjunct
+        // (`?7 > updated_at`) beside the expected-revision conjunct
+        // (`updated_at = ?10`) this test names. Both the plan and the
+        // concurrent writer derive their revision from `max(now, expected + 1)`
+        // and the concurrent writer ran LATER, so left alone the stored
+        // revision sits at or past the plan's replacement and BOTH conjuncts
+        // refuse — the test would stay green with either one deleted. Pin the
+        // stored revision one microsecond below the plan's replacement, the
+        // same treatment the entity and edge siblings above already carry.
+        let (absorb_replacement, absorb_expected, absorb_expected_deleted, absorb_ns, absorb_id) = {
+            let statements = match &plan {
+                AtomicOpPlan::Update(p) => p.statements.clone(),
+                other => panic!("expected an Update plan, got {other:?}"),
+            };
+            let s = statements
+                .iter()
+                .find(|st| {
+                    st.statement.label.as_deref() == Some("edge-symmetric-absorb-or-update-inplace")
+                })
+                .expect("the plan must carry the guarded symmetric in-place absorb");
+            let int = |i: usize| match &s.statement.params[i] {
+                SqlValue::Integer(v) => *v,
+                other => panic!("param {i} must be an integer revision, got {other:?}"),
+            };
+            let marker = |i: usize| match &s.statement.params[i] {
+                SqlValue::Null => None,
+                SqlValue::Integer(v) => Some(*v),
+                other => panic!("param {i} must be a deletion marker, got {other:?}"),
+            };
+            let txt = |i: usize| match &s.statement.params[i] {
+                SqlValue::Text(v) => v.clone(),
+                other => panic!("param {i} must be text, got {other:?}"),
+            };
+            (int(6), int(9), marker(10), txt(0), txt(1))
+        };
+        let stored_pinned = absorb_replacement - 1;
+        assert_ne!(
+            stored_pinned, absorb_expected,
+            "fixture premise: the pinned revision must differ from the plan's `?10`, otherwise \
+             `updated_at = ?10` would MATCH and nothing would refuse the in-place arm (and the \
+             guarded delete's `updated_at = ?6`, bound to the same value, would MATCH too and \
+             fire, leaving `changes() = 1` and selecting the absorbed arm instead)"
+        );
+        {
+            let mut writer = runtime.sql().writer().await.expect("writer");
+            let affected = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE graph_edges SET updated_at = ?1 WHERE id = ?2".to_string(),
+                    params: vec![
+                        SqlValue::Integer(stored_pinned),
+                        SqlValue::Text(requested_id.to_string()),
+                    ],
+                    label: Some("test-pin-stored-revision".to_string()),
+                })
+                .await
+                .expect("pin the stored revision");
+            assert_eq!(affected, 1, "the pin must touch exactly the requested edge");
+        }
+        assert!(
+            absorb_replacement > stored_pinned,
+            "fixture premise: the plan's `?7` must still strictly advance past the stored \
+             revision, otherwise `?7 > updated_at` refuses too and the refusal stops being \
+             attributable to `updated_at = ?10`"
+        );
+
+        // A symmetric plan carries TWO guarded statements, and it matters
+        // which one refuses.
+        //
+        //   1. `edge-symmetric-delete-if-conflict`, guarded
+        //      `{expected_min: 0, expected_max: Some(1)}` — a zero-row delete
+        //      SATISFIES this guard. It does not roll the unit back. Its
+        //      effect here is to leave SQLite's `changes()` at 0.
+        //   2. `edge-symmetric-absorb-or-update-inplace`, guarded
+        //      `exactly(1)` — this is the statement that refuses and rolls the
+        //      unit back, through its in-place arm
+        //      `(id = ?2 AND changes() = 0 AND updated_at = ?10 AND
+        //        deleted_at IS ?11 AND ?7 > updated_at)`,
+        //      whose `updated_at = ?10` is the stale-revision guard under
+        //      test. The absorbed arm needs `changes() = 1`, so the delete
+        //      refusing is what selects the in-place arm.
+        //
+        // So the premises come in two layers. The delete's own predicates
+        // (`?6`, `?7`, and the EXISTS survivor at `?3`/`?4`/`?5`) are premised
+        // because they decide WHETHER the delete fires, and therefore which
+        // arm of statement 2 is live. Statement 2's remaining conjuncts are
+        // premised because each of them refuses identically to the revision
+        // guard this test names. Read the plans' own bound values and check
+        // the world against them, immediately before the DML.
+        {
+            let statements = match &plan {
+                AtomicOpPlan::Update(p) => p.statements.clone(),
+                other => panic!("expected an Update plan, got {other:?}"),
+            };
+            // By LABEL, for the same reason as the siblings above.
+            let del = statements
+                .iter()
+                .find(|s| s.statement.label.as_deref() == Some("edge-symmetric-delete-if-conflict"))
+                .expect("the plan must carry the guarded symmetric delete");
+            let text = |i: usize| match &del.statement.params[i] {
+                SqlValue::Text(v) => v.clone(),
+                other => panic!("param {i} must be text, got {other:?}"),
+            };
+            let plan_expected_updated = match &del.statement.params[5] {
+                SqlValue::Integer(v) => *v,
+                other => panic!("param 5 must be the expected revision, got {other:?}"),
+            };
+            let plan_expected_deleted = match &del.statement.params[6] {
+                SqlValue::Null => None,
+                SqlValue::Integer(v) => Some(*v),
+                other => panic!("param 6 must be a deletion marker, got {other:?}"),
+            };
+
+            // The delete's OWN identity conjuncts. Reading them into the
+            // survivor-count panic message below is not asserting them: point
+            // `?1` or `?2` at a row that does not exist and the delete still
+            // affects zero rows, its `0..=1` guard still accepts that, and
+            // statement 2 still refuses on the pinned stale revision — so the
+            // test stays green while establishing nothing about which row the
+            // named delete attempted.
+            assert_eq!(
+                text(0),
+                "local",
+                "fixture premise: the delete's `?1` must be the namespace the row lives in, \
+                 otherwise `namespace = ?1` refuses on its own"
+            );
+            assert_eq!(
+                text(1),
+                requested_id.to_string(),
+                "fixture premise: the delete's `?2` must be the edge under test, otherwise \
+                 `id = ?2` refuses on identity and the delete never attempted the requested row"
+            );
+
+            let requested_now = runtime
+                .get_edge_including_deleted(&token, requested_id)
+                .await
+                .expect("read the requested edge")
+                .expect("the requested edge is present before the plan runs");
+            assert_ne!(
+                requested_now.updated_at.timestamp_micros(),
+                plan_expected_updated,
+                "fixture premise: the concurrent writer must actually have moved the \
+                 revision past the plan's `?6`, otherwise nothing refuses the delete"
+            );
+            assert_eq!(
+                requested_now.deleted_at.map(|d| d.timestamp_micros()),
+                plan_expected_deleted,
+                "fixture premise: the stored deletion marker must MATCH the plan's `?7`, \
+                 otherwise `deleted_at IS ?7` refuses too and the refusal is not \
+                 attributable to the revision guard"
+            );
+
+            // The EXISTS arm. A missing survivor refuses the delete on its own
+            // and looks identical from outside, so the premise has to be that
+            // arm's OWN question. Do not reconstruct it from the seeded row's
+            // endpoints: the natural key the plan binds is the canonical
+            // ordering, which need not equal the order the survivor was stored
+            // in, and a hand-built comparison would be asserting my model of
+            // canonicalisation rather than the predicate. Run the subquery
+            // verbatim against the plan's own bound parameters instead.
+            assert_ne!(
+                canonical_id, requested_id,
+                "fixture premise: the survivor must be a DIFFERENT row, since the EXISTS \
+                 arm excludes the requested id"
+            );
+            let survivors = {
+                let mut reader = runtime.sql().reader().await.expect("sql reader");
+                reader
+                    .query_scalar(SqlStatement {
+                        sql: "SELECT count(*) FROM graph_edges \
+                              WHERE namespace = ?1 AND source_id = ?3 AND target_id = ?4 \
+                                AND relation = ?5 AND id != ?2"
+                            .to_string(),
+                        params: del.statement.params[0..5].to_vec(),
+                        label: Some("test-survivor-exists-premise".to_string()),
+                    })
+                    .await
+                    .expect("run the plan's own EXISTS predicate")
+            };
+            let survivors = match survivors {
+                Some(SqlValue::Integer(n)) => n,
+                other => panic!("count(*) must come back as an integer, got {other:?}"),
+            };
+            assert_eq!(
+                survivors,
+                1,
+                "fixture premise: exactly one survivor must satisfy the plan's own EXISTS \
+                 predicate (namespace {}, source {}, target {}, relation {}, id != {}), \
+                 otherwise the delete refuses on the survivor arm and the refusal is not \
+                 attributable to the revision guard",
+                text(0),
+                text(2),
+                text(3),
+                text(4),
+                text(1),
+            );
+        }
+
+        // Statement 2's remaining conjuncts. Each of these refuses the in-place
+        // arm identically to the revision guard this test names, so each has to
+        // be shown satisfied for the attribution to hold.
+        assert_eq!(
+            absorb_ns, "local",
+            "fixture premise: the plan's `?1` must be the namespace the row lives in, \
+             otherwise the outer `namespace = ?1` refuses on its own"
+        );
+        assert_eq!(
+            absorb_id,
+            requested_id.to_string(),
+            "fixture premise: the plan's `?2` must be the edge under test, otherwise the \
+             in-place arm's `id = ?2` refuses on identity"
+        );
+        {
+            let stored = runtime
+                .get_edge_including_deleted(&token, requested_id)
+                .await
+                .expect("read the requested edge")
+                .expect("the requested edge is present before the plan runs");
+            assert_eq!(
+                stored.updated_at.timestamp_micros(),
+                stored_pinned,
+                "fixture premise: the pin must be what the guard reads at DML time, so the \
+                 stored revision is the pinned value and nothing re-advanced it"
+            );
+            assert_eq!(
+                stored.deleted_at.map(|d| d.timestamp_micros()),
+                absorb_expected_deleted,
+                "fixture premise: the stored deletion marker must MATCH the plan's `?11`, \
+                 otherwise `deleted_at IS ?11` refuses too and the refusal stops being \
+                 attributable to `updated_at = ?10`"
+            );
+        }
+
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("the seam call itself must not error; the unit rolls back cleanly");
+        match outcome {
+            crate::atomic_runner::AtomicRunOutcome::RolledBack {
+                failed_op_index,
+                failure,
+            } => {
+                assert_eq!(
+                    failed_op_index, 0,
+                    "the sole op's guard must be the one that fails"
+                );
+                // The decisive attribution, and the reason the two-layer
+                // premise stack above exists: `failed_op_index` cannot
+                // distinguish the two statements, because both live in op 0.
+                // Naming the label is what says the in-place absorb refused
+                // rather than the delete — and the delete's `0..=1` guard
+                // means it CANNOT be the refuser, so a run that reported it
+                // here would be evidence the guards had been rewired.
+                assert_eq!(
+                    failure,
+                    crate::atomic_runner::AtomicOpFailure::GuardFailed {
+                        statement_label: Some(
+                            "edge-symmetric-absorb-or-update-inplace".to_string()
+                        ),
+                        expected: crate::atomic_plan::AffectedRowGuard::exactly(1),
+                        observed: 0,
+                    },
+                    "the guarded in-place absorb must be the statement whose guard refused"
+                );
+            }
+            other => panic!(
+                "a stale absorption plan must roll back, not silently absorb E into the \
+                 survivor and discard the concurrent writer's change: {other:?}"
+            ),
+        }
+
+        let requested_after = runtime
+            .get_edge(&token, requested_id)
+            .await
+            .expect("get_edge")
+            .expect("E must still exist after the rolled-back absorption");
+        assert_eq!(
+            requested_after.relation,
+            EdgeRelation::Extends,
+            "E must be untouched by the rolled-back absorption: {requested_after:?}"
+        );
+        assert!(
+            (requested_after.weight - 0.77).abs() < 1e-9,
+            "the concurrent writer's committed weight must survive the rolled-back plan: \
+             {requested_after:?}"
+        );
+
+        let canonical_after = runtime
+            .get_edge(&token, canonical_id)
+            .await
+            .expect("get_edge")
+            .expect("S must still exist after the rolled-back absorption");
+        assert_eq!(
+            canonical_after.weight, 0.6,
+            "the survivor must never have been touched by the aborted absorption"
         );
     }
 
@@ -4112,5 +5045,146 @@ mod tests {
         let (edge_count, _, _, _) =
             probe_edge_natural_key(&runtime, "local", a_id, x_id, "extends").await;
         assert_eq!(edge_count, 0, "no edge may have been committed");
+    }
+
+    /// ADR-014 tri-state on the atomic path: `entity_type: null` must
+    /// explicitly CLEAR a stored entity type (and reindex), not collapse to
+    /// "unchanged" like the old `optional_create_string` did.
+    #[tokio::test]
+    async fn atomic_update_entity_type_null_clears_stored_type() {
+        let runtime = scratch_runtime();
+        runtime.install_entity_type_validator(std::sync::Arc::new(|kind, entity_type| {
+            let Some(raw) = entity_type else {
+                return Ok(None);
+            };
+            let normalized = raw.trim().to_ascii_lowercase();
+            if kind == "concept" && normalized == "algorithm" {
+                Ok(Some(normalized))
+            } else {
+                Err(RuntimeError::InvalidInput(format!(
+                    "unknown entity_type {raw:?} for {kind:?}; valid: algorithm"
+                )))
+            }
+        }));
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut entity = khive_storage::Entity::new("local", "concept", "AtomicNullClear");
+        entity.entity_type = Some("algorithm".to_string());
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": entity_id.to_string(), "entity_type": null}),
+            None,
+        )
+        .await
+        .expect("atomic prepare must accept entity_type: null");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("atomic update must run");
+        let post_commit = match outcome {
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        assert_eq!(
+            post_commit.as_slice(),
+            &[PostCommitEffect::ReindexEntity { entity_id }],
+            "a type clear that differs from the prior value must reindex"
+        );
+
+        let updated = runtime
+            .get_entity(&token, entity_id)
+            .await
+            .expect("read updated entity");
+        assert_eq!(
+            updated.entity_type, None,
+            "entity_type: null must clear the stored type"
+        );
+        assert_eq!(updated.name, "AtomicNullClear");
+    }
+
+    /// ADR-014 tri-state on the atomic path: a PRESENT `entity_type` key,
+    /// including JSON `null`, must be rejected on note and edge targets
+    /// (parity with `khive-pack-kg`'s `reject_inapplicable_fields`).
+    #[tokio::test]
+    async fn atomic_update_null_entity_type_rejected_for_note_and_edge() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let note = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "note body for entity_type guard",
+                Some(0.5),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+        let note_err = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": note.id.to_string(), "entity_type": null}),
+            Some(crate::atomic_prepare::AtomicUpdateKind::Note { specific: None }),
+        )
+        .await
+        .expect_err("entity_type: null on a note must be rejected");
+        assert!(
+            matches!(note_err, RuntimeError::InvalidInput(ref msg) if msg.contains("entity_type") && msg.contains("not valid for a note")),
+            "expected an InvalidInput naming entity_type for a note, got: {note_err:?}"
+        );
+
+        let source = khive_storage::Entity::new("local", "concept", "AtomicNullTypeEdgeSource");
+        let target = khive_storage::Entity::new("local", "concept", "AtomicNullTypeEdgeTarget");
+        let source_id = source.id;
+        let target_id = target.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(source)
+            .await
+            .expect("seed source");
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(target)
+            .await
+            .expect("seed target");
+        let edge = runtime
+            .link(
+                &token,
+                source_id,
+                target_id,
+                "supports".parse().expect("relation"),
+                0.5,
+                None,
+            )
+            .await
+            .expect("create edge");
+
+        let edge_err = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": edge.id.to_string(), "entity_type": null}),
+            Some(crate::atomic_prepare::AtomicUpdateKind::Edge),
+        )
+        .await
+        .expect_err("entity_type: null on an edge must be rejected");
+        assert!(
+            matches!(edge_err, RuntimeError::InvalidInput(ref msg) if msg.contains("entity_type") && msg.contains("not valid for an edge")),
+            "expected an InvalidInput naming entity_type for an edge, got: {edge_err:?}"
+        );
     }
 }

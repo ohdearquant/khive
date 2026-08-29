@@ -5,6 +5,49 @@ fn open_memory() -> Connection {
     Connection::open_in_memory().expect("in-memory connection")
 }
 
+/// SQLite fixes the text encoding when the database is first initialized;
+/// creating (and dropping) a table under the pragma leaves an initialized
+/// UTF-16LE database that every later statement on this connection inherits.
+fn open_memory_utf16le() -> Connection {
+    let conn = Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch(
+        "PRAGMA encoding = 'UTF-16le'; \
+         CREATE TABLE __encoding_pin (x INTEGER); \
+         DROP TABLE __encoding_pin;",
+    )
+    .expect("pin utf-16le encoding");
+    conn
+}
+
+/// `length()` and `GLOB` both stop scanning at an embedded NUL, so 64 hex
+/// characters followed by a NUL and trailing bytes passes the character-only
+/// arms while still being 66+ bytes on the wire.
+fn nul_embedded_canonical_ref() -> String {
+    let mut polluted = "a".repeat(64);
+    polluted.push('\0');
+    polluted.push_str("zz");
+    polluted
+}
+
+fn migrate_through(conn: &mut Connection, through_version: u32) {
+    conn.execute_batch(MIGRATION_TRACKING_TABLE)
+        .expect("create migration ledger");
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= through_version)
+    {
+        let tx = conn.transaction().expect("begin historical migration");
+        tx.execute_batch(migration.up)
+            .expect("apply historical migration body");
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![migration.version, migration.name],
+        )
+        .expect("record historical migration");
+        tx.commit().expect("commit historical migration");
+    }
+}
+
 fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
@@ -846,13 +889,17 @@ fn v4_creates_consolidated_fts_tables() {
 }
 
 #[test]
-fn rejects_pre_consolidation_ledger() {
+fn rejects_ledger_ahead_of_binary_latest() {
     let mut conn = open_memory();
-    // Simulate a database carrying the old, pre-consolidation V1..V22 ledger.
+    // Simulate a database whose recorded version is ahead of everything this
+    // build knows — a newer build's ledger (historically, the
+    // pre-consolidation shape). Computed from the live chain so the fixture
+    // stays ahead when a real migration lands on the number a literal would
+    // have pinned.
     conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
     conn.execute(
-        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (22, 'legacy', 0)",
-        [],
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, 'legacy', 0)",
+        rusqlite::params![latest_schema_version() + 1],
     )
     .unwrap();
 
@@ -1407,7 +1454,7 @@ fn v6_implicit_mass_upsert_on_conflict() {
 #[test]
 fn v10_adds_content_ref_column_and_partial_index() {
     let mut conn = open_memory();
-    run_migrations(&mut conn).expect("migrations should succeed");
+    migrate_through(&mut conn, 10);
     assert!(
         column_exists(&conn, "entities", "content_ref"),
         "V10 must add entities.content_ref"
@@ -1421,7 +1468,7 @@ fn v10_adds_content_ref_column_and_partial_index() {
 #[test]
 fn v10_content_ref_defaults_null_and_accepts_a_value() {
     let mut conn = open_memory();
-    run_migrations(&mut conn).expect("migrations should succeed");
+    migrate_through(&mut conn, 10);
 
     conn.execute(
         "INSERT INTO entities (id, namespace, kind, name, tags, created_at, updated_at) \
@@ -1904,38 +1951,52 @@ impl Drop for BarrierGuard {
     }
 }
 
-// khive#1212: two processes booting the same database file must both complete
-// migrations — the IMMEDIATE transaction serializes them and the under-lock
-// re-check makes the loser converge instead of failing on already-applied DDL.
+// khive#1212 + ADR-160: two boots of one file must both converge, with the
+// canonical database-GC owner acquired before either pool writer. The
+// pre-held owner makes both waiters deterministic and proves no V21 marker or
+// ledger mutation appears before ownership transfers.
 #[test]
 #[serial_test::serial(migration_contention)]
 fn concurrent_boots_converge() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("concurrent-boot.db");
-    let _guard = BarrierGuard;
+    let backends = [
+        crate::StorageBackend::sqlite(&path).expect("open first backend"),
+        crate::StorageBackend::sqlite(&path).expect("open second backend"),
+    ];
+    let canonical = backends[0]
+        .pool()
+        .canonical_path()
+        .expect("file-backed canonical path")
+        .to_path_buf();
+    let owner =
+        crate::stores::blob::acquire_database_gc_owner_for_path_blocking(Some(canonical.clone()))
+            .expect("pre-hold database GC owner");
 
-    // Deterministic interleaving via the in-crate stale-read barrier: both
-    // threads must observe the empty ledger (version 0, no lock held) before
-    // either is released to compete for the IMMEDIATE write lock. The loser
-    // is thereby guaranteed to reach the under-lock re-check with a stale
-    // view, which the fast-forward counter asserts below.
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    *test_sync::STALE_READ_BARRIER.lock().unwrap() = Some(barrier);
-    test_sync::LOCKED_FAST_FORWARDS.store(0, std::sync::atomic::Ordering::Relaxed);
-    test_sync::BUSY_OBSERVED.store(false, std::sync::atomic::Ordering::SeqCst);
-    test_sync::WINNER_COMMITTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    test_sync::LOSER_SAW_WINNER_COMMIT.store(false, std::sync::atomic::Ordering::SeqCst);
-
-    let handles: Vec<_> = (0..2)
-        .map(|_| {
-            let path = path.clone();
-            std::thread::spawn(move || {
-                test_sync::PARTICIPATE.with(|p| p.set(true));
-                let mut conn = Connection::open(&path).expect("open");
-                run_migrations(&mut conn)
-            })
-        })
+    let handles: Vec<_> = backends
+        .into_iter()
+        .map(|backend| std::thread::spawn(move || backend.prepare_core_schema()))
         .collect();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while crate::stores::blob::database_gc_waiter_count(Some(&canonical)) != 2
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        crate::stores::blob::database_gc_waiter_count(Some(&canonical)),
+        2,
+        "both boot paths must wait behind the canonical owner before taking a writer"
+    );
+    let before = Connection::open(&path).expect("inspect pre-owner schema");
+    assert_eq!(
+        read_schema_version(&before).expect("read pre-owner ledger"),
+        0,
+        "schema must remain untouched while database-GC ownership is unavailable"
+    );
+    drop(before);
+    drop(owner);
 
     let latest = MIGRATIONS.last().expect("at least one migration").version;
     for handle in handles {
@@ -1945,31 +2006,6 @@ fn concurrent_boots_converge() {
             .expect("both concurrent boots must succeed");
         assert_eq!(version, latest);
     }
-    *test_sync::STALE_READ_BARRIER.lock().unwrap() = None;
-
-    // Both threads observed version 0 before either took the write lock, so
-    // the loser necessarily re-checked under the lock and fast-forwarded past
-    // the winner's applied migrations. This fails if either the IMMEDIATE
-    // behavior or the under-lock MAX(version) re-check regresses.
-    assert!(
-        test_sync::LOCKED_FAST_FORWARDS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
-        "loser thread must observe the sibling's ledger under the write lock"
-    );
-
-    // SQLite itself reported a busy acquisition to the loser while the winner
-    // held the write lock: the winner does not commit until the loser's busy
-    // handler has fired, so this is observed contention, not an intended
-    // attempt. If IMMEDIATE regressed to deferred behavior, no busy signal
-    // occurs on BEGIN and this fails (that interleaving also fails outright
-    // on duplicate DDL).
-    assert!(
-        test_sync::BUSY_OBSERVED.load(std::sync::atomic::Ordering::SeqCst),
-        "SQLite must observe the loser's blocked BEGIN IMMEDIATE while the winner holds the lock"
-    );
-    assert!(
-        test_sync::LOSER_SAW_WINNER_COMMIT.load(std::sync::atomic::Ordering::SeqCst),
-        "loser's BEGIN IMMEDIATE must return only after the winner committed"
-    );
 
     let conn = Connection::open(&path).expect("reopen");
     let rows: u32 = conn
@@ -1982,6 +2018,45 @@ fn concurrent_boots_converge() {
         MIGRATIONS.len(),
         "exactly one ledger row per migration"
     );
+}
+
+#[test]
+#[serial_test::serial(migration_contention)]
+fn raw_file_migration_refuses_when_database_gc_owner_is_held() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("raw-owner-refusal.db");
+    drop(Connection::open(&path).expect("create raw migration database"));
+    let canonical = std::fs::canonicalize(&path).expect("canonical database path");
+    let owner = crate::stores::blob::acquire_database_gc_owner_for_path_blocking(Some(canonical))
+        .expect("hold database GC owner");
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let path_for_runner = path.clone();
+    let runner = std::thread::spawn(move || {
+        let mut conn = Connection::open(path_for_runner).expect("open raw migration connection");
+        let result = run_migrations(&mut conn)
+            .map(|_| "unexpected success".to_string())
+            .unwrap_or_else(|error| error.to_string());
+        let version = read_schema_version(&conn).expect("read post-refusal schema");
+        result_tx.send((result, version)).expect("report refusal");
+    });
+    let (error, version) = match result_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(result) => result,
+        Err(timeout) => {
+            drop(owner);
+            let _ = runner.join();
+            panic!("raw migration waited for database-GC ownership instead of refusing: {timeout}");
+        }
+    };
+    assert!(
+        error.contains("database GC owner"),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(
+        version, 0,
+        "raw refusal must occur before creating the migration ledger"
+    );
+    drop(owner);
+    runner.join().expect("raw migration runner joins");
 }
 
 // khive#1217 review blocking finding: the pre-lock ahead-of-latest guard runs
@@ -2088,7 +2163,7 @@ fn insert_v19_test_edge(conn: &Connection, id: &str, source_id: &str, target_id:
 #[test]
 fn v19_repairs_divergent_cursor_ledgers() {
     let mut conn = open_memory();
-    run_migrations(&mut conn).expect("fresh migrate to latest (includes V19)");
+    migrate_through(&mut conn, 18);
 
     // Populate rows that predate the divergence being simulated below.
     insert_v19_test_entity(&conn, "e1", 10);
@@ -2223,7 +2298,7 @@ fn post_v19_name_mismatch_fails_loud() {
 #[test]
 fn v20_blob_gc_claims_block_new_live_references_until_cleanup() {
     let mut conn = open_memory();
-    run_migrations(&mut conn).expect("fresh migrate to latest (includes V20)");
+    migrate_through(&mut conn, 20);
 
     assert!(
         table_exists(&conn, "blob_gc_claims"),
@@ -2289,4 +2364,387 @@ fn v20_blob_gc_claims_block_new_live_references_until_cleanup() {
         [claimed],
     )
     .expect("the reference becomes writable after claim cleanup");
+}
+
+// ── V21: coordinated attachments-first cutover (ADR-160 D4) ────────────────────
+
+#[test]
+fn v21_legacy_refs_remain_pending_until_explicit_stage_and_finalize() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    let content = khive_storage::blob::ContentRef::from_hex("a".repeat(64)).unwrap();
+    let model = khive_storage::blob::ContentRef::from_hex("b".repeat(64)).unwrap();
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, entity_type, name, tags, created_at, updated_at, deleted_at, content_ref) \
+         VALUES ('doc', 'local', 'document', NULL, 'doc', '[]', 1, 1, 2, ?1), \
+                ('model', 'local', 'artifact', 'moodboard_model', 'model', '[]', 1, 1, NULL, ?2)",
+        rusqlite::params![content.as_str(), model.as_str()],
+    )
+    .unwrap();
+
+    assert_eq!(run_migrations(&mut conn).unwrap(), 20);
+    assert_eq!(
+        attachment_cutover_status(&conn).unwrap(),
+        AttachmentCutoverStatus::Pending
+    );
+    assert!(!table_exists(&conn, "attachments"));
+
+    conn.execute(
+        "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) VALUES ('abandoned', ?1, 1)",
+        [content.as_str()],
+    )
+    .unwrap();
+    stage_attachment_cutover(&mut conn).unwrap();
+    assert_eq!(
+        attachment_cutover_status(&conn).unwrap(),
+        AttachmentCutoverStatus::Incomplete
+    );
+    assert!(column_exists(&conn, "entities", "content_ref"));
+    assert_eq!(read_schema_version(&conn).unwrap(), 20);
+    let backfilled: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM attachments WHERE role = 'content' AND record_uuid IN ('doc', 'model')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(backfilled, 2, "stage must include soft-deleted entity rows");
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM blob_gc_claims", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "exclusive stage owner clears abandoned claims"
+    );
+
+    assert_eq!(
+        run_migrations(&mut conn).unwrap(),
+        20,
+        "restart must remain resumable"
+    );
+    assert_eq!(
+        attachment_cutover_status(&conn).unwrap(),
+        AttachmentCutoverStatus::Incomplete
+    );
+
+    apply_generic_verified_attachment(
+        &conn,
+        "model",
+        "entity",
+        "fann-network",
+        &model,
+        Some("application/vnd.khive.fann+json"),
+        Some(123),
+        3,
+    )
+    .unwrap();
+    finalize_attachment_cutover(&mut conn).unwrap();
+    assert_eq!(read_schema_version(&conn).unwrap(), 21);
+    assert_eq!(
+        attachment_cutover_status(&conn).unwrap(),
+        AttachmentCutoverStatus::Complete
+    );
+    assert!(!column_exists(&conn, "entities", "content_ref"));
+    assert!(!index_exists(&conn, "idx_entities_content_ref"));
+    for trigger in [
+        "entities_reject_claimed_blob_insert",
+        "entities_reject_claimed_blob_update",
+    ] {
+        assert!(
+            !schema_object_exists(&conn, "trigger", trigger).unwrap(),
+            "finalization must remove legacy trigger {trigger}"
+        );
+    }
+    for trigger in [
+        "attachments_reject_claimed_blob_insert",
+        "attachments_reject_claimed_blob_update",
+    ] {
+        assert!(
+            schema_object_exists(&conn, "trigger", trigger).unwrap(),
+            "finalization must install attachment trigger {trigger}"
+        );
+    }
+}
+
+#[test]
+fn v21_empty_database_fast_path_is_atomic_and_complete() {
+    let mut conn = open_memory();
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert_eq!(
+        attachment_cutover_status(&conn).unwrap(),
+        AttachmentCutoverStatus::Complete
+    );
+    assert!(table_exists(&conn, "attachments"));
+    assert!(!column_exists(&conn, "entities", "content_ref"));
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM attachment_cutover_state WHERE state = 'incomplete'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0,
+        "the zero-ref fast path must expose no durable incomplete window"
+    );
+}
+
+#[test]
+fn v21_stage_rejects_invalid_refs_without_partial_schema_or_marker() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('bad', 'local', 'document', 'bad', '[]', 1, 1, 'NOT-CANONICAL')",
+        [],
+    )
+    .unwrap();
+
+    let error = stage_attachment_cutover(&mut conn)
+        .expect_err("invalid legacy refs must fail the coordinated stage");
+    assert!(
+        error.to_string().contains("canonical"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(read_schema_version(&conn).unwrap(), 20);
+    assert!(
+        !table_exists(&conn, "attachments"),
+        "failed stage must roll back DDL"
+    );
+    assert!(!table_exists(&conn, "attachment_cutover_state"));
+    assert!(column_exists(&conn, "entities", "content_ref"));
+}
+
+/// Reddens the `021-attachments-a-stage.sql` table CHECK if the byte-length
+/// arm is reverted: a 64-hex + NUL + tail value must still violate the CHECK
+/// on a direct INSERT into `attachments`.
+#[test]
+fn v21_attachments_check_rejects_a_nul_embedded_content_ref() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    stage_attachment_cutover(&mut conn).unwrap();
+
+    let error = conn
+        .execute(
+            "INSERT INTO attachments \
+             (record_uuid, substrate, role, content_ref, created_at) \
+             VALUES ('doc', 'entity', 'nul-probe', ?1, 1)",
+            rusqlite::params![nul_embedded_canonical_ref()],
+        )
+        .expect_err("a NUL-embedded content_ref must violate the attachments CHECK constraint");
+    assert!(
+        error.to_string().to_lowercase().contains("check"),
+        "expected a CHECK constraint violation, got {error}"
+    );
+}
+
+/// Reddens `validate_canonical_legacy_refs` if its byte-length arm is
+/// reverted: entities.content_ref carries no CHECK of its own, so a
+/// NUL-tailed value is only caught by the migration validator.
+#[test]
+fn v21_stage_rejects_a_nul_embedded_legacy_content_ref() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('bad', 'local', 'document', 'bad', '[]', 1, 1, ?1)",
+        rusqlite::params![nul_embedded_canonical_ref()],
+    )
+    .unwrap();
+
+    let error = stage_attachment_cutover(&mut conn)
+        .expect_err("a NUL-embedded legacy content_ref must fail the coordinated stage");
+    assert!(
+        error.to_string().contains("canonical"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(read_schema_version(&conn).unwrap(), 20);
+    assert!(
+        !table_exists(&conn, "attachments"),
+        "failed stage must roll back DDL"
+    );
+}
+
+/// Reddens `validate_canonical_attachment_and_claim_refs` if its byte-length
+/// arm is reverted: `blob_gc_claims` carries no CHECK of its own, so a
+/// NUL-tailed value is only caught by the migration validator.
+#[test]
+fn v21_stage_rejects_a_nul_embedded_blob_gc_claim_ref() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    conn.execute(
+        "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) VALUES ('abandoned', ?1, 1)",
+        rusqlite::params![nul_embedded_canonical_ref()],
+    )
+    .unwrap();
+
+    let error = stage_attachment_cutover(&mut conn)
+        .expect_err("a NUL-embedded blob_gc_claims ref must fail the coordinated stage");
+    let message = error.to_string();
+    assert!(
+        message.contains("blob_gc_claims") && message.contains("canonical"),
+        "unexpected error: {message}"
+    );
+    assert_eq!(read_schema_version(&conn).unwrap(), 20);
+}
+
+/// A fixed bytes=64 arm would reject every valid 64-char ref in a UTF-16LE
+/// database (128 bytes), so this proves the width-derived arm is
+/// encoding-neutral rather than a hardcoded 64.
+#[test]
+fn v21_stage_accepts_a_valid_ref_in_a_utf16le_database() {
+    let mut conn = open_memory_utf16le();
+    let encoding: String = conn
+        .query_row("PRAGMA encoding", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        encoding, "UTF-16le",
+        "the fixture database must actually be UTF-16le"
+    );
+
+    migrate_through(&mut conn, 20);
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('doc', 'local', 'document', 'doc', '[]', 1, 1, ?1)",
+        rusqlite::params!["a".repeat(64)],
+    )
+    .unwrap();
+
+    stage_attachment_cutover(&mut conn)
+        .expect("a valid canonical ref must pass the width-derived CHECK in a UTF-16LE database");
+    assert_eq!(
+        attachment_cutover_status(&conn).unwrap(),
+        AttachmentCutoverStatus::Incomplete
+    );
+}
+
+/// The NUL arm must stay red in UTF-16 as well: 64 chars + NUL + tail is
+/// 130+ bytes against the expected 128.
+#[test]
+fn v21_stage_rejects_a_nul_embedded_ref_in_a_utf16le_database() {
+    let mut conn = open_memory_utf16le();
+    let encoding: String = conn
+        .query_row("PRAGMA encoding", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        encoding, "UTF-16le",
+        "the fixture database must actually be UTF-16le"
+    );
+
+    migrate_through(&mut conn, 20);
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('bad', 'local', 'document', 'bad', '[]', 1, 1, ?1)",
+        rusqlite::params![nul_embedded_canonical_ref()],
+    )
+    .unwrap();
+
+    let error = stage_attachment_cutover(&mut conn)
+        .expect_err("a NUL-embedded ref must stay rejected in a UTF-16LE database");
+    assert!(
+        error.to_string().contains("canonical"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn v21_verified_attachment_conflict_preserves_the_staged_identity() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    let original = khive_storage::blob::ContentRef::from_hex("d".repeat(64)).unwrap();
+    let conflicting = khive_storage::blob::ContentRef::from_hex("e".repeat(64)).unwrap();
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('doc', 'local', 'document', 'doc', '[]', 1, 1, ?1)",
+        [original.as_str()],
+    )
+    .unwrap();
+    stage_attachment_cutover(&mut conn).unwrap();
+
+    let error = apply_generic_verified_attachment(
+        &conn,
+        "doc",
+        "entity",
+        "content",
+        &conflicting,
+        None,
+        None,
+        2,
+    )
+    .expect_err("one role cannot be rebound to a different verified digest");
+    assert!(
+        error.to_string().contains("conflicts"),
+        "unexpected error: {error}"
+    );
+    let retained: String = conn
+        .query_row(
+            "SELECT content_ref FROM attachments WHERE record_uuid = 'doc' AND role = 'content'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, original.as_str());
+    assert_eq!(
+        attachment_cutover_status(&conn).unwrap(),
+        AttachmentCutoverStatus::Incomplete
+    );
+}
+
+#[test]
+fn v21_finalize_revalidates_model_coverage_and_attachment_claim_fences() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    let model = khive_storage::blob::ContentRef::from_hex("c".repeat(64)).unwrap();
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, entity_type, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('model', 'local', 'artifact', 'moodboard_model', 'model', '[]', 1, 1, ?1)",
+        [model.as_str()],
+    )
+    .unwrap();
+    stage_attachment_cutover(&mut conn).unwrap();
+
+    let error = finalize_attachment_cutover(&mut conn)
+        .expect_err("every extant model with content requires fann-network");
+    assert!(
+        error.to_string().contains("fann-network"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        attachment_cutover_status(&conn).unwrap(),
+        AttachmentCutoverStatus::Incomplete
+    );
+    assert!(column_exists(&conn, "entities", "content_ref"));
+
+    apply_generic_verified_attachment(
+        &conn,
+        "model",
+        "entity",
+        "fann-network",
+        &model,
+        None,
+        None,
+        2,
+    )
+    .unwrap();
+    finalize_attachment_cutover(&mut conn).unwrap();
+    conn.execute(
+        "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) VALUES ('active', ?1, 3)",
+        [model.as_str()],
+    )
+    .unwrap();
+    let insert_error = conn
+        .execute(
+            "INSERT INTO attachments \
+             (record_uuid, substrate, role, content_ref, created_at) \
+             VALUES ('other', 'entity', 'content', ?1, 4)",
+            [model.as_str()],
+        )
+        .expect_err("an attachment cannot acquire a claimed digest");
+    assert!(insert_error.to_string().contains("active blob sweep"));
 }

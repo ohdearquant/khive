@@ -1,8 +1,8 @@
 //! Integration tests for `BrainPack` dispatch.
 use super::*;
 use khive_runtime::{
-    DispatchHook, KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeError,
-    VerbRegistryBuilder,
+    DispatchHook, KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeConfig,
+    RuntimeError, VerbRegistryBuilder,
 };
 use khive_types::HandlerDef;
 use serde_json::{json, Value};
@@ -55,6 +55,23 @@ impl PackRuntime for TestConsumerPack {
 
 fn make_pack() -> (BrainPack, KhiveRuntime) {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = BrainPack::new(rt.clone());
+    (pack, rt)
+}
+
+/// Like `make_pack`, with the display timezone pinned so date-only
+/// `since`/`until` anchoring is deterministic regardless of the host zone
+/// (`RuntimeConfig::default()` resolves the machine's own zone).
+fn make_pack_with_tz(tz: &str) -> (BrainPack, KhiveRuntime) {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        display_timezone: tz.parse().expect("known IANA zone"),
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime");
     let pack = BrainPack::new(rt.clone());
     (pack, rt)
 }
@@ -2395,6 +2412,8 @@ fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
     // absent on CI runners and fails entity creation with ModelInitialization.
     let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
         git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
         db_path: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
@@ -7782,6 +7801,358 @@ mod event_counts_tests {
         assert_eq!(counts_by_verb.get("search"), Some(&3));
     }
 
+    /// The exhaustive walk pages with a strict `before` cursor; rows sharing
+    /// one `created_at` microsecond across a page edge must arrive exactly
+    /// once — neither dropped by the strict bound nor double-counted by the
+    /// boundary re-read.
+    #[tokio::test]
+    async fn exhaustive_fetch_survives_timestamp_ties_across_page_edges() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // A tie run wider than the page size, plus one older row below it.
+        for _ in 0..9 {
+            seed_event(
+                &rt,
+                &token,
+                "recall",
+                EventKind::RecallExecuted,
+                "lambda:a",
+                5_000_000,
+                json!({}),
+            )
+            .await;
+        }
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let store = rt.events(&token).expect("event store");
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let (items, window_event_total, truncated) =
+            crate::handlers::fetch_event_counts_window_exhaustive(
+                store.as_ref(),
+                &base_filter,
+                /* page_size = */ 4,
+                /* max_events = */ 20,
+            )
+            .await
+            .expect("tie-heavy exhaustive fetch must succeed");
+
+        assert_eq!(window_event_total, 10);
+        assert_eq!(items.len(), 10, "each tied row must arrive exactly once");
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            items.iter().map(|event| event.id).collect();
+        assert_eq!(distinct.len(), 10, "no row may be double-counted");
+        assert!(!truncated);
+    }
+
+    /// A page holding MORE than one timestamp group must not cycle: the
+    /// cursor steps to `oldest-in-page + 1` and the strict `created_at <`
+    /// bound excludes every newer group already emitted, so the walk is
+    /// monotone. Three timestamp groups with a page edge inside a group
+    /// exercise the mixed-page shape directly: page one carries two groups
+    /// (2×T3, 2×T2), the boundary set tracks only T2, and the next page must
+    /// deliver the remaining T2 row and the T1 group exactly once each.
+    #[tokio::test]
+    async fn exhaustive_fetch_terminates_across_multiple_timestamp_groups_per_page() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // Three groups, newest first in delivery order: 2 @ T3, 3 @ T2,
+        // 2 @ T1, with page_size 4 splitting the T2 group across pages.
+        for _ in 0..2 {
+            seed_event(
+                &rt,
+                &token,
+                "recall",
+                EventKind::RecallExecuted,
+                "lambda:a",
+                9_000_000,
+                json!({}),
+            )
+            .await;
+        }
+        for _ in 0..3 {
+            seed_event(
+                &rt,
+                &token,
+                "search",
+                EventKind::SearchExecuted,
+                "lambda:a",
+                5_000_000,
+                json!({}),
+            )
+            .await;
+        }
+        for _ in 0..2 {
+            seed_event(
+                &rt,
+                &token,
+                "recall",
+                EventKind::RecallExecuted,
+                "lambda:a",
+                1_000_000,
+                json!({}),
+            )
+            .await;
+        }
+
+        let store = rt.events(&token).expect("event store");
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let (items, window_event_total, truncated) =
+            crate::handlers::fetch_event_counts_window_exhaustive(
+                store.as_ref(),
+                &base_filter,
+                /* page_size = */ 4,
+                /* max_events = */ 20,
+            )
+            .await
+            .expect("multi-group exhaustive fetch must terminate and succeed");
+
+        assert_eq!(window_event_total, 7);
+        assert_eq!(items.len(), 7, "every group must be reached exactly once");
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            items.iter().map(|event| event.id).collect();
+        assert_eq!(distinct.len(), 7, "no row may be double-counted");
+        let mut counts_by_ts = std::collections::BTreeMap::new();
+        for event in &items {
+            *counts_by_ts.entry(event.created_at).or_insert(0_u64) += 1;
+        }
+        assert_eq!(counts_by_ts.get(&9_000_000), Some(&2));
+        assert_eq!(counts_by_ts.get(&5_000_000), Some(&3));
+        assert_eq!(
+            counts_by_ts.get(&1_000_000),
+            Some(&2),
+            "the oldest group must be reached"
+        );
+        assert!(!truncated);
+    }
+
+    /// Build `count` events sharing one `created_at` for bulk seeding.
+    fn tied_events(namespace: &str, created_at: i64, count: usize) -> Vec<Event> {
+        (0..count)
+            .map(|_| {
+                let mut event = Event::new(
+                    namespace,
+                    "recall",
+                    EventKind::RecallExecuted,
+                    SubstrateKind::Note,
+                    "lambda:a",
+                );
+                event.created_at = created_at;
+                event
+            })
+            .collect()
+    }
+
+    /// A timestamp tie that EXACTLY fills a transport-cap page is pageable:
+    /// once the at-the-cap page comes back all-duplicates, the walk proves
+    /// the tie complete against `count_events` and steps the strict bound to
+    /// the boundary itself, reaching the older rows instead of failing. A
+    /// tie WIDER than the cap must still return the typed dense-tie error.
+    #[tokio::test]
+    async fn exact_cap_timestamp_tie_pages_past_while_wider_tie_errors() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let store = rt.events(&token).expect("event store");
+        let cap = usize::try_from(crate::handlers::TRANSPORT_PAGE_ROWS).unwrap();
+
+        let mut batch = tied_events(token.namespace().as_str(), 5_000_000, cap);
+        batch.extend(tied_events(token.namespace().as_str(), 1_000_000, 1));
+        store.append_events(batch).await.expect("seed cap tie");
+
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let items = crate::handlers::collect_events_cursor_walk(
+            store.as_ref(),
+            &base_filter,
+            crate::handlers::TRANSPORT_PAGE_ROWS,
+            (cap as u64) + 1,
+        )
+        .await
+        .expect("an exactly-cap tie must page past, not error");
+        assert_eq!(items.len(), cap + 1, "the older row must be reached");
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            items.iter().map(|event| event.id).collect();
+        assert_eq!(distinct.len(), cap + 1, "no row may be double-counted");
+
+        // One more row at the tied microsecond pushes the run past the cap:
+        // the walk must now fail with the typed dense-tie error, not loop.
+        store
+            .append_events(tied_events(token.namespace().as_str(), 5_000_000, 1))
+            .await
+            .expect("seed over-cap tie");
+        let err = crate::handlers::collect_events_cursor_walk(
+            store.as_ref(),
+            &base_filter,
+            crate::handlers::TRANSPORT_PAGE_ROWS,
+            (cap as u64) + 2,
+        )
+        .await
+        .expect_err("a tie wider than the cap is unpageable");
+        assert!(
+            err.to_string().contains("share one created_at microsecond"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Delegating store that appends one prepared row to the inner store
+    /// immediately AFTER serving a `count_events` call, reproducing a
+    /// concurrent boundary-timestamp append landing between the walk's
+    /// completeness count and its next page query.
+    struct AppendAfterCountStore {
+        inner: std::sync::Arc<dyn khive_storage::event::EventStore>,
+        pending: tokio::sync::Mutex<Option<Event>>,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::event::EventStore for AppendAfterCountStore {
+        async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
+            self.inner.append_event(event).await
+        }
+        async fn append_events(
+            &self,
+            events: Vec<Event>,
+        ) -> khive_storage::StorageResult<khive_storage::BatchWriteSummary> {
+            self.inner.append_events(events).await
+        }
+        async fn get_event(&self, id: uuid::Uuid) -> khive_storage::StorageResult<Option<Event>> {
+            self.inner.get_event(id).await
+        }
+        async fn query_events(
+            &self,
+            filter: EventFilter,
+            page: khive_storage::PageRequest,
+        ) -> khive_storage::StorageResult<khive_storage::Page<Event>> {
+            self.inner.query_events(filter, page).await
+        }
+        async fn count_events(&self, filter: EventFilter) -> khive_storage::StorageResult<u64> {
+            let count = self.inner.count_events(filter).await?;
+            if let Some(event) = self.pending.lock().await.take() {
+                self.inner.append_event(event).await?;
+            }
+            Ok(count)
+        }
+    }
+
+    /// The walk's at-cap completeness proof and its next page query are
+    /// independent reads of a live plane: a boundary-timestamp row appended
+    /// between them is a point-in-time exclusion, never an error and never a
+    /// duplicate. This pins the documented read-consistency contract.
+    #[tokio::test]
+    async fn concurrent_boundary_append_between_count_and_next_page_is_excluded_cleanly() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let store = rt.events(&token).expect("event store");
+        let cap = usize::try_from(crate::handlers::TRANSPORT_PAGE_ROWS).unwrap();
+
+        let mut batch = tied_events(token.namespace().as_str(), 5_000_000, cap);
+        batch.extend(tied_events(token.namespace().as_str(), 1_000_000, 1));
+        store.append_events(batch).await.expect("seed cap tie");
+        let racer = tied_events(token.namespace().as_str(), 5_000_000, 1)
+            .pop()
+            .expect("one racer event");
+        let racer_id = racer.id;
+
+        let wrapped = AppendAfterCountStore {
+            inner: store.clone(),
+            pending: tokio::sync::Mutex::new(Some(racer)),
+        };
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let items = crate::handlers::collect_events_cursor_walk(
+            &wrapped,
+            &base_filter,
+            crate::handlers::TRANSPORT_PAGE_ROWS,
+            (cap as u64) + 2,
+        )
+        .await
+        .expect("a concurrent boundary append must not error the walk");
+        assert_eq!(
+            items.len(),
+            cap + 1,
+            "the point-in-time view holds the pre-append population"
+        );
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            items.iter().map(|event| event.id).collect();
+        assert_eq!(distinct.len(), cap + 1, "no row may be double-counted");
+        assert!(
+            !distinct.contains(&racer_id),
+            "the racing row is excluded from this walk's view, not half-included"
+        );
+        assert!(
+            wrapped.pending.lock().await.is_none(),
+            "the completeness count must have fired and injected the racing append; \
+             otherwise this test exercised nothing"
+        );
+        assert!(
+            store
+                .get_event(racer_id)
+                .await
+                .expect("racer lookup")
+                .is_some(),
+            "the racing row must actually be in the store"
+        );
+    }
+
+    /// Rows at `created_at == i64::MAX` admit no exclusive bound above them:
+    /// the cursor must not saturate past them (which would silently skip the
+    /// uncollected remainder of the group) — the walk re-reads, dedups, and
+    /// still reaches every row exactly once, including the older rows.
+    #[tokio::test]
+    async fn max_timestamp_group_is_fully_collected_not_skipped() {
+        let (_, rt) = make_pack();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let store = rt.events(&token).expect("event store");
+
+        let mut batch = tied_events(token.namespace().as_str(), i64::MAX, 5);
+        batch.extend(tied_events(token.namespace().as_str(), 1_000_000, 2));
+        store.append_events(batch).await.expect("seed max group");
+
+        let base_filter = EventFilter {
+            after: Some(0),
+            ..EventFilter::default()
+        };
+        let items = crate::handlers::collect_events_cursor_walk(
+            store.as_ref(),
+            &base_filter,
+            /* page_size = */ 4,
+            /* max_rows = */ 100,
+        )
+        .await
+        .expect("the max-timestamp group must be pageable");
+        assert_eq!(items.len(), 7, "all seven rows must arrive");
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            items.iter().map(|event| event.id).collect();
+        assert_eq!(distinct.len(), 7, "no row may be double-counted");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|event| event.created_at == i64::MAX)
+                .count(),
+            5,
+            "every max-timestamp row must be collected, none skipped"
+        );
+    }
+
     /// The public handler must still identify a successful exhaustive response
     /// as exact; pagination mechanics are covered separately with injected limits.
     #[tokio::test]
@@ -8498,13 +8869,15 @@ mod event_counts_tests {
         }
     }
 
-    /// A date-only `since` (no time-of-day component) is coerced to midnight
-    /// UTC rather than silently resolving to a null result — the bug reported
-    /// in #984, where the RFC-3339 parser rejected the value but the failure
-    /// never surfaced to the caller.
+    /// A date-only `since` (no time-of-day component) is accepted rather than
+    /// silently resolving to a null result (#984), and anchors to the named
+    /// day's earliest instant in the CONFIGURED DISPLAY TIMEZONE (ADR-169 D1)
+    /// — not midnight UTC. New York's 2026-07-07 begins at 04:00Z, so the
+    /// two rules produce different instants and a UTC-anchoring regression
+    /// fails this assert.
     #[tokio::test]
-    async fn date_only_since_is_coerced_to_midnight_utc() {
-        let (pack, rt) = make_pack();
+    async fn date_only_since_anchors_in_the_display_timezone() {
+        let (pack, rt) = make_pack_with_tz("America/New_York");
         let registry = empty_registry();
         let token = rt.authorize(Namespace::local()).unwrap();
 
@@ -8518,78 +8891,153 @@ mod event_counts_tests {
             .await
             .expect("date-only `since` must be accepted, not silently nulled");
 
+        let expected_us = chrono::DateTime::parse_from_rfc3339("2026-07-07T00:00:00-04:00")
+            .unwrap()
+            .timestamp_micros();
         let since = result["since"].as_str().expect("since must be a string");
-        assert!(
-            since.starts_with("2026-07-07T00:00:00"),
-            "date-only `since` must coerce to midnight UTC: {result}"
+        assert_eq!(
+            since,
+            micros_to_iso(expected_us),
+            "date-only `since` must anchor to the day's earliest instant in the \
+             display timezone (04:00Z for New York), not midnight UTC: {result}"
         );
     }
 
-    /// A date-only `until` must include the entire named day, not just its
-    /// midnight instant — the window is half-open `[since, until)`, so a
-    /// date-only `until` has to roll to the *next* day's midnight or the
-    /// whole named day is silently dropped (#994).
+    /// With the display timezone configured as UTC, date-only anchoring is
+    /// exactly the old midnight-UTC behavior — the control arm separating
+    /// "anchors in the configured zone" from "anchors somewhere new".
     #[tokio::test]
-    async fn date_only_until_includes_the_whole_named_day() {
-        let (pack, rt) = make_pack();
+    async fn date_only_since_under_utc_config_is_midnight_utc() {
+        let (pack, rt) = make_pack_with_tz("UTC");
         let registry = empty_registry();
         let token = rt.authorize(Namespace::local()).unwrap();
 
-        let just_before_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 6)
-            .unwrap()
-            .and_hms_opt(23, 59, 59)
-            .unwrap()
-            .and_utc()
-            .timestamp_micros();
-        // Last representable instant of the `until` day = the INCLUDED end of the edge;
-        // paired with `next_midnight` (the first EXCLUDED instant) this pins both sides
-        // of the exclusive upper bound to within one microsecond.
-        let end_of_named_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 7)
-            .unwrap()
-            .and_hms_micro_opt(23, 59, 59, 999_999)
-            .unwrap()
-            .and_utc()
-            .timestamp_micros();
-        let next_midnight = chrono::NaiveDate::from_ymd_opt(2026, 7, 8)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_micros();
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2026-07-07"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("date-only `since` must be accepted under UTC config");
 
-        seed_event(
-            &rt,
-            &token,
-            "search",
-            EventKind::SearchExecuted,
-            "lambda:a",
-            just_before_day,
-            json!({}),
-        )
-        .await;
-        seed_event(
-            &rt,
-            &token,
-            "search",
-            EventKind::SearchExecuted,
-            "lambda:a",
-            end_of_named_day,
-            json!({}),
-        )
-        .await;
-        // Exactly at the next day's midnight — must still be EXCLUDED.
-        seed_event(
-            &rt,
-            &token,
-            "search",
-            EventKind::SearchExecuted,
-            "lambda:a",
-            next_midnight,
-            json!({}),
-        )
-        .await;
+        let since = result["since"].as_str().expect("since must be a string");
+        assert!(
+            since.starts_with("2026-07-07T00:00:00"),
+            "UTC display timezone anchors date-only `since` at midnight UTC: {result}"
+        );
+    }
 
-        assert_eq!(seeded_count(&rt, &token).await, 3);
+    /// On a zone's spring-forward date local midnight does not exist; the
+    /// anchor must be the least instant carrying the date (Havana jumps
+    /// 00:00 -> 01:00 on 2021-03-14, so the day begins at 01:00 local,
+    /// 05:00Z), never a silent fall-back to UTC midnight and never an error.
+    #[tokio::test]
+    async fn date_only_since_on_a_gap_date_takes_the_least_instant() {
+        let (pack, rt) = make_pack_with_tz("America/Havana");
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2021-03-14"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("a gap date must anchor, not error");
+
+        let boundary_us = chrono::DateTime::parse_from_rfc3339("2021-03-14T01:00:00-04:00")
+            .unwrap()
+            .timestamp_micros();
+        let since = result["since"].as_str().expect("since must be a string");
+        let since_us = chrono::DateTime::parse_from_rfc3339(&since.replace("Z", "+00:00"))
+            .expect("since must parse")
+            .timestamp_micros();
+        // The shared anchor resolves gap dates by bisection at one-second
+        // granularity (see `khive_runtime::time_anchor`), so the result is
+        // within [boundary, boundary + 1s) — never before the boundary
+        // (which would be the previous local date) and never the silent
+        // UTC-midnight (04:00Z) the old rule produced.
+        assert!(
+            (0..1_000_000).contains(&(since_us - boundary_us)),
+            "the gap date anchors at its 01:00-local/05:00Z boundary \
+             (within the 1s bisection granularity): {result}"
+        );
+    }
+
+    /// A date the zone's local calendar skips entirely (Samoa crossed the
+    /// date line over 2011-12-30) has no instant to anchor to: the verb
+    /// rejects it with an error naming the zone, rather than silently
+    /// anchoring somewhere else.
+    #[tokio::test]
+    async fn date_only_since_on_a_skipped_date_is_rejected_naming_the_zone() {
+        let (pack, rt) = make_pack_with_tz("Pacific/Apia");
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "2011-12-30"}),
+                &registry,
+                &token,
+            )
+            .await;
+
+        match result {
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("since") && msg.contains("Pacific/Apia"),
+                    "the error must name the field and the zone: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput for a skipped date, got {other:?}"),
+        }
+    }
+
+    /// A date-only `until` must include the entire named day in the display
+    /// timezone, not just its first instant — the window is half-open
+    /// `[since, until)`, so a date-only `until` has to roll to the *next*
+    /// day's earliest instant or the whole named day is silently dropped
+    /// (#994). Pinned to America/New_York: the named day 2026-07-07 spans
+    /// [04:00Z on the 7th, 04:00Z on the 8th), so every edge below sits four
+    /// hours away from where UTC anchoring would put it — a UTC regression
+    /// flips the included/excluded status of the edge events.
+    #[tokio::test]
+    async fn date_only_until_includes_the_whole_named_day() {
+        let (pack, rt) = make_pack_with_tz("America/New_York");
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let us = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("fixture instant")
+                .timestamp_micros()
+        };
+        // The window is [2026-07-06T04:00:00Z, 2026-07-08T04:00:00Z).
+        // Four seeds pin all four edge behaviors:
+        let before_window = us("2026-07-06T03:59:59Z"); // excluded (before since)
+        let at_since = us("2026-07-06T04:00:00Z"); // included (since inclusive)
+        let end_of_named_day = us("2026-07-08T03:59:59.999999Z"); // included edge
+        let next_day_start = us("2026-07-08T04:00:00Z"); // excluded (until exclusive)
+
+        for ts in [before_window, at_since, end_of_named_day, next_day_start] {
+            seed_event(
+                &rt,
+                &token,
+                "search",
+                EventKind::SearchExecuted,
+                "lambda:a",
+                ts,
+                json!({}),
+            )
+            .await;
+        }
+
+        assert_eq!(seeded_count(&rt, &token).await, 4);
 
         let result = pack
             .dispatch(
@@ -8607,7 +9055,8 @@ mod event_counts_tests {
         assert_eq!(
             result["total"],
             json!(2),
-            "date-only `until` must include the whole named day and exclude the next day's midnight: {result}"
+            "the window must include exactly the since edge and the named day's \
+             last instant, excluding the instants at both outer edges: {result}"
         );
     }
 

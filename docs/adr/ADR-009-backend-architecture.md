@@ -2,12 +2,16 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: khive maintainers
+**Authors**: khive maintainers\
+**Amended by**: [ADR-111](ADR-111-blob-store.md) adds `BlobStore`; [ADR-121](ADR-121-attachments-first-class.md)
+and ADR-160 Phase 4 add `AttachmentStore`. References below to eight traits describe the original
+surface; the current public capability enum has ten variants.
 
 ## Context
 
 khive persists its knowledge graph in SQLite. The storage layer is split: `khive-storage`
-defines eight capability traits (ADR-005); `khive-db` implements SQLite storage traits,
+defines capability traits (the original eight in ADR-005, later extended by ADR-111/121);
+`khive-db` implements SQLite storage traits,
 including FTS5 `TextSearch` and the current sqlite-vec `VectorStore`. Separate retrieval
 crates (`khive-retrieval`, `khive-bm25`, `khive-hnsw`, `khive-vamana`, `khive-fusion`)
 ship in-process retrieval engines and fusion.
@@ -20,7 +24,7 @@ The backend architecture must satisfy:
 2. **Multi-file federation.** Different packs may use different SQLite files (hot KG vs cold
    corpus vs archive). This is multiple SQLite files in one process, not a distributed
    database.
-3. **Trait portability.** The eight storage traits (ADR-005) are the contract boundary.
+3. **Trait portability.** The storage traits (ADR-005 and amendments) are the contract boundary.
    A future non-SQLite backend must be possible without changing runtime or pack code.
 4. **Vector search.** The current `khive-db` VectorStore is sqlite-vec compatibility.
    In-process retrieval engines also ship as separate crates, and pack-specific paths may
@@ -33,7 +37,8 @@ The backend architecture must satisfy:
 
 khive's v1 backend is SQLite. The concrete backend crate is `khive-db`.
 
-`khive-db` implements the eight `khive-storage` capability traits (ADR-005):
+`khive-db` implements the original eight `khive-storage` capability traits (ADR-005), plus the
+later blob and attachment capabilities:
 
 - `SqlAccess` — raw SQL reader/writer/transaction
 - `EntityStore` — entity/node CRUD
@@ -43,6 +48,8 @@ khive's v1 backend is SQLite. The concrete backend crate is `khive-db`.
 - `VectorStore` — current dense vector storage/search via sqlite-vec compatibility
 - `SparseStore` — sparse vector storage
 - `TextSearch` — full-text search via FTS5 trigram
+- `BlobStore` — content-addressed object storage and transactional filesystem GC
+- `AttachmentStore` — role-keyed entity/note blob-reference metadata
 - Retrieval engines — BM25, HNSW, Vamana, and fusion live outside `khive-db`
 
 `khive-db` supports both file-backed and in-memory storage. In-memory mode is used for
@@ -67,7 +74,8 @@ Current: khive-db (SQLite)
 Future:  khive-db-postgres, khive-db-rocksdb, etc. (if approved by ADR)
 ```
 
-Each backend crate implements the same eight `khive-storage` traits. The runtime and
+Each backend crate implements the capabilities it advertises under the same `khive-storage`
+contracts. The runtime and
 packs depend on traits, not on any specific backend crate.
 
 ### v1 multi-backend: multiple SQLite files
@@ -168,7 +176,7 @@ version commitment in this ADR.
 If a non-SQLite engine is proposed, it requires:
 
 1. A new ADR justifying the engine against the embedded deployment constraint.
-2. Its own backend crate implementing the eight storage traits.
+2. Its own backend crate implementing the required storage traits.
 3. Backend contract test coverage matching `khive-db`.
 
 ### `StorageError::Unsupported` contract
@@ -184,7 +192,7 @@ implementing traits only to fail at every call.
 
 ### Backend contract tests
 
-Backend contract tests exercise the eight storage traits against `khive-db` (both
+Backend contract tests exercise the advertised storage traits against `khive-db` (both
 SQLite memory and SQLite file-backed). They validate that the backend correctly
 implements the trait contracts.
 
@@ -292,10 +300,111 @@ read-only mode.
 
 ## Implementation
 
-- `crates/khive-db/`: SQLite backend implementing eight storage traits.
+- `crates/khive-db/`: SQLite backend implementing the current storage traits.
 - `crates/khive-db/src/stores/`: one module per trait implementation (entity, graph,
   note, event, vector, sparse, text, sql).
 - `crates/khive-db/src/migrations.rs`: SQLite schema migrations (applied by `kkernel db migrate`, ADR-003).
 - `crates/khive-db/src/backend.rs`: `StorageBackend` — the concrete SQLite connection
   wrapper providing `Arc<dyn Trait>` accessors.
-- Backend contract tests: `khive-db/tests/contract/` exercising all eight traits.
+- Backend contract tests: trait-specific suites exercising the advertised capabilities.
+
+## Amendment — Guarded replacement for full-row updates (#1753)
+
+This amendment qualifies the following accepted text:
+
+> “`khive-storage` trait surface unchanged by this ADR.”
+
+and:
+
+> “`upsert_edge` uses `INSERT ... ON CONFLICT DO UPDATE` (not `DO NOTHING`).”
+
+### Decision
+
+The storage contract adds guarded full-row replacement for entities and edges, alongside the
+existing note replacement primitive:
+
+- `EntityStore::replace_entity_if_unchanged` accepts a complete replacement entity and the
+  revision read during preparation. Its write is an update-only compare-and-swap: the entity id,
+  expected revision, and expected deletion state must still match, and the replacement revision
+  must strictly advance the expected revision.
+- `GraphStore::replace_edge_if_unchanged` provides the corresponding contract for a complete edge
+  replacement. It compares the edge id, expected revision, and expected deletion state before
+  replacing the row; it does not insert a missing edge or silently apply a stale replacement.
+- Exactly one affected row is a successful guarded replacement. A missing row, changed revision or
+  deletion state, or non-advancing replacement is a distinct optimistic-concurrency conflict,
+  surfaced at the storage boundary as `StorageError::Conflict`. It is not `NotFound`, an input
+  error, or an undifferentiated backend-driver failure. Callers must not blindly retry the stale
+  full row; they must read current state and explicitly reapply or abandon their intended change.
+
+The existing `NoteStore::replace_note_if_unchanged` remains available as the note precedent. Its
+current public result is `false` for a refused compare-and-swap, and its strict revision and
+deletion-marker predicate remains the reference semantics (`crates/khive-storage/src/note.rs:309-321`;
+`crates/khive-db/src/stores/note.rs:114-175,891-905`). This amendment does not remove or repurpose
+that method. Backends that do not implement either new method may return the existing
+`StorageError::Unsupported` default; they must not fall back to an unguarded upsert.
+
+`StorageError::Conflict` already exists as a public storage error (`crates/khive-storage/src/error.rs:59-64`),
+so this amendment does not require a new error variant. If implementation chooses to introduce a
+new public error variant instead, adding that variant is a source-compatibility event: downstream
+code with exhaustive matches must handle it. The new trait methods likewise require downstream
+storage implementations to add an implementation or use an explicitly documented default.
+
+### Existing operations and semantics that do not change
+
+The ordinary `upsert_entity` and `upsert_edge` operations remain insert-or-update operations and
+remain usable when the caller intentionally wants their existing behavior. The entity statement
+continues to write the full entity row (`crates/khive-db/src/stores/entity.rs:57-82`) and the edge
+statement continues to use its existing id and natural-key conflict arms
+(`crates/khive-db/src/stores/graph.rs:90-124`); their SQLite conflict behavior is not silently
+changed into compare-and-swap. Batch upserts, reads, deletes, cross-backend rules, the SQL schema,
+and the MCP wire surface are unchanged. Guarded replacement is an additional opt-in storage seam.
+
+### Scope
+
+This change covers these eight production-graph sites:
+
+1. Runtime entity curation (`crates/khive-runtime/src/curation.rs:853-928`).
+2. Runtime non-symmetric edge curation (`crates/khive-runtime/src/operations.rs:5662-5816`).
+3. Runtime symmetric edge curation (`crates/khive-runtime/src/operations.rs:5559-5639,5747-5771`),
+   which replaces both directed rows in place.
+4. Atomic entity plans (`crates/khive-runtime/src/atomic_prepare.rs:804-892`).
+5. Atomic non-symmetric edge plans (`crates/khive-runtime/src/atomic_prepare.rs:863-1050`).
+6. Atomic symmetric edge plans (`crates/khive-runtime/src/atomic_prepare.rs:1000-1040`).
+7. `comm.heartbeat` channel-health persistence (`crates/khive-pack-comm/src/handlers.rs:2321-2411`;
+   dispatch at `crates/khive-pack-comm/src/pack.rs:291-292`).
+8. Scheduled-event finalization (`crates/khive-mcp/src/pending_events.rs:1113-1128,2149-2213`),
+   covering every finalization branch rather than the normal dispatch path alone.
+
+Sites 3 and 6 are the symmetric edge paths. They are in scope because they replace rows through the
+same unguarded full-row statement (`crates/khive-db/src/stores/graph.rs:303-306`, whose `WHERE`
+clause pins only namespace and id) as the non-symmetric paths. Excluding them would leave the
+contract stated here true of one edge path and false of the other, which is not a contract.
+
+Site 8 covers all six finalization branches, not only the normal one. The pre-action, error, missed
+and non-action branches finalize on claim identity alone; the guard stated here binds the serialized
+properties snapshot as well, because a claim token is an ownership fence and not a content fence, so
+a property writer landing between claim and finalization is otherwise overwritten while the
+finalizer reports success.
+
+The 19 code-map sites in `khive-pack-code` are not covered by this amendment. They are tracked
+separately in public issue #2231.
+
+The source confirms why these sites need the additional seam: entity curation currently reads and
+then calls the unguarded entity upsert (`crates/khive-runtime/src/curation.rs:852-856,918-928`),
+and the non-symmetric edge path currently calls the unguarded edge upsert
+(`crates/khive-runtime/src/operations.rs:5811-5816`). The guarded methods close that
+read-to-replacement race without changing the ordinary upsert contract.
+
+### Rejected alternatives
+
+- Relying on the write queue alone is insufficient. The entity store routes a write through the
+  pool-wide writer task (`crates/khive-db/src/stores/entity.rs:182-205`), while `get_entity` uses a
+  separate reader (`crates/khive-db/src/stores/entity.rs:726-742`); that does not bind the earlier
+  read to the later replacement. The guarded predicate is the required safety boundary.
+- Blindly retrying a stale row is rejected because it can overwrite the intervening change again.
+- Replacing a whole-document race with an unconditional `SET properties = ?` is rejected; it
+  still permits a stale document to overwrite concurrent changes.
+
+No open design question remains within this storage amendment: the conflict is a typed storage
+outcome, ordinary upserts retain their existing semantics, and the six-site boundary above is
+explicit.

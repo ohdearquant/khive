@@ -3,10 +3,11 @@
 **Status**: accepted\
 **Date**: 2026-08-08\
 **Authors**: khive maintainers\
-**Amended by**: [ADR-149](ADR-149-moodboard-preference-learning.md); proposed
-[ADR-160](ADR-160-shared-pack-infrastructure.md) converges attachment publication on ADR-121 and
-extracts shared hydration, complete embedding-space identity/lineage mapping, fusion,
-materialization, and checkpoint seams on acceptance.
+**Amended by**: [ADR-149](ADR-149-moodboard-preference-learning.md); accepted
+[ADR-160](ADR-160-shared-pack-infrastructure.md), whose shared-hydration phase is implemented
+(source-image and preference reads hydrate through the runtime seam) and whose remaining phases
+converge attachment publication on ADR-121 and extract the embedding-space identity/lineage
+mapping, fusion, materialization, and checkpoint seams.
 
 ## Context
 
@@ -139,10 +140,11 @@ and `rank` is one-based after self-exclusion.
 
 The runtime adds two consumer seams rather than exposing its backend:
 
-1. `create_entity_with_content_ref(..., &ContentRef)` is the typed publish-time attachment path.
-   It requires an installed `BlobStore` and verifies `exists(content_ref)` before any entity
-   mutation, then delegates to the same compensated entity-create implementation as `create_entity`, so an
-   FTS or text-vector failure cleans the entity row and every index touched by that call.
+1. `create_entity_with_attachments(..., Vec<NewAttachment>)` is the typed publish-time path.
+   Moodboard supplies the original under role `"content"`. The seam requires an installed
+   `BlobStore`, verifies every `ContentRef` before mutation, and commits the entity plus roles in
+   one transaction before the existing FTS/vector compensation path; compensation hard-deletes
+   the entity and attachment rows together.
 2. `vectors_for_named_identity(token, &NamedVectorIdentity)` returns a token-scoped vector store.
    `NamedVectorIdentity::new` rejects an empty/unsafe or over-128-byte model key, an empty or
    over-512-byte model name, zero dimension, and dimensions above 8192. The accessor validates the actual vec table's declared dimension
@@ -176,8 +178,8 @@ is shared by the two runtime handles.
    visual vector row.
 
 The normalized PNG is derived cache input, not a persisted attachment in the current
-implementation. Proposed ADR-160 migrates the original visual and the preference bundle/network
-blob anchors to ADR-121 roles on acceptance without promoting this normalized cache input. A
+implementation. ADR-160 Phase 4 migrates the original visual and the preference bundle/network
+blob anchors to ADR-121 roles without promoting this normalized cache input. A
 failure after blob publication may leave an orphan for ADR-111 grace-period GC. A
 failure after entity creation may leave an attached asset without the current descriptor row;
 retrying the same bytes reuses the entity and heals the vector. `created` reports whether this call
@@ -189,8 +191,9 @@ stored as mutable scalar asset properties; they belong to the immutable descript
 
 The lookup-before-create contract is retry-idempotent. A process-wide content-ref-striped critical
 section performs the lookup again before create, preventing duplicate first ingests within one
-Khive process without serializing unrelated content. Because `entities.content_ref` is indexed but
-not unique, separate Khive processes can still race and create duplicates. V1 discloses that
+Khive process without serializing unrelated content. Because attachment role `"content"` is indexed
+but not uniquely constrained across records, separate Khive processes can still race and create
+duplicates. V1 discloses that
 cross-process boundary rather than adding a uniqueness rule that would incorrectly apply to every
 entity kind or namespace.
 
@@ -242,17 +245,16 @@ semaphore: `KHIVE_MOODBOARD_INFERENCE_CONCURRENCY` defaults to 1 and must be an 
 preventing one parallel ops-file chunk from launching unbounded Qwen activation memory.
 The owned semaphore permit is moved into the blocking inference closure, so cancellation of an
 awaiting request cannot release capacity while native Lattice inference is still running.
-Raster byte decode and governed preprocessing have a separate pack-owned single-permit gate,
-acquired before base64 decode or BlobStore hydration and held until the original byte buffer and
-large decoded intermediates have been consumed/dropped. This bounds the ordinary 100-op parallel
-chunk to one active 64 MiB source / 256 MiB decoder allocation pipeline while still allowing the
-small governed rendition to queue for inference. Cold ingest completes verified model loading
-before acquiring this gate or decoding caller bytes, preserving the pre-publication identity fence
-without retaining a large raster across Qwen construction. Search releases the gate after its
-original bytes and decode intermediates are gone, before a possible cold model load. Search first
-reads `BlobStore::size` and rejects
-a missing or over-64-MiB source before hydration, then rechecks the returned byte length and BLAKE3
-digest so imported/repointed assets and backend races cannot bypass the ingest ceiling.
+Raster byte decode and governed preprocessing have a separate pack-owned single-permit gate. Ingest
+acquires it before caller base64 decode; search first obtains a backend-verified source through the
+shared runtime `BlobHydrator`, then acquires the preprocessing gate before raster decode and
+normalization. Search retains the `VerifiedBlob` lease while it waits for and executes preprocessing,
+and releases both the raw lease and preprocessing permit after the governed rendition is owned. This
+keeps shared raw-byte admission separate from the decoded-raster allocation bound, while still
+limiting the ordinary 100-op parallel chunk to one active decoder pipeline. Cold ingest completes
+verified model loading before acquiring the gate or decoding caller bytes, preserving the
+pre-publication identity fence without retaining a large raster across Qwen construction. Search
+releases the gate before a possible cold model load.
 
 ### D6 — Exact local cosine retrieval
 
@@ -373,4 +375,4 @@ before equivalent numerical claims may be made for 0.9.0.
 - [ADR-027](ADR-027-dynamic-pack-loading.md) — inventory registration and opt-in loading.
 - [ADR-095](ADR-095-verb-surface-consolidation.md) — CRUD consolidation.
 - [ADR-111](ADR-111-blob-store.md) — publish-then-reference CAS and orphan grace GC.
-- [ADR-121](ADR-121-attachments-first-class.md) — proposed multi-rendition attachment model.
+- [ADR-121](ADR-121-attachments-first-class.md) — accepted multi-rendition attachment model.

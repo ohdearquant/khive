@@ -1,0 +1,94 @@
+name: Timezone Database Audit
+
+# Date-only values (task due dates) resolve against a configured display
+# timezone by searching the UTC axis for the least instant carrying a local
+# date. That search is correct only with respect to the zone data chrono-tz
+# bundles, so the bundled data is an input to the resolver, not an inert
+# dependency: moving the pin can change which dates have no local midnight and
+# where a gap begins.
+#
+# The all-zone sweep exists to re-derive that. It is `#[ignore]`d because it
+# walks every zone and costs 48.28s in the debug profile CI uses (measured
+# 2026-08-23; the same sweep is 3.08s with --release, and the job still runs
+# debug because the trigger is a lockfile change, which invalidates the build
+# cache, so a release run would pay a cold optimized rebuild to save 45s of
+# sweep). That is the wrong trade on every ordinary PR and the right one
+# exactly when the pin moves. This workflow supplies the trigger, so the duty
+# is enforced rather than remembered: it runs on any PR touching a manifest or
+# lockfile that can carry a chrono-tz version, and on the source of the gtd
+# pack, which holds both the resolver and the sweep.
+#
+# What this does NOT gate: ordinary correctness of the resolver, which the
+# crate's normal (non-ignored) tests cover on every PR through the main CI job.
+
+on:
+  pull_request:
+    paths:
+      - "crates/Cargo.toml"
+      - "crates/Cargo.lock"
+      - "crates/khive-merge/Cargo.lock"
+      - "crates/khive-runtime/Cargo.toml"
+      # Source only. The resolver and the sweep both live under src/, so a
+      # README, a bench, or a doc change in this crate cannot affect the
+      # result and should not pay for the run.
+      - "crates/khive-runtime/src/**"
+      - ".github/workflows/tz-database-audit.yml"
+
+# Declared rather than inherited. With no `permissions:` block a workflow gets
+# the repository's default GITHUB_TOKEN scopes, so its actual authority is set
+# by a repository setting this file cannot see and does not track. This job
+# checks out, builds and runs one test; read access to the contents is the
+# whole of what it needs.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tz-database-audit:
+    name: Timezone Database Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: crates
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The next steps build and run code from the pull request, so the
+          # checkout must not leave a usable token behind for them to read.
+          # The trigger is `pull_request` and the job declares `contents: read`
+          # on a public repository, so what a leak would yield is small; that
+          # bounds the damage, it does not make persisting the credential
+          # correct. Matches unlocked-dependencies.yml, which does the same.
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+
+      - name: Report the resolved chrono-tz version
+        run: |
+          set -euo pipefail
+          # Printed so a failure is diagnosable from the log alone: the sweep's
+          # result is only meaningful against a named version of the zone data.
+          # Read from the lockfile rather than `cargo tree`, and with no `|| true`:
+          # a step that cannot fail cannot report, and this one should fail loudly
+          # if the dependency it is named for is not in the graph at all.
+          grep -A1 '^name = "chrono-tz"' Cargo.lock
+
+      - name: Run the all-zone sweep
+        run: |
+          set -euo pipefail
+          # --ignored, not --include-ignored: this job exists to run exactly the
+          # sweep, and including the ordinary tests here would let a failure in
+          # one be reported as a failure of the other.
+          cargo test -p khive-runtime --lib --release tz_database_audit -- --ignored --nocapture

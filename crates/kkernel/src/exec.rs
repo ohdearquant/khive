@@ -46,8 +46,8 @@ use clap::Parser;
 #[cfg(test)]
 use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
-    apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
-    enforce_strict_actor_mode, install_resolved_blob_store,
+    apply_env_output_format, build_server_multi_backend_with_db_anchor,
+    build_single_backend_runtime, config_discovery_db_anchor, enforce_strict_actor_mode,
     normalize_redundant_db_override_with_source, reject_conflicting_db_override_with_source,
     validate_declared_backend_access_modes, RuntimeConfigInputs,
 };
@@ -55,9 +55,11 @@ use khive_mcp::server::KhiveMcpServer;
 #[cfg(unix)]
 use khive_mcp::server::{compute_config_id, compute_config_id_with_storage_mode};
 use khive_mcp::tools::request::RequestParams;
+#[cfg(test)]
+use khive_runtime::KhiveRuntime;
 #[cfg(unix)]
 use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
-use khive_runtime::{KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig};
+use khive_runtime::{KhiveConfig, Namespace, RuntimeConfig};
 use khive_types::RefusalReason;
 
 /// Stable stderr prefix for machine-classifiable exec refusals.
@@ -1762,6 +1764,19 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
             brain_profile: None,
         })?;
 
+    // ADR-170 embedded mode: `kkernel exec`'s in-process fallback is a
+    // one-shot — a socket forwarder would be reaped at process exit before
+    // delivering, losing every event. The shared resolver already emits
+    // direct (socket-less) mode for exactly this class of host; only the
+    // resident daemon entrypoints upgrade to forwarding
+    // (`enable_events_forwarding_for_daemon`). SQLite's per-file
+    // cross-process exclusion covers direct appends overlapping a running
+    // events daemon.
+    debug_assert!(cfg
+        .events_split
+        .as_ref()
+        .is_none_or(|split| split.socket_path.is_none()));
+
     // Apply the explicit actor only AFTER the shared resolver has loaded the
     // project/config/environment fallbacks. This makes the CLI value the true
     // highest-precedence tier without coupling identity to storage namespace.
@@ -2349,7 +2364,8 @@ async fn run_exec_inline_with_forward(
         &khive_cfg,
         db_context.raw.as_deref(),
         db_context.anchor.as_deref(),
-    )?;
+    )
+    .await?;
 
     let params = RequestParams {
         ops,
@@ -2377,30 +2393,23 @@ async fn run_exec_inline_with_forward(
 /// bulk-apply paths). See
 /// `crates/kkernel/docs/design.md#exec-local-dispatch-fallback-server-adr-067-adr-028-8`
 /// for why this must agree with the daemon's own multi-backend boot logic.
-fn build_local_fallback_server(
+async fn build_local_fallback_server(
     cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
     db_anchor: Option<&std::path::Path>,
 ) -> Result<KhiveMcpServer> {
-    // Held across construction below (`KhiveRuntime::new` / `KhiveMcpServer::new`
-    // / `build_server_multi_backend`, both of which run migrations and apply
-    // pack schema plans synchronously) and dropped when this function returns.
+    // Held across the real-host async schema/application coordinator and pack
+    // assembly; dropped only after the fully wired server is ready.
     let _boot_guard = acquire_local_construction_guard(&cfg)?;
     if khive_cfg.backends.is_empty() {
-        let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
-        // Mirror the `serve` boot path's single-backend branch (ADR-111
-        // Amendment 2): without this, `exec`'s in-process fallback server
-        // never installs a `BlobStore`, so `blob.put`/`blob.get`/`blob.stat`
-        // fail as "unconfigured" here even when `serve` resolves one from
-        // the same config and backend (khive#1209).
-        install_resolved_blob_store(&rt, khive_cfg, rt.backend())?;
+        let rt = build_single_backend_runtime(cfg, khive_cfg).await?;
         let env_fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
         Ok(KhiveMcpServer::new(rt)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_default_output_format(env_fmt))
     } else {
-        build_server_multi_backend_with_db_anchor(cfg, khive_cfg, cli_db_override, db_anchor)
+        build_server_multi_backend_with_db_anchor(cfg, khive_cfg, cli_db_override, db_anchor).await
     }
 }
 
@@ -2588,7 +2597,8 @@ async fn run_exec_ops_file(
         &khive_cfg,
         db_context.raw.as_deref(),
         db_context.anchor.as_deref(),
-    )?;
+    )
+    .await?;
 
     validated
         .snapshot
@@ -3174,7 +3184,9 @@ mod tests {
             ..RuntimeConfig::default()
         };
         apply_actor_pin_and_expectation(&mut cfg, Some("lambda:pinned"), None).unwrap();
-        let server = build_local_fallback_server(cfg, &KhiveConfig::default(), None, None).unwrap();
+        let server = build_local_fallback_server(cfg, &KhiveConfig::default(), None, None)
+            .await
+            .unwrap();
         let raw = server
             .dispatch_request_local(RequestParams {
                 ops: r#"comm.send(to="local", content="actor pin attribution")"#.to_string(),
@@ -3845,6 +3857,7 @@ id = "lambda:fallback"
                     "session".to_string(),
                     PackConfig {
                         backend: "sessions".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -3957,6 +3970,7 @@ id = "lambda:fallback"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -3988,6 +4002,7 @@ id = "lambda:fallback"
         // (ADR-028 §8) since 2 backends are already declared.
         let db_anchor = cfg.db_path.clone();
         let server = build_local_fallback_server(cfg, &khive_cfg, None, db_anchor.as_deref())
+            .await
             .expect("multi-backend local fallback must build");
 
         let send = server
@@ -4060,9 +4075,9 @@ id = "lambda:fallback"
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn build_local_fallback_server_uses_captured_anchor_after_home_changes() {
+    async fn build_local_fallback_server_uses_captured_anchor_after_home_changes() {
         let (previous_home, _first_home) = isolate_home_for_test();
         let cfg = RuntimeConfig {
             db_path: khive_runtime::resolve_db_anchor(None),
@@ -4086,7 +4101,7 @@ id = "lambda:fallback"
         let second_home = tempfile::tempdir().expect("second HOME");
         std::env::set_var("HOME", second_home.path());
 
-        let result = build_local_fallback_server(cfg, &khive_cfg, None, db_anchor.as_deref());
+        let result = build_local_fallback_server(cfg, &khive_cfg, None, db_anchor.as_deref()).await;
         restore_home(previous_home);
 
         assert!(
@@ -4110,8 +4125,8 @@ id = "lambda:fallback"
     // `[storage.blob]` config and no `KHIVE_BLOB_ROOT`, resolution falls
     // back to `<db_dir>/blobs` — that directory existing after construction
     // is proof the install call ran.
-    #[test]
-    fn build_local_fallback_server_installs_blob_store_single_backend() {
+    #[tokio::test]
+    async fn build_local_fallback_server_installs_blob_store_single_backend() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("exec_blob.db");
         let cfg = RuntimeConfig {
@@ -4123,6 +4138,7 @@ id = "lambda:fallback"
         let khive_cfg = KhiveConfig::default();
 
         let _server = build_local_fallback_server(cfg, &khive_cfg, None, None)
+            .await
             .expect("single-backend local-exec construction must succeed");
 
         assert!(
@@ -4212,6 +4228,7 @@ id = "lambda:fallback"
             // guard, so it could run migrations/FTS DDL concurrently with
             // the guarded boot above against the same file.
             let server = build_local_fallback_server(cfg, &khive_cfg, None, None)
+                .await
                 .expect("guarded local-exec construction must succeed");
 
             for i in 0..count {
@@ -4292,7 +4309,7 @@ id = "lambda:fallback"
             // (daemon-unreachable fallback, --save-file, KHIVE_NO_DAEMON=1,
             // non-atomic --ops-file) funnels through this one function.
             let result = rt_handle
-                .block_on(async { build_local_fallback_server(cfg, &khive_cfg, None, None) });
+                .block_on(async { build_local_fallback_server(cfg, &khive_cfg, None, None).await });
             // Sent only AFTER construction returns — the test observes
             // whether this arrives before or after the lock is released.
             let _ = tx.send(());
@@ -6462,6 +6479,7 @@ path = "{}"
             .expect("explicit config must exist");
         let opened =
             khive_mcp::serve::build_registry_for_multi_backend(cfg, &khive_cfg, Some(":memory:"))
+                .await
                 .expect("force-memory runtime must build");
         restore_home(prev_home);
 

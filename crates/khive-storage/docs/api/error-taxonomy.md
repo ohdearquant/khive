@@ -71,13 +71,12 @@ fail-closed outcomes of `BlobStore::get_bounded_verified`. All three report
 default. Their owned `ContentRef` fields preserve validated content-addressed
 identity; no raw or malformed digest string enters the backend contract.
 
-This addition is intentionally Rust source-breaking: `BlobStore` gains a
-required method with no default, and `StorageError` is a public enum without
-`#[non_exhaustive]`. Downstream implementations must provide
-`get_bounded_verified`; exhaustive error matches must add arms for all three
-new variants. The existing `get` method remains available during the staged
-ADR-160 migration and is removed only after every production consumer moves to
-the bounded runtime path.
+This addition is intentionally Rust source-breaking: `BlobStore` requires
+`get_bounded_verified` with no default and no longer exposes an unbounded
+whole-buffer `get`; `StorageError` is also a public enum without
+`#[non_exhaustive]`. Downstream implementations must provide the bounded
+method, remove any obsolete trait `get` implementation, and add arms for all
+three new error variants in exhaustive matches.
 
 `BlobTooLarge.observed_at_least` is a lower bound, not always a verified final
 size. It may come from same-object metadata that caused an early refusal or
@@ -86,6 +85,20 @@ from the byte prefix that first crossed the caller's limit.
 and `BlobDigestMismatch` is evaluated only for a metadata-consistent complete
 body. None of these variants carries bytes or changes the existing flattened
 runtime/MCP error envelope.
+
+## Attachment capability source compatibility
+
+ADR-121/ADR-160 adds `StorageCapability::Attachments`. Because
+`StorageCapability` is a public closed enum, downstream exhaustive matches must
+add an `Attachments` arm. The new `AttachmentStore` trait does not change
+existing store implementers; `EntityStore::upsert_entity_with_attachments` has
+a conservative `Unsupported` default.
+
+Removing `Entity::with_content_ref` and runtime
+`create_entity_with_content_ref` is intentionally caller-source-breaking.
+`Entity.content_ref` itself remains for wire/read compatibility, but it is a
+read-only projection of attachment role `content`; ordinary entity upserts
+ignore it.
 
 ## Typed writer-pool checkout timeout source
 
@@ -112,6 +125,65 @@ MCP preserves this proof with `code`/`stage` set to
 `writer_queue_saturated`, the queue did accept this request, and no separate
 backoff policy is defined. Other `BEGIN IMMEDIATE` failures retain the generic
 pool error and are not promoted by rendered-message matching.
+
+## Typed storage-admission timeout
+
+`StorageError::AdmissionTimeout { operation, timeout_ms }` means a bounded
+wait for storage admission — a reader/writer handle slot or a pooled reader
+checkout — elapsed before anything was acquired. The operation never started,
+so retrying cannot duplicate a side effect. This is distinct from
+`StorageError::Timeout`, which makes no claim about whether work was in
+flight when the deadline expired; only the admission variant is promoted to
+a structured retryable failure, and only by its typed variant, never by
+rendered-message matching.
+
+One carve-out: the raw-SQL reader admission paths (`sql_bridge.reader_open`
+and `sql_bridge.reader_operation`) keep returning `StorageError::Timeout` on
+saturation, as the ADR-005 reader-admission amendment requires. The typed
+admission variant covers the writer-handle, atomic-unit, and pooled-reader
+checkout budgets.
+
+MCP emits `code`/`stage` of `storage_admission_timeout` with the failing
+`operation`, the elapsed `timeout_ms`, and `retryable: true`. `capability`,
+`scope`, and `retry_after_ms` are null: the handle-slot and reader-checkout
+budgets are capability-neutral and no separate backoff policy is defined.
+
+## Typed cached-reader read-transaction age eviction
+
+`sql_bridge`'s cached-reader read path proactively rolls back an admitted
+read transaction once it has pinned a WAL snapshot past the configured
+`read_tx_max_age` (#1846). Two typed, capability-neutral, `is_retryable() ==
+true` variants report the outcome, both public and both introduced by this
+change:
+
+- `StorageError::ReadTransactionAgeEvicted { operation, max_age_secs }` — the
+  `ROLLBACK` succeeded and autocommit was restored; the connection returns to
+  the pool ready for a fresh read snapshot.
+- `StorageError::ReadTransactionAgeEvictionCleanupFailed { operation,
+  max_age_secs, message }` — the `ROLLBACK` was denied or errored, or it
+  reported success without actually restoring autocommit. The connection is
+  discarded instead of being returned to the pool. `message` names which of
+  the two cleanup failures occurred.
+
+Both are always safe to retry: the age check runs before any read on the
+connection, so no side effect exists for a retry to duplicate, regardless of
+which cleanup outcome followed. Both are distinct from the generic
+`StorageError::Transaction` variant, whose other cases (write-side ambiguity,
+unrelated rollback failures) are not uniformly safe to retry — callers must
+not detect this condition by parsing rendered text.
+
+MCP maps both variants to the same `code`/`stage` of `read_tx_age_evicted`
+(`khive_runtime::error::READ_TX_AGE_EVICTED_STAGE`), the failing `operation`,
+`capability: "sql"`, `retryable: true`, and `timeout_ms` set to
+`max_age_secs * 1000`. `scope` and `retry_after_ms` are null. The rendered
+`message` field is the only wire-visible way to distinguish a clean eviction
+from a failed cleanup.
+
+`StorageError` is a public enum without `#[non_exhaustive]`, so adding these
+two variants is a Rust source-compatibility change for downstream code that
+exhaustively matches every variant; those matches must add
+`ReadTransactionAgeEvicted` and `ReadTransactionAgeEvictionCleanupFailed`
+arms.
 
 ## `is_fts5_syntax_error`
 

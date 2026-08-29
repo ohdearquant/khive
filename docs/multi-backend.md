@@ -46,18 +46,18 @@ declared in the resolved config file. From `crates/khive-mcp/src/serve.rs`:
 
 ```rust
 if khive_cfg.backends.is_empty() {
-    // Single-backend path — identical to pre-ADR-028 behavior.
-    let runtime = KhiveRuntime::new(config)?;
+    // Single-backend host path: prepare schema, coordinate V21, then expose runtime.
+    let runtime = build_single_backend_runtime(config, &khive_cfg).await?;
     return KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"));
 }
 
 // Multi-backend path (ADR-028).
-build_server_multi_backend(config, &khive_cfg)
+build_server_multi_backend(config, &khive_cfg, None).await
 ```
 
-With no `[[backends]]` section the server takes the byte-identical
-single-backend path: existing databases, MCP clients, and agent code are
-unaffected.
+With no `[[backends]]` section the server takes the single-backend async host
+path. Its external MCP behavior remains compatible, but boot now completes the
+V21 attachment/GC state machine before serving.
 
 ### The `main` backend is required
 
@@ -71,7 +71,7 @@ add a [[backends]] entry with name = "main"
 ```
 
 (Source: `build_server_multi_backend` and `build_registry_for_multi_backend` in
-`crates/khive-mcp/src/serve.rs`, lines 369-377 and 141-148.)
+`crates/khive-mcp/src/serve.rs`.)
 
 ### Pack default
 
@@ -123,6 +123,14 @@ path   = "~/.khive/records.db"
 # ── Per-pack routing ───────────────────────────────────────────────────────────
 # Packs not listed here fall back to "main".
 # The value of `backend` must match a [[backends]].name above.
+# `no_embed = true` additionally strips the embedder set from that pack's
+# runtime: its own rows get FTS and metadata only — no vec_* rows, no ANN
+# participation. Concept-tier writes the pack routes through core() are NOT
+# stripped: they embed with the main runtime's embedders, so the shared graph
+# stays uniformly searchable. Use it for packs whose own rows are structural
+# rather than retrieval targets (e.g. comm). The flag participates in the
+# warm-daemon config_id: flipping it requires a daemon restart like any other
+# topology change.
 
 [packs.records]           # hypothetical operator-supplied records pack
 backend = "records"
@@ -177,11 +185,16 @@ path = "/var/lib/your-app/records.db"
 backend = "records"
 ```
 
-The guarantee: each pack's substrate writes are confined to its assigned
+The general guarantee: each pack's auxiliary substrate writes are confined to its assigned
 backend file. This is enforced structurally because `build_server_multi_backend`
 constructs one `KhiveRuntime` per pack, each wrapping its own
-`Arc<StorageBackend>`. The custom pack's runtime holds only its assigned
-backend; it has no handle to `agent.db`. The isolation test
+`Arc<StorageBackend>`. Record identity and attachment liveness are the deliberate
+exception: every pack runtime also has a `core()` handle to canonical `main`, and
+record-plus-attachment publication routes there. Direct attachment access on a
+secondary is rejected. Boot inventories every secondary before enabling V21 on
+main; any legacy ref or attachment row, including one retained by a soft-deleted
+record, blocks startup rather than creating liveness invisible to main-database
+GC. The isolation test
 (`multi_backend_isolates_pack_data_to_separate_files` in
 `crates/khive-mcp/src/serve.rs`) verifies this directly: it pins the `comm` pack
 to a second on-disk backend, writes through both packs, then opens each SQLite
@@ -308,12 +321,44 @@ protocol-version mismatch, never for config-id drift.
 
 ### Full schema on every backend
 
-Every writable declared backend receives the full khive schema via
-`run_migrations()` at startup. Packs do not write to tables outside their
-substrate; the schema is applied uniformly for simplicity. There is no
-per-backend schema trimming. A read-only backend is validated against the
-build's exact current core-schema version instead; boot never attempts a
-migration or pack-auxiliary DDL against it.
+Every writable declared backend reaches the full khive schema through the async
+host coordinator, but V21 makes the ordering load-bearing. Boot first prepares
+and inventories every distinct secondary, refuses any legacy or current
+attachment authority there, and completes its empty attachment state. Only then
+does it prepare canonical `main`, install bounded hydration, authenticate any
+pack-owned legacy roles, and finalize V21. `run_migrations()` supplies the
+ordinary prefix and zero-reference fast path; it intentionally stops at V20
+when application-assisted backfill is required. Packs do not write outside their
+substrate, and there is no per-backend schema trimming. A read-only backend is
+validated against the build's exact current core-schema version; boot never
+attempts migration or pack-auxiliary DDL against it.
+
+The admin surface uses the same configured target model without constructing
+pack runtimes: `kkernel db migrate --config <path>` deduplicates physical aliases
+and advances distinct secondaries before `main`; `--backend <name>` selects a
+declared target, while selecting `main` retains its secondary prerequisites.
+`kkernel db check` loads the same config and pure target plan: `main` or its
+SQLite alias includes every secondary prerequisite, while an independent
+secondary remains a single read-only target. Both commands suppress pack
+registration, embedders, and pack DDL;
+migration retains only core topology coordination plus blob configuration used
+when legacy V20 moodboard evidence actually requires hydration. Exact-current
+admin paths and migrations without legacy moodboard model evidence do not
+resolve a BlobStore. A concrete `--db` override must agree with the declared
+main backend instead of replacing the topology.
+The shared pure planner validates every physical SQLite alias's `read_only` mode
+before a selected migration opens anything. Under `--db :memory:` configured
+names become distinct ephemeral backends, so only the literal `main` name has
+the full prerequisite plan. Migration result flags use physical backend
+identity: aliases of the selected main are targets; distinct secondaries are
+prerequisites.
+
+The V21 cutover still uses ADR-160's two-release deployment gate. After the
+Phase-4a GC gate converges and pre-Phase-4a binaries are drained, quiesce every
+Phase-4a application-serving/read-write process (or prove it cannot touch any
+planned database) before migrating. Only a GC-only Phase-4a worker has narrow
+compatibility with completed V21. Start the Phase-4b serving fleet only after
+`db check --strict` reports the entire planned topology exact-current.
 
 ### Canonical-path deduplication
 
@@ -375,14 +420,19 @@ a writable main; conversely, a writable blob secondary beside a read-only main
 retains normal puts.
 
 Feature-enabled email and Telegram background work is also admitted by the
-runtime that serves each loop's verbs, not by `--daemon` alone. Inbound polling
-requires the assigned `comm` runtime to be writable because it dispatches
-`comm.ingest`, heartbeat, and cursor writes. Outbound delivery requires the
-assigned `kg` runtime to be writable because it uses generic `list`/`update` to
-claim and mark a message; otherwise no external send task starts, avoiding a
-send followed by an inevitably failed `delivered_at` write. These gates are
-independent, so a mixed topology can admit one direction without admitting the
-other.
+runtime that serves each loop's verbs, not by `--daemon` alone. Both
+directions key on the assigned `comm` runtime being writable: inbound polling
+dispatches `comm.ingest`, heartbeat, and cursor writes, and outbound delivery
+scans, claims, and marks outbound `message` notes through that runtime's
+non-wire owner-side APIs (the notes live on whatever backend `[packs.comm]`
+assigns, so the generic kg-routed `list`/`update` verbs cannot reach them).
+The scan applies each channel's recipient prefix before its row limit, so one
+channel's backlog cannot starve another's, and delivery outcomes are recorded
+as terminal `properties.delivery` states (`delivered` with `delivered_at` and
+the transport message id, or `failed` with `failed_at`/`last_error` for
+permanent rejections such as a recipient outside the allowlist). If the comm
+runtime is not writable, no external send task starts, avoiding a send
+followed by an inevitably failed delivery mark.
 
 The explicit `read_only` value participates in the backend-topology portion of
 the warm-daemon `config_id`. In multi-backend configuration it must agree with

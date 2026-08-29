@@ -209,16 +209,19 @@ pub fn process_ref_from_env() -> Option<String> {
 
 /// Runtime configuration.
 ///
-/// The `db_path` and `embedding_model` fields are deprecated in favour of
-/// constructing the backend externally and calling [`crate::KhiveRuntime::from_backend`].
-/// They remain for backward compatibility with tests and single-binary deployments.
+/// The `db_path` field remains for backward compatibility and as input to the
+/// supported async khive-mcp/kkernel host builders. Direct backend assembly is
+/// reserved for an already-coordinated database; use
+/// [`crate::KhiveRuntime::from_prepared_backend`] when that precondition has
+/// been established. `embedding_model` remains as the primary-model config
+/// shorthand beside the provider registry.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
-    /// Deprecated: use [`crate::KhiveRuntime::from_backend`] instead. The boot path
-    /// constructs backends from `khive.toml` (`AppConfig`) and passes them to
-    /// `from_backend`. Direct `db_path` usage persists only in tests.
+    /// Production boot passes this value to the async khive-mcp/kkernel host
+    /// builders, which coordinate V21 before constructing runtimes. Tests and
+    /// already-current single-backend callers may still use it directly.
     pub db_path: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,
@@ -307,6 +310,19 @@ pub struct RuntimeConfig {
     /// instead of re-running config discovery (which would ignore an
     /// explicit `--config` path not also exported as `KHIVE_CONFIG`).
     pub git_write: crate::engine_config::GitWriteSectionConfig,
+    /// Resolved rendering timezone (ADR-169), consumed today by date-only
+    /// `parse_due` anchoring. Populated from `[display] timezone` in
+    /// `khive.toml` by [`runtime_config_from_khive_config`]; when absent,
+    /// resolves once to the host's local IANA zone (falling back to UTC when
+    /// the host zone cannot be determined) via [`resolve_default_display_timezone`].
+    pub display_timezone: chrono_tz::Tz,
+    /// Events-daemon split (ADR-170). `None` = legacy behavior: events persist
+    /// in the main store. `Some` routes event persistence to the events database —
+    /// forwarded over the events daemon socket in daemon deployments, opened
+    /// directly in embedded/one-shot contexts. Populated by the transport
+    /// hosts (khive-mcp serve, kkernel exec); tests and in-memory runtimes
+    /// leave it `None`.
+    pub events_split: Option<crate::events_split::EventsSplitConfig>,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -336,6 +352,18 @@ fn ann_fresh_tail_enabled_from_value(value: Option<&str>) -> bool {
 pub fn ann_fresh_tail_enabled_from_env() -> bool {
     let value = std::env::var("KHIVE_ANN_FRESH_TAIL").ok();
     ann_fresh_tail_enabled_from_value(value.as_deref())
+}
+
+/// Resolve the host's local IANA zone name once, for [`RuntimeConfig`]'s
+/// default `display_timezone` (ADR-169). Falls back to UTC when the host
+/// zone cannot be determined (e.g. `TZ`/`/etc/localtime` unreadable) or does
+/// not parse as a known `chrono_tz::Tz` — this must never panic or block
+/// construction of a default `RuntimeConfig`.
+pub fn resolve_default_display_timezone() -> chrono_tz::Tz {
+    iana_time_zone::get_timezone()
+        .ok()
+        .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::Tz::UTC)
 }
 
 impl Default for RuntimeConfig {
@@ -379,6 +407,8 @@ impl Default for RuntimeConfig {
             allowed_outbound_namespaces: vec![],
             actor_id,
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
+            display_timezone: resolve_default_display_timezone(),
+            events_split: None,
         }
     }
 }
@@ -716,6 +746,17 @@ pub fn runtime_config_from_khive_config(
         .blob_hydration_bytes
         .unwrap_or(base.blob_hydration_bytes);
 
+    // KhiveConfig::validate() guarantees a present timezone parses as a valid
+    // chrono_tz::Tz, so the fallback to base.display_timezone below is only
+    // reachable for an unvalidated caller-constructed KhiveConfig, not a
+    // config loaded via KhiveConfig::load.
+    let display_timezone = khive_cfg
+        .display
+        .timezone
+        .as_deref()
+        .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(base.display_timezone);
+
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
             default_namespace,
@@ -725,6 +766,7 @@ pub fn runtime_config_from_khive_config(
             actor_id,
             git_write,
             blob_hydration_bytes,
+            display_timezone,
             ..base
         };
     }
@@ -761,7 +803,21 @@ pub fn runtime_config_from_khive_config(
         actor_id,
         git_write,
         blob_hydration_bytes,
+        display_timezone,
         ..base
+    }
+}
+
+#[cfg(test)]
+mod display_timezone_tests {
+    use super::resolve_default_display_timezone;
+
+    // The host's actual zone is environment-dependent (CI runners are
+    // typically UTC), so this only asserts the resolver always produces some
+    // valid, non-panicking Tz — never that it matches a specific zone.
+    #[test]
+    fn resolve_default_display_timezone_never_panics() {
+        let _tz = resolve_default_display_timezone();
     }
 }
 
@@ -933,9 +989,13 @@ mod resolve_project_actor_id_tests {
         let path = write_toml(&dir, "[actor]\nid = \"\"\n");
 
         let err = resolve_project_actor_id(Some(&path)).expect_err("invalid actor.id must error");
+        let root = match &err {
+            crate::engine_config::ConfigError::InFile { source, .. } => source.as_ref(),
+            other => other,
+        };
         assert!(
             matches!(
-                err,
+                root,
                 crate::engine_config::ConfigError::InvalidActorId { .. }
             ),
             "expected InvalidActorId, got {err:?}"

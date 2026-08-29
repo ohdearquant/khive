@@ -8,21 +8,27 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use uuid::{Uuid, Version};
 
-use khive_runtime::{actor_is_unattributed, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{
+    actor_is_unattributed, BlobHydrator, KhiveRuntime, NamespaceToken, RuntimeError,
+};
 use khive_storage::blob::ContentRef;
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
-use khive_storage::{BlobStore, Entity};
+use khive_storage::{AttachmentSubstrate, BlobStore, Entity, NewAttachment};
 use khive_types::{EdgeRelation, EventKind, EventOutcome, SubstrateKind};
 
 use crate::preference::{
-    deserialize_fann, feature_schema_id, feature_schema_response, is_lower_hex_64, predict,
-    prepare_training_data, sha256_hex, train_model, validate_features, validate_loaded_bundle,
-    validate_reason_code, JudgmentChoice, JudgmentRecord, ModelBundle, PreferenceScope,
-    PresentationProvenance, RandomizationProvenance, ReasonCode, ResultOccurrence,
-    SelectionProvenance, ServeRecord, TrainedModel, FEATURE_COUNT, FEATURE_SCHEMA_VERSION,
-    JUDGMENT_SCHEMA_VERSION, MAX_TRAINING_EVENTS, MODEL_BUNDLE_SCHEMA_VERSION,
-    PREFERENCE_RESPONSE_SCHEMA_VERSION, RANDOMIZATION_REVISION, SERVE_SCHEMA_VERSION,
+    feature_schema_id, feature_schema_response, is_lower_hex_64, predict, prepare_training_data,
+    sha256_hex, train_model, validate_features, validate_loaded_bundle, validate_reason_code,
+    JudgmentChoice, JudgmentRecord, ModelBundle, PreferenceScope, PresentationProvenance,
+    RandomizationProvenance, ReasonCode, ResultOccurrence, SelectionProvenance, ServeRecord,
+    TrainedModel, FEATURE_COUNT, FEATURE_SCHEMA_VERSION, JUDGMENT_SCHEMA_VERSION,
+    MAX_TRAINING_EVENTS, MODEL_BUNDLE_SCHEMA_VERSION, PREFERENCE_RESPONSE_SCHEMA_VERSION,
+    RANDOMIZATION_REVISION, SERVE_SCHEMA_VERSION,
+};
+use crate::preference_artifact::{
+    model_event_id, validate_model_event_evidence, verify_preference_bundle_evidence,
+    verify_preference_network,
 };
 use crate::MoodboardPack;
 
@@ -34,7 +40,6 @@ const MAX_RESPONSE_MS: u64 = 3_600_000;
 // These UUIDv5 namespaces and their name framing are persistent wire identity.
 // ADR-149 freezes both values; golden tests below prevent accidental drift.
 const JUDGMENT_UUID_NAMESPACE: Uuid = Uuid::from_u128(0x8fc4_55de_533c_5d1d_9228_09b8_1ef1_8e33);
-const MODEL_EVENT_UUID_NAMESPACE: Uuid = Uuid::from_u128(0x1dc2_337e_b200_5bd1_824f_2653_1164_5c16);
 static JUDGMENT_LOCKS: [Mutex<()>; 256] = [const { Mutex::const_new(()) }; 256];
 static MODEL_LOCKS: [Mutex<()>; 256] = [const { Mutex::const_new(()) }; 256];
 const TRAIN_CONCURRENCY: usize = 1;
@@ -226,12 +231,6 @@ pub(crate) async fn handle_serve(
         &input.descriptor,
     );
 
-    // Candidate hydration (bounded source-blob read + BLAKE3 verify inside
-    // validate_asset) rides the pack-wide preprocessing gate exactly like the
-    // ingest and search paths: without it, concurrent serve calls could each
-    // hydrate two source blobs with no concurrency bound. The blob pack's own
-    // hydration semaphore is private to that crate and unreachable here.
-    let hydration_permit = pack.model_state().acquire_preprocessing_permit().await?;
     let mut validated = Vec::with_capacity(2);
     for (index, candidate) in input.candidates.into_iter().enumerate() {
         debug_assert_eq!(candidate.state, CandidateState::Scored);
@@ -257,7 +256,6 @@ pub(crate) async fn handle_serve(
             features: candidate.features,
         });
     }
-    drop(hydration_permit);
     if validated[0].asset_id == validated[1].asset_id
         || validated[0].content_ref == validated[1].content_ref
     {
@@ -401,6 +399,12 @@ pub(crate) async fn handle_train_preference(
             "serialize moodboard preference model bundle: {error}"
         ))
     })?;
+    let bundle_size = u64::try_from(bundle_bytes.len()).map_err(|_| {
+        RuntimeError::Internal("moodboard preference bundle size exceeds u64".to_string())
+    })?;
+    let network_size = u64::try_from(trained.network_bytes.len()).map_err(|_| {
+        RuntimeError::Internal("moodboard preference network size exceeds u64".to_string())
+    })?;
     let bundle_sha256 = sha256_hex(&bundle_bytes);
     let bundle_content_ref = blob_store.put(bundle_bytes).await?;
 
@@ -413,6 +417,9 @@ pub(crate) async fn handle_train_preference(
         &trained.bundle,
         &bundle_content_ref,
         &bundle_sha256,
+        bundle_size,
+        &network_content_ref,
+        network_size,
     )
     .await?;
     core.link(
@@ -434,7 +441,7 @@ pub(crate) async fn handle_train_preference(
         &scope,
         &bundle_content_ref,
         &bundle_sha256,
-        &trained.bundle.fann.network_content_ref,
+        &network_content_ref,
         &trained.bundle.fann.network_sha256,
     )
     .await?;
@@ -497,15 +504,10 @@ pub(crate) async fn handle_preference(
     validate_board(&core, token, board_entity_id, &input.board_id).await?;
     let scope = scope_from_input(token, board_entity_id, input.board_id, &input.descriptor);
 
-    // Same gate as handle_serve: candidate hydration inside
-    // validate_inference_candidate rides the pack-wide preprocessing gate so
-    // concurrent preference calls cannot hydrate source blobs unboundedly.
-    let hydration_permit = pack.model_state().acquire_preprocessing_permit().await?;
     let (left_asset_id, left_content_ref) =
         validate_inference_candidate(&core, token, &input.left, "left").await?;
     let (right_asset_id, right_content_ref) =
         validate_inference_candidate(&core, token, &input.right, "right").await?;
-    drop(hydration_permit);
     if left_asset_id == right_asset_id || left_content_ref == right_content_ref {
         return Err(RuntimeError::InvalidInput(
             "moodboard.preference requires two distinct asset identities".to_string(),
@@ -740,17 +742,11 @@ async fn validate_asset(
         )));
     }
     let blob_store = require_blob_store(runtime)?;
-    // ADR-149: corrupt candidate bytes fail closed. Existence alone would admit
-    // a corrupted object stored under a valid ref, so the bytes are read within
-    // the source-blob bound and BLAKE3-verified before any inference sees them.
-    crate::handlers::read_bounded_source_blob(blob_store.as_ref(), expected_ref)
-        .await
-        .map_err(|error| match error {
-            RuntimeError::NotFound(_) => RuntimeError::InvalidInput(format!(
-                "moodboard asset {asset_id} references a missing BlobStore object"
-            )),
-            other => other,
-        })?;
+    if !blob_store.exists(expected_ref).await? {
+        return Err(RuntimeError::InvalidInput(format!(
+            "moodboard asset {asset_id} references a missing BlobStore object"
+        )));
+    }
     Ok(entity)
 }
 
@@ -1123,38 +1119,56 @@ fn compare_existing_judgment(
     Ok(())
 }
 
+/// Load every persisted judgment for `token`'s actor.
+///
+/// `MAX_TRAINING_EVENTS` (50,000) exceeds the events daemon's per-request
+/// page cap (`khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS`, 4,096),
+/// so the snapshot cannot be a single wide `query_events` call in daemon mode
+/// — the daemon refuses any page above its cap outright. The snapshot is
+/// instead collected by cursor-walking transport-cap-sized pages (see
+/// [`collect_judgment_events_cursor_walk`]).
+///
+/// Read consistency: the single-query form this replaces was one stable
+/// SQLite read snapshot, immune to a concurrently appended judgment shifting
+/// later pages. A cursor walk instead issues one independent page read per
+/// step against a live event plane: a judgment appended concurrently with
+/// the walk may land before or after the cursor depending on timing and be
+/// included or excluded accordingly. It is never double-counted — the
+/// boundary-microsecond dedup in the walk prevents that — but two
+/// back-to-back `moodboard.train_preference` calls can now observe slightly
+/// different snapshots if judgments are being appended between them. The
+/// `MAX_TRAINING_EVENTS` ceiling below still bounds the total independent of
+/// this window.
 async fn load_judgment_snapshot(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
 ) -> Result<Vec<(i64, JudgmentRecord)>, RuntimeError> {
     let store = runtime.events(token)?;
-    // One storage query is one stable SQLite read snapshot. Offset paging would
-    // permit a newly appended event to shift later pages and cause duplication
-    // or omission, so the hard ceiling is also the single-query limit.
-    let page = store
-        .query_events(
-            EventFilter {
-                verbs: vec![JUDGMENT_RECORD_VERB.to_string()],
-                actors: vec![actor_label(token)],
-                ..Default::default()
-            },
-            PageRequest {
-                offset: 0,
-                limit: (MAX_TRAINING_EVENTS + 1) as u32,
-            },
-        )
-        .await?;
-    if page
-        .total
-        .is_some_and(|total| total > MAX_TRAINING_EVENTS as u64)
-        || page.items.len() > MAX_TRAINING_EVENTS
-    {
+    let base_filter = EventFilter {
+        verbs: vec![JUDGMENT_RECORD_VERB.to_string()],
+        actors: vec![actor_label(token)],
+        ..Default::default()
+    };
+    let total = store.count_events(base_filter.clone()).await?;
+    if total > MAX_TRAINING_EVENTS as u64 {
+        return Err(RuntimeError::InvalidInput(format!(
+            "moodboard.train_preference actor judgment snapshot exceeds {MAX_TRAINING_EVENTS} records"
+        )));
+    }
+    let events = collect_judgment_events_cursor_walk(
+        store.as_ref(),
+        &base_filter,
+        khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS,
+        (MAX_TRAINING_EVENTS + 1) as u64,
+    )
+    .await?;
+    if events.len() > MAX_TRAINING_EVENTS {
         return Err(RuntimeError::InvalidInput(format!(
             "moodboard.train_preference actor judgment snapshot exceeds {MAX_TRAINING_EVENTS} records"
         )));
     }
     let mut records = Vec::new();
-    for event in page.items {
+    for event in events {
         let valid_envelope = has_success_entity_envelope(&event, token);
         let record: JudgmentRecord = serde_json::from_value(event.payload).map_err(|error| {
             RuntimeError::Internal(format!(
@@ -1189,8 +1203,128 @@ async fn load_judgment_snapshot(
     Ok(records)
 }
 
+/// Collect up to `max_rows` events for `base_filter` by walking a strict
+/// descending `before` cursor at `offset: 0`, requesting at most `page_size`
+/// (clamped to the events-daemon transport cap) rows per query — the same
+/// technique `khive-pack-brain`'s `collect_events_cursor_walk` uses for its
+/// split-store reads (duplicated here rather than shared: that helper is
+/// crate-private to `khive-pack-brain`).
+///
+/// `before` is a strict `created_at <` bound, so stepping the cursor to the
+/// last row's timestamp would drop rows sharing that microsecond beyond the
+/// page edge. Step to `last.created_at + 1` instead — which re-admits the
+/// boundary microsecond — and drop the re-read rows by id. Aggregation is
+/// order-independent here (the caller re-sorts by `judgment_id`), so
+/// delivery order across pages does not matter; each row must simply arrive
+/// exactly once. A timestamp tie run wider than the transport cap cannot be
+/// paged past (widening the page is refused by the daemon) and is reported
+/// as a typed error rather than looping.
+async fn collect_judgment_events_cursor_walk(
+    store: &dyn khive_storage::event::EventStore,
+    base_filter: &EventFilter,
+    page_size: u32,
+    max_rows: u64,
+) -> Result<Vec<Event>, RuntimeError> {
+    let cap = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS;
+    let mut items: Vec<Event> = Vec::new();
+    let mut cursor: Option<i64> = base_filter.before;
+    let mut boundary_at: Option<i64> = None;
+    let mut boundary_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut fetch_limit = page_size.clamp(1, cap);
+    while (items.len() as u64) < max_rows {
+        let mut filter = base_filter.clone();
+        filter.before = cursor;
+        let page = store
+            .query_events(
+                filter,
+                PageRequest {
+                    offset: 0,
+                    limit: fetch_limit,
+                },
+            )
+            .await?;
+        let fetched = page.items.len() as u64;
+        let fresh: Vec<Event> = page
+            .items
+            .into_iter()
+            .filter(|event| !boundary_ids.contains(&event.id))
+            .collect();
+        if fresh.is_empty() {
+            if fetched < u64::from(fetch_limit) {
+                // The store returned everything under the cursor and all of
+                // it was already collected: the window is exhausted.
+                break;
+            }
+            // A full page of already-collected boundary rows: the tie run at
+            // this microsecond fills the page. Widen and re-read — but only
+            // up to the transport cap, past which the daemon refuses the
+            // request.
+            if fetch_limit >= cap {
+                let boundary = boundary_at.ok_or_else(|| {
+                    RuntimeError::Internal(
+                        "moodboard judgment cursor walk saw duplicate rows before any boundary"
+                            .to_string(),
+                    )
+                })?;
+                let mut ge_boundary = base_filter.clone();
+                ge_boundary.after = boundary.checked_sub(1).or(base_filter.after);
+                let ge_total = store.count_events(ge_boundary).await?;
+                if ge_total == items.len() as u64 {
+                    cursor = Some(boundary);
+                    continue;
+                }
+                return Err(RuntimeError::InvalidInput(format!(
+                    "moodboard.train_preference cannot page this actor's judgment snapshot: \
+                     more than {fetch_limit} judgments share one created_at microsecond, which \
+                     exceeds the event transport's page cap"
+                )));
+            }
+            fetch_limit = fetch_limit.saturating_mul(2).min(cap);
+            continue;
+        }
+        // Pages come back created_at DESC, so the last fresh row carries the
+        // new boundary microsecond.
+        let boundary = fresh
+            .last()
+            .map(|event| event.created_at)
+            .expect("fresh is non-empty");
+        if boundary_at != Some(boundary) {
+            boundary_ids.clear();
+            boundary_at = Some(boundary);
+        }
+        boundary_ids.extend(
+            fresh
+                .iter()
+                .filter(|event| event.created_at == boundary)
+                .map(|event| event.id),
+        );
+        items.extend(fresh);
+        cursor = if boundary == i64::MAX {
+            cursor
+        } else {
+            Some(boundary + 1)
+        };
+        if fetched < u64::from(fetch_limit) {
+            break;
+        }
+    }
+    // A page may carry the collection past `max_rows`; the bound is a row
+    // budget, so surplus rows from the final page are dropped rather than
+    // returned over-budget.
+    items.truncate(usize::try_from(max_rows).unwrap_or(usize::MAX));
+    Ok(items)
+}
+
 fn require_blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, RuntimeError> {
     runtime.blob_store().ok_or_else(|| {
+        RuntimeError::Unconfigured(
+            "moodboard preference learning requires an installed BlobStore".to_string(),
+        )
+    })
+}
+
+fn require_blob_hydrator(runtime: &KhiveRuntime) -> Result<Arc<BlobHydrator>, RuntimeError> {
+    runtime.blob_hydrator().ok_or_else(|| {
         RuntimeError::Unconfigured(
             "moodboard preference learning requires an installed BlobStore".to_string(),
         )
@@ -1218,9 +1352,12 @@ async fn find_model_by_content_ref(
     let mut reader = runtime.sql().reader().await?;
     let row = reader
         .query_row(SqlStatement {
-            sql: "SELECT id FROM entities WHERE namespace = ?1 AND kind = 'artifact' \
-                  AND entity_type = 'moodboard_model' AND content_ref = ?2 \
-                  AND deleted_at IS NULL ORDER BY created_at, id LIMIT 1"
+            sql: "SELECT e.id FROM entities e \
+                  JOIN attachments a ON a.record_uuid = e.id \
+                    AND a.substrate = 'entity' AND a.role = 'content' \
+                  WHERE e.namespace = ?1 AND e.kind = 'artifact' \
+                  AND e.entity_type = 'moodboard_model' AND a.content_ref = ?2 \
+                  AND e.deleted_at IS NULL ORDER BY e.created_at, e.id LIMIT 1"
                 .to_string(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
@@ -1248,6 +1385,7 @@ async fn find_model_by_content_ref(
     runtime.get_entity(token, id).await.map(Some)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn find_or_create_model(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1255,8 +1393,29 @@ async fn find_or_create_model(
     bundle: &ModelBundle,
     bundle_content_ref: &ContentRef,
     bundle_sha256: &str,
+    bundle_size: u64,
+    network_content_ref: &ContentRef,
+    network_size: u64,
 ) -> Result<(Entity, bool), RuntimeError> {
     if let Some(existing) = find_model_by_content_ref(runtime, token, bundle_content_ref).await? {
+        let attachment = runtime
+            .attachments()?
+            .get_attachment(existing.id, "fann-network")
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "moodboard preference model {} has no fann-network attachment",
+                    existing.id
+                ))
+            })?;
+        if attachment.substrate != AttachmentSubstrate::Entity
+            || attachment.content_ref != *network_content_ref
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "moodboard preference model {} fann-network attachment disagrees with its authenticated bundle",
+                existing.id
+            )));
+        }
         return Ok((existing, false));
     }
     let properties = json!({
@@ -1275,7 +1434,7 @@ async fn find_or_create_model(
         "network_sha256": bundle.fann.network_sha256,
     });
     let model = runtime
-        .create_entity_with_content_ref(
+        .create_entity_with_attachments(
             token,
             "artifact",
             Some("moodboard_model"),
@@ -1287,18 +1446,23 @@ async fn find_or_create_model(
                 "preference_model".to_string(),
                 "experimental".to_string(),
             ],
-            bundle_content_ref,
+            vec![
+                NewAttachment {
+                    role: "content".to_string(),
+                    content_ref: bundle_content_ref.clone(),
+                    media_type: Some("application/json".to_string()),
+                    size_bytes: Some(bundle_size),
+                },
+                NewAttachment {
+                    role: "fann-network".to_string(),
+                    content_ref: network_content_ref.clone(),
+                    media_type: Some("application/octet-stream".to_string()),
+                    size_bytes: Some(network_size),
+                },
+            ],
         )
         .await?;
     Ok((model, true))
-}
-
-fn model_event_id(model_id: Uuid, bundle_content_ref: &ContentRef) -> Uuid {
-    let mut name = Vec::with_capacity(16 + 1 + 64);
-    name.extend_from_slice(model_id.as_bytes());
-    name.push(0);
-    name.extend_from_slice(bundle_content_ref.as_str().as_bytes());
-    Uuid::new_v5(&MODEL_EVENT_UUID_NAMESPACE, &name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1309,7 +1473,7 @@ async fn ensure_model_event(
     scope: &PreferenceScope,
     bundle_content_ref: &ContentRef,
     bundle_sha256: &str,
-    network_content_ref: &str,
+    network_content_ref: &ContentRef,
     network_sha256: &str,
 ) -> Result<(), RuntimeError> {
     let event_id = model_event_id(model.id, bundle_content_ref);
@@ -1324,9 +1488,9 @@ async fn ensure_model_event(
     });
     let store = runtime.events(token)?;
     if let Some(existing) = store.get_event(event_id).await? {
-        return validate_model_event(
+        return validate_model_event_evidence(
             &existing,
-            token,
+            &model.namespace,
             model.id,
             scope,
             bundle_content_ref,
@@ -1350,9 +1514,9 @@ async fn ensure_model_event(
     match store.append_event(event).await {
         Ok(()) => Ok(()),
         Err(first_error) => match store.get_event(event_id).await? {
-            Some(existing) => validate_model_event(
+            Some(existing) => validate_model_event_evidence(
                 &existing,
-                token,
+                &model.namespace,
                 model.id,
                 scope,
                 bundle_content_ref,
@@ -1363,73 +1527,6 @@ async fn ensure_model_event(
             None => Err(first_error.into()),
         },
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_model_event(
-    event: &Event,
-    token: &NamespaceToken,
-    model_id: Uuid,
-    scope: &PreferenceScope,
-    bundle_content_ref: &ContentRef,
-    bundle_sha256: &str,
-    network_content_ref: &str,
-    network_sha256: &str,
-) -> Result<(), RuntimeError> {
-    let expected = json!({
-        "schema_version": MODEL_BUNDLE_SCHEMA_VERSION,
-        "preference_model_id": model_id,
-        "model_content_ref": bundle_content_ref,
-        "model_fingerprint": bundle_sha256,
-        "network_content_ref": network_content_ref,
-        "network_sha256": network_sha256,
-        "scope": scope,
-    });
-    if event.id != model_event_id(model_id, bundle_content_ref)
-        || !has_success_entity_envelope(event, token)
-        || event.verb != MODEL_RECORD_VERB
-        || event.kind != EventKind::Audit
-        || event.actor != actor_label(token)
-        || event.target_id != Some(model_id)
-        || event.aggregate_kind.as_deref() != Some("moodboard_model")
-        || event.aggregate_id != Some(model_id)
-        || event.payload_schema_version != 1
-        || event.payload != expected
-    {
-        return Err(RuntimeError::InvalidInput(format!(
-            "moodboard preference model {model_id} lacks matching immutable pack provenance"
-        )));
-    }
-    Ok(())
-}
-
-async fn read_verified_blob(
-    store: &dyn BlobStore,
-    content_ref: &ContentRef,
-    label: &str,
-) -> Result<Vec<u8>, RuntimeError> {
-    let size = store
-        .size(content_ref)
-        .await?
-        .ok_or_else(|| RuntimeError::NotFound(format!("{label} {content_ref}")))?;
-    if size > MAX_MODEL_BLOB_BYTES {
-        return Err(RuntimeError::InvalidInput(format!(
-            "{label} {content_ref} is {size} bytes, exceeding the {MAX_MODEL_BLOB_BYTES}-byte model ceiling"
-        )));
-    }
-    let bytes = store.get(content_ref).await?;
-    if bytes.len() as u64 != size || bytes.len() as u64 > MAX_MODEL_BLOB_BYTES {
-        return Err(RuntimeError::InvalidInput(format!(
-            "{label} {content_ref} changed size or exceeded its preflight bound"
-        )));
-    }
-    let actual = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
-    if &actual != content_ref {
-        return Err(RuntimeError::InvalidInput(format!(
-            "{label} {content_ref} failed BLAKE3 content verification"
-        )));
-    }
-    Ok(bytes)
 }
 
 async fn load_preference_model(
@@ -1450,42 +1547,6 @@ async fn load_preference_model(
         ))
     })?;
     let bundle_content_ref = parse_content_ref(raw_ref, "moodboard model content_ref")?;
-    let blob_store = require_blob_store(runtime)?;
-    let bundle_bytes = read_verified_blob(
-        blob_store.as_ref(),
-        &bundle_content_ref,
-        "moodboard model bundle",
-    )
-    .await?;
-    let bundle_sha256 = sha256_hex(&bundle_bytes);
-    let bundle: ModelBundle = serde_json::from_slice(&bundle_bytes).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "moodboard preference model {model_id} bundle is corrupt: {error}"
-        ))
-    })?;
-    validate_loaded_bundle(&bundle)?;
-    if &bundle.scope != expected_scope {
-        return Err(RuntimeError::InvalidInput(format!(
-            "moodboard preference model {model_id} has the wrong board, actor, descriptor, or feature-schema scope"
-        )));
-    }
-    validate_entity_model_properties(&entity, &bundle, &bundle_sha256)?;
-    let network_content_ref = parse_content_ref(
-        &bundle.fann.network_content_ref,
-        "moodboard model network_content_ref",
-    )?;
-    let network_bytes = read_verified_blob(
-        blob_store.as_ref(),
-        &network_content_ref,
-        "moodboard FANN network",
-    )
-    .await?;
-    if sha256_hex(&network_bytes) != bundle.fann.network_sha256 {
-        return Err(RuntimeError::InvalidInput(format!(
-            "moodboard preference model {model_id} FANN SHA-256 does not match its bundle"
-        )));
-    }
-    let network = deserialize_fann(&network_bytes)?;
     let event_id = model_event_id(model_id, &bundle_content_ref);
     let event = runtime
         .events(token)?
@@ -1496,21 +1557,52 @@ async fn load_preference_model(
                 "moodboard preference model {model_id} has no immutable pack provenance event"
             ))
         })?;
-    validate_model_event(
-        &event,
-        token,
+    let hydrator = require_blob_hydrator(runtime)?;
+    let bundle_blob = hydrator
+        .hydrate_verified(&bundle_content_ref, MAX_MODEL_BLOB_BYTES)
+        .await?;
+    let verified = verify_preference_bundle_evidence(
         model_id,
-        &bundle.scope,
+        &entity.namespace,
         &bundle_content_ref,
-        &bundle_sha256,
-        &bundle.fann.network_content_ref,
-        &bundle.fann.network_sha256,
+        bundle_blob.bytes(),
+        &event,
     )?;
+    drop(bundle_blob);
+    let network_attachment = runtime
+        .attachments()?
+        .get_attachment(model_id, "fann-network")
+        .await?
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "moodboard preference model {model_id} has no fann-network attachment"
+            ))
+        })?;
+    if network_attachment.record_uuid != model_id
+        || network_attachment.substrate != AttachmentSubstrate::Entity
+        || network_attachment.role != "fann-network"
+        || network_attachment.content_ref != verified.network_ref
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "moodboard preference model {model_id} fann-network attachment disagrees with its authenticated bundle"
+        )));
+    }
+    let network_blob = hydrator
+        .hydrate_verified(&verified.network_ref, MAX_MODEL_BLOB_BYTES)
+        .await?;
+    let network = verify_preference_network(&verified, network_blob.bytes())?;
+    drop(network_blob);
+    if &verified.bundle.scope != expected_scope {
+        return Err(RuntimeError::InvalidInput(format!(
+            "moodboard preference model {model_id} has the wrong board, actor, descriptor, or feature-schema scope"
+        )));
+    }
+    validate_entity_model_properties(&entity, &verified.bundle, &verified.bundle_sha256)?;
     Ok(LoadedPreferenceModel {
         entity,
         bundle_content_ref,
-        bundle_sha256,
-        bundle,
+        bundle_sha256: verified.bundle_sha256,
+        bundle: verified.bundle,
         network,
     })
 }
@@ -1575,24 +1667,75 @@ async fn validate_inference_candidate(
 mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
+    use khive_db::migrations::{AttachmentCutoverStatus, ATTACHMENT_CUTOVER_VERSION, MIGRATIONS};
+    use khive_db::stores::blob::acquire_database_gc_owner;
     use khive_db::stores::blob::FsBlobStore;
+    use khive_db::StorageBackend;
     use khive_runtime::{BackendId, Namespace, RuntimeConfig};
+    use khive_storage::Attachment;
 
     use super::*;
     use crate::preference::{
-        materialize_fann, pair_split, CalibrationProvenance, FannProvenance, OptimizerProvenance,
-        PairKey, SplitCounts, TestMetrics, TrainingProvenance, FANN_CRATE_VERSION, FANN_FORMAT,
-        FEATURE_SCHEMA_CANONICAL_JSON, MODEL_FAMILY, OPTIMIZER_BACKTRACKING_IDENTITY,
-        PAIR_SPLIT_REVISION, TIE_BAND_RULE_IDENTITY, TRAINING_REVISION,
+        materialize_fann, pair_split, CalibrationProvenance, DataSplit, FannProvenance,
+        OptimizerProvenance, PairKey, SplitCounts, TestMetrics, TrainingProvenance,
+        FANN_CRATE_VERSION, FANN_FORMAT, FEATURE_SCHEMA_CANONICAL_JSON, MIN_CAL_DECISIVE_GROUPS,
+        MIN_CAL_TIE_GROUPS, MIN_TEST_DECISIVE_GROUPS, MIN_TRAIN_DECISIVE_GROUPS, MODEL_FAMILY,
+        OPTIMIZER_BACKTRACKING_IDENTITY, PAIR_SPLIT_REVISION, TIE_BAND_RULE_IDENTITY,
+        TRAINING_REVISION,
     };
 
-    fn persistent_runtime(db_path: &Path, actor_id: &str) -> KhiveRuntime {
-        KhiveRuntime::new(RuntimeConfig {
+    #[derive(Debug)]
+    struct RecordingBoundedStore {
+        inner: Arc<FsBlobStore>,
+        calls: Mutex<Vec<(ContentRef, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for RecordingBoundedStore {
+        async fn put(&self, bytes: Vec<u8>) -> khive_storage::StorageResult<ContentRef> {
+            self.inner.put(bytes).await
+        }
+
+        async fn get_bounded_verified(
+            &self,
+            content_ref: &ContentRef,
+            max_bytes: u64,
+        ) -> khive_storage::StorageResult<Vec<u8>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((content_ref.clone(), max_bytes));
+            self.inner
+                .get_bounded_verified(content_ref, max_bytes)
+                .await
+        }
+
+        async fn exists(&self, content_ref: &ContentRef) -> khive_storage::StorageResult<bool> {
+            self.inner.exists(content_ref).await
+        }
+
+        async fn size(
+            &self,
+            _content_ref: &ContentRef,
+        ) -> khive_storage::StorageResult<Option<u64>> {
+            panic!("preference hydration must not compose size with a read")
+        }
+
+        async fn delete(&self, content_ref: &ContentRef) -> khive_storage::StorageResult<bool> {
+            self.inner.delete(content_ref).await
+        }
+    }
+
+    fn persistent_runtime_config(db_path: &Path, actor_id: &str) -> RuntimeConfig {
+        RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: Some(db_path.to_path_buf()),
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
@@ -1605,8 +1748,252 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: Some(actor_id.to_string()),
-        })
-        .expect("persistent runtime")
+        }
+    }
+
+    fn persistent_runtime(db_path: &Path, actor_id: &str) -> KhiveRuntime {
+        KhiveRuntime::new(persistent_runtime_config(db_path, actor_id)).expect("persistent runtime")
+    }
+
+    fn canonical_v20_backend(db_path: &Path) -> Arc<StorageBackend> {
+        let backend = Arc::new(StorageBackend::sqlite(db_path).expect("V20 fixture backend"));
+        let mut writer = backend.pool().try_writer().expect("V20 fixture writer");
+        let conn = writer.conn_mut();
+        conn.execute_batch(
+            "CREATE TABLE _schema_migrations (\
+                 version INTEGER PRIMARY KEY, \
+                 name TEXT NOT NULL, \
+                 applied_at INTEGER NOT NULL\
+             ) STRICT;",
+        )
+        .expect("create V20 fixture migration ledger");
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+        {
+            let tx = conn.transaction().expect("begin V20 fixture migration");
+            tx.execute_batch(migration.up)
+                .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
+            tx.execute(
+                "INSERT INTO _schema_migrations (version, name, applied_at) \
+                 VALUES (?1, ?2, ?3)",
+                (
+                    migration.version,
+                    migration.name,
+                    i64::from(migration.version),
+                ),
+            )
+            .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
+            tx.commit().expect("commit V20 fixture migration");
+        }
+        drop(writer);
+        backend
+    }
+
+    /// Build one intrinsically valid judgment record for `scope`, using real
+    /// UUIDv4 serve/occurrence ids, a `judgment_id_for`-derived judgment id,
+    /// and `side_randomization`-derived provenance — the identity fields
+    /// `load_judgment_snapshot`'s round trip enforces, which
+    /// `crate::preference::tests::sufficient_records` skips because it feeds
+    /// `fit_preference_bounded` directly rather than round-tripping through
+    /// the event store.
+    fn synthetic_judgment_record(
+        scope: &PreferenceScope,
+        lower: &str,
+        upper: &str,
+        choice: JudgmentChoice,
+        left_wins: bool,
+    ) -> JudgmentRecord {
+        let serve_id = Uuid::new_v4();
+        let randomization = side_randomization(serve_id);
+        let (left_index, right_index) = if randomization.swap_applied {
+            (1u8, 0u8)
+        } else {
+            (0u8, 1u8)
+        };
+        let mut left_features = [0.5f32; FEATURE_COUNT];
+        let mut right_features = [0.5f32; FEATURE_COUNT];
+        if choice != JudgmentChoice::Tie {
+            left_features[0] = if left_wins { 0.9 } else { 0.1 };
+            right_features[0] = if left_wins { 0.1 } else { 0.9 };
+        }
+        JudgmentRecord {
+            schema_version: JUDGMENT_SCHEMA_VERSION.to_string(),
+            judgment_id: judgment_id_for(serve_id),
+            serve_id,
+            scope: scope.clone(),
+            source_report_sha256: "c".repeat(64),
+            left: ResultOccurrence {
+                result_occurrence_id: Uuid::new_v4(),
+                source_candidate_index: left_index,
+                asset_id: Uuid::new_v4(),
+                content_ref: lower.to_string(),
+                source_rank: Some(1),
+                features: left_features,
+            },
+            right: ResultOccurrence {
+                result_occurrence_id: Uuid::new_v4(),
+                source_candidate_index: right_index,
+                asset_id: Uuid::new_v4(),
+                content_ref: upper.to_string(),
+                source_rank: Some(2),
+                features: right_features,
+            },
+            selection: SelectionProvenance {
+                policy_revision: "cursor-walk-fixture-v1".to_string(),
+                pair_propensity: Some(0.5),
+                candidate_pool_sha256: Some("d".repeat(64)),
+            },
+            presentation: PresentationProvenance {
+                preference_probability_shown: false,
+                source_rank_shown: false,
+                served_preference_model_id: None,
+            },
+            randomization,
+            choice,
+            reason_code: None,
+            response_ms: Some(100),
+        }
+    }
+
+    /// Generate a full valid judgment population for `scope`: enough
+    /// decisive train/calibration/test pairs and calibration ties to clear
+    /// `train_model`'s support gates, continued past those minimums until at
+    /// least `target_total` records exist.
+    fn synthetic_training_population(
+        scope: &PreferenceScope,
+        target_total: usize,
+    ) -> Vec<JudgmentRecord> {
+        let targets: BTreeMap<DataSplit, usize> = BTreeMap::from([
+            (DataSplit::Train, MIN_TRAIN_DECISIVE_GROUPS),
+            (DataSplit::Calibration, MIN_CAL_DECISIVE_GROUPS),
+            (DataSplit::Test, MIN_TEST_DECISIVE_GROUPS),
+        ]);
+        let mut counts: BTreeMap<DataSplit, usize> = BTreeMap::from([
+            (DataSplit::Train, 0usize),
+            (DataSplit::Calibration, 0usize),
+            (DataSplit::Test, 0usize),
+        ]);
+        let mut cal_ties = 0usize;
+        let mut records = Vec::new();
+        let mut index = 0u64;
+        while records.len() < target_total
+            || counts.iter().any(|(split, count)| *count < targets[split])
+            || cal_ties < MIN_CAL_TIE_GROUPS
+        {
+            let lower = sha256_hex(format!("cursor-walk-lower-{index}").as_bytes());
+            let upper = sha256_hex(format!("cursor-walk-upper-{index}").as_bytes());
+            let pair = PairKey::new(&lower, &upper);
+            let split = pair_split(scope, &pair);
+            let left_wins = index.is_multiple_of(2);
+            let choice = if left_wins {
+                JudgmentChoice::Left
+            } else {
+                JudgmentChoice::Right
+            };
+            records.push(synthetic_judgment_record(
+                scope, &lower, &upper, choice, left_wins,
+            ));
+            *counts.get_mut(&split).expect("split counted above") += 1;
+            if split == DataSplit::Calibration && cal_ties < MIN_CAL_TIE_GROUPS {
+                records.push(synthetic_judgment_record(
+                    scope,
+                    &lower,
+                    &upper,
+                    JudgmentChoice::Tie,
+                    left_wins,
+                ));
+                cal_ties += 1;
+            }
+            index += 1;
+        }
+        records
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn train_preference_snapshot_pages_a_population_above_the_daemon_page_cap() {
+        // Regression for the MAJOR finding fixed alongside this test:
+        // `load_judgment_snapshot` used to request `MAX_TRAINING_EVENTS + 1`
+        // (50,001) rows in one `query_events` call, which the events daemon
+        // refuses outright above `MAX_QUERY_EVENTS_PAGE_ROWS` (4,096) rows.
+        // Seed a population above that page cap but comfortably below
+        // `MAX_TRAINING_EVENTS`, and prove the cursor-walking snapshot load
+        // still assembles every judgment exactly once and that training
+        // still succeeds on the assembled data.
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.db");
+        let runtime = persistent_runtime(&db_path, "alice");
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let store = runtime.events(&token).unwrap();
+
+        let scope = PreferenceScope {
+            namespace: token.namespace().as_str().to_string(),
+            actor_kind: token.actor().kind.clone(),
+            actor_id: token.actor().id.clone(),
+            board_entity_id: Uuid::from_u128(0xB0A2D),
+            board_id: "a".repeat(64),
+            model_key: "moodboard_cursor_walk_fixture".to_string(),
+            descriptor_fingerprint: "b".repeat(64),
+            feature_schema_id: feature_schema_id().to_string(),
+        };
+        let page_cap = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS as usize;
+        let target_total = page_cap + 137;
+        assert!(
+            target_total < MAX_TRAINING_EVENTS,
+            "fixture must stay under the training ceiling"
+        );
+
+        let population = synthetic_training_population(&scope, target_total);
+        assert!(
+            population.len() > page_cap,
+            "fixture must exceed the daemon's page cap to exercise paging: {} rows",
+            population.len()
+        );
+        let mut expected_ids = std::collections::HashSet::new();
+        let mut events = Vec::with_capacity(population.len());
+        for record in &population {
+            expected_ids.insert(record.judgment_id);
+            let payload = serde_json::to_value(record).unwrap();
+            let mut event = Event::new(
+                token.namespace().as_str(),
+                JUDGMENT_RECORD_VERB,
+                EventKind::FeedbackExplicit,
+                SubstrateKind::Entity,
+                actor_label(&token),
+            )
+            .with_target(record.scope.board_entity_id)
+            .with_aggregate("moodboard_judgment", record.serve_id)
+            .with_payload(payload)
+            .with_payload_schema_version(1);
+            event.id = record.judgment_id;
+            events.push(event);
+        }
+        store
+            .append_events(events)
+            .await
+            .expect("seed judgment population");
+
+        let records = load_judgment_snapshot(&runtime, &token)
+            .await
+            .expect("a population above the page cap but under MAX_TRAINING_EVENTS must load");
+        assert_eq!(
+            records.len(),
+            population.len(),
+            "every seeded judgment must be collected exactly once across pages"
+        );
+        let collected_ids: std::collections::HashSet<Uuid> = records
+            .iter()
+            .map(|(_, record)| record.judgment_id)
+            .collect();
+        assert_eq!(
+            collected_ids, expected_ids,
+            "no judgment may be missing or duplicated across paged reads"
+        );
+
+        let permit = acquire_train_permit().expect("gate is free");
+        fit_preference_bounded(permit, records, scope)
+            .await
+            .expect("training must succeed once the paged snapshot is assembled");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1646,7 +2033,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_asset_rejects_corrupted_blob_bytes() {
+    async fn validate_asset_keeps_candidate_checks_metadata_only() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("state.db");
         let blob_root = temp.path().join("blobs");
@@ -1661,7 +2048,7 @@ mod tests {
             .await
             .unwrap();
         let asset = runtime
-            .create_entity_with_content_ref(
+            .create_entity_with_attachments(
                 &token,
                 "artifact",
                 Some("visual_asset"),
@@ -1669,23 +2056,24 @@ mod tests {
                 None,
                 None,
                 vec![],
-                &content_ref,
+                vec![NewAttachment {
+                    role: "content".to_string(),
+                    content_ref: content_ref.clone(),
+                    media_type: Some("image/png".to_string()),
+                    size_bytes: Some(32),
+                }],
             )
             .await
             .unwrap();
         validate_asset(&runtime, &token, asset.id, &content_ref)
             .await
-            .expect("intact candidate bytes must validate");
+            .expect("present candidate must validate");
         let hex = content_ref.as_str();
         let object_path = blob_root.join(&hex[0..2]).join(&hex[2..4]).join(hex);
         std::fs::write(&object_path, b"corrupted candidate bytes").unwrap();
-        let error = validate_asset(&runtime, &token, asset.id, &content_ref)
+        validate_asset(&runtime, &token, asset.id, &content_ref)
             .await
-            .expect_err("corrupted candidate bytes must fail closed before inference");
-        assert!(
-            error.to_string().contains("BLAKE3"),
-            "corruption must surface as digest verification failure: {error}"
-        );
+            .expect("candidate eligibility must use metadata-only existence, not hydrate bytes");
     }
 
     fn valid_serve_record() -> ServeRecord {
@@ -1888,7 +2276,9 @@ mod tests {
             descriptor_fingerprint: "b".repeat(64),
             feature_schema_id: feature_schema_id().to_string(),
         };
-        let (_, network_bytes) = materialize_fann(&[0.25; FEATURE_COUNT]).unwrap();
+        let (network, network_bytes) = materialize_fann(&[0.25; FEATURE_COUNT]).unwrap();
+        let (_, expected_probability) =
+            predict(&network, 1.25, &[0.9; FEATURE_COUNT], &[0.1; FEATURE_COUNT]).unwrap();
         let network_content_ref = blob_store.put(network_bytes.clone()).await.unwrap();
         let split_counts = BTreeMap::from([
             (
@@ -1980,6 +2370,7 @@ mod tests {
         };
         validate_loaded_bundle(&bundle).unwrap();
         let bundle_bytes = serde_json::to_vec(&bundle).unwrap();
+        let bundle_size = u64::try_from(bundle_bytes.len()).unwrap();
         let bundle_sha256 = sha256_hex(&bundle_bytes);
         let bundle_content_ref = blob_store.put(bundle_bytes).await.unwrap();
         let (entity, created) = find_or_create_model(
@@ -1989,6 +2380,9 @@ mod tests {
             &bundle,
             &bundle_content_ref,
             &bundle_sha256,
+            bundle_size,
+            &network_content_ref,
+            u64::try_from(network_bytes.len()).unwrap(),
         )
         .await
         .unwrap();
@@ -2000,7 +2394,7 @@ mod tests {
             &scope,
             &bundle_content_ref,
             &bundle_sha256,
-            &bundle.fann.network_content_ref,
+            &network_content_ref,
             &bundle.fann.network_sha256,
         )
         .await
@@ -2011,8 +2405,12 @@ mod tests {
         drop(blob_store);
 
         let restarted = persistent_runtime(&db_path, "alice");
+        let recording_store = Arc::new(RecordingBoundedStore {
+            inner: Arc::new(FsBlobStore::new(blob_root.clone(), 0).unwrap()),
+            calls: Mutex::new(Vec::new()),
+        });
         restarted
-            .install_blob_store(Arc::new(FsBlobStore::new(blob_root, 0).unwrap()))
+            .install_blob_store(Arc::clone(&recording_store) as Arc<dyn BlobStore>)
             .expect("install blob store");
         let restarted_token = restarted.authorize(Namespace::local()).unwrap();
         let loaded = load_preference_model(&restarted, &restarted_token, model_id, &scope)
@@ -2025,13 +2423,198 @@ mod tests {
             &[0.1; FEATURE_COUNT],
         )
         .unwrap();
-        assert!(probability > 0.5);
+        assert_eq!(
+            probability, expected_probability,
+            "attachment-backed restart must reconstruct the exact prior FANN prediction"
+        );
+        assert_eq!(
+            *recording_store.calls.lock().unwrap(),
+            vec![
+                (bundle_content_ref.clone(), MAX_MODEL_BLOB_BYTES),
+                (network_content_ref.clone(), MAX_MODEL_BLOB_BYTES),
+            ],
+            "bundle and network must each enter shared bounded hydration at the 1 MiB pack cap"
+        );
 
-        let mut wrong_scope = scope;
+        let mut wrong_scope = scope.clone();
         wrong_scope.board_id = "f".repeat(64);
         let error = load_preference_model(&restarted, &restarted_token, model_id, &wrong_scope)
             .await
             .expect_err("wrong identity must fail closed");
         assert!(error.to_string().contains("wrong board"));
+
+        let published_event = restarted
+            .events(&restarted_token)
+            .unwrap()
+            .get_event(model_event_id(model_id, &bundle_content_ref))
+            .await
+            .unwrap()
+            .expect("published model event");
+        let legacy_db_path = temp.path().join("legacy-v20.db");
+        let legacy_backend = canonical_v20_backend(&legacy_db_path);
+        {
+            let writer = legacy_backend
+                .pool()
+                .try_writer()
+                .expect("legacy fixture writer");
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO entities (\
+                         id, namespace, kind, entity_type, name, description, properties, tags, \
+                         created_at, updated_at, deleted_at, merged_into, merge_event_id, \
+                         content_ref\
+                     ) VALUES (\
+                         ?1, 'local', 'artifact', 'moodboard_model', 'legacy preference model', \
+                         NULL, ?2, '[]', ?3, ?3, NULL, NULL, NULL, ?4\
+                     )",
+                    (
+                        model_id.to_string(),
+                        entity
+                            .properties
+                            .as_ref()
+                            .expect("model property mirror")
+                            .to_string(),
+                        entity.created_at,
+                        bundle_content_ref.to_string(),
+                    ),
+                )
+                .expect("insert pre-V21 legacy model");
+        }
+        legacy_backend
+            .events_for_namespace("local")
+            .unwrap()
+            .append_event(published_event)
+            .await
+            .expect("insert immutable legacy model event");
+
+        let legacy_sql = legacy_backend.sql();
+        let owner = acquire_database_gc_owner(legacy_sql.as_ref())
+            .await
+            .expect("acquire legacy database GC owner");
+        legacy_backend
+            .stage_attachment_cutover(&owner)
+            .expect("stage real V21 cutover");
+        assert_eq!(
+            legacy_backend.attachment_cutover_status().unwrap(),
+            AttachmentCutoverStatus::Incomplete
+        );
+        assert_eq!(
+            crate::legacy_preference_model_count(legacy_sql.as_ref())
+                .await
+                .unwrap(),
+            1
+        );
+        let shared_hydrator = restarted.blob_hydrator().expect("shared restart hydrator");
+        let verified = crate::verify_legacy_preference_attachments(
+            legacy_sql.as_ref(),
+            shared_hydrator.as_ref(),
+        )
+        .await
+        .expect("verify real pre-V21 model evidence");
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].model_id, model_id);
+        assert_eq!(verified[0].network_content_ref, network_content_ref);
+        let verified_attachments = verified
+            .into_iter()
+            .map(|verified| Attachment {
+                record_uuid: verified.model_id,
+                substrate: AttachmentSubstrate::Entity,
+                role: "fann-network".to_string(),
+                content_ref: verified.network_content_ref,
+                media_type: Some("application/octet-stream".to_string()),
+                size_bytes: Some(verified.size_bytes),
+                created_at: entity.created_at,
+            })
+            .collect::<Vec<_>>();
+        legacy_backend
+            .apply_verified_attachments(&owner, &verified_attachments)
+            .expect("apply verified fann-network role");
+        legacy_backend
+            .finalize_attachment_cutover(&owner)
+            .expect("finalize real V21 cutover");
+        assert_eq!(
+            legacy_backend.attachment_cutover_status().unwrap(),
+            AttachmentCutoverStatus::Complete
+        );
+        drop(owner);
+
+        let sweep_store = Arc::new(
+            FsBlobStore::new(blob_root, 0)
+                .unwrap()
+                .with_orphan_sweep_grace(Duration::ZERO),
+        );
+        let migrated = KhiveRuntime::from_prepared_backend(
+            Arc::clone(&legacy_backend),
+            persistent_runtime_config(&legacy_db_path, "alice"),
+        )
+        .expect("runtime over finalized V21 database");
+        migrated
+            .install_blob_store(sweep_store.clone())
+            .expect("install migrated blob store");
+        let migrated_token = migrated.authorize(Namespace::local()).unwrap();
+        let migrated_model = load_preference_model(&migrated, &migrated_token, model_id, &scope)
+            .await
+            .expect("load migrated model");
+        let (_, migrated_probability) = predict(
+            &migrated_model.network,
+            migrated_model.bundle.calibration.temperature,
+            &[0.9; FEATURE_COUNT],
+            &[0.1; FEATURE_COUNT],
+        )
+        .unwrap();
+        assert_eq!(migrated_probability, expected_probability);
+
+        let orphan_ref = sweep_store
+            .put(b"unreferenced migration regression object".to_vec())
+            .await
+            .unwrap();
+        let sweep = sweep_store
+            .transactional_orphan_sweep(legacy_sql.as_ref(), false)
+            .await
+            .expect("attachment-only GC after V21 finalization");
+        assert_eq!(sweep.deleted, 1, "the control orphan proves GC executed");
+        assert!(!sweep_store.exists(&orphan_ref).await.unwrap());
+        assert!(sweep_store.exists(&bundle_content_ref).await.unwrap());
+        assert!(sweep_store.exists(&network_content_ref).await.unwrap());
+        let after_gc = load_preference_model(&migrated, &migrated_token, model_id, &scope)
+            .await
+            .expect("load migrated model after attachment-only GC");
+        let (_, after_gc_probability) = predict(
+            &after_gc.network,
+            after_gc.bundle.calibration.temperature,
+            &[0.9; FEATURE_COUNT],
+            &[0.1; FEATURE_COUNT],
+        )
+        .unwrap();
+        assert_eq!(after_gc_probability, expected_probability);
+
+        let wrong_network_ref = ContentRef::from_hex("f".repeat(64)).unwrap();
+        restarted
+            .attachments()
+            .unwrap()
+            .upsert_attachment(Attachment {
+                record_uuid: model_id,
+                substrate: AttachmentSubstrate::Entity,
+                role: "fann-network".to_string(),
+                content_ref: wrong_network_ref,
+                media_type: Some("application/octet-stream".to_string()),
+                size_bytes: Some(u64::try_from(network_bytes.len()).unwrap()),
+                created_at: entity.created_at,
+            })
+            .await
+            .unwrap();
+        recording_store.calls.lock().unwrap().clear();
+        let error = load_preference_model(&restarted, &restarted_token, model_id, &scope)
+            .await
+            .expect_err("attachment disagreement must fail before network hydration");
+        assert!(error
+            .to_string()
+            .contains("fann-network attachment disagrees"));
+        assert_eq!(
+            *recording_store.calls.lock().unwrap(),
+            vec![(bundle_content_ref, MAX_MODEL_BLOB_BYTES)],
+            "an unauthenticated attachment reference must never reach the hydrator"
+        );
     }
 }

@@ -3,16 +3,20 @@
 **Status**: accepted
 **Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 accepted and implemented
 2026-07-17, PR #1054; Amendment 3
-accepted 2026-07-17; Amendment 4 accepted 2026-07-19)
+accepted 2026-07-17; Amendment 4 accepted 2026-07-19; attachment-GC compatibility epoch added
+2026-08-16 by ADR-160)
 **Authors**: khive maintainers
-**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which requires
-backend-enforced bounded and digest-verified reads and retires public unbounded `get` on acceptance.
+**Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), which requires
+backend-enforced bounded and digest-verified reads, retires public unbounded `get`, and implements
+ADR-121's attachment-only liveness and claim fences through a Phase-4a GC compatibility release,
+mandatory fleet convergence/drain plus application-service quiescence, and boot-gated Phase-4b V21
+cutover.
 **Depends on**:
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits (trait-only capability
   surface this ADR extends with a ninth capability)
 - [ADR-015](ADR-015-schema-migrations.md) — Schema Migrations (the versioned migration this ADR uses
-  to add `entities.content_ref`)
+  to add the historical V10 `entities.content_ref`, later superseded by V21 attachments)
 - [ADR-044](ADR-044-vector-store-extensions.md) — Vector Store Extensions (the `orphan_sweep`
   CLI-only precedent this ADR mirrors for `BlobStore`)
   **Related**: [ADR-086](ADR-086-doc-file-pack.md) — proposed Doc/File Pack that deferred
@@ -29,7 +33,7 @@ large blobs that a downstream consumer (the planned doc/file pack, ADR-086) want
 reference from the graph, without inflating `khive.db` itself or forcing every KG query to page
 through blob bytes it never asked for.
 
-ADR-005 defines eight storage capability traits (`Sql`, `Notes`, `Entities`, `Graph`, `Events`,
+At the time this ADR was accepted, ADR-005 defined eight storage capability traits (`Sql`, `Notes`, `Entities`, `Graph`, `Events`,
 `Vectors`, `Sparse`, `Text`) under a "zero implementation, trait-only" constraint for
 `khive-storage`. ADR-086 explicitly deferred adding a blob capability until a real consumer needed
 it, and named `StorageCapability::Blob` as the natural v2 amendment. This ADR is that amendment
@@ -94,8 +98,13 @@ hand-rolled (7 lines, tested against BLAKE3's own published test vector for `BLA
 #[async_trait]
 pub trait BlobStore: Send + Sync + 'static {
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef>;
-    async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>>;
+    async fn get_bounded_verified(
+        &self,
+        content_ref: &ContentRef,
+        max_bytes: u64,
+    ) -> StorageResult<Vec<u8>>;
     async fn exists(&self, content_ref: &ContentRef) -> StorageResult<bool>;
+    async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>>;
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool>;
     async fn orphan_sweep(
         &self,
@@ -104,10 +113,12 @@ pub trait BlobStore: Send + Sync + 'static {
 }
 ```
 
-`get` returns `StorageError::NotFound` (capability `Blob`) for an absent reference. `delete`
-returns `Ok(false)` (not an error) when nothing existed to remove — deleting an absent object is
-not a failure. `orphan_sweep` defaults to `StorageError::Unsupported`, following `VectorStore`'s
-precedent (ADR-044): a backend opts in by overriding it.
+As amended by ADR-160, `get_bounded_verified` is the only whole-buffer read and returns
+`StorageError::NotFound` (capability `Blob`) for an absent reference. It enforces the caller's
+actual-byte maximum and authenticates BLAKE3 before returning bytes. `delete` returns `Ok(false)`
+(not an error) when nothing existed to remove — deleting an absent object is not a failure.
+`orphan_sweep` defaults to `StorageError::Unsupported`, following `VectorStore`'s precedent
+(ADR-044): a backend opts in by overriding it.
 
 ### 4. `FsBlobStore` — the filesystem backend (`khive-db`)
 
@@ -203,6 +214,13 @@ beside, and `resolve_blob_root` returns an error rather than picking an arbitrar
 
 ### 7. `entities.content_ref` — the reference column
 
+**Superseded storage shape (ADR-121 / ADR-160 Phase 4b).** This section records the V10 design that
+preceded first-class attachments. After the separate Phase-4a GC compatibility release has
+converged and every older process is drained, V21 backfills the value under attachment role
+`"content"`, keeps `Entity.content_ref` only as a compatibility read projection, and drops the
+physical entity column, its index, and its claim triggers. `attachments.content_ref` is then the sole
+SQL liveness source.
+
 A new nullable, indexed column on `entities` (migration V10,
 `crates/khive-db/sql/010-entities-content-ref.sql`):
 
@@ -233,8 +251,8 @@ column: content_ref".
 `BlobStore::orphan_sweep` is the ninth capability's mirror of `VectorStore::orphan_sweep`
 (ADR-044): an admin-side operation, not an MCP verb (adding one would be a wire-surface change
 requiring its own ADR amendment, per ADR-023). The caller (an admin CLI, not a live consumer path)
-assembles the set of live `content_ref`s — e.g. `SELECT DISTINCT content_ref FROM entities WHERE
-content_ref IS NOT NULL AND deleted_at IS NULL` — and passes it in `BlobOrphanSweepConfig`;
+assembles the set of live `content_ref`s — e.g. `SELECT DISTINCT content_ref FROM attachments` —
+and passes it in `BlobOrphanSweepConfig`;
 `FsBlobStore` walks its shard tree and reports (`dry_run: true`) or deletes (`dry_run: false`)
 everything not in that set.
 
@@ -248,55 +266,100 @@ ever add references and let GC reconcile.
 paragraph above, as originally written, claimed this design "is never removed out from under a
 concurrent reader". That remains false for `delete` and the caller-snapshot
 `orphan_sweep(config)` API. Both are **offline-maintenance-only**, not safe to run against a live
-entity writer:
+attachment writer:
 
 - `orphan_sweep`'s `live_refs` set is a **snapshot** the caller assembles before the call. Nothing
-  in `BlobStore` detects a `content_ref` that becomes newly live — an entity write lands
-  referencing it — between when that snapshot was taken and when the sweep runs; such a blob is
-  deleted anyway. `khive-db`'s
-  `orphan_sweep_race_demonstrates_the_documented_quiescence_requirement` test reproduces this
-  exactly, so the hazard is pinned in code, not just prose.
+  in `BlobStore` detects a `content_ref` that becomes newly live — an attachment write lands
+  referencing it — between when that snapshot was taken and when the sweep runs; such a blob would
+  be deleted anyway. As of the amendment below, the filesystem backend closes this specific
+  destructive path in this compatibility release by refusing every call outright, rather than
+  narrowing the hazard.
 - `delete` is an unconditional physical removal with the same class of hazard: any caller can
-  delete a `content_ref` an entity write races into existence a moment later, with no coordination
+  delete a `content_ref` an attachment write races into existence a moment later, with no coordination
   from this trait.
 
-Run those two methods only when writes that could create a new `content_ref` reference are
-quiesced. `BlobStore::transactional_orphan_sweep(sql, dry_run)`, added by PR #1313, is the live-
-traffic alternative for backends that can coordinate both stores. The filesystem implementation:
+Run `delete` only when writes that could create a new `content_ref` reference are quiesced.
+`BlobStore::transactional_orphan_sweep(sql, dry_run)`, added by PR #1313, is the live-traffic
+alternative for backends that can coordinate both stores.
 
-1. acquires a canonical-database in-process lock and `<database>.khive-blob-gc.lock`, then the
-   canonical-root in-process and advisory write locks, and captures the complete blob candidate
-   set while publishers are excluded;
-2. outside SQLite, evaluates file age and prepares the complete candidate set;
-3. after validating durable evidence, removes claims abandoned by the previous database owner in
-   SQL-only transactions of at most 128 rows; ownership, not the mutable path-derived `root_key`,
-   makes root relocation and restored-backup recovery safe;
+**Caller-snapshot `orphan_sweep` disabled on the filesystem backend (amended 2026-08-21).** This
+API has no `SqlAccess` capability of its own, so — unlike `transactional_orphan_sweep` — it cannot
+prove a completed V21 attachment epoch before deleting anything. A caller-assembled `live_refs`
+snapshot could delete an object a V20 SQL query cannot see as live (e.g. a moodboard FANN network),
+bypassing the epoch gate below entirely. `FsBlobStore::orphan_sweep` therefore returns typed
+`StorageError::Unsupported` for every call in this release, in both `dry_run` modes, matching the
+trait default; there is no destructive path through this method until a snapshot API can carry its
+own epoch proof. This does not affect `S3BlobStore`, whose `orphan_sweep` remains the
+offline-maintenance-only quiescence-required path described near the end of this section — the
+disablement is filesystem-specific because only the filesystem backend has a competing,
+epoch-gated `transactional_orphan_sweep` implementation to defer to.
+
+**Attachment-cutover compatibility epoch (amended 2026-08-16, Phase4a).** The filesystem
+implementation no longer sweeps against V20 entity liveness. Both report-only and destructive
+calls first require the named objects and markers of the exact completed V21 attachment epoch: the
+durable complete marker and V21 ledger row; attachment and claim tables/indexes; attachment
+INSERT/UPDATE claim fences; and no legacy `entities.content_ref` column, index, or triggers. V20,
+pending, incomplete, missing-required-object, retained-legacy, and ahead-of-V21 epochs return typed
+`StorageError::Unsupported` before root locking, filesystem walking, or abandoned-claim cleanup.
+Malformed table/evidence reads fail with their validation or storage error, and a nonfunctional
+named fence returns typed `Unsupported`; all fail closed before claim cleanup or deletion.
+`dry_run` does not weaken this contract.
+
+Once admitted, the filesystem implementation:
+
+1. acquires database ownership (the process-local guard plus the cross-process advisory lock) and
+   immediately rechecks the completed epoch, before ever waiting on the root guard/lock or walking
+   the filesystem — this closes the gap if external maintenance changed the schema between the
+   read-only preflight above and ownership, and keeps the pre-lock refusal contract true for every
+   listed epoch, not only the one the preflight observed;
+2. only once that recheck passes, acquires root ownership, captures the complete blob candidate set
+   while publishers are excluded, evaluates file age outside SQLite's writer transaction, validates
+   every attachment and claim reference, and then proves the attachment INSERT/UPDATE fences
+   function before any abandoned-claim cleanup;
+3. removes validated claims abandoned by the previous database owner in SQL-only transactions of
+   at most 128 rows; ownership, not the mutable path-derived `root_key`, makes root relocation and
+   restored-backup recovery safe;
 4. for each candidate batch of at most 128, enters a short, SQL-only `SqlAccess::atomic_unit`
-   (`BEGIN IMMEDIATE` on SQLite), selects distinct references from non-deleted entities, and
-   durably claims only absent candidates in `blob_gc_claims`;
-5. after that transaction commits, deletes only the claimed batch while retaining database/root
-   ownership; entity INSERT/UPDATE triggers reject a newly live reference to any active claim; and
+   (`BEGIN IMMEDIATE` on SQLite), anti-joins every `attachments.content_ref` role, and durably
+   claims only absent candidates in `blob_gc_claims`;
+5. after that transaction commits, deletes only the claimed batch while retaining ownership;
+   attachment INSERT/UPDATE triggers reject a newly live reference to any active claim; and
 6. removes that bounded claim batch in a second short SQL-only atomic unit before advancing, then
    releases all locks after the final batch.
 
+**Two-release rollout (ADR-160 Phase 4a → Phase 4b).** The epoch gate above ships first as
+Phase 4a and makes no schema or data change: it does not create attachments, register or execute
+V21, backfill, dual-read, dual-write, or drop the legacy column. Callers must not fall back to
+caller-snapshot `orphan_sweep` or unconditional `delete` while the gate refuses.
+
+Every process and scheduled job that can share the database/blob root must converge on the
+Phase-4a-or-newer gate, and every pre-Phase-4a process must be drained and restart-fenced, before a
+Phase-4b binary may migrate V21. Every Phase-4a application-serving/read-write process must also be
+quiesced for the cutover, or independently proven unable to touch the database: Phase 4a does not
+make its V20 entity readers and writers compatible with the V21 column drop. A Phase-4a GC-only
+worker is safe on exact completed V21, but that narrow property is not general serving
+compatibility. Start the Phase-4b service fleet only after exact-current topology validation. This
+intentionally pauses transactional GC on V20 during the compatibility epoch; operators must budget
+capacity rather than weaken the fence.
+
 This yields two concurrency guarantees pinned by tests. A blob published after candidate capture
-is not in the sweep set and survives. A committed entity reference cannot appear between the
+is not in the sweep set and survives. A committed attachment reference cannot appear between the
 liveness query and physical deletion: SQLite's writer lock covers the anti-join plus claim commit,
 then the durable trigger fence covers the external deletion phase without monopolizing SQLite's
-single writer. Invalid stored `content_ref` or claim values fail closed rather than making the
-sweep delete against an incomplete live set. A crash after claim commit leaves a durable
-fail-closed row; the next exclusive database owner rescans the current root and liveness state,
-clears abandoned claims in bounded units, and freshly claims any still-eligible work. At no point
-does one writer transaction bind, mutate, or return more than 128 candidates, bounding claim-table
-and WAL work per writer hold.
+single writer. Invalid stored attachment or claim refs fail closed before the functional probe,
+claim recovery, or deletion. A crash after claim commit leaves a durable fail-closed row; the next
+exclusive database owner rescans the current root and liveness state, clears abandoned claims in
+bounded units, and freshly claims any still-eligible work. At no point does one writer transaction
+bind, mutate, or return more than 128 candidates, bounding claim-table and WAL work per writer hold.
 
-The guarantee still has a bounded publish gap. `put(bytes)` and the later entity write that stores
-its returned reference are separate client steps, outside one shared transaction. A candidate with
-no committed reference is therefore protected by file age: `FsBlobStore` defaults to a one-hour
-grace period, treats an unknown age as protected, and refreshes the mtime on a deduplicated `put`.
-A client whose put-to-reference gap exceeds the configured grace remains exposed to deletion.
-Tests cover a fresh unreferenced publish, deduplicated republication, zero-grace behavior, and
-deletion after grace expiry; the warning is not weakened beyond that evidence.
+The guarantee still has a bounded publish gap. `put(bytes)` and the later attachment write that
+stores its returned reference are separate client steps, outside one shared transaction. A
+candidate with no committed reference is therefore protected by file age: `FsBlobStore` defaults
+to a one-hour grace period, treats an unknown age as protected, and refreshes the mtime on a
+deduplicated `put`. A client whose put-to-reference gap exceeds the configured grace remains
+exposed to deletion. Tests cover a fresh unreferenced publish, deduplicated republication,
+zero-grace behavior, and deletion after grace expiry; the warning is not weakened beyond that
+evidence.
 
 `S3BlobStore` does not override `transactional_orphan_sweep` and returns `Unsupported`; its
 caller-snapshot `orphan_sweep` has no publish-grace accounting and remains offline-maintenance-
@@ -336,33 +399,38 @@ misses.
 
 ## Consequences
 
+The following bullets record the original V10 acceptance consequences. ADR-121 / ADR-160 Phase 4b
+supersedes their entity-column details with the V21 outcome described immediately afterward.
+
 - `khive-storage` grows one new module (`blob.rs`) and one new `StorageCapability` variant; no
   existing trait or type changes shape.
 - `khive-db` grows one new store module (`stores/blob.rs`, `FsBlobStore`), one new
   `StorageBackend::blob_store` factory method, and one new migration (V10). No existing migration
   is edited.
-- `Entity` (the `khive-storage` flat/SQL-facing struct, not `khive_types::entity::Entity`) grows a
-  `content_ref: Option<String>` field. Every call site constructing an `Entity` literal
-  (`khive-db`, `khive-runtime`, `khive-vcs`) needed updating; all currently set `content_ref: None`
-  except the SQL-backed CRUD paths in `khive-db::stores::entity`, which thread the real value
-  through.
+- `Entity` (the `khive-storage` flat/SQL-facing struct, not `khive_types::entity::Entity`) grew a
+  `content_ref: Option<String>` field. At V10 acceptance, SQL-backed entity CRUD threaded the
+  physical column through that field.
 - The pre-existing entity-merge SQL path in `khive-runtime::curation::merge_entity_sql`'s `INSERT
   OR REPLACE` already omits `entity_type` from its column list (a pre-existing gap, not introduced
   by this ADR) — merging an entity through that path resets `entity_type` to `NULL` in the stored
-  row today. `content_ref` was deliberately left out of that same `INSERT OR REPLACE` for
+  row at the time. `content_ref` was deliberately left out of that same `INSERT OR REPLACE` for
   consistency with the existing (undocumented) behavior rather than silently fixing one field and
   not the other; the in-memory `MergeResult`'s returned `Entity` does still carry the "into"
   entity's `content_ref` forward, matching how it already carries `entity_type` forward in memory
-  despite the DB row losing it. This existing gap should be fixed in its own change, not folded
-  into this ADR's scope.
+  despite the DB row losing it.
 - No MCP wire-surface change: `blob_store` is reached only through `StorageBackend`, not through
   any pack verb. A future doc/file pack ADR will define what (if anything) becomes MCP-visible.
+- **Current V21 outcome (ADR-121 / ADR-160 Phase 4b):** after the Phase-4a fleet gate, the physical
+  entity column and its index and
+  claim triggers are removed. `Entity.content_ref` remains only as a compatibility response
+  projection of attachment role `"content"`; entity writes and merges no longer read or write a
+  physical `entities.content_ref`. The role-keyed attachment row is authoritative for liveness.
 - **Amendments (2026-07-13, PR #922):** `ContentRef` no longer derives
   `Deserialize` — it is hand-implemented to route every input through `from_hex`, so a malformed
   serialized value is rejected at deserialization instead of later panicking in `shard_path`.
   `FsBlobStore::put`'s floor check now accounts for the pending write's own size. `delete` and
   `orphan_sweep` are now explicitly documented (trait doc comments, §8 above) as
-  offline-maintenance-only, requiring quiesced entity writes — a real concurrency hazard the
+  offline-maintenance-only, requiring quiesced attachment writes — a real concurrency hazard the
   original §8 text incorrectly described as absent. PR #1313 later added the distinct filesystem
   `transactional_orphan_sweep` path described in §8; it did not make these legacy methods safe.
 - **Further amendment (same date):** the first fix for serializing `put` scoped
@@ -458,14 +526,14 @@ ADR's physical-deletion and orphan-reclamation contract.
 
 ### Trait method mapping
 
-| `BlobStore` method     | S3-compatible operation                                   | Required behavior                                                                                                                                                                                                                 |
-| ---------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `put(bytes)`           | Client-side BLAKE3, `HEAD`, then conditional `PUT Object` | Compute `ContentRef` before network I/O. An existing key is the dedup no-op. A missing key is created with `If-None-Match: *`; a concurrent precondition failure means an identical writer won and is returned as success.        |
-| `get(content_ref)`     | `GET Object`                                              | Return exact bytes. A missing key maps to `StorageError::NotFound` with capability `Blob`, resource `blob`, and the content ref as key.                                                                                           |
-| `exists(content_ref)`  | `HEAD Object`                                             | Success is `true`; not-found is `false`. Authorization, timeout, and transport failures remain errors and must not masquerade as absence.                                                                                         |
-| `delete(content_ref)`  | `HEAD Object`, then `DELETE Object`                       | Under the required quiescence, an absent HEAD returns `false`; a present HEAD followed by successful deletion returns `true`. The HEAD is necessary because S3 DELETE is idempotent and does not reliably report prior existence. |
-| `size(content_ref)`    | `HEAD Object`                                             | Returns `Some(size)` from the HEAD response's content length, or `None` when the HEAD reports the key absent. See Amendment 3.                                                                                                    |
-| `orphan_sweep(config)` | Paginated `ListObjectsV2`, diff, bounded deletes          | List only the configured prefix, process no more than 1,000 keys per page, validate the exact shard/key form, compare to `live_refs`, and retain only page-sized remote state. Dry-run never deletes.                             |
+| `BlobStore` method                             | S3-compatible operation                                   | Required behavior                                                                                                                                                                                                                                              |
+| ---------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `put(bytes)`                                   | Client-side BLAKE3, `HEAD`, then conditional `PUT Object` | Compute `ContentRef` before network I/O. An existing key is the dedup no-op. A missing key is created with `If-None-Match: *`; a concurrent precondition failure means an identical writer won and is returned as success.                                     |
+| `get_bounded_verified(content_ref, max_bytes)` | One `GET Object`                                          | Enforce the caller limit while streaming, require response metadata to match final length, and authenticate BLAKE3 before returning bytes. A missing key maps to `StorageError::NotFound` with capability `Blob`, resource `blob`, and the content ref as key. |
+| `exists(content_ref)`                          | `HEAD Object`                                             | Success is `true`; not-found is `false`. Authorization, timeout, and transport failures remain errors and must not masquerade as absence.                                                                                                                      |
+| `delete(content_ref)`                          | `HEAD Object`, then `DELETE Object`                       | Under the required quiescence, an absent HEAD returns `false`; a present HEAD followed by successful deletion returns `true`. The HEAD is necessary because S3 DELETE is idempotent and does not reliably report prior existence.                              |
+| `size(content_ref)`                            | `HEAD Object`                                             | Returns `Some(size)` from the HEAD response's content length, or `None` when the HEAD reports the key absent. See Amendment 3.                                                                                                                                 |
+| `orphan_sweep(config)`                         | Paginated `ListObjectsV2`, diff, bounded deletes          | List only the configured prefix, process no more than 1,000 keys per page, validate the exact shard/key form, compare to `live_refs`, and retain only page-sized remote state. Dry-run never deletes.                                                          |
 
 `orphan_sweep` continues until the provider returns no continuation token. Delete request size and
 concurrency are bounded; the implementation does not materialize the full remote listing. A normal
@@ -483,10 +551,10 @@ Content-addressed keys plus conditional create replace the filesystem publish cr
 concurrent `put` calls.
 
 No object-store mutex replaces the §8 safety requirement because an in-process lock would not solve
-it. The hazardous race is between a database snapshot of live `content_ref`s and a later entity
+it. The hazardous race is between a database snapshot of live `content_ref`s and a later attachment
 write, potentially across processes and storage systems. `delete` and the caller-snapshot
 `orphan_sweep` therefore remain offline-maintenance-only for S3 and require deployment-wide
-quiescence of every writer that can create a new entity reference for the full snapshot-plus-sweep
+quiescence of every writer that can create a new attachment reference for the full snapshot-plus-sweep
 interval. PR #1313 implemented `transactional_orphan_sweep` only for `FsBlobStore`;
 `S3BlobStore` retains the trait default (`Unsupported`) and does not inherit the filesystem grace-
 period guarantee.
@@ -501,14 +569,14 @@ race-free “capacity remaining after this write” check, so `S3BlobStore` perf
 A provider quota or capacity refusal is surfaced from the failed PUT and is never mapped to
 `StorageError::CapacityFloor`.
 
-| HTTP/client failure                                                                                                                              | `StorageError` mapping                                              |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
-| GET or HEAD not-found                                                                                                                            | `NotFound` for `get`; `false` for `exists` and the pre-delete check |
-| Expected conditional-create already-exists/precondition failure                                                                                  | Successful dedup for `put`                                          |
-| Request deadline or transport timeout                                                                                                            | `Timeout { operation }`                                             |
-| Invalid bucket, endpoint, region, prefix, or incomplete credential environment                                                                   | Startup/config error; `InvalidInput` if discovered at method scope  |
-| Unexpected provider conflict                                                                                                                     | `Conflict { capability: Blob, operation, message }`                 |
-| Authorization/signature rejection, TLS/DNS/connect failure, exhausted transient response, quota/capacity refusal, or malformed protocol response | `Driver { capability: Blob, operation, source }`                    |
+| HTTP/client failure                                                                                                                              | `StorageError` mapping                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| GET or HEAD not-found                                                                                                                            | `NotFound` for `get_bounded_verified`; `false` for `exists` and the pre-delete check |
+| Expected conditional-create already-exists/precondition failure                                                                                  | Successful dedup for `put`                                                           |
+| Request deadline or transport timeout                                                                                                            | `Timeout { operation }`                                                              |
+| Invalid bucket, endpoint, region, prefix, or incomplete credential environment                                                                   | Startup/config error; `InvalidInput` if discovered at method scope                   |
+| Unexpected provider conflict                                                                                                                     | `Conflict { capability: Blob, operation, message }`                                  |
+| Authorization/signature rejection, TLS/DNS/connect failure, exhausted transient response, quota/capacity refusal, or malformed protocol response | `Driver { capability: Blob, operation, source }`                                     |
 
 The S3 client applies bounded exponential backoff with jitter to replay-safe requests and the
 idempotent content-addressed PUT. Transient `429` and `5xx` responses are retried within that budget;
@@ -535,12 +603,12 @@ and is unrelated to this ADR's S3 backend. There is no re-derived hard budget ye
 size-delta reviews for this and future backends must compare against a freshly measured `main`
 binary, not the old 18 MB figure.
 
-The existing whole-buffer trait is accepted for S3 v1 up to 64 MiB per object. `put` rejects a
-larger buffer with `InvalidInput`; `get` checks returned object metadata before collecting a larger
-response. Consumers must enforce the same ceiling before reading a source into memory. A streaming
-amendment covering both upload and download, hash finalization, replay, multipart abort, and retry
-semantics is required before khive supports larger blobs or concurrent traffic whose measured peak
-memory violates a supported deployment envelope.
+The bounded whole-buffer trait is accepted for S3 v1 up to 64 MiB per object. `put` rejects a
+larger buffer with `InvalidInput`; `get_bounded_verified` checks both returned metadata and actual
+streamed bytes, then authenticates the complete body. Production consumers additionally enter
+through runtime weighted admission. A streaming amendment covering upload and download, hash
+finalization, replay, multipart abort, and retry semantics is required before khive supports larger
+blobs or traffic whose measured peak memory violates a supported deployment envelope.
 
 CI uses three layers:
 
@@ -622,18 +690,18 @@ Amendment 2). Both implementations map a not-found response to `Ok(None)`, not a
 `S3BlobStore`), and a metadata-only size accessor is meaningful for either backend, so there is
 no principled default to fall back on.
 
-Downstream, the `blob.stat` verb handler now answers directly from `size` and no longer reads
-or digest-verifies the object; digest verification remains on the `blob.get` read path, where
-the bytes are already fetched to serve. `blob.get` also calls `size` before hydrating, and
-rejects an object exceeding its hydration ceiling before any bytes are read.
+Downstream, the `blob.stat` verb handler answers directly from `size` and never reads or
+digest-verifies the object. As amended by ADR-160, `blob.get` performs its whole-buffer read through
+the shared runtime hydrator and the backend verifies the digest before bytes reach the handler;
+`size` remains a cheap preflight for response/range refusal, not the hydration authority.
 
 ### Consequences
 
 - `BlobStore` implementers must provide a metadata-only size accessor; both implementations
   in this crate already have direct access to the required information (`stat`/`HEAD`).
 - `blob.stat` no longer reports whether a stored object's bytes match its own `ContentRef`
-  (the `corrupt` field is removed); that check happens on `blob.get`, the only verb that
-  actually reads the bytes.
+  (the `corrupt` field is removed); the bounded verified read used by `blob.get` performs that
+  check.
 - No schema, wire-format, or `ContentRef` change; this amendment is additive to the trait
   surface only.
 
@@ -732,7 +800,9 @@ unauthenticated callers, or telemetry that leaves the deployment boundary.
   `BlobOrphanSweepResult`, `BlobStore`.
 - `crates/khive-storage/src/capability.rs` — `StorageCapability::Blob`.
 - `crates/khive-storage/src/error.rs` — `StorageError::CapacityFloor`.
-- `crates/khive-storage/src/entity.rs` — `Entity::content_ref`, `Entity::with_content_ref`.
+- `crates/khive-storage/src/entity.rs` — `Entity::content_ref` compatibility response projection;
+  the former writable helper is removed.
+- `crates/khive-storage/src/attachment.rs` — ADR-121 role-keyed attachment contract.
 - `crates/khive-db/src/stores/blob.rs` — `FsBlobStore`, `resolve_blob_root`,
   `write_lock_for_root`/`root_write_locks` (the canonical-root-keyed shared-lock registry),
   `crosses_floor` (the pure write-size-aware floor comparison).
@@ -742,12 +812,15 @@ unauthenticated callers, or telemetry that leaves the deployment boundary.
   `crates/khive-mcp/src/serve.rs` — config-aware blob-store selection and boot wiring from PR #1054;
   no provider type enters `khive-storage`.
 - `crates/khive-storage/src/blob.rs` and `crates/khive-db/src/stores/blob.rs` — provider-neutral
-  transactional sweep contract and filesystem implementation from PR #1313.
-- `crates/khive-db/sql/010-entities-content-ref.sql` — migration V10.
-- `crates/khive-db/sql/entities-ddl.sql` — mirrored `content_ref` column + index.
-- `crates/khive-db/src/stores/entity.rs` — `content_ref` threaded through
-  `entity_upsert_statement`, `batch_upsert_entities`, `read_entity`, and all three `SELECT` column
-  lists.
+  transactional sweep contract and filesystem implementation; the Phase-4a epoch gate refuses V20
+  and every incomplete/malformed V21 combination in both modes, while exact completed V21
+  anti-joins `attachments` and validates attachment/claim refs.
+- `crates/khive-db/sql/010-entities-content-ref.sql` — historical V10 column introduced by this
+  ADR; V21 removes it after backfill.
+- `crates/khive-db/sql/021-attachments-a-stage.sql` and
+  `021-attachments-b-claim-fences.sql` — resumable stage schema and final attachment fences.
+- `crates/khive-db/src/stores/entity.rs` — role `"content"` read projection, atomic
+  entity-plus-attachment publication, and transactional hard-delete cleanup.
 
 ## References
 

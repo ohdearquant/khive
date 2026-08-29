@@ -26,13 +26,149 @@ pub const DEFAULT_BLOB_HYDRATION_BYTES: u64 = 4 * khive_storage::MAX_BLOB_WHOLE_
 #[derive(Debug)]
 pub struct BlobHydrator {
     store: Arc<dyn BlobStore>,
+    /// The store as handed in by the caller, before any read-only wrapping.
+    /// Kept so the install seam can recognize a reinstall of the same raw
+    /// store by pointer identity even when `store` is a wrapper around it.
+    raw_store: Arc<dyn BlobStore>,
+    /// True only for hydrators built through [`Self::new_read_only`], whose
+    /// mutators are refused by construction. The runtime's install seam
+    /// requires this on read-only runtimes: `dyn BlobStore` carries no
+    /// downcast hook, so the wrapper cannot be recognized after the fact —
+    /// the guarantee has to travel with the hydrator that made it.
+    read_only: bool,
+    /// True only for hydrators built by
+    /// [`Self::resolve_for_governing_backend`], whose mode was derived from a
+    /// governing backend's own access mode rather than declared by the
+    /// caller. The shared install seam accepts only governed hydrators, so a
+    /// hand-paired writable hydrator cannot ride it onto a read-only
+    /// runtime.
+    governed: bool,
     admission: Arc<tokio::sync::Semaphore>,
     budget_bytes: u64,
 }
 
+/// Error from [`BlobHydrator::resolve_for_governing_backend`], split so boot
+/// can distinguish store resolution failures (which fall back to "no blob
+/// configured" when `[storage.blob]` is absent) from budget pairing failures
+/// (always fatal).
+#[derive(Debug)]
+pub enum GovernedBlobError {
+    /// The configured store could not be resolved for the governing mode.
+    Resolve(SqliteError),
+    /// The resolved store could not be paired with the hydration budget.
+    Construct(RuntimeError),
+}
+
+impl std::fmt::Display for GovernedBlobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resolve(error) => write!(f, "blob store resolution: {error}"),
+            Self::Construct(error) => write!(f, "blob hydrator construction: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GovernedBlobError {}
+
 impl BlobHydrator {
+    /// Pair the raw store with a budget, refusing every physical mutator:
+    /// the store is wrapped so `put`/`delete`/sweeps error while the bounded
+    /// read surface stays available. This is the only constructor a
+    /// read-only runtime's install seam accepts.
+    pub(crate) fn new_read_only(
+        store: Arc<dyn BlobStore>,
+        budget_bytes: u64,
+    ) -> RuntimeResult<Self> {
+        let mut hydrator =
+            Self::new_inner(wrap_read_only(Arc::clone(&store)), store, budget_bytes)?;
+        hydrator.read_only = true;
+        Ok(hydrator)
+    }
+
+    /// Whether this hydrator refuses mutation by construction.
+    pub(crate) fn enforces_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// The store exactly as the caller handed it in, before any wrapping.
+    pub(crate) fn raw_store(&self) -> Arc<dyn BlobStore> {
+        Arc::clone(&self.raw_store)
+    }
+
+    /// Pair a raw store with a budget under an explicitly declared
+    /// blob-runtime mode. `read_only = true` wraps the store so every
+    /// physical mutator refuses while the bounded read surface stays
+    /// available; `false` is [`Self::new`]. Boot paths that decide the blob
+    /// mode from configuration (the blob pack's backend mode, ADR-160 D3)
+    /// construct through this so the decision travels with the hydrator —
+    /// the install seam can then hold hydrator mode against runtime mode
+    /// instead of trusting the caller's pairing.
+    pub fn for_mode(
+        store: Arc<dyn BlobStore>,
+        budget_bytes: u64,
+        read_only: bool,
+    ) -> RuntimeResult<Self> {
+        if read_only {
+            Self::new_read_only(store, budget_bytes)
+        } else {
+            Self::new(store, budget_bytes)
+        }
+    }
+
+    /// Resolve the configured store and pair it with the budget under the
+    /// mode of the backend that GOVERNS blob mutability — the backend the
+    /// blob pack maps to (ADR-160 D3), which on single-backend boots is the
+    /// runtime's own backend.
+    ///
+    /// The mode is derived here from `governing_backend`'s own access mode,
+    /// never accepted as a caller-declared flag, and the hydrator is stamped
+    /// as governed. [`crate::KhiveRuntime::install_shared_blob_hydrator`]
+    /// accepts only governed hydrators.
+    ///
+    /// Trust model (explicit policy): which backend governs blob mutability
+    /// is a deployment-topology assertion made by the host that wires boot
+    /// (the blob pack's backend, ADR-160 D3), and this seam takes the
+    /// caller's word for it. What the derivation defends against is the
+    /// ACCIDENTAL mode mismatch — a hand-paired writable hydrator drifting
+    /// onto a read-only handle through the shared seam. It does not defend
+    /// against an in-process caller who deliberately misdeclares the
+    /// governing backend, because no runtime seam can: any such caller can
+    /// already open the configured blob root directly (the same config and
+    /// store constructors are public) and mutate it without touching a
+    /// runtime handle. Read-only runtime handles are a wrong-wiring guard,
+    /// not an in-process sandbox.
+    pub fn resolve_for_governing_backend(
+        cfg: &KhiveConfig,
+        resolve_backend: &StorageBackend,
+        governing_backend: &StorageBackend,
+        budget_bytes: u64,
+    ) -> Result<Self, GovernedBlobError> {
+        let read_only = governing_backend.is_read_only();
+        let store = resolve_blob_store_for_mode(cfg, resolve_backend, read_only)
+            .map_err(GovernedBlobError::Resolve)?;
+        let mut hydrator =
+            Self::for_mode(store, budget_bytes, read_only).map_err(GovernedBlobError::Construct)?;
+        hydrator.governed = true;
+        Ok(hydrator)
+    }
+
+    /// Whether this hydrator's mode was derived from a governing backend
+    /// (see [`Self::resolve_for_governing_backend`]).
+    pub(crate) fn is_governed(&self) -> bool {
+        self.governed
+    }
+
     /// Pair one store with one aggregate byte budget.
     pub fn new(store: Arc<dyn BlobStore>, budget_bytes: u64) -> RuntimeResult<Self> {
+        let raw = Arc::clone(&store);
+        Self::new_inner(store, raw, budget_bytes)
+    }
+
+    fn new_inner(
+        store: Arc<dyn BlobStore>,
+        raw_store: Arc<dyn BlobStore>,
+        budget_bytes: u64,
+    ) -> RuntimeResult<Self> {
         if budget_bytes < khive_storage::MAX_BLOB_WHOLE_BYTES {
             return Err(RuntimeError::InvalidInput(format!(
                 "blob hydration budget must be at least {} bytes, got {budget_bytes}",
@@ -52,6 +188,9 @@ impl BlobHydrator {
         }
         Ok(Self {
             store,
+            raw_store,
+            read_only: false,
+            governed: false,
             admission: Arc::new(tokio::sync::Semaphore::new(permits)),
             budget_bytes,
         })
@@ -215,11 +354,11 @@ pub fn resolve_blob_store(
 
 /// Resolve the configured store for one pack runtime's effective access mode.
 ///
-/// A read-only runtime retains `get`/`exists`/`size` against an already-present
-/// fs root (or a configured S3 store), but boot never creates the default fs
-/// root and the wrapper rejects every physical mutator. The mode belongs to the
-/// runtime assigned to the `blob` pack; a mixed topology must not infer it from
-/// the main audit backend.
+/// A read-only runtime retains bounded verified reads plus `exists`/`size`
+/// against an already-present fs root (or a configured S3 store), but boot
+/// never creates the default fs root and the wrapper rejects every physical
+/// mutator. The mode belongs to the runtime assigned to the `blob` pack; a
+/// mixed topology must not infer it from the main audit backend.
 pub fn resolve_blob_store_for_mode(
     cfg: &KhiveConfig,
     backend: &StorageBackend,
@@ -258,6 +397,15 @@ pub fn resolve_blob_store_for_mode(
     Ok(Arc::new(ReadOnlyBlobStore { inner }))
 }
 
+/// Wrap an arbitrary store so every physical mutator is refused while the
+/// bounded read surface stays available. Used by the runtime's install seam
+/// to hold the read-only invariant for stores installed after boot; wrapping
+/// an already-wrapped store is harmless (reads delegate, mutators refuse at
+/// the outer layer).
+pub(crate) fn wrap_read_only(inner: Arc<dyn BlobStore>) -> Arc<dyn BlobStore> {
+    Arc::new(ReadOnlyBlobStore { inner })
+}
+
 #[derive(Debug)]
 struct ReadOnlyBlobStore {
     inner: Arc<dyn BlobStore>,
@@ -277,10 +425,6 @@ impl ReadOnlyBlobStore {
 impl BlobStore for ReadOnlyBlobStore {
     async fn put(&self, _bytes: Vec<u8>) -> StorageResult<ContentRef> {
         Err(Self::mutation_error("put"))
-    }
-
-    async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
-        self.inner.get(content_ref).await
     }
 
     async fn get_bounded_verified(
@@ -336,10 +480,6 @@ mod tests {
     impl BlobStore for RecordingReadStore {
         async fn put(&self, _bytes: Vec<u8>) -> StorageResult<ContentRef> {
             panic!("put is not used by the read-only delegation test")
-        }
-
-        async fn get(&self, _content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
-            panic!("legacy get must not service a bounded read")
         }
 
         async fn get_bounded_verified(
@@ -473,10 +613,6 @@ mod tests {
     impl BlobStore for HydrationReadStore {
         async fn put(&self, _bytes: Vec<u8>) -> StorageResult<ContentRef> {
             panic!("put is not used by hydrator tests")
-        }
-
-        async fn get(&self, _content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
-            panic!("legacy get must not service hydration")
         }
 
         async fn get_bounded_verified(

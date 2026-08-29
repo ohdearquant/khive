@@ -3,10 +3,11 @@
 **Status**: accepted\
 **Date**: 2026-08-08\
 **Authors**: khive maintainers\
-**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which moves the
-deterministic numerical core to `lattice-tune`, preserves feature/scope and byte/event identities,
-and anchors the existing FANN object under ADR-121 role `"fann-network"` with authenticated
-cross-checks on acceptance.
+**Amended by**: accepted [ADR-160](ADR-160-shared-pack-infrastructure.md), whose shared-hydration
+phase is implemented (preference bundle/network reads hydrate through the runtime seam); its
+remaining phases move the deterministic numerical core to `lattice-tune`, preserve feature/scope
+and byte/event identities, and anchor the existing FANN object under ADR-121 role `"fann-network"`
+with authenticated cross-checks.
 
 ## Context
 
@@ -85,10 +86,13 @@ The immutable learning scope is the tuple:
 After Gate authorization, `board_entity_id` must resolve by globally unique UUID to a live
 `artifact/moodboard` whose `properties.board_id` equals the supplied 64-lowercase-hex fingerprint.
 Occurrence asset IDs likewise resolve globally to live `artifact/visual_asset` entities whose
-attached `content_ref` equals the supplied live BlobStore reference. Handlers perform no inline
-entity-namespace equality checks, per ADR-007 Rev 6. The scope namespace remains immutable event
-and training attribution, not a by-ID visibility boundary. Descriptor fingerprints and report
-digests are 64-lowercase-hex SHA-256 strings.
+attached `content_ref` equals the supplied live BlobStore reference. Serve and preference
+occurrence eligibility checks that entity/reference identity and `BlobStore::exists` only; it does
+not hydrate candidate bytes. Integrity is enforced when bytes are actually consumed: ADR-148
+search verifies its source image, while this ADR verifies the preference bundle and FANN network
+on model load. Handlers perform no inline entity-namespace equality checks, per ADR-007 Rev 6. The
+scope namespace remains immutable event and training attribution, not a by-ID visibility boundary.
+Descriptor fingerprints and report digests are 64-lowercase-hex SHA-256 strings.
 
 ### D3 — Explicit serve and judgment provenance
 
@@ -222,7 +226,8 @@ containing:
 - exact `10 -> 1 Linear, bias=0` architecture; and
 - FANN blob reference and SHA-256.
 
-The bundle is a second BlobStore object attached to an `artifact/moodboard_model`; its SHA-256 is
+The bundle is a second BlobStore object attached to an `artifact/moodboard_model` under ADR-121
+role `"content"`; the FANN object is attached atomically under role `"fann-network"`. Its SHA-256 is
 the model fingerprint. The model is linked `derived_from` its board. A pack-only immutable
 `moodboard.model_record` `Audit` event binds actor, entity ID, bundle reference/fingerprint,
 network reference/digest, and full scope. Generic KG properties are display mirrors and cannot by
@@ -237,7 +242,15 @@ attributed bundle/event scope, both BlobStore BLAKE3 references, bundle and netw
 the model provenance event, support/calibration gates, FANN version, one-layer shape, Linear
 activation, finite parameters, and exactly zero bias. FANN's binary parser
 validates shape and exact length but accepts non-finite parameters, so the pack performs the
-additional finite-parameter walk. The bundle and FANN blobs are capped at 1 MiB each.
+additional finite-parameter walk. The authenticated bundle's network reference must equal the
+`"fann-network"` attachment before that object is hydrated. The bundle and FANN blobs are capped at
+1 MiB each.
+
+During V21 upgrade, the legacy bundle ref is backfilled as role `"content"`; role
+`"fann-network"` is reconstructed only after bounded hydration verifies that bundle, its exact
+immutable `moodboard.model_record` event, and the referenced FANN bytes. Mutable entity properties
+remain display mirrors and are never migration authority. Missing or conflicting evidence aborts
+the cutover rather than guessing, and both attachment rows participate in GC liveness.
 
 `Network::forward` reuses mutable activation buffers. Serving therefore keeps no shared mutable
 network instance: a validated network is cloned for each prediction. Concurrent calls use
@@ -257,8 +270,10 @@ scored occurrences. It returns:
 The probability is conditional on a decisive human judgment. It is not a conformal p-value, a
 retrieval score, or a board-coherence statistic. Although the frozen input vector includes an
 upstream `style_conformal_p`, the learned output does not replace or merge with that evidence.
-Wrong actor, namespace, board, descriptor, schema, asset/content identity, corrupt bytes,
-non-finite input, or uncalibrated model fails closed; there is no fallback score.
+Wrong actor, namespace, board, descriptor, schema, asset/content identity, a missing candidate
+object, corrupt preference bundle or FANN network bytes, non-finite input, or an uncalibrated model
+fails closed; there is no fallback score. Candidate occurrence validation remains metadata-only as
+specified in D2.
 
 ### D8 — Deferred learning layers
 
@@ -308,3 +323,10 @@ identity, support failure, both labels, tie/abstain exclusion, deterministic tra
 FANN corrupt/wrong-shape/non-finite rejection, independent concurrent buffers, wrong scope/schema,
 uncalibrated rejection, BlobStore/entity/event round-trip across runtime restart, and the complete
 public `serve -> judge -> train_preference -> preference` path.
+
+ADR-160 Phase 4 additionally requires a real V20 database fixture to stage `content`, reconstruct
+`fann-network` only from the verified bundle plus exact immutable event, finalize V21, restart,
+and reproduce the prior exact prediction after attachment-only GC preserves both objects. The
+host migrator runs independently of active moodboard-pack selection. Corrupt, missing, or
+conflicting bundle/event/network evidence leaves the durable cutover incomplete and exposes no
+serving runtime.

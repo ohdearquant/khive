@@ -1369,17 +1369,17 @@ of course part of statement execution and is not “external work” in this rul
 **Complete production write-scope audit (current tree).** The owner row is the review unit; every
 production caller named in that row was inspected through its commit/rollback edge.
 
-| Transaction owner                               | Production scopes/callers                                                                                      | Work inside the transaction                                                   | Verdict                                 |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------- |
-| `run_migrations_locked` and `apply_schema_plan` | Core versioned migrations; pack service migrations                                                             | Migration DDL/DML and ledger insert                                           | SQL-only                                |
-| `WriterGuard::transaction`                      | Pack auxiliary DDL; runtime symmetric edge update; entity/note merge fallback                                  | Synchronous statement sequences over one borrowed connection                  | SQL-only                                |
-| `writer_task::drain_loop`                       | All `send`/`send_bounded` store mutations, queue-backed `SqlBridge` batches, and `atomic_unit` requests        | The request's prepared SQL statements and bounded row/result folding          | SQL-only after the blob-GC repair below |
-| `SqlBridge` manual owners                       | Standalone and pool-backed `execute_batch`; flag-off `run_manual_atomic_unit`                                  | Pre-prepared parameterized statements, commit/rollback, poisoning bookkeeping | SQL-only                                |
-| Store flag-off batch owners                     | `entity`, `note`, `event`, `graph`, `text`, `sparse`, `vectors`, and `agents` batch/upsert/delete methods      | Bounded per-item SQL loops and result counters                                | SQL-only                                |
-| Vector-store private IMMEDIATE transactions     | Vector batch upsert/delete/orphan reconciliation                                                               | sqlite-vec/ordinary table statements and bounded row binding                  | SQL-only                                |
-| Retrieval weight private IMMEDIATE transaction  | `engine_weights::apply_weight_delta_with_eta`                                                                  | One scalar read, bounded EMA arithmetic, weight upsert, and audit-row insert  | SQL-only                                |
-| Runtime/pack `AtomicUnitOp` callers             | Runtime atomic runner and ANN registry; brain fold/persist; session mirror ingest; blob recovery/claim/cleanup | DML/query statements and bounded validation/folding                           | SQL-only                                |
-| Blob physical GC (outside owner)                | `FsBlobStore::transactional_orphan_sweep`                                                                      | Root walk, metadata, advisory locking, and file deletion                      | Explicitly outside SQLite transactions  |
+| Transaction owner                               | Production scopes/callers                                                                                               | Work inside the transaction                                                   | Verdict                                 |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------- |
+| `run_migrations_locked` and `apply_schema_plan` | Core versioned migrations; pack service migrations                                                                      | Migration DDL/DML and ledger insert                                           | SQL-only                                |
+| `WriterGuard::transaction`                      | Pack auxiliary DDL; runtime symmetric edge update; entity/note merge fallback                                           | Synchronous statement sequences over one borrowed connection                  | SQL-only                                |
+| `writer_task::drain_loop`                       | All `send`/`send_bounded` store mutations, queue-backed `SqlBridge` batches, and `atomic_unit` requests                 | The request's prepared SQL statements and bounded row/result folding          | SQL-only after the blob-GC repair below |
+| `SqlBridge` manual owners                       | Standalone and pool-backed `execute_batch`; flag-off `run_manual_atomic_unit`                                           | Pre-prepared parameterized statements, commit/rollback, poisoning bookkeeping | SQL-only                                |
+| Store flag-off batch owners                     | `entity`, `note`, `event`, `graph`, `text`, `sparse`, `vectors`, `agents`, and `attachment` batch/upsert/delete methods | Bounded per-item SQL loops and result counters                                | SQL-only                                |
+| Vector-store private IMMEDIATE transactions     | Vector batch upsert/delete/orphan reconciliation                                                                        | sqlite-vec/ordinary table statements and bounded row binding                  | SQL-only                                |
+| Retrieval weight private IMMEDIATE transaction  | `engine_weights::apply_weight_delta_with_eta`                                                                           | One scalar read, bounded EMA arithmetic, weight upsert, and audit-row insert  | SQL-only                                |
+| Runtime/pack `AtomicUnitOp` callers             | Runtime atomic runner and ANN registry; brain fold/persist; session mirror ingest; blob recovery/claim/cleanup          | DML/query statements and bounded validation/folding                           | SQL-only                                |
+| Blob physical GC (outside owner)                | `FsBlobStore::transactional_orphan_sweep`                                                                               | Root walk, metadata, advisory locking, and file deletion                      | Explicitly outside SQLite transactions  |
 
 **Blob cross-resource repair.** The sweep now prepares its file candidates before SQLite opens a
 writer transaction. The protocol first holds a process-local lock keyed by the canonical database
@@ -1390,9 +1390,15 @@ is removed in transactions of at most 128 rows. Recovery therefore does not depe
 path-derived `root_key` and also covers a relocated root or an online-backup snapshot restored at a
 different database path.
 
-Candidate processing is likewise split into units of at most 128. Each short atomic unit anti-joins
-live `entities.content_ref` values and commits only that bounded set of durable `blob_gc_claims`;
-V20 entity INSERT/UPDATE triggers reject a new live reference to any claimed digest. After commit,
+Candidate processing is likewise split into units of at most 128. The separately shipped Phase-4a
+gate first requires one exact completed V21 epoch: ledger/latest version, completed marker,
+attachment/claim tables and attachment claim triggers, and absence of the legacy entity
+column/index/triggers must agree. V20, pending, incomplete, and malformed states refuse dry-run and
+destructive sweep before filesystem or durable-claim mutation. After validating every
+`attachments.content_ref` and claim value, each short atomic unit anti-joins all attachment rows
+(including soft-deleted recoverable records) and commits only that bounded set of durable
+`blob_gc_claims`; attachment INSERT/UPDATE triggers reject a new live reference to any claimed
+digest. After commit,
 the sweep deletes only that batch's files outside SQLite and removes only that batch's claims in a
 second bounded atomic unit before advancing. JSON bindings, claim-table mutations, returned rows,
 and application result folding are therefore cardinality-bounded per writer hold. A crash between

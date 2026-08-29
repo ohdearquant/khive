@@ -1010,6 +1010,8 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
     // `run_migrations` to latest, including V7's backfill.
     let config = RuntimeConfig {
         git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
         db_path: Some(path.clone()),
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
@@ -1194,6 +1196,8 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
     // fixed anti-join lazy bootstrap.
     let config = RuntimeConfig {
         git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
         db_path: Some(path.clone()),
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),

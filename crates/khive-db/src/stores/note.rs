@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
+use khive_storage::attachment::AttachmentSubstrate;
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::note::{FilterOp, Note, NoteFilter, SortDir};
 use khive_storage::types::{
@@ -18,6 +19,7 @@ use khive_storage::StorageCapability;
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
+use crate::stores::attachment::delete_record_attachments_statement;
 use crate::writer_task::{execute_wrapped_transaction, WriterTaskHandle};
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
@@ -63,6 +65,28 @@ pub const NOTE_UPSERT_SQL: &str = "INSERT INTO notes \
        properties = excluded.properties, \
        updated_at = excluded.updated_at, \
        deleted_at = excluded.deleted_at";
+
+/// Insert-if-absent counterpart to [`NOTE_UPSERT_SQL`], for a caller whose
+/// read found no row.
+///
+/// Identical column list and parameter order, and deliberately
+/// `DO NOTHING` rather than `DO UPDATE`: the point is that a row already
+/// present must survive untouched, so the losing caller can be told it lost
+/// instead of silently overwriting the winner. `changes()` is then the
+/// answer to "did I insert it", which `DO UPDATE` cannot report.
+pub const NOTE_INSERT_IF_ABSENT_SQL: &str = "INSERT INTO notes \
+     (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+      properties, created_at, updated_at, deleted_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+     ON CONFLICT(id) DO NOTHING";
+
+/// The exact statement this store's `insert_note_if_absent` issues.
+pub fn note_insert_if_absent_statement(note: &Note) -> SqlStatement {
+    let mut statement = note_upsert_statement(note);
+    statement.sql = NOTE_INSERT_IF_ABSENT_SQL.to_string();
+    statement.label = Some("note-insert-if-absent".to_string());
+    statement
+}
 
 /// The exact true UPSERT this store's `upsert_note` issues.
 pub fn note_upsert_statement(note: &Note) -> SqlStatement {
@@ -431,12 +455,11 @@ impl SqlNoteStore {
                 StorageCapability::Notes,
                 op,
                 move |scope| {
-                    let mut guard = pool
-                        .reader_until(|| scope.should_stop())
-                        .map_err(|e| map_sqlite_err(e, op))?
-                        .ok_or_else(|| StorageError::Timeout {
-                            operation: op.into(),
-                        })?;
+                    let mut guard = pool.resolve_reader_checkout(
+                        StorageCapability::Notes,
+                        op,
+                        pool.reader_until(|| scope.should_stop()),
+                    )?;
                     scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
                 },
             )
@@ -887,6 +910,24 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
+    async fn insert_note_if_absent(&self, note: Note) -> Result<bool, StorageError> {
+        let id_str = note.id.to_string();
+        let statement = note_insert_if_absent_statement(&note);
+        self.with_writer_tx("insert_note_if_absent", move |conn| {
+            let mut stmt = conn.prepare_cached(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            let inserted = stmt.raw_execute()? > 0;
+            // Only a real insert needs a sequence number. Assigning one on the
+            // no-op path would write to a row this call did not create, which
+            // is the overwrite this primitive exists to avoid.
+            if inserted {
+                assign_note_seq(conn, &id_str)?;
+            }
+            Ok(inserted)
+        })
+        .await
+    }
+
     async fn replace_note_if_unchanged(
         &self,
         note: Note,
@@ -1226,11 +1267,20 @@ impl NoteStore for SqlNoteStore {
                 .await
             }
             DeleteMode::Hard => {
-                let statement = note_hard_delete_statement(id);
-                self.with_writer("delete_note_hard", move |conn| {
-                    let mut stmt = conn.prepare(&statement.sql)?;
-                    bind_params(&mut stmt, &statement.params)?;
-                    Ok(stmt.raw_execute()? > 0)
+                let note_statement = note_hard_delete_statement(id);
+                let attachment_statement =
+                    delete_record_attachments_statement(id, AttachmentSubstrate::Note);
+                self.with_writer_tx("delete_note_hard", move |conn| {
+                    let mut note_stmt = conn.prepare(&note_statement.sql)?;
+                    bind_params(&mut note_stmt, &note_statement.params)?;
+                    let deleted = note_stmt.raw_execute()? > 0;
+                    drop(note_stmt);
+                    if deleted {
+                        let mut attachment_stmt = conn.prepare(&attachment_statement.sql)?;
+                        bind_params(&mut attachment_stmt, &attachment_statement.params)?;
+                        attachment_stmt.raw_execute()?;
+                    }
+                    Ok(deleted)
                 })
                 .await
             }

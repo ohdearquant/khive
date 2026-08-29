@@ -2,17 +2,27 @@ import { describe, expect, it } from "vitest";
 
 import type { ViewId } from "@/lib/repo-bundle";
 import {
+  investigationShareUrl,
   parseRepositoryLocation,
   REPOSITORY_VIEW_IDS,
   type RepositoryLocation,
-  investigationShareUrl,
   repositoryLocationUrl,
 } from "@/lib/repository-location";
 
 const repository = "https://github.com/ohdearquant/khive";
 const snapshotSha = "0123456789abcdef0123456789abcdef01234567";
+const moduleId = "khive:module:sha256:0123456789abcdef";
 
 describe("repository investigation location", () => {
+  it("accepts a curated repository alias and stores its canonical URL", () => {
+    const parsed = parseRepositoryLocation(
+      new URL("https://example.test/?repo=khive"),
+    );
+
+    expect(parsed.issues).toEqual([]);
+    expect(parsed.location.repository).toBe(repository);
+  });
+
   it.each(REPOSITORY_VIEW_IDS)(
     "round-trips a shareable %s investigation",
     (view: ViewId) => {
@@ -20,6 +30,7 @@ describe("repository investigation location", () => {
         repository,
         snapshotSha,
         modulePath: "crates/space & signals/src/lib.rs",
+        moduleId,
         view,
       };
 
@@ -31,8 +42,8 @@ describe("repository investigation location", () => {
 
       expect(parsed.issues).toEqual([]);
       expect(parsed.location).toEqual(location);
-      expect(url.searchParams.get("utm_source")).toBe("demo");
-      expect(url.hash).toBe("#analysis");
+      expect(url.searchParams.has("utm_source")).toBe(false);
+      expect(url.hash).toBe("");
     },
   );
 
@@ -45,6 +56,7 @@ describe("repository investigation location", () => {
       "repo",
     ],
     ["duplicate module", "module=crates%2Fa.rs&module=crates%2Fb.rs", "module"],
+    ["duplicate module id", "module_id=one&module_id=two", "module_id"],
     ["malformed snapshot", "at=abc123", "at"],
     ["unknown view", "view=everything", "view"],
     ["absolute module path", "module=%2Fetc%2Fpasswd", "module"],
@@ -52,6 +64,10 @@ describe("repository investigation location", () => {
     ["empty path segment", "module=crates%2F%2Fsecret.rs", "module"],
     ["empty module", "module=", "module"],
     ["overlong module", `module=${"a".repeat(1025)}`, "module"],
+    ["empty module id", "module_id=", "module_id"],
+    ["overlong module id", `module_id=${"a".repeat(1025)}`, "module_id"],
+    ["query-delimiter module id", "module_id=khive%3Fmodule", "module_id"],
+    ["fragment-delimiter module id", "module_id=khive%23module", "module_id"],
   ])(
     "rejects %s without accepting the ambiguous value",
     (_name, search, parameter) => {
@@ -68,6 +84,8 @@ describe("repository investigation location", () => {
         ? "snapshotSha"
         : parameter === "module"
         ? "modulePath"
+        : parameter === "module_id"
+        ? "moduleId"
         : "view";
       expect(parsed.location[property]).toBeNull();
     },
@@ -77,7 +95,15 @@ describe("repository investigation location", () => {
     ["query string", `${repository}?tab=readme`],
     ["fragment", `${repository}#readme`],
   ])(
-    "accepts a curated repository URL carrying a %s",
+    // normalizeRepositoryUrl now returns the CANONICAL value (no query, no
+    // fragment) rather than the raw input — parseRepository stores that
+    // canonical value on the parsed location. A repo value carrying its
+    // own query string or fragment is still accepted, but the extras are
+    // dropped from the stored/round-tripped value; they never reach a
+    // rebuilt URL. This is an intended consequence of the round-trip
+    // invariant, not a regression: the canonical value is what
+    // `repositoryLocationUrl`/`investigationShareUrl` will emit anyway.
+    "accepts a curated repository URL carrying a %s, but canonicalizes away the extras",
     (_name, repositoryWithExtras) => {
       const parsed = parseRepositoryLocation(
         new URL(
@@ -86,11 +112,11 @@ describe("repository investigation location", () => {
       );
 
       expect(parsed.issues).toEqual([]);
-      expect(parsed.location.repository).toBe(repositoryWithExtras);
+      expect(parsed.location.repository).toBe(repository);
     },
   );
 
-  it("canonicalizes only the closed location parameters in stable order", () => {
+  it("canonicalizes to only the closed location parameters in stable order, dropping every other query parameter", () => {
     const url = repositoryLocationUrl(
       new URL(
         "https://example.test/?view=scorecard&module=old.rs&at=old&repo=old&keep=1",
@@ -99,15 +125,57 @@ describe("repository investigation location", () => {
         repository,
         snapshotSha,
         modulePath: "crates/khive-db/src/pool.rs",
+        moduleId,
         view: "dependency_topology",
       },
     );
 
     expect(url.search).toBe(
-      `?keep=1&repo=${
+      `?repo=${
         encodeURIComponent(repository)
-      }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=dependency_topology`,
+      }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&module_id=${
+        encodeURIComponent(moduleId)
+      }&view=dependency_topology`,
     );
+    expect(url.searchParams.has("keep")).toBe(false);
+  });
+
+  it("drops credential-bearing query parameters instead of preserving them", () => {
+    const url = repositoryLocationUrl(
+      new URL(
+        "https://example.test/?access_token=super-secret&id_token=another-secret",
+      ),
+      {
+        repository,
+        snapshotSha,
+        modulePath: null,
+        moduleId: null,
+        view: "scorecard",
+      },
+    );
+
+    expect(url.searchParams.has("access_token")).toBe(false);
+    expect(url.searchParams.has("id_token")).toBe(false);
+    expect(url.href).not.toContain("super-secret");
+    expect(url.href).not.toContain("another-secret");
+  });
+
+  it("drops a fragment-borne credential instead of preserving it", () => {
+    const url = repositoryLocationUrl(
+      new URL(
+        "https://example.test/#access_token=super-secret",
+      ),
+      {
+        repository,
+        snapshotSha,
+        modulePath: null,
+        moduleId: null,
+        view: "scorecard",
+      },
+    );
+
+    expect(url.hash).toBe("");
+    expect(url.href).not.toContain("super-secret");
   });
 
   it("share form carries only investigation parameters and drops the fragment", () => {
@@ -119,6 +187,7 @@ describe("repository investigation location", () => {
         repository,
         snapshotSha,
         modulePath: "crates/khive-db/src/pool.rs",
+        moduleId,
         view: "dependency_topology",
       },
     );
@@ -130,7 +199,9 @@ describe("repository investigation location", () => {
     expect(url.search).toBe(
       `?repo=${
         encodeURIComponent(repository)
-      }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&view=dependency_topology`,
+      }&at=${snapshotSha}&module=crates%2Fkhive-db%2Fsrc%2Fpool.rs&module_id=${
+        encodeURIComponent(moduleId)
+      }&view=dependency_topology`,
     );
   });
 
@@ -140,6 +211,7 @@ describe("repository investigation location", () => {
         "https://forge.example/group/repo?access_token=not-a-real-secret#token-fragment",
       snapshotSha,
       modulePath: "crates/khive-db/src/pool.rs",
+      moduleId,
       view: "dependency_topology",
     });
 
@@ -161,6 +233,7 @@ describe("repository investigation location", () => {
         repository,
         snapshotSha,
         modulePath,
+        moduleId: null,
         view: "dependency_topology",
       });
 

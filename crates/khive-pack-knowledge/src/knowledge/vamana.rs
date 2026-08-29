@@ -986,6 +986,8 @@ fn decode_ann_dir_name(name: &str) -> Option<(String, String)> {
         return None;
     }
     let mut bytes = Vec::with_capacity(raw.len() / 2);
+    // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     for pair in raw.chunks_exact(2) {
         let hi = (pair[0] as char).to_digit(16)?;
         let lo = (pair[1] as char).to_digit(16)?;
@@ -1513,6 +1515,8 @@ async fn replay_final_states(
             let Some(SqlValue::Blob(bytes)) = row.get("embedding") else {
                 return Err(format!("final upsert for {uuid}: embedding missing on row"));
             };
+            // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
+            #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
             let vec: Vec<f32> = bytes
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1723,6 +1727,8 @@ async fn fetch_fresh_tail_snapshot(
                 bytes.len()
             ));
         }
+        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
+        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
         let embedding = bytes
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -2448,6 +2454,8 @@ async fn scan_corpus_raw(
         if bytes.len() != dims * 4 {
             continue;
         }
+        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
+        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
         let vec: Vec<f32> = bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -3153,20 +3161,8 @@ mod tests {
         drop(KhiveRuntime::new(config.clone()).expect("migrate snapshot source"));
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let db_path = config.db_path.as_ref().expect("db path");
-            for suffix in ["-wal", "-shm"] {
-                let mut name = db_path.file_name().expect("db file name").to_os_string();
-                name.push(suffix);
-                let sidecar = db_path.parent().expect("db parent dir").join(name);
-                if sidecar.exists() {
-                    let mut permissions = std::fs::metadata(&sidecar)
-                        .expect("sidecar metadata")
-                        .permissions();
-                    permissions.set_mode(0o444);
-                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-                }
-            }
+            khive_storage::test_support::freeze_snapshot_sidecars(db_path);
         }
         let rt = KhiveRuntime::new_readonly(config).expect("open snapshot read-only");
         let ann = new_shared();
@@ -4255,6 +4251,8 @@ mod tests {
     fn rt_with_embedder(db_path: Option<std::path::PathBuf>) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),

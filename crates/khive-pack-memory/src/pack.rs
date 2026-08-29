@@ -224,6 +224,18 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "created_after",
+                param_type: "string",
+                required: false,
+                description: "Only memories created at or after this instant (inclusive). RFC 3339 with offset, e.g. \"2026-08-20T00:00:00-04:00\" or a \"Z\" form; date-only strings are rejected. With created_before this is a half-open window [after, before) — the brain.event_counts since/until convention.",
+            },
+            ParamDef {
+                name: "created_before",
+                param_type: "string",
+                required: false,
+                description: "Only memories created strictly before this instant (exclusive). Same RFC 3339-with-offset format as created_after. An empty window (created_after >= created_before) is an error.",
+            },
+            ParamDef {
                 name: "fusion_strategy",
                 param_type: "string",
                 required: false,

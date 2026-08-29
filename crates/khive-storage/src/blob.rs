@@ -120,8 +120,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// rationale.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BlobOrphanSweepConfig {
-    /// Content refs currently referenced by at least one live row somewhere
-    /// in the system, as of when the caller assembled this set. Anything
+    /// Content refs currently referenced by at least one committed record
+    /// attachment, as of when the caller assembled this set. Anything
     /// this backend stores that is NOT in this set is treated as orphaned
     /// and deleted (or reported, in `dry_run` mode) — including a
     /// `content_ref` that becomes live after this snapshot was taken.
@@ -143,8 +143,8 @@ pub struct BlobOrphanSweepResult {
     pub would_delete: u64,
     /// Objects with zero live references that were left alone because they
     /// are still inside their publish grace period — recently written and
-    /// not yet orphaned, just not yet referenced by an entity. Reported in
-    /// both modes; never counted in `would_delete` or `deleted`.
+    /// not yet orphaned, just not yet referenced by a record attachment.
+    /// Reported in both modes; never counted in `would_delete` or `deleted`.
     pub grace_period_skipped: u64,
 }
 
@@ -165,25 +165,15 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// once returns the same `ContentRef` and does not re-write the object.
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef>;
 
-    /// Fetch the bytes stored under `content_ref`.
-    ///
-    /// Returns `StorageError::NotFound` (capability `Blob`) if no object
-    /// exists for this reference.
-    async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>>;
-
     /// Fetch at most `max_bytes` from `content_ref` and verify its BLAKE3
     /// digest before returning any bytes.
     ///
     /// `max_bytes` may be zero (only an empty object can then succeed) and
     /// must not exceed [`MAX_BLOB_WHOLE_BYTES`]. Implementations must enforce
     /// the limit while reading the authoritative object, not by composing a
-    /// metadata-only [`Self::size`] check with the unbounded [`Self::get`]
-    /// compatibility method. A successful result is complete, no larger than
-    /// the declared maximum, metadata-size-consistent, and digest-matched to
-    /// `content_ref`.
-    ///
-    /// The unbounded `get` method remains temporarily while ADR-160's
-    /// consumers migrate and is removed with the final consumer in Phase 3.
+    /// metadata-only [`Self::size`] check with another read. A successful
+    /// result is complete, no larger than the declared maximum,
+    /// metadata-size-consistent, and digest-matched to `content_ref`.
     async fn get_bounded_verified(
         &self,
         content_ref: &ContentRef,
@@ -211,9 +201,9 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// # Safety / concurrency hazard (ADR-111 §8, amended)
     ///
     /// Unconditional physical removal with **no coordination against any
-    /// entity that might reference `content_ref`**. Safe to call only when
-    /// the caller has independently quiesced whatever writer could attach a
-    /// new `content_ref` to an entity for the duration of the call — this
+    /// record or attachment that might reference `content_ref`**. Safe to call only when
+    /// the caller has independently quiesced every writer that could commit a
+    /// new SQL liveness reference for the duration of the call — this
     /// trait does not detect or prevent a race. Offline-maintenance-only.
     /// See `crates/khive-storage/docs/api/blob-store.md`.
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool>;
@@ -222,16 +212,22 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// `dry_run` mode, report) those absent from `config.live_refs`.
     /// Operator-side GC path (khive#292 deliverable 5) — admin-only, not an
     /// MCP verb. Default returns `StorageError::Unsupported`; the filesystem
-    /// backend overrides it with a real directory walk.
+    /// backend currently returns the same typed refusal for every call (see
+    /// below) rather than performing a real directory walk.
     ///
     /// # Safety / concurrency hazard (ADR-111 §8, amended)
     ///
     /// `config.live_refs` is a **snapshot**; a `content_ref` that becomes
     /// newly live between the snapshot and the sweep is deleted anyway.
-    /// **Callers MUST quiesce entity writes** for the duration of
+    /// **Callers MUST quiesce attachment writes** for the duration of
     /// snapshot-plus-sweep. See `crates/khive-storage/docs/api/blob-store.md`
-    /// for the race repro. Concurrent callers must use
-    /// [`Self::transactional_orphan_sweep`] instead.
+    /// for the hazard. This API also has no [`SqlAccess`] capability with
+    /// which to prove a completed V21 attachment epoch, so — unlike
+    /// [`Self::transactional_orphan_sweep`] — it cannot honor that gate. The
+    /// filesystem backend therefore disables this method entirely in this
+    /// compatibility release, in both `dry_run` modes: concurrent AND
+    /// offline callers alike must use [`Self::transactional_orphan_sweep`]
+    /// instead.
     async fn orphan_sweep(
         &self,
         config: &BlobOrphanSweepConfig,
@@ -244,19 +240,19 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
         })
     }
 
-    /// Select live entity references and sweep orphaned blobs behind a
+    /// Select live attachment references and sweep orphaned blobs behind a
     /// database-coordinated, bounded claim protocol.
     ///
     /// Unlike [`Self::orphan_sweep`], this operation obtains liveness itself
     /// from `sql`; callers do not assemble a stale snapshot. `sql` must be the
-    /// same database capability used for the entity writes that own these
+    /// canonical main database capability used for the attachment writes that own
     /// references. Implementations must also ensure an object published after
     /// the sweep's candidate set is captured cannot be mistaken for an orphan,
     /// including when it is published between selecting live references and
     /// physical deletion. Implementations must not perform filesystem or
     /// other external I/O while holding the database writer transaction;
     /// durable claims/triggers or an equivalently fail-closed fence must keep
-    /// entity writes safe after each short transaction commits. Claim/result
+    /// attachment writes safe after each short transaction commits. Claim/result
     /// materialization and cleanup must have an explicit per-transaction
     /// cardinality bound rather than scale one writer hold with the complete
     /// object population. A file-backed `sql` implementation must expose its
@@ -268,7 +264,28 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// Backends that cannot provide both guarantees return
     /// `StorageError::Unsupported`.
     ///
-    /// Publishing a blob and committing the entity write that references it
+    /// The filesystem implementation is schema-epoch gated and supports both
+    /// report-only and destructive modes only when `sql` proves the exact
+    /// completed V21 attachment cutover: durable complete marker and ledger
+    /// row, attachment table/indexes and INSERT/UPDATE claim fences, and
+    /// absence of every legacy entity reference column/index/fence. V20,
+    /// pending, incomplete, missing-required-object, retained-legacy, and
+    /// ahead-of-V21 epochs return typed `Unsupported` before root locking,
+    /// filesystem walking, or abandoned-claim cleanup. Malformed stored
+    /// evidence or a nonfunctional named fence fails closed with its validation,
+    /// storage, or typed `Unsupported` error before claim cleanup or deletion.
+    /// Once admitted, every attachment role is live; soft deletion alone does
+    /// not make its blob collectible.
+    ///
+    /// This is the Phase-4a GC compatibility gate. Phase 4a changes no schema or
+    /// data. Every older process sharing the database/blob root must be drained
+    /// before Phase 4b performs the attachment backfill and legacy-column drop.
+    /// Phase-4a application readers/writers must also be quiesced during cutover;
+    /// only a GC-only worker has narrow compatibility with exact completed V21.
+    /// Callers must not fall back to [`Self::orphan_sweep`] or [`Self::delete`]
+    /// when this gate refuses.
+    ///
+    /// Publishing a blob and committing the attachment write that references it
     /// are two separate client steps; nothing serializes them against this
     /// sweep. Implementations must therefore also give a just-published,
     /// not-yet-referenced object a bounded grace period before treating it as

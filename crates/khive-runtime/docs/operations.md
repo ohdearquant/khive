@@ -52,12 +52,28 @@ to the merged non-root node count.
 
 ### update_edge_symmetric_dml
 
-DML text is the single source of truth shared with the atomic `prepare_update_edge` symmetric
-branch (`khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL` /
-`EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL` / `EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`): this function
-binds them against `rusqlite::params!` (it runs inside an existing transaction on a borrowed
-`&rusqlite::Connection`), while the atomic path binds the same text via `SqlValue` plan params —
-see the constants' doc comment in `khive-db` for why a single bridge type isn't used for both.
+This function runs inside an existing transaction on a borrowed `&rusqlite::Connection`, so it
+binds SQL against `rusqlite::params!` rather than the `SqlStatement`/`SqlValue` plan shape used
+elsewhere — see the constants' doc comment in `khive-db` for why a single bridge type isn't used
+for both.
+
+It binds `khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL` for the probe,
+`EDGE_SYMMETRIC_DELETE_NONCANONICAL_GUARDED_SQL` for the absorbed arm, and
+`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL` for the in-place arm.
+
+**Only the probe text is still shared with the atomic path.** The atomic `prepare_update_edge`
+symmetric branch builds its two write statements from
+`edge_symmetric_delete_if_conflict_statement` and
+`edge_symmetric_absorb_or_update_inplace_statement`, which carry their own SQL. They are not
+textual copies of the constants above: the atomic delete additionally requires a surviving row
+at the natural key via an `EXISTS` subquery, and the atomic in-place statement is a single
+two-armed `UPDATE` selected by `changes()` rather than a probe followed by a branch. Changing
+one path's SQL therefore does **not** change the other's, and an edit to either has to be
+mirrored deliberately.
+
+`EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL` (unguarded) is bound by neither of these. It remains
+in use by merge's predicate-based rewrites in `khive-runtime::curation`, which run inside their
+own single-writer transaction.
 
 ## Fault-injection static state
 
@@ -90,3 +106,11 @@ External integration test crates enable it via `khive-runtime = { ..., features 
 - `ENTITY_COMPENSATION_FAIL_NS`: entity-create compensation failure injection. The matching
   compensation skips only the entity-row delete; FTS/vector cleanup still runs so tests can
   inspect the exact residual state and combined error contract.
+- `PREFIX_RESOLVE_FAIL_NS`: storage-failure injection for `resolve_prefix_inner`, keyed by the
+  scanned prefix string rather than a namespace — `resolve_prefix_unfiltered` and
+  `resolve_prefix_unfiltered_including_deleted` pass `namespaces: None` by contract, so there is
+  no namespace to key on. Armed via `arm_prefix_resolve_fail_scoped(prefix)`; the next call
+  scanning that exact prefix returns an injected `StorageError::Timeout` instead of running the
+  table scan, then disarms. Used to prove callers that resolve an id through a prefix (e.g. the
+  `get` verb's fallback chain) distinguish a storage fault from a genuine no-match instead of
+  reporting both as not-found.

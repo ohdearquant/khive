@@ -1,9 +1,15 @@
 # The full pack set the installed daemon must serve. `make local` verifies the
 # freshly built artifact before installation by running verbs() against that
-# exact binary. The floor is the current 90-verb production surface: additions
+# exact binary. The floor is the current 98-verb production surface: additions
 # pass without a Makefile change, while any loss remains fail-closed.
-FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal
-LOCAL_VERB_FLOOR := 90
+#
+# `moodboard` belongs in this list because `build-local` links pack-moodboard,
+# so the artifact serves the pack's seven verbs whether or not the list names
+# it. Omitting it did not make the gate lenient about a pack it never built; it
+# made the gate blind to seven verbs the artifact was already shipping, so
+# losing all of them still cleared a floor set below their count.
+FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal,moodboard
+LOCAL_VERB_FLOOR := 98
 CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
 FLEET_ARTIFACT ?=
@@ -39,7 +45,7 @@ override CARGO_VALUE := $(value CARGO)
 unexport CARGO
 export CARGO_VALUE
 
-.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact validate-make-inputs fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate eval-retrieval-gold-check
+.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact validate-make-inputs fleet-build fleet-check clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate eval-retrieval-gold-check tz-audit
 
 check:
 	cd crates && cargo check --workspace
@@ -49,6 +55,18 @@ clippy:
 
 test:
 	cd crates && cargo test --workspace
+
+# The all-zone chrono-tz sweep. Ignored by default because it walks every
+# zone in the bundled database and costs 48.28s in the debug profile, against
+# 3.08s with --release (both measured 2026-08-23). Debug is kept because the
+# occasion to run this is a chrono-tz pin move, which invalidates the build
+# cache, so an optimized run would pay a cold rebuild to save 45s. It exists
+# to be RUN when the
+# chrono-tz pin moves, which is when the bundled zone data can change under
+# the resolver. Wired to CI on the manifests that carry that pin, so the
+# duty is triggered rather than remembered.
+tz-audit:
+	cd crates && cargo test -p khive-runtime --lib tz_database_audit -- --ignored
 
 contract-test:
 	cd crates && cargo build --release -p kkernel
@@ -64,13 +82,22 @@ fmt-check:
 build:
 	cd crates && cargo build --workspace --release
 
+# pack-formal and pack-moodboard are listed here because this recipe builds the
+# binary an operator actually serves, and both packs are now optional crate
+# dependencies rather than unconditional ones. A default `cargo build` links
+# neither, which is the point of making them optional; a locally installed
+# kkernel still needs them, because FULL_PACKS above names both `formal` and
+# `moodboard` and verify-local-artifact runs the artifact with that list — a
+# binary without the pack answers `unknown pack name "formal"` and the
+# verification gate fails.
+# The same applies at runtime to any KHIVE_PACKS naming `formal` or `moodboard`.
 build-local:
-	@echo "==> Building kkernel (release, channel-email, channel-telegram)..."
+	@echo "==> Building kkernel (release, channel-email, channel-telegram, pack-formal, pack-moodboard)..."
 	@python3 scripts/build_local_artifact.py \
 		--cargo "$$CARGO_VALUE" \
 		--manifest-path crates/Cargo.toml \
 		--package kkernel \
-		--features channel-email,channel-telegram \
+		--features channel-email,channel-telegram,pack-formal,pack-moodboard \
 		--receipt "$$LOCAL_BUILD_RECEIPT_VALUE"
 
 # Reject a FULL_PACKS/LOCAL_VERB_FLOOR value (from the Makefile default or a

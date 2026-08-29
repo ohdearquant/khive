@@ -300,7 +300,7 @@ rows actually returned, and treat an incomplete empty page as non-resumable with
 filter or a larger effective limit.
 
 Row shape (each item in the offset or cursor envelope) depends on `kind`.
-For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**
+For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full public record shape**
 for that substrate, listed below in its **verbose** form (the shape returned with
 `presentation="verbose"`, which is also the default for `kkernel exec` and the `khive` CLI).
 This is the key difference from `search` and `neighbors` below, which both return narrow
@@ -318,6 +318,8 @@ compacted to a relative or minute-truncated form; and `salience`/`decay_factor` 
 
 - **`kind="entity"`**: `{id, namespace, kind, entity_type, name, description, properties, tags,
   created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref}`.
+  `content_ref`, when present, is the compatibility projection of attachment role `content`;
+  entities no longer store a writable same-named column.
   `created_at`/`updated_at`/`deleted_at` are ISO-8601 strings (the store keeps them as
   epoch-microseconds internally; the handler converts before returning).
 - **`kind="note"`**: `{id, namespace, kind, status, name, content, salience, decay_factor,
@@ -350,6 +352,10 @@ full record with `get(id=...)` (or `list`) when you need more than what they ret
 ### `stats` — Assertive
 
 Return aggregate KG substrate counts (entities, edges, notes). No params.
+
+The response carries a `count_scope` object stating what the counts range over:
+`{"namespaces": "caller_visible", "rows": "live_only"}` — counts cover the namespaces visible to
+the caller and exclude soft-deleted rows.
 
 ```
 request(ops="stats()")
@@ -857,6 +863,16 @@ count is the legacy cross-namespace duplicate-ID state that can make a multi-nam
 walk lossy. The two row counts are raw evidence, not a parity verdict: list-sequence rows
 intentionally survive hard deletion, so the ledger can legitimately contain more rows than the
 live edge table. `graph_edge_integrity_error` explains a missing integrity section.
+
+The handler additionally annotates `graph_edge_integrity` with four derived fields:
+`graph_edges_rows_scope` (`{"namespaces": "all", "rows": "live_and_soft_deleted"}`),
+`graph_edges_seq_rows_scope` (`{"namespaces": "all", "rows":
+"inserted_ids_retained_after_hard_delete"}`), `graph_edges_seq_minus_graph_edges` (the signed
+ledger delta), and `graph_edges_seq_relationship` — one of
+`ledger_ahead_consistent_with_hard_deletes`, `equal`,
+`ledger_behind_pre_v14_duplicate_edge_state` (a negative delta while the report flags the pre-V14
+duplicate-edge state), or `ledger_behind_unexpected` (a negative delta with no known legacy
+explanation).
 Sections that cannot be collected (in-memory backend, missing file, unsupported platform) carry
 explicit reasons rather than being silently omitted.
 
@@ -2244,10 +2260,12 @@ Store bytes (base64) in the content-addressed blob store; returns the BLAKE3
 ### `blob.get` — Assertive
 
 Read an object back by `content_ref`, base64-encoded in the response, with an optional
-byte range. The object is rejected before any bytes are hydrated if it exceeds the
-64 MiB ceiling this verb will fetch, or if the requested slice would base64-encode to a
-response exceeding the daemon's IPC frame cap. Concurrent `blob.get` hydration is bounded
-by a small pack-level semaphore.
+byte range. Metadata preflight rejects an object reported above the 64 MiB ceiling before
+hydration; the backend's streaming actual-byte bound remains authoritative when metadata is
+stale or false-small. A requested slice that would base64-encode past the daemon's IPC frame
+cap is also rejected. Concurrent `blob.get` hydration is bounded by the runtime's shared
+weighted raw-byte admission; range responses still hydrate and verify the complete object
+before slicing.
 
 | Param         | Type   | Required | Notes                                                                                                                             |
 | ------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |

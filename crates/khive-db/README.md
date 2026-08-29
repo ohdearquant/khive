@@ -1,15 +1,15 @@
 # khive-db
 
-SQLite storage backend for the khive knowledge graph runtime: entity, note, event, and
-edge storage, FTS5 text search, and optional `sqlite-vec` vector storage over a
-WAL-mode connection pool.
+SQLite storage backend for the khive knowledge graph runtime: entity, note, event,
+edge, attachment, and content-addressed blob storage; FTS5 text search; and
+optional `sqlite-vec` vector storage over a WAL-mode connection pool.
 
 ## Features
 
 - **WAL-mode connection pool** — one writer, N concurrent readers (`ConnectionPool`)
 - **Capability-trait factories** — `StorageBackend` hands out `Arc<dyn EntityStore>`,
   `GraphStore`, `NoteStore`, `EventStore`, `VectorStore`, `SparseStore`, `TextSearch`,
-  and `SqlAccess` from `khive-storage`
+  `BlobStore`, `AttachmentStore`, and `SqlAccess` from `khive-storage`
 - **Forward-only versioned migrations** — `run_migrations` applies `MIGRATIONS` in
   order, tracked in `_schema_migrations`
 - **Legacy pack-scoped schema plans** — `ServiceSchemaPlan` / `apply_schema_plan` for
@@ -33,14 +33,19 @@ let backend = StorageBackend::sqlite("/path/to/khive.db")?;
 }
 
 let entities = backend.entities()?; // Arc<dyn khive_storage::EntityStore>
+let attachments = backend.attachments()?; // Arc<dyn khive_storage::AttachmentStore>
 let graph = backend.graph()?; // Arc<dyn khive_storage::GraphStore>
 let text = backend.text("entities_fts")?; // Arc<dyn khive_storage::TextSearch>
 let sql = backend.sql(); // Arc<dyn khive_storage::SqlAccess>, for pack-owned tables
 ```
 
-Each capability accessor (`entities`, `graph`, `notes`, `events`, `vectors`, `sparse`,
-`text`) applies its own DDL idempotently on first call, so callers never need a
-separate "create schema" step per store. Namespace-scoped variants
+Most legacy capability accessors (`entities`, `graph`, `notes`, `events`,
+`vectors`, `sparse`,
+`text`) apply their own DDL idempotently on first call. `attachments()` is the
+exception: it never installs schema on demand because the coordinated V21
+cutover owns table creation, GC fences, and legacy-column removal as one
+boot-gated operation. Callers never need a separate "create schema" step per
+store. Namespace-scoped variants
 (`entities_for_namespace`, `graph_for_namespace`, …) validate that the namespace is
 non-empty; the store itself remains namespace-agnostic — callers pass namespace on
 each query.
@@ -52,7 +57,7 @@ Two migration systems coexist, both defined in `migrations.rs`:
 - **Versioned** (`MIGRATIONS: &[VersionedMigration]`, applied by `run_migrations`) —
   the forward-only pipeline for core substrate tables (entities, notes, edges,
   events). `V1` is the consolidated fresh-start baseline loaded from
-  `sql/schema.sql`; `V2..V5` are incremental `.sql` files applied in order and
+  `sql/schema.sql`; later versions are incremental `.sql` files applied in order and
   tracked in `_schema_migrations`. A database whose recorded version is ahead of the
   latest known migration fails loudly rather than silently skipping the baseline.
 - **Legacy per-service** (`ServiceSchemaPlan` / `apply_schema_plan`) — used by packs
@@ -62,6 +67,21 @@ Schema DDL is authored in `crates/khive-db/sql/*.sql` and pulled in via
 `include_str!` — never hand-written as inline Rust string literals. Adding a
 migration means a new `.sql` file plus a new `VersionedMigration` entry; `V1` itself
 is never edited on an existing database.
+
+V21 is a coordinated Phase-4b exception to ordinary eager application. A
+zero-reference database may complete it atomically inside `run_migrations`; a
+legacy V20 database stops at V20 and requires the async MCP/kkernel host
+coordinator to hold the blob-GC owner, stage attachments, authenticate pack-owned
+roles, and finalize. The V21 ledger row is written only in that final transaction.
+
+Phase 4b may run only after the separately shipped Phase-4a transactional-GC
+epoch gate has converged across every process sharing the database/blob root and
+all pre-Phase-4a processes have been drained. Phase 4a leaves V20 untouched and
+refuses transactional GC on V20 or any incomplete/malformed V21 state in both
+dry-run and destructive modes; it does not create or backfill attachments.
+Before cutover, also quiesce every Phase-4a application reader/writer or prove
+it cannot access the database. Only a GC-only worker has narrow completed-V21
+compatibility; start Phase-4b serving after exact-current topology validation.
 
 ## Vector storage
 

@@ -1,6 +1,6 @@
 # khive-storage Design
 
-Function-specific technical reference docs (error taxonomy, blob store,
+Function-specific technical reference docs (error taxonomy, blob store, attachments,
 transaction registry) live in [`docs/api/`](api/). This document covers
 design rationale and ADR compliance.
 
@@ -23,10 +23,23 @@ verb, substrate, actor, session, aggregate, and observed/selected referents.
 
 The `StorageCapability` enum in `capability.rs` identifies which surface produced
 an error (`Sql`, `Notes`, `Entities`, `Graph`, `Events`, `Vectors`, `Sparse`,
-`Text`). Each trait file defines one capability surface as a separate module.
+`Text`, `Blob`, `Attachments`). Each trait file defines one capability surface as a separate module.
 `NoteStore::set_note_property` is the atomic, top-level JSON-key mutation
 contract: backend implementations must preserve unrelated keys without a
 caller-side read/replace cycle.
+
+### [ADR-121: Attachments — Role-Keyed Blob Renditions as a First-Class Substrate Property](../../../docs/adr/ADR-121-attachments-first-class.md)
+
+`AttachmentStore` exposes a role-keyed map of `ContentRef` values for entity
+and note records. `EntityStore::upsert_entity_with_attachments` is the atomic
+publication seam for an entity row and its initial roles. `Entity.content_ref`
+remains a compatibility response projection of role `"content"`; it is not a
+writable entity field. Hard record deletion removes attachment rows in the same
+transaction, while soft deletion retains them.
+
+The trait layer does not choose a database or garbage collector. Runtime boot
+routes attachment mutation to the canonical main backend, and the concrete
+backend makes `attachments` the sole SQL liveness source for blob GC.
 
 ### [ADR-009: Backend Architecture](../../../docs/adr/ADR-009-backend-architecture.md)
 
@@ -66,6 +79,8 @@ Key design constraints:
 
 | Module                                      | Purpose                                                                     |
 | ------------------------------------------- | --------------------------------------------------------------------------- |
+| [`src/attachment.rs`](../src/attachment.rs) | role-keyed attachment types and `AttachmentStore`                           |
+| [`src/blob.rs`](../src/blob.rs)             | `ContentRef`, bounded read contract, and `BlobStore`                        |
 | [`src/capability.rs`](../src/capability.rs) | `StorageCapability` enum                                                    |
 | [`src/entity.rs`](../src/entity.rs)         | `Entity`, `EntityFilter`, `EntityStore`                                     |
 | [`src/error.rs`](../src/error.rs)           | `StorageError`                                                              |
@@ -80,10 +95,11 @@ Key design constraints:
 
 ## Tests
 
-| Path                                            | Coverage                                                                                                           |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| [`tests/compliance.rs`](../tests/compliance.rs) | Validate() invariant tests for `VectorSearchRequest`, `SparseVector`, `EdgeFilter`; vector filter compliance suite |
-| [`tests/vectors.rs`](../tests/vectors.rs)       | `VectorStore` default-impl behavior: capabilities, batch, update, orphan sweep                                     |
+| Path                                                              | Coverage                                                                                                           |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| [`tests/attachment_contract.rs`](../tests/attachment_contract.rs) | attachment validation and stable substrate wire values                                                             |
+| [`tests/compliance.rs`](../tests/compliance.rs)                   | Validate() invariant tests for `VectorSearchRequest`, `SparseVector`, `EdgeFilter`; vector filter compliance suite |
+| [`tests/vectors.rs`](../tests/vectors.rs)                         | `VectorStore` default-impl behavior: capabilities, batch, update, orphan sweep                                     |
 
 ## Invariants
 
@@ -92,6 +108,8 @@ Key design constraints:
   increasing, all values finite.
 - `VectorSearchRequest`: query_vectors non-empty, top_k > 0, all values finite.
 - `EdgeFilter`: weight bounds must be finite and min <= max.
+- Attachment roles are non-empty and contain no control characters; optional
+  sizes fit SQLite's signed integer envelope.
 - Deserialization of `VectorSearchRequest`, `SparseVector`, and `EdgeFilter`
   enforces invariants via `serde(try_from)`.
 - Storage is ID-only. Namespace authorization is enforced at the runtime layer.
@@ -103,7 +121,8 @@ Key design constraints:
   implemented.
 - `StorageError::Driver` wraps backend-specific errors.
 - `StorageError::NotFound` / `AlreadyExists` for ID-based lookups.
-- Pool, Timeout, Transaction errors are retryable (`is_retryable() == true`).
+- Pool, Timeout, AdmissionTimeout, Transaction errors are retryable
+  (`is_retryable() == true`).
 
 ## Consistency Notes
 
@@ -117,4 +136,4 @@ Key design constraints:
 - `TextTermStats.inverse_document_frequency` uses the Robertson-Walker IDF
   formula.
 
-Last reviewed: 2026-06-06
+Last reviewed: 2026-08-16
