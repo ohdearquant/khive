@@ -565,6 +565,16 @@ When `retryable=true`, the error object MUST additionally carry
 `retry_after_ms`, a positive integer. Clients MUST NOT reissue before it
 elapses.
 
+The field is mandatory rather than optional because §3's answer to the
+amplification argument depends on the *server* naming the pace; an absent field
+returns that decision to the client, which is the situation the retry contract
+already distrusts. A surface with no better estimate MUST therefore emit a
+documented default floor rather than omitting the field — "the server always
+names a pace" is the property being relied on, and a floor satisfies it. The
+default floor is a per-surface constant published with the retry policy required
+by §4; deriving a sharper value from observed backend state is permitted and
+preferred, and is what the §6 verification row asks for.
+
 ### 3. Why Decision §6's arithmetic does not forbid this
 
 Decision §6 is correct that a naive client multiplies load against an already-failing
@@ -627,9 +637,10 @@ they are read as one, so each is stated with its actor.
 **The surface that emits `retryable=true`** MUST NOT do so unless it publishes,
 in the retry documentation Decision §6 already requires, the budget, the backoff
 schedule and the breaker threshold that a conforming client is expected to apply
-— and MUST emit a `retry_after_ms` that is meaningful for its own degraded
-state rather than a fixed constant. A surface that cannot publish all three MUST
-keep `retryable=false`, which remains the default and the safe value.
+— and MUST emit a `retry_after_ms` on every `retryable=true` response, at
+minimum the default floor published with that policy. A surface that cannot
+publish all three MUST keep `retryable=false`, which remains the default and the
+safe value.
 
 The asymmetry is deliberate. The server cannot enforce client backoff, so this
 amendment does not claim it can. What the server controls is (a) whether it
@@ -683,9 +694,10 @@ them equal would read as a rule that they must be.
 - `kind` admits exactly the two values; any other value is rejected.
 - A surface that emits `retryable=true` without publishing the budget, backoff
   schedule and breaker threshold required by §4 fails review.
-- `retry_after_ms` is derived from the surface's own degraded state; a fixed
-  compile-time constant fails review, because a constant returns the pacing
-  decision to the client and §3's argument rests on the server holding it.
+- `retryable=true` is never emitted without `retry_after_ms`. A constant value
+  is acceptable only as the default floor published with the retry policy; an
+  undocumented constant fails review, as does omitting the field on the grounds
+  that no estimate was available.
 
 ## References
 
