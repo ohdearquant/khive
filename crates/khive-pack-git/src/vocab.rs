@@ -7,8 +7,8 @@
 
 use khive_runtime::{NoteKindSpec, NoteLifecycleSpec};
 use khive_types::{
-    EdgeEndpointRule, EdgeRelation, EndpointKind, EntityKind, EntityTypeDef, HandlerDef, ParamDef,
-    VerbCategory, Visibility,
+    EdgeEndpointRule, EdgeRelation, EndpointKind, EntityKind, EntityTypeDef, HandlerDef,
+    IdResolutionMode, ParamDef, VerbCategory, Visibility,
 };
 
 /// Shared open/closed lifecycle for `issue` and `pull_request`. See
@@ -94,6 +94,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                                non-github.com hosts degrade to commits-only (gh cannot serve \
                                their issues/PRs). ssh://, git://, http://, and scp-shorthand \
                                (user@host:path) sources are rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "project",
@@ -104,6 +105,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                                exact then normalized properties.repo_url reconciliation, or \
                                created if no identity evidence matches (see the response's \
                                project_id and project_created). Names are never a match key.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "max_items",
@@ -112,6 +114,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                 description: "Bounded work for this call, counted across commits + issues + PRs \
                                (default 500, clamped to 1..=2000). Cursor-resumable: call again \
                                while the response's done field is false.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "include",
@@ -119,6 +122,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                 required: false,
                 description: "Which record kinds to ingest this call: any of commits | issues | \
                                pull_requests (default: all three).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -136,12 +140,14 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                 required: true,
                 description: "Absolute local path to a git repository (must contain a .git \
                                entry).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "message",
                 param_type: "string",
                 required: true,
                 description: "Commit message, passed to git as a single -m argument value.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "paths",
@@ -150,12 +156,14 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                 description: "Relative paths to stage and scope the commit to. Absent commits \
                                everything currently staged/modified in tracked files (git \
                                commit -a) — never auto-adds new untracked files.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "author",
                 param_type: "string",
                 required: false,
                 description: "Override the commit author, e.g. \"Name <email>\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -172,18 +180,21 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                 required: true,
                 description: "Absolute local path to a git repository (must contain a .git \
                                entry).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "name",
                 param_type: "string",
                 required: true,
                 description: "New branch name.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "from",
                 param_type: "string",
                 required: false,
                 description: "Ref or SHA to branch from. Absent uses the repo's current HEAD.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -200,18 +211,21 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                 required: true,
                 description: "Absolute local path to a git repository (must contain a .git \
                                entry).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "branch",
                 param_type: "string",
                 required: true,
                 description: "Branch to push.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "remote",
                 param_type: "string",
                 required: false,
                 description: "Remote to push to (default: origin).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "force",
@@ -221,6 +235,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                                this verb (ADR-108 hard rule 1). Present only so a caller's \
                                explicit force=true request fails loudly rather than being \
                                silently ignored.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
