@@ -292,6 +292,16 @@ impl NoteStore for PolicyEnforcingNoteStore {
             .await
     }
 
+    async fn count_notes_filtered_in_snapshot(
+        &self,
+        namespace: &str,
+        filters: &[NoteFilter],
+    ) -> StorageResult<Vec<u64>> {
+        self.inner
+            .count_notes_filtered_in_snapshot(namespace, filters)
+            .await
+    }
+
     async fn note_sequence(&self, id: Uuid) -> StorageResult<Option<i64>> {
         self.inner.note_sequence(id).await
     }

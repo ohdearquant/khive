@@ -234,14 +234,18 @@ pub enum FilterOp {
     /// Matches rows where the JSON field equals the value OR the field is absent/NULL.
     /// Used for properties that may be missing in legacy rows (e.g. `$.read`).
     EqOrMissing,
-    /// Matches a non-empty textual value using an indexable
-    /// `ifnull(json_extract(...), '')` expression. Missing values map to the
-    /// empty string and therefore do not match the non-empty values for which
-    /// this operator is intended (the comm unread count handles legacy rows
-    /// separately).
+    /// Matches the supplied value using the indexable
+    /// `ifnull(json_extract(...), '')` expression. The value may be any
+    /// [`SqlValue`] accepted by the SQL adapter; in particular, `Text("")`
+    /// matches both missing values and present-but-empty values.
     EqOrMissingIndexed,
     /// Matches rows where the JSON field is absent or SQL-NULL.
     JsonTypeMissing,
+    /// Matches rows where the JSON field is absent or explicitly JSON `null`,
+    /// while constraining its index key to the empty recipient key. This is
+    /// the index-friendly legacy-recipient partition used with
+    /// [`EqOrMissingIndexed`].
+    JsonTypeMissingOrNullIndexed,
     /// Matches rows where a JSON text field equals the value, while treating
     /// every missing or non-text value as that same value. The SQL adapter
     /// emits `CASE WHEN json_type(...) = 'text' THEN json_extract(...) ELSE
@@ -259,7 +263,9 @@ pub enum FilterOp {
     JsonTypeEq,
     /// Matches rows where the json_type is absent (NULL) OR differs from value.
     /// Equivalent to `json_type IS NULL OR json_type != value`.
-    /// Used for unread filter: matches any `$.read` that is NOT the JSON boolean true.
+    /// Value must be a SQLite json_type string literal: 'true', 'false',
+    /// 'integer', 'real', 'text', 'array', 'object', or 'null'. Used for
+    /// unread filter: matches any `$.read` that is NOT the JSON boolean true.
     JsonTypeNeMissing,
     /// Matches rows where `json_extract(properties, path)` equals any value in
     /// the set. A row with a missing/NULL property does not match — use
@@ -480,6 +486,34 @@ pub trait NoteStore: Send + Sync + 'static {
         filter: &NoteFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Count several filtered note populations in one consistent backend
+    /// snapshot. SQL backends should override this operation so callers can
+    /// retain separate index-friendly predicates without racing between
+    /// their counts. The compatibility default preserves the trait contract
+    /// for custom stores but does not provide cross-query snapshot isolation.
+    async fn count_notes_filtered_in_snapshot(
+        &self,
+        namespace: &str,
+        filters: &[NoteFilter],
+    ) -> StorageResult<Vec<u64>> {
+        let mut counts = Vec::with_capacity(filters.len());
+        for filter in filters {
+            counts.push(
+                self.query_notes_filtered(
+                    namespace,
+                    filter,
+                    PageRequest {
+                        limit: 0,
+                        offset: 0,
+                    },
+                )
+                .await?
+                .total
+                .unwrap_or(0),
+            );
+        }
+        Ok(counts)
+    }
     /// Resolve a note id to its immutable insertion sequence.
     async fn note_sequence(&self, _id: Uuid) -> StorageResult<Option<i64>> {
         Err(crate::StorageError::Unsupported {

@@ -883,33 +883,24 @@ async fn count_unread_messages(
             ..Default::default()
         }
     };
-    // Count addressed rows through the recipient-keyed partial index, then
-    // add legacy rows whose addressee is absent. Both populations are
-    // unread-only, so neither query scans read or deleted mailbox history.
-    let exact = store
-        .query_notes_filtered(
+    // Count the disjoint addressed and legacy-recipient partitions in one
+    // storage snapshot. Both predicates retain the recipient key expression
+    // required by idx_notes_unread_probe_recipient; the legacy partition's
+    // empty key includes both absent and explicit JSON-null recipients.
+    let counts = store
+        .count_notes_filtered_in_snapshot(
             namespace,
-            &count_filter(FilterOp::EqOrMissingIndexed),
-            PageRequest {
-                limit: 0,
-                offset: 0,
-            },
+            &[
+                count_filter(FilterOp::EqOrMissingIndexed),
+                count_filter(FilterOp::JsonTypeMissingOrNullIndexed),
+            ],
         )
-        .await?
-        .total
-        .unwrap_or(0);
-    let legacy = store
-        .query_notes_filtered(
-            namespace,
-            &count_filter(FilterOp::JsonTypeMissing),
-            PageRequest {
-                limit: 0,
-                offset: 0,
-            },
-        )
-        .await?
-        .total
-        .unwrap_or(0);
+        .await?;
+    let [exact, legacy] = counts.as_slice() else {
+        return Err(RuntimeError::Internal(
+            "comm.unread: storage returned an invalid partition count vector".into(),
+        ));
+    };
     Ok(exact + legacy)
 }
 

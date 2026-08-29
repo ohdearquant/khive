@@ -593,6 +593,121 @@ async fn note_page_count_and_items_share_one_snapshot_during_concurrent_insert()
 }
 
 #[tokio::test]
+async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note-filter-count-snapshot.db");
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+
+    let store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
+    let namespace = format!("count-snapshot-{}", Uuid::new_v4().simple());
+    let mut note = make_note_with_props(
+        &namespace,
+        "message",
+        "addressed before concurrent update",
+        serde_json::json!({
+            "direction": "inbound",
+            "read": false,
+            "to_actor": "actor:a",
+        }),
+    );
+    note.created_at = 1;
+    let note_id = note.id;
+    store.upsert_note(note).await.unwrap();
+
+    let base_filters = vec![
+        NotePropFilter {
+            json_path: "$.direction".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text("inbound".to_string()),
+        },
+        NotePropFilter {
+            json_path: "$.read".to_string(),
+            op: FilterOp::JsonTypeNeMissing,
+            value: SqlValue::Text("true".to_string()),
+        },
+    ];
+    let partition_filter = |op| {
+        let mut property_filters = base_filters.clone();
+        property_filters.push(NotePropFilter {
+            json_path: "$.to_actor".to_string(),
+            op,
+            value: SqlValue::Text("actor:a".to_string()),
+        });
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters,
+            ..NoteFilter::default()
+        }
+    };
+    let filters = vec![
+        partition_filter(FilterOp::EqOrMissingIndexed),
+        partition_filter(FilterOp::JsonTypeMissingOrNullIndexed),
+    ];
+
+    let (reached_rx, proceed_tx) =
+        page_snapshot_seam::install("count_notes_filtered_in_snapshot", namespace.clone());
+    let query_task = {
+        let store = Arc::clone(&store);
+        let namespace = namespace.clone();
+        let filters = filters.clone();
+        tokio::spawn(async move {
+            store
+                .count_notes_filtered_in_snapshot(&namespace, &filters)
+                .await
+        })
+    };
+
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .expect("waiting for the count snapshot seam must not panic")
+        .expect("count query must reach the seam after its first partition");
+
+    let writer = pool.writer().unwrap();
+    writer
+        .conn()
+        .execute(
+            "UPDATE notes SET properties = json_object('direction', 'inbound', 'read', 0) \
+             WHERE id = ?1",
+            [note_id.to_string()],
+        )
+        .unwrap();
+
+    proceed_tx
+        .send(())
+        .expect("count query must still be waiting at the production seam");
+    let counts = query_task
+        .await
+        .expect("count query task must not panic")
+        .expect("count query must succeed");
+    page_snapshot_seam::uninstall();
+
+    assert_eq!(counts, vec![1, 0], "both partitions must use one snapshot");
+
+    let after = store
+        .count_notes_filtered_in_snapshot(&namespace, &filters)
+        .await
+        .unwrap();
+    assert_eq!(
+        after,
+        vec![0, 1],
+        "the committed update must appear afterward"
+    );
+}
+
+#[tokio::test]
 async fn test_soft_delete_sets_status_deleted() {
     let pool = setup_pool();
     let store = SqlNoteStore::new(Arc::clone(&pool), false);
@@ -2281,6 +2396,87 @@ async fn unread_probe_query_uses_partial_index() {
     assert!(
         !control_plan.contains("idx_notes_unread_probe_recipient"),
         "control: dropped index must vanish from the plan, got:\n{control_plan}"
+    );
+}
+
+/// The legacy-recipient partition includes absent and explicit JSON-null
+/// recipients but excludes a present empty string, and remains recipient-keyed
+/// so the unread probe can use the partial index.
+#[tokio::test]
+async fn unread_probe_legacy_partition_includes_null_and_uses_partial_index() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::types::SqlValue;
+
+    let pool = setup_pool();
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
+
+    for (label, recipient) in [
+        ("missing", None),
+        ("null", Some(serde_json::Value::Null)),
+        ("empty", Some(serde_json::Value::String(String::new()))),
+        ("other", Some(serde_json::json!("actor:z"))),
+    ] {
+        let mut properties = serde_json::json!({
+            "direction": "inbound",
+            "read": false,
+        });
+        if let Some(recipient) = recipient {
+            properties["to_actor"] = recipient;
+        }
+        store
+            .upsert_note(make_note_with_props(
+                "default", "message", label, properties,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::JsonTypeMissingOrNullIndexed,
+                value: SqlValue::Text("actor:a".to_string()),
+            },
+        ],
+        ..NoteFilter::default()
+    };
+
+    let rows = store
+        .query_notes_filtered_bounded("default", &filter, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "only missing and JSON-null recipients match");
+
+    let (where_sql, params) = build_note_filter_where("default", &filter).unwrap();
+    let sql =
+        format!("SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT 1001");
+    let reader = pool.reader().unwrap();
+    let mut stmt = reader
+        .conn()
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let plan: Vec<String> = stmt
+        .query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let plan = plan.join("\n");
+    assert!(
+        plan.contains("idx_notes_unread_probe_recipient"),
+        "legacy recipient partition must use the partial index, got plan:\n{plan}"
     );
 }
 

@@ -818,6 +818,13 @@ fn build_note_filter_where(
                 let type_expr = json_type_expr(&pf.json_path);
                 conditions.push(format!("{type_expr} IS NULL"));
             }
+            FilterOp::JsonTypeMissingOrNullIndexed => {
+                let expr = json_extract_expr(&pf.json_path);
+                let type_expr = json_type_expr(&pf.json_path);
+                conditions.push(format!(
+                    "ifnull({expr}, '') = '' AND ({type_expr} IS NULL OR {type_expr} = 'null')"
+                ));
+            }
             FilterOp::JsonTypeNeMissing => {
                 let type_expr = json_type_expr(&pf.json_path);
                 // Inlined as a validated literal, NOT a parameter: the
@@ -878,6 +885,7 @@ fn build_note_filter_where(
                     | FilterOp::TextEqOrNonText
                     | FilterOp::JsonTypeEq
                     | FilterOp::JsonTypeMissing
+                    | FilterOp::JsonTypeMissingOrNullIndexed
                     | FilterOp::JsonTypeNeMissing
                     | FilterOp::In(_)
                     | FilterOp::NotInOrMissing(_) => {
@@ -1453,6 +1461,45 @@ impl NoteStore for SqlNoteStore {
                 &data_sql,
                 &data_params,
             )
+        })
+        .await
+    }
+
+    async fn count_notes_filtered_in_snapshot(
+        &self,
+        namespace: &str,
+        filters: &[NoteFilter],
+    ) -> Result<Vec<u64>, StorageError> {
+        for filter in filters {
+            for pf in &filter.property_filters {
+                validate_json_path(&pf.json_path)?;
+            }
+        }
+
+        let namespace = namespace.to_string();
+        let filters = filters.to_vec();
+        self.with_reader("count_notes_filtered_in_snapshot", move |conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Deferred,
+            )?;
+            let mut counts = Vec::with_capacity(filters.len());
+            for filter in filters.iter() {
+                #[cfg(test)]
+                if !counts.is_empty() {
+                    tests::page_snapshot_seam::hook("count_notes_filtered_in_snapshot", &namespace);
+                }
+
+                let (where_sql, params) = build_note_filter_where(&namespace, filter)?;
+                let sql = format!("SELECT COUNT(*) FROM notes{where_sql}");
+                let mut stmt = tx.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|param| param.as_ref()).collect();
+                let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+                counts.push(count as u64);
+            }
+            tx.commit()?;
+            Ok(counts)
         })
         .await
     }

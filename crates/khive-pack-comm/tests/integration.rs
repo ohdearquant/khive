@@ -10306,6 +10306,48 @@ async fn i1931_inbox_unread_count_does_not_saturate_at_old_probe_cap() {
     );
 }
 
+/// Explicit JSON null has the same fail-open inbox visibility as an absent
+/// `to_actor`; the mailbox-wide unread count must include it too.
+#[tokio::test]
+async fn i2166_unread_count_includes_explicit_null_recipient() {
+    let backend = shared_backend();
+    let (_registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    backend
+        .notes()
+        .expect("raw notes store")
+        .upsert_note(
+            Note::new("local", "message", "explicit null recipient").with_properties(
+                serde_json::json!({
+                    "direction": "inbound",
+                    "to_actor": null,
+                }),
+            ),
+        )
+        .await
+        .expect("seed explicit-null message");
+
+    let unread = registry_b
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread succeeds");
+    assert_eq!(
+        unread["count"], 1,
+        "explicit null must be counted: {unread}"
+    );
+
+    let inbox = registry_b
+        .dispatch("comm.inbox", serde_json::json!({ "limit": 10 }))
+        .await
+        .expect("inbox succeeds");
+    assert_eq!(inbox["count"], 1, "explicit null must be visible: {inbox}");
+    assert_eq!(
+        inbox["unread_count"], 1,
+        "count must match visibility: {inbox}"
+    );
+}
+
 /// `limit=0` is the count-only inbox path: it returns no message payloads but still reports the caller's real unread total.
 #[tokio::test]
 async fn i66_inbox_limit_zero_carries_real_unread_count() {
