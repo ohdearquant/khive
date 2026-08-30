@@ -6269,6 +6269,63 @@ pub(crate) mod tests {
         }
     }
 
+    /// An event-backed registry can drain the process-wide config ledger at
+    /// dispatch, so every such test fixture must join the ledger's serial
+    /// group even when its own assertion is about another audit field.
+    #[test]
+    fn event_store_test_fixtures_are_config_ledger_serialized() {
+        const SELF_SRC: &str = include_str!("pack.rs");
+        let lines: Vec<&str> = SELF_SRC.lines().collect();
+        let test_starts: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim();
+                trimmed == "#[test]" || trimmed.starts_with("#[tokio::test")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let event_store_fixture = ["with_event_", "store("].concat();
+        let mut offenders = Vec::new();
+
+        for (index, start) in test_starts.iter().copied().enumerate() {
+            let end = test_starts.get(index + 1).copied().unwrap_or(lines.len());
+            let span = &lines[start..end];
+            if !span.iter().any(|line| line.contains(&event_store_fixture)) {
+                continue;
+            }
+
+            let signature_offset = span
+                .iter()
+                .position(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.starts_with("fn ") || trimmed.starts_with("async fn ")
+                })
+                .expect("test span has a function signature");
+            let has_group = span[..signature_offset]
+                .iter()
+                .any(|line| line.trim() == "#[serial(config_ledger)]");
+            if !has_group {
+                let signature = span[signature_offset].trim_start();
+                let name = signature
+                    .strip_prefix("async ")
+                    .unwrap_or(signature)
+                    .strip_prefix("fn ")
+                    .unwrap_or(signature)
+                    .split('(')
+                    .next()
+                    .unwrap_or("<unknown>");
+                offenders.push(name.to_string());
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "event-store-backed pack tests must use #[serial(config_ledger)]; \
+             offenders: {offenders:?}"
+        );
+    }
+
     fn only_git_digest_event(store: &MemoryEventStore) -> Event {
         let events: Vec<Event> = store
             .events
@@ -6287,6 +6344,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn git_digest_success_returns_complete_durable_receipt() {
         let project_id = uuid::Uuid::new_v4();
         let store = Arc::new(MemoryEventStore::default());
@@ -6332,6 +6390,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn malformed_git_digest_report_appends_one_generic_error_audit() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -6363,6 +6422,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     #[serial(audit_append_failures)]
     #[serial(audit_obligation_append_failures)]
     async fn git_digest_receipt_append_failure_never_returns_unqualified_success() {
@@ -6420,6 +6480,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn git_digest_gate_unavailable_precedes_the_receipt_contract() {
         #[derive(Debug)]
         struct FailingGate;
@@ -6458,6 +6519,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_gate_error_returns_typed_refusal_without_invoking_operation() {
         #[derive(Debug)]
         struct FailingGate;
@@ -6521,6 +6583,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_deny_remains_distinct_and_does_not_invoke_operation() {
         #[derive(Debug)]
         struct DenyingGate;
@@ -6564,6 +6627,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_git_digest_uses_the_same_receipt_contract() {
         let project_id = uuid::Uuid::new_v4();
         let store = Arc::new(MemoryEventStore::default());
@@ -6598,6 +6662,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_git_digest_receipt_preserves_typed_metadata() {
         let project_id = uuid::Uuid::new_v4();
         let store = Arc::new(MemoryEventStore::default());
@@ -6631,6 +6696,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_malformed_git_digest_appends_one_generic_error_audit() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -6882,6 +6948,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_persists_to_event_store_on_allow() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -6914,6 +6981,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     #[serial(audit_append_failures)]
     #[serial(audit_obligation_append_failures)]
     async fn audit_append_failure_fails_an_obligation_bearing_dispatch() {
@@ -7009,15 +7077,15 @@ pub(crate) mod tests {
     /// Not pinned here: that the row commits on a SEPARATE writer acquisition from the
     /// handler's. The store double has no writer to observe, so that half of the mechanism
     /// needs a different fixture than this one.
-    #[tokio::test]
-    #[serial(audit_append_failures)]
-    #[serial(audit_obligation_append_failures)]
     // The config ledger is process-global and an event-store dispatch drains its
     // queue before invoking the pack, so a concurrent config_ledger test can land
     // a submission ahead of this handler's effect and break the first-entry
     // assertion below. That group is held for the position assertion, not for the
-    // audit counters the two groups above cover.
+    // audit counters the other two groups cover.
+    #[tokio::test]
     #[serial(config_ledger)]
+    #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
     async fn obligation_failure_reports_a_write_that_already_committed() {
         /// `total` is what `cost_unit` is computed from, so this number is the
         /// test's handle on whether the audit row was built from the return
@@ -7342,6 +7410,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(config_ledger)]
     fn build_rejects_a_configured_event_store_incompatible_with_the_audit_batch_seam() {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
@@ -7447,6 +7516,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_duration_us_reflects_measured_dispatch_time() {
         // The persisted audit row's `duration_us` must carry the measured
         // pack-dispatch time, not the `Event::new` default of 0 (persisting
@@ -7483,6 +7553,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_unknown_verb_allowed_by_gate_still_persists_audit_row() {
         // Generalizing audit-row deferral to every Allow-outcome verb (not
         // just singleton `link`) must not silently drop the audit row for a
@@ -7520,6 +7591,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_persists_to_event_store_on_deny() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
@@ -7562,6 +7634,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn gate_error_returns_typed_refusal_without_invoking_pack() {
         #[derive(Debug)]
         struct FailingGate;
@@ -7620,6 +7693,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     #[serial(audit_append_failures)]
     async fn gate_error_audit_failure_cannot_reopen_dispatch_or_replace_typed_error() {
         #[derive(Debug)]
@@ -7824,6 +7898,7 @@ pub(crate) mod tests {
     // verifies the complete envelope survives append_event → query_events.
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_envelope_round_trips_deny_reason_and_gate_impl_through_event_store() {
         #[derive(Debug)]
         struct DenyGateWithName;
@@ -7896,6 +7971,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_envelope_round_trips_obligations_through_event_store() {
         use khive_gate::Obligation;
 
@@ -7963,6 +8039,7 @@ pub(crate) mod tests {
     // (Event.data is stored as TEXT and parsed back on read).
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn sql_backed_audit_envelope_round_trips_deny_reason_gate_impl_and_obligations() {
         #[derive(Debug)]
         struct SqlTestDenyGate;
@@ -8062,6 +8139,7 @@ pub(crate) mod tests {
     //   1. Raw Event.data["obligations"] is a non-empty JSON array.
     //   2. Deserialized AuditEvent.obligations[0] matches the expected variant.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn sql_backed_audit_envelope_round_trips_non_empty_obligations() {
         use khive_gate::Obligation;
 
@@ -8168,6 +8246,7 @@ pub(crate) mod tests {
     // through the EventStore. Ensures the wire shape is independent of which verb
     // triggers the gate check.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_payload_shape_for_create_verb() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8337,6 +8416,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_present_on_non_embedding_successful_dispatch() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8365,6 +8445,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_scales_with_registered_model_count_for_create() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8396,6 +8477,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_zero_registered_models_is_base_weight_only() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8424,6 +8506,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_when_dispatch_returns_error() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8463,6 +8546,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_when_no_pack_owns_the_verb() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8492,6 +8576,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_on_denied_dispatch() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
@@ -8528,6 +8613,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_present_on_link_singleton_success() {
         let store = Arc::new(MemoryEventStore::default());
         let edge_id = uuid::Uuid::new_v4();
@@ -8575,6 +8661,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_on_link_dispatch_failure() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8612,6 +8699,7 @@ pub(crate) mod tests {
 
     // Registry audit event must carry target_id when dispatch params include it.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_threads_target_id_from_dispatch_args() {
         let store = Arc::new(MemoryEventStore::default());
         let target = uuid::Uuid::new_v4();
@@ -8712,6 +8800,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_enriches_successful_singleton_with_edge_v2() {
         let store = Arc::new(MemoryEventStore::default());
         let edge_id = uuid::Uuid::new_v4();
@@ -8781,6 +8870,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_falls_back_to_v1_when_dispatch_fails() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8850,6 +8940,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_falls_back_to_v1_when_result_missing_edge_fields() {
         let store = Arc::new(MemoryEventStore::default());
         let target_arg = uuid::Uuid::new_v4();
@@ -8896,6 +8987,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_bulk_links_get_no_enrichment() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -9036,6 +9128,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_success() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -9060,6 +9153,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_dispatch_error() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -9086,6 +9180,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_denied() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
@@ -9120,6 +9215,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_link_v2_success() {
         let store = Arc::new(MemoryEventStore::default());
         let edge_id = uuid::Uuid::new_v4();
@@ -9164,6 +9260,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_link_v1_fallback() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -9199,6 +9296,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_unknown_verb() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -9226,6 +9324,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_omits_request_id_key_when_absent() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();

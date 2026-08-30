@@ -3341,6 +3341,7 @@ mod tests {
     /// invocation (`crates/kkernel/src/exec.rs`'s spy seam proves the exec
     /// side hands the path over; this side proves it reaches `argv`).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_config_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3370,6 +3371,7 @@ mod tests {
     /// (or `--pack`-flag, or config-file `[runtime].packs`) selection when it
     /// spawns a fresh daemon (khive-oss#1941).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_pack_flags_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3398,6 +3400,7 @@ mod tests {
     /// at all — the spawned daemon falls through to its own env/config
     /// resolution exactly as before this fix.
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_omits_pack_flags_when_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3425,6 +3428,7 @@ mod tests {
     /// would bind the config's declared persistent backend files, the exact
     /// inversion of the operator's ephemeral invocation.
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_memory_db_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3464,6 +3468,7 @@ mod tests {
     /// the frame's fingerprint has already been normalized to the
     /// no-override anchor (`normalize_redundant_db_override_with_source`).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_forwards_concrete_db_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3491,6 +3496,7 @@ mod tests {
     /// seam retries only ExecutableFileBusy, so holding this file open for
     /// writing forces the exact failure class reported by coverage CI.
     #[test]
+    #[serial]
     fn spawn_daemon_retries_a_transient_executable_file_busy_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let exe = daemon_script_fixture(&dir, "temporarily-busy.sh", "#!/bin/sh\nexit 0\n");
@@ -3508,6 +3514,44 @@ mod tests {
         release.join().expect("fixture writer release thread");
         let status = child.wait().expect("wait for executable fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
+    }
+
+    /// Every direct test caller of the spawn seam mutates the process-wide
+    /// `SPAWN_COUNT`, so it must share the default serial group with tests
+    /// that reset and assert that counter.
+    #[test]
+    fn direct_spawn_seam_test_callers_are_serialized() {
+        const SELF_SRC: &str = include_str!("daemon.rs");
+        let lines: Vec<&str> = SELF_SRC.lines().collect();
+        let test_starts: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim();
+                trimmed == "#[test]" || trimmed.starts_with("#[tokio::test")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let spawn_call = ["spawn_daemon_with_exe_and_", "config("].concat();
+        let mut offenders = Vec::new();
+
+        for (index, start) in test_starts.iter().copied().enumerate() {
+            let end = test_starts.get(index + 1).copied().unwrap_or(lines.len());
+            let span = &lines[start..end];
+            if !span.iter().any(|line| line.contains(&spawn_call)) {
+                continue;
+            }
+
+            if !span.iter().any(|line| line.trim() == "#[serial]") {
+                offenders.push(start + 1);
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "tests that directly call the SPAWN_COUNT-mutating spawn seam must use \
+             #[serial]; test attributes start at lines {offenders:?}"
+        );
     }
 
     /// The helper behind the retry above must actually retry the exact
