@@ -15,6 +15,7 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
     let runtime = KhiveRuntime::new(RuntimeConfig {
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
         db_path: Some(db_path),
         default_namespace: Namespace::local(),
         embedding_model: None,
