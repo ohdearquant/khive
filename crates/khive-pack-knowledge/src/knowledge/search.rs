@@ -402,6 +402,106 @@ tokio::task_local! {
 }
 
 #[cfg(test)]
+pub(crate) async fn scope_fts_test_deadline_advance<F>(
+    after_completed_terms: usize,
+    by: std::time::Duration,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    FTS_TEST_DEADLINE_ADVANCE
+        .scope(
+            FtsTestDeadlineAdvance {
+                after_completed_terms,
+                by,
+            },
+            future,
+        )
+        .await
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CandidateStageTestControl {
+    pub(crate) ann_started: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) ann_release: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) ann_finished: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) lexical_started: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) lexical_release: std::sync::Arc<tokio::sync::Notify>,
+    block_ann: bool,
+    block_lexical: bool,
+}
+
+#[cfg(test)]
+impl CandidateStageTestControl {
+    pub(crate) fn new(block_ann: bool, block_lexical: bool) -> Self {
+        Self {
+            ann_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            ann_release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            ann_finished: std::sync::Arc::new(tokio::sync::Notify::new()),
+            lexical_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            lexical_release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            block_ann,
+            block_lexical,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum CandidateStage {
+    Ann,
+    Lexical,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CANDIDATE_STAGE_TEST_CONTROL: CandidateStageTestControl;
+}
+
+#[cfg(test)]
+pub(crate) async fn scope_candidate_stage_test_control<F>(
+    control: CandidateStageTestControl,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CANDIDATE_STAGE_TEST_CONTROL.scope(control, future).await
+}
+
+#[cfg(test)]
+async fn candidate_stage_test_start(stage: CandidateStage) {
+    let control = CANDIDATE_STAGE_TEST_CONTROL.try_with(Clone::clone).ok();
+    let Some(control) = control else {
+        return;
+    };
+    match stage {
+        CandidateStage::Ann => {
+            control.ann_started.notify_one();
+            if control.block_ann {
+                control.ann_release.notified().await;
+            }
+        }
+        CandidateStage::Lexical => {
+            control.lexical_started.notify_one();
+            if control.block_lexical {
+                control.lexical_release.notified().await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn candidate_stage_test_finish(stage: CandidateStage) {
+    let _ = CANDIDATE_STAGE_TEST_CONTROL.try_with(|control| match stage {
+        CandidateStage::Ann => control.ann_finished.notify_one(),
+        CandidateStage::Lexical => {}
+    });
+}
+
+#[cfg(test)]
 async fn advance_fts_test_deadline_after_term(completed_terms: usize) {
     let advance_by = FTS_TEST_DEADLINE_ADVANCE
         .try_with(|control| {
@@ -1165,6 +1265,13 @@ struct EligibleAnnSearchState {
     hydration_failures: usize,
 }
 
+#[derive(Default)]
+struct AnnCandidateOutcome {
+    hits: Vec<ScoredHit>,
+    availability: Option<AnnAvailability>,
+    hydration_failures: usize,
+}
+
 /// Retrieve an ANN pool whose bounded, rank-preserving truncation happens only
 /// after canonical hydration and caller eligibility.
 ///
@@ -1240,6 +1347,76 @@ async fn search_eligible_ann_with_refill(
         }
         request_k = next_k;
     }
+}
+
+/// Run the query-embedding and eligible ANN candidate leg with the handler's
+/// established fail-open policy. Read-deadline expiry and embedding failures
+/// produce an empty ANN outcome; other runtime failures remain hard errors.
+async fn search_ann_candidates(
+    phase: &'static str,
+    ctx: &SearchCtx<'_>,
+    token: &NamespaceToken,
+    ann: &vamana::SharedAnn,
+    raw_query: &str,
+    target_eligible: usize,
+    initial_k: usize,
+) -> Result<AnnCandidateOutcome, RuntimeError> {
+    #[cfg(test)]
+    candidate_stage_test_start(CandidateStage::Ann).await;
+
+    let outcome =
+        match khive_storage::await_request_read_phase(phase, ctx.runtime.embed_query(raw_query))
+            .await
+        {
+            Ok(Ok(query_emb)) => {
+                let key = vamana::AnnKey::new(ctx.ns, ctx.runtime.default_embedder_name());
+                match search_eligible_ann_with_refill(
+                    ctx,
+                    token,
+                    ann,
+                    &key,
+                    &query_emb,
+                    target_eligible,
+                    initial_k,
+                )
+                .await
+                {
+                    Ok(EligibleAnnSearchState {
+                        hits,
+                        availability,
+                        hydration_failures,
+                    }) => Ok(AnnCandidateOutcome {
+                        hits,
+                        availability: Some(availability),
+                        hydration_failures,
+                    }),
+                    Err(e) if is_read_timeout(&e) => Ok(AnnCandidateOutcome::default()),
+                    Err(e) => Err(e),
+                }
+            }
+            Ok(Err(_)) => Ok(AnnCandidateOutcome::default()),
+            Err(e) if is_timeout(&e) => Ok(AnnCandidateOutcome::default()),
+            Err(e) => Err(e.into()),
+        };
+
+    #[cfg(test)]
+    candidate_stage_test_finish(CandidateStage::Ann);
+
+    outcome
+}
+
+/// Poll the independent ANN and lexical candidate legs together while keeping
+/// them attached to the caller task. This preserves task-local read deadlines
+/// and cancellation and guarantees both legs settle before fusion.
+async fn join_candidate_stages<AnnFuture, LexicalFuture>(
+    ann_future: AnnFuture,
+    lexical_future: LexicalFuture,
+) -> (AnnFuture::Output, LexicalFuture::Output)
+where
+    AnnFuture: std::future::Future,
+    LexicalFuture: std::future::Future,
+{
+    tokio::join!(ann_future, lexical_future)
 }
 
 // ─── compose helpers ──────────────────────────────────────────────────────────
@@ -1921,57 +2098,42 @@ impl KnowledgeHandlers {
         // Trigger background warm — never block search on the ANN rebuild.
         vamana::ensure_ann_background(runtime, token, ann);
 
-        // Fetch ANN candidates BEFORE the lexical stage. The lexical fetch is
-        // now bounded (issue #1930) but still non-zero cost; running ANN
-        // first means a lexical read-deadline timeout afterward cannot
-        // discard ANN results that were already safely computed — the
-        // degraded arm below can then report ANN-backed results instead of
-        // erroring the whole verb. A read timeout in this ANN stage itself
-        // is likewise fail-open, never propagated as a verb-level error.
-        let mut ann_hits: Vec<ScoredHit> = Vec::new();
-        let mut ann_availability: Option<AnnAvailability> = None;
-        let mut hydration_failures = 0usize;
+        // ANN and lexical candidates are independent until fusion. Poll both
+        // under the same absolute request deadline so ANN latency cannot spend
+        // the lexical leg's entire budget. Structured joining keeps both legs
+        // attached to this task, preserving request-scoped cancellation and
+        // allowing either leg's timeout to fail open to the other's results.
         let ann_k = fetch_limit.max(20);
-        match khive_storage::await_request_read_phase(
+        let ann_future = search_ann_candidates(
             "knowledge.search",
-            runtime.embed_query(&raw_query),
-        )
-        .await
-        {
-            Ok(Ok(query_emb)) => {
-                let model = runtime.default_embedder_name();
-                let key = vamana::AnnKey::new(&ns, model);
-                match search_eligible_ann_with_refill(
-                    &ctx, token, ann, &key, &query_emb, ann_k, ann_k,
-                )
-                .await
-                {
-                    Ok(EligibleAnnSearchState {
-                        hits,
-                        availability,
-                        hydration_failures: ann_hydration_failures,
-                    }) => {
-                        hydration_failures += ann_hydration_failures;
-                        ann_hits = hits;
-                        ann_availability = Some(availability);
-                    }
-                    Err(e) if is_read_timeout(&e) => {}
-                    Err(e) => return Err(e),
-                }
+            &ctx,
+            token,
+            ann,
+            &raw_query,
+            ann_k,
+            ann_k,
+        );
+        let lexical_future = async {
+            #[cfg(test)]
+            candidate_stage_test_start(CandidateStage::Lexical).await;
+            if do_decompose && non_stop_count >= decompose_threshold {
+                search_decomposed(&ctx, &raw_query, intersection_bonus).await
+            } else {
+                search_core(&ctx, &raw_query).await
             }
-            Ok(Err(_)) => {}
-            Err(e) if is_timeout(&e) => {}
-            Err(e) => return Err(e.into()),
-        }
-
+        };
+        let (ann_result, lexical_result) = join_candidate_stages(ann_future, lexical_future).await;
+        // Preserve the pre-concurrency hard-error precedence: ANN was awaited
+        // first before #1996, so inspect its result first after both legs settle.
+        let AnnCandidateOutcome {
+            hits: ann_hits,
+            availability: ann_availability,
+            hydration_failures,
+        } = ann_result?;
         let SearchCoreOutcome {
             mut hits,
             lexical_timed_out,
-        } = if do_decompose && non_stop_count >= decompose_threshold {
-            search_decomposed(&ctx, &raw_query, intersection_bonus).await?
-        } else {
-            search_core(&ctx, &raw_query).await?
-        };
+        } = lexical_result?;
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -2108,61 +2270,38 @@ impl KnowledgeHandlers {
             exclude_statuses: SUGGEST_EXCLUDE,
         };
 
-        // Fetch ANN candidates BEFORE the lexical stage — same rationale as
-        // `search`: the lexical fetch is bounded (issue #1930) but still
-        // non-zero cost, so computing ANN first means a lexical read-deadline
-        // timeout afterward cannot discard ANN results already in hand.
+        // ANN and lexical candidates are independent until fusion. Poll them
+        // concurrently under the same absolute deadline, as in `search`.
         vamana::ensure_ann_background(runtime, token, ann);
-        let mut ann_hits: Vec<ScoredHit> = Vec::new();
-        let mut ann_availability: Option<AnnAvailability> = None;
-        let mut hydration_failures = 0usize;
         // Over-fetch aggressively: the corpus is ~27% domains / ~73% atoms, so
         // limit*3 would return mostly atoms that all get dropped after type filtering.
         // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
         // top ANN neighbors before the type gate discards atom hits.
         let ann_k = (limit * 50).max(200);
-        match khive_storage::await_request_read_phase(
+        let ann_future = search_ann_candidates(
             "knowledge.suggest",
-            runtime.embed_query(&raw_query),
-        )
-        .await
-        {
-            Ok(Ok(query_emb)) => {
-                let model = runtime.default_embedder_name();
-                let key = vamana::AnnKey::new(&ns, model);
-                match search_eligible_ann_with_refill(
-                    &ctx,
-                    token,
-                    ann,
-                    &key,
-                    &query_emb,
-                    ctx.fetch_limit,
-                    ann_k,
-                )
-                .await
-                {
-                    Ok(EligibleAnnSearchState {
-                        hits,
-                        availability,
-                        hydration_failures: ann_hydration_failures,
-                    }) => {
-                        hydration_failures += ann_hydration_failures;
-                        ann_hits = hits;
-                        ann_availability = Some(availability);
-                    }
-                    Err(e) if is_read_timeout(&e) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(Err(_)) => {}
-            Err(e) if is_timeout(&e) => {}
-            Err(e) => return Err(e.into()),
-        }
-
+            &ctx,
+            token,
+            ann,
+            &raw_query,
+            ctx.fetch_limit,
+            ann_k,
+        );
+        let lexical_future = async {
+            #[cfg(test)]
+            candidate_stage_test_start(CandidateStage::Lexical).await;
+            search_core(&ctx, &raw_query).await
+        };
+        let (ann_result, lexical_result) = join_candidate_stages(ann_future, lexical_future).await;
+        let AnnCandidateOutcome {
+            hits: ann_hits,
+            availability: ann_availability,
+            hydration_failures,
+        } = ann_result?;
         let SearchCoreOutcome {
             mut hits,
             lexical_timed_out,
-        } = search_core(&ctx, &raw_query).await?;
+        } = lexical_result?;
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -3178,31 +3317,44 @@ mod tests {
     fn knowledge_ann_query_paths_use_query_intent_embed() {
         let src = include_str!("search.rs");
         // Build needle at runtime to avoid self-match in include_str.
-        let generic_needle: String = [".embed(", "&raw_query)"].concat();
+        let generic_borrowed_needle: String = [".embed(", "&raw_query)"].concat();
+        let generic_direct_needle: String = [".embed(", "raw_query)"].concat();
         let generic_count = src
             .lines()
             // Skip lines that are part of this test body (contain "concat" or "needle").
             .filter(|l| !l.contains("concat") && !l.contains("needle"))
-            .filter(|l| l.contains(&generic_needle))
+            .filter(|l| l.contains(&generic_borrowed_needle) || l.contains(&generic_direct_needle))
             .count();
         assert_eq!(
             generic_count, 0,
-            "ANN query paths must not call generic {generic_needle}; \
+            "ANN query paths must not call generic embed with raw_query; \
              found {generic_count} occurrence(s) — use embed_query instead"
         );
-        // Confirm the query-intent call is present for both search and suggest.
-        let query_intent_needle: String = [".embed_query(", "&raw_query)"].concat();
+        // Search and suggest share one ANN helper after #1996, while section
+        // scoring retains its own query-intent call. Confirm both handler call
+        // sites route through that helper and both query-intent sites remain.
+        let ann_helper_needle: String = ["let ann_future = ", "search_ann_candidates("].concat();
+        let ann_helper_count = src
+            .lines()
+            .filter(|l| !l.contains("concat"))
+            .filter(|l| l.contains(&ann_helper_needle))
+            .count();
+        assert_eq!(
+            ann_helper_count, 2,
+            "expected search and suggest to route through the shared ANN helper; \
+             found {ann_helper_count} call(s)"
+        );
+
+        let query_intent_needle: String = [".embed_query", "("].concat();
         let query_intent_count = src
             .lines()
             .filter(|l| !l.contains("concat"))
             .filter(|l| l.contains(&query_intent_needle))
             .count();
-        // 3 sites: knowledge.search ANN path, knowledge.suggest ANN path,
-        // and the section-scoring query embed (search.rs:~1291).
         assert_eq!(
-            query_intent_count, 3,
-            "expected exactly 3 {query_intent_needle} calls \
-             (search ANN + suggest ANN + section query), found {query_intent_count}"
+            query_intent_count, 2,
+            "expected the shared ANN helper and section scoring to use \
+             {query_intent_needle}; found {query_intent_count} occurrence(s)"
         );
     }
 

@@ -24,7 +24,7 @@
 //! `retrieval_snapshots`.  Calling `warm_known_snapshots` on a *fresh* `SharedAnn`
 //! must load the snapshot so `search_loaded` returns `Some`.
 
-use crate::knowledge::{vamana, KnowledgeHandlers};
+use crate::knowledge::{search, vamana, KnowledgeHandlers};
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
@@ -268,6 +268,139 @@ impl Drop for TimeoutOverrideReset {
 /// before `TimeoutOverrideReset`, so on exit the reset (override -> 0) runs
 /// first and the lock releases only after, handing a clean state to the next.
 static TIMEOUT_OVERRIDE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// ── Issue #1996: concurrent candidate scheduling ─────────────────────────────
+
+/// Block the ANN leg at its deterministic test checkpoint and prove the
+/// lexical leg reaches its own checkpoint before ANN is released. The same
+/// assertion exercises both handlers, so a future accidental return to serial
+/// scheduling in either call path fails without corpus-size or wall-clock
+/// timing assumptions.
+#[tokio::test(start_paused = true)]
+async fn search_and_suggest_candidate_stages_overlap() {
+    for suggest in [false, true] {
+        let rt = rt_with_fake_embedder();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let ann = vamana::new_shared();
+        let control = search::CandidateStageTestControl::new(true, false);
+        let observer_control = control.clone();
+
+        let call = async {
+            if suggest {
+                KnowledgeHandlers::suggest(
+                    &rt,
+                    &token,
+                    json!({ "query": "alpha beta gamma delta epsilon", "limit": 1 }),
+                    &ann,
+                )
+                .await
+            } else {
+                KnowledgeHandlers::search(
+                    &rt,
+                    &token,
+                    json!({ "query": "alpha beta", "rerank": false, "limit": 1 }),
+                    &ann,
+                )
+                .await
+            }
+        };
+        let observer = async move {
+            observer_control.ann_started.notified().await;
+            let overlapped = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                observer_control.lexical_started.notified(),
+            )
+            .await
+            .is_ok();
+            observer_control.ann_release.notify_one();
+            overlapped
+        };
+
+        let (result, overlapped) = search::scope_candidate_stage_test_control(control, async {
+            tokio::join!(call, observer)
+        })
+        .await;
+
+        result.unwrap_or_else(|error| {
+            panic!(
+                "{} must complete after the ANN gate is released: {error}",
+                if suggest { "suggest" } else { "search" }
+            )
+        });
+        assert!(
+            overlapped,
+            "{} lexical candidates must start while ANN is blocked",
+            if suggest { "suggest" } else { "search" }
+        );
+    }
+}
+
+/// Coordinate the two real handler legs so ANN finishes first, then advance
+/// paused Tokio time exactly between lexical term queries. The completed ANN
+/// candidate must survive the lexical deadline and the response must carry the
+/// established partial-result advisory.
+#[tokio::test(start_paused = true)]
+async fn controlled_lexical_timeout_keeps_concurrent_ann_result() {
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [{
+                "slug": "controlled-concurrent-timeout-domain",
+                "name": "Controlled Concurrent Timeout Domain",
+                "description": "term0 term1 term2 term3 term4 term5 term6 term7 deterministic concurrent candidate deadline regression for lexical retrieval and vector search overlap while preserving partial results under one request budget",
+                "members": []
+            }]}),
+        )
+        .await
+        .expect("upsert domain");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let control = search::CandidateStageTestControl::new(false, true);
+    let coordinator_control = control.clone();
+    let deadline = std::time::Duration::from_millis(650);
+    let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+
+    let call = khive_storage::scope_request_read_deadline(
+        deadline,
+        search::scope_candidate_stage_test_control(
+            control,
+            search::scope_fts_test_deadline_advance(
+                1,
+                deadline,
+                KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+            ),
+        ),
+    );
+    let coordinator = async move {
+        tokio::join!(
+            coordinator_control.ann_finished.notified(),
+            coordinator_control.lexical_started.notified()
+        );
+        coordinator_control.lexical_release.notify_one();
+    };
+
+    let (result, ()) = tokio::join!(call, coordinator);
+    let result = result.expect("lexical timeout must degrade instead of failing suggest");
+    assert_eq!(
+        result["degraded"]["lexical_timeout"], true,
+        "controlled lexical expiry must be reported: {result}"
+    );
+    assert!(
+        result["total"].as_u64().unwrap_or_default() > 0,
+        "the ANN result completed before lexical expiry must survive: {result}"
+    );
+    assert_eq!(
+        result["results"][0]["name"], "Controlled Concurrent Timeout Domain",
+        "the vector-backed domain must remain available: {result}"
+    );
+}
 
 // ── P1: search preserves its timeout fallback policy
 
@@ -699,14 +832,14 @@ async fn suggest_flags_degraded_no_match_when_hits_empty() {
 // ── P4: issue #1930 — lexical-timeout degraded arm ────────────────────────────
 
 /// A lexical/FTS candidate fetch that hits the request read deadline must
-/// degrade `suggest` to ANN-backed results carrying `degraded.lexical_timeout`
-/// — never a verb-level error. ANN candidates are fetched before the lexical
-/// stage precisely so they survive a lexical timeout (see `search.rs`'s
-/// `search`/`suggest` handlers); a real (unwarmed, no snapshot) `SharedAnn`
-/// still serves via the fresh-tail vector-store scan, so this exercises the
-/// production code path, not a mock.
+/// degrade `suggest` with `degraded.lexical_timeout` — never a verb-level
+/// error. This wall-clock case deliberately spends the entire shared budget,
+/// so concurrent ANN may or may not finish first; the controlled regression
+/// above separately proves that a completed ANN result survives lexical
+/// expiry. A real (unwarmed, no snapshot) `SharedAnn` exercises the production
+/// fresh-tail path rather than a mock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
+async fn wall_clock_lexical_timeout_degrades_suggest_without_verb_error() {
     let rt = rt_with_fake_embedder();
     let registry = build_registry(&rt);
 
@@ -752,14 +885,6 @@ async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
     assert_eq!(
         result["degraded"]["lexical_timeout"], true,
         "suggest must flag degraded.lexical_timeout when the lexical fetch times out; got: {result}"
-    );
-    assert!(
-        result["total"].as_u64().unwrap_or(0) > 0,
-        "ANN candidates fetched before the lexical stage must still produce results; got: {result}"
-    );
-    assert_eq!(
-        result["results"][0]["name"], "Degrade Lexical Timeout Domain",
-        "the only vector-backed candidate must be the seeded domain; got: {result}"
     );
 }
 
