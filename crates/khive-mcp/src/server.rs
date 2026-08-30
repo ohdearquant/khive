@@ -434,8 +434,8 @@ impl DispatchFailure {
 /// Two servers produce the same id iff they can safely share one warm engine:
 /// same pack set (order-independent), same storage target and effective access
 /// mode, same embedders, same backend topology/routing, and same
-/// construction-baked fresh-tail, blob-hydration, outbound, and git-write
-/// policies.
+/// construction-baked fresh-tail, blob-hydration, outbound, caller-enrollment,
+/// and git-write policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
 /// compares this against each forwarded request's `config_id` and rejects
@@ -571,6 +571,11 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         .collect();
     outbound.sort();
     outbound.dedup();
+    let gate = config
+        .gate
+        .configuration_fingerprint()
+        .map(|fingerprint| format!(";gate={fingerprint}"))
+        .unwrap_or_default();
     let mut git_write_hasher = Sha256::new();
     git_write_hasher.update(b"khive.git-write-policy.v1");
     git_write_hasher.update((config.git_write.allowed.len() as u64).to_be_bytes());
@@ -619,7 +624,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // a one-time operational cost that ends when the daemon is restarted, by
     // whoever restarts it.
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}];git_write={};display_tz={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};display_tz={}",
         packs.join(","),
         db,
         primary,
@@ -628,6 +633,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         config.blob_hydration_bytes,
         backend,
         outbound.join(","),
+        gate,
         git_write,
         config.display_timezone.name(),
     );
@@ -1193,10 +1199,8 @@ impl KhiveMcpServer {
         // registry exposes an advisory beside each successful result instead.
         if runtime.is_read_only() {
             builder.with_read_only_audit_store();
-        } else if let Ok(tok) = runtime.authorize(khive_runtime::Namespace::local()) {
-            if let Ok(event_store) = runtime.events(&tok) {
-                builder.with_event_store(event_store);
-            }
+        } else if let Err(error) = builder.with_runtime_event_store(&runtime) {
+            tracing::warn!(%error, "registry audit event store is unavailable");
         }
         if let Err(load_err) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
             let failure = match load_err {
@@ -4234,6 +4238,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn config_id_differs_when_caller_enrollment_policy_differs() {
+        let base = RuntimeConfig::no_embeddings();
+        let enrolled = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(
+                vec!["lambda:enrolled".to_string()],
+                false,
+            )),
+            ..base.clone()
+        };
+        let revoked = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(Vec::new(), false)),
+            ..base
+        };
+
+        assert_ne!(
+            compute_config_id_with_runtime_policies(&enrolled, None, true, false),
+            compute_config_id_with_runtime_policies(&revoked, None, true, false),
+            "different caller-enrollment policies must not share one warm daemon"
+        );
+    }
+
     /// `gtd.assign` anchors a date-only `due` through `display_timezone` and
     /// PERSISTS the resulting instant, so a warm daemon reused across two
     /// runtimes differing only in that field writes an instant wrong by the
@@ -6705,11 +6731,11 @@ mod tests {
         server
             .request(
                 Parameters(RequestParams {
-                    // Explicit `namespace="local"` so the write lands in the
+                    // Explicit `namespace="test"` so the write lands in the
                     // same namespace the server's audit `EventStore` handle is
-                    // scoped to at construction (`Namespace::local()`), matching
+                    // scoped to at construction, matching
                     // `find_audit_event_with_request_id`'s read scope.
-                    ops: "stats(namespace=\"local\")".to_string(),
+                    ops: "stats(namespace=\"test\")".to_string(),
                     request_id: Some(9001),
                     ..Default::default()
                 }),
@@ -6746,7 +6772,7 @@ mod tests {
         server
             .request(
                 Parameters(RequestParams {
-                    ops: "stats(namespace=\"local\")".to_string(),
+                    ops: "stats(namespace=\"test\")".to_string(),
                     save_to: Some(sink_path.to_string_lossy().to_string()),
                     request_id: Some(9002),
                     ..Default::default()

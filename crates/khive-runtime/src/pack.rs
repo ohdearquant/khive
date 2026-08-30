@@ -688,6 +688,22 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// Configure the registry's trusted audit sink from a runtime.
+    ///
+    /// Registry audit constructors stamp namespace and actor directly from
+    /// each resolved [`GateRequest`], including per-request daemon identity
+    /// overrides. This deliberately uses the runtime's undecorated sink: the
+    /// public token-scoped [`KhiveRuntime::events`] decorator would otherwise
+    /// replace every per-request stamp with the single actor that happened to
+    /// construct the registry.
+    pub fn with_runtime_event_store(
+        &mut self,
+        runtime: &KhiveRuntime,
+    ) -> Result<&mut Self, RuntimeError> {
+        let store = runtime.raw_events_for_namespace(self.default_namespace.as_str())?;
+        Ok(self.with_event_store(store))
+    }
+
     /// Override the ADR-133 audit-batch seam's tunables, applied when
     /// `build()` lazily constructs the batch from `event_store`.
     /// `None` (the default) uses `AuditBatchConfig::default()`. Exposed for
