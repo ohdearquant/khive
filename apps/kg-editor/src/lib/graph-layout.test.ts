@@ -64,4 +64,30 @@ describe("settleGraphLayout", () => {
       expect(center + nodeHalfWidth).toBeLessThanOrEqual(stageWidth);
     }
   });
+
+  it("bounds pair-distance work for a schema-maximum graph", () => {
+    const originalSqrt = Math.sqrt;
+    const originalHypot = Math.hypot;
+    let distanceEvaluations = 0;
+    Math.sqrt = (value) => {
+      distanceEvaluations += 1;
+      return originalSqrt(value);
+    };
+    Math.hypot = (...values) => {
+      distanceEvaluations += 1;
+      return originalHypot(...values);
+    };
+
+    try {
+      settleGraphLayout(
+        Array.from({ length: 200 }, (_, index) => ({ id: `node-${index}` })),
+        [],
+      );
+    } finally {
+      Math.sqrt = originalSqrt;
+      Math.hypot = originalHypot;
+    }
+
+    expect(distanceEvaluations).toBeLessThanOrEqual(400_000);
+  }, 15_000);
 });

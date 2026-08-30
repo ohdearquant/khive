@@ -23,11 +23,28 @@ const HORIZONTAL_PADDING = 23;
 const VERTICAL_PADDING = 10;
 const CENTER = 50;
 const ITERATIONS = 160;
+// Keep the established layout path for review and showcase-sized graphs, but
+// cap synchronous all-pairs work once graphs are large enough for the fixed
+// iteration counts to dominate the main thread. At the supported 200-node
+// maximum these budgets allow 12 force passes and 5 separation passes.
+const FULL_QUALITY_NODE_LIMIT = 64;
+const FORCE_PAIR_EVALUATION_BUDGET = 250_000;
+const SEPARATION_PAIR_EVALUATION_BUDGET = 100_000;
 // Minimum center-to-center separation (in the 0-100 layout space) below
 // which two settled nodes are considered overlapping and get pushed apart by
 // the deterministic cleanup pass that runs after the force settle.
 const MIN_SEPARATION = 7;
 const SEPARATION_ITERATIONS = 200;
+
+function boundedPairIterations(
+  nodeCount: number,
+  maximum: number,
+  pairEvaluationBudget: number,
+): number {
+  if (nodeCount <= FULL_QUALITY_NODE_LIMIT) return maximum;
+  const pairCount = nodeCount * (nodeCount - 1) / 2;
+  return Math.min(maximum, Math.max(1, Math.floor(pairEvaluationBudget / pairCount)));
+}
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -97,8 +114,18 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
       ? []
       : [{ source, target }];
   });
+  const forceIterations = boundedPairIterations(
+    points.length,
+    ITERATIONS,
+    FORCE_PAIR_EVALUATION_BUDGET,
+  );
+  const separationIterations = boundedPairIterations(
+    points.length,
+    SEPARATION_ITERATIONS,
+    SEPARATION_PAIR_EVALUATION_BUDGET,
+  );
 
-  for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
+  for (let iteration = 0; iteration < forceIterations; iteration += 1) {
     const forceX = Array.from({ length: points.length }, () => 0);
     const forceY = Array.from({ length: points.length }, () => 0);
 
@@ -131,7 +158,7 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
       forceY[edge.target] -= y;
     }
 
-    const temperature = 0.9 - iteration / ITERATIONS * 0.72;
+    const temperature = 0.9 - iteration / forceIterations * 0.72;
     for (let index = 0; index < points.length; index += 1) {
       forceX[index] += (CENTER - points[index].x) * 0.006;
       forceY[index] += (CENTER - points[index].y) * 0.006;
@@ -163,7 +190,7 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
   // pair closer than MIN_SEPARATION apart along their connecting vector (or
   // a stable per-pair fallback direction when they coincide exactly), then
   // re-clamp to the stage bounds.
-  for (let pass = 0; pass < SEPARATION_ITERATIONS; pass += 1) {
+  for (let pass = 0; pass < separationIterations; pass += 1) {
     let movedAny = false;
     for (let left = 0; left < points.length; left += 1) {
       for (let right = left + 1; right < points.length; right += 1) {
