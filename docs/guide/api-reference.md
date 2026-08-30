@@ -462,6 +462,22 @@ presentation and response-frame compaction. If no hit survives filtering, the
 operation is `ok: false` with `error.kind="search_incomplete"`; the structured
 error carries the same diagnostics. `backend_errors_truncated` plus
 `backend_errors_omitted` explicitly report causes omitted by safety bounds.
+When every failed leg is structurally classified as `timeout`, the error has
+`retryable: true` and a positive `retry_after_ms`; any non-timeout leg keeps
+`retryable: false` and omits `retry_after_ms`. Classification and pacing use the
+full pre-truncation failure set. The server pace is 2,000ms plus 250ms for each
+failed backend after the first, capped at 10,000ms.
+
+Clients that act on `retryable: true` are expected to use at most three total
+attempts per logical request. Before retry _n_ (starting at 1), wait
+`max(retry_after_ms, 2000) * 2^(n - 1)` milliseconds plus nonnegative random
+jitter no greater than half that base; never retry sooner than the server's
+value. A breaker keyed by the failed backend set opens after three consecutive
+all-timeout outcomes, suppresses both first attempts and retries for 30 seconds,
+then admits one half-open probe. Success closes the breaker; another
+all-timeout outcome reopens it for 30 seconds. A client that does not implement
+the complete attempt budget, backoff, and breaker policy must not retry this
+error automatically.
 
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 
