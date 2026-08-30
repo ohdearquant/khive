@@ -82,7 +82,8 @@ stronger checkpoints.
 Every completed writer-task request records a backend-scoped in-memory sample
 with four independent stages: `queue_wait_micros` starts before bounded-channel
 admission and ends when the drain loop dequeues the request;
-`transaction_acquire_micros` measures only `BEGIN IMMEDIATE`; `body_micros`
+`transaction_acquire_micros` measures the bounded `BEGIN IMMEDIATE` attempt
+sequence, including its retry backoffs; `body_micros`
 measures the typed operation closure; and `commit_micros` measures only
 SQLite's `COMMIT`. `total_micros`, queue depth at entry, and observation time
 remain siblings. A top-level request has zero acquisition/commit stages; a
@@ -101,22 +102,26 @@ successful response cannot race ahead of its telemetry sample.
 
 See `crates/khive-db/src/writer_task.rs` — private fn `run_writer_task`.
 
-A `BEGIN IMMEDIATE` failure (for example, `SQLITE_BUSY` from an explicitly
+A busy/locked `BEGIN IMMEDIATE` refusal (for example, from an explicitly
 exempt writer or a non-strict compatibility fallback still holding another
-writer connection) replies the request's error via
-`AnyWriteRequest::reply_error` without ever invoking the
+writer connection) is retried only at this pre-execution seam. The writer
+makes at most three total BEGIN attempts, sleeping 5 ms and then 10 ms between
+them. Each SQLite attempt remains bounded by the configured `busy_timeout`, so
+persistent contention can add at most two more busy-timeout windows plus 15 ms;
+the request's operation closure remains owned and uninvoked throughout.
+Non-busy BEGIN failures are never retried. After the bounded attempts, a final
+failure replies via `AnyWriteRequest::reply_error` without ever invoking the
 request's operation closure via `AnyWriteRequest::execute_and_reply`.
 For transaction-wrapped requests, the scoped `writer_task_tx` registry span
 is dropped before the oneshot reply wakes the caller, both after a completed
 transaction and after a failed `BEGIN`. A caller that has observed its reply
 therefore cannot still observe that request as an open SQL transaction.
-When the raw SQLite code is `SQLITE_BUSY` or `SQLITE_LOCKED`, the caller
+When the final raw SQLite code is `SQLITE_BUSY` or `SQLITE_LOCKED`, the caller
 receives `StorageError::WriterTaskBusy` with the connection's configured busy
-timeout. This is retryable because the operation closure never ran; it does
-not mean queue admission failed. Any other `BEGIN` error retains the generic
-pool failure. The connection tries `BEGIN IMMEDIATE` fresh on the next request,
-so transient contention does not retire the writer task. Automatic internal
-retry remains outside this seam.
+timeout. Its runtime/MCP classification remains `writer_task_begin_busy`,
+`retryable: true`, and `operation: "writer_task_begin"`, with no queue-admission
+scope or retry hint. Any other `BEGIN` error retains the generic pool failure.
+Transient contention does not retire the writer task.
 
 Request-path stores refresh a missing construction-time handle at write time.
 Strict routing therefore fails closed before any store fallback, and a
@@ -172,6 +177,14 @@ queue, not by its own execution.
 `db_diagnostics.writer_contention` as plain `u64` fields — unlike the
 runtime-supplied `audit_*` fields, they come straight from the pool and are
 never `Option`.
+
+BEGIN contention has two additional disjoint counters at the same surface:
+`writer_task_begin_busy_absorbed` increments for each busy/locked refusal that
+is followed by another bounded BEGIN attempt, while the backward-compatible
+`writer_task_begin_busy` field increments only for the final refusal surfaced
+to the caller. A successful retry can therefore move the absorbed counter
+without fabricating a caller failure; an exhausted three-attempt request moves
+the absorbed counter twice and the surfaced counter once.
 
 ### Bounded enqueue admission (#1382)
 

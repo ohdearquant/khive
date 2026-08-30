@@ -58,6 +58,13 @@ use khive_storage::error::{StorageError, WriterTaskRequestState};
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, WriterAcquisitionCounters};
 
+/// Retry delays after a busy/locked `BEGIN IMMEDIATE` refusal. The operation
+/// closure remains owned by the request until one BEGIN succeeds, so these
+/// are the only retries this path may perform. Persistent contention is
+/// bounded to three total BEGIN attempts and 15 ms of explicit backoff.
+const WRITER_BEGIN_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(5), Duration::from_millis(10)];
+
 /// Closure signature for a write operation executed against the writer
 /// task's dedicated connection.
 ///
@@ -887,9 +894,9 @@ async fn close_and_fail_queued_requests(rx: &mut mpsc::Receiver<Box<dyn AnyWrite
 }
 
 /// Drain loop: the sole caller of `BEGIN IMMEDIATE` for write traffic routed
-/// through the channel. A `BEGIN IMMEDIATE` failure replies the request's
-/// error via [`AnyWriteRequest::reply_error`] without invoking the
-/// request's closure; no retry — the connection tries fresh next request.
+/// through the channel. Busy/locked `BEGIN IMMEDIATE` refusals receive the
+/// bounded retry above before a final failure replies the request's error via
+/// [`AnyWriteRequest::reply_error`] without invoking the request's closure.
 ///
 /// A request-operation panic is contained inside the concrete
 /// [`WriteRequest<R>`] so its typed reply survives. A panic, failed rollback,
@@ -948,7 +955,32 @@ async fn run_writer_task(
                     origin,
                 );
                 let transaction_acquire_started = Instant::now();
-                let begin_outcome = conn.execute_batch("BEGIN IMMEDIATE");
+                let mut begin_attempt = 1_u32;
+                let mut retry_delays = WRITER_BEGIN_RETRY_DELAYS.into_iter();
+                let begin_outcome = loop {
+                    match conn.execute_batch("BEGIN IMMEDIATE") {
+                        Ok(()) => break Ok(()),
+                        Err(error) if crate::timeout_sink::is_busy_or_locked(&error) => {
+                            let Some(delay) = retry_delays.next() else {
+                                break Err(error);
+                            };
+                            // This refusal remains pre-execution: the request
+                            // still owns its FnOnce closure and no DML has run.
+                            // Count it before sleeping so diagnostics expose
+                            // contention even while the retry is pending.
+                            acquisition_counters.record_writer_task_begin_busy_absorbed();
+                            tracing::debug!(
+                                attempt = begin_attempt,
+                                backoff_ms = delay.as_millis() as u64,
+                                "writer task: BEGIN IMMEDIATE refused busy; retrying before \
+                                 request execution"
+                            );
+                            std::thread::sleep(delay);
+                            begin_attempt = begin_attempt.saturating_add(1);
+                        }
+                        Err(error) => break Err(error),
+                    }
+                };
                 let transaction_acquire = transaction_acquire_started.elapsed();
                 match begin_outcome {
                     Ok(()) => {
@@ -969,6 +1001,7 @@ async fn run_writer_task(
                         // failed.
                         tracing::warn!(
                             error = %e,
+                            attempts = begin_attempt,
                             "writer task: BEGIN IMMEDIATE failed; replying an \
                              error without running the request's operation"
                         );
@@ -977,8 +1010,10 @@ async fn run_writer_task(
                         // it before waking the caller for the same reply-side
                         // lifecycle guarantee as successful requests (#1790).
                         drop(tx_span);
-                        // Count the refusal the caller is about to be told
-                        // about. Classify by matching the value the shared
+                        // Count only the final refusal the caller is about to
+                        // be told about here. Earlier busy refusals were
+                        // counted as absorbed immediately before their retry.
+                        // Classify by matching the value the shared
                         // classifier returned, never by re-testing `e`: a
                         // second copy of the busy rule here could drift from
                         // the error actually replied, and the counter would
@@ -1072,7 +1107,7 @@ mod tests {
     }
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Wake, Waker};
@@ -1084,6 +1119,23 @@ mod tests {
             ..PoolConfig::default()
         };
         ConnectionPool::new(cfg).expect("pool open")
+    }
+
+    async fn wait_for_absorbed_begin_refusals(pool: &ConnectionPool, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if pool
+                    .writer_acquisition_snapshot()
+                    .writer_task_begin_busy_absorbed
+                    >= expected
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer task must record the absorbed BEGIN refusal");
     }
 
     fn deny_commit_and_rollback(ctx: AuthContext<'_>) -> Authorization {
@@ -1387,9 +1439,92 @@ mod tests {
 
     // `#[serial(tx_registry)]`: same rationale as
     // `begin_immediate_failure_replies_error_without_running_op`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(tx_registry)]
+    async fn contended_begin_retry_absorbs_refusal_and_runs_op_exactly_once() {
+        // Hold a real SQLite write lock until the writer task records its
+        // first refused BEGIN. Releasing only at that observable boundary
+        // makes success on the retry deterministic without a timing guess.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_begin_retry_absorbed.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            // The test releases at a counter transition, not a guessed
+            // timestamp. A generous second-attempt wait keeps that handoff
+            // deterministic even on a heavily scheduled CI host.
+            busy_timeout: Duration::from_millis(250),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+        let lock_holder = pool.try_writer().unwrap();
+        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let op_runs = Arc::new(AtomicUsize::new(0));
+        let op_runs_in_request = Arc::clone(&op_runs);
+        let send = tokio::spawn(async move {
+            handle
+                .send(move |conn| {
+                    op_runs_in_request.fetch_add(1, Ordering::SeqCst);
+                    conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                        .map_err(|error| StorageError::Pool {
+                            operation: "test_insert_after_begin_retry".into(),
+                            message: error.to_string(),
+                        })
+                })
+                .await
+        });
+
+        wait_for_absorbed_begin_refusals(&pool, 1).await;
+        let pending = pool.writer_acquisition_snapshot();
+        assert_eq!(pending.writer_task_begin_busy_absorbed, 1);
+        assert_eq!(
+            pending.writer_task_begin_busy, 0,
+            "a refusal still inside the retry loop must not look surfaced"
+        );
+        assert_eq!(
+            op_runs.load(Ordering::SeqCst),
+            0,
+            "the request closure must remain untouched before a BEGIN succeeds"
+        );
+
+        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+        drop(lock_holder);
+        assert_eq!(
+            send.await
+                .expect("writer send task joins")
+                .expect("retry acquires the released write lock"),
+            1
+        );
+        assert_eq!(
+            op_runs.load(Ordering::SeqCst),
+            1,
+            "the FnOnce request closure must execute exactly once after retry success"
+        );
+
+        let settled = pool.writer_acquisition_snapshot();
+        assert_eq!(settled.writer_task_begin_busy_absorbed, 1);
+        assert_eq!(settled.writer_task_begin_busy, 0);
+        let reader = pool.reader().unwrap();
+        let rows: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "exactly one closure execution commits one row");
+    }
+
+    // `#[serial(tx_registry)]`: same rationale as
+    // `begin_immediate_failure_replies_error_without_running_op`.
     #[tokio::test]
     #[serial(tx_registry)]
-    async fn contended_begin_increments_its_own_failure_counter() {
+    async fn contended_begin_exhaustion_separates_absorbed_and_surfaced_refusals() {
         // Real contention, same construction as the test above: a refused
         // write must be COUNTED, not merely reported to its caller. Before
         // this counter, `db_diagnostics` showed a clean writer while requests
@@ -1418,6 +1553,7 @@ mod tests {
             before.writer_task_begin_busy, 0,
             "baseline: nothing has been refused yet"
         );
+        assert_eq!(before.writer_task_begin_busy_absorbed, 0);
 
         let lock_holder = pool.try_writer().unwrap();
         lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -1439,7 +1575,12 @@ mod tests {
         let after = pool.writer_acquisition_snapshot();
         assert_eq!(
             after.writer_task_begin_busy, 1,
-            "the refusal the caller was told about must appear in the counters"
+            "only the final refusal the caller was told about is surfaced"
+        );
+        assert_eq!(
+            after.writer_task_begin_busy_absorbed,
+            WRITER_BEGIN_RETRY_DELAYS.len() as u64,
+            "each refusal followed by another bounded attempt must remain observable as absorbed"
         );
         assert_eq!(
             after.writer_task_begin_errors, 0,
@@ -1471,6 +1612,11 @@ mod tests {
         assert_eq!(
             settled.writer_task_begin_busy, 1,
             "a successful request must leave the refusal counter untouched"
+        );
+        assert_eq!(
+            settled.writer_task_begin_busy_absorbed,
+            WRITER_BEGIN_RETRY_DELAYS.len() as u64,
+            "an uncontended request must not move the absorbed counter"
         );
         assert!(
             settled.writer_task_acquisitions > after.writer_task_acquisitions,

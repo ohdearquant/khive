@@ -824,3 +824,29 @@ mean the queue never accepted the request. Non-busy/non-locked BEGIN failures
 remain generic pool errors. `comm.send` preserves this typed retryable result
 without adding an outbound delivery probe: `comm.delivered` remains reserved
 for `SideEffectsUnknown`, where a write may already have committed.
+
+## Amendment 5 (2026-08-29): Bounded pre-execution BEGIN retry
+
+The writer task absorbs a small, bounded number of the retry-safe refusals
+classified by Amendment 4. A transaction-wrapped request makes at most three
+total `BEGIN IMMEDIATE` attempts, with fixed 5 ms and 10 ms backoffs after the
+first two busy/locked refusals. Each attempt retains the connection's
+configured SQLite `busy_timeout`; persistent contention is therefore bounded
+to three busy-timeout windows plus 15 ms of explicit backoff. A non-busy BEGIN
+error is never retried.
+
+The retry loop is immediately around `BEGIN IMMEDIATE`, before the task
+transfers the request's `FnOnce` operation closure to execution. Success runs
+that closure exactly once. Exhaustion runs it zero times and preserves the
+Amendment 4 `StorageError::WriterTaskBusy` result and runtime/MCP fields:
+`writer_task_begin_busy`, `retryable: true`,
+`operation: "writer_task_begin"`, no admission scope, and no admission retry
+hint. Request-body failures, COMMIT, ROLLBACK, top-level operations, and every
+ambiguous or terminal path remain single-pass and are never replayed.
+
+Observability distinguishes every refusal without changing the existing
+counter's meaning. `writer_task_begin_busy_absorbed` increments once for each
+busy/locked refusal followed by another internal BEGIN attempt;
+`writer_task_begin_busy` continues to count only the final refusal surfaced to
+the caller. These counters are disjoint and are published as concrete `u64`
+values under `db_diagnostics.writer_contention`.

@@ -447,10 +447,11 @@ pub fn wal_pin_attribution(_db_path: &Path, _sweep_interval: Duration) -> WalPin
 /// finite-wait pool-mutex stage; standalone SQLite failures and writer-task
 /// `BEGIN` failures have different ADR-135 F6 stages and are not mislabeled as
 /// pool checkout timeouts. Those stages now carry their OWN failure counters
-/// (`writer_task_begin_busy`, `writer_task_begin_errors`) rather than being
-/// absent: refusing to mislabel a failure is not a reason to omit it, and an
-/// omitted failure counter fails toward looking healthy, which is the reading
-/// an operator believes. `audit_append_failures` is supplied by the runtime
+/// (`writer_task_begin_busy`, `writer_task_begin_busy_absorbed`,
+/// `writer_task_begin_errors`) rather than being absent: refusing to mislabel
+/// a failure is not a reason to omit it, and an omitted failure counter fails
+/// toward looking healthy, which is the reading an operator believes.
+/// `audit_append_failures` is supplied by the runtime
 /// because the audit store lives above `khive-db`; direct `khive-db` callers
 /// receive `None` plus an explicit reason instead of a fabricated zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -466,11 +467,16 @@ pub struct WriterContentionDiagnostics {
     pub writer_task_acquisitions: u64,
     /// Main-pool writer checkouts that exhausted their finite deadline.
     pub writer_acquisition_timeouts: u64,
-    /// Writer-task `BEGIN IMMEDIATE` attempts refused busy or locked. These
-    /// are the refusals a caller sees as the retryable `writer_task_begin_busy`
-    /// stage, so a nonzero value here has a matching failed request on the
-    /// caller's side rather than being visible only from inside the process.
+    /// Writer-task `BEGIN IMMEDIATE` attempts whose final busy or locked
+    /// refusal surfaced to a caller as the retryable `writer_task_begin_busy`
+    /// stage. A nonzero value here therefore has a matching failed request on
+    /// the caller's side.
     pub writer_task_begin_busy: u64,
+    /// Busy or locked `BEGIN IMMEDIATE` refusals absorbed by the bounded
+    /// retry before the request closure ran. This is disjoint from
+    /// `writer_task_begin_busy`: every refusal is counted in exactly one field
+    /// according to whether another BEGIN attempt followed it.
+    pub writer_task_begin_busy_absorbed: u64,
     /// Writer-task `BEGIN IMMEDIATE` attempts that failed for a reason other
     /// than busy or locked.
     pub writer_task_begin_errors: u64,
@@ -590,6 +596,7 @@ impl WriterContentionDiagnostics {
             writer_task_acquisitions: writer.writer_task_acquisitions,
             writer_acquisition_timeouts: writer.timeouts,
             writer_task_begin_busy: writer.writer_task_begin_busy,
+            writer_task_begin_busy_absorbed: writer.writer_task_begin_busy_absorbed,
             writer_task_begin_errors: writer.writer_task_begin_errors,
             writer_task_request_failures: writer.writer_task_request_failures,
             writer_task_side_effects_unknown: writer.writer_task_side_effects_unknown,

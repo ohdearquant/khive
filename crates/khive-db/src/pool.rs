@@ -641,10 +641,14 @@ pub struct WriterAcquisitionSnapshot {
     pub writer_task_acquisitions: u64,
     /// Finite-wait pool writer checkouts that exhausted their deadline.
     pub timeouts: u64,
-    /// Writer-task `BEGIN IMMEDIATE` attempts refused busy or locked. Counted
-    /// separately from `timeouts` because that counter names the pool-mutex
-    /// checkout stage; folding the two would mislabel the stage.
+    /// Writer-task `BEGIN IMMEDIATE` attempts whose final busy or locked
+    /// refusal was surfaced to the caller. Counted separately from `timeouts`
+    /// because that counter names the pool-mutex checkout stage; folding the
+    /// two would mislabel the stage.
     pub writer_task_begin_busy: u64,
+    /// Writer-task `BEGIN IMMEDIATE` busy or locked refusals absorbed by the
+    /// bounded seam-local retry before the request closure ran.
+    pub writer_task_begin_busy_absorbed: u64,
     /// Writer-task `BEGIN IMMEDIATE` attempts that failed for a reason other
     /// than busy or locked, and so surface as `StorageError::Pool`.
     pub writer_task_begin_errors: u64,
@@ -669,6 +673,7 @@ pub(crate) struct WriterAcquisitionCounters {
     writer_task_acquisitions: AtomicU64,
     pooled_timeouts: AtomicU64,
     writer_task_begin_busy: AtomicU64,
+    writer_task_begin_busy_absorbed: AtomicU64,
     writer_task_begin_errors: AtomicU64,
     writer_task_request_failures: AtomicU64,
     writer_task_side_effects_unknown: AtomicU64,
@@ -688,6 +693,14 @@ impl WriterAcquisitionCounters {
     /// error the caller is actually told about.
     pub(crate) fn record_writer_task_begin_busy(&self) {
         self.writer_task_begin_busy.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one busy or locked `BEGIN IMMEDIATE` refusal hidden from the
+    /// caller by a subsequent bounded retry. This counter moves before the
+    /// next BEGIN attempt; it never implies that the request closure ran.
+    pub(crate) fn record_writer_task_begin_busy_absorbed(&self) {
+        self.writer_task_begin_busy_absorbed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records one writer-task `BEGIN IMMEDIATE` that failed for any other
@@ -728,6 +741,9 @@ impl WriterAcquisitionCounters {
             writer_task_acquisitions,
             timeouts: self.pooled_timeouts.load(Ordering::Relaxed),
             writer_task_begin_busy: self.writer_task_begin_busy.load(Ordering::Relaxed),
+            writer_task_begin_busy_absorbed: self
+                .writer_task_begin_busy_absorbed
+                .load(Ordering::Relaxed),
             writer_task_begin_errors: self.writer_task_begin_errors.load(Ordering::Relaxed),
             writer_task_request_failures: self.writer_task_request_failures.load(Ordering::Relaxed),
             writer_task_side_effects_unknown: self
@@ -3424,6 +3440,7 @@ mod tests {
                 writer_task_acquisitions: 0,
                 timeouts: 0,
                 writer_task_begin_busy: 0,
+                writer_task_begin_busy_absorbed: 0,
                 writer_task_begin_errors: 0,
                 writer_task_request_failures: 0,
                 writer_task_side_effects_unknown: 0,
@@ -3497,6 +3514,7 @@ mod tests {
                 // writer-task BEGIN counters: separate stages, separate
                 // counters. This is the mislabeling guard in assertion form.
                 writer_task_begin_busy: 0,
+                writer_task_begin_busy_absorbed: 0,
                 writer_task_begin_errors: 0,
                 writer_task_request_failures: 0,
                 writer_task_side_effects_unknown: 0,
@@ -3514,6 +3532,7 @@ mod tests {
                 writer_task_acquisitions: 0,
                 timeouts: 1,
                 writer_task_begin_busy: 0,
+                writer_task_begin_busy_absorbed: 0,
                 writer_task_begin_errors: 0,
                 writer_task_request_failures: 0,
                 writer_task_side_effects_unknown: 0,
