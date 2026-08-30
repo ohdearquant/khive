@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `KHIVE_EMAIL_DEFAULT_ACTOR` now falls back to `local` when unset or blank,
+  matching `KHIVE_EMAIL_INGEST_NAMESPACE` and the adjacent startup resolver,
+  instead of a hard-coded identity with no meaning outside the deployment it
+  was named for. Behaviour with the variable explicitly set is unchanged.
+
 ## [0.8.0] - 2026-08-27
 
 ### Added

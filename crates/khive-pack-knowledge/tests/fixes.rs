@@ -1528,6 +1528,112 @@ async fn upsert_explicit_source_fields_replace_existing_values() {
     );
 }
 
+// #1999: nullable atom fields distinguish omission from explicit null.
+
+#[tokio::test]
+async fn upsert_explicit_nulls_clear_sources_and_reset_finalized_without_demoting_status() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "clear-nullable-atom",
+            "name": "Clear Nullable Atom",
+            "content": "body dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+            "source_uri": "https://example.com/original",
+            "source_type": "manual",
+            "finalized": true
+        }] }),
+    )
+    .await
+    .expect("insert attributed finalized atom");
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "clear-nullable-atom",
+            "name": "Clear Nullable Atom V2",
+            "content": "body updated dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+            "source_uri": null,
+            "source_type": null,
+            "finalized": null
+        }] }),
+    )
+    .await
+    .expect("clear nullable fields");
+
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "clear-nullable-atom" }))
+        .await
+        .expect("read cleared atom");
+    assert!(
+        atom["source_uri"].is_null(),
+        "explicit source_uri=null must clear the stored URI: {atom}"
+    );
+    assert!(
+        atom["source_type"].is_null(),
+        "explicit source_type=null must clear the stored type: {atom}"
+    );
+    assert_eq!(
+        atom["finalized"],
+        json!(false),
+        "finalized=null resets the non-null flag to false"
+    );
+    assert_eq!(
+        atom["status"],
+        json!("reviewed"),
+        "clearing finalization must not demote an independent lifecycle status"
+    );
+
+    // A later patch that omits the nullable fields must preserve the explicit clears.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "clear-nullable-atom",
+            "name": "Clear Nullable Atom V3",
+            "content": "body updated again dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+        }] }),
+    )
+    .await
+    .expect("re-upsert with nullable fields omitted");
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "clear-nullable-atom" }))
+        .await
+        .expect("read atom after omitted patch");
+    assert!(atom["source_uri"].is_null());
+    assert!(atom["source_type"].is_null());
+    assert_eq!(atom["finalized"], json!(false));
+    assert_eq!(atom["status"], json!("reviewed"));
+}
+
+#[tokio::test]
+async fn upsert_explicit_nulls_on_insert_use_storage_defaults() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "null-default-atom",
+            "name": "Null Default Atom",
+            "content": "body dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+            "source_uri": null,
+            "source_type": null,
+            "finalized": null
+        }] }),
+    )
+    .await
+    .expect("insert atom with explicit nulls");
+
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "null-default-atom" }))
+        .await
+        .expect("read inserted atom");
+    assert!(atom["source_uri"].is_null());
+    assert!(atom["source_type"].is_null());
+    assert_eq!(atom["finalized"], json!(false));
+    assert_eq!(atom["status"], json!("draft"));
+}
+
 // ── FTS5 MATCH escaping regression ───────────────────────────────────────────
 
 #[tokio::test]
