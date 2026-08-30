@@ -2856,6 +2856,13 @@ or `"writer_task_begin_busy"`)
 never rolls back a sibling that already committed. Inspect each result
 entry's own `ok` field rather than assuming batch-level atomicity.
 
+`comm.read` and `comm.mark_read` mutate delivery state. In a parallel batch,
+either acknowledgement does not wait for or depend on comm.send/comm.reply, so
+a read mark can commit even when the sibling send fails. When the mark must
+depend on a send, use a chain so a failed send aborts the mark. For the common
+reply-and-read flow, prefer `comm.reply`: comm.reply delivers first, then attempts
+the original message's best-effort read mark.
+
 `search` carries its own per-op `status` ("complete" | "partial") inside that
 op's `result` entry, separate from the top-level batch `status` above. A
 degraded-but-answered search stays ok:true with status="partial" plus a
