@@ -222,8 +222,10 @@ assigned backend is a read-only snapshot.
 | claude.ai export | `claude_ai_export` | `<exports dir>/**/conversations.json` (JSON array) | whole-file     |
 
 **Line-tail** (append-only JSONL): each pass reads from the file's stored byte offset,
-parses complete lines, and advances the cursor to the last complete line boundary. A file
-whose length has not grown past the cursor is skipped without being opened.
+parses complete lines, and advances the cursor to the last complete line boundary — with
+one exception added by §7, where a line already known to exceed the cap checkpoints a
+bounded discarded prefix mid-line. A file whose length has not grown past the cursor is
+skipped without being opened.
 
 A single line is never buffered past a hard per-line byte cap (`MirrorLimits::max_line_bytes`,
 PACKSESSION-AUD-003): a complete line (terminated by `\n`) over the cap is skipped —
@@ -236,6 +238,12 @@ never come. The cursor is left at that line's start — the same as an ordinary 
 line — so the next pass, or the next daemon start, repeats the same bounded read rather than an
 unbounded tail scan; once the line eventually terminates (or growth stops and the file reaches
 true EOF mid-line), it resolves through the ordinary skip-and-advance path above.
+
+**Amended: see §7.** The cursor no longer stays at the line's start. This case also
+covers a _complete_ line whose terminator lies several reader windows past the cap, and
+for that member the rule above never advances the offset — the wedge the complete-line
+case above exists to prevent. §7 replaces it with a checkpointed bounded skip; the read
+bound, the warning, and the never-parse rule are unchanged.
 
 **Whole-file** (export archives): the file is parsed as a single JSON document. On success
 the cursor is set to the file's byte length, so an unchanged export is skipped by the same
@@ -255,6 +263,13 @@ upsert at the end of dispatch, so an interrupted or partially failing dispatch c
 strand the cursor past bytes that no candidate inserted — the bytes are re-read on a
 later pass, bounded and idempotent. A no-progress success, such as one provider's lower
 whole-file size ceiling, likewise falls through without committing.
+
+**Amended: see §7.** An advance over a line already known to exceed
+`MirrorLimits::max_line_bytes` is a **claiming** advance, not an empty one, and commits
+even when a sibling candidate errors. That exception is narrow and it is the only one:
+those bytes are unparseable by every candidate by construction, since the cap is a
+property of the line rather than of any parser, so committing cannot strand bytes another
+candidate would have inserted — which is the sole property this fall-through protects.
 
 #### Delta-proportional polling (Amendment, 2026-08-02)
 
@@ -427,6 +442,101 @@ independently to `mirror_claude_ai_export_file`.
 Summarization, transcript digestion, and any aggregation that derives structured output
 from mirrored rows. The mirror lands faithful, masked, idempotent copies; everything that
 interprets them lives outside this repository.
+
+### 7. Oversized-line forward progress (Amendment, 2026-08-29)
+
+§6's line-tail rules split oversized lines into two cases: a **complete** over-cap line,
+which is skipped with the cursor advanced past it, and a line that crosses the cap with
+**no terminating `\n` yet**, whose cursor is left at that line's start so the next pass
+repeats the same bounded read.
+
+That split is exhaustive only under an assumption it does not state: that a line's
+terminator is either found within one bounded read window or is genuinely not there. A
+third state exists — **a complete line whose terminator lies several windows past the
+cap**. It is a member of the first case by its own definition, since it is terminated,
+but it is indistinguishable from the second case at the moment of the read, because a
+single bounded read window is the only evidence available.
+
+Applying the recorded rule for the second case to it produces a wedge. The cursor returns
+to the line's start, the next pass performs the identical bounded read, reaches the
+identical conclusion, and no offset ever advances. That is precisely the failure the
+first case exists to prevent — "so ingestion cannot wedge on one oversized line" — reached
+through the branch written to be the safe one. Every later record in the file is
+unreachable for as long as that line is the frontier.
+
+This amendment therefore **widens** the second case rather than correcting it. The
+recorded behaviour for a still-growing final line and for a truncated tail is retained;
+what changes is that "leave the cursor at the line's start" is replaced by a rule that
+also terminates for a complete line spanning several windows.
+
+**Checkpointed skip.** On an over-cap read that ends without a terminator, the cursor
+advances by the bounded number of bytes discarded in that call and is persisted, even
+though no event was parsed. Each pass discards another bounded prefix until a pass reaches
+the terminator, after which parsing resumes at the following line. Progress is therefore
+monotonic in every pass that reads bytes, which is what makes the case terminate.
+
+**An oversized-skip advance is a claiming advance.** That monotonicity is a claim about
+the _persisted_ cursor, so it depends on the candidate-dispatch commit rule above, and
+under that rule as originally written it would be false. A checkpoint pass advances the
+cursor and inserts zero rows, which is the definition of an empty advance there — it falls
+through and commits only if no candidate errored. In an overlapping-root configuration
+where a sibling candidate errors on every pass, the checkpoint would never commit, the same
+bounded prefix would be re-read forever, and the wedge this section exists to kill would
+return through the dispatch layer instead of the read layer.
+
+So an advance over a line already known to exceed the cap **claims the path** and commits
+regardless of a sibling's error. The safety property the empty-advance fall-through
+protects is that no candidate's cursor strands bytes another candidate would have turned
+into rows; an over-cap line cannot be turned into rows by any candidate, because the cap is
+a property of the line and not of the parser. The exception therefore costs nothing the
+rule was defending.
+
+This is not a new carve-out so much as a statement of one §6 already relied on. The
+complete-oversized-line skip in §6 also advances past a line while inserting no rows for
+it, so a pass whose only content is such a line is an empty advance too, and was already
+exposed to the same never-commit corner. §7 makes that corner reachable far more often —
+every window of a multi-window line rather than only a whole-line skip — which is what
+turned a latent case into one worth stating.
+
+**The mid-line marker is derived, not stored.** A cursor whose immediately preceding byte
+is not `\n` means ingestion is partway through an oversized line; offset zero is a line
+boundary by definition and has no predecessor to read. This is a property of the file and
+the offset alone, so it survives a daemon restart without a schema change and without a
+separate state column that could disagree with the cursor. The next pass resumes in
+oversized-skip mode on that basis.
+
+Deriving the marker rather than persisting it is the load-bearing choice here, not an
+optimization. A stored "mid-line" flag and the stored offset are two facts that can
+disagree — after a crash between the two writes, or after any later change that updates
+one path and not the other — and the disagreement is silent, because both values are
+individually well-formed. Reading the byte before the cursor cannot disagree with the
+cursor.
+
+**No remainder is promoted to a record.** Because the resumed pass starts in skip mode, a
+remainder that happens to fall under the cap is not parsed as an independent JSON record.
+Without this, the tail of a discarded line could be admitted as a legitimate event — a
+correctness failure strictly worse than the wedge, since it is silent.
+
+**Bounds are unchanged.** Every call retains the per-call read bound; no pass reads to EOF
+searching for a terminator. A truncated tail with no new bytes is an EOF no-op, and a
+final under-cap fragment remains an ordinary partial line retried when the file grows.
+
+Amended text: §6's sentences beginning "The cursor is left at that line's start" no longer
+describe the implementation and are superseded by this section. The surrounding rules —
+the cap itself, `tracing::warn!` logging with file and byte offset, never parsing an
+over-cap line, and the complete-line skip-and-advance path — are unchanged.
+
+**Verification.** A complete over-cap line spanning several reader windows advances its
+persisted cursor on every non-EOF pass, and records before and after it both land; this is
+the arm that fails against the superseded rule. That arm MUST be run under a
+**single-candidate** dispatch and again under an **overlapping-root, sibling-erroring**
+dispatch, asserting the persisted cursor advances in both — the second is the arm that
+fails if the oversized-skip advance is treated as an empty advance, and it passes
+vacuously if only the single-candidate case is exercised. An unterminated over-cap final line
+checkpoints its discarded bytes, stays an EOF no-op across a simulated restart, and is
+never parsed as an event; when a terminator and a valid line are appended, skip mode
+clears and the following record lands. A still-growing line under the cap continues to
+behave as an ordinary partial.
 
 ## Rationale
 
