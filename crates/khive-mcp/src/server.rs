@@ -927,6 +927,7 @@ pub struct KhiveMcpServer {
 pub enum PackRegFailure {
     UnknownPack(String),
     MissingDependency { pack: String, dep: String },
+    NoPublicVerbs { pack: String },
     Registry(khive_runtime::RuntimeError),
 }
 
@@ -945,6 +946,7 @@ impl std::fmt::Debug for PackRegError {
             PackRegFailure::MissingDependency { pack, dep } => {
                 dbg.field("pack", pack).field("missing_dep", dep)
             }
+            PackRegFailure::NoPublicVerbs { pack } => dbg.field("pack", pack),
             PackRegFailure::Registry(source) => dbg.field("source", source),
         }
         .finish_non_exhaustive()
@@ -964,6 +966,11 @@ impl std::fmt::Display for PackRegError {
                 f,
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
                  add --pack {dep} before --pack {pack}"
+            ),
+            PackRegFailure::NoPublicVerbs { pack } => write!(
+                f,
+                "declared pack {pack:?} registers no public verbs and is not marked as \
+                 intentionally vocabulary- or ontology-only"
             ),
             PackRegFailure::Registry(source) => write!(f, "pack registry build failed: {source}"),
         }
@@ -1204,6 +1211,7 @@ impl KhiveMcpServer {
                 PackLoadError::MissingDependency { pack, dep } => {
                     PackRegFailure::MissingDependency { pack, dep }
                 }
+                PackLoadError::NoPublicVerbs { pack } => PackRegFailure::NoPublicVerbs { pack },
             };
             return Err(PackRegError { failure, runtime });
         }

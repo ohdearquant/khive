@@ -451,7 +451,7 @@ read paths query. Engine resolution is the same one `kkernel mcp` uses (§1). Fu
 
 | Flag                              | Default                                     | Effect                                                                                  |
 | --------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `--db` / `KHIVE_DB`               | `~/.khive/khive.db`                         | Target database (`:memory:` sentinel supported)                                         |
+| `--db` / `KHIVE_DB`               | `~/.khive/khive.db`                         | Target database; with `[[backends]]`, required and must match one declared SQLite path   |
 | `--config` / `KHIVE_CONFIG`       | home-fallback search                        | TOML config path                                                                        |
 | `--namespace` / `KHIVE_NAMESPACE` | `"local"` (or `[actor] id` if not explicit) | Namespace to reindex                                                                    |
 | `--model <name>`                  | unset → every registered model              | Restrict the graph (entity/note) pass to one embedding model                            |
@@ -468,6 +468,12 @@ read paths query. Engine resolution is the same one `kkernel mcp` uses (§1). Fu
 `--no-sections`/`--sections-only` are declared as clap `conflicts_with` pairs, so invalid
 combinations are rejected at parse time, before any of the scope logic below runs
 (`reindex.rs:169-188`).
+
+If the selected config declares `[[backends]]`, reindex refuses to infer a
+target from the single-backend default. The operator must pass a persistent
+`--db` / `KHIVE_DB` path that matches any declared SQLite backend; this permits
+an intentional secondary-backend rebuild while catching an omitted or mistyped
+path before the runtime opens it.
 
 **Actual scope derivation** (`reindex.rs:478-481`):
 

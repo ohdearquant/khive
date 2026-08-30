@@ -270,7 +270,7 @@ kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only sect
 
 | Flag               | Effect                                                                          |
 | ------------------ | ------------------------------------------------------------------------------- |
-| `--db <path>`      | database (env `KHIVE_DB`; `:memory:` for ephemeral) — parity with `mcp`/`exec`  |
+| `--db <path>`      | database (env `KHIVE_DB`); with `[[backends]]`, must match one declared SQLite path |
 | `--config <path>`  | khive TOML config (env `KHIVE_CONFIG`) — resolves engines like `kkernel mcp`    |
 | `--knowledge-only` | only the knowledge corpus (skip entities/notes)                                 |
 | `--no-knowledge`   | only entities/notes (skip knowledge)                                            |
@@ -292,6 +292,11 @@ win over the `KHIVE_EMBEDDING_MODEL` env vars and over `RuntimeConfig` defaults.
 This guarantees reindex writes vectors for the SAME engine set the MCP server
 serves recall from. `--namespace` is the explicit per-namespace target and
 always wins over any config `[actor] id`.
+
+When the selected config declares `[[backends]]`, reindex remains a
+one-database command: `--db` / `KHIVE_DB` is required and must match one of the
+declared SQLite backend paths (including a secondary backend). An omitted,
+`:memory:`, or undeclared path is refused before any database is opened.
 
 **Fail-closed.** By default reindex returns a **non-zero exit** if any requested
 engine failed, the knowledge pass errored, any knowledge atom vector insert

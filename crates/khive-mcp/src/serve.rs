@@ -2433,6 +2433,71 @@ pub fn reject_conflicting_db_override_with_source(
     Err(DatabaseOverrideConflict::new(other, backends.len(), config_source).into())
 }
 
+/// Validate the single database selected by `kkernel reindex` against a
+/// declared multi-backend topology.
+///
+/// Unlike MCP/exec's override guard, reindex is deliberately a one-database
+/// maintenance command and may target any declared SQLite backend, not only
+/// `main`. Once `[[backends]]` exists it must name that target explicitly:
+/// falling through to the ordinary single-backend default can rebuild an
+/// unrelated file while leaving the intended backend's indexes stale.
+pub fn validate_reindex_db_target_with_source(
+    db_target: Option<&str>,
+    backends: &[BackendConfig],
+    config_source: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    if backends.is_empty() {
+        return Ok(());
+    }
+
+    let declared_targets = backends
+        .iter()
+        .filter_map(|backend| {
+            (backend.kind == BackendKind::Sqlite)
+                .then_some(backend.path.as_ref())
+                .flatten()
+                .map(|path| format!("{}={}", backend.name, path.display()))
+        })
+        .collect::<Vec<_>>();
+    let declared_summary = if declared_targets.is_empty() {
+        "<none>".to_string()
+    } else {
+        declared_targets.join(", ")
+    };
+    let source_suffix = config_source
+        .map(|path| format!(" The selected config is {}.", path.display()))
+        .unwrap_or_default();
+
+    let Some(db_target) = db_target.filter(|target| *target != ":memory:") else {
+        anyhow::bail!(
+            "kkernel reindex requires an explicit persistent --db / KHIVE_DB target when \
+             [[backends]] is declared; choose one declared SQLite backend path \
+             ({declared_summary}).{source_suffix}"
+        );
+    };
+
+    let target = canonical_path_no_side_effects(&khive_runtime::expand_tilde(
+        std::path::Path::new(db_target),
+    ))?;
+    for backend in backends {
+        if backend.kind != BackendKind::Sqlite {
+            continue;
+        }
+        let Some(path) = backend.path.as_ref() else {
+            continue;
+        };
+        if canonical_path_no_side_effects(&khive_runtime::expand_tilde(path))? == target {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!(
+        "kkernel reindex database target {db_target:?} is not a path declared in \
+         [[backends]]; refusing to rebuild an unowned file. Declared SQLite backend \
+         paths: {declared_summary}.{source_suffix}"
+    )
+}
+
 /// Validate a database override and normalize a redundant concrete override
 /// to the same fingerprint anchor used when no override is supplied.
 ///

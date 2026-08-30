@@ -3230,6 +3230,16 @@ pub trait PackFactory: Send + Sync + 'static {
         &[]
     }
 
+    /// Whether this pack intentionally exposes no top-level MCP verbs.
+    ///
+    /// Defaults to `false` so a declared pack whose runtime contributes no
+    /// [`Visibility::Verb`] handlers fails at registration instead of silently
+    /// disappearing from the served surface. Vocabulary- or ontology-only
+    /// packs must opt in explicitly.
+    fn intentionally_verbless(&self) -> bool {
+        false
+    }
+
     /// Create a new pack instance for the given runtime.
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime>;
 
@@ -3279,6 +3289,12 @@ pub enum PackLoadError {
         /// The dependency that is missing from the requested pack list.
         dep: String,
     },
+    /// A declared pack contributed no top-level verbs without explicitly
+    /// declaring itself vocabulary/ontology-only.
+    NoPublicVerbs {
+        /// The declared pack name.
+        pack: String,
+    },
 }
 
 impl std::fmt::Display for PackLoadError {
@@ -3289,6 +3305,12 @@ impl std::fmt::Display for PackLoadError {
                 f,
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
                  add --pack {dep} before --pack {pack}"
+            ),
+            PackLoadError::NoPublicVerbs { pack } => write!(
+                f,
+                "declared pack {pack:?} registers no public verbs; if this pack is \
+                 intentionally vocabulary- or ontology-only, its factory must declare \
+                 intentionally_verbless() = true"
             ),
         }
     }
@@ -3362,6 +3384,15 @@ impl PackRegistry {
         for name in names {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
             let install = factory.create_install(runtime.clone());
+            if !factory.intentionally_verbless()
+                && !install
+                    .runtime
+                    .handlers()
+                    .iter()
+                    .any(|handler| matches!(handler.visibility, Visibility::Verb))
+            {
+                return Err(PackLoadError::NoPublicVerbs { pack: name.clone() });
+            }
             if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
                 install
                     .runtime
@@ -3426,6 +3457,15 @@ impl PackRegistry {
                 .cloned()
                 .unwrap_or_else(|| default_runtime.clone());
             let install = factory.create_install(runtime);
+            if !factory.intentionally_verbless()
+                && !install
+                    .runtime
+                    .handlers()
+                    .iter()
+                    .any(|handler| matches!(handler.visibility, Visibility::Verb))
+            {
+                return Err(PackLoadError::NoPublicVerbs { pack: name.clone() });
+            }
             if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
                 install
                     .runtime
@@ -4095,6 +4135,7 @@ pub(crate) mod tests {
     /// `comm` name is free for the probe here.
     struct CommProbeFactory;
     struct OtherProbeFactory;
+    struct AccidentalZeroVerbFactory;
 
     fn probe_pack(
         _runtime: KhiveRuntime,
@@ -4138,6 +4179,9 @@ pub(crate) mod tests {
         fn name(&self) -> &'static str {
             "comm"
         }
+        fn intentionally_verbless(&self) -> bool {
+            true
+        }
         fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
             probe_pack(runtime, &COMM_PROBE_GRANTED)
         }
@@ -4147,6 +4191,18 @@ pub(crate) mod tests {
         fn name(&self) -> &'static str {
             "grant-probe-other"
         }
+        fn intentionally_verbless(&self) -> bool {
+            true
+        }
+        fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
+            probe_pack(runtime, &OTHER_PROBE_GRANTED)
+        }
+    }
+
+    impl PackFactory for AccidentalZeroVerbFactory {
+        fn name(&self) -> &'static str {
+            "accidental-zero-verb"
+        }
         fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
             probe_pack(runtime, &OTHER_PROBE_GRANTED)
         }
@@ -4154,6 +4210,7 @@ pub(crate) mod tests {
 
     inventory::submit! { PackRegistration(&CommProbeFactory) }
     inventory::submit! { PackRegistration(&OtherProbeFactory) }
+    inventory::submit! { PackRegistration(&AccidentalZeroVerbFactory) }
 
     #[test]
     fn channel_ingest_grant_reaches_only_allowlisted_pack_names() {
@@ -4173,6 +4230,47 @@ pub(crate) mod tests {
             !OTHER_PROBE_GRANTED.load(std::sync::atomic::Ordering::SeqCst),
             "a factory outside CHANNEL_INGEST_CAPABLE_PACKS must never be granted"
         );
+    }
+
+    #[test]
+    fn declared_zero_verb_pack_requires_explicit_intent_metadata() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        let error = PackRegistry::register_packs(
+            &["accidental-zero-verb".to_string()],
+            runtime,
+            &mut builder,
+        )
+        .expect_err("an unmarked zero-verb pack must fail registration");
+
+        assert!(matches!(
+            error,
+            PackLoadError::NoPublicVerbs { ref pack } if pack == "accidental-zero-verb"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("intentionally_verbless() = true"),
+            "operator error must name the explicit exemption: {error}"
+        );
+    }
+
+    #[test]
+    fn multi_backend_loader_enforces_zero_verb_intent_metadata() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        let error = PackRegistry::register_packs_with_runtimes(
+            &["accidental-zero-verb".to_string()],
+            &HashMap::new(),
+            &runtime,
+            &mut builder,
+        )
+        .expect_err("multi-backend registration must enforce the same invariant");
+
+        assert!(matches!(
+            error,
+            PackLoadError::NoPublicVerbs { ref pack } if pack == "accidental-zero-verb"
+        ));
     }
 
     #[test]
