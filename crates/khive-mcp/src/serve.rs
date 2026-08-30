@@ -158,6 +158,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         khive_runtime::daemon::acquire_recovery_lock()
     };
     let (server, schedule_rt) = build_server(&args).await?;
+    tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
 
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, &args);
@@ -2004,6 +2005,7 @@ pub async fn serve_server(
              in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
         );
     }
+    tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, args);
     #[cfg(feature = "channel-telegram")]
@@ -3861,6 +3863,20 @@ pub fn resolved_database_disclosure(
     }
 }
 
+/// One-line, stdout-safe disclosure of the actor selected by the resolved
+/// CLI/project/environment precedence chain.
+pub fn resolved_actor_disclosure(actor_id: Option<&str>) -> String {
+    let actor = khive_runtime::resolve_actor(actor_id);
+    if khive_runtime::actor_is_unattributed(&actor) {
+        format!(
+            "actor: {:?} (resolved; unattributed local fallback)",
+            actor.id
+        )
+    } else {
+        format!("actor: {:?} (resolved; attributed)", actor.id)
+    }
+}
+
 /// Inputs for [`resolve_runtime_config`] — the subset of serve-time arguments
 /// that determine the resolved [`RuntimeConfig`]. Callers other than
 /// `kkernel mcp` (e.g. `kkernel reindex`) supply these directly so they resolve
@@ -4332,6 +4348,21 @@ mod tests {
         assert!(
             line.contains(":memory:") && line.contains("ephemeral"),
             "in-memory disclosure must say the target is ephemeral; got: {line}"
+        );
+    }
+
+    #[test]
+    fn resolved_actor_disclosure_names_attributed_actor() {
+        let line = resolved_actor_disclosure(Some("lambda:worker"));
+        assert_eq!(line, "actor: \"lambda:worker\" (resolved; attributed)");
+    }
+
+    #[test]
+    fn resolved_actor_disclosure_marks_local_unattributed() {
+        let line = resolved_actor_disclosure(None);
+        assert_eq!(
+            line,
+            "actor: \"local\" (resolved; unattributed local fallback)"
         );
     }
 

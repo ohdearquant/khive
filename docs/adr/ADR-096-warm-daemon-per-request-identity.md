@@ -547,3 +547,20 @@ diagnostics continue to report `backend`; declared per-backend modes live in the
 existing topology component. A mismatch remains a hard reject before verb
 dispatch and follows the ordinary local fallback path. Identity-derived frame
 fields remain excluded exactly as specified above.
+
+## Amendment 5: resolved actor disclosure is a host-boundary invariant (2026-08-30)
+
+Issue #2277 closes the silent-success half of actor resolution. Every normal
+`kkernel exec` dispatch writes one stable resolved-actor line to stderr before
+daemon forwarding or local execution. Both MCP host paths—the ordinary
+single-backend entrypoint and the coordinator-backed multi-backend
+entrypoint—emit the same line on the forced `khive.boot` INFO target before
+serving. Attributed identities and the unattributed `local` fallback are
+reported symmetrically; stdout remains reserved for JSON or MCP framing.
+
+This is disclosure, not authentication and not a new identity source. The
+precedence ratified above remains CLI `--actor` → project config `[actor]` →
+`KHIVE_ACTOR` → `local`. The already-shipped `kkernel exec --expect-actor`
+continues to provide the fail-closed script assertion before dispatch. The
+line names only the resolved actor id and attribution state; it never exposes
+tokens, credentials, Gate policy, or the caller's visible namespace set.
