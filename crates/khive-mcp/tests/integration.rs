@@ -1876,6 +1876,20 @@ impl khive_types::Pack for ErrorInjectPack {
             params: &[],
         },
         HandlerDef {
+            name: "writer_task_rolled_back",
+            description: "returns an ordinary writer request error after proven rollback",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "writer_task_side_effects_unknown",
+            description: "returns a terminal writer error with ambiguous side effects",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
             name: "storage_admission_timeout",
             description: "returns a typed storage-admission timeout error",
             visibility: Visibility::Verb,
@@ -1943,6 +1957,24 @@ impl PackRuntime for ErrorInjectPack {
         if verb == "writer_task_busy" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 },
+            ));
+        }
+        if verb == "writer_task_rolled_back" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::WriterTaskRequestFailed {
+                    request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                    source: Box::new(khive_storage::StorageError::Pool {
+                        operation: "writer_task_commit".into(),
+                        message: "commit refused".into(),
+                    }),
+                },
+            ));
+        }
+        if verb == "writer_task_side_effects_unknown" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::WriterTaskTerminated {
+                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                },
             ));
         }
         if verb == "storage_admission_timeout" {
@@ -2179,6 +2211,57 @@ async fn writer_task_busy_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
             "retry_after_ms": serde_json::Value::Null,
         }),
         "BEGIN contention must remain distinguishable and safely retryable"
+    );
+
+    Ok(())
+}
+
+/// Request finality and writer-task liveness are independent. A COMMIT error
+/// followed by verified rollback is safe from duplicate effects and keeps the
+/// writer alive; a failed rollback is terminal and ambiguous. Preserve both
+/// facts as structured MCP fields rather than forcing clients to parse text.
+#[tokio::test]
+async fn writer_task_finality_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+
+    let rolled_back = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "writer_task_rolled_back()"}),
+    )
+    .await?;
+    let rolled_back_body: serde_json::Value = serde_json::from_str(&first_text(&rolled_back))?;
+    assert_eq!(
+        rolled_back_body["results"][0]["error"],
+        serde_json::json!({
+            "kind": "storage",
+            "code": "writer_task_request_failed",
+            "stage": "writer_task_request_failed",
+            "message": "storage: writer task request failed (request_state=transaction_rolled_back): pool failure during writer_task_commit: commit refused",
+            "retryable": true,
+            "request_state": "transaction_rolled_back",
+            "task_terminated": false,
+        })
+    );
+
+    let unknown = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "writer_task_side_effects_unknown()"}),
+    )
+    .await?;
+    let unknown_body: serde_json::Value = serde_json::from_str(&first_text(&unknown))?;
+    assert_eq!(
+        unknown_body["results"][0]["error"],
+        serde_json::json!({
+            "kind": "storage",
+            "code": "writer_task_terminated",
+            "stage": "writer_task_terminated",
+            "message": "storage: writer task terminated (request_state=side_effects_unknown)",
+            "retryable": false,
+            "request_state": "side_effects_unknown",
+            "task_terminated": true,
+        })
     );
 
     Ok(())
