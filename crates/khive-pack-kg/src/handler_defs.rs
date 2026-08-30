@@ -1217,9 +1217,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                       expected non-negative ledger delta explicit; a negative delta is unexpected \
                       unless the report also flags the pre-V14 duplicate-edge state, which is \
                       classified as ledger_behind_pre_v14_duplicate_edge_state. \
+                      A bounded dbstat size composition reports per-table/per-index pages and \
+                      row, index, FTS, vector, mixed row-and-embedding, and internal byte totals. \
                       ADR-091 checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
-                      WAL-pin holder census. The \
+                      WAL-pin holder census reconciled with a bounded read-only sidecar pass. The \
                       checkpoint probe issues a real PRAGMA wal_checkpoint(PASSIVE), which \
                       backfills WAL frames into the main database on the happy path — that \
                       is ordinary checkpoint I/O, never a TRUNCATE escalation, and it never \

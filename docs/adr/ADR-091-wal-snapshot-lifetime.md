@@ -1496,3 +1496,42 @@ Operator controls are `KHIVE_REQUEST_READ_TIMEOUT_SECS` (default 30, valid
 second-stage join bound above). These bound read work and interrupt
 settlement only. They do not change write admission, commit, rollback,
 checkpoint, or TRUNCATE policy.
+
+### 2026-08-30 amendment (Amendment 13): read-only reconciliation and bounded producer-temp cleanup
+
+**Supersession.** This amendment supersedes Amendment 6 only where it says
+`db_diagnostics` cannot enumerate the sidecar and must omit
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap`. The daemon's one-pass-per-tick
+rule, housekeeping/attribution distinction, and evidence-retention policy remain unchanged.
+
+**Read-only operator reconciliation.** `walpin::inspect_live` is a third enumeration purpose. It
+shares the descriptor-bound directory and entry validation, identity/freshness classification,
+entry-size limit, and 512-entry work cap with checkpoint attribution, but every deletion policy is
+disabled. Dead, reused, malformed, stale, symlinked, and producer-temp evidence remains on disk.
+The report states whether listing truncated and how many trusted stale producer temps ordinary
+housekeeping would reap. `db_diagnostics` reconciles that result with the independently bounded OS
+holder census: `complete` requires a complete census, an untruncated sidecar walk, no unknown
+sidecar classifications, and sidecar evidence for every confirmed holder. Each missing condition
+is an explicit degradation reason. The diagnostic request therefore measures cleanup candidates
+but never becomes the actor that consumes its own forensic evidence.
+
+**Producer-temp residue.** The atomic writers' exact `.<pid>.json.tmp` and
+`.<pid>.beacon.tmp` names are now recognized in a separate bounded listing lane instead of being
+indistinguishable from arbitrary hidden files. Ordinary housekeeping and checkpoint attribution
+may remove a candidate only after it is older than the staleness window and its producer is
+positively dead or its parsed PID/start identity proves PID reuse. Fresh temps, live matching
+producers, malformed identity, uninspectable processes, non-owned entries, symlinks, and all
+unrecognized dot-names are retained. The candidate is opened with the existing non-following,
+regular-file, ownership, and size checks; immediately before unlink, its device/inode identity is
+rechecked against the classified object so a producer replacement is not intentionally removed on
+a stale verdict. The ordinary and producer-temp result sets each cap at 512 entries and the raw
+directory scan retains its existing bounded multiplier. Thus a crash population drains over
+bounded ticks without letting one cleanup pass scale with historical residue.
+
+**Database byte composition.** The same operator report now runs SQLite's read-only aggregate
+`dbstat` view on its guarded standalone connection. It returns per-object page/byte totals and
+file-wide row-table, index, FTS, vector, mixed row-and-embedding, internal, freelist, and
+unaccounted totals. Tables containing both ordinary rows and an embedding BLOB stay in the mixed
+class because SQLite pages cannot support a defensible per-column split. Object detail is capped
+and reports truncation/omission explicitly; aggregate class totals continue across the full
+`dbstat` result.

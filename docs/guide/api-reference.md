@@ -785,7 +785,8 @@ request(ops="whoami()")
 
 Report writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics for the main
 database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal`
-sidecar file size, and a WAL-pin holder census. Takes no parameters.
+sidecar file size, page-level database size composition, and a WAL-pin holder census. Takes no
+parameters.
 
 `writer_contention` contains monotonic counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
@@ -853,9 +854,21 @@ deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded
 `unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
 `unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
 holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
-`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are cleanup-enumeration
-measurements: this request deliberately does not run that mutating enumeration, so both fields are
-omitted rather than reporting fabricated `false`/`0` values.
+The holder census is reconciled with a separate, bounded, read-only sidecar pass. A complete census
+and conclusive sidecar walk can therefore produce `wal_pin.status: "complete"`; truncated walks,
+unknown sidecar identities, and OS-confirmed holders missing sidecar evidence degrade explicitly.
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are measured by that pass. The
+latter is a forecast: diagnostics never performs the cleanup it reports.
+
+`size_composition` accounts SQLite pages by individual table or index using aggregate `dbstat`.
+It reports file-wide page/freelist/accounted/unaccounted byte totals plus operational class totals
+for ordinary row tables, indexes, FTS storage, vector storage, mixed row-and-embedding tables, and
+SQLite internal objects. A table that stores both ordinary columns and an `embedding BLOB` is kept
+in `mixed_embedding_bytes`: SQLite cannot attribute bytes within a shared page to one column, so
+the field is an upper bound for the embedding-bearing table, not a fabricated pure-vector byte
+count. Object detail is deterministic and capped at 4,096 rows; `objects_truncated` and
+`objects_omitted` make cap pressure explicit while the aggregate class totals still cover every
+object returned by `dbstat`. `size_composition_error` explains an unavailable report.
 
 `graph_edge_integrity` reports `duplicate_edge_id_groups`, `graph_edges_rows`,
 `graph_edges_seq_rows`, and `pre_v14_duplicate_edge_state_detected`. A non-zero duplicate group
