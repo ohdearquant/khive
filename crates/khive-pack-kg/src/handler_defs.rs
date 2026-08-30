@@ -671,31 +671,39 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Commissive: commits a typed edge to the graph
     HandlerDef {
         name: "link",
-        description: "Create a typed directed edge",
+        description: "Create one typed directed edge or a bounded bulk of edges. Supply the \
+                      singleton source_id/target_id/relation fields or links; unknown top-level \
+                      fields and unknown fields inside links entries are rejected.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
             ParamDef {
                 name: "source_id",
                 param_type: "uuid",
-                required: true,
-                description: "Source node complete UUID or globally unique 8+ hex prefix. \
-                              Entity-name fallback uses the primary namespace.",
+                required: false,
+                description: "Required in singleton mode. Source node complete UUID or globally \
+                              unique 8+ hex prefix. UUID \
+                              and prefix lookup are namespace-unfiltered under ADR-007; \
+                              entity-name fallback uses the primary namespace. Ignored when \
+                              links is supplied.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "target_id",
                 param_type: "uuid",
-                required: true,
-                description: "Target node complete UUID or globally unique 8+ hex prefix. \
-                              Entity-name fallback uses the primary namespace.",
+                required: false,
+                description: "Required in singleton mode. Target node complete UUID or globally \
+                              unique 8+ hex prefix. UUID \
+                              and prefix lookup are namespace-unfiltered under ADR-007; \
+                              entity-name fallback uses the primary namespace. Ignored when \
+                              links is supplied.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "relation",
                 param_type: "string",
-                required: true,
-                description: "Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
+                required: false,
+                description: "Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
                     Each relation only accepts specific (source_kind -> target_kind) endpoint pairs; an out-of-allowlist pair between two otherwise-valid endpoints is rejected with InvalidInput, and a missing endpoint returns NotFound — never silently accepted. \
                     Base ADR-002 entity->entity allowlist (issue #964 — this table is a hand-maintained mirror of `base_entity_endpoint_rules()` (khive-runtime) and is guarded by a regression test on key rows; enforcement consults the shared rule data via `base_entity_rule_allows()`, not this text — `base_entity_endpoint_rules()` is just an exposed view of the same constant): \
                     contains: concept->concept, project->project, project->artifact, org->project, org->service. \
@@ -721,7 +729,54 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "weight",
                 param_type: "number",
                 required: false,
-                description: "Edge weight 0.0–1.0 (default 1.0). 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible.",
+                description: "Singleton edge weight 0.0–1.0 (default 1.0). 1.0=definitional, \
+                              0.7-0.9=strong, 0.4-0.6=plausible. Ignored when links is supplied.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "metadata",
+                param_type: "object",
+                required: false,
+                description: "Singleton edge metadata. Metadata is returned by get(id=<edge UUID>); \
+                              neighbors does not currently project edge metadata. Ignored when \
+                              links is supplied; use each bulk entry's metadata instead.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "dependency_kind",
+                param_type: "string",
+                required: false,
+                description: "Singleton convenience field for metadata.dependency_kind on \
+                              depends_on edges: build | runtime | data | artifact | tooling | \
+                              normative. An existing metadata.dependency_kind wins. Ignored when \
+                              links is supplied; each bulk entry accepts the same field.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "verbose",
+                param_type: "bool",
+                required: false,
+                description: "Bulk mode only. When true, include successfully created edges in \
+                              an edges array; default false.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "links",
+                param_type: "array of object",
+                required: false,
+                description: "Bulk edge creation, capped at 1000 entries. Each entry requires \
+                              source_id, target_id, and relation, and accepts optional weight, \
+                              metadata, and dependency_kind. Unknown entry fields are rejected. \
+                              When supplied, singleton edge fields are ignored.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "atomic",
+                param_type: "bool",
+                required: false,
+                description: "Bulk mode only. When true (default), all entries succeed or none \
+                              are written. When false, entries are attempted individually and \
+                              per-entry errors are collected in the response.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -1352,6 +1407,71 @@ mod tests {
             h.params.iter().any(|p| p.name == "changeset" && p.required),
             "propose must have required changeset param"
         );
+    }
+
+    #[test]
+    fn link_help_schema_matches_strict_singleton_and_bulk_params() {
+        let handler = find_handler("link");
+        let advertised = handler
+            .params
+            .iter()
+            .map(|param| param.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            advertised,
+            [
+                "source_id",
+                "target_id",
+                "relation",
+                "weight",
+                "metadata",
+                "dependency_kind",
+                "verbose",
+                "links",
+                "atomic",
+            ],
+            "link help must enumerate the complete LinkParams surface in wire order"
+        );
+        assert!(
+            handler.params.iter().all(|param| !param.required),
+            "link has a singleton-or-bulk contract, so no one field is unconditionally required"
+        );
+
+        let accepted = serde_json::from_value::<crate::handlers::LinkParams>(serde_json::json!({
+            "source_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "target_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "relation": "depends_on",
+            "weight": 0.7,
+            "metadata": {"optional": true},
+            "dependency_kind": "build",
+            "verbose": true,
+            "links": [],
+            "atomic": false,
+        }));
+        if let Err(error) = accepted {
+            panic!("every link help parameter must be accepted by LinkParams: {error}");
+        }
+
+        for payload in [
+            serde_json::json!({"properties": {"x": 1}}),
+            serde_json::json!({
+                "links": [{
+                    "source_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "target_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                    "relation": "extends",
+                    "properties": {"x": 1},
+                }],
+            }),
+        ] {
+            let error = match serde_json::from_value::<crate::handlers::LinkParams>(payload) {
+                Ok(_) => panic!("unknown link fields must be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("unknown field") && error.contains("properties"),
+                "link must reject unknown fields explicitly, got: {error}"
+            );
+        }
     }
 
     #[test]
