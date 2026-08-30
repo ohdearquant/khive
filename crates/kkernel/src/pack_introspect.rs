@@ -281,4 +281,97 @@ mod tests {
         let info = pack_handler("does_not_exist").unwrap();
         assert!(info.is_none(), "unknown pack returns None, not Err");
     }
+
+    /// Every `uuid`/`array of uuid` parameter on every REAL registered
+    /// handler (every pack linked into this binary via `inventory!`
+    /// self-registration, not a synthetic test pack) must declare a
+    /// resolution mode other than `IdResolutionMode::NotApplicable`.
+    ///
+    /// `khive-runtime`'s own unit tests can only exercise a synthetic pack —
+    /// it cannot depend on `khive-pack-kg`/`khive-pack-gtd`/etc. without a
+    /// circular dependency. `kkernel` is the first crate in the dependency
+    /// graph that links every default pack, so this is where a real
+    /// coverage gap becomes visible: a new `uuid` param added to any pack
+    /// with no `resolution_mode` set (leaving the struct's zero-value
+    /// `NotApplicable`) fails HERE, not in a hand-picked fixture.
+    #[test]
+    fn every_uuid_param_across_every_registered_pack_declares_a_resolution_mode() {
+        let (registry, _runtime) = build_registry().expect("introspection registry builds");
+        let mut missing: Vec<String> = Vec::new();
+        for (pack_name, handler) in registry.all_handlers_with_names() {
+            for param in handler.params.iter() {
+                let is_id_typed = param.param_type == "uuid" || param.param_type == "array of uuid";
+                if is_id_typed
+                    && param.resolution_mode == khive_runtime::IdResolutionMode::NotApplicable
+                {
+                    missing.push(format!(
+                        "{pack_name}.{}::{} (param_type={:?})",
+                        handler.name, param.name, param.param_type
+                    ));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "every uuid/array-of-uuid parameter must declare a non-NotApplicable \
+             IdResolutionMode so describe_verb renders an accurate contract instead of \
+             silently omitting one; missing on: {missing:?}"
+        );
+    }
+
+    /// Companion to the coverage check above: a mode-appropriate contract
+    /// must actually be rendered into `describe_verb`'s params array for a
+    /// representative primary-scoped verb from each of the four non-Unscoped
+    /// modes, proving the rendering path (not just the declared field) is
+    /// wired correctly end to end against real pack definitions.
+    #[test]
+    fn describe_verb_renders_mode_specific_contract_for_real_handlers() {
+        let (registry, _runtime) = build_registry().expect("introspection registry builds");
+
+        let cases: &[(&str, &str, &str)] = &[
+            // UnscopedById
+            ("get", "id", "no namespace filter"),
+            // PrefixScopedToPrimary
+            (
+                "neighbors",
+                "node_id",
+                "no namespace check performed by this resolver",
+            ),
+            // FullAndPrefixScopedToPrimary
+            ("review", "id", "both a full"),
+            // FullUuidOnlyScopedToPrimary
+            (
+                "propose",
+                "parent_id",
+                "rejected outright because this field stores",
+            ),
+            // UnscopedFullUuidOnly
+            (
+                "memory.feedback",
+                "target_id",
+                "no namespace check is performed on this parameter itself",
+            ),
+        ];
+
+        for (verb, param_name, expected_fragment) in cases {
+            let result = registry
+                .describe_verb(verb)
+                .unwrap_or_else(|e| panic!("describe_verb({verb:?}) must succeed: {e}"));
+            let params = result["params"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{verb:?} help envelope must carry a params array"));
+            let param = params
+                .iter()
+                .find(|p| p["name"] == *param_name)
+                .unwrap_or_else(|| panic!("{verb:?} must declare param {param_name:?}"));
+            let description = param["description"]
+                .as_str()
+                .expect("description must be a string");
+            assert!(
+                description.contains(expected_fragment),
+                "{verb:?}.{param_name} description must contain {expected_fragment:?} for its \
+                 declared resolution mode; got: {description}"
+            );
+        }
+    }
 }

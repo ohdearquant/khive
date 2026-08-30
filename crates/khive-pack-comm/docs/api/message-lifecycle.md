@@ -177,8 +177,11 @@ admits legacy outbound rows without `from_actor`. `to_actor` is an optional
 exact recipient filter for the sent box. Read `status` and sender filters are
 inbox-only and are rejected with `box="sent"`, while `to_actor` is rejected for
 the default inbox, so a misplaced filter cannot silently return the wrong box.
-The existing envelope remains stable; `unread_count` is zero for the sent box
-because outbound rows have no recipient read state.
+The existing envelope remains stable. For the default inbox, `unread_count` is
+the exact caller's mailbox-wide unread count — independent of the page window
+and of `status` and sender filters. Its partial-index-backed count is bounded
+by the unread population rather than total mailbox size. It is zero for the
+sent box because outbound rows have no recipient read state.
 
 Every caller is filtered by `to_actor = caller OR to_actor IS NULL`. A
 configured actor therefore sees messages addressed to that actor plus legacy
@@ -308,6 +311,15 @@ the read. There is no retry loop; a caller polling unread counts simply
 sees the message still unread and can re-issue `comm.read` (self-healing).
 Every validation error that runs before the patch (not found, wrong kind,
 outbound, wrong addressee) is unaffected and stays a hard error.
+
+At the enclosing MCP request boundary, `comm.read` and `comm.mark_read` remain
+mutations even though their names are acknowledgement-shaped. Parallel batch
+entries are independent, so a read mark may commit when a sibling `comm.send`
+or `comm.reply` fails; result-array order is not execution or commit order. A
+caller that requires delivery before acknowledgement must use an abort-on-failure
+chain. The single-message reply path already provides the common safe ordering:
+`comm.reply` commits the delivery pair first and only then attempts its
+best-effort fold-in read mark.
 
 ## `handlers.rs::handle_mark_read`
 

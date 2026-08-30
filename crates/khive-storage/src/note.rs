@@ -216,6 +216,149 @@ mod tests {
         let err = base_note().try_with_decay(-0.1).unwrap_err();
         assert!(err.contains("0.0"), "error must mention bound: {err}");
     }
+
+    #[derive(Default)]
+    struct DefaultOnlyNoteStore {
+        query_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DefaultOnlyNoteStore {
+        fn query_call_count(&self) -> usize {
+            self.query_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn unsupported<T>(operation: &'static str) -> StorageResult<T> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: operation.into(),
+            message: "test double does not implement this operation".into(),
+        })
+    }
+
+    #[async_trait]
+    impl NoteStore for DefaultOnlyNoteStore {
+        async fn upsert_note(&self, _note: Note) -> StorageResult<()> {
+            unsupported("upsert_note")
+        }
+
+        async fn upsert_notes(&self, _notes: Vec<Note>) -> StorageResult<BatchWriteSummary> {
+            unsupported("upsert_notes")
+        }
+
+        async fn get_note(&self, _id: Uuid) -> StorageResult<Option<Note>> {
+            unsupported("get_note")
+        }
+
+        async fn get_note_including_deleted(&self, _id: Uuid) -> StorageResult<Option<Note>> {
+            unsupported("get_note_including_deleted")
+        }
+
+        async fn delete_note(&self, _id: Uuid, _mode: DeleteMode) -> StorageResult<bool> {
+            unsupported("delete_note")
+        }
+
+        async fn update_note_properties(
+            &self,
+            _id: Uuid,
+            _properties: Option<Value>,
+            _updated_at: i64,
+        ) -> StorageResult<bool> {
+            unsupported("update_note_properties")
+        }
+
+        async fn set_note_property(
+            &self,
+            _id: Uuid,
+            _key: &str,
+            _value: Value,
+            _updated_at: i64,
+        ) -> StorageResult<bool> {
+            unsupported("set_note_property")
+        }
+
+        async fn try_patch_note_property(
+            &self,
+            _id: Uuid,
+            _namespace: &str,
+            _filter: &NoteFilter,
+            _json_path: &str,
+            _value: Value,
+            _updated_at: i64,
+        ) -> StorageResult<bool> {
+            unsupported("try_patch_note_property")
+        }
+
+        async fn query_notes(
+            &self,
+            _namespace: &str,
+            _kind: Option<&str>,
+            _page: PageRequest,
+        ) -> StorageResult<Page<Note>> {
+            self.query_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Page {
+                items: Vec::new(),
+                total: Some(0),
+            })
+        }
+
+        async fn query_notes_filtered(
+            &self,
+            _namespace: &str,
+            _filter: &NoteFilter,
+            _page: PageRequest,
+        ) -> StorageResult<Page<Note>> {
+            self.query_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Page {
+                items: Vec::new(),
+                total: Some(0),
+            })
+        }
+
+        async fn query_notes_filtered_bounded(
+            &self,
+            _namespace: &str,
+            _filter: &NoteFilter,
+            _max_rows: u32,
+        ) -> StorageResult<Vec<Note>> {
+            unsupported("query_notes_filtered_bounded")
+        }
+
+        async fn count_notes(&self, _namespace: &str, _kind: Option<&str>) -> StorageResult<u64> {
+            unsupported("count_notes")
+        }
+
+        async fn try_insert_note(&self, _note: Note) -> StorageResult<bool> {
+            unsupported("try_insert_note")
+        }
+    }
+
+    #[tokio::test]
+    async fn default_snapshot_count_is_fail_closed_without_query_fallback() {
+        let store = DefaultOnlyNoteStore::default();
+        let result = store
+            .count_notes_filtered_in_snapshot(
+                "ns:test",
+                &[NoteFilter::default(), NoteFilter::default()],
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::StorageError::Unsupported { ref operation, .. })
+                    if operation == "count_notes_filtered_in_snapshot"
+            ),
+            "inherited snapshot count must fail closed, got {result:?}"
+        );
+        assert_eq!(
+            store.query_call_count(),
+            0,
+            "inherited snapshot count must not fall back to independent queries"
+        );
+    }
 }
 
 /// Sort direction for filtered note queries.
@@ -234,6 +377,18 @@ pub enum FilterOp {
     /// Matches rows where the JSON field equals the value OR the field is absent/NULL.
     /// Used for properties that may be missing in legacy rows (e.g. `$.read`).
     EqOrMissing,
+    /// Matches the supplied value using the indexable
+    /// `ifnull(json_extract(...), '')` expression. The value may be any
+    /// [`SqlValue`] accepted by the SQL adapter; in particular, `Text("")`
+    /// matches both missing values and present-but-empty values.
+    EqOrMissingIndexed,
+    /// Matches rows where the JSON field is absent or SQL-NULL.
+    JsonTypeMissing,
+    /// Matches rows where the JSON field is absent or explicitly JSON `null`,
+    /// while constraining its index key to the empty recipient key. This is
+    /// the index-friendly legacy-recipient partition used with
+    /// [`FilterOp::EqOrMissingIndexed`].
+    JsonTypeMissingOrNullIndexed,
     /// Matches rows where a JSON text field equals the value, while treating
     /// every missing or non-text value as that same value. The SQL adapter
     /// emits `CASE WHEN json_type(...) = 'text' THEN json_extract(...) ELSE
@@ -251,7 +406,9 @@ pub enum FilterOp {
     JsonTypeEq,
     /// Matches rows where the json_type is absent (NULL) OR differs from value.
     /// Equivalent to `json_type IS NULL OR json_type != value`.
-    /// Used for unread filter: matches any `$.read` that is NOT the JSON boolean true.
+    /// Value must be a SQLite json_type string literal: 'true', 'false',
+    /// 'integer', 'real', 'text', 'array', 'object', or 'null'. Used for
+    /// unread filter: matches any `$.read` that is NOT the JSON boolean true.
     JsonTypeNeMissing,
     /// Matches rows where `json_extract(properties, path)` equals any value in
     /// the set. A row with a missing/NULL property does not match — use
@@ -472,6 +629,24 @@ pub trait NoteStore: Send + Sync + 'static {
         filter: &NoteFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Count several filtered note populations in one consistent backend
+    /// snapshot. Backends that cannot provide that guarantee must return
+    /// [`crate::StorageError::Unsupported`] rather than composing independent
+    /// queries or treating an absent page total as zero. SQL backends should
+    /// override this operation so callers can retain separate index-friendly
+    /// predicates without racing between their counts.
+    async fn count_notes_filtered_in_snapshot(
+        &self,
+        _namespace: &str,
+        _filters: &[NoteFilter],
+    ) -> StorageResult<Vec<u64>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "count_notes_filtered_in_snapshot".into(),
+            message: "this backend does not implement snapshot-consistent filtered note counts"
+                .into(),
+        })
+    }
     /// Resolve a note id to its immutable insertion sequence.
     async fn note_sequence(&self, _id: Uuid) -> StorageResult<Option<i64>> {
         Err(crate::StorageError::Unsupported {

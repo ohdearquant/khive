@@ -1308,6 +1308,10 @@ Remove rows from the profile resolution table. At least one filter is required.
 request(ops="brain.unbind(actor=\"role:implementer\")")
 ```
 
+The result includes `removed`, the number of matching bindings deleted. A successful
+request that matched nothing returns `removed: 0`. The legacy `unbound` field carries
+the same count for compatibility.
+
 ### `brain.bindings` — Assertive
 
 List rows in the profile resolution table, optionally filtered.
@@ -1409,7 +1413,9 @@ request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 
 List and page through the caller's filtered inbound messages (default) or sent
 history (`box="sent"`).
-The response keeps the inbox envelope; `unread_count` is zero for sent rows.
+The response keeps the inbox envelope. `unread_count` is the exact mailbox-wide
+unread count for the caller — independent of the page window and of `status`
+and sender filters — and is zero for sent rows.
 With `wait_ms`, an initially empty fully filtered page waits for a newly
 committed matching message and otherwise returns at the deadline.
 

@@ -1004,6 +1004,37 @@ fn run_migrations_twice_is_idempotent() {
     );
 }
 
+#[test]
+fn v22_upgrades_pre_index_database_for_read_only_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pre-unread-probe-index.db");
+
+    {
+        let mut conn = Connection::open(&path).expect("create pre-index database");
+        migrate_through(&mut conn, 20);
+        stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+        finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+        assert_eq!(read_schema_version(&conn).expect("read V21 ledger"), 21);
+        conn.execute("DROP INDEX idx_notes_unread_probe_recipient", [])
+            .expect("simulate pre-index V21 database");
+        assert!(!index_exists(&conn, "idx_notes_unread_probe_recipient"));
+    }
+
+    {
+        let mut conn = Connection::open(&path).expect("reopen writable database");
+        assert_eq!(
+            run_migrations(&mut conn).expect("apply V22 unread probe migration"),
+            latest_schema_version()
+        );
+        assert!(index_exists(&conn, "idx_notes_unread_probe_recipient"));
+    }
+
+    let read_only = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open migrated database read-only");
+    assert!(index_exists(&read_only, "idx_notes_unread_probe_recipient"));
+    validate_schema_is_current(&read_only).expect("migrated read-only schema validates");
+}
+
 // ── V5: external_id unique index tests ──────────────────────────────────────
 
 fn index_exists(conn: &Connection, name: &str) -> bool {

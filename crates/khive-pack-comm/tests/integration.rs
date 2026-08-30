@@ -10240,6 +10240,114 @@ async fn i66_inbox_response_carries_unread_count() {
     );
 }
 
+#[tokio::test]
+async fn i1931_inbox_unread_count_is_mailbox_wide() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend, "lambda:b");
+
+    for content in ["msg 1", "msg 2", "msg 3"] {
+        registry_a
+            .dispatch(
+                "comm.send",
+                serde_json::json!({ "to": "lambda:b", "content": content }),
+            )
+            .await
+            .expect("send succeeds");
+    }
+
+    for limit in [1, 2] {
+        let inbox = registry_b
+            .dispatch("comm.inbox", serde_json::json!({ "limit": limit }))
+            .await
+            .expect("inbox succeeds");
+        assert_eq!(inbox["count"], limit);
+        assert_eq!(
+            inbox["unread_count"], 3,
+            "unread_count must not be bounded by limit={limit}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn i1931_inbox_unread_count_does_not_saturate_at_old_probe_cap() {
+    let backend = shared_backend();
+    let (_registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, rt_b) = build_actor_registry(backend, "lambda:b");
+
+    let token_b = rt_b
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize actor b");
+    let store_b = rt_b.notes(&token_b).expect("notes store");
+    let notes = (0..1_001)
+        .map(|index| {
+            Note::new("local", "message", format!("unread {index}")).with_properties(
+                serde_json::json!({
+                    "direction": "inbound",
+                    "to_actor": "lambda:b",
+                }),
+            )
+        })
+        .collect();
+    let summary = store_b
+        .upsert_notes(notes)
+        .await
+        .expect("seed unread mailbox");
+    assert_eq!(summary.failed, 0, "unread seed failures: {summary:?}");
+
+    let inbox = registry_b
+        .dispatch("comm.inbox", serde_json::json!({ "limit": 1 }))
+        .await
+        .expect("inbox succeeds");
+    assert_eq!(inbox["count"], 1);
+    assert_eq!(
+        inbox["unread_count"], 1_001,
+        "unread_count must remain exact beyond the removed probe cap"
+    );
+}
+
+/// Explicit JSON null has the same fail-open inbox visibility as an absent
+/// `to_actor`; the mailbox-wide unread count must include it too.
+#[tokio::test]
+async fn i2166_unread_count_includes_explicit_null_recipient() {
+    let backend = shared_backend();
+    let (_registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+
+    backend
+        .notes()
+        .expect("raw notes store")
+        .upsert_note(
+            Note::new("local", "message", "explicit null recipient").with_properties(
+                serde_json::json!({
+                    "direction": "inbound",
+                    "to_actor": null,
+                }),
+            ),
+        )
+        .await
+        .expect("seed explicit-null message");
+
+    let unread = registry_b
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread succeeds");
+    assert_eq!(
+        unread["count"], 1,
+        "explicit null must be counted: {unread}"
+    );
+
+    let inbox = registry_b
+        .dispatch("comm.inbox", serde_json::json!({ "limit": 10 }))
+        .await
+        .expect("inbox succeeds");
+    assert_eq!(inbox["count"], 1, "explicit null must be visible: {inbox}");
+    assert_eq!(
+        inbox["unread_count"], 1,
+        "count must match visibility: {inbox}"
+    );
+}
+
 /// `limit=0` is the count-only inbox path: it returns no message payloads but still reports the caller's real unread total.
 #[tokio::test]
 async fn i66_inbox_limit_zero_carries_real_unread_count() {

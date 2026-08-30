@@ -897,6 +897,14 @@ fn extract_chatgpt_text(
 mod tests {
     use super::*;
 
+    fn anthropic_api_key_fixture() -> String {
+        format!("sk-ant-api03-{}AA", "A".repeat(93))
+    }
+
+    fn github_fine_grained_pat_fixture() -> String {
+        format!("github_pat_{}", "A".repeat(82))
+    }
+
     // Helper: build a minimal CC event JSON string.
     fn make_line(uuid: &str, session_id: &str, type_: &str, extra: &str) -> String {
         format!(
@@ -979,7 +987,7 @@ mod tests {
 
     #[test]
     fn test_secret_masking_in_text_and_raw() {
-        let secret = "sk-ant-api03-AAABBBCCCDDDEEEFFFGGG-XXXXX";
+        let secret = anthropic_api_key_fixture();
         let line = format!(
             r#"{{"uuid":"iiii-jjjj","sessionId":"sess-1111","type":"user","timestamp":"2026-06-29T10:03:00Z","message":{{"role":"user","content":"my key is {secret}"}}}}"#
         );
@@ -987,7 +995,7 @@ mod tests {
 
         let text = ev.text.expect("text should be present");
         assert!(
-            !text.contains(secret),
+            !text.contains(secret.as_str()),
             "secret must not appear in text: {text}"
         );
         assert!(
@@ -996,7 +1004,7 @@ mod tests {
         );
 
         assert!(
-            !ev.raw.contains(secret),
+            !ev.raw.contains(secret.as_str()),
             "secret must not appear in raw: {}",
             ev.raw
         );
@@ -1009,12 +1017,12 @@ mod tests {
 
     #[test]
     fn test_github_pat_masked() {
-        let secret = "github_pat_ABCDE12345fghij67890KLMNO";
+        let secret = github_fine_grained_pat_fixture();
         let line = format!(
             r#"{{"uuid":"kkkk-llll","sessionId":"sess-2","type":"user","timestamp":"2026-06-29T10:04:00Z","message":{{"role":"user","content":"token={secret}"}}}}"#
         );
         let ev = parse_cc_line(&line).unwrap();
-        assert!(!ev.raw.contains(secret));
+        assert!(!ev.raw.contains(secret.as_str()));
         assert!(ev.raw.contains("***MASKED***"));
     }
 
@@ -1166,16 +1174,22 @@ mod tests {
     #[test]
     fn test_codex_secret_masked_in_text_and_raw() {
         // input_text block carrying a secret — masking must apply to both text and raw.
-        let secret = "sk-ant-api03-AAABBBCCCDDDEEEFFFGGG-XXXXX";
-        let line = codex_user_msg(secret);
+        let secret = anthropic_api_key_fixture();
+        let line = codex_user_msg(&secret);
         let ev = parse_codex_line(&line, CDX_SID, 0).expect("should parse");
         let text = ev.text.expect("text present");
-        assert!(!text.contains(secret), "secret must not appear in text");
+        assert!(
+            !text.contains(secret.as_str()),
+            "secret must not appear in text"
+        );
         assert!(
             text.contains("***MASKED***"),
             "MASKED marker must appear in text"
         );
-        assert!(!ev.raw.contains(secret), "secret must not appear in raw");
+        assert!(
+            !ev.raw.contains(secret.as_str()),
+            "secret must not appear in raw"
+        );
         assert!(
             ev.raw.contains("***MASKED***"),
             "MASKED marker must appear in raw"
