@@ -28,6 +28,7 @@ pub use preference_artifact::{
 };
 
 pub(crate) const PACK_NAME: &str = "moodboard";
+pub(crate) const LATTICE_VERSION: &str = "0.9.0";
 
 /// Opt-in Moodboard visual-retrieval and preference-learning pack.
 pub struct MoodboardPack {
@@ -59,5 +60,31 @@ impl MoodboardPack {
 
     pub(crate) fn model_state(&self) -> &VisionModelState {
         &self.model
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LATTICE_VERSION;
+
+    #[test]
+    fn lattice_provenance_version_matches_all_exact_workspace_pins() {
+        let manifest: toml::Value = include_str!("../../Cargo.toml")
+            .parse()
+            .expect("workspace Cargo.toml must parse");
+        let dependencies = manifest["workspace"]["dependencies"]
+            .as_table()
+            .expect("workspace.dependencies must be a table");
+
+        for dependency in ["lattice-embed", "lattice-inference", "lattice-fann"] {
+            let pin = match &dependencies[dependency] {
+                toml::Value::String(version) => version.as_str(),
+                toml::Value::Table(specification) => specification["version"]
+                    .as_str()
+                    .expect("lattice dependency table must contain a version"),
+                value => panic!("unexpected {dependency} dependency shape: {value:?}"),
+            };
+            assert_eq!(pin, format!("={LATTICE_VERSION}"), "{dependency}");
+        }
     }
 }

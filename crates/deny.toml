@@ -26,18 +26,7 @@ all-features = false
 # "workspace" = only unmaintained direct workspace deps are reported.
 unmaintained = "workspace"
 yanked = "deny"
-ignore = [
-    # FINDING: RUSTSEC-2026-0002 (lru 0.12.x IterMut soundness violation).
-    # Fix is lru >= 0.16.3, which is a breaking API change from lru 0.12.
-    # Two paths reach lru 0.12.5 (cargo tree -i lru@0.12.5): khive-pack-memory
-    # (query_cache.rs) and the lattice-embed 0.3.0 dependency. Both use
-    # lru::LruCache via .get()/.put() only — neither calls .iter_mut() on the
-    # cache, so the unsound IterMut is not reachable through any path in our tree
-    # today. Verified against khive-pack-memory source and the lattice-embed
-    # registry source.
-    # Track: upgrade lru to >= 0.16.3 once API compatibility is confirmed.
-    { id = "RUSTSEC-2026-0002", reason = "lru::IterMut is never called on either reachable path (khive-pack-memory, lattice-embed); only .get()/.put() are used. Upgrade to lru >= 0.16.3 tracked separately." },
-]
+ignore = []
 
 [licenses]
 confidence-threshold = 0.93
