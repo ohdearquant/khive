@@ -10,6 +10,7 @@ pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod audit_batch;
+pub mod audit_context;
 pub mod blob;
 pub mod build_info;
 pub mod config;
@@ -94,8 +95,8 @@ pub use khive_db::{
     CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
-    ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
-    GateRef, GateRequest, Obligation,
+    ActorRef, AllowAllGate, ArgumentOrigin, AuditArgumentIdentity, AuditDecision, AuditEvent, Gate,
+    GateContext, GateDecision, GateError, GateRef, GateRequest, Obligation,
 };
 pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};

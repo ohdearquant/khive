@@ -20,8 +20,12 @@ into `RuntimeConfig.gate`.
 | `actor`     | `ActorRef`          | Caller identity (`kind` + `id`)        |
 | `namespace` | `Namespace`         | Validated namespace from `khive-types` |
 | `verb`      | `String`            | Verb being dispatched                  |
-| `args`      | `serde_json::Value` | Verb arguments as arbitrary JSON       |
+| `args`      | `serde_json::Value` | Resolved, pre-canonical transport args  |
 | `context`   | `GateContext`       | Optional session, timestamp, source    |
+
+The gate authorizes actor/namespace/verb. `args` is intentionally non-authoritative for semantic
+authorization: `$prev` substitution has run, while handler validation, defaults, and kind hooks
+have not. Effective handler arguments are identified separately in durable audit events.
 
 ### `GateDecision` (output)
 
@@ -33,7 +37,8 @@ Tagged by `"decision"` field: `"allow"` or `"deny"`.
 ### `AuditEvent` (ADR-018 audit record)
 
 Emitted once per gate consultation. Fields include `actor`, `namespace`, `verb`,
-`decision`, `deny_reason`, `obligations`, `gate_impl`, `session_id`, and `timestamp`.
+`decision`, `deny_reason`, `obligations`, `gate_impl`, `session_id`, `timestamp`, optional
+request-group operation provenance, and masked resolved/effective argument identities.
 Field names are a **stable public contract** — renaming requires a new ADR.
 
 ## Quick start

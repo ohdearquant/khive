@@ -366,6 +366,11 @@ impl KgPack {
             h.prepare_create(&self.runtime, &mut params).await?;
         }
 
+        // The gate intentionally receives the resolved wire envelope. Record the hook-finalized
+        // shape separately so the durable audit can prove when canonical handler semantics differ
+        // without persisting either argument value set.
+        khive_runtime::audit_context::record_effective_arguments(&params);
+
         let p: CreateParams = deser(params.clone())?;
         let skip_dedup = p.skip_dedup_check.unwrap_or(false);
 

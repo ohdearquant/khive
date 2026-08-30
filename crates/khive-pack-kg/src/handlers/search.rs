@@ -230,6 +230,25 @@ impl ValidatedSearchRequest {
             self.limit
         }
     }
+
+    /// Canonical argument projection consumed by both single- and multi-backend search paths.
+    pub fn effective_arguments(&self) -> Value {
+        json!({
+            "query": self.query,
+            "limit": self.limit,
+            "substrate": match self.substrate {
+                SearchSubstrate::Entity => "entity",
+                SearchSubstrate::Note => "note",
+            },
+            "kind_filter": self.kind_filter,
+            "entity_type": self.entity_type,
+            "include_superseded": self.include_superseded,
+            "properties": self.properties,
+            "tags": self.tags,
+            "source": self.source.map(|source| source.as_str()),
+            "min_score": self.min_score,
+        })
+    }
 }
 
 fn reject_search_field_for_substrate<T>(
@@ -258,6 +277,7 @@ impl KgPack {
     ) -> Result<Value, RuntimeError> {
         let search_start = Instant::now();
         let request = ValidatedSearchRequest::from_value(params, registry)?;
+        khive_runtime::audit_context::record_effective_arguments(&request.effective_arguments());
         match request.substrate() {
             SearchSubstrate::Entity => {
                 let props_filter = request.properties();

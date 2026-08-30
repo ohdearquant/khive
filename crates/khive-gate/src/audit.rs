@@ -1,7 +1,37 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{ActorRef, GateDecision, Obligation};
+
+/// How a top-level operation argument entered the resolved dispatch envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgumentOrigin {
+    /// The operation supplied a concrete JSON value.
+    Literal,
+    /// The value was obtained entirely from a chain `$prev` reference.
+    ResolvedReference,
+    /// A container combined literal content with one or more `$prev` references.
+    Mixed,
+}
+
+/// Non-reversible identity for an argument envelope.
+///
+/// Values are never persisted. The runtime secret-masks a canonical JSON projection before
+/// hashing it and exposes only a bounded list of masked top-level keys for diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditArgumentIdentity {
+    /// BLAKE3 identity of the secret-masked canonical argument envelope.
+    pub digest: String,
+    /// Sorted, bounded, secret-masked top-level object keys.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Whether additional top-level keys were omitted from `keys`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keys_truncated: bool,
+}
 
 /// Structured audit record emitted once per gate consultation.
 ///
@@ -30,6 +60,18 @@ pub struct AuditEvent {
     /// Correlation token — `GateContext::session_id` when present, else `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Zero-based operation position within a request group, when supplied by the transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_index: Option<u32>,
+    /// Per-top-level-argument literal/substitution provenance from the parsed request.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub argument_origins: BTreeMap<String, ArgumentOrigin>,
+    /// Identity of the resolved pre-gate argument envelope; values are never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_arguments: Option<AuditArgumentIdentity>,
+    /// Identity of the canonical argument envelope consumed by the handler, when dispatched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_arguments: Option<AuditArgumentIdentity>,
 }
 
 /// The outcome field of an [`AuditEvent`].
@@ -64,6 +106,10 @@ impl AuditEvent {
             obligations,
             gate_impl: gate_impl.to_string(),
             session_id: req.context.session_id.clone(),
+            operation_index: None,
+            argument_origins: BTreeMap::new(),
+            resolved_arguments: None,
+            effective_arguments: None,
         }
     }
 
@@ -79,6 +125,10 @@ impl AuditEvent {
             obligations: Vec::new(),
             gate_impl: gate_impl.to_string(),
             session_id: req.context.session_id.clone(),
+            operation_index: None,
+            argument_origins: BTreeMap::new(),
+            resolved_arguments: None,
+            effective_arguments: None,
         }
     }
 }

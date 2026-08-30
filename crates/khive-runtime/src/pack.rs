@@ -1720,7 +1720,11 @@ impl VerbRegistry {
         let gate_req = self.gate_request_with_identity(verb, params, identity)?;
         let mut deferred_audit = match self.gate.check(&gate_req) {
             Ok(decision) => {
-                let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
+                let audit = begin_audit_event(
+                    AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name()),
+                    &gate_req,
+                    request_id,
+                );
                 tracing::info!(
                     audit_event = %serde_json::to_string(&audit)
                         .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
@@ -1765,8 +1769,15 @@ impl VerbRegistry {
         };
 
         let started = Instant::now();
-        let mut result = dispatch(gate_req.namespace.clone()).await;
+        let (dispatch_result, effective_arguments) =
+            crate::audit_context::capture_effective_arguments(
+                gate_req.args.clone(),
+                dispatch(gate_req.namespace.clone()),
+            )
+            .await;
+        let mut result = dispatch_result;
         let duration_us = started.elapsed().as_micros() as i64;
+        complete_audit_event(&mut deferred_audit, &effective_arguments);
         let receipt_outcome = if verb == "git.digest" && result.is_ok() {
             let resource = result.as_ref().ok().map(|outcome| {
                 crate::cost_unit::resource_payload(
@@ -1935,7 +1946,11 @@ impl VerbRegistry {
         error: &khive_gate::GateError,
         request_id: Option<u64>,
     ) -> RuntimeError {
-        let audit = AuditEvent::gate_unavailable(gate_req, self.gate.impl_name());
+        let audit = begin_audit_event(
+            AuditEvent::gate_unavailable(gate_req, self.gate.impl_name()),
+            gate_req,
+            request_id,
+        );
         tracing::info!(
             audit_event = %serde_json::to_string(&audit)
                 .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
@@ -2042,7 +2057,11 @@ impl VerbRegistry {
                 let is_deny = matches!(decision, GateDecision::Deny { .. });
 
                 // Emit audit event via tracing.
-                let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
+                let audit = begin_audit_event(
+                    AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name()),
+                    &gate_req,
+                    request_id,
+                );
                 tracing::info!(
                     audit_event = %serde_json::to_string(&audit)
                         .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
@@ -2248,8 +2267,16 @@ impl VerbRegistry {
                     params
                 };
                 let dispatch_start = Instant::now();
-                let mut result = pack.dispatch(verb, params, self, &token).await;
+                let effective_fallback = params.clone();
+                let (dispatch_result, effective_arguments) =
+                    crate::audit_context::capture_effective_arguments(
+                        effective_fallback,
+                        pack.dispatch(verb, params, self, &token),
+                    )
+                    .await;
+                let mut result = dispatch_result;
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
+                complete_audit_event(&mut deferred_audit, &effective_arguments);
 
                 // Unlike ordinary audit rows, a successful `git.digest`
                 // response is returned only after its complete report has
@@ -3448,6 +3475,38 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
     args.get("target_id")
         .and_then(serde_json::Value::as_str)
         .and_then(|s| s.parse::<uuid::Uuid>().ok())
+}
+
+/// Attach request-group provenance and a non-reversible identity of the exact pre-gate envelope.
+fn begin_audit_event(
+    mut audit: AuditEvent,
+    gate_req: &GateRequest,
+    request_id: Option<u64>,
+) -> AuditEvent {
+    if let Some(context) = crate::audit_context::current_operation() {
+        audit.operation_index = Some(context.index);
+        audit.argument_origins = context.argument_origins;
+    } else if request_id.is_some() {
+        // Non-MCP hosts can supply a request id without a parsed-operation scope. Such a dispatch
+        // is necessarily one literal operation in its group.
+        audit.operation_index = Some(0);
+        if let Value::Object(arguments) = &gate_req.args {
+            audit.argument_origins = arguments
+                .keys()
+                .map(|name| (name.clone(), khive_gate::ArgumentOrigin::Literal))
+                .collect();
+        }
+    }
+    audit.resolved_arguments = Some(crate::audit_context::argument_identity(&gate_req.args));
+    audit
+}
+
+/// Add the handler/coordinator's final canonical argument identity before durable persistence.
+fn complete_audit_event(audit: &mut Option<AuditEvent>, effective_arguments: &Value) {
+    if let Some(audit) = audit {
+        audit.effective_arguments =
+            Some(crate::audit_context::argument_identity(effective_arguments));
+    }
 }
 
 /// Build a v1-shape audit storage event from a gate check outcome.

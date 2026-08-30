@@ -20,6 +20,12 @@ public compatibility contract. `verb` must be non-empty; `actor` and `namespace`
 invariants. `try_new` returns `GateValidationError`, `new` panics for trusted inputs, and
 `with_context` attaches session, timestamp, and transport-source metadata.
 
+`args` is the resolved transport envelope at dispatch entry. In a chain, `$prev` has already been
+substituted; pack validation, defaults, kind hooks, and coordinator canonicalization have not run.
+It is not an authoritative representation of final semantic handler arguments. Authorization is
+actor/namespace/verb scoped; semantic argument constraints remain handler-seam responsibilities
+unless a future contract adds pre-gate canonicalization or a second check.
+
 ## `GateDecision`
 
 The internally tagged JSON form uses `"decision": "allow"` or `"deny"`. Allow decisions carry an

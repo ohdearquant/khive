@@ -20,7 +20,7 @@ input.actor.kind          # "user" | "agent" | "lambda" | "anonymous" | ...
 input.actor.id            # caller id
 input.namespace           # khive namespace, as a string
 input.verb                # the verb being dispatched
-input.args                # raw JSON args for the verb
+input.args                # resolved transport args; pre-validation/canonicalization
 input.context.session_id  # optional
 input.context.timestamp   # optional, RFC3339
 input.context.source      # optional ("mcp", "cli", ...)
