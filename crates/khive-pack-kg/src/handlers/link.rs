@@ -66,13 +66,14 @@ impl KgPack {
                         relation,
                         weight,
                         metadata,
+                        resurrect: entry.resurrect.unwrap_or(false),
                     });
                 }
                 registry
                     .validate_link_hooks(&self.runtime, token, &specs)
                     .await?;
-                let edges = match self.runtime.link_many(token, specs.clone()).await {
-                    Ok(edges) => edges,
+                let rows = match self.runtime.link_many_observed(token, specs.clone()).await {
+                    Ok(rows) => rows,
                     Err(RuntimeError::InvalidInput(ref msg))
                         if msg.contains("not in the base endpoint allowlist") =>
                     {
@@ -88,15 +89,43 @@ impl KgPack {
                     }
                     Err(e) => return Err(e),
                 };
+                let created = rows
+                    .iter()
+                    .filter(|row| row.disposition == khive_storage::EdgeUpsertDisposition::Created)
+                    .count();
+                let updated = rows
+                    .iter()
+                    .filter(|row| row.disposition == khive_storage::EdgeUpsertDisposition::Updated)
+                    .count();
+                let resurrected = rows
+                    .iter()
+                    .filter(|row| {
+                        row.disposition == khive_storage::EdgeUpsertDisposition::Resurrected
+                    })
+                    .count();
                 let mut resp = serde_json::json!({
                     "attempted": attempted,
-                    "created": edges.len(),
+                    "created": created,
+                    "updated": updated,
+                    "resurrected": resurrected,
                     "skipped": skipped,
                     "failed": 0,
                 });
                 if verbose {
-                    resp["edges"] = serde_json::to_value(&edges)
-                        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+                    resp["edges"] = Value::Array(
+                        rows.iter()
+                            .map(|row| {
+                                let mut value = to_json(&row.edge)?;
+                                if let Some(object) = value.as_object_mut() {
+                                    object.insert(
+                                        "mutation".to_string(),
+                                        json!(row.disposition.name()),
+                                    );
+                                }
+                                Ok(value)
+                            })
+                            .collect::<Result<Vec<_>, RuntimeError>>()?,
+                    );
                 }
                 return to_json(&resp);
             } else {
@@ -104,6 +133,9 @@ impl KgPack {
                 let mut error_list: Vec<Value> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
                 let mut skipped = 0usize;
+                let mut created = 0usize;
+                let mut updated = 0usize;
+                let mut resurrected = 0usize;
                 for (idx, entry) in entries.into_iter().enumerate() {
                     let source =
                         match resolve_uuid_unfiltered(&entry.source_id, &self.runtime, token).await
@@ -164,6 +196,7 @@ impl KgPack {
                         relation,
                         weight,
                         metadata: metadata.clone(),
+                        resurrect: entry.resurrect.unwrap_or(false),
                     };
                     if let Err(e) = registry
                         .validate_link_hooks(&self.runtime, token, std::slice::from_ref(&spec))
@@ -174,10 +207,32 @@ impl KgPack {
                     }
                     match self
                         .runtime
-                        .link(token, source, target, relation, weight, metadata)
+                        .link_observed(
+                            token,
+                            source,
+                            target,
+                            relation,
+                            weight,
+                            metadata,
+                            spec.resurrect,
+                        )
                         .await
                     {
-                        Ok(edge) => results.push(to_json(&edge)?),
+                        Ok(row) => {
+                            match row.disposition {
+                                khive_storage::EdgeUpsertDisposition::Created => created += 1,
+                                khive_storage::EdgeUpsertDisposition::Updated => updated += 1,
+                                khive_storage::EdgeUpsertDisposition::Resurrected => {
+                                    resurrected += 1
+                                }
+                            }
+                            let mut value = to_json(&row.edge)?;
+                            if let Some(object) = value.as_object_mut() {
+                                object
+                                    .insert("mutation".to_string(), json!(row.disposition.name()));
+                            }
+                            results.push(value);
+                        }
                         Err(RuntimeError::InvalidInput(ref msg))
                             if msg.contains("not in the base endpoint allowlist") =>
                         {
@@ -197,7 +252,9 @@ impl KgPack {
                 }
                 let mut resp = serde_json::json!({
                     "attempted": attempted,
-                    "created": results.len(),
+                    "created": created,
+                    "updated": updated,
+                    "resurrected": resurrected,
                     "skipped": skipped,
                     "failed": error_list.len(),
                     "errors": error_list,
@@ -230,14 +287,23 @@ impl KgPack {
             relation,
             weight,
             metadata: metadata.clone(),
+            resurrect: p.resurrect.unwrap_or(false),
         };
         registry
             .validate_link_hooks(&self.runtime, token, std::slice::from_ref(&spec))
             .await?;
 
-        let edge = match self
+        let row = match self
             .runtime
-            .link(token, source, target, relation, weight, metadata)
+            .link_observed(
+                token,
+                source,
+                target,
+                relation,
+                weight,
+                metadata,
+                spec.resurrect,
+            )
             .await
         {
             Ok(e) => e,
@@ -251,7 +317,10 @@ impl KgPack {
             }
             Err(e) => return Err(e),
         };
-        let mut raw = to_json(&edge)?;
+        let mut raw = to_json(&row.edge)?;
+        if let Some(obj) = raw.as_object_mut() {
+            obj.insert("mutation".to_string(), json!(row.disposition.name()));
+        }
         if relation.is_symmetric() {
             if let Some(obj) = raw.as_object_mut() {
                 obj.insert("source_id".to_string(), json!(source.to_string()));

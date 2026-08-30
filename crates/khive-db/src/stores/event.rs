@@ -208,6 +208,7 @@ fn referent_kind_from_str(s: &str) -> Result<ReferentKind, rusqlite::Error> {
     match s {
         "entity" => Ok(ReferentKind::Entity),
         "note" => Ok(ReferentKind::Note),
+        "edge" => Ok(ReferentKind::Edge),
         other => Err(rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Text,
@@ -673,6 +674,7 @@ fn decode_event_observations(event: &Event) -> Result<Vec<EventObservation>, rus
         EventKind::RecallExecuted => decode_recall_observations(event),
         EventKind::SearchExecuted => decode_search_observations(event),
         EventKind::LinkCreated => decode_link_observations(event),
+        EventKind::EdgeUpdated | EventKind::EdgeDeleted => decode_edge_target_observation(event),
         EventKind::EntityCreated
         | EventKind::EntityUpdated
         | EventKind::EntityDeleted
@@ -918,7 +920,29 @@ fn decode_link_observations(event: &Event) -> Result<Vec<EventObservation>, rusq
             position: 1,
         });
     }
+    if let Some(edge_id) = event.target_id.or(payload_uuid(event, "id")?) {
+        rows.push(EventObservation {
+            event_id: event.id,
+            entity_id: edge_id,
+            referent_kind: ReferentKind::Edge,
+            role: ObservationRole::Target,
+            position: 2,
+        });
+    }
     Ok(rows)
+}
+
+fn decode_edge_target_observation(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
+    let Some(edge_id) = event.target_id.or(payload_uuid(event, "id")?) else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![EventObservation {
+        event_id: event.id,
+        entity_id: edge_id,
+        referent_kind: ReferentKind::Edge,
+        role: ObservationRole::Target,
+        position: 0,
+    }])
 }
 
 fn decode_target_observation(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
@@ -1033,8 +1057,13 @@ fn build_event_filter_sql(
         conditions.push(format!("session_id = ?{}", params.len()));
     }
 
-    push_observation_exists(&mut conditions, &mut params, "candidate", &filter.observed);
-    push_observation_exists(&mut conditions, &mut params, "selected", &filter.selected);
+    push_observation_exists(&mut conditions, &mut params, None, &filter.observed);
+    push_observation_exists(
+        &mut conditions,
+        &mut params,
+        Some("selected"),
+        &filter.selected,
+    );
 
     if let Some(proposal_id) = filter.payload_proposal_id {
         params.push(Box::new(proposal_id.to_string()));
@@ -1071,7 +1100,7 @@ fn push_in_clause<I>(
 fn push_observation_exists(
     conditions: &mut Vec<String>,
     params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
-    role: &'static str,
+    role: Option<&'static str>,
     entity_ids: &[Uuid],
 ) {
     if entity_ids.is_empty() {
@@ -1084,9 +1113,12 @@ fn push_observation_exists(
             format!("?{}", params.len())
         })
         .collect();
+    let role_clause = role
+        .map(|role| format!(" AND o.role = '{role}'"))
+        .unwrap_or_default();
     conditions.push(format!(
         "EXISTS (SELECT 1 FROM event_observations o \
-         WHERE o.event_id = events.id AND o.role = '{role}' AND o.entity_id IN ({}))",
+         WHERE o.event_id = events.id{role_clause} AND o.entity_id IN ({}))",
         placeholders.join(",")
     ));
 }

@@ -2217,6 +2217,177 @@ async fn configured_kg_pack() -> (
     (rt, token, pack, registry)
 }
 
+// khive#2087: `link` is an observable upsert. A live natural-key conflict is
+// an explicit replacement, while a tombstone requires caller opt-in before it
+// can be resurrected. Typed lifecycle events must project the affected edge id
+// so the event surface can answer `observed=[edge_id]`.
+#[tokio::test]
+async fn link_reports_replace_and_explicit_resurrection_with_edge_observations() {
+    use khive_storage::{event::EventFilter, PageRequest};
+    use khive_types::EventKind;
+    use uuid::Uuid;
+
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+    let source = rt
+        .create_entity(&token, "concept", None, "source", None, None, vec![])
+        .await
+        .expect("create source");
+    let target = rt
+        .create_entity(&token, "concept", None, "target", None, None, vec![])
+        .await
+        .expect("create target");
+
+    let created = pack
+        .handle_link(
+            &token,
+            json!({
+                "source_id": source.id,
+                "target_id": target.id,
+                "relation": "extends",
+                "weight": 0.4,
+                "metadata": {"phase": "created"},
+            }),
+            &registry,
+        )
+        .await
+        .expect("initial link");
+    assert_eq!(created["mutation"], "created");
+    let edge_id = Uuid::parse_str(created["id"].as_str().expect("edge id")).expect("UUID");
+
+    let created_events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::LinkCreated],
+                observed: vec![edge_id],
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query LinkCreated by edge observation");
+    let all_events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query all events");
+    assert_eq!(
+        created_events.items.len(),
+        1,
+        "LinkCreated must be visible through its edge observation; all events: {:?}",
+        all_events.items
+    );
+    assert_eq!(created_events.items[0].target_id, Some(edge_id));
+
+    let updated = pack
+        .handle_link(
+            &token,
+            json!({
+                "source_id": source.id,
+                "target_id": target.id,
+                "relation": "extends",
+                "weight": 0.7,
+                "metadata": {"phase": "updated"},
+            }),
+            &registry,
+        )
+        .await
+        .expect("live natural-key replacement");
+    assert_eq!(updated["mutation"], "updated");
+    assert_eq!(updated["id"], created["id"]);
+    assert_eq!(updated["metadata"], json!({"phase": "updated"}));
+
+    assert!(rt
+        .delete_edge(&token, edge_id, false)
+        .await
+        .expect("soft-delete edge"));
+    let tombstone = rt
+        .get_edge_including_deleted(&token, edge_id)
+        .await
+        .expect("read tombstone")
+        .expect("tombstone exists");
+    assert!(tombstone.deleted_at.is_some());
+
+    let refusal = pack
+        .handle_link(
+            &token,
+            json!({
+                "source_id": source.id,
+                "target_id": target.id,
+                "relation": "extends",
+                "weight": 0.9,
+                "metadata": {"phase": "must-not-apply"},
+            }),
+            &registry,
+        )
+        .await
+        .expect_err("implicit resurrection must be refused");
+    assert!(
+        refusal.to_string().contains("resurrect=true"),
+        "refusal must explain the explicit opt-in: {refusal}"
+    );
+    let preserved = rt
+        .get_edge_including_deleted(&token, edge_id)
+        .await
+        .expect("read refused tombstone")
+        .expect("tombstone remains");
+    assert_eq!(preserved.deleted_at, tombstone.deleted_at);
+    assert_eq!(preserved.metadata, tombstone.metadata);
+
+    let resurrected = pack
+        .handle_link(
+            &token,
+            json!({
+                "source_id": source.id,
+                "target_id": target.id,
+                "relation": "extends",
+                "weight": 0.9,
+                "metadata": {"phase": "resurrected"},
+                "resurrect": true,
+            }),
+            &registry,
+        )
+        .await
+        .expect("explicit resurrection");
+    assert_eq!(resurrected["mutation"], "resurrected");
+    assert_eq!(resurrected["id"], created["id"]);
+    assert!(resurrected["deleted_at"].is_null());
+
+    let mutation_events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::EdgeUpdated],
+                observed: vec![edge_id],
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query EdgeUpdated by edge observation");
+    assert_eq!(mutation_events.items.len(), 2);
+    assert!(mutation_events
+        .items
+        .iter()
+        .any(|event| event.payload["mutation"] == "resurrected"
+            && !event.payload["previous"]["deleted_at"].is_null()));
+}
+
 // ADR-087 Amendment 1 §A9: review-round chains are `decision precedes
 // decision` note-to-note edges (round N-1 precedes round N). KG_EDGE_RULES
 // additively extends the base entity-only `precedes` contract to

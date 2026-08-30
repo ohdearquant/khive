@@ -11,10 +11,12 @@ use uuid::Uuid;
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
-    MissingEndpoints, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor,
-    SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget,
-    TraversalOptions, TraversalRequest,
+    EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult,
+    GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedEdgeBatchRefusal,
+    GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, MissingEndpoints,
+    NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor, SeekPage, SortDirection,
+    SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions,
+    TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -35,6 +37,17 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Graph, op, e)
 }
 
+fn resurrection_required_error(operation: &'static str, edge: &Edge) -> StorageError {
+    StorageError::Conflict {
+        capability: StorageCapability::Graph,
+        operation: operation.into(),
+        message: format!(
+            "edge {} is soft-deleted; explicit resurrection is required",
+            edge.id
+        ),
+    }
+}
+
 const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
 
 // ---------------------------------------------------------------------------
@@ -45,18 +58,28 @@ const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
 // non-symmetric branch) all call these.
 // ---------------------------------------------------------------------------
 
-/// The natural-key conflict arm's `SET` list — shared, textually, between
-/// [`edge_upsert_statement`] and [`edge_insert_guarded_by_endpoints_statement`]
-/// (ADR-099 §B3) so the two can never silently
-/// diverge again: the atomic link path previously hand-duplicated this SET
-/// list without `target_backend = excluded.target_backend`, so a re-link of
-/// an edge that had a cross-backend `target_backend` stamp behaved
-/// differently under `--atomic` than under canonical `link`.
-const EDGE_NATURAL_KEY_CONFLICT_SET: &str = "weight = excluded.weight, \
-     updated_at = excluded.updated_at, \
-     deleted_at = NULL, \
-     metadata = excluded.metadata, \
-     target_backend = excluded.target_backend";
+/// Replacement clause shared by canonical and guarded upserts. Live rows use
+/// replace semantics. Tombstones are excluded unless resurrection was
+/// explicitly requested; only that branch clears `deleted_at`.
+fn edge_conflict_clause(resurrect: bool) -> String {
+    let deleted_at = if resurrect {
+        "NULL"
+    } else {
+        "graph_edges.deleted_at"
+    };
+    let predicate = if resurrect {
+        ""
+    } else {
+        " WHERE graph_edges.deleted_at IS NULL"
+    };
+    format!(
+        "weight = excluded.weight, \
+         updated_at = excluded.updated_at, \
+         deleted_at = {deleted_at}, \
+         metadata = excluded.metadata, \
+         target_backend = excluded.target_backend{predicate}"
+    )
+}
 
 /// A `WHERE`-clause fragment asserting the id bound to `id_param` (an SQL
 /// placeholder like `?3`) resolves to a live edge endpoint — an
@@ -81,12 +104,18 @@ fn endpoint_exists_clause(id_param: &str) -> String {
 /// `upsert_edge` issues. Canonicalizes symmetric-relation endpoints first,
 /// matching `upsert_edge`'s own call to `canonical_edge_endpoints`.
 pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
+    edge_upsert_statement_with_resurrection(edge, false)
+}
+
+/// Policy-aware form of [`edge_upsert_statement`].
+pub fn edge_upsert_statement_with_resurrection(edge: &Edge, resurrect: bool) -> SqlStatement {
     let (source_id, target_id) =
         canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
     let metadata_str = edge
         .metadata
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let conflict_clause = edge_conflict_clause(resurrect);
     SqlStatement {
         sql: format!(
             "INSERT INTO graph_edges \
@@ -97,9 +126,9 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
                   source_id = excluded.source_id, \
                   target_id = excluded.target_id, \
                   relation = excluded.relation, \
-                  {EDGE_NATURAL_KEY_CONFLICT_SET} \
+                  {conflict_clause} \
               ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
-                  {EDGE_NATURAL_KEY_CONFLICT_SET}"
+                  {conflict_clause}"
         ),
         params: vec![
             SqlValue::Text(edge.namespace.clone()),
@@ -215,8 +244,27 @@ pub fn edge_insert_guarded_by_endpoints_statement(
     now: i64,
     metadata: Option<&str>,
 ) -> SqlStatement {
+    edge_insert_guarded_by_endpoints_with_resurrection_statement(
+        namespace, source_id, target_id, edge_id, relation, weight, now, metadata, false,
+    )
+}
+
+/// Policy-aware form of [`edge_insert_guarded_by_endpoints_statement`].
+#[allow(clippy::too_many_arguments)]
+pub fn edge_insert_guarded_by_endpoints_with_resurrection_statement(
+    namespace: &str,
+    source_id: Uuid,
+    target_id: Uuid,
+    edge_id: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+    now: i64,
+    metadata: Option<&str>,
+    resurrect: bool,
+) -> SqlStatement {
     let src_exists = endpoint_exists_clause("?3");
     let tgt_exists = endpoint_exists_clause("?4");
+    let conflict_clause = edge_conflict_clause(resurrect);
     SqlStatement {
         sql: format!(
             "INSERT INTO graph_edges \
@@ -225,7 +273,7 @@ pub fn edge_insert_guarded_by_endpoints_statement(
               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8 \
               WHERE ({src_exists}) AND ({tgt_exists}) \
               ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
-                  {EDGE_NATURAL_KEY_CONFLICT_SET}"
+                  {conflict_clause}"
         ),
         params: vec![
             SqlValue::Text(namespace.to_string()),
@@ -241,6 +289,91 @@ pub fn edge_insert_guarded_by_endpoints_statement(
             },
         ],
         label: Some("atomic-link-insert-edge-where-exists".to_string()),
+    }
+}
+
+/// Atomic `link` create arm. Unlike the compatibility upsert builder above,
+/// this statement never changes a row that appeared after prepare: a natural-
+/// key conflict affects zero rows and therefore fails the caller's guard.
+#[allow(clippy::too_many_arguments)]
+pub fn edge_insert_new_guarded_by_endpoints_statement(
+    namespace: &str,
+    edge_id: Uuid,
+    source_id: Uuid,
+    target_id: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+    now: i64,
+    metadata: Option<&str>,
+) -> SqlStatement {
+    let src_exists = endpoint_exists_clause("?3");
+    let tgt_exists = endpoint_exists_clause("?4");
+    SqlStatement {
+        sql: format!(
+            "INSERT INTO graph_edges \
+              (namespace, id, source_id, target_id, relation, weight, \
+               created_at, updated_at, metadata) \
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8 \
+              WHERE ({src_exists}) AND ({tgt_exists}) \
+              ON CONFLICT DO NOTHING"
+        ),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(edge_id.to_string()),
+            SqlValue::Text(source_id.to_string()),
+            SqlValue::Text(target_id.to_string()),
+            SqlValue::Text(relation.to_string()),
+            SqlValue::Float(weight),
+            SqlValue::Integer(now),
+            metadata
+                .map(|value| SqlValue::Text(value.to_string()))
+                .unwrap_or(SqlValue::Null),
+        ],
+        label: Some("edge-link-create-if-absent-and-endpoints-exist".to_string()),
+    }
+}
+
+/// Atomic `link` replace/resurrection arm. The natural-key row and both
+/// concurrency markers must still match the prepare snapshot, and both
+/// endpoints must still exist. Clearing `deleted_at` is deliberate here:
+/// callers only build this statement for a live replacement or an explicitly
+/// authorized resurrection.
+pub fn edge_link_replace_if_unchanged_and_endpoints_exist_statement(
+    previous: &Edge,
+    weight: f64,
+    now: i64,
+    metadata: Option<&str>,
+) -> SqlStatement {
+    let src_exists = endpoint_exists_clause("?6");
+    let tgt_exists = endpoint_exists_clause("?7");
+    SqlStatement {
+        sql: format!(
+            "UPDATE graph_edges SET \
+               weight = ?1, updated_at = ?2, deleted_at = NULL, \
+               metadata = ?3, target_backend = NULL \
+             WHERE namespace = ?4 AND id = ?5 \
+               AND source_id = ?6 AND target_id = ?7 AND relation = ?8 \
+               AND updated_at = ?9 AND deleted_at IS ?10 AND ?2 > updated_at \
+               AND ({src_exists}) AND ({tgt_exists})"
+        ),
+        params: vec![
+            SqlValue::Float(weight),
+            SqlValue::Integer(now),
+            metadata
+                .map(|value| SqlValue::Text(value.to_string()))
+                .unwrap_or(SqlValue::Null),
+            SqlValue::Text(previous.namespace.clone()),
+            SqlValue::Text(Uuid::from(previous.id).to_string()),
+            SqlValue::Text(previous.source_id.to_string()),
+            SqlValue::Text(previous.target_id.to_string()),
+            SqlValue::Text(previous.relation.to_string()),
+            SqlValue::Integer(previous.updated_at.timestamp_micros()),
+            previous
+                .deleted_at
+                .map(|value| SqlValue::Integer(value.timestamp_micros()))
+                .unwrap_or(SqlValue::Null),
+        ],
+        label: Some("edge-link-replace-if-unchanged-and-endpoints-exist".to_string()),
     }
 }
 
@@ -697,6 +830,78 @@ impl SqlGraphStore {
         }
     }
 
+    async fn observed_edge_write(
+        &self,
+        operation: &'static str,
+        request: EdgeUpsertRequest,
+        guard_endpoints: bool,
+    ) -> Result<GuardedEdgeUpsertOutcome, StorageError> {
+        if let Some(writer_task) = self.current_writer_task(operation)? {
+            return writer_task
+                .send_bounded(move |conn| {
+                    observed_edge_upsert(conn, &request, guard_endpoints)
+                        .map_err(|error| map_err(error, operation))
+                })
+                .await;
+        }
+
+        let origin = self.pool.origin();
+        self.with_writer(operation, move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register_scoped(Some(operation.to_string()), origin);
+            let outcome = match observed_edge_upsert(conn, &request, guard_endpoints) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            };
+            if let Err(error) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+            Ok(outcome)
+        })
+        .await
+    }
+
+    async fn observed_edge_batch_write(
+        &self,
+        operation: &'static str,
+        requests: Vec<EdgeUpsertRequest>,
+        guard_endpoints: bool,
+    ) -> Result<GuardedEdgeBatchUpsertOutcome, StorageError> {
+        if let Some(writer_task) = self.current_writer_task(operation)? {
+            return writer_task
+                .send_bounded(move |conn| {
+                    observed_edge_batch_upsert(conn, &requests, guard_endpoints)
+                        .map_err(|error| map_err(error, operation))
+                })
+                .await;
+        }
+
+        let origin = self.pool.origin();
+        self.with_writer(operation, move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register_scoped(Some(operation.to_string()), origin);
+            let outcome = match observed_edge_batch_upsert(conn, &requests, guard_endpoints) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            };
+            if let Err(error) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+            Ok(outcome)
+        })
+        .await
+    }
+
     async fn with_reader<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -1087,36 +1292,6 @@ fn canonical_edge_endpoints(
     }
 }
 
-/// DML-only batch upsert loop shared by both the legacy (flag-off) and
-/// WriterTask-routed (flag-on) `upsert_edges` paths. Issues no
-/// `BEGIN`/`COMMIT`/`ROLLBACK` itself — the caller owns the transaction.
-/// All-or-nothing: the first row failure returns `Err` immediately. See
-/// `crates/khive-db/docs/api/graph.md` for why this shares
-/// [`edge_upsert_statement`]'s conflict-arm builder rather than a
-/// second copy.
-fn batch_upsert_edges(
-    conn: &rusqlite::Connection,
-    edges: &[Edge],
-    attempted: u64,
-) -> Result<BatchWriteSummary, rusqlite::Error> {
-    let mut affected = 0u64;
-
-    for edge in edges {
-        let statement = edge_upsert_statement(edge);
-        let mut stmt = conn.prepare(&statement.sql)?;
-        bind_params(&mut stmt, &statement.params)?;
-        stmt.raw_execute()?;
-        affected += 1;
-    }
-
-    Ok(BatchWriteSummary {
-        attempted,
-        affected,
-        failed: 0,
-        first_error: String::new(),
-    })
-}
-
 /// Standalone existence probe for both endpoints of a would-be edge (#769),
 /// matching the `WHERE EXISTS(...)` shape
 /// [`edge_insert_guarded_by_endpoints_statement`] embeds in its own guarded
@@ -1146,91 +1321,139 @@ fn edge_endpoints_exist(
     )
 }
 
-/// DML-only guarded single-row insert shared by both the legacy (flag-off)
-/// and WriterTask-routed (flag-on) `upsert_edge_guarded` paths.
-///
-/// Runs the guarded `INSERT` and, if it was refused, the missing-endpoint
-/// probe on the SAME connection with no gap for another writer to intervene
-/// between them, PROVIDED the caller holds the connection under a single
-/// write-locked transaction (either the WriterTask's own `BEGIN IMMEDIATE`,
-/// or an explicit one the flag-off caller opens around this call: the
-/// singleton fallback previously ran the insert and the
-/// probe as two separate autocommit statements).
-fn edge_insert_guarded(
+fn edge_by_natural_key_including_deleted(
     conn: &rusqlite::Connection,
-    statement: &SqlStatement,
-    source_id: Uuid,
-    target_id: Uuid,
-) -> Result<GuardedWriteOutcome, rusqlite::Error> {
-    let mut stmt = conn.prepare(&statement.sql)?;
-    bind_params(&mut stmt, &statement.params)?;
-    if stmt.raw_execute()? > 0 {
-        return Ok(GuardedWriteOutcome::Written);
-    }
-    // Test-only observation point for the exact insert-to-probe seam this
-    // function's doc comment describes: a no-op in every non-test build,
-    // and a no-op in test builds unless a test has installed a barrier for
-    // this precise (source_id, target_id) pair (see
-    // `tests::insert_probe_seam` in graph_tests.rs). Lets the
-    // atomicity regression test force a racer to run at this seam instead
-    // of guessing at it with sleeps.
-    #[cfg(test)]
-    tests::insert_probe_seam::hook((source_id, target_id));
-    let missing = edge_endpoints_exist(conn, source_id, target_id)?;
-    Ok(GuardedWriteOutcome::Refused(missing))
+    edge: &Edge,
+) -> Result<Option<Edge>, rusqlite::Error> {
+    let (source_id, target_id) =
+        canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+    conn.query_row(
+        "SELECT namespace, id, source_id, target_id, relation, weight, \
+                created_at, updated_at, deleted_at, metadata, target_backend \
+         FROM graph_edges \
+         WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 AND relation = ?4",
+        rusqlite::params![
+            &edge.namespace,
+            source_id.to_string(),
+            target_id.to_string(),
+            edge.relation.as_str(),
+        ],
+        read_edge,
+    )
+    .optional()
 }
 
-/// DML-only guarded batch upsert loop shared by both the legacy (flag-off)
-/// and WriterTask-routed (flag-on) `upsert_edges_guarded` paths, mirroring
-/// [`batch_upsert_edges`]'s split. Pre-checks every edge's endpoints with
-/// [`edge_endpoints_exist`] BEFORE issuing any `INSERT` — if any endpoint is
-/// missing, returns immediately with `affected: 0` and no writes at all
-/// (#769), so the caller's transaction has nothing to roll back. See
-/// `crates/khive-db/docs/api/graph.md`.
-fn batch_upsert_edges_guarded(
+/// Apply one replacement-style upsert and derive its disposition/preimage on
+/// the same write connection. Callers keep this inside one write transaction.
+fn observed_edge_upsert(
     conn: &rusqlite::Connection,
-    edges: &[Edge],
-    attempted: u64,
-) -> Result<GuardedBatchOutcome, rusqlite::Error> {
-    for (index, edge) in edges.iter().enumerate() {
-        let (source_id, target_id) =
-            canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+    request: &EdgeUpsertRequest,
+    guard_endpoints: bool,
+) -> Result<GuardedEdgeUpsertOutcome, rusqlite::Error> {
+    let (source_id, target_id) = canonical_edge_endpoints(
+        request.edge.relation,
+        request.edge.source_id,
+        request.edge.target_id,
+    );
+    if guard_endpoints {
+        // Test-only rendezvous proving the endpoint decision is made while
+        // this write transaction still excludes racing writers.
+        #[cfg(test)]
+        tests::insert_probe_seam::hook((source_id, target_id));
         let missing = edge_endpoints_exist(conn, source_id, target_id)?;
         if missing.any() {
-            return Ok(GuardedBatchOutcome {
-                summary: BatchWriteSummary {
-                    attempted,
-                    affected: 0,
-                    failed: attempted,
-                    first_error: format!(
-                        "batch entry {index}: edge endpoint no longer exists at write time: source {source_id} or target {target_id}"
-                    ),
-                },
-                refused: Some(GuardedBatchRefusal {
-                    entry_index: index,
-                    missing,
-                }),
-            });
+            return Ok(GuardedEdgeUpsertOutcome::Refused(
+                EdgeUpsertRefusal::MissingEndpoints(missing),
+            ));
         }
     }
 
-    let mut affected = 0u64;
-    for edge in edges {
-        let statement = edge_upsert_statement(edge);
-        let mut stmt = conn.prepare(&statement.sql)?;
-        bind_params(&mut stmt, &statement.params)?;
-        stmt.raw_execute()?;
-        affected += 1;
+    let previous = edge_by_natural_key_including_deleted(conn, &request.edge)?;
+    if let Some(edge) = previous.as_ref() {
+        if edge.deleted_at.is_some() && !request.resurrect {
+            return Ok(GuardedEdgeUpsertOutcome::Refused(
+                EdgeUpsertRefusal::ResurrectionRequired { edge: edge.clone() },
+            ));
+        }
     }
 
-    Ok(GuardedBatchOutcome {
-        summary: BatchWriteSummary {
-            attempted,
-            affected,
-            failed: 0,
-            first_error: String::new(),
-        },
-        refused: None,
+    let statement = edge_upsert_statement_with_resurrection(&request.edge, request.resurrect);
+    let mut stmt = conn.prepare(&statement.sql)?;
+    bind_params(&mut stmt, &statement.params)?;
+    let affected = stmt.raw_execute()?;
+    if affected == 0 {
+        let edge = edge_by_natural_key_including_deleted(conn, &request.edge)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        return Ok(GuardedEdgeUpsertOutcome::Refused(
+            EdgeUpsertRefusal::ResurrectionRequired { edge },
+        ));
+    }
+
+    let edge = edge_by_natural_key_including_deleted(conn, &request.edge)?
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let disposition = match previous.as_ref().and_then(|edge| edge.deleted_at) {
+        None if previous.is_none() => EdgeUpsertDisposition::Created,
+        None => EdgeUpsertDisposition::Updated,
+        Some(_) => EdgeUpsertDisposition::Resurrected,
+    };
+    Ok(GuardedEdgeUpsertOutcome::Written(EdgeUpsertResult {
+        edge,
+        disposition,
+        previous,
+    }))
+}
+
+fn observed_edge_batch_upsert(
+    conn: &rusqlite::Connection,
+    requests: &[EdgeUpsertRequest],
+    guard_endpoints: bool,
+) -> Result<GuardedEdgeBatchUpsertOutcome, rusqlite::Error> {
+    // Preflight every refusal before the first mutation so the successful
+    // return path is genuinely all-or-nothing even under WriterTask, whose
+    // transaction commits any `Ok(...)` closure result.
+    for (entry_index, request) in requests.iter().enumerate() {
+        let (source_id, target_id) = canonical_edge_endpoints(
+            request.edge.relation,
+            request.edge.source_id,
+            request.edge.target_id,
+        );
+        if guard_endpoints {
+            let missing = edge_endpoints_exist(conn, source_id, target_id)?;
+            if missing.any() {
+                return Ok(GuardedEdgeBatchUpsertOutcome {
+                    rows: Vec::new(),
+                    refusal: Some(GuardedEdgeBatchRefusal {
+                        entry_index,
+                        reason: EdgeUpsertRefusal::MissingEndpoints(missing),
+                    }),
+                });
+            }
+        }
+        if let Some(edge) = edge_by_natural_key_including_deleted(conn, &request.edge)? {
+            if edge.deleted_at.is_some() && !request.resurrect {
+                return Ok(GuardedEdgeBatchUpsertOutcome {
+                    rows: Vec::new(),
+                    refusal: Some(GuardedEdgeBatchRefusal {
+                        entry_index,
+                        reason: EdgeUpsertRefusal::ResurrectionRequired { edge },
+                    }),
+                });
+            }
+        }
+    }
+
+    let mut rows = Vec::with_capacity(requests.len());
+    for request in requests {
+        match observed_edge_upsert(conn, request, false)? {
+            GuardedEdgeUpsertOutcome::Written(row) => rows.push(row),
+            GuardedEdgeUpsertOutcome::Refused(_) => {
+                return Err(rusqlite::Error::ExecuteReturnedResults)
+            }
+        }
+    }
+    Ok(GuardedEdgeBatchUpsertOutcome {
+        rows,
+        refusal: None,
     })
 }
 
@@ -1482,14 +1705,34 @@ fn run_bounded_traversal(
 #[async_trait]
 impl GraphStore for SqlGraphStore {
     async fn upsert_edge(&self, edge: Edge) -> Result<(), StorageError> {
-        let statement = edge_upsert_statement(&edge);
-        self.with_writer("upsert_edge", move |conn| {
-            let mut stmt = conn.prepare(&statement.sql)?;
-            bind_params(&mut stmt, &statement.params)?;
-            stmt.raw_execute()?;
-            Ok(())
+        self.upsert_edge_observed(EdgeUpsertRequest {
+            edge,
+            resurrect: false,
         })
         .await
+        .map(|_| ())
+    }
+
+    async fn upsert_edge_observed(
+        &self,
+        request: EdgeUpsertRequest,
+    ) -> Result<EdgeUpsertResult, StorageError> {
+        match self
+            .observed_edge_write("upsert_edge_observed", request, false)
+            .await?
+        {
+            GuardedEdgeUpsertOutcome::Written(result) => Ok(result),
+            GuardedEdgeUpsertOutcome::Refused(EdgeUpsertRefusal::ResurrectionRequired { edge }) => {
+                Err(resurrection_required_error("upsert_edge_observed", &edge))
+            }
+            GuardedEdgeUpsertOutcome::Refused(EdgeUpsertRefusal::MissingEndpoints(_)) => {
+                Err(StorageError::Conflict {
+                    capability: StorageCapability::Graph,
+                    operation: "upsert_edge_observed".into(),
+                    message: "unguarded edge upsert reported a missing-endpoint refusal".into(),
+                })
+            }
+        }
     }
 
     async fn replace_edge_if_unchanged(
@@ -1510,109 +1753,60 @@ impl GraphStore for SqlGraphStore {
 
     async fn upsert_edges(&self, edges: Vec<Edge>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = edges.len() as u64;
-
-        // ADR-067 Component A: when the write queue is enabled, route
-        // through the pool-wide WriterTask. DML-only closure — no BEGIN
-        // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
-        // owns the transaction (a bare BEGIN IMMEDIATE here would violate
-        // SQLite's nested-transaction rule).
-        if let Some(writer_task) = self.current_writer_task("upsert_edges")? {
-            return writer_task
-                .send_bounded(move |conn| {
-                    batch_upsert_edges(conn, &edges, attempted)
-                        .map_err(|e| map_err(e, "upsert_edges"))
-                })
-                .await;
-        }
-
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
-        // via the pool-mutex/standalone writer.
-        let origin = self.pool.origin();
-        self.with_writer("upsert_edges", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("graph_upsert_edges".to_string()),
-                origin,
-            );
-
-            let summary = match batch_upsert_edges(conn, &edges, attempted) {
-                Ok(summary) => summary,
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
+        let requests = edges
+            .into_iter()
+            .map(|edge| EdgeUpsertRequest {
+                edge,
+                resurrect: false,
+            })
+            .collect();
+        let outcome = self
+            .observed_edge_batch_write("upsert_edges", requests, false)
+            .await?;
+        if let Some(refusal) = outcome.refusal {
+            return match refusal.reason {
+                EdgeUpsertRefusal::ResurrectionRequired { edge } => {
+                    Err(resurrection_required_error("upsert_edges", &edge))
                 }
+                EdgeUpsertRefusal::MissingEndpoints(_) => Err(StorageError::Conflict {
+                    capability: StorageCapability::Graph,
+                    operation: "upsert_edges".into(),
+                    message: "unguarded edge batch reported a missing-endpoint refusal".into(),
+                }),
             };
-
-            if let Err(e) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-            Ok(summary)
+        }
+        Ok(BatchWriteSummary {
+            attempted,
+            affected: outcome.rows.len() as u64,
+            failed: 0,
+            first_error: String::new(),
         })
-        .await
     }
 
     async fn upsert_edge_guarded(&self, edge: Edge) -> Result<GuardedWriteOutcome, StorageError> {
-        let (source_id, target_id) =
-            canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
-        let metadata_str = edge
-            .metadata
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
-        let statement = edge_insert_guarded_by_endpoints_statement(
-            &edge.namespace,
-            Uuid::from(edge.id),
-            source_id,
-            target_id,
-            edge.relation,
-            edge.weight,
-            edge.created_at.timestamp_micros(),
-            metadata_str.as_deref(),
-        );
-
-        // Same WriterTask routing as `upsert_edges_guarded` — the
-        // WriterTask's run loop owns its own `BEGIN IMMEDIATE`, so the
-        // insert and the missing-endpoint probe below already run inside
-        // one write-locked transaction; a bare `BEGIN IMMEDIATE` here would
-        // violate SQLite's nested-transaction rule.
-        if let Some(writer_task) = self.current_writer_task("upsert_edge_guarded")? {
-            return writer_task
-                .send_bounded(move |conn| {
-                    edge_insert_guarded(conn, &statement, source_id, target_id)
-                        .map_err(|e| map_err(e, "upsert_edge_guarded"))
-                })
-                .await;
-        }
-
-        // Flag-off (singleton) path: wrap the insert and the refused-probe
-        // in one explicit transaction so nothing can change an endpoint
-        // between them (this fallback previously
-        // ran the two as separate autocommit statements on the standalone
-        // writer connection).
-        let origin = self.pool.origin();
-        self.with_writer("upsert_edge_guarded", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("graph_upsert_edge_guarded".to_string()),
-                origin,
-            );
-
-            let outcome = match edge_insert_guarded(conn, &statement, source_id, target_id) {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
-                }
-            };
-
-            if let Err(e) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
+        match self
+            .upsert_edge_guarded_observed(EdgeUpsertRequest {
+                edge,
+                resurrect: false,
+            })
+            .await?
+        {
+            GuardedEdgeUpsertOutcome::Written(_) => Ok(GuardedWriteOutcome::Written),
+            GuardedEdgeUpsertOutcome::Refused(EdgeUpsertRefusal::MissingEndpoints(missing)) => {
+                Ok(GuardedWriteOutcome::Refused(missing))
             }
-            Ok(outcome)
-        })
-        .await
+            GuardedEdgeUpsertOutcome::Refused(EdgeUpsertRefusal::ResurrectionRequired { edge }) => {
+                Err(resurrection_required_error("upsert_edge_guarded", &edge))
+            }
+        }
+    }
+
+    async fn upsert_edge_guarded_observed(
+        &self,
+        request: EdgeUpsertRequest,
+    ) -> Result<GuardedEdgeUpsertOutcome, StorageError> {
+        self.observed_edge_write("upsert_edge_guarded_observed", request, true)
+            .await
     }
 
     async fn upsert_edges_guarded(
@@ -1620,42 +1814,53 @@ impl GraphStore for SqlGraphStore {
         edges: Vec<Edge>,
     ) -> Result<GuardedBatchOutcome, StorageError> {
         let attempted = edges.len() as u64;
-
-        // Same WriterTask routing as `upsert_edges` — the guard's pre-check
-        // runs inside the WriterTask's own `BEGIN IMMEDIATE`, so a missing
-        // endpoint is caught before any `INSERT` in this batch runs at all.
-        if let Some(writer_task) = self.current_writer_task("upsert_edges_guarded")? {
-            return writer_task
-                .send_bounded(move |conn| {
-                    batch_upsert_edges_guarded(conn, &edges, attempted)
-                        .map_err(|e| map_err(e, "upsert_edges_guarded"))
-                })
-                .await;
-        }
-
-        let origin = self.pool.origin();
-        self.with_writer("upsert_edges_guarded", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("graph_upsert_edges_guarded".to_string()),
-                origin,
-            );
-
-            let summary = match batch_upsert_edges_guarded(conn, &edges, attempted) {
-                Ok(summary) => summary,
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
+        let requests = edges
+            .into_iter()
+            .map(|edge| EdgeUpsertRequest {
+                edge,
+                resurrect: false,
+            })
+            .collect();
+        let outcome = self.upsert_edges_guarded_observed(requests).await?;
+        match outcome.refusal {
+            None => Ok(GuardedBatchOutcome {
+                summary: BatchWriteSummary {
+                    attempted,
+                    affected: outcome.rows.len() as u64,
+                    failed: 0,
+                    first_error: String::new(),
+                },
+                refused: None,
+            }),
+            Some(refusal) => match refusal.reason {
+                EdgeUpsertRefusal::MissingEndpoints(missing) => Ok(GuardedBatchOutcome {
+                    summary: BatchWriteSummary {
+                        attempted,
+                        affected: 0,
+                        failed: attempted,
+                        first_error: format!(
+                            "batch entry {}: edge endpoint no longer exists at write time",
+                            refusal.entry_index
+                        ),
+                    },
+                    refused: Some(GuardedBatchRefusal {
+                        entry_index: refusal.entry_index,
+                        missing,
+                    }),
+                }),
+                EdgeUpsertRefusal::ResurrectionRequired { edge } => {
+                    Err(resurrection_required_error("upsert_edges_guarded", &edge))
                 }
-            };
+            },
+        }
+    }
 
-            if let Err(e) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-            Ok(summary)
-        })
-        .await
+    async fn upsert_edges_guarded_observed(
+        &self,
+        requests: Vec<EdgeUpsertRequest>,
+    ) -> Result<GuardedEdgeBatchUpsertOutcome, StorageError> {
+        self.observed_edge_batch_write("upsert_edges_guarded_observed", requests, true)
+            .await
     }
 
     async fn get_edge(&self, id: LinkId) -> Result<Option<Edge>, StorageError> {

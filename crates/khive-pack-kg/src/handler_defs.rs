@@ -671,9 +671,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Commissive: commits a typed edge to the graph
     HandlerDef {
         name: "link",
-        description: "Create one typed directed edge or a bounded bulk of edges. Supply the \
+        description: "Create or replace one typed directed edge, or a bounded bulk of edges. Supply the \
                       singleton source_id/target_id/relation fields or links; unknown top-level \
-                      fields and unknown fields inside links entries are rejected.",
+                      fields and unknown fields inside links entries are rejected. A live natural-key \
+                      match replaces weight and metadata and returns mutation=updated; a tombstone is \
+                      refused unless resurrect=true.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -753,11 +755,21 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "resurrect",
+                param_type: "bool",
+                required: false,
+                description: "Allow this singleton link to restore an existing soft-deleted \
+                              natural-key edge (default false). Explicit restoration returns \
+                              mutation=resurrected. Each bulk entry accepts the same field.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "verbose",
                 param_type: "bool",
                 required: false,
-                description: "Bulk mode only. When true, include successfully created edges in \
-                              an edges array; default false.",
+                description: "Bulk mode only. When true, include successfully written edges and \
+                              each row's mutation (created | updated | resurrected) in an edges \
+                              array; default false.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -766,7 +778,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: false,
                 description: "Bulk edge creation, capped at 1000 entries. Each entry requires \
                               source_id, target_id, and relation, and accepts optional weight, \
-                              metadata, and dependency_kind. Unknown entry fields are rejected. \
+                              metadata, dependency_kind, and resurrect. Unknown entry fields are rejected. \
                               When supplied, singleton edge fields are ignored.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
@@ -1426,6 +1438,7 @@ mod tests {
                 "weight",
                 "metadata",
                 "dependency_kind",
+                "resurrect",
                 "verbose",
                 "links",
                 "atomic",
@@ -1444,6 +1457,7 @@ mod tests {
             "weight": 0.7,
             "metadata": {"optional": true},
             "dependency_kind": "build",
+            "resurrect": true,
             "verbose": true,
             "links": [],
             "atomic": false,

@@ -185,6 +185,7 @@ pub(crate) struct BulkLinkEntry {
     pub(crate) weight: Option<f64>,
     pub(crate) metadata: Option<Value>,
     pub(crate) dependency_kind: Option<String>,
+    pub(crate) resurrect: Option<bool>,
 }
 
 /// ADR-099 B3: `pub` for the same reason as `UpdateParams` above — reused
@@ -200,6 +201,7 @@ pub struct LinkParams {
     pub(crate) weight: Option<f64>,
     pub(crate) metadata: Option<Value>,
     pub(crate) dependency_kind: Option<String>,
+    pub(crate) resurrect: Option<bool>,
     pub(crate) verbose: Option<bool>,
     pub(crate) links: Option<Vec<BulkLinkEntry>>,
     pub(crate) atomic: Option<bool>,

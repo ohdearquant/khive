@@ -358,9 +358,13 @@ impl DeletePlan {
 pub struct LinkPlan {
     pub(crate) source_id: Uuid,
     pub(crate) target_id: Uuid,
-    /// The guarded `INSERT ... SELECT ... WHERE EXISTS(...)` statement:
-    /// its affected-row count is the endpoint-existence probe.
-    pub(crate) statement: PlanStatement,
+    /// Guarded edge mutation followed by its event-plane append statements.
+    /// The first statement's affected-row count is also the endpoint and
+    /// compare-and-swap probe; event statements are reached only after it
+    /// succeeds.
+    pub(crate) statements: Vec<PlanStatement>,
+    /// Prepare-time disposition, protected by the first statement's guard.
+    pub(crate) disposition: khive_storage::EdgeUpsertDisposition,
 }
 
 impl LinkPlan {
@@ -372,6 +376,12 @@ impl LinkPlan {
     /// The canonical target endpoint used by the prepared statement.
     pub fn target_id(&self) -> Uuid {
         self.target_id
+    }
+
+    /// Whether this atomic link created, replaced, or explicitly resurrected
+    /// its natural-key row.
+    pub fn disposition(&self) -> khive_storage::EdgeUpsertDisposition {
+        self.disposition
     }
 }
 
@@ -643,14 +653,18 @@ mod tests {
         let plan = LinkPlan {
             source_id: source,
             target_id: target,
-            statement: guarded("insert-edge-where-exists", AffectedRowGuard::exactly(1)),
+            statements: vec![guarded(
+                "insert-edge-where-exists",
+                AffectedRowGuard::exactly(1),
+            )],
+            disposition: khive_storage::EdgeUpsertDisposition::Created,
         };
         assert_eq!(plan.source_id, source);
         assert_eq!(plan.target_id, target);
         // Dangling-edge acceptance criterion: once an endpoint row is gone,
         // the guarded INSERT...WHERE EXISTS affects 0 rows and the guard
         // on *that exact statement* must fail, not silently pass.
-        let guard = plan.statement.guard.expect("link insert is guarded");
+        let guard = plan.statements[0].guard.expect("link insert is guarded");
         assert!(!guard.holds_for(0));
     }
 

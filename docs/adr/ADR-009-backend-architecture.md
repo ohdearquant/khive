@@ -117,10 +117,18 @@ SubstrateCoordinator resolves the target to the named backend.
 
 ### Edge upsert semantics
 
-`upsert_edge` uses `INSERT ... ON CONFLICT DO UPDATE` (not `DO NOTHING`). The `DO
-UPDATE` path refreshes `updated_at`, `weight`, `properties`, and crucially clears
-`deleted_at` if the edge is being re-created after a soft delete. `DO NOTHING` silently
-preserves stale NULL values and breaks hard-delete cascade.
+`upsert_edge` uses `INSERT ... ON CONFLICT DO UPDATE` (not `DO NOTHING`) for a
+live natural-key match. The update refreshes `updated_at`, `weight`, metadata,
+and `target_backend`; it is replacement, not metadata merge. The persisted row
+ID and original `created_at` survive.
+
+Amendment (2026-08-30): a soft-deleted natural-key row is not a live upsert
+target. Default upserts refuse that conflict without changing metadata or
+`deleted_at`; restoration requires an explicit `resurrect=true` policy at the
+runtime boundary. Observed storage variants return `created`, `updated`, or
+`resurrected` with the preimage so the runtime can record an honest audit event.
+Legacy storage methods retain their return types and adopt the safe default
+(`resurrect=false`).
 
 ### Cross-backend delete cascade
 
@@ -406,5 +414,5 @@ read-to-replacement race without changing the ordinary upsert contract.
   still permits a stale document to overwrite concurrent changes.
 
 No open design question remains within this storage amendment: the conflict is a typed storage
-outcome, ordinary upserts retain their existing semantics, and the six-site boundary above is
-explicit.
+outcome, ordinary upserts retain live-row replacement semantics while tombstone restoration is
+explicit, and the six-site boundary above is explicit.
