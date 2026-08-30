@@ -264,6 +264,13 @@ strand the cursor past bytes that no candidate inserted — the bytes are re-rea
 later pass, bounded and idempotent. A no-progress success, such as one provider's lower
 whole-file size ceiling, likewise falls through without committing.
 
+**Amended: see §7.** An advance over a line already known to exceed
+`MirrorLimits::max_line_bytes` is a **claiming** advance, not an empty one, and commits
+even when a sibling candidate errors. That exception is narrow and it is the only one:
+those bytes are unparseable by every candidate by construction, since the cap is a
+property of the line rather than of any parser, so committing cannot strand bytes another
+candidate would have inserted — which is the sole property this fall-through protects.
+
 #### Delta-proportional polling (Amendment, 2026-08-02)
 
 The service performs one full discovery pass at startup, then keeps an in-memory directory
@@ -468,6 +475,29 @@ though no event was parsed. Each pass discards another bounded prefix until a pa
 the terminator, after which parsing resumes at the following line. Progress is therefore
 monotonic in every pass that reads bytes, which is what makes the case terminate.
 
+**An oversized-skip advance is a claiming advance.** That monotonicity is a claim about
+the _persisted_ cursor, so it depends on the candidate-dispatch commit rule above, and
+under that rule as originally written it would be false. A checkpoint pass advances the
+cursor and inserts zero rows, which is the definition of an empty advance there — it falls
+through and commits only if no candidate errored. In an overlapping-root configuration
+where a sibling candidate errors on every pass, the checkpoint would never commit, the same
+bounded prefix would be re-read forever, and the wedge this section exists to kill would
+return through the dispatch layer instead of the read layer.
+
+So an advance over a line already known to exceed the cap **claims the path** and commits
+regardless of a sibling's error. The safety property the empty-advance fall-through
+protects is that no candidate's cursor strands bytes another candidate would have turned
+into rows; an over-cap line cannot be turned into rows by any candidate, because the cap is
+a property of the line and not of the parser. The exception therefore costs nothing the
+rule was defending.
+
+This is not a new carve-out so much as a statement of one §6 already relied on. The
+complete-oversized-line skip in §6 also advances past a line while inserting no rows for
+it, so a pass whose only content is such a line is an empty advance too, and was already
+exposed to the same never-commit corner. §7 makes that corner reachable far more often —
+every window of a multi-window line rather than only a whole-line skip — which is what
+turned a latent case into one worth stating.
+
 **The mid-line marker is derived, not stored.** A cursor whose immediately preceding byte
 is not `\n` means ingestion is partway through an oversized line; offset zero is a line
 boundary by definition and has no predecessor to read. This is a property of the file and
@@ -498,7 +528,11 @@ over-cap line, and the complete-line skip-and-advance path — are unchanged.
 
 **Verification.** A complete over-cap line spanning several reader windows advances its
 persisted cursor on every non-EOF pass, and records before and after it both land; this is
-the arm that fails against the superseded rule. An unterminated over-cap final line
+the arm that fails against the superseded rule. That arm MUST be run under a
+**single-candidate** dispatch and again under an **overlapping-root, sibling-erroring**
+dispatch, asserting the persisted cursor advances in both — the second is the arm that
+fails if the oversized-skip advance is treated as an empty advance, and it passes
+vacuously if only the single-candidate case is exercised. An unterminated over-cap final line
 checkpoints its discarded bytes, stays an EOF no-op across a simulated restart, and is
 never parsed as an event; when a terminator and a valid line are appended, skip mode
 clears and the following record lands. A still-growing line under the cap continues to
