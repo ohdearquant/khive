@@ -80,6 +80,39 @@ per-tick `debug!` trace of the oldest open entry, and the Plank 1 age sweep,
 run unconditionally on every tick — including a Skipped one; the sweep's own
 emissions stay edge-triggered per rung via `TxAgeSweepState`.
 
+### Bounded FTS5 segment maintenance
+
+The daemon's main-backend checkpoint task also owns derived-index maintenance because it
+already has one long-lived standalone SQLite connection and a lifecycle tied
+to the file-backed backend. FTS maintenance is independent of the 500 ms WAL
+tick: by default it considers one table every 300 seconds, round-robins
+`fts_entities` and `fts_notes`, and performs at most one 500-page incremental
+merge step per due call. The first step uses FTS5's negative `merge` command
+to begin an incremental optimize; later positive steps continue that cycle.
+It never invokes the unbounded `optimize` command.
+
+The daemon deliberately leaves FTS5's persistent `automerge` and
+`crisismerge` settings unchanged. Retuning either would move less predictable
+merge work back onto foreground commits; the explicit maintenance owner keeps
+that work bounded and observable. A future retune requires production
+workload evidence rather than being coupled to this maintenance policy.
+
+Before each merge the dedicated connection temporarily sets `busy_timeout`
+to zero. An application writer therefore wins immediately; the skipped step
+is counted and the same negative starter is retried on that table's next
+turn. Maintenance errors are logged and counted independently and do not make
+an otherwise successful checkpoint discard its connection. Tables below two
+segments are skipped. Secondary-backend checkpoint tasks never probe for or
+maintain the main substrate's FTS tables.
+
+Operator overrides are `KHIVE_FTS_MERGE_ENABLED`,
+`KHIVE_FTS_MERGE_INTERVAL_SECS`, `KHIVE_FTS_MERGE_PAGES`, and
+`KHIVE_FTS_MERGE_MIN_SEGMENTS`. Invalid values warn and retain conservative
+compiled defaults. `db_diagnostics.fts_maintenance` exposes checks, attempts,
+progress/no-op/threshold/busy/error outcomes, and cumulative requested pages.
+`db_diagnostics.fts_segments` decodes the documented structure record at
+`%_data.id = 10` for both indexes; it does not count or scan `%_idx` rows.
+
 ### Plank 2: rare TRUNCATE escalation
 
 The periodic tick stays PASSIVE-only and non-blocking; on top of it,

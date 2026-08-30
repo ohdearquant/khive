@@ -46,10 +46,14 @@
 //!    an explicit `unavailable_reason` rather than fabricated from a
 //!    mutating enumeration. Cleanup-derived counters are omitted entirely,
 //!    so a skipped measurement never looks like measured `0`/`false`.
-//! 4. Graph-edge integrity uses three scalar SELECTs on the same guarded
-//!    standalone connection. It exposes the exact pre-V14 duplicate-ID group
-//!    count plus raw live-edge/list-ledger counts and never repairs or deletes
-//!    data.
+//! 4. Graph-edge integrity and FTS structure inspection share one interruptible
+//!    read phase on the guarded standalone connection. The graph side uses
+//!    three scalar SELECTs, exposes the exact pre-V14 duplicate-ID group count
+//!    plus raw live-edge/list-ledger counts, and never repairs or deletes data.
+//! 5. FTS5 segment diagnostics decode each index's documented one-row
+//!    structure record (`%_data.id = 10`). They never run `COUNT(*)` over or
+//!    scan a `%_idx` table, so observing segment health is bounded even when
+//!    the corpus itself is large.
 //!
 //! The counters are process-global statics inside this crate, so a report is
 //! only meaningful when built inside the process that owns the checkpoint
@@ -679,6 +683,14 @@ pub struct DbDiagnostics {
     pub writer_contention: WriterContentionDiagnostics,
     pub graph_edge_integrity: Option<GraphEdgeIntegrity>,
     pub graph_edge_integrity_error: Option<String>,
+    /// Current FTS5 segment structure, decoded from each index's documented
+    /// one-row structure record (shadow-table row id 10). This does not scan
+    /// either corpus or `%_idx` table.
+    pub fts_segments: Option<crate::FtsSegmentDiagnostics>,
+    pub fts_segments_error: Option<String>,
+    /// Process-lifetime outcomes from the checkpoint task's bounded FTS5
+    /// maintenance steps.
+    pub fts_maintenance: crate::FtsMaintenanceCounters,
     pub wal_pin: WalPinAttribution,
 }
 
@@ -783,6 +795,11 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
             graph_edge_integrity_error: Some(
                 "in-memory database: no durable graph-edge ledger to inspect".to_string(),
             ),
+            fts_segments: None,
+            fts_segments_error: Some(
+                "in-memory database: no durable FTS5 indexes to inspect".to_string(),
+            ),
+            fts_maintenance: crate::fts_maintenance_counters(),
             wal_pin: WalPinAttribution::unavailable(
                 "in-memory database: no file for the OS holder census",
             ),
@@ -811,6 +828,9 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
         writer_contention,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
+        fts_segments: inspection.fts_segments,
+        fts_segments_error: inspection.fts_segments_error,
+        fts_maintenance: crate::fts_maintenance_counters(),
         wal_pin,
     })
 }
@@ -844,6 +864,11 @@ fn collect_inner(
             graph_edge_integrity_error: Some(
                 "in-memory database: no durable graph-edge ledger to inspect".to_string(),
             ),
+            fts_segments: None,
+            fts_segments_error: Some(
+                "in-memory database: no durable FTS5 indexes to inspect".to_string(),
+            ),
+            fts_maintenance: crate::fts_maintenance_counters(),
             wal_pin: WalPinAttribution::unavailable(
                 "in-memory database: no file for the OS holder census",
             ),
@@ -862,6 +887,9 @@ fn collect_inner(
         writer_contention,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
+        fts_segments: inspection.fts_segments,
+        fts_segments_error: inspection.fts_segments_error,
+        fts_maintenance: crate::fts_maintenance_counters(),
         wal_pin: wal_pin_attribution(&path, sweep_interval),
     }
 }
@@ -871,6 +899,8 @@ struct PoolInspection {
     checkpoint_probe_error: Option<String>,
     graph_edge_integrity: Option<GraphEdgeIntegrity>,
     graph_edge_integrity_error: Option<String>,
+    fts_segments: Option<crate::FtsSegmentDiagnostics>,
+    fts_segments_error: Option<String>,
 }
 
 fn inspect_pool_interruptibly(
@@ -887,7 +917,9 @@ fn inspect_pool_interruptibly(
                 checkpoint_probe: None,
                 checkpoint_probe_error: Some(reason.clone()),
                 graph_edge_integrity: None,
-                graph_edge_integrity_error: Some(reason),
+                graph_edge_integrity_error: Some(reason.clone()),
+                fts_segments: None,
+                fts_segments_error: Some(reason),
             });
         }
     };
@@ -916,7 +948,12 @@ fn inspect_pool_interruptibly(
 
     // Preserve ordinary diagnostic degradation while allowing the outer
     // request cause to escape as a typed timeout.
-    let integrity = scope.run(&conn, || Ok(graph_edge_integrity(&conn)))?;
+    let (integrity, fts_segments) = scope.run(&conn, || {
+        Ok((
+            graph_edge_integrity(&conn),
+            crate::fts_maintenance::inspect_fts_segments(&conn),
+        ))
+    })?;
     let (graph_edge_integrity, graph_edge_integrity_error) = match integrity {
         Ok(integrity) => (Some(integrity), None),
         Err(e) => (
@@ -924,12 +961,18 @@ fn inspect_pool_interruptibly(
             Some(format!("graph-edge integrity query failed: {e}")),
         ),
     };
+    let (fts_segments, fts_segments_error) = match fts_segments {
+        Ok(segments) => (Some(segments), None),
+        Err(error) => (None, Some(error)),
+    };
 
     Ok(PoolInspection {
         checkpoint_probe,
         checkpoint_probe_error,
         graph_edge_integrity,
         graph_edge_integrity_error,
+        fts_segments,
+        fts_segments_error,
     })
 }
 
@@ -1022,7 +1065,9 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
                 checkpoint_probe: None,
                 checkpoint_probe_error: Some(reason.clone()),
                 graph_edge_integrity: None,
-                graph_edge_integrity_error: Some(reason),
+                graph_edge_integrity_error: Some(reason.clone()),
+                fts_segments: None,
+                fts_segments_error: Some(reason),
             };
         }
     };
@@ -1041,12 +1086,19 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
             Some(format!("graph-edge integrity query failed: {e}")),
         ),
     };
+    let (fts_segments, fts_segments_error) =
+        match crate::fts_maintenance::inspect_fts_segments(&conn) {
+            Ok(segments) => (Some(segments), None),
+            Err(error) => (None, Some(error)),
+        };
 
     PoolInspection {
         checkpoint_probe,
         checkpoint_probe_error,
         graph_edge_integrity,
         graph_edge_integrity_error,
+        fts_segments,
+        fts_segments_error,
     }
 }
 
@@ -1079,7 +1131,19 @@ mod tests {
                          seq INTEGER PRIMARY KEY AUTOINCREMENT,
                          edge_id TEXT NOT NULL UNIQUE
                      ); \
-                     INSERT INTO t VALUES (1), (2), (3);",
+                     CREATE VIRTUAL TABLE fts_entities USING fts5(
+                         namespace UNINDEXED, subject_id UNINDEXED, title, body,
+                         tokenize='trigram'
+                     ); \
+                     CREATE VIRTUAL TABLE fts_notes USING fts5(
+                         namespace UNINDEXED, subject_id UNINDEXED, title, body,
+                         tokenize='trigram'
+                     ); \
+                     INSERT INTO t VALUES (1), (2), (3); \
+                     INSERT INTO fts_entities(namespace, subject_id, title, body)
+                         VALUES('local', 'entity-1', 'entity title', 'entity diagnostic body'); \
+                     INSERT INTO fts_notes(namespace, subject_id, title, body)
+                         VALUES('local', 'note-1', 'note title', 'note diagnostic body');",
                 )
                 .expect("seed writes");
         }
@@ -1420,6 +1484,19 @@ mod tests {
             })
         );
         assert!(report.graph_edge_integrity_error.is_none());
+        let fts_segments = report
+            .fts_segments
+            .as_ref()
+            .expect("file-backed diagnostics must decode both FTS structure rows");
+        assert_eq!(fts_segments.entities.segment_count, 1);
+        assert_eq!(fts_segments.notes.segment_count, 1);
+        assert_eq!(fts_segments.total_segments, 2);
+        assert!(report.fts_segments_error.is_none());
+        let fts_json = json
+            .get("fts_segments")
+            .expect("FTS segment diagnostics serialize");
+        assert_eq!(fts_json["entities"]["segment_count"], 1);
+        assert!(json.get("fts_maintenance").is_some());
         assert!(report.writer_contention.audit_append_failures.is_none());
         assert!(
             report
@@ -1699,6 +1776,8 @@ mod tests {
         assert!(report.db_path.is_none());
         assert!(report.wal_file.is_none());
         assert!(report.checkpoint_probe.is_none());
+        assert!(report.fts_segments.is_none());
+        assert!(report.fts_segments_error.is_some());
         assert!(
             report.checkpoint_probe_error.is_some(),
             "an in-memory report must say WHY there is no probe"

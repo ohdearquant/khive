@@ -35,6 +35,11 @@
 //! for full ADR-091 Plank 0/1/2 design rationale (why TRUNCATE is excluded
 //! from ordinary ticks, the dedicated-connection invariant, and why Plank 1
 //! is a sweep rather than the ADR's originally-described per-statement guard).
+//!
+//! The same long-lived standalone connection also owns a separate, five-minute
+//! FTS5 maintenance cadence. One due call gives one index at most 500 pages of
+//! incremental merge work and uses a zero busy timeout, so this best-effort
+//! derived-index maintenance cannot queue behind application writes.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -2025,6 +2030,17 @@ pub async fn run_checkpoint_task(
     // in-memory/read-only pool) retries the open on every subsequent tick.
     let mut checkpoint_conn = CheckpointConnection::new();
     checkpoint_conn.ensure_open(&pool);
+    // FTS5 segment maintenance shares this task's standalone connection, but
+    // not its 500 ms cadence. Each due call performs at most one bounded
+    // merge step on one table and refuses immediately when another writer
+    // owns SQLite's write lock.
+    let mut fts_maintenance_config = crate::fts_maintenance::FtsMaintenanceConfig::from_env();
+    // Secondary backends have independent schemas (for example the code-map
+    // database) and are not required to contain the substrate FTS tables.
+    // Exactly the main backend owns this derived-index maintenance.
+    fts_maintenance_config.enabled &= is_main;
+    let mut fts_maintenance_state =
+        crate::fts_maintenance::FtsMaintenanceState::new(Instant::now());
 
     loop {
         // A closed sender (the daemon returning without an explicit send)
@@ -2055,6 +2071,52 @@ pub async fn run_checkpoint_task(
                     }
                     #[cfg(not(unix))]
                     let _ = outcome.sidecar_attribution;
+                    match crate::fts_maintenance::run_if_due(
+                        conn,
+                        &fts_maintenance_config,
+                        &mut fts_maintenance_state,
+                        Instant::now(),
+                    ) {
+                        Ok(Some(step)) => match step.outcome {
+                            crate::fts_maintenance::FtsMaintenanceOutcome::Worked => {
+                                tracing::info!(
+                                    table = step.table,
+                                    requested_pages = step.requested_pages,
+                                    segments_before = step.segments_before,
+                                    segments_after = step.segments_after,
+                                    "bounded FTS5 segment maintenance made progress"
+                                );
+                            }
+                            crate::fts_maintenance::FtsMaintenanceOutcome::Busy => {
+                                tracing::debug!(
+                                    table = step.table,
+                                    requested_pages = step.requested_pages,
+                                    segments = step.segments_before,
+                                    "bounded FTS5 segment maintenance skipped a busy writer"
+                                );
+                            }
+                            crate::fts_maintenance::FtsMaintenanceOutcome::Noop
+                            | crate::fts_maintenance::FtsMaintenanceOutcome::BelowThreshold => {
+                                tracing::debug!(
+                                    table = step.table,
+                                    outcome = ?step.outcome,
+                                    segments = step.segments_before,
+                                    "bounded FTS5 segment maintenance had no work"
+                                );
+                            }
+                        },
+                        Ok(None) => {}
+                        Err(error) => {
+                            // The checkpoint pragma already succeeded. An FTS
+                            // structure/read/merge error is an independent,
+                            // best-effort maintenance failure and must not make
+                            // the task discard an otherwise healthy connection.
+                            tracing::warn!(
+                                error = %error,
+                                "bounded FTS5 segment maintenance failed"
+                            );
+                        }
+                    }
                     CheckpointTick::Observed(outcome.wal_pages)
                 }
                 Err(e) => {

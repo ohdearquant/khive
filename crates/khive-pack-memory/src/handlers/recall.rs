@@ -29,8 +29,9 @@ use crate::MemoryPack;
 use super::common::{
     compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, plog, plog_n,
     recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
-    TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
-    DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
+    RecallStageTimings, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC,
+    DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID,
+    RECALL_SLOW_THRESHOLD_MS,
 };
 
 /// Bounded storage page for inbound supersession checks. This is deliberately
@@ -58,6 +59,35 @@ fn checked_token_budget_chars(scoring_cfg: &ScoringConfig) -> Result<usize, Runt
                 "memory.recall effective character budget overflows platform size".to_string(),
             )
         })
+}
+
+fn emit_slow_recall_warning(
+    total_ms: u64,
+    timings: &RecallStageTimings,
+    result_count: usize,
+    query_bytes: usize,
+    ann_degraded: bool,
+    budget_capped: bool,
+    is_verbose: bool,
+) {
+    if total_ms < RECALL_SLOW_THRESHOLD_MS {
+        return;
+    }
+    tracing::warn!(
+        total_ms,
+        threshold_ms = RECALL_SLOW_THRESHOLD_MS,
+        embed_ms = timings.embed_ms(),
+        fts_ms = timings.fts_ms(),
+        ann_ms = timings.ann_ms(),
+        fresh_tail_ms = timings.fresh_tail_ms(),
+        hydrate_ms = timings.hydrate_ms(),
+        result_count,
+        query_bytes,
+        ann_degraded,
+        budget_capped,
+        is_verbose,
+        "memory.recall exceeded slow-request threshold"
+    );
 }
 
 async fn load_brain_profile(
@@ -300,6 +330,7 @@ impl MemoryPack {
         // pointer at both await sites so its state is not inlined into this
         // already-large pipeline and then into the MCP dispatch poll stack.
         let mut current_candidate_limit = candidate_limit;
+        let mut recall_stage_timings = RecallStageTimings::default();
         let mut candidates = Box::pin(self.collect_recall_candidates(
             query_trimmed,
             token,
@@ -314,8 +345,11 @@ impl MemoryPack {
             },
         ))
         .await?;
+        recall_stage_timings.add_retrieval_round(candidates.timings);
+        let hydrate_started = Instant::now();
         let (mut memory_ids, mut notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
+        recall_stage_timings.add_hydration(hydrate_started.elapsed());
 
         // Widening must count only candidates the created_at window can keep:
         // the window predicate runs post-fusion, so counting raw candidates
@@ -390,8 +424,11 @@ impl MemoryPack {
                 },
             ))
             .await?;
+            recall_stage_timings.add_retrieval_round(candidates.timings);
+            let hydrate_started = Instant::now();
             (memory_ids, notes_by_id) =
                 self.load_memory_candidate_notes(token, &candidates).await?;
+            recall_stage_timings.add_hydration(hydrate_started.elapsed());
             eligible_count = count_eligible(&candidates, &notes_by_id);
         }
         let candidate_limit = current_candidate_limit;
@@ -452,6 +489,8 @@ impl MemoryPack {
         };
 
         let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize);
+        // Needed on both the empty and non-empty completion paths.
+        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 
         if prof {
             if let Some(ref t) = t_stage {
@@ -476,6 +515,15 @@ impl MemoryPack {
             if let Ok(mut state) = self.recall_state.lock() {
                 on_recall_miss(&mut state);
             }
+            emit_slow_recall_warning(
+                recall_start.elapsed().as_millis() as u64,
+                &recall_stage_timings,
+                0,
+                query_trimmed.len(),
+                ann_degraded,
+                false,
+                is_verbose,
+            );
             // #1657: an empty degraded response is a third state — surface the
             // marker here too, otherwise a bare [] is indistinguishable from a
             // genuine no-match.
@@ -553,9 +601,6 @@ impl MemoryPack {
         }
 
         let recall_pipeline = make_pipeline(&cfg);
-
-        // Only verbose responses pay for the second default-weight score.
-        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 
         let mut ranked: Vec<ScoredNote> = Vec::new();
         for hit in &fused {
@@ -944,21 +989,15 @@ impl MemoryPack {
         // whose total handler time crosses the threshold, regardless of whether
         // KHIVE_RECALL_PROFILE is set, so a slow-but-completing recall leaves
         // daemon-side evidence even when nobody opted into per-stage profiling.
-        {
-            let total_ms = recall_start.elapsed().as_millis() as u64;
-            if total_ms >= RECALL_SLOW_THRESHOLD_MS {
-                tracing::warn!(
-                    total_ms,
-                    threshold_ms = RECALL_SLOW_THRESHOLD_MS,
-                    result_count = results.len(),
-                    query_bytes = query_trimmed.len(),
-                    ann_degraded,
-                    budget_capped,
-                    is_verbose,
-                    "memory.recall exceeded slow-request threshold"
-                );
-            }
-        }
+        emit_slow_recall_warning(
+            recall_start.elapsed().as_millis() as u64,
+            &recall_stage_timings,
+            results.len(),
+            query_trimmed.len(),
+            ann_degraded,
+            budget_capped,
+            is_verbose,
+        );
 
         if is_verbose && candidates.vector_hits_per_model.len() > 1 {
             // Raw global ANN diagnostics MUST use the same hydrated namespace filter as results.
@@ -5968,6 +6007,48 @@ mod tests {
             assert!(
                 super::RECALL_SLOW_THRESHOLD_MS < 30_000,
                 "threshold must fire before the default 30s recall_deadline_ms budget expires"
+            );
+        }
+    }
+
+    #[test]
+    fn completed_slow_recall_warning_names_every_retrieval_stage() {
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: Arc::clone(&buffer),
+        };
+        let timings = super::RecallStageTimings::from_millis_for_test(11, 22, 33, 44, 55);
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::emit_slow_recall_warning(
+                super::RECALL_SLOW_THRESHOLD_MS,
+                &timings,
+                7,
+                9,
+                false,
+                true,
+                false,
+            );
+        });
+
+        let events = buffer.lock().unwrap();
+        let warning = events
+            .iter()
+            .find(|event| {
+                event.message.as_deref() == Some("memory.recall exceeded slow-request threshold")
+            })
+            .unwrap_or_else(|| panic!("expected completed slow-recall warning, got {events:?}"));
+        for (field, expected) in [
+            ("embed_ms", "11"),
+            ("fts_ms", "22"),
+            ("ann_ms", "33"),
+            ("fresh_tail_ms", "44"),
+            ("hydrate_ms", "55"),
+        ] {
+            assert_eq!(
+                warning.fields.get(field).map(String::as_str),
+                Some(expected),
+                "missing or incorrect {field}: {warning:?}"
             );
         }
     }
