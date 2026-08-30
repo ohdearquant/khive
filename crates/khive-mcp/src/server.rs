@@ -2741,6 +2741,30 @@ fn request_read_timeout() -> std::time::Duration {
     })
 }
 
+/// Ensure every MCP request attempt has a daemon/audit correlation id.
+///
+/// A caller-supplied id is an explicit retry/correlation key and therefore
+/// wins unchanged. Otherwise the bridge mints an opaque nonzero 64-bit id from
+/// UUID entropy before daemon forwarding or local fallback. The same value is
+/// then echoed by the daemon frame and stamped into every operation's audit
+/// resource, making a handler that disappears after admission observable.
+fn ensure_bridge_request_id(params: &mut RequestParams) -> u64 {
+    if let Some(request_id) = params.request_id {
+        return request_id;
+    }
+
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let high = u64::from_be_bytes(
+        bytes[..8]
+            .try_into()
+            .expect("UUID high half is eight bytes"),
+    );
+    let low = u64::from_be_bytes(bytes[8..].try_into().expect("UUID low half is eight bytes"));
+    let request_id = (high ^ low).max(1);
+    params.request_id = Some(request_id);
+    request_id
+}
+
 async fn scope_mcp_request_read_cancellation<F>(
     cancellation: tokio_util::sync::CancellationToken,
     future: F,
@@ -2841,10 +2865,14 @@ result (e.g. create then link with the new entity's id)."#)]
     }
 }
 
-/// Boxed future returned by the daemon-forwarding seam.
+/// Owned boxed future returned by the daemon-forwarding seam.
+///
+/// Ownership is deliberate: once daemon forwarding is admitted the exchange
+/// runs in its own task, so dropping the outer MCP handler cannot drop the
+/// socket future after the daemon may already have committed work.
 #[cfg(unix)]
-type ForwardFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Option<Result<String, McpError>>> + Send + 'a>,
+type ForwardFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Option<Result<String, McpError>>> + Send + 'static>,
 >;
 
 /// Function pointer type for the daemon-forwarding seam, parameterized so
@@ -2857,8 +2885,7 @@ type ForwardFuture<'a> = std::pin::Pin<
 /// the real function would receive. `config`/`db` are always `None` at this
 /// call site.
 #[cfg(unix)]
-type ForwardFnPtr =
-    for<'a> fn(&'a khive_runtime::DaemonRequestFrame, Option<Vec<String>>) -> ForwardFuture<'a>;
+type ForwardFnPtr = fn(khive_runtime::DaemonRequestFrame, Option<Vec<String>>) -> ForwardFuture;
 
 /// Adapts the real `forward_or_spawn_with_config_and_packs` to the `ForwardFnPtr`
 /// signature. A pure pass-through — the `Some`/`None` decision already
@@ -2866,17 +2893,23 @@ type ForwardFnPtr =
 /// spy could fail to observe.
 #[cfg(unix)]
 fn forward_or_spawn_boxed(
-    frame: &khive_runtime::DaemonRequestFrame,
+    frame: khive_runtime::DaemonRequestFrame,
     packs: Option<Vec<String>>,
-) -> ForwardFuture<'_> {
+) -> ForwardFuture {
     Box::pin(async move {
-        crate::daemon::forward_or_spawn_with_config_and_packs(frame, None, None, packs.as_deref())
+        crate::daemon::forward_or_spawn_with_config_and_packs(&frame, None, None, packs.as_deref())
             .await
     })
 }
 
 impl KhiveMcpServer {
     async fn request_with_cancellation(&self, p: RequestParams) -> Result<String, McpError> {
+        let mut p = p;
+        let request_id = ensure_bridge_request_id(&mut p);
+        tracing::debug!(
+            request_id,
+            "MCP request admitted with bridge correlation id"
+        );
         #[cfg(unix)]
         return self.request_with_forward(p, forward_or_spawn_boxed).await;
         #[cfg(not(unix))]
@@ -2919,7 +2952,18 @@ impl KhiveMcpServer {
         // matching the existing `kkernel exec --save-file` precedent.
         #[cfg(unix)]
         if p.save_to.is_none() {
+            // A request cancelled before daemon admission must not start new
+            // work. After admission, however, cancellation cannot safely drop
+            // the forward: the daemon may already have committed one or more
+            // operations, so the bridge must preserve its real response.
+            if khive_storage::request_read_is_cancelled() {
+                return Err(McpError::internal_error(
+                    "request cancelled before daemon dispatch",
+                    None,
+                ));
+            }
             let frame = self.wire_daemon_frame(&p);
+            let request_id = frame.request_id;
             // Forward this server's own resolved pack list so a daemon this
             // call spawns serves the SAME packs this process registered —
             // `pack_names()` reflects the actual loaded registry regardless
@@ -2932,14 +2976,41 @@ impl KhiveMcpServer {
                 .into_iter()
                 .map(str::to_string)
                 .collect();
-            let forwarded = forward_fn(&frame, Some(resolved_packs));
-            tokio::pin!(forwarded);
+            let mut forward_task = tokio::spawn(async move {
+                let outcome = forward_fn(frame, Some(resolved_packs)).await;
+                tracing::debug!(
+                    request_id,
+                    daemon_outcome_present = outcome.is_some(),
+                    "admitted daemon forward reached a terminal outcome"
+                );
+                outcome
+            });
+            let mut cancelled_during_forward = false;
             let forwarded = tokio::select! {
-                result = &mut forwarded => result,
+                result = &mut forward_task => result,
                 _ = khive_storage::wait_for_request_read_cancellation() => {
-                    return Err(McpError::internal_error("request cancelled", None));
+                    cancelled_during_forward = true;
+                    tracing::warn!(
+                        request_id,
+                        "request cancellation arrived after daemon admission; shielding the \
+                         forward until its per-operation outcome is known"
+                    );
+                    forward_task.await
                 }
             };
+            let forwarded = forwarded.map_err(|error| {
+                McpError::internal_error(
+                    format!(
+                        "daemon forwarding task failed after admission ({error}); outcome is \
+                         unknown and the request must not be retried blindly"
+                    ),
+                    Some(json!({
+                        "outcome": "unknown",
+                        "retryable": false,
+                        "request_id": request_id,
+                    })),
+                )
+            })?;
             if let Some(res) = forwarded {
                 return match res {
                     Ok(s) => Ok(s),
@@ -2956,6 +3027,16 @@ impl KhiveMcpServer {
                         None => Err(e),
                     },
                 };
+            }
+            if cancelled_during_forward {
+                return Err(McpError::internal_error(
+                    "request cancelled before local fallback dispatch",
+                    Some(json!({
+                        "outcome": "not_dispatched",
+                        "retryable": true,
+                        "request_id": request_id,
+                    })),
+                ));
             }
         }
         self.dispatch_request_wire(p).await
@@ -4037,7 +4118,7 @@ mod tests {
 
     #[cfg(unix)]
     use khive_storage::test_support::freeze_snapshot_sidecars;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[test]
@@ -4049,6 +4130,30 @@ mod tests {
             error.data.as_ref().and_then(|data| data["reason"].as_str()),
             Some("parse-error")
         );
+    }
+
+    #[test]
+    fn bridge_request_id_is_unconditional_and_preserves_caller_value() {
+        let mut generated = RequestParams {
+            ops: "stats()".to_string(),
+            ..Default::default()
+        };
+        let first = ensure_bridge_request_id(&mut generated);
+        assert_ne!(first, 0, "bridge-generated request ids are nonzero");
+        assert_eq!(generated.request_id, Some(first));
+        assert_eq!(
+            ensure_bridge_request_id(&mut generated),
+            first,
+            "one admitted MCP attempt keeps one stable id"
+        );
+
+        let mut supplied = RequestParams {
+            ops: "stats()".to_string(),
+            request_id: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(ensure_bridge_request_id(&mut supplied), 42);
+        assert_eq!(supplied.request_id, Some(42));
     }
 
     #[tokio::test]
@@ -4101,11 +4206,11 @@ mod tests {
     /// this spy observes precisely what the real
     /// `forward_or_spawn_with_config_and_packs` call would receive. Two independent
     /// mutations must both redden this test:
-    /// - swapping the production `forward_fn(&frame, Some(resolved_packs))`
-    ///   call for `forward_fn(&frame, Some(Vec::new()))` — the restricted
+    /// - swapping the production `forward_fn(frame, Some(resolved_packs))`
+    ///   call for `forward_fn(frame, Some(Vec::new()))` — the restricted
     ///   two-pack registry built here (`kg`, `gtd`) no longer matches what
     ///   the spy records;
-    /// - swapping that same call for `forward_fn(&frame, None)` — the spy
+    /// - swapping that same call for `forward_fn(frame, None)` — the spy
     ///   records `None` instead of `Some(vec!["kg", "gtd"])`.
     #[cfg(unix)]
     #[tokio::test]
@@ -4116,9 +4221,9 @@ mod tests {
         }
 
         fn spy_forward(
-            _frame: &khive_runtime::DaemonRequestFrame,
+            _frame: khive_runtime::DaemonRequestFrame,
             packs: Option<Vec<String>>,
-        ) -> ForwardFuture<'_> {
+        ) -> ForwardFuture {
             SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = Some(packs));
             Box::pin(async {
                 Some(Ok(json!({
@@ -4163,6 +4268,134 @@ mod tests {
             "the server's own resolved registry pack set must reach the daemon-forwarding \
              seam as Some(...) so a daemon this call spawns serves the same packs this \
              process registered"
+        );
+    }
+
+    /// A cancellation notification after daemon admission must not replace the
+    /// daemon's actual per-op outcome with a bare RPC-level error. The daemon
+    /// response is the only source that can say which independent operations
+    /// committed and which failed validation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forwarded_cancellation_returns_the_actual_partial_envelope() {
+        fn delayed_partial_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+        ) -> ForwardFuture {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Some(Ok(json!({
+                    "results": [
+                        {"ok": true, "tool": "comm.send", "result": {"id": "sent"}},
+                        {"ok": false, "tool": "link", "error": "invalid endpoint pair"}
+                    ],
+                    "summary": {"total": 2, "succeeded": 1, "failed": 1, "aborted": 0},
+                    "status": "partial"
+                })
+                .to_string()))
+            })
+        }
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel_after_admission = cancellation.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel_after_admission.cancel();
+        });
+
+        let response = scope_mcp_request_read_cancellation(
+            cancellation,
+            server.request_with_forward(
+                RequestParams {
+                    ops: "[stats(), stats()]".to_string(),
+                    ..Default::default()
+                },
+                delayed_partial_forward,
+            ),
+        )
+        .await
+        .expect("cancellation after admission must preserve the daemon response");
+        canceller.await.expect("canceller task completes");
+
+        let response: Value = serde_json::from_str(&response).expect("response envelope is JSON");
+        assert_eq!(response["status"], "partial");
+        assert_eq!(response["summary"]["succeeded"], 1);
+        assert_eq!(response["summary"]["failed"], 1);
+        assert_eq!(response["results"][1]["error"], "invalid endpoint pair");
+    }
+
+    /// Once daemon forwarding is admitted, dropping the outer MCP handler
+    /// must detach rather than cancel the socket exchange. Otherwise the
+    /// daemon can commit while the bridge silently discards the only result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_handler_does_not_drop_an_admitted_forward() {
+        static FORWARD_STARTED: AtomicBool = AtomicBool::new(false);
+        static FORWARD_COMPLETED: AtomicBool = AtomicBool::new(false);
+
+        fn slow_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+        ) -> ForwardFuture {
+            Box::pin(async {
+                FORWARD_STARTED.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                FORWARD_COMPLETED.store(true, Ordering::SeqCst);
+                Some(Ok(json!({
+                    "results": [{"ok": true, "tool": "stats", "result": {}}],
+                    "summary": {"total": 1, "succeeded": 1, "failed": 0, "aborted": 0},
+                    "status": "success"
+                })
+                .to_string()))
+            })
+        }
+
+        FORWARD_STARTED.store(false, Ordering::SeqCst);
+        FORWARD_COMPLETED.store(false, Ordering::SeqCst);
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let handler = tokio::spawn(async move {
+            server
+                .request_with_forward(
+                    RequestParams {
+                        ops: "stats()".to_string(),
+                        ..Default::default()
+                    },
+                    slow_forward,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !FORWARD_STARTED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forward never reached admission");
+        handler.abort();
+        let _ = handler.await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            FORWARD_COMPLETED.load(Ordering::SeqCst),
+            "dropping the handler must not cancel an already-admitted daemon forward"
         );
     }
 

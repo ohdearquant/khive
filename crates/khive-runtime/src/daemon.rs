@@ -484,14 +484,15 @@ pub struct DaemonRequestFrame {
     /// key on transport.
     #[serde(default)]
     pub from_wire: bool,
-    /// Caller-supplied correlation id (khive#948): a `u64` from the caller's
-    /// own process-local monotonic counter, echoed back unchanged on
+    /// Request-group correlation id (khive#948), echoed back unchanged on
     /// [`DaemonResponseFrame::request_id`] and stamped into the dispatch's
     /// audit event (`resource.request_id`) so a benchmark harness can join
     /// its own pre-send sample to the server-side audit row for the same
-    /// request. Purely additive — `#[serde(default)]` matches
-    /// `metrics_only`/`format`/`format_per_op` precedent, no
-    /// `PROTOCOL_VERSION` bump. `None` means the caller supplied no id.
+    /// request. Agent-facing MCP requests always carry one: the bridge keeps a
+    /// caller-supplied value or mints an opaque nonzero value when absent.
+    /// Operator-built/probe frames may still use `None`. Purely additive —
+    /// `#[serde(default)]` matches `metrics_only`/`format`/`format_per_op`
+    /// precedent, with no `PROTOCOL_VERSION` bump.
     #[serde(default)]
     pub request_id: Option<u64>,
 }
