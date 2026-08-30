@@ -119,7 +119,7 @@ async fn require_existing_thread_root(
     };
     let store = runtime.notes(token)?;
     let page = store
-        .query_notes_filtered(
+        .query_notes_filtered_count_free(
             token.namespace().as_str(),
             &filter,
             PageRequest {
@@ -1644,7 +1644,7 @@ pub(crate) async fn handle_thread(
     let mut seen_row_ids = HashSet::new();
     loop {
         let page = thread_store
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &thread_filter,
                 PageRequest {
@@ -1971,7 +1971,7 @@ pub(crate) async fn handle_ingest(
                     ..Default::default()
                 };
                 let corr_page = store
-                    .query_notes_filtered(
+                    .query_notes_filtered_count_free(
                         ns,
                         &corr_filter,
                         PageRequest {
@@ -2038,7 +2038,7 @@ pub(crate) async fn handle_ingest(
                         ..Default::default()
                     };
                     let thread_page = store
-                        .query_notes_filtered(
+                        .query_notes_filtered_count_free(
                             ns,
                             &thread_filter,
                             PageRequest {
@@ -2191,7 +2191,7 @@ pub(crate) async fn handle_ingest(
                 ..Default::default()
             };
             let duplicate_page = store
-                .query_notes_filtered(
+                .query_notes_filtered_count_free(
                     ns,
                     &duplicate_filter,
                     PageRequest {
@@ -2705,7 +2705,7 @@ pub(crate) async fn handle_health(
         ..Default::default()
     };
     let page = store
-        .query_notes_filtered(
+        .query_notes_filtered_count_free(
             token.namespace().as_str(),
             &filter,
             PageRequest {

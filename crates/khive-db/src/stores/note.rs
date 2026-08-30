@@ -1407,6 +1407,51 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
+    async fn query_notes_count_free(
+        &self,
+        namespace: &str,
+        kind: Option<&str>,
+        page: PageRequest,
+    ) -> Result<Page<Note>, StorageError> {
+        let namespace = namespace.to_string();
+        let kind = kind.map(str::to_string);
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: "query_notes_count_free".into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
+
+        self.with_reader("query_notes_count_free", move |conn| {
+            let (where_sql, mut params) = build_note_where(&namespace, kind.as_deref());
+            params.push(Box::new(limit_i64));
+            params.push(Box::new(offset_i64));
+            let limit_idx = params.len() - 1;
+            let offset_idx = params.len();
+            let sql = format!(
+                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
+                 expires_at, properties, created_at, updated_at, deleted_at \
+                 FROM notes{where_sql} ORDER BY created_at DESC, id ASC \
+                 LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+            );
+
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let mut rows = stmt.query(param_refs.as_slice())?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                items.push(read_note(row)?);
+            }
+
+            Ok(Page { items, total: None })
+        })
+        .await
+    }
+
     async fn query_notes_filtered(
         &self,
         namespace: &str,

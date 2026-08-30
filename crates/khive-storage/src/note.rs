@@ -388,6 +388,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unfiltered_count_free_page_default_is_fail_closed_without_exact_query_fallback() {
+        let store = DefaultOnlyNoteStore::default();
+        let result = store
+            .query_notes_count_free("ns:test", Some("message"), PageRequest::default())
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::StorageError::Unsupported { ref operation, .. })
+                    if operation == "query_notes_count_free"
+            ),
+            "inherited count-free query must fail closed, got {result:?}"
+        );
+        assert_eq!(
+            store.query_call_count(),
+            0,
+            "count-free default must not invoke the exact-count page"
+        );
+    }
+
+    #[tokio::test]
     async fn bounded_snapshot_count_default_is_fail_closed_without_query_fallback() {
         let store = DefaultOnlyNoteStore::default();
         let result = store
@@ -673,6 +695,24 @@ pub trait NoteStore: Send + Sync + 'static {
         kind: Option<&str>,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Query notes by namespace and optional kind without computing an exact total.
+    ///
+    /// Implementations must return `total: None`. Backends that cannot
+    /// guarantee a count-free projection must fail closed rather than invoke
+    /// [`Self::query_notes`], whose exact total remains available to callers
+    /// that expose a snapshot-consistent count.
+    async fn query_notes_count_free(
+        &self,
+        _namespace: &str,
+        _kind: Option<&str>,
+        _page: PageRequest,
+    ) -> StorageResult<Page<Note>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "query_notes_count_free".into(),
+            message: "this backend does not implement count-free note paging".into(),
+        })
+    }
     /// Query notes with property-based filtering and custom sort.
     /// The returned total and page items must come from one consistent
     /// backend snapshot.

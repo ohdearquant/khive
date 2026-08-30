@@ -281,6 +281,17 @@ impl NoteStore for PolicyEnforcingNoteStore {
         self.inner.query_notes(namespace, kind, page).await
     }
 
+    async fn query_notes_count_free(
+        &self,
+        namespace: &str,
+        kind: Option<&str>,
+        page: PageRequest,
+    ) -> StorageResult<Page<Note>> {
+        self.inner
+            .query_notes_count_free(namespace, kind, page)
+            .await
+    }
+
     async fn query_notes_filtered(
         &self,
         namespace: &str,

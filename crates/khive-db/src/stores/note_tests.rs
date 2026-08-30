@@ -666,14 +666,31 @@ async fn filtered_count_free_page_runs_without_count_over_large_match_set() {
         "control exact-count page must be rejected by the count authorizer"
     );
 
+    let exact_unfiltered_control = store
+        .query_notes(&namespace, Some("message"), request.clone())
+        .await;
+    assert!(
+        exact_unfiltered_control.is_err(),
+        "control unfiltered exact-count page must be rejected by the count authorizer"
+    );
+
     let page = store
-        .query_notes_filtered_count_free(&namespace, &filter, request)
+        .query_notes_filtered_count_free(&namespace, &filter, request.clone())
         .await
         .expect("count-free page must not invoke SQLite count");
     assert_eq!(page.total, None);
     assert_eq!(page.items.len(), 6, "caller receives its lookahead row");
     assert_eq!(page.items[0].content, "message-1999");
     assert_eq!(page.items[5].content, "message-1994");
+
+    let unfiltered_page = store
+        .query_notes_count_free(&namespace, Some("message"), request)
+        .await
+        .expect("unfiltered count-free page must not invoke SQLite count");
+    assert_eq!(unfiltered_page.total, None);
+    assert_eq!(unfiltered_page.items.len(), 6);
+    assert_eq!(unfiltered_page.items[0].content, "message-1999");
+    assert_eq!(unfiltered_page.items[5].content, "message-1994");
 
     let reader = pool.reader().unwrap();
     reader

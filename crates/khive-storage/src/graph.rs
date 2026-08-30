@@ -114,7 +114,9 @@ pub trait GraphStore: Send + Sync + 'static {
     ) -> StorageResult<Option<Edge>>;
     /// Delete an edge by link ID using the specified delete mode.
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> StorageResult<bool>;
-    /// Query edges with filter, sort, and pagination.
+    /// Query edges with filter, sort, and pagination without an implicit
+    /// exact count. Implementations should return `total: None`; callers that
+    /// need a count use [`Self::count_edges`] explicitly.
     async fn query_edges(
         &self,
         filter: EdgeFilter,
@@ -128,7 +130,9 @@ pub trait GraphStore: Send + Sync + 'static {
     /// prefixes and slicing a client-side merge floats the window between
     /// calls (silent duplicate/skip enumeration). Backends without batched
     /// namespace support retain the single-namespace path and reject
-    /// multi-namespace requests explicitly.
+    /// multi-namespace requests explicitly. Implementations should return
+    /// `total: None`; callers that need a count use
+    /// [`Self::count_edges_in_namespaces`] explicitly.
     async fn query_edges_in_namespaces(
         &self,
         namespaces: &[String],
@@ -139,7 +143,7 @@ pub trait GraphStore: Send + Sync + 'static {
         match namespaces.len() {
             0 => Ok(Page {
                 items: Vec::new(),
-                total: Some(0),
+                total: None,
             }),
             1 => self.query_edges(filter, sort, page).await,
             _ => Err(StorageError::Unsupported {
