@@ -1236,6 +1236,30 @@ mod tests {
 
     use crate::MemoryPack;
 
+    /// Keeps a file-backed test runtime alive before removing its database directory.
+    /// Fields are declared in drop order: the runtime closes before the guard cleans up.
+    struct TestRuntime {
+        runtime: KhiveRuntime,
+        _temp_dir: Option<tempfile::TempDir>,
+    }
+
+    impl TestRuntime {
+        fn in_memory(runtime: KhiveRuntime) -> Self {
+            Self {
+                runtime,
+                _temp_dir: None,
+            }
+        }
+    }
+
+    impl std::ops::Deref for TestRuntime {
+        type Target = KhiveRuntime;
+
+        fn deref(&self) -> &Self::Target {
+            &self.runtime
+        }
+    }
+
     fn memory_runtime_with_fresh_tail(ann_fresh_tail_enabled: bool) -> KhiveRuntime {
         KhiveRuntime::memory()
             .expect("in-memory runtime")
@@ -2003,22 +2027,25 @@ mod tests {
 
     // ── ADR-081 §5 (#394): recall serve-time attribution + ledger append ──────
 
-    fn build_full_rt_with_brain() -> khive_runtime::KhiveRuntime {
+    fn build_full_rt_with_brain() -> TestRuntime {
         let tmp = tempfile::Builder::new()
             .prefix("khive-mem-recall-adr081-")
             .tempdir_in(std::env::temp_dir())
             .expect("temp dir");
         let db_path = tmp.path().join("khive.db");
-        std::mem::forget(tmp);
 
-        khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        let runtime = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
             db_path: Some(db_path),
             embedding_model: None,
             additional_embedding_models: vec![],
             packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
             ..khive_runtime::RuntimeConfig::default()
         })
-        .expect("runtime")
+        .expect("runtime");
+        TestRuntime {
+            runtime,
+            _temp_dir: Some(tmp),
+        }
     }
 
     // `#[serial(background_tasks)]`: see the note on
@@ -2160,7 +2187,6 @@ mod tests {
             .tempdir_in(std::env::temp_dir())
             .expect("temp dir");
         let db_path = tmp.path().join("khive.db");
-        std::mem::forget(tmp);
 
         let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
             db_path: Some(db_path),
@@ -2616,7 +2642,6 @@ mod tests {
             .tempdir_in(std::env::temp_dir())
             .expect("temp dir");
         let db_path = tmp.path().join("khive.db");
-        std::mem::forget(tmp);
 
         let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
             db_path: Some(db_path),
@@ -2761,7 +2786,6 @@ mod tests {
             .tempdir_in(std::env::temp_dir())
             .expect("temp dir");
         let db_path = tmp.path().join("khive.db");
-        std::mem::forget(tmp);
 
         let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
             db_path: Some(db_path),
@@ -3161,7 +3185,7 @@ mod tests {
             let rt = if with_brain {
                 build_full_rt_with_brain()
             } else {
-                KhiveRuntime::memory().expect("in-memory runtime")
+                TestRuntime::in_memory(KhiveRuntime::memory().expect("in-memory runtime"))
             };
             let ns = Namespace::parse("local").expect("ns");
             let token = rt.authorize(ns.clone()).expect("token");
@@ -3333,7 +3357,7 @@ mod tests {
 
     /// Build a controlled four-note corpus whose profile salience projection flips H/L order.
     async fn adr104_build_ranking_corpus() -> (
-        khive_runtime::KhiveRuntime,
+        TestRuntime,
         khive_runtime::VerbRegistry,
         Namespace,
         Uuid,
@@ -3500,7 +3524,7 @@ mod tests {
             let rt = if with_brain {
                 build_full_rt_with_brain()
             } else {
-                KhiveRuntime::memory().expect("in-memory runtime")
+                TestRuntime::in_memory(KhiveRuntime::memory().expect("in-memory runtime"))
             };
             let ns = Namespace::parse("local").expect("ns");
             let token = rt.authorize(ns.clone()).expect("token");

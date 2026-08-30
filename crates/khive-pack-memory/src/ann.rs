@@ -2628,6 +2628,20 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// Owns a file-backed runtime and removes its database directory after shutdown.
+    struct TestRuntime {
+        runtime: KhiveRuntime,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestRuntime {
+        type Target = KhiveRuntime;
+
+        fn deref(&self) -> &Self::Target {
+            &self.runtime
+        }
+    }
+
     struct InterleavingTailReader {
         subject: Uuid,
         calls: Vec<String>,
@@ -3906,14 +3920,12 @@ mod tests {
         );
     }
 
-    fn test_runtime_with_hash_embedder(model: &str, dims: usize) -> KhiveRuntime {
+    fn test_runtime_with_hash_embedder(model: &str, dims: usize) -> TestRuntime {
         let tmp = tempfile::Builder::new()
             .prefix("khive-memory-ann-test-")
             .tempdir_in(std::env::temp_dir())
             .expect("temp db dir");
-        // Leak the guard so the returned runtime's database directory remains alive.
         let db_path = tmp.path().join("khive-graph.db");
-        std::mem::forget(tmp);
         let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
             db_path: Some(db_path),
             embedding_model: None,
@@ -3925,7 +3937,10 @@ mod tests {
             model_name: model.to_owned(),
             dims,
         });
-        rt
+        TestRuntime {
+            runtime: rt,
+            _temp_dir: tmp,
+        }
     }
 
     /// A completed warm releases its guard so a later write can trigger another rebuild.
@@ -4381,7 +4396,6 @@ mod tests {
             .tempdir_in(std::env::temp_dir())
             .expect("temp db dir");
         let db_path = tmp.path().join("khive-graph.db");
-        std::mem::forget(tmp);
 
         // "Daemon": first runtime, warms the ANN index and stays resident —
         // exactly like a long-lived `kkernel mcp --daemon` process.

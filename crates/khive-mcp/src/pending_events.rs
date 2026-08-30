@@ -3328,7 +3328,7 @@ mod tests {
     use khive_storage::event::EventFilter;
     use khive_storage::types::PageRequest;
     use khive_types::{Details, HandlerDef, KhiveError, VerbCategory, Visibility};
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
     #[derive(Debug)]
@@ -3550,10 +3550,11 @@ mod tests {
         }
     }
 
-    fn tmp_db() -> (NamedTempFile, String) {
-        let f = NamedTempFile::new().expect("tempfile");
-        let path = f.path().to_str().expect("utf8 path").to_string();
-        (f, path)
+    fn tmp_db() -> (TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("khive-test.db");
+        let path = path.to_str().expect("utf8 path").to_string();
+        (dir, path)
     }
 
     /// Due, but inside the default missed-event grace window, so callers land
