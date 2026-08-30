@@ -72,6 +72,9 @@ impl BackendRegistry {
 
     /// List all registered [`BackendId`]s.
     pub fn ids(&self) -> Vec<BackendId> {
-        self.backends.keys().map(BackendId::new).collect()
+        self.backends
+            .values()
+            .map(|entry| entry.id.clone())
+            .collect()
     }
 }

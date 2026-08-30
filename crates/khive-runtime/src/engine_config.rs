@@ -10,7 +10,7 @@ use khive_types::namespace::Namespace;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::presentation::OutputFormat;
+use crate::{config::BackendId, presentation::OutputFormat};
 
 // ---- Error type ----
 
@@ -46,6 +46,9 @@ pub enum ConfigError {
 
     #[error("duplicate backend name: {name:?}")]
     DuplicateBackendName { name: String },
+
+    #[error("invalid backend name {name:?}: {reason}")]
+    InvalidBackendName { name: String, reason: String },
 
     #[error(
         "[packs.{pack}].backend = {backend:?} references an unknown backend; \
@@ -834,6 +837,12 @@ impl KhiveConfig {
         if !self.backends.is_empty() {
             let mut seen_backends = std::collections::HashSet::new();
             for backend in &self.backends {
+                BackendId::parse(&backend.name).map_err(|error| {
+                    ConfigError::InvalidBackendName {
+                        name: backend.name.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
                 if !seen_backends.insert(backend.name.clone()) {
                     return Err(ConfigError::DuplicateBackendName {
                         name: backend.name.clone(),
@@ -2101,6 +2110,24 @@ kind = "memory"
         assert!(
             matches!(config_error_root(&err), ConfigError::DuplicateBackendName { ref name } if name == "dup"),
             "expected DuplicateBackendName {{ name: \"dup\" }}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_empty_backend_name_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = ""
+kind = "memory"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("empty backend name must fail");
+        assert!(
+            matches!(config_error_root(&err), ConfigError::InvalidBackendName { ref name, .. } if name.is_empty()),
+            "expected InvalidBackendName for the empty name, got {err:?}"
         );
     }
 

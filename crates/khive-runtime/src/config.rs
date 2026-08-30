@@ -18,19 +18,31 @@ use crate::error::RuntimeResult;
 /// `SubstrateCoordinator` in `kkernel`
 /// uses `BackendId` for node-to-backend resolution and cross-backend edge routing.
 ///
-/// A single-backend `KhiveRuntime` always has `BackendId("main")` by default.
+/// A single-backend `KhiveRuntime` always has the `main` backend id by default.
 /// The boot path in `kkernel` or `khive-mcp` sets the id via `RuntimeConfig::backend_id`
 /// when constructing per-pack runtimes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BackendId(pub String);
+pub struct BackendId(String);
+
+/// Validation error returned when a backend identifier is rejected.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BackendIdError {
+    /// The supplied identifier was empty or contained only whitespace.
+    #[error("backend id must not be empty or whitespace-only")]
+    Empty,
+}
 
 impl BackendId {
     /// The default single-backend name.
     pub const MAIN: &'static str = "main";
 
-    /// Construct from a string name.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
+    /// Parse a nonempty backend identifier.
+    pub fn parse(name: impl Into<String>) -> Result<Self, BackendIdError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(BackendIdError::Empty);
+        }
+        Ok(Self(name))
     }
 
     /// The default `main` backend id.
@@ -44,9 +56,55 @@ impl BackendId {
     }
 }
 
+impl TryFrom<String> for BackendId {
+    type Error = BackendIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl TryFrom<&str> for BackendId {
+    type Error = BackendIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl std::str::FromStr for BackendId {
+    type Err = BackendIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
 impl std::fmt::Display for BackendId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod backend_id_tests {
+    use super::BackendId;
+
+    #[test]
+    fn empty_and_whitespace_only_backend_ids_are_rejected() {
+        for invalid in ["", " ", "\t\n"] {
+            assert!(
+                BackendId::parse(invalid).is_err(),
+                "backend id {invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn nonempty_backend_id_round_trips() {
+        let id = BackendId::parse("archive").expect("valid backend id");
+        assert_eq!(id.as_str(), "archive");
+        assert_eq!(id.to_string(), "archive");
     }
 }
 

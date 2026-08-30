@@ -5274,10 +5274,11 @@ mod tests {
             let mut per_backend: Vec<crate::coordinator::BackendSearchResult> = (0
                 ..MAX_BACKEND_ERROR_ENTRIES + 9)
                 .map(|index| crate::coordinator::BackendSearchResult {
-                    backend_id: khive_runtime::BackendId::new(format!(
+                    backend_id: khive_runtime::BackendId::parse(format!(
                         "backend-{index:03}-{}",
                         "x".repeat(MAX_BACKEND_ERROR_KEY_CHARS)
-                    )),
+                    ))
+                    .expect("valid backend id"),
                     entity_hits: Vec::new(),
                     note_hits: Vec::new(),
                     error: Some(format!(
@@ -5355,7 +5356,8 @@ mod tests {
             entity_hits: Vec::new(),
             note_hits: Vec::new(),
             per_backend: vec![crate::coordinator::BackendSearchResult {
-                backend_id: khive_runtime::BackendId::new(secret.clone()),
+                backend_id: khive_runtime::BackendId::parse(secret.clone())
+                    .expect("valid backend id"),
                 entity_hits: Vec::new(),
                 note_hits: Vec::new(),
                 error: Some("storage unavailable".to_string()),

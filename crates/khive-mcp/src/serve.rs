@@ -2793,7 +2793,7 @@ async fn build_registry_for_multi_backend_inner(
             }
         };
         let mut rt_config = base_config.clone();
-        rt_config.backend_id = BackendId::new(backend_name);
+        rt_config.backend_id = BackendId::parse(backend_name)?;
         if no_embed {
             // `[packs.<name>] no_embed = true`: this pack's runtime gets zero
             // embedders — pack-owned writes are FTS + metadata only. Clear

@@ -577,7 +577,7 @@ async fn build_multi_backend_server_with_coordinator_and_db_anchor(
             .get(pack_name.as_str())
             .map(|pc| pc.backend.as_str())
             .unwrap_or(BackendId::MAIN);
-        let backend_id = BackendId::new(backend_name);
+        let backend_id = BackendId::parse(backend_name)?;
         // `BackendRegistry::register` is idempotent by backend_id —
         // the second registration for the same id is a no-op.
         backend_reg.register(backend_id, Arc::clone(rt));
@@ -1005,7 +1005,7 @@ fn cmd_backend(cmd: BackendCommand) -> Result<()> {
             Ok(())
         }
         BackendCommand::Info { name, human } => {
-            let id = BackendId::new(&name);
+            let id = BackendId::parse(&name)?;
             let entry = registry
                 .get(&id)
                 .with_context(|| format!("backend {name:?} is not registered"))?;
