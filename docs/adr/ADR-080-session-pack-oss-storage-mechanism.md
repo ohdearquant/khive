@@ -240,7 +240,7 @@ unbounded tail scan; once the line eventually terminates (or growth stops and th
 true EOF mid-line), it resolves through the ordinary skip-and-advance path above.
 
 **Amended: see §7.** The cursor no longer stays at the line's start. This case also
-covers a *complete* line whose terminator lies several reader windows past the cap, and
+covers a _complete_ line whose terminator lies several reader windows past the cap, and
 for that member the rule above never advances the offset — the wedge the complete-line
 case above exists to prevent. §7 replaces it with a checkpointed bounded skip; the read
 bound, the warning, and the never-parse rule are unchanged.
