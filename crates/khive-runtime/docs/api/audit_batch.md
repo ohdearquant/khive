@@ -69,8 +69,16 @@ accounting-bearing side effects; see that constant's doc comment), either reason
 best-effort instead of failing the dispatch — the read performed no domain write, so discarding
 its already-computed result to protect an obligation it does not need as strictly as a write does
 inverts the point of serving it (khive#2147, khive#2217). Every other obligation failure, and
-every failure for a non-opted-in verb, is unaffected — write-side hard-fail semantics are
-unchanged.
+every failure for a non-opted-in verb, is unaffected.
+
+For a successful non-degrade-safe operation, the domain effect may already be committed when its
+deferred audit row is enqueued. Those rows, and `GitDigestReceipt` rows, use
+`AuditBatch::submit_until_resolved()` (khive#2256): crossing `admission_deadline` emits a warning but
+keeps awaiting the same generation receiver until it commits or reaches a genuine terminal
+failure. The handler is not invoked again and the row is not re-enqueued. Pre-enqueue
+`QueueAdmissionExhausted` and real store/driver failures still return errors. Ordinary `submit()`
+retains the bounded deadline contract for admission-degrade reads, failed/denied outcomes, and
+pure observability.
 
 ## Supervision and failure ownership (owner ruling R1)
 

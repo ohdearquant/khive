@@ -40,6 +40,8 @@ use serial_test::serial;
 #[derive(Default)]
 struct MemoryEventStore {
     events: std::sync::Mutex<Vec<Event>>,
+    append_started: Option<Arc<tokio::sync::Notify>>,
+    append_release: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[async_trait]
@@ -84,6 +86,12 @@ impl EventStore for MemoryEventStore {
         &self,
         events: Vec<Event>,
     ) -> StorageResult<khive_storage::event::IdempotentEventBatchResult> {
+        if let Some(started) = &self.append_started {
+            started.notify_one();
+        }
+        if let Some(release) = &self.append_release {
+            release.notified().await;
+        }
         let mut store = self.events.lock().unwrap();
         let mut rows = Vec::with_capacity(events.len());
         for event in events {
@@ -205,6 +213,52 @@ impl PackRuntime for AlphaPack {
     }
 }
 
+/// Minimal non-idempotent write used by khive#2256 to prove the handler
+/// effect has landed before the audit generation resolves.
+struct RecordingWritePack {
+    effects: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Pack for RecordingWritePack {
+    const NAME: &'static str = "recording_write";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+        name: "create",
+        description: "record one committed effect",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[],
+    }];
+}
+
+#[async_trait]
+impl PackRuntime for RecordingWritePack {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+    fn note_kinds(&self) -> &'static [&'static str] {
+        Self::NOTE_KINDS
+    }
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        Self::ENTITY_KINDS
+    }
+    fn handlers(&self) -> &'static [HandlerDef] {
+        Self::HANDLERS
+    }
+    async fn dispatch(
+        &self,
+        _verb: &str,
+        _params: Value,
+        _registry: &khive_runtime::pack::VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        self.effects
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(serde_json::json!({"created": true}))
+    }
+}
+
 fn mk_event(verb: &str) -> Event {
     Event::new(
         "local",
@@ -231,6 +285,72 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
         );
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
+}
+
+/// khive#2256: a successful non-idempotent write has already committed by
+/// the time its deferred audit row is submitted. If the row is enqueued but
+/// its generation remains in flight past `admission_deadline`, the dispatch
+/// must await the generation's real outcome rather than report the committed
+/// write as a failure and invite an unsafe retry.
+#[serial]
+#[tokio::test]
+async fn write_verb_waits_past_audit_deadline_until_row_commits() {
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let append_release = Arc::new(tokio::sync::Notify::new());
+    let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store = Arc::new(MemoryEventStore {
+        append_started: Some(Arc::clone(&append_started)),
+        append_release: Some(Arc::clone(&append_release)),
+        ..MemoryEventStore::default()
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(RecordingWritePack {
+        effects: Arc::clone(&effects),
+    });
+    builder.with_event_store(store.clone());
+    builder.with_audit_batch_config(AuditBatchConfig {
+        admission_deadline: std::time::Duration::from_millis(30),
+        ..AuditBatchConfig::default()
+    });
+    let registry = Arc::new(builder.build().expect("registry builds"));
+
+    let mut dispatch = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move { registry.dispatch("create", Value::Null).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("audit generation reaches the blocking store");
+    assert_eq!(
+        effects.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the domain effect must already be committed before the audit wait"
+    );
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(80), &mut dispatch)
+            .await
+            .is_err(),
+        "an enqueued audit row crossing its bounded wait must not turn a committed write into a failure"
+    );
+
+    append_release.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut dispatch)
+        .await
+        .expect("dispatch resolves after the audit generation")
+        .expect("dispatch task joins")
+        .expect("committed write reports success once its audit row commits");
+    assert_eq!(result, serde_json::json!({"created": true}));
+    assert_eq!(
+        effects.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "awaiting audit resolution must not rerun the non-idempotent handler"
+    );
+    assert_eq!(
+        store.events.lock().expect("events lock").len(),
+        1,
+        "the successful dispatch must have exactly one durable audit row"
+    );
 }
 
 // Both tests in this file arm `fault_injection`'s process-global

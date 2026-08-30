@@ -3701,9 +3701,8 @@ async fn persist_git_digest_receipt(
     // acquisition with concurrent rows, never whether it is durable before
     // the caller observes success.
     let submit_result = if let Some(audit_batch) = audit_batch {
-        use crate::audit_batch::AuditBatchControl;
         audit_batch
-            .submit(crate::audit_batch::PreparedAuditRow {
+            .submit_until_resolved(crate::audit_batch::PreparedAuditRow {
                 event,
                 producer: crate::audit_batch::AuditProducer::GitDigestReceipt,
             })
@@ -3793,10 +3792,21 @@ async fn append_audit_event_best_effort(
         degrade_allowlisted && producer == AuditProducer::DispatchSucceeded;
 
     if let Some(audit_batch) = audit_batch {
-        if let Err(reason) = audit_batch
-            .submit(crate::audit_batch::PreparedAuditRow { event, producer })
-            .await
-        {
+        let row = crate::audit_batch::PreparedAuditRow { event, producer };
+        // khive#2256: for a successful non-degrade-safe operation, the
+        // domain effect may already be committed. Once its audit row is
+        // enqueued, keep awaiting the generation's real result past the
+        // ordinary admission deadline instead of reporting a false failure
+        // that invites an unsafe retry. Admission-degrade-safe reads retain
+        // their bounded-wait behavior, as do error/denial observations whose
+        // caller-visible outcome is already fixed.
+        let submit_result =
+            if producer == AuditProducer::DispatchSucceeded && !admission_degrade_eligible {
+                audit_batch.submit_until_resolved(row).await
+            } else {
+                audit_batch.submit(row).await
+            };
+        if let Err(reason) = submit_result {
             if is_obligation {
                 // khive#2147/khive#2217: a read verb performs no domain write, so
                 // when the audit-lane's OWN admission is merely under transient

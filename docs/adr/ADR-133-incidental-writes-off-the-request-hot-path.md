@@ -678,3 +678,34 @@ This amendment does not revisit "Split the audit row so accounting lives in its 
 Alternatives considered above — that remains rejected for the reasons stated there (a migration,
 and it breaks the response/audit-payload identity property). The accepted trade here is a bounded,
 measured undercount over that redesign.
+
+## Amendment 2 (2026-08-30): Resolve Enqueued Audit Outcomes for Committed Successes
+
+**Status**: Accepted, implemented for khive#2256.
+
+Amendment 1 deliberately lets an admission-degrade-safe read return when its already-enqueued
+audit row crosses `admission_deadline`. That same return rule is not sound for a successful
+non-degrade-safe operation: its domain effect may already be committed, so converting the audit
+wait timeout into a generic dispatch failure reports the opposite of what happened and invites an
+unsafe retry of a non-idempotent verb.
+
+Successful `DispatchSucceeded` operations outside the read-degrade allowlist, plus the dedicated
+`GitDigestReceipt` producer, therefore use the batch seam's resolved-wait mode. They enqueue and
+share generations exactly as before. If `admission_deadline` elapses after enqueue, the runtime
+records a warning and keeps awaiting that same receiver until the generation reports its real
+commit or terminal failure; it never re-enqueues the row and never reruns the handler.
+
+The distinction at the two admission boundaries remains exact:
+
+- `QueueAdmissionExhausted` happens before enqueue and is still returned immediately. No audit row
+  exists to await.
+- `AdmissionDeadlineExpired` remains a caller-visible result of ordinary bounded `submit()` and
+  continues to drive Amendment 1's read-degradation accounting. It is not returned by the
+  resolved-wait mode once a committed success row has been enqueued.
+- `IdentityConflict`, `StoreFailure`, unsupported idempotency, and driver terminal failures still
+  fail the successful dispatch once they are known. The change removes only a false failure caused
+  by an unresolved wait threshold; it does not weaken durable audit obligations.
+
+Gate-denial, unknown-verb, failed-dispatch, and pure-observability rows retain bounded submission:
+their caller-visible operation outcome is already fixed, or their contract is explicitly
+best-effort. The eleven admission-degrade-safe reads remain governed by Amendment 1 unchanged.

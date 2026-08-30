@@ -496,6 +496,92 @@ impl AuditBatch {
         });
         *self.supervisor.lock() = Some(handle);
     }
+
+    /// Enqueue one row and wait for its real generation outcome even when
+    /// the ordinary admission wait deadline elapses.
+    ///
+    /// This is the narrow khive#2256 seam for a successful operation whose
+    /// domain effect has already committed. Returning
+    /// [`AuditTerminalReason::AdmissionDeadlineExpired`] there would report a
+    /// false operation failure and invite an unsafe retry while the same
+    /// audit row remains enqueued. Pre-enqueue refusal and genuine terminal
+    /// generation failures still return normally.
+    pub(crate) async fn submit_until_resolved(
+        &self,
+        row: PreparedAuditRow,
+    ) -> Result<AuditCommitOutcome, AuditTerminalReason> {
+        self.submit_with_wait_policy(row, true).await
+    }
+
+    async fn submit_with_wait_policy(
+        &self,
+        row: PreparedAuditRow,
+        wait_until_resolved: bool,
+    ) -> Result<AuditCommitOutcome, AuditTerminalReason> {
+        // Pre-enqueue validation (invariant 3): a malformed row is rejected
+        // before it can share a generation with anyone else's.
+        if self.store.preflight_event(&row.event).is_err() {
+            return Err(AuditTerminalReason::PreflightRejected);
+        }
+
+        let producer = row.producer;
+        let (tx, mut rx) = oneshot::channel();
+        let need_spawn = {
+            let mut state = self.inner.state.lock();
+            match state.lifecycle {
+                Lifecycle::Closed | Lifecycle::Closing => {
+                    return Err(AuditTerminalReason::AdmissionClosed)
+                }
+                Lifecycle::Failed(reason) => return Err(reason),
+                Lifecycle::Open => {}
+            }
+            if state.pending.len() >= self.config.max_pending_rows.get() {
+                return Err(AuditTerminalReason::QueueAdmissionExhausted);
+            }
+            state.pending.push(Waiting {
+                event: row.event,
+                producer,
+                responder: tx,
+            });
+            state.submitted_rows += 1;
+            let need_spawn = !state.driver_active;
+            if need_spawn {
+                state.driver_active = true;
+            }
+            need_spawn
+        };
+        if need_spawn {
+            self.spawn_supervisor_if_idle();
+        }
+
+        if wait_until_resolved {
+            match tokio::time::timeout(self.config.admission_deadline, &mut rx).await {
+                Ok(Ok(result)) => return result,
+                Ok(Err(_recv_error)) => return Err(AuditTerminalReason::DriverJoinLost),
+                Err(_elapsed) => tracing::warn!(
+                    ?producer,
+                    "strict audit obligation remains enqueued after the admission wait deadline; \
+                     waiting for its real terminal outcome"
+                ),
+            }
+            return match rx.await {
+                Ok(result) => result,
+                Err(_recv_error) => Err(AuditTerminalReason::DriverJoinLost),
+            };
+        }
+
+        match tokio::time::timeout(self.config.admission_deadline, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_recv_error)) => Err(AuditTerminalReason::DriverJoinLost),
+            // The row was already pushed onto `state.pending` above (and
+            // `submitted_rows` incremented) before this wait began — this is
+            // a deadline elapsing on an enqueued row, not a queue-full
+            // refusal, so it gets its own terminal reason (khive#2117,
+            // khive#2208). The row is left in place for the driver to drain;
+            // this arm performs no removal.
+            Err(_elapsed) => Err(AuditTerminalReason::AdmissionDeadlineExpired),
+        }
+    }
 }
 
 async fn supervisor_loop(
@@ -655,52 +741,7 @@ impl AuditBatchControl for AuditBatch {
         &self,
         row: PreparedAuditRow,
     ) -> Result<AuditCommitOutcome, AuditTerminalReason> {
-        // Pre-enqueue validation (invariant 3): a malformed row is rejected
-        // before it can share a generation with anyone else's.
-        if self.store.preflight_event(&row.event).is_err() {
-            return Err(AuditTerminalReason::PreflightRejected);
-        }
-
-        let (tx, rx) = oneshot::channel();
-        let need_spawn = {
-            let mut state = self.inner.state.lock();
-            match state.lifecycle {
-                Lifecycle::Closed | Lifecycle::Closing => {
-                    return Err(AuditTerminalReason::AdmissionClosed)
-                }
-                Lifecycle::Failed(reason) => return Err(reason),
-                Lifecycle::Open => {}
-            }
-            if state.pending.len() >= self.config.max_pending_rows.get() {
-                return Err(AuditTerminalReason::QueueAdmissionExhausted);
-            }
-            state.pending.push(Waiting {
-                event: row.event,
-                producer: row.producer,
-                responder: tx,
-            });
-            state.submitted_rows += 1;
-            let need_spawn = !state.driver_active;
-            if need_spawn {
-                state.driver_active = true;
-            }
-            need_spawn
-        };
-        if need_spawn {
-            self.spawn_supervisor_if_idle();
-        }
-
-        match tokio::time::timeout(self.config.admission_deadline, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_recv_error)) => Err(AuditTerminalReason::DriverJoinLost),
-            // The row was already pushed onto `state.pending` above (and
-            // `submitted_rows` incremented) before this wait began — this is
-            // a deadline elapsing on an enqueued row, not a queue-full
-            // refusal, so it gets its own terminal reason (khive#2117,
-            // khive#2208). The row is left in place for the driver to drain;
-            // this arm performs no removal.
-            Err(_elapsed) => Err(AuditTerminalReason::AdmissionDeadlineExpired),
-        }
+        self.submit_with_wait_policy(row, false).await
     }
 
     async fn quiesce(&self) -> Result<(), AuditTerminalReason> {
