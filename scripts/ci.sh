@@ -295,6 +295,15 @@ phase_no_default_features() {
 
 phase_release() {
     echo "=== Build (release) ==="
+    if [ -z "${KKERNEL_BINARY:-}" ]; then
+        cargo_target_dir=${CARGO_TARGET_DIR:-"$SCRIPT_DIR/../crates/target"}
+        case "$cargo_target_dir" in
+            /*) ;;
+            *) cargo_target_dir="$SCRIPT_DIR/../crates/$cargo_target_dir" ;;
+        esac
+        KKERNEL_BINARY="$cargo_target_dir/release/kkernel"
+        export KKERNEL_BINARY
+    fi
     # pack-formal is an optional dependency, so a default build does not link it.
     # smoke_test.py's formal section spawns the binary with `--pack formal` to
     # cover the pack's additive EntityOfType endpoint rules, and an unlinked pack
@@ -386,7 +395,7 @@ run_phase() {
 }
 
 run_all() {
-    for phase in \
+    run_all_phases="\
         no-stubs-scan \
         lockfile \
         forward-deployed \
@@ -403,10 +412,39 @@ run_all() {
         deno-tests \
         smoke-tests \
         vector-smoke \
-        contract-suite
-    do
+        contract-suite"
+    current_phase=
+    run_all_complete=0
+
+    report_incomplete_ci() {
+        status=$?
+        trap - 0
+        if [ "$run_all_complete" -eq 0 ] && [ "$status" -ne 0 ]; then
+            skipped_phases=
+            after_failed=0
+            for candidate in $run_all_phases; do
+                if [ "$after_failed" -eq 1 ]; then
+                    skipped_phases="${skipped_phases}${skipped_phases:+ }${candidate}"
+                elif [ "$candidate" = "$current_phase" ]; then
+                    after_failed=1
+                fi
+            done
+            echo "=== CI Failed ===" >&2
+            echo "Failed phase: $current_phase (exit $status)" >&2
+            if [ -n "$skipped_phases" ]; then
+                echo "Skipped phases: $skipped_phases" >&2
+            fi
+        fi
+        exit "$status"
+    }
+
+    trap report_incomplete_ci 0
+    for phase in $run_all_phases; do
+        current_phase=$phase
         run_phase "$phase"
     done
+    run_all_complete=1
+    trap - 0
     echo "=== CI Passed ==="
 }
 

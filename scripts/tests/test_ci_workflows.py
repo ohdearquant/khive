@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import pathlib
+import runpy
+import sys
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -73,6 +75,77 @@ class BenchTrackWorkflowTests(unittest.TestCase):
         self.assertEqual(len(quick_commands), 1)
         self.assertIn("--benches", quick_commands[0])
         self.assertIn("--criterion-dir crates/target/criterion", workflow)
+
+
+class HarnessEnvironmentTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tests_dir = str(REPO_ROOT / "tests")
+        sys.path.insert(0, tests_dir)
+        try:
+            cls.contract = runpy.run_path(str(REPO_ROOT / "tests" / "contract_test.py"))
+            cls.smoke = runpy.run_path(str(REPO_ROOT / "tests" / "smoke_test.py"))
+        finally:
+            sys.path.remove(tests_dir)
+
+    def test_contract_binary_honors_cargo_target_dir_and_explicit_override(self):
+        resolve = self.contract["resolve_binary_path"]
+        absolute_target = REPO_ROOT / ".test-target"
+        self.assertEqual(
+            pathlib.Path(resolve({"CARGO_TARGET_DIR": str(absolute_target)})),
+            absolute_target / "release" / "kkernel",
+        )
+        self.assertEqual(
+            pathlib.Path(resolve({"CARGO_TARGET_DIR": "custom-target"})),
+            REPO_ROOT / "crates" / "custom-target" / "release" / "kkernel",
+        )
+        self.assertEqual(
+            resolve(
+                {
+                    "CARGO_TARGET_DIR": str(absolute_target),
+                    "KKERNEL_BINARY": "/explicit/kkernel",
+                }
+            ),
+            "/explicit/kkernel",
+        )
+
+    def test_smoke_child_environment_removes_pack_override(self):
+        child = self.smoke["smoke_child_env"](
+            {"KHIVE_PACKS": "kg,formal", "PRESERVED": "yes"}
+        )
+        self.assertNotIn("KHIVE_PACKS", child)
+        self.assertEqual(child["PRESERVED"], "yes")
+        self.assertEqual(child["KHIVE_NO_DAEMON"], "1")
+        self.assertTrue(pathlib.Path(child["HOME"]).is_dir())
+        self.assertEqual(
+            self.smoke["DEFAULT_PACKS"],
+            {
+                "kg",
+                "gtd",
+                "memory",
+                "brain",
+                "comm",
+                "schedule",
+                "knowledge",
+                "session",
+                "git",
+                "code",
+                "workspace",
+                "blob",
+            },
+        )
+
+    def test_full_ci_reports_failed_and_skipped_phases(self):
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        self.assertIn("trap report_incomplete_ci 0", script)
+        self.assertIn('echo "Failed phase: $current_phase (exit $status)"', script)
+        self.assertIn('echo "Skipped phases: $skipped_phases"', script)
+
+    def test_release_exports_one_binary_path_for_later_harnesses(self):
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        self.assertIn('cargo_target_dir=${CARGO_TARGET_DIR:-', script)
+        self.assertIn('KKERNEL_BINARY="$cargo_target_dir/release/kkernel"', script)
+        self.assertIn("export KKERNEL_BINARY", script)
 
 
 if __name__ == "__main__":

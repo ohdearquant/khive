@@ -50,18 +50,26 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
 # Binary location
 # ---------------------------------------------------------------------------
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(
-        os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"
-    ),
-)
+def resolve_binary_path(env=None) -> str:
+    env = os.environ if env is None else env
+    if explicit := env.get("KKERNEL_BINARY"):
+        return explicit
+
+    repo_root = Path(__file__).resolve().parent.parent
+    target_dir = Path(env.get("CARGO_TARGET_DIR", "target"))
+    if not target_dir.is_absolute():
+        target_dir = repo_root / "crates" / target_dir
+    return str(target_dir / "release" / "kkernel")
+
+
+BINARY = resolve_binary_path()
 
 # ---------------------------------------------------------------------------
 # Low-level JSON-RPC + MCP helpers
