@@ -1782,9 +1782,10 @@ request(ops="[{\"tool\":\"knowledge.fold\",\"args\":{\"candidates\":[{\"id\":\"a
 ### `knowledge.search` — Assertive
 
 TF-IDF ranked search over the knowledge corpus with embedding rerank (default when an
-embedder is configured). Draft and deprecated atoms are excluded by default. Score
-bands: `score>=0.46` reliably on-target, `0.42<=score<0.46` mixed quality, `score<0.42`
-mostly off-target.
+embedder is configured). Draft and deprecated atoms are excluded by default. Scores are
+request-relative hybrid ranking values, not calibrated probabilities or absolute presence
+signals. Compare rank within the response and inspect provenance instead of applying fixed
+score bands.
 
 | Param                 | Type    | Required | Notes                                                                                   |
 | --------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
@@ -1802,6 +1803,35 @@ mostly off-target.
 | `intersection_bonus`  | number  | no       | Default 0.25; score multiplier for multi-sub-query hits.                                |
 | `rerank`              | bool    | no       | Default true; embedding rerank; no-op with no embedder configured.                      |
 | `rerank_alpha`        | number  | no       | Default 0.7 (TF-IDF-dominant blend).                                                    |
+
+The response is `{results, total, candidate_provenance, ...}`. A genuine FTS miss does
+not scan or rank the newest corpus rows. `candidate_provenance.lexical` reports one of:
+
+- `matched`: eligible lexical candidates were found.
+- `no_match`: FTS found no lexical match.
+- `filtered`: FTS matched, but kind/status eligibility removed every lexical candidate.
+- `partial_timeout`: part of a lexical/decomposed candidate stage completed before the
+  request read deadline.
+- `timed_out`: the lexical candidate stage timed out without a completed candidate leg.
+
+`candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and
+no returned result has lexical evidence; it is otherwise `none`, including for an empty
+result. Each result includes `score_provenance`:
+
+```json
+{
+  "sources": ["lexical", "ann"],
+  "embedding_rerank": true,
+  "normalization": "s_over_s_plus_1",
+  "calibrated": false
+}
+```
+
+`sources` is a stable-order subset of `lexical` and `ann`. `embedding_rerank` records
+whether a successful embedding rerank transformed that result's score. The raw
+request-local score is monotonically squashed with `s / (s + 1)` and then receives the
+existing status multiplier; therefore a score remains useful for ordering and
+`min_score` within a call, but no fixed numeric band establishes corpus presence.
 
 ```
 request(ops="knowledge.search(query=\"FastAPI JWT middleware\", rerank=true, limit=10)")
