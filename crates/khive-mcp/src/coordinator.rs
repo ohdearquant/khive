@@ -67,6 +67,8 @@ pub struct BackendSearchResult {
     pub backend_id: BackendId,
     pub entity_hits: Vec<SearchHit>,
     pub note_hits: Vec<NoteSearchHit>,
+    /// Whether this backend selected the vector arm for this search.
+    pub vector_selected: bool,
     /// Populated when this backend errored during the fan-out.
     pub error: Option<String>,
 }
@@ -323,17 +325,26 @@ pub(crate) mod tests {
                 } else {
                     vec![]
                 },
-                per_backend: self
-                    .failed_backend
-                    .iter()
-                    .cloned()
-                    .map(|backend_id| BackendSearchResult {
-                        backend_id,
-                        entity_hits: vec![],
-                        note_hits: vec![],
-                        error: Some("injected search failure".to_string()),
-                    })
-                    .collect(),
+                per_backend: std::iter::once(BackendSearchResult {
+                    backend_id: BackendId::new("main"),
+                    entity_hits: vec![],
+                    note_hits: vec![],
+                    vector_selected: true,
+                    error: None,
+                })
+                .chain(
+                    self.failed_backend
+                        .iter()
+                        .cloned()
+                        .map(|backend_id| BackendSearchResult {
+                            backend_id,
+                            entity_hits: vec![],
+                            note_hits: vec![],
+                            vector_selected: true,
+                            error: Some("injected search failure".to_string()),
+                        }),
+                )
+                .collect(),
                 partial: self.failed_backend.is_some(),
                 entity_kinds: std::collections::HashMap::from([(id, "concept".to_string())]),
                 note_kinds: std::collections::HashMap::from([(id, "observation".to_string())]),
@@ -649,6 +660,15 @@ pub(crate) mod tests {
             );
             assert_eq!(search["partial"], json!(true));
             assert_eq!(search["missing_backends"], json!(["archive"]));
+            let expected_text_candidates = usize::from(!ops.contains("kind=\"note\""));
+            assert_eq!(
+                search["arm_participation"],
+                json!({
+                    "text": {"status": "error", "candidate_count": expected_text_candidates},
+                    "vector": {"status": "error", "candidate_count": 1}
+                }),
+                "selected arms must remain typed on partial-with-hit responses"
+            );
             assert_eq!(
                 search["backend_errors"],
                 json!({
@@ -689,6 +709,13 @@ pub(crate) mod tests {
         assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
         assert_eq!(search["status"], json!("complete"));
         assert_eq!(search["result"], json!([]));
+        assert_eq!(
+            search["arm_participation"],
+            json!({
+                "text": {"status": "ran", "candidate_count": 0},
+                "vector": {"status": "ran", "candidate_count": 0}
+            })
+        );
         assert!(search.get("partial").is_none());
         assert!(search.get("missing_backends").is_none());
         assert!(search.get("backend_errors").is_none());
@@ -726,6 +753,13 @@ pub(crate) mod tests {
         assert_eq!(search["error"]["kind"], json!("search_incomplete"));
         assert_eq!(search["error"]["retryable"], json!(false));
         assert_eq!(search["error"]["missing_backends"], json!(["archive"]));
+        assert_eq!(
+            search["error"]["arm_participation"],
+            json!({
+                "text": {"status": "error", "candidate_count": 0},
+                "vector": {"status": "error", "candidate_count": 0}
+            })
+        );
         assert_eq!(
             search["error"]["backend_errors"],
             json!({
@@ -975,6 +1009,15 @@ pub(crate) mod tests {
                 hit.get("source").and_then(serde_json::Value::as_str),
                 Some(expected_source),
                 "{kind} hit must expose its retrieval source; got: {hit}"
+            );
+            let expected_text_candidates = usize::from(kind == "entity");
+            assert_eq!(
+                entry["arm_participation"],
+                json!({
+                    "text": {"status": "ran", "candidate_count": expected_text_candidates},
+                    "vector": {"status": "ran", "candidate_count": 1}
+                }),
+                "{kind} search must count final candidates by source membership"
             );
             assert!(entry.get("partial").is_none());
             assert!(entry.get("missing_backends").is_none());

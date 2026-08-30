@@ -763,6 +763,61 @@ v0.8.0 contract. Emitting `timeout` while keeping `retryable` unconditionally
 `false` is not a valid partial adoption, because it publishes a cause the reader
 can act on while denying the action the cause licenses.
 
+## Amendment 3 (2026-08-30): per-arm participation evidence
+
+The KG search envelope MUST expose `arm_participation` on every successful
+search and inside every `search_incomplete` error. It is an object with exactly
+the keys `text` and `vector`; each value carries:
+
+- `status`, from the closed vocabulary `ran | skipped | error`; and
+- `candidate_count`, a non-negative integer.
+
+The statuses describe selection and completion, not result presence:
+
+- `ran` means the arm was selected and every backend on which it was selected
+  completed that search.
+- `skipped` means the arm was not selected on any backend. Today this occurs
+  for `vector` when no configured embedding model can produce a query vector.
+- `error` means at least one backend on which the arm was selected failed
+  before the server could establish that arm's complete contribution. Other
+  backends may still have contributed candidates, so `error` does not require
+  `candidate_count` to be zero.
+
+`candidate_count` counts final canonical response candidates whose `source`
+includes that arm, after every server-side predicate, source/score filter, and
+the caller's result limit. A `source="both"` hit increments both counts. The
+count therefore describes evidence in the response, not the backend's raw
+pre-fusion candidate pool. It is bounded by the public search result limit and
+does not alter ranking, fusion, eligibility, or truncation.
+
+In particular, `status="ran", candidate_count=0` is a clean zero-contribution
+outcome and is distinct from both `skipped` and `error`. This is the fact needed
+for long, keyword-dense FTS queries: an all-vector response can now prove that
+the text arm completed with no surviving match instead of leaving completion
+implicit.
+
+Arm evidence deliberately does not duplicate an error message or invent a
+second cause taxonomy. On partial and `search_incomplete` responses, the
+bounded per-backend causes remain in `backend_errors`, including Amendment 2's
+closed `timeout | backend_error` vocabulary. `arm_participation` states which
+selected arms failed to complete; `backend_errors` states why and where the
+backend search failed. Both fields MUST survive presentation and frame-budget
+omission at their normal envelope location.
+
+This amendment does not make vector nearest neighbours an identity lookup. A
+caller checking whether an entity name already exists MUST issue the bare
+canonical name and require the matching row itself to carry
+`source="text" | "both"`. It MUST NOT infer absence from an all-vector result,
+or from text-arm `status="error" | "skipped"`. A text arm that ran with zero
+final candidates establishes only that the lexical query produced no surviving
+match under the requested filters.
+
+This change is additive in v0.8.0. Tolerant readers ignore the new object;
+strict readers must add the two fixed arm keys and the closed status vocabulary.
+Verification MUST cover an exact-name text hit, a 60-plus-character
+keyword-dense text zero-hit, vector-only and `both` candidate counting,
+complete-empty, partial-with-hit, degraded-empty, and frame-budget preservation.
+
 ## References
 
 - the two follow-up items this record's fixes were split from

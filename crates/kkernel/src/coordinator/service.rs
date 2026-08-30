@@ -158,11 +158,19 @@ impl CoordinatorService for SubstrateCoordinatorService {
 
         let coord_per_backend: Vec<CoordBackendResult> = per_backend
             .into_iter()
-            .map(|r| CoordBackendResult {
-                backend_id: r.backend_id,
-                entity_hits: r.hits,
-                note_hits: r.note_hits,
-                error: r.error,
+            .map(|r| {
+                let vector_selected = self
+                    .inner
+                    .registry()
+                    .get(&r.backend_id)
+                    .is_some_and(|entry| entry.runtime.config().embedding_model.is_some());
+                CoordBackendResult {
+                    backend_id: r.backend_id,
+                    entity_hits: r.hits,
+                    note_hits: r.note_hits,
+                    vector_selected,
+                    error: r.error,
+                }
             })
             .collect();
 

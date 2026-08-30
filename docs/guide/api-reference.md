@@ -463,6 +463,35 @@ operation is `ok: false` with `error.kind="search_incomplete"`; the structured
 error carries the same diagnostics. `backend_errors_truncated` plus
 `backend_errors_omitted` explicitly report causes omitted by safety bounds.
 
+Every successful KG search also carries `arm_participation` beside `result`;
+`search_incomplete` carries the same object inside `error`:
+
+```json
+{
+  "arm_participation": {
+    "text": { "status": "ran", "candidate_count": 0 },
+    "vector": { "status": "ran", "candidate_count": 8 }
+  }
+}
+```
+
+Each arm status is `ran`, `skipped`, or `error`. `ran` with zero candidates
+means that arm completed but contributed no final hit; `skipped` means it was
+not selected (for example, vector search without a configured embedding model);
+and `error` means a selected backend search failed before the arm's complete
+contribution was known. On degraded responses, the bounded reason stays in
+`backend_errors`, whose cause vocabulary is `timeout | backend_error`; arm
+entries do not duplicate those messages. `candidate_count` counts final hits
+whose `source` includes the arm, after server filters and the result limit, so a
+`both` hit increments both counts and each count is bounded by `limit`.
+
+For an entity-name presence check, issue the short bare canonical name and
+require the matching row itself to report `source: "text"` or `"both"`. An
+all-vector response, or text-arm status `error`/`skipped`, is not evidence that
+the name is absent. Long keyword-dense queries may legitimately report text
+`ran` with `candidate_count: 0` because the lexical expression is selective;
+the explicit arm evidence makes that different from a silent skip or failure.
+
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 
 ```json
