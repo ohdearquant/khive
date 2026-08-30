@@ -3107,13 +3107,18 @@ mod tests {
     /// Build the canonical completed V21 schema used by transactional-GC
     /// tests. Phase 4b owns the real cutover now, so tests exercise its schema
     /// instead of retaining Phase 4a's synthetic future-schema fixture.
+    ///
+    /// This stages through V21 explicitly rather than calling `run_migrations`,
+    /// because the GC gate admits exactly V21: running the whole chain would
+    /// hand these tests whatever the latest version happens to be, which the
+    /// gate then rejects. The assert below is what catches a drift here.
     fn prepare_completed_v21_gc_fixture(conn: &mut rusqlite::Connection) {
-        let version = crate::run_migrations(conn).expect("prepare canonical completed V21");
-        // Pinned to the V21 epoch, NOT to the moving latest version: the GC
-        // gate admits exactly V21, so the day a V22 migration lands this
-        // assert fails LOUDLY here — telling that migration's author to give
-        // these tests a fixture built explicitly through V21 — instead of
-        // silently handing every GC test a ledger the gate rejects.
+        prepare_v20_gc_fixture(conn);
+        crate::migrations::stage_attachment_cutover(conn).expect("stage canonical completed V21");
+        crate::migrations::finalize_attachment_cutover(conn)
+            .expect("finalize canonical completed V21");
+        let version = crate::migrations::read_schema_version(conn)
+            .expect("read canonical completed V21 ledger");
         assert_eq!(
             version,
             crate::migrations::ATTACHMENT_CUTOVER_VERSION,

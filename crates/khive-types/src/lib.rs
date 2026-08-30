@@ -33,7 +33,9 @@ pub mod vector;
 pub use agent::{AgentRecord, AgentState, TerminalReason};
 pub use edge::{EdgeCategory, EdgeRelation};
 pub use entity::{Entity, EntityKind, Link, PropertyValue};
-pub use entity_type::{EntityTypeDef, EntityTypeError, EntityTypeRegistry, ResolvedEntityType};
+pub use entity_type::{
+    to_snake_case, EntityTypeDef, EntityTypeError, EntityTypeRegistry, ResolvedEntityType,
+};
 pub use error::{TypeError, UnknownVariant};
 pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
@@ -56,8 +58,8 @@ pub use note::{Note, NoteStatus};
 #[allow(deprecated)]
 pub use pack::VerbDef;
 pub use pack::{
-    EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, Pack,
-    PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
+    EdgeEndpointRule, EndpointKind, HandlerDef, IdResolutionMode, NoteKindSpec, NoteLifecycleSpec,
+    Pack, PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
     RESERVED_ENVELOPE_ARGS,
 };
 pub use refusal::RefusalReason;

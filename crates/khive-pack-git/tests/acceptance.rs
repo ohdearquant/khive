@@ -3712,7 +3712,18 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     // Mirrors `ingest.rs`'s private `PAGE_LIMIT` -- `gh {pr,issue} list
     // --search` never returns more than this many results per page.
     const PAGE_LIMIT: usize = 1000;
-    const CREDENTIAL: &str = "sk-ant-api03-FAKE1234567890FAKE1234567890FAKE1234567890FAKE";
+    const CREDENTIAL: &str = concat!(
+        "sk-ant-api03-",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "FAKE1234567890",
+        "AA"
+    );
 
     let mut issues: Vec<Value> = (1..PAGE_LIMIT)
         .map(|i| {
@@ -3847,7 +3858,18 @@ async fn pr_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     std::fs::create_dir_all(&log_dir).expect("mk log dir");
 
     const PAGE_LIMIT: usize = 1000;
-    const CREDENTIAL: &str = "sk-ant-api03-FAKE0987654321FAKE0987654321FAKE0987654321FAKE";
+    const CREDENTIAL: &str = concat!(
+        "sk-ant-api03-",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "FAKE0987654321",
+        "AA"
+    );
 
     let mut prs: Vec<Value> = (1..PAGE_LIMIT)
         .map(|i| {
@@ -5354,6 +5376,18 @@ async fn digest_verb_sources_stopped_early_on_budget_exhaustion() {
         .expect("digest ok");
 
     assert_eq!(resp["commits_ingested"].as_u64().unwrap(), 1);
+    assert_eq!(resp["max_items_requested"], 1);
+    assert_eq!(resp["max_items_effective"], 1);
+    assert!(
+        resp["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| !warning
+                .as_str()
+                .is_some_and(|text| text.contains("max_items"))),
+        "an in-range budget must not produce a clamp warning: {resp:?}"
+    );
     assert!(
         !resp["done"].as_bool().unwrap(),
         "budget exhausted with commits unwalked: {resp:?}"
@@ -6163,19 +6197,56 @@ async fn ingest_commit_lookup_failure_is_reported_in_band_after_walk_start() {
     write(&repo, "README.md", "hello\n");
     commit(&repo, &["README.md"], "Initial commit");
 
-    // The comm external-id index evaluates json_extract over properties on
-    // every insert, so a malformed-JSON row cannot land while it exists.
-    // Drop it (test database only) so the sabotage row is storable; the
-    // lookup's own json_extract then fails at query time, mid-walk.
+    // SQLite evaluates an index expression on every insert, and `json_extract`
+    // raises on invalid JSON — so a malformed-JSON row cannot land while ANY
+    // index evaluates `json_extract` over `notes.properties`.
+    //
+    // Dropping one such index BY NAME is structurally fragile: this test used
+    // to name `idx_comm_message_external_id` alone, and any later migration
+    // adding a second json-evaluating index on `notes` silently re-imposes the
+    // constraint, failing this test with a bare "malformed JSON" from an insert
+    // that looks unrelated to the migration that caused it. Drop the CLASS
+    // instead (test database only) — enumerate the json-evaluating indexes on
+    // `notes` and drop every one. The lookup's own `json_extract` then still
+    // fails at query time, mid-walk, which is the behaviour under test.
+    let json_indexes = {
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("sql reader");
+        reader
+            .query_all(SqlStatement {
+                sql: "SELECT name FROM sqlite_master \
+                      WHERE type = 'index' AND tbl_name = 'notes' \
+                        AND sql LIKE '%json_extract%'"
+                    .into(),
+                params: vec![],
+                label: Some("test_list_json_indexes_on_notes".into()),
+            })
+            .await
+            .expect("list json-evaluating indexes on notes")
+    };
+    // Empty is not clean: if the enumeration silently returned nothing, the
+    // sabotage row below would insert for the wrong reason and this test would
+    // pass while asserting nothing.
+    assert!(
+        !json_indexes.is_empty(),
+        "expected at least one json-evaluating index on notes; an empty result \
+         means the enumeration is broken, not that the schema has none"
+    );
+
     let mut writer = rt.sql().writer().await.expect("writer");
-    writer
-        .execute(SqlStatement {
-            sql: "DROP INDEX IF EXISTS idx_comm_message_external_id".into(),
-            params: vec![],
-            label: Some("test_drop_json_index".into()),
-        })
-        .await
-        .expect("drop json-evaluating index");
+    for row in &json_indexes {
+        let Some(SqlValue::Text(name)) = row.get("name") else {
+            panic!("sqlite_master.name must be text");
+        };
+        writer
+            .execute(SqlStatement {
+                sql: format!("DROP INDEX IF EXISTS {name}"),
+                params: vec![],
+                label: Some("test_drop_json_index".into()),
+            })
+            .await
+            .expect("drop json-evaluating index");
+    }
     writer
         .execute(SqlStatement {
             sql: "INSERT INTO notes(id, namespace, kind, content, properties, created_at, updated_at) \
@@ -6765,6 +6836,17 @@ async fn digest_verb_max_items_negative_and_zero_clamp_to_one() {
             1,
             "max_items={requested} must clamp to the lower bound (1 item this call): {resp:?}"
         );
+        assert_eq!(resp["max_items_requested"], requested);
+        assert_eq!(resp["max_items_effective"], 1);
+        let expected_warning = format!("max_items request {requested} was clamped to 1");
+        assert!(
+            resp["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str() == Some(expected_warning.as_str())),
+            "the report must disclose the lower-bound clamp: {resp:?}"
+        );
         assert!(
             !resp["done"].as_bool().unwrap(),
             "2 commits remain after a 1-item pass: {resp:?}"
@@ -6790,6 +6872,16 @@ async fn digest_verb_max_items_above_cap_clamps_to_two_thousand() {
         .await
         .expect("digest ok");
     assert_eq!(resp["commits_ingested"].as_u64().unwrap(), 1);
+    assert_eq!(resp["max_items_requested"], 2001);
+    assert_eq!(resp["max_items_effective"], 2000);
+    assert!(
+        resp["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str() == Some("max_items request 2001 was clamped to 2000")),
+        "the report must disclose the clamp: {resp:?}"
+    );
     assert!(
         resp["done"].as_bool().unwrap(),
         "a single-commit repo finishes in one call however large max_items clamps to: {resp:?}"

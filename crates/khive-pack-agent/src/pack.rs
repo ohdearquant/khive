@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, ParamDef, Visibility};
+use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
 use crate::{handlers, AgentPack, PACK_NAME};
 
@@ -32,12 +32,14 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
                 param_type: "string",
                 required: true,
                 description: "Name of the model provider adapter to run this agent under.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "task",
                 param_type: "string",
                 required: true,
                 description: "Initial instruction content for the spawned agent.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "idempotency_key",
@@ -45,6 +47,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
                 required: false,
                 description: "Caller-supplied replay key, scoped to the calling actor; a \
                                repeat with identical arguments returns the original record.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "provider_session_id",
@@ -52,12 +55,14 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
                 required: false,
                 description: "Provider-native continuity key; at most one non-terminal record \
                                may bind a given (provider, provider_session_id) pair.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "checkpoint_session_id",
                 param_type: "string",
                 required: false,
                 description: "Khive session-note identifier of a checkpoint to continue from.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -72,6 +77,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
             param_type: "string",
             required: true,
             description: "The agent_id to observe.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -85,6 +91,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
             param_type: "string",
             required: true,
             description: "The agent_id to suspend.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -97,6 +104,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
             param_type: "string",
             required: true,
             description: "The agent_id to resume.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -110,6 +118,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
             param_type: "string",
             required: true,
             description: "The agent_id to kill.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
 ];
