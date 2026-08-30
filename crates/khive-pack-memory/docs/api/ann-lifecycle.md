@@ -6,7 +6,7 @@ The memory pack keeps one Vamana approximate-nearest-neighbor (ANN) index per em
 
 `AnnKey` is model-only even though its constructors accept a namespace or token for compatibility. Namespace isolation happens after global ANN search, not by constructing a separate graph for every namespace.
 
-`AnnState` owns five production coordination mechanisms:
+`AnnState` owns six production coordination mechanisms:
 
 | State              | Purpose                                                                                    |
 | ------------------ | ------------------------------------------------------------------------------------------ |
@@ -15,6 +15,7 @@ The memory pack keeps one Vamana approximate-nearest-neighbor (ANN) index per em
 | `model_locks`      | Async per-model single-flight locks shared by boot warm, background warm, and cold recall. |
 | `generations`      | In-process monotonic write generation for each model.                                      |
 | `last_epoch_check` | Debounce timestamps for the durable epoch query.                                           |
+| `rotation_watch_started` | Idempotence guard for the file-generation watcher.                                  |
 
 `warming` deliberately uses `std::sync::Mutex`: its critical sections never await, and `WarmingGuard::drop` must release the key synchronously on success, error, or panic. The model-lock map is separate: `warming` prevents duplicate fire-and-forget tasks, while `model_locks` lets concurrent callers wait for the same actual warm attempt. The outer map lock is held only while looking up an `Arc<tokio::sync::Mutex<()>>`, so unrelated models do not contend during builds.
 
@@ -22,8 +23,9 @@ Test-only notifications form deterministic barriers around rebuild attempt selec
 
 ## `AnnBridge`
 
-An `AnnBridge` contains the Vamana index, the UUID position map, the set of namespaces present in the corpus, and two freshness stamps:
+An `AnnBridge` contains the Vamana index, the UUID position map, the set of namespaces present in the corpus, and three freshness stamps:
 
+- `commit_digest` identifies the exact file-backed checkpoint publication; owned builds use `None` until persisted and reopened.
 - `generation` is the in-process write-generation floor captured before scanning.
 - `epoch_baseline` is the durable database epoch observed when the graph was built or restored.
 
@@ -50,6 +52,27 @@ Since issue #791, a write does not clear the installed graph or delete its snaps
 `maybe_check_durable_epoch` compares the installed baseline with the database value. When the durable epoch advances, it bumps the in-process generation so the ordinary `is_current` and background-rebuild machinery handles the change. Production checks are debounced to once per model every five seconds; tests use a zero interval for deterministic single-call coverage. The check returns immediately when no graph is installed because a genuine miss will read the epoch during its normal build.
 
 This durable signal is necessary because `kkernel reindex` runs in another process. It changes vector rows and removes snapshots without access to a warm daemon's generation map; without the epoch, that daemon could serve pre-reindex vectors indefinitely.
+
+## File-generation rotation watcher
+
+File-backed pack warm starts one five-second watcher for the lifetime of the shared ANN state. Each
+unchanged tick reads only `metadata.bin`; it does not touch vector, graph, lifecycle, or code pages.
+Every new `save_atomic` commit includes a publication nonce, so the commit digest changes even when
+the index payload is byte-for-byte identical. This makes the digest a file-generation identity,
+not merely a content hash.
+
+When a peer identity differs, the watcher takes the model single-flight lock and
+`<segment-dir>/.bridge-checkpoint.lock`, then rechecks, validates, and mmaps the complete segment and
+UUID sidecar. It preserves the incumbent's in-process generation, durable epoch baseline, namespace
+coverage, and non-regressing write-log watermark before swapping the bridge. The swap drops the
+predecessor `VamanaIndex`, releasing its now-unlinked `vectors.bin` and `codes.bin` mappings without
+waiting for another recall or for process exit. A changed publication that cannot validate is
+evicted rather than retained: the next request enters the ordinary Cold/rebuild path, while the
+unlinked predecessor no longer consumes hidden disk space.
+
+The watcher holds only the ANN root path and a weak `AnnState` reference between ticks. It exits on
+daemon shutdown or when pack state disappears. `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS` remains an optional
+whole-session bound for abandoned stdio clients, but mmap release does not depend on enabling it.
 
 ## `ensure_ann_background`
 
@@ -155,3 +178,4 @@ copied or relinked to the new database-scoped root:
 - Snapshot content hash and graph input come from the same ordered scan.
 - Namespace filtering occurs before ANN hits become caller-visible.
 - Writes preserve an intact prior graph until a complete replacement installs.
+- Peer checkpoint rotation releases the predecessor mmap generation without request traffic.

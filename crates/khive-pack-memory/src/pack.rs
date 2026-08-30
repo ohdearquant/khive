@@ -451,6 +451,7 @@ impl PackRuntime for MemoryPack {
         // population check below is genuinely load-only and remains useful.
         if !self.runtime.is_read_only() {
             crate::ann::warm_existing_memory_indexes(&self.runtime, &self.ann).await;
+            crate::ann::start_rotation_watcher(&self.runtime, &self.ann);
         }
         fts_population_guard(&self.runtime).await;
     }

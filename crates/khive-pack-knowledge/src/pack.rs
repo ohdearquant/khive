@@ -131,6 +131,7 @@ impl PackRuntime for KnowledgePack {
         // below; it must not enter a writer-bearing ANN lifecycle.
         if !self.runtime.is_read_only() {
             crate::knowledge::vamana::warm_known_snapshots(&self.runtime, &self.ann).await;
+            crate::knowledge::vamana::start_rotation_watcher(&self.runtime, &self.ann);
         }
         if !self.runtime.default_embedder_name().is_empty() {
             let runtime = self.runtime.clone();
