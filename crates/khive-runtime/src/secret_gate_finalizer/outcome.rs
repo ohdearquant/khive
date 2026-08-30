@@ -13,6 +13,8 @@ use uuid::Uuid;
 pub(crate) enum Substrate {
     Entity,
     Note,
+    KnowledgeAtom,
+    KnowledgeDomain,
 }
 
 /// Which finalization step failed, for the `FailureDiagnostic` it produced.

@@ -5,7 +5,11 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{uuid_prefix_bounds, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{
+    finalize_secret_gate_candidate, finalize_secret_gate_update_candidate,
+    secret_gate_atomic_statements, uuid_prefix_bounds, KhiveRuntime, NamespaceToken, RuntimeError,
+    SecretGateCandidateFields, SecretGateTargetKind,
+};
 use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::schema::{
@@ -100,26 +104,8 @@ impl KnowledgeHandlers {
                 raw_content.trim().to_string()
             };
             validate_atom_content(&content)?;
-            // Secret gate: scan all caller-supplied text and structured fields
-            // before any reader/writer is acquired.
-            khive_runtime::secret_gate::check(&slug)?;
-            khive_runtime::secret_gate::check(&atom_in.name)?;
-            khive_runtime::secret_gate::check(&content)?;
-            if let Some(ref tags_vec) = atom_in.tags {
-                khive_runtime::secret_gate::check_tags(tags_vec)?;
-            }
-            if let Some(ref props) = atom_in.properties {
-                khive_runtime::secret_gate::check_json(props)?;
-            }
-            khive_runtime::secret_gate::reject_reserved_secret_gate_property(
-                atom_in.properties.as_ref(),
-            )?;
-            if let Some(Some(uri)) = &atom_in.source_uri {
-                khive_runtime::secret_gate::check(uri)?;
-            }
-            if let Some(Some(st)) = &atom_in.source_type {
-                khive_runtime::secret_gate::check(st)?;
-            }
+            // The shared finalizer below scans the exact final candidate after
+            // target identity resolution and before the writer is acquired.
         }
 
         let mut reader = sql
@@ -131,7 +117,7 @@ impl KnowledgeHandlers {
         for atom_in in &p.atoms {
             let slug = atom_in.slug.trim().to_string();
             if let Some(id) = ids_by_slug.get(&slug) {
-                operations.push((id.clone(), false));
+                operations.push((id.clone(), false, None));
                 continue;
             }
 
@@ -141,7 +127,7 @@ impl KnowledgeHandlers {
             // error instead of a defined lifecycle error.
             let existing = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id, deleted_at, tags FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
+                    sql: "SELECT id, deleted_at, tags, properties FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
@@ -165,9 +151,13 @@ impl KnowledgeHandlers {
                 }
             }
 
-            let (id, insert) = if let Some(row) = existing {
+            let persisted_properties = existing.as_ref().and_then(|row| {
+                row_str(row, "properties")
+                    .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+            });
+            let (id, insert) = if let Some(row) = &existing {
                 (
-                    row_str(&row, "id").ok_or_else(|| {
+                    row_str(row, "id").ok_or_else(|| {
                         RuntimeError::Internal("missing id in existing atom row".into())
                     })?,
                     false,
@@ -176,14 +166,14 @@ impl KnowledgeHandlers {
                 (new_id(), true)
             };
             ids_by_slug.insert(slug, id.clone());
-            operations.push((id, insert));
+            operations.push((id, insert, persisted_properties));
         }
         drop(reader);
 
         let mut created = 0usize;
         let mut updated = 0usize;
-        let mut statements = Vec::with_capacity(p.atoms.len());
-        for (atom_in, (id, insert)) in p.atoms.iter().zip(operations) {
+        let mut statements = Vec::with_capacity(p.atoms.len() * 2);
+        for (atom_in, (id, insert, persisted_properties)) in p.atoms.iter().zip(operations) {
             let slug = atom_in.slug.trim().to_string();
             let raw_content = atom_in.content.as_deref().unwrap_or("");
             let content = if preserve_content_whitespace {
@@ -192,7 +182,80 @@ impl KnowledgeHandlers {
                 raw_content.trim().to_string()
             };
             let tags_json = tags_to_json(atom_in.tags.as_ref());
-            let props_json = atom_in
+            let target_id = Uuid::parse_str(&id).map_err(|error| {
+                RuntimeError::Internal(format!("invalid resolved knowledge atom id: {error}"))
+            })?;
+            // Omission is an unchanged-properties update. Materialize the
+            // persisted value before finalization so a runtime stamp is never
+            // silently cleared by an update that did not name properties.
+            let mut candidate_properties = atom_in
+                .properties
+                .clone()
+                .or_else(|| persisted_properties.clone());
+            let exact_echo = if atom_in.properties.is_some() {
+                khive_runtime::secret_gate::normalize_secret_gate_property_echo(
+                    &mut candidate_properties,
+                    persisted_properties.as_ref(),
+                    khive_runtime::secret_gate::PropertyWriteShape::Replace,
+                )?
+            } else {
+                false
+            };
+            if exact_echo {
+                let map = candidate_properties
+                    .as_mut()
+                    .and_then(Value::as_object_mut)
+                    .expect("an exact top-level echo came from an object");
+                map.insert(
+                    khive_runtime::secret_gate::RESERVED_SECRET_GATE_KEY.to_string(),
+                    Value::String(
+                        khive_runtime::secret_gate::SECRET_GATE_EXEMPTION_STAMP.to_string(),
+                    ),
+                );
+            }
+            let fields = SecretGateCandidateFields {
+                record_content: vec![content.clone()],
+                name_description: vec![slug.clone(), atom_in.name.clone()],
+                json_properties: candidate_properties.clone(),
+                tags: atom_in.tags.clone().unwrap_or_default(),
+                code_source: atom_in
+                    .source_uri
+                    .iter()
+                    .chain(atom_in.source_type.iter())
+                    .filter_map(|value| value.as_ref().cloned())
+                    .collect(),
+            };
+            let carries_runtime_stamp = candidate_properties
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|map| map.get(khive_runtime::secret_gate::RESERVED_SECRET_GATE_KEY))
+                .and_then(Value::as_str)
+                == Some(khive_runtime::secret_gate::SECRET_GATE_EXEMPTION_STAMP);
+            // secret-gate-finalizer-entry: knowledge.atom knowledge.crud
+            let finalization = if carries_runtime_stamp {
+                finalize_secret_gate_update_candidate(
+                    runtime,
+                    &ns,
+                    &token.actor().id,
+                    target_id,
+                    SecretGateTargetKind::KnowledgeAtom,
+                    "knowledge.atom",
+                    &fields,
+                    candidate_properties,
+                )
+                .await?
+            } else {
+                finalize_secret_gate_candidate(
+                    &ns,
+                    &token.actor().id,
+                    target_id,
+                    SecretGateTargetKind::KnowledgeAtom,
+                    "knowledge.atom",
+                    &fields,
+                    candidate_properties,
+                )?
+            };
+            let props_json = finalization
                 .properties
                 .as_ref()
                 .map(|v| serde_json::to_string(v).unwrap_or_default());
@@ -218,7 +281,7 @@ impl KnowledgeHandlers {
             let finalized = atom_in.finalized.flatten().unwrap_or(false);
 
             if insert {
-                statements.push(SqlStatement {
+                let record_statement = SqlStatement {
                         sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, source_uri, source_type, status, finalized, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)".into(),
                         params: vec![
                             SqlValue::Text(id),
@@ -238,10 +301,15 @@ impl KnowledgeHandlers {
                             SqlValue::Integer(now),
                         ],
                         label: None,
-                    });
+                    };
+                if let Some(event) = finalization.success_event.as_ref() {
+                    statements.extend(secret_gate_atomic_statements(record_statement, event)?);
+                } else {
+                    statements.push(record_statement);
+                }
                 created += 1;
             } else {
-                statements.push(SqlStatement {
+                let record_statement = SqlStatement {
                     // Presence/value pairs distinguish omission from explicit JSON
                     // null. Finalized is non-nullable, so its null value is bound as
                     // false. Only true promotes draft -> reviewed; clearing the flag
@@ -263,7 +331,12 @@ impl KnowledgeHandlers {
                         SqlValue::Text(ns.clone()),
                     ],
                     label: None,
-                });
+                };
+                if let Some(event) = finalization.success_event.as_ref() {
+                    statements.extend(secret_gate_atomic_statements(record_statement, event)?);
+                } else {
+                    statements.push(record_statement);
+                }
                 updated += 1;
             }
         }
@@ -315,10 +388,6 @@ impl KnowledgeHandlers {
                     "domain name must not be empty".into(),
                 ));
             }
-            // Secret gate: scan slug and name first (before content-length validation)
-            // so security violations short-circuit before business logic errors.
-            khive_runtime::secret_gate::check(&slug)?;
-            khive_runtime::secret_gate::check(&name)?;
             // Domain mirror atoms are written to knowledge_atoms with the description
             // as content. Enforce the same 20-word minimum that normal atoms must satisfy
             // so the FTS and embedding surfaces receive adequate content.
@@ -326,14 +395,8 @@ impl KnowledgeHandlers {
             validate_atom_content(mirror_content).map_err(|e| {
                 RuntimeError::InvalidInput(format!("domain {slug:?}: description {e}"))
             })?;
-            // Secret gate: scan remaining caller-supplied text.
-            khive_runtime::secret_gate::check(mirror_content)?;
-            if let Some(ref tags_vec) = domain_in.tags {
-                khive_runtime::secret_gate::check_tags(tags_vec)?;
-            }
-            if let Some(ref members_vec) = domain_in.members {
-                khive_runtime::secret_gate::check_tags(members_vec)?;
-            }
+            // The shared finalizer scans the final canonical domain + mirror
+            // candidate after the common target UUID has been resolved.
 
             let mut tags: Vec<String> = domain_in.tags.clone().unwrap_or_default();
             if !tags.iter().any(|t| t == "type:domain") {
@@ -347,10 +410,8 @@ impl KnowledgeHandlers {
             // The mirror's properties are synthesized entirely from `members`
             // (a `Vec<String>`, no arbitrary-key input); `DomainInput` carries no
             // `properties` field, so the top-level reserved key is unreachable here.
-            let properties_json = serde_json::to_string(
-                &serde_json::json!({ "members": domain_in.members.as_deref().unwrap_or(&[]) }),
-            )
-            .unwrap_or_else(|_| "{}".into());
+            let mut candidate_properties =
+                serde_json::json!({ "members": domain_in.members.as_deref().unwrap_or(&[]) });
 
             let mut reader = sql
                 .reader()
@@ -391,7 +452,7 @@ impl KnowledgeHandlers {
             let atom_collision = reader
                 .query_row(SqlStatement {
                     sql:
-                        "SELECT id FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1"
+                        "SELECT id, properties FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1"
                             .into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
@@ -408,6 +469,72 @@ impl KnowledgeHandlers {
                     )));
                 }
             }
+
+            let persisted_mirror_properties = atom_collision.as_ref().and_then(|row| {
+                row_str(row, "properties")
+                    .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+            });
+            let carried_stamp = persisted_mirror_properties
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|map| map.get(khive_runtime::secret_gate::RESERVED_SECRET_GATE_KEY))
+                .and_then(Value::as_str)
+                == Some(khive_runtime::secret_gate::SECRET_GATE_EXEMPTION_STAMP);
+            if carried_stamp {
+                candidate_properties
+                    .as_object_mut()
+                    .expect("domain mirror properties are an object")
+                    .insert(
+                        khive_runtime::secret_gate::RESERVED_SECRET_GATE_KEY.to_string(),
+                        Value::String(
+                            khive_runtime::secret_gate::SECRET_GATE_EXEMPTION_STAMP.to_string(),
+                        ),
+                    );
+            }
+            let target_id = Uuid::parse_str(&id).map_err(|error| {
+                RuntimeError::Internal(format!("invalid resolved knowledge domain id: {error}"))
+            })?;
+            let fields = SecretGateCandidateFields {
+                name_description: vec![slug.clone(), name.clone(), mirror_content.to_string()],
+                json_properties: Some(candidate_properties.clone()),
+                tags: tags
+                    .iter()
+                    .cloned()
+                    .chain(domain_in.members.clone().unwrap_or_default())
+                    .collect(),
+                ..Default::default()
+            };
+            // secret-gate-finalizer-entry: knowledge.domain knowledge.crud
+            let finalization = if carried_stamp {
+                finalize_secret_gate_update_candidate(
+                    runtime,
+                    &ns,
+                    &token.actor().id,
+                    target_id,
+                    SecretGateTargetKind::KnowledgeDomain,
+                    "knowledge.domain",
+                    &fields,
+                    Some(candidate_properties),
+                )
+                .await?
+            } else {
+                finalize_secret_gate_candidate(
+                    &ns,
+                    &token.actor().id,
+                    target_id,
+                    SecretGateTargetKind::KnowledgeDomain,
+                    "knowledge.domain",
+                    &fields,
+                    Some(candidate_properties),
+                )?
+            };
+            let properties_json = serde_json::to_string(
+                finalization
+                    .properties
+                    .as_ref()
+                    .expect("domain mirror finalizer always retains object properties"),
+            )
+            .unwrap_or_else(|_| "{}".into());
 
             // Mirror write is keyed by id (shared with the domain), never by slug —
             // ON CONFLICT(namespace, slug) would blind-overwrite an unrelated atom
@@ -451,8 +578,14 @@ impl KnowledgeHandlers {
                 // Atomic: the canonical domain row and its FTS mirror atom are one
                 // logical record; a mirror-write failure must roll back the domain
                 // update too.
+                let mut batch = vec![domain_stmt];
+                if let Some(event) = finalization.success_event.as_ref() {
+                    batch.extend(secret_gate_atomic_statements(mirror_stmt, event)?);
+                } else {
+                    batch.push(mirror_stmt);
+                }
                 writer
-                    .execute_batch(vec![domain_stmt, mirror_stmt])
+                    .execute_batch(batch)
                     .await
                     .map_err(|e| sql_err("upsert_domains update batch", e))?;
                 updated += 1;
@@ -474,8 +607,14 @@ impl KnowledgeHandlers {
                 };
                 // Atomic: a mirror-insert failure must roll back the domain insert
                 // too, so no domain row is ever left committed without its mirror.
+                let mut batch = vec![domain_stmt];
+                if let Some(event) = finalization.success_event.as_ref() {
+                    batch.extend(secret_gate_atomic_statements(mirror_stmt, event)?);
+                } else {
+                    batch.push(mirror_stmt);
+                }
                 writer
-                    .execute_batch(vec![domain_stmt, mirror_stmt])
+                    .execute_batch(batch)
                     .await
                     .map_err(|e| sql_err("upsert_domains insert batch", e))?;
                 created += 1;
@@ -516,7 +655,7 @@ impl KnowledgeHandlers {
             // their same-slug mirror atoms.
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: "SELECT d.*, (SELECT a.properties FROM knowledge_atoms a WHERE a.id=d.id) AS properties FROM knowledge_domains d WHERE d.namespace = ?1 AND d.slug = ?2 AND d.deleted_at IS NULL LIMIT 1".into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(id.clone())],
                     label: Some("knowledge.get.domain_by_slug".into()),
                 })
@@ -587,7 +726,7 @@ impl KnowledgeHandlers {
             // its own mirror atom instead of the canonical domain record.
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: "SELECT d.*, (SELECT a.properties FROM knowledge_atoms a WHERE a.id=d.id) AS properties FROM knowledge_domains d WHERE d.id = ?1 AND d.deleted_at IS NULL LIMIT 1".into(),
                     params: vec![SqlValue::Text(resolved_id.clone())],
                     label: Some("knowledge.get.domain_by_id".into()),
                 })
@@ -650,7 +789,7 @@ impl KnowledgeHandlers {
                 let rows = reader
                     .query_all(SqlStatement {
                         // #1671: `id` tiebreak — deterministic total order for offset pages.
-                        sql: "SELECT * FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3".into(),
+                        sql: "SELECT d.*, (SELECT a.properties FROM knowledge_atoms a WHERE a.id=d.id) AS properties FROM knowledge_domains d WHERE d.namespace = ?1 AND d.deleted_at IS NULL ORDER BY d.created_at DESC, d.id DESC LIMIT ?2 OFFSET ?3".into(),
                         params: vec![
                             SqlValue::Text(ns.clone()),
                             SqlValue::Integer(limit),
@@ -1031,7 +1170,10 @@ mod tests {
     // requiring a live DB connection.
 
     use khive_runtime::secret_gate::check;
-    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+    use khive_runtime::{
+        arm_secret_gate_test_audit_failure, arm_secret_gate_test_exemption, KhiveRuntime,
+        Namespace, SecretGateFieldScope, VerbRegistryBuilder,
+    };
     use khive_storage::SqlValue;
 
     #[tokio::test]
@@ -1073,6 +1215,313 @@ mod tests {
                 }),
             "knowledge.get short-id tables must use primary-key range seeks: {details:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn knowledge_atom_consumes_fixture_with_atomic_redacted_audit() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(crate::KnowledgePack::new(runtime.clone()));
+        let registry = builder.build().expect("registry builds");
+        registry.apply_schema_plans(runtime.backend());
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+
+        let content = [
+            "reviewed false-positive fixture",
+            "AKIAFAKE000000000000",
+            "with enough ordinary surrounding words to satisfy the knowledge atom content length contract safely without changing the reviewed credential-shaped bytes",
+        ]
+        .join(" ");
+        let _arm = arm_secret_gate_test_exemption(
+            token.namespace().as_str(),
+            SecretGateFieldScope::RecordContent,
+            &content,
+        );
+
+        super::KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            serde_json::json!({
+                "atoms": [{"slug": "fixture-admission", "name": "Fixture admission", "content": content.clone()}]
+            }),
+        )
+        .await
+        .expect("the exact reviewed fixture is admitted");
+
+        let stored = super::KnowledgeHandlers::get(
+            &runtime,
+            &token,
+            serde_json::json!({"id": "fixture-admission"}),
+        )
+        .await
+        .expect("read back atom");
+        assert_eq!(
+            stored["properties"]["khive:secret_gate"],
+            "exempted:content-sha256-manifest-v1"
+        );
+
+        let mut reader = runtime.sql().reader().await.expect("event reader");
+        let row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT payload, target_id FROM events WHERE namespace=?1 AND verb='secret_gate.finalize'".into(),
+                params: vec![SqlValue::Text(token.namespace().as_str().to_owned())],
+                label: Some("test.secret_gate.knowledge_audit".into()),
+            })
+            .await
+            .expect("query finalizer event")
+            .expect("one finalizer event");
+        let payload = match row.get("payload") {
+            Some(SqlValue::Text(value)) => value,
+            other => panic!("missing audit payload: {other:?}"),
+        };
+        assert!(payload.contains("content-sha256-manifest-v1"));
+        assert!(
+            !payload.contains("AKIA"),
+            "audit must not disclose submitted content"
+        );
+        assert!(row.get("target_id").is_some(), "audit is target-bound");
+        drop(reader);
+
+        let echoed_properties = stored["properties"].clone();
+        super::KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            serde_json::json!({
+                "atoms": [{
+                    "slug": "fixture-admission",
+                    "name": "Fixture admission RMW",
+                    "content": content,
+                    "properties": echoed_properties,
+                }]
+            }),
+        )
+        .await
+        .expect("byte-identical persisted stamp echo is normalized");
+        let reread = super::KnowledgeHandlers::get(
+            &runtime,
+            &token,
+            serde_json::json!({"id": "fixture-admission"}),
+        )
+        .await
+        .expect("read back RMW atom");
+        assert_eq!(
+            reread["properties"]["khive:secret_gate"],
+            "exempted:content-sha256-manifest-v1"
+        );
+
+        let removal_error = super::KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            serde_json::json!({
+                "atoms": [{
+                    "slug": "fixture-admission",
+                    "name": "Fixture admission RMW",
+                    "content": content.clone(),
+                    "properties": {"ordinary": true},
+                }]
+            }),
+        )
+        .await
+        .expect_err("a replacement that omits the persisted stamp is removal-shaped");
+        assert!(removal_error.to_string().contains("cannot remove"));
+
+        let mut differing = reread["properties"].clone();
+        differing["khive:secret_gate"] = serde_json::Value::String("exempted:different".into());
+        let differing_error = super::KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            serde_json::json!({
+                "atoms": [{
+                    "slug": "fixture-admission",
+                    "name": "Fixture admission RMW",
+                    "content": content.clone(),
+                    "properties": differing,
+                }]
+            }),
+        )
+        .await
+        .expect_err("a differing value is not an echo");
+        assert!(differing_error.to_string().contains("byte-identical"));
+
+        let transplant_error = super::KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            serde_json::json!({
+                "atoms": [{
+                    "slug": "fixture-admission-transplant",
+                    "name": "Fixture admission transplant",
+                    "content": content.clone(),
+                    "properties": reread["properties"].clone(),
+                }]
+            }),
+        )
+        .await
+        .expect_err("a stamp cannot be transplanted to a fresh target");
+        assert!(transplant_error.to_string().contains("byte-identical"));
+
+        let safe_content = "this replacement knowledge atom contains enough ordinary words to satisfy the minimum content validation while proving changed reviewed bytes cannot retain a prior exemption posture stamp";
+        super::KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            serde_json::json!({
+                "atoms": [{
+                    "slug": "fixture-admission",
+                    "name": "Fixture admission changed content",
+                    "content": safe_content,
+                    "properties": reread["properties"].clone(),
+                }]
+            }),
+        )
+        .await
+        .expect("changed safe bytes are rescanned and the old stamp is dropped");
+        let changed = super::KnowledgeHandlers::get(
+            &runtime,
+            &token,
+            serde_json::json!({"id": "fixture-admission"}),
+        )
+        .await
+        .expect("read back changed atom");
+        assert!(changed["properties"].get("khive:secret_gate").is_none());
+
+        let mut reader = runtime.sql().reader().await.expect("event count reader");
+        let event_count = reader
+            .query_scalar(khive_storage::types::SqlStatement {
+                sql:
+                    "SELECT COUNT(*) FROM events WHERE namespace=?1 AND verb='secret_gate.finalize'"
+                        .into(),
+                params: vec![SqlValue::Text(token.namespace().as_str().to_owned())],
+                label: Some("test.secret_gate.knowledge_audit_count".into()),
+            })
+            .await
+            .expect("count finalizer events");
+        assert!(matches!(event_count, Some(SqlValue::Integer(1))));
+    }
+
+    #[tokio::test]
+    async fn knowledge_domain_projects_mirror_stamp_and_target_identity() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(crate::KnowledgePack::new(runtime.clone()));
+        let registry = builder.build().expect("registry builds");
+        registry.apply_schema_plans(runtime.backend());
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let description = [
+            "reviewed domain description",
+            "AKIAFAKE111111111111",
+            "with many harmless surrounding words proving the canonical domain and its search mirror commit one posture decision atomically",
+        ]
+        .join(" ");
+        let _arm = arm_secret_gate_test_exemption(
+            token.namespace().as_str(),
+            SecretGateFieldScope::NameDescription,
+            &description,
+        );
+
+        super::KnowledgeHandlers::upsert_domains(
+            &runtime,
+            &token,
+            serde_json::json!({
+                "domains": [{
+                    "slug": "fixture-domain",
+                    "name": "Fixture domain",
+                    "description": description,
+                    "members": []
+                }]
+            }),
+        )
+        .await
+        .expect("exact reviewed domain fixture is admitted");
+
+        let stored = super::KnowledgeHandlers::get(
+            &runtime,
+            &token,
+            serde_json::json!({"id": "fixture-domain"}),
+        )
+        .await
+        .expect("read back domain");
+        assert_eq!(
+            stored["properties"]["khive:secret_gate"],
+            "exempted:content-sha256-manifest-v1"
+        );
+        let id = stored["id"].as_str().expect("domain id");
+        let mut reader = runtime.sql().reader().await.expect("event reader");
+        let row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT target_id, aggregate_kind, payload FROM events WHERE namespace=?1 AND verb='secret_gate.finalize'".into(),
+                params: vec![SqlValue::Text(token.namespace().as_str().to_owned())],
+                label: Some("test.secret_gate.domain_audit".into()),
+            })
+            .await
+            .expect("query finalizer event")
+            .expect("domain finalizer event");
+        assert!(matches!(row.get("target_id"), Some(SqlValue::Text(value)) if value == id));
+        assert!(
+            matches!(row.get("aggregate_kind"), Some(SqlValue::Text(value)) if value == "knowledge_domain")
+        );
+        assert!(
+            matches!(row.get("payload"), Some(SqlValue::Text(value)) if !value.contains("AKIA"))
+        );
+    }
+
+    #[tokio::test]
+    async fn knowledge_exemption_audit_failure_rolls_back_record_stamp_and_event() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(crate::KnowledgePack::new(runtime.clone()));
+        let registry = builder.build().expect("registry builds");
+        registry.apply_schema_plans(runtime.backend());
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let content = [
+            "reviewed rollback fixture",
+            "AKIAFAKE222222222222",
+            "with enough harmless words to satisfy validation while proving a late audit failure rolls back every earlier write in the unit",
+        ]
+        .join(" ");
+        let _fixture = arm_secret_gate_test_exemption(
+            token.namespace().as_str(),
+            SecretGateFieldScope::RecordContent,
+            &content,
+        );
+        let _audit_failure = arm_secret_gate_test_audit_failure(token.namespace().as_str());
+
+        let error = super::KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            serde_json::json!({
+                "atoms": [{"slug": "rollback-fixture", "name": "Rollback fixture", "content": content}]
+            }),
+        )
+        .await
+        .expect_err("injected success-audit failure must refuse the admission");
+        assert!(
+            !error.to_string().contains("AKIA"),
+            "failure diagnostics must not disclose submitted content: {error}"
+        );
+
+        let mut reader = runtime.sql().reader().await.expect("rollback reader");
+        let atom_count = reader
+            .query_scalar(khive_storage::types::SqlStatement {
+                sql: "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace=?1 AND slug='rollback-fixture'".into(),
+                params: vec![SqlValue::Text(token.namespace().as_str().to_owned())],
+                label: Some("test.secret_gate.rollback_atom".into()),
+            })
+            .await
+            .expect("count rolled-back atom");
+        let event_count = reader
+            .query_scalar(khive_storage::types::SqlStatement {
+                sql:
+                    "SELECT COUNT(*) FROM events WHERE namespace=?1 AND verb='secret_gate.finalize'"
+                        .into(),
+                params: vec![SqlValue::Text(token.namespace().as_str().to_owned())],
+                label: Some("test.secret_gate.rollback_event".into()),
+            })
+            .await
+            .expect("count rolled-back event");
+        assert!(matches!(atom_count, Some(SqlValue::Integer(0))));
+        assert!(matches!(event_count, Some(SqlValue::Integer(0))));
     }
 
     #[test]

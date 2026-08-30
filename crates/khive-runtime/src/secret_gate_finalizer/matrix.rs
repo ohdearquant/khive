@@ -137,7 +137,7 @@ mod tests {
     }
 
     /// Visibility: the declaration surface the matrix exposes to the
-    /// harness is bounded to exactly the six contract-specified entry
+    /// harness is bounded to exactly the eight contract-specified entry
     /// points and no others — nothing declared elsewhere leaks in, and
     /// nothing declared here is silently dropped from the generated matrix.
     #[test]
@@ -151,6 +151,8 @@ mod tests {
             "note.create",
             "note.update",
             "note.atomic_message",
+            "knowledge.atom",
+            "knowledge.domain",
         ]
         .into_iter()
         .collect();

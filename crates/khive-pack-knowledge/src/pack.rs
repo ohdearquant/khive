@@ -331,9 +331,10 @@ impl PackByIdResolver for KnowledgePack {
         // 1. Check knowledge_domains first (canonical over the mirror atom).
         let domain_row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, slug, name, description, tags, members, \
-                      created_at, updated_at, deleted_at \
-                      FROM knowledge_domains WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
+                sql: "SELECT d.id, d.namespace, d.slug, d.name, d.description, d.tags, d.members, \
+                      (SELECT a.properties FROM knowledge_atoms a WHERE a.id=d.id) AS properties, \
+                      d.created_at, d.updated_at, d.deleted_at \
+                      FROM knowledge_domains d WHERE d.id = ?1 AND d.deleted_at IS NULL LIMIT 1"
                     .into(),
                 params: vec![SqlValue::Text(id_str.clone())],
                 label: Some("knowledge.resolve_by_id.domain".into()),
@@ -399,9 +400,10 @@ impl PackByIdResolver for KnowledgePack {
 
         let domain_row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, slug, name, description, tags, members, \
-                      created_at, updated_at, deleted_at \
-                      FROM knowledge_domains WHERE id = ?1 LIMIT 1"
+                sql: "SELECT d.id, d.namespace, d.slug, d.name, d.description, d.tags, d.members, \
+                      (SELECT a.properties FROM knowledge_atoms a WHERE a.id=d.id) AS properties, \
+                      d.created_at, d.updated_at, d.deleted_at \
+                      FROM knowledge_domains d WHERE d.id = ?1 LIMIT 1"
                     .into(),
                 params: vec![SqlValue::Text(id_str.clone())],
                 label: Some("knowledge.resolve_by_id_incl_deleted.domain".into()),

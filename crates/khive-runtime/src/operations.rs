@@ -22,21 +22,26 @@ use khive_storage::{
 };
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, KhiveError, SubstrateKind};
 
+use khive_db::stores::attachment::attachment_upsert_statement;
 use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_statement};
 use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
-use khive_db::stores::note::note_hard_delete_statement;
+use khive_db::stores::note::{note_hard_delete_statement, note_upsert_statement};
 use khive_db::stores::text::insert_document_statement;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
 use crate::atomic_plan::{
-    AddEntityPlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect,
+    AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect,
 };
 use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
 use crate::curation::{entity_fts_document, note_embedding_text_ref, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+use crate::{
+    finalize_secret_gate_candidate, secret_gate_atomic_statements, SecretGateCandidateFields,
+    SecretGateTargetKind,
+};
 
 // Test-only fault-injection state; see docs/operations.md#fault-injection-static-state.
 #[cfg(test)]
@@ -1480,16 +1485,6 @@ impl KhiveRuntime {
         attachments: Vec<NewAttachment>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         self.validate_entity_kind(kind)?;
-        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        // Secret gate: scan name, description, structured properties, and tags.
-        crate::secret_gate::check(name)?;
-        if let Some(d) = description {
-            crate::secret_gate::check(d)?;
-        }
-        if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
-        }
-        crate::secret_gate::check_tags(&tags)?;
         let ns = token.namespace().as_str();
         let mut entity = Entity::new(ns, kind, name).with_entity_type(entity_type);
         if let Some(d) = description {
@@ -1501,6 +1496,27 @@ impl KhiveRuntime {
         if !tags.is_empty() {
             entity = entity.with_tags(tags);
         }
+        // secret-gate-finalizer-entry: entity.create runtime
+        let finalization = finalize_secret_gate_candidate(
+            ns,
+            &token.actor().id,
+            entity.id,
+            SecretGateTargetKind::Entity,
+            "entity.create",
+            &SecretGateCandidateFields {
+                name_description: entity
+                    .description
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(entity.name.clone()))
+                    .collect(),
+                json_properties: entity.properties.clone(),
+                tags: entity.tags.clone(),
+                ..Default::default()
+            },
+            entity.properties.take(),
+        )?;
+        entity.properties = finalization.properties;
         let projected_content_ref = attachments
             .iter()
             .find(|attachment| attachment.role == "content")
@@ -1516,9 +1532,25 @@ impl KhiveRuntime {
                 )
             })
             .collect();
-        self.entities(token)?
-            .upsert_entity_with_attachments(entity.clone(), attachment_rows)
-            .await?;
+        if let Some(event) = finalization.success_event.as_ref() {
+            let mut statements = vec![entity_upsert_statement(&entity)];
+            for attachment in &attachment_rows {
+                statements.push(attachment_upsert_statement(attachment)?);
+            }
+            let record = statements.remove(0);
+            let mut atomic = secret_gate_atomic_statements(record, event)?;
+            // Attachments are record state and must commit in the same unit;
+            // place them before the audit event without rebuilding its shape.
+            let event_statements = atomic.split_off(1);
+            atomic.extend(statements);
+            atomic.extend(event_statements);
+            let mut writer = self.sql().writer().await?;
+            writer.execute_batch(atomic).await?;
+        } else {
+            self.entities(token)?
+                .upsert_entity_with_attachments(entity.clone(), attachment_rows)
+                .await?;
+        }
         entity.content_ref = projected_content_ref;
 
         let doc = entity_fts_document(&entity);
@@ -3412,14 +3444,6 @@ impl KhiveRuntime {
         allow_transport_owned_message_properties: bool,
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
-        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        crate::secret_gate::check(content)?;
-        if let Some(n) = name {
-            crate::secret_gate::check(n)?;
-        }
-        if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
-        }
         if !allow_transport_owned_message_properties && kind == "message" {
             if let Some(key) = properties
                 .as_ref()
@@ -3443,13 +3467,68 @@ impl KhiveRuntime {
             note = note.with_properties(p);
         }
 
+        // secret-gate-finalizer-entry: note.create runtime.fast_insert
+        // secret-gate-finalizer-entry: note.create runtime.fast_insert
+        let finalization = finalize_secret_gate_candidate(
+            ns,
+            &token.actor().id,
+            note.id,
+            SecretGateTargetKind::Note,
+            "note.create",
+            &SecretGateCandidateFields {
+                record_content: vec![note.content.clone()],
+                name_description: note.name.iter().cloned().collect(),
+                json_properties: note.properties.clone(),
+                ..SecretGateCandidateFields::default()
+            },
+            note.properties.take(),
+        )?;
+        note.properties = finalization.properties;
+
         // Bypasses the `notes()` accessor's PolicyEnforcingNoteStore wrapper —
         // the reserved-transport-property check above already enforces the
         // identical policy, conditionally allowing the trusted-ingest path,
         // so this reaches storage directly rather than duplicate the check
         // through a wrapper that cannot see the trust decision this function
         // just made.
-        let inserted = self.raw_notes(token)?.try_insert_note(note.clone()).await?;
+        let inserted = if let Some(event) = finalization.success_event.as_ref() {
+            let mut raw = secret_gate_atomic_statements(
+                khive_db::stores::note::note_insert_if_absent_statement(&note),
+                event,
+            )?;
+            raw.insert(
+                1,
+                khive_db::stores::note::note_assign_seq_statement(note.id),
+            );
+            let statements = raw
+                .into_iter()
+                .enumerate()
+                .map(|(index, statement)| PlanStatement {
+                    statement,
+                    guard: (index == 0).then(|| AffectedRowGuard::exactly(1)),
+                })
+                .collect();
+            let plan = AtomicOpPlan::AddNote(AddNotePlan {
+                note_id: note.id,
+                statements,
+                post_commit: PostCommitEffect::None,
+            });
+            match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
+                Ok(AtomicRunOutcome::Committed { .. }) => true,
+                Ok(AtomicRunOutcome::RolledBack {
+                    failure: AtomicOpFailure::GuardFailed { .. },
+                    ..
+                }) => false,
+                Ok(AtomicRunOutcome::RolledBack { failure, .. }) => {
+                    return Err(RuntimeError::Internal(format!(
+                        "try_create_note finalizer atomic write rolled back: {failure:?}"
+                    )));
+                }
+                Err(error) => return Err(RuntimeError::Storage(error.0)),
+            }
+        } else {
+            self.raw_notes(token)?.try_insert_note(note.clone()).await?
+        };
         if !inserted {
             return Ok(None);
         }
@@ -3544,15 +3623,6 @@ impl KhiveRuntime {
         // same derived values. Runs before the secret gate so the gate scans
         // exactly what will be written.
         let properties = self.derive_note_write_properties(kind, token, properties)?;
-        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        // Secret gate: scan content, optional name, and structured properties.
-        crate::secret_gate::check(content)?;
-        if let Some(n) = name {
-            crate::secret_gate::check(n)?;
-        }
-        if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
-        }
         // `embedding_content` is a caller-supplied alternate vector-embedding
         // input: it must be a non-empty proper prefix of `content` (never a
         // superset, an unrelated string, or the full text) and passes the
@@ -3620,7 +3690,34 @@ impl KhiveRuntime {
         if let Some(p) = properties {
             note = note.with_properties(p);
         }
-        self.notes(token)?.upsert_note(note.clone()).await?;
+        // secret-gate-finalizer-entry: note.create runtime
+        let finalization = finalize_secret_gate_candidate(
+            ns,
+            &token.actor().id,
+            note.id,
+            SecretGateTargetKind::Note,
+            "note.create",
+            &SecretGateCandidateFields {
+                record_content: vec![note.content.clone()],
+                name_description: note.name.iter().cloned().collect(),
+                json_properties: note.properties.clone(),
+                ..Default::default()
+            },
+            note.properties.take(),
+        )?;
+        note.properties = finalization.properties;
+        if let Some(event) = finalization.success_event.as_ref() {
+            let mut statements =
+                secret_gate_atomic_statements(note_upsert_statement(&note), event)?;
+            statements.insert(
+                1,
+                khive_db::stores::note::note_assign_seq_statement(note.id),
+            );
+            let mut writer = self.sql().writer().await?;
+            writer.execute_batch(statements).await?;
+        } else {
+            self.notes(token)?.upsert_note(note.clone()).await?;
+        }
 
         // From here on, any error must compensate by removing the note row, its
         // FTS document, and any vector entries already inserted — the same
@@ -6223,6 +6320,7 @@ impl KhiveRuntime {
         // Includes entity-type validation via the pack-installed validator when available.
         // Any validation failure here guarantees zero rows are written.
         let mut entities = Vec::with_capacity(specs.len());
+        let mut finalizer_events = Vec::with_capacity(specs.len());
         for spec in &specs {
             self.validate_entity_kind(&spec.kind)?;
             // Validate entity_type at the runtime layer via pack-installed callback.
@@ -6234,16 +6332,6 @@ impl KhiveRuntime {
             if spec.name.trim().is_empty() {
                 return Err(RuntimeError::InvalidInput("name must not be empty".into()));
             }
-            crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
-            crate::secret_gate::check(&spec.name)?;
-            if let Some(d) = &spec.description {
-                crate::secret_gate::check(d)?;
-            }
-            if let Some(ref p) = spec.properties {
-                crate::secret_gate::check_json(p)?;
-            }
-            crate::secret_gate::check_tags(&spec.tags)?;
-
             let mut entity =
                 Entity::new(ns, &spec.kind, &spec.name).with_entity_type(validated_type.as_deref());
             if let Some(d) = &spec.description {
@@ -6255,6 +6343,28 @@ impl KhiveRuntime {
             if !spec.tags.is_empty() {
                 entity = entity.with_tags(spec.tags.clone());
             }
+            // secret-gate-finalizer-entry: entity.bulk runtime
+            let finalization = finalize_secret_gate_candidate(
+                ns,
+                &token.actor().id,
+                entity.id,
+                SecretGateTargetKind::Entity,
+                "entity.bulk",
+                &SecretGateCandidateFields {
+                    name_description: entity
+                        .description
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(entity.name.clone()))
+                        .collect(),
+                    json_properties: entity.properties.clone(),
+                    tags: entity.tags.clone(),
+                    ..Default::default()
+                },
+                entity.properties.take(),
+            )?;
+            entity.properties = finalization.properties;
+            finalizer_events.push(finalization.success_event);
             entities.push(entity);
         }
 
@@ -6281,8 +6391,9 @@ impl KhiveRuntime {
 
         let plans = entities
             .iter()
+            .zip(finalizer_events.iter())
             .enumerate()
-            .map(|(index, entity)| {
+            .map(|(index, (entity, finalizer_event))| {
                 let mut fts_statement =
                     insert_document_statement("fts_entities", &entity_fts_document(entity));
                 if injected_failure_index == Some(index) {
@@ -6293,22 +6404,26 @@ impl KhiveRuntime {
                         label: Some("fts-insert-injected-failure".to_string()),
                     };
                 }
-                AtomicOpPlan::AddEntity(AddEntityPlan {
+                let record_statement = entity_upsert_statement(entity);
+                let mut statements = match finalizer_event {
+                    Some(event) => secret_gate_atomic_statements(record_statement, event),
+                    None => Ok(vec![record_statement]),
+                }?;
+                statements.push(fts_statement);
+                Ok(AtomicOpPlan::AddEntity(AddEntityPlan {
                     entity_id: entity.id,
-                    statements: vec![
-                        PlanStatement {
-                            statement: entity_upsert_statement(entity),
-                            guard: Some(AffectedRowGuard::exactly(1)),
-                        },
-                        PlanStatement {
-                            statement: fts_statement,
-                            guard: None,
-                        },
-                    ],
+                    statements: statements
+                        .into_iter()
+                        .enumerate()
+                        .map(|(statement_index, statement)| PlanStatement {
+                            statement,
+                            guard: (statement_index == 0).then(|| AffectedRowGuard::exactly(1)),
+                        })
+                        .collect(),
                     post_commit: PostCommitEffect::None,
-                })
+                }))
             })
-            .collect();
+            .collect::<RuntimeResult<Vec<_>>>()?;
 
         match run_atomic_unit(self.sql().as_ref(), plans).await {
             Ok(AtomicRunOutcome::Committed { .. }) => Ok(entities),
