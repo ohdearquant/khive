@@ -4222,13 +4222,15 @@ mod kg_blend {
     use khive_types::Namespace;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     const MARKER: &str = "zzzquantumfoo";
     const MODEL_KEY: &str = "all-minilm-l6-v2";
     const DIM: usize = 384;
 
-    struct MarkerEmbedService;
+    struct MarkerEmbedService {
+        recorded: Option<Arc<Mutex<Vec<String>>>>,
+    }
 
     #[async_trait]
     impl EmbeddingService for MarkerEmbedService {
@@ -4237,6 +4239,12 @@ mod kg_blend {
             texts: &[String],
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            if let Some(recorded) = &self.recorded {
+                recorded
+                    .lock()
+                    .expect("recording lock")
+                    .extend(texts.iter().cloned());
+            }
             Ok(texts
                 .iter()
                 .map(|t| {
@@ -4251,6 +4259,14 @@ mod kg_blend {
                 .collect())
         }
 
+        async fn embed_query(
+            &self,
+            texts: &[String],
+            model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            self.embed(texts, model).await
+        }
+
         fn supports_model(&self, _model: EmbeddingModel) -> bool {
             true
         }
@@ -4260,7 +4276,9 @@ mod kg_blend {
         }
     }
 
-    struct MarkerEmbedProvider;
+    struct MarkerEmbedProvider {
+        recorded: Option<Arc<Mutex<Vec<String>>>>,
+    }
 
     #[async_trait]
     impl EmbedderProvider for MarkerEmbedProvider {
@@ -4275,11 +4293,19 @@ mod kg_blend {
         async fn build(
             &self,
         ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
-            Ok(Arc::new(MarkerEmbedService))
+            Ok(Arc::new(MarkerEmbedService {
+                recorded: self.recorded.as_ref().map(Arc::clone),
+            }))
         }
     }
 
     fn rt_with_marker_embedder() -> KhiveRuntime {
+        rt_with_marker_embedder_recording(None)
+    }
+
+    fn rt_with_marker_embedder_recording(
+        recorded: Option<Arc<Mutex<Vec<String>>>>,
+    ) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
@@ -4298,7 +4324,7 @@ mod kg_blend {
             actor_id: None,
         })
         .expect("runtime");
-        rt.register_embedder(MarkerEmbedProvider);
+        rt.register_embedder(MarkerEmbedProvider { recorded });
         rt
     }
 
@@ -4395,6 +4421,39 @@ mod kg_blend {
         assert!(
             md.contains("ZipCache"),
             "markdown must render the blended concept's name, got: {md}"
+        );
+    }
+
+    /// #2232: auto-compose crosses suggest ANN/rerank, atom rerank, and two
+    /// KG kind searches. Every stage must reuse the first successful query
+    /// vector instead of independently embedding the same request text.
+    #[tokio::test]
+    async fn auto_compose_embeds_request_query_exactly_once() {
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let f = pack(rt_with_marker_embedder_recording(Some(Arc::clone(
+            &recorded,
+        ))));
+        seed_domain_and_atom(&f).await;
+        seed_kg_concept(&f).await;
+        recorded.lock().expect("recording lock").clear();
+
+        let response = f
+            .dispatch("knowledge.compose", json!({ "query": QUERY }))
+            .await
+            .expect("auto compose ok");
+        assert!(
+            response["data"]["count"].as_u64().unwrap_or_default() > 0,
+            "fixture must exercise a non-empty compose path: {response:?}"
+        );
+
+        let recorded = recorded.lock().expect("recording lock");
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|text| text.as_str() == QUERY)
+                .count(),
+            1,
+            "one request must embed its query exactly once: {recorded:?}"
         );
     }
 

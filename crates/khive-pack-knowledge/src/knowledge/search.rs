@@ -864,14 +864,25 @@ async fn search_decomposed(
 async fn embed_cosine_scores(
     runtime: &KhiveRuntime,
     query: &str,
+    query_embedding: &mut Option<Vec<f32>>,
     candidate_texts: &[String],
 ) -> Result<Option<Vec<f32>>, RuntimeError> {
     if runtime.default_embedder_name().is_empty() || candidate_texts.is_empty() {
         return Ok(None);
     }
-    let mut texts = Vec::with_capacity(candidate_texts.len() + 1);
-    texts.push(query.to_string());
-    texts.extend_from_slice(candidate_texts);
+
+    // When ANN did not already populate the cache, include the query in this
+    // one batch and retain its vector for every downstream stage. Otherwise
+    // embed only candidates; the query vector is request-local immutable data.
+    let query_was_cached = query_embedding.is_some();
+    let texts = if query_was_cached {
+        candidate_texts.to_vec()
+    } else {
+        let mut texts = Vec::with_capacity(candidate_texts.len() + 1);
+        texts.push(query.to_string());
+        texts.extend_from_slice(candidate_texts);
+        texts
+    };
     let embeddings = match khive_storage::await_request_read_phase(
         "knowledge.embedding_rerank",
         runtime.embed_batch(&texts),
@@ -884,9 +895,17 @@ async fn embed_cosine_scores(
     if embeddings.len() != texts.len() {
         return Ok(None);
     }
-    let query_emb = &embeddings[0];
+    let candidate_embeddings = if query_was_cached {
+        embeddings.as_slice()
+    } else {
+        *query_embedding = Some(embeddings[0].clone());
+        &embeddings[1..]
+    };
+    let query_emb = query_embedding
+        .as_deref()
+        .expect("query embedding was cached or populated from non-empty batch");
     Ok(Some(
-        embeddings[1..]
+        candidate_embeddings
             .iter()
             .map(|emb| cosine_similarity(query_emb, emb))
             .collect(),
@@ -896,6 +915,7 @@ async fn embed_cosine_scores(
 async fn rerank_with_embeddings(
     runtime: &KhiveRuntime,
     query: &str,
+    query_embedding: &mut Option<Vec<f32>>,
     hits: &mut [ScoredHit],
     alpha: f32,
 ) -> Result<bool, RuntimeError> {
@@ -906,7 +926,7 @@ async fn rerank_with_embeddings(
         .iter()
         .map(|h| format!("{} {}", h.name, h.content.as_deref().unwrap_or("")))
         .collect();
-    if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await? {
+    if let Some(cosines) = embed_cosine_scores(runtime, query, query_embedding, &texts).await? {
         let max_tfidf = hits
             .iter()
             .map(|h| h.score)
@@ -1524,13 +1544,14 @@ async fn load_atom_body_line_counts(
 async fn rerank_text_items(
     runtime: &KhiveRuntime,
     query: &str,
+    query_embedding: &mut Option<Vec<f32>>,
     items: &mut [ScoredTextItem],
 ) -> Result<(), RuntimeError> {
     if items.is_empty() {
         return Ok(());
     }
     let texts: Vec<String> = items.iter().map(|item| item.text.clone()).collect();
-    if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await? {
+    if let Some(cosines) = embed_cosine_scores(runtime, query, query_embedding, &texts).await? {
         for (item, cos) in items.iter_mut().zip(cosines.iter()) {
             item.score = cos.max(0.0);
         }
@@ -1588,15 +1609,32 @@ async fn search_kg_entities(
     token: &NamespaceToken,
     ns: &str,
     query: &str,
+    query_embedding: &mut Option<Vec<f32>>,
     cap: usize,
     min_score: f32,
 ) -> Result<Vec<KgEntityHit>, RuntimeError> {
+    // KG discovery has two kind-specific hybrid searches. Supplying the
+    // vector cached by compose keeps both from independently embedding the
+    // same query; no vector means the dense blend is unavailable and the
+    // caller safely keeps its already-complete atom-only briefing.
+    let Some(query_vector) = query_embedding.clone() else {
+        return Ok(Vec::new());
+    };
     let candidate_k = ((cap * 4) as u32).max(20);
     let mut candidate_ids: Vec<Uuid> = Vec::new();
     let mut seen: HashSet<Uuid> = HashSet::new();
     for kind in KG_BLEND_ENTITY_KINDS {
         let hits = runtime
-            .hybrid_search(token, query, None, candidate_k, Some(kind), None, &[], None)
+            .hybrid_search(
+                token,
+                query,
+                Some(query_vector.clone()),
+                candidate_k,
+                Some(kind),
+                None,
+                &[],
+                None,
+            )
             .await?;
         for hit in hits {
             if seen.insert(hit.entity_id) {
@@ -1642,7 +1680,7 @@ async fn search_kg_entities(
         .iter()
         .map(|e| format!("{} {}", e.name, e.description.as_deref().unwrap_or("")))
         .collect();
-    let cosines = match embed_cosine_scores(runtime, query, &texts).await? {
+    let cosines = match embed_cosine_scores(runtime, query, query_embedding, &texts).await? {
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
@@ -1931,6 +1969,10 @@ impl KnowledgeHandlers {
         let mut ann_hits: Vec<ScoredHit> = Vec::new();
         let mut ann_availability: Option<AnnAvailability> = None;
         let mut hydration_failures = 0usize;
+        // One query vector is shared by ANN retrieval and the optional
+        // embedding rerank. Candidate embeddings remain stage-specific, but
+        // the request never pays to embed the same query twice (#2232).
+        let mut query_embedding: Option<Vec<f32>> = None;
         let ann_k = fetch_limit.max(20);
         match khive_storage::await_request_read_phase(
             "knowledge.search",
@@ -1939,10 +1981,19 @@ impl KnowledgeHandlers {
         .await
         {
             Ok(Ok(query_emb)) => {
+                query_embedding = Some(query_emb);
                 let model = runtime.default_embedder_name();
                 let key = vamana::AnnKey::new(&ns, model);
                 match search_eligible_ann_with_refill(
-                    &ctx, token, ann, &key, &query_emb, ann_k, ann_k,
+                    &ctx,
+                    token,
+                    ann,
+                    &key,
+                    query_embedding
+                        .as_deref()
+                        .expect("query embedding was just populated"),
+                    ann_k,
+                    ann_k,
                 )
                 .await
                 {
@@ -1998,7 +2049,14 @@ impl KnowledgeHandlers {
         // embedding read rather than let it convert a degraded-but-ok
         // response into a verb-level error.
         if do_rerank && !hits.is_empty() && !lexical_timed_out {
-            rerank_with_embeddings(runtime, &raw_query, &mut hits, rerank_alpha).await?;
+            rerank_with_embeddings(
+                runtime,
+                &raw_query,
+                &mut query_embedding,
+                &mut hits,
+                rerank_alpha,
+            )
+            .await?;
         }
 
         apply_status_multipliers(&mut hits, allow_deprecated);
@@ -2075,6 +2133,21 @@ impl KnowledgeHandlers {
         params: Value,
         ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
+        let (out, _) =
+            Self::suggest_with_query_embedding(runtime, token, params, ann, None).await?;
+        Ok(out)
+    }
+
+    /// Internal suggest path that accepts and returns the request's cached
+    /// query vector. Auto-compose calls this directly so its suggest, atom,
+    /// section, and KG stages all share one successful query embedding.
+    async fn suggest_with_query_embedding(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+        ann: &vamana::SharedAnn,
+        mut query_embedding: Option<Vec<f32>>,
+    ) -> Result<(Value, Option<Vec<f32>>), RuntimeError> {
         khive_storage::ensure_request_read_active("knowledge.suggest")?;
         let p: SuggestParams = deser(params)?;
         let raw_query = p.query.trim().to_string();
@@ -2121,42 +2194,45 @@ impl KnowledgeHandlers {
         // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
         // top ANN neighbors before the type gate discards atom hits.
         let ann_k = (limit * 50).max(200);
-        match khive_storage::await_request_read_phase(
-            "knowledge.suggest",
-            runtime.embed_query(&raw_query),
-        )
-        .await
-        {
-            Ok(Ok(query_emb)) => {
-                let model = runtime.default_embedder_name();
-                let key = vamana::AnnKey::new(&ns, model);
-                match search_eligible_ann_with_refill(
-                    &ctx,
-                    token,
-                    ann,
-                    &key,
-                    &query_emb,
-                    ctx.fetch_limit,
-                    ann_k,
-                )
-                .await
-                {
-                    Ok(EligibleAnnSearchState {
-                        hits,
-                        availability,
-                        hydration_failures: ann_hydration_failures,
-                    }) => {
-                        hydration_failures += ann_hydration_failures;
-                        ann_hits = hits;
-                        ann_availability = Some(availability);
-                    }
-                    Err(e) if is_read_timeout(&e) => {}
-                    Err(e) => return Err(e),
-                }
+        if query_embedding.is_none() {
+            match khive_storage::await_request_read_phase(
+                "knowledge.suggest",
+                runtime.embed_query(&raw_query),
+            )
+            .await
+            {
+                Ok(Ok(query_emb)) => query_embedding = Some(query_emb),
+                Ok(Err(_)) => {}
+                Err(e) if is_timeout(&e) => {}
+                Err(e) => return Err(e.into()),
             }
-            Ok(Err(_)) => {}
-            Err(e) if is_timeout(&e) => {}
-            Err(e) => return Err(e.into()),
+        }
+        if let Some(query_emb) = query_embedding.as_deref() {
+            let model = runtime.default_embedder_name();
+            let key = vamana::AnnKey::new(&ns, model);
+            match search_eligible_ann_with_refill(
+                &ctx,
+                token,
+                ann,
+                &key,
+                query_emb,
+                ctx.fetch_limit,
+                ann_k,
+            )
+            .await
+            {
+                Ok(EligibleAnnSearchState {
+                    hits,
+                    availability,
+                    hydration_failures: ann_hydration_failures,
+                }) => {
+                    hydration_failures += ann_hydration_failures;
+                    ann_hits = hits;
+                    ann_availability = Some(availability);
+                }
+                Err(e) if is_read_timeout(&e) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         let SearchCoreOutcome {
@@ -2184,7 +2260,14 @@ impl KnowledgeHandlers {
         let fresh_rerank_applied = if lexical_timed_out {
             false
         } else {
-            rerank_with_embeddings(runtime, &raw_query, &mut hits, D_SUGGEST_RERANK_ALPHA).await?
+            rerank_with_embeddings(
+                runtime,
+                &raw_query,
+                &mut query_embedding,
+                &mut hits,
+                D_SUGGEST_RERANK_ALPHA,
+            )
+            .await?
         };
 
         // Safety net: retain only domain hits in case any non-domain survived above.
@@ -2264,7 +2347,7 @@ impl KnowledgeHandlers {
         if !lexical_timed_out {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
-        Ok(out)
+        Ok((out, query_embedding))
     }
 
     pub(crate) async fn compose(
@@ -2326,6 +2409,7 @@ impl KnowledgeHandlers {
         let blend_kg = p.blend_kg.unwrap_or(true) && !atom_ids_only;
         let mut suggest_ann_unavailable = false;
         let mut suggest_hydration_failures = 0usize;
+        let mut query_embedding: Option<Vec<f32>> = None;
         if is_auto {
             let word_count = raw_query.split_whitespace().count();
             if word_count < 10 {
@@ -2361,18 +2445,20 @@ impl KnowledgeHandlers {
 
         if is_auto {
             let auto_limit = p.auto_limit.unwrap_or(5).clamp(1, 20);
-            let suggest_attempt = Self::suggest(
+            let suggest_attempt = Self::suggest_with_query_embedding(
                 runtime,
                 token,
                 json!({ "query": &raw_query, "limit": auto_limit }),
                 ann,
+                query_embedding.take(),
             )
             .await;
             try_or_finish!(khive_storage::ensure_request_read_active(
                 "knowledge.compose"
             ));
             let suggest_result = match suggest_attempt {
-                Ok(v) => {
+                Ok((v, reused_query_embedding)) => {
+                    query_embedding = reused_query_embedding;
                     suggest_ann_unavailable = v
                         .get("ann_unavailable")
                         .and_then(|f| f.as_bool())
@@ -2519,7 +2605,19 @@ impl KnowledgeHandlers {
             .collect();
 
         try_or_finish!(timing.begin(Phase::Rerank));
-        try_or_finish!(rerank_text_items(runtime, &raw_query, &mut items).await);
+        if query_embedding.is_none() && !runtime.default_embedder_name().is_empty() {
+            let embedded = try_or_finish!(
+                khive_storage::await_request_read_phase(
+                    "knowledge.compose",
+                    runtime.embed_query(&raw_query),
+                )
+                .await
+            );
+            query_embedding = embedded.ok();
+        }
+        try_or_finish!(
+            rerank_text_items(runtime, &raw_query, &mut query_embedding, &mut items,).await
+        );
 
         let atom_ids: Vec<String> = ordered_atoms.iter().map(|a| a.id.to_string()).collect();
         let atom_cosine_scores: HashMap<String, f32> = items
@@ -2558,22 +2656,14 @@ impl KnowledgeHandlers {
                 })
                 .collect();
 
-            let q_emb = try_or_finish!(
-                khive_storage::await_request_read_phase(
-                    "knowledge.compose",
-                    runtime.embed_query(&raw_query),
-                )
-                .await
-            );
             try_or_finish!(khive_storage::ensure_request_read_active(
                 "knowledge.compose"
             ));
-            let q_emb = q_emb.ok();
 
-            if let Some(qe) = q_emb {
+            if let Some(qe) = query_embedding.as_deref() {
                 try_or_finish!(super::compose::score_sections(
                     &raw_query,
-                    &qe,
+                    qe,
                     &atom_cosine_scores,
                     &section_map,
                     &domain_scores,
@@ -2699,6 +2789,7 @@ impl KnowledgeHandlers {
                     token,
                     &ns,
                     &raw_query,
+                    &mut query_embedding,
                     KG_BLEND_CAP,
                     floor,
                 )
@@ -3190,20 +3281,145 @@ mod tests {
             "ANN query paths must not call generic {generic_needle}; \
              found {generic_count} occurrence(s) — use embed_query instead"
         );
-        // Confirm the query-intent call is present for both search and suggest.
+        // Confirm the query-intent call is present only at the three request
+        // entry/fallback points. Auto-compose reuses suggest's vector, while
+        // explicit compose fills the same cache itself; section and KG
+        // scoring must not introduce another direct query embed.
         let query_intent_needle: String = [".embed_query(", "&raw_query)"].concat();
         let query_intent_count = src
             .lines()
             .filter(|l| !l.contains("concat"))
             .filter(|l| l.contains(&query_intent_needle))
             .count();
-        // 3 sites: knowledge.search ANN path, knowledge.suggest ANN path,
-        // and the section-scoring query embed (search.rs:~1291).
         assert_eq!(
             query_intent_count, 3,
             "expected exactly 3 {query_intent_needle} calls \
-             (search ANN + suggest ANN + section query), found {query_intent_count}"
+             (search ANN + suggest ANN + explicit compose fallback), found {query_intent_count}"
         );
+    }
+
+    /// #2232: once a rerank stage has successfully embedded the query, later
+    /// stages embed candidates only. The recording provider sees the literal
+    /// query exactly once across two independent candidate pools.
+    #[tokio::test]
+    async fn query_embedding_cache_reuses_query_vector_across_reranks() {
+        use std::sync::{Arc, Mutex};
+
+        use async_trait::async_trait;
+        use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+        const MODEL_KEY: &str = "all-minilm-l6-v2";
+        const DIM: usize = 384;
+
+        struct RecordingService {
+            texts: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl EmbeddingService for RecordingService {
+            async fn embed(
+                &self,
+                texts: &[String],
+                _model: EmbeddingModel,
+            ) -> Result<Vec<Vec<f32>>, EmbedError> {
+                self.texts
+                    .lock()
+                    .expect("recording lock")
+                    .extend(texts.iter().cloned());
+                Ok(texts.iter().map(|_| vec![0.5; DIM]).collect())
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "query-reuse-recording-service"
+            }
+        }
+
+        struct RecordingProvider {
+            texts: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl EmbedderProvider for RecordingProvider {
+            fn name(&self) -> &str {
+                MODEL_KEY
+            }
+
+            fn dimensions(&self) -> usize {
+                DIM
+            }
+
+            async fn build(
+                &self,
+            ) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+                Ok(Arc::new(RecordingService {
+                    texts: Arc::clone(&self.texts),
+                }))
+            }
+        }
+
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
+            db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: Vec::new(),
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["knowledge".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: Vec::new(),
+            allowed_outbound_namespaces: Vec::new(),
+            actor_id: None,
+        })
+        .expect("runtime");
+        runtime.register_embedder(RecordingProvider {
+            texts: Arc::clone(&texts),
+        });
+
+        let query = "one request-local query vector";
+        let mut query_embedding = None;
+        let first = vec![
+            "first candidate".to_string(),
+            "second candidate".to_string(),
+        ];
+        let second = vec!["third candidate".to_string()];
+        assert_eq!(
+            embed_cosine_scores(&runtime, query, &mut query_embedding, &first)
+                .await
+                .expect("first rerank")
+                .expect("first scores")
+                .len(),
+            2
+        );
+        assert!(query_embedding.is_some(), "first rerank must fill cache");
+        assert_eq!(
+            embed_cosine_scores(&runtime, query, &mut query_embedding, &second)
+                .await
+                .expect("second rerank")
+                .expect("second scores")
+                .len(),
+            1
+        );
+
+        let recorded = texts.lock().expect("recording lock");
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|text| text.as_str() == query)
+                .count(),
+            1,
+            "the shared query must be embedded exactly once: {recorded:?}"
+        );
+        assert_eq!(recorded.len(), 4, "one query plus three candidates");
     }
 
     // ── filter_by_excluded_statuses ───────────────────────────────────────────
