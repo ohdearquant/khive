@@ -53,6 +53,10 @@ const STAGING_LOCK_FILE: &str = ".khive-staging.lock";
 /// `REAP_THROTTLE_INTERVAL` instead of on every cache mutation.
 const REAP_SWEEP_MARKER: &str = ".khive-last-swept";
 const REAP_THROTTLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// A clone's partial pack normally grows in a handful of large files, so a
+/// short polling interval bounds overshoot without putting a recursive walk
+/// in git's hot path continuously.
+const CLONE_SIZE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Belt-and-suspenders fallback for a staging entry that crashed before it
 /// could write its own lock file (the brief mkdir-then-open-lock gap at the
 /// very start of `install_fresh_clone`) -- not the primary staleness
@@ -472,7 +476,7 @@ fn install_fresh_clone(
     })?;
 
     let staging_dir = wrapper.join("repo");
-    clone(canonical_url, &staging_dir).inspect_err(|_| {
+    clone(canonical_url, &staging_dir, cap).inspect_err(|_| {
         // `git clone` can create and partially populate the destination
         // before failing (network drop, auth failure, bad ref) -- clean up
         // the whole wrapper so a run of failures doesn't leave staging
@@ -888,8 +892,9 @@ fn remove_dir_all_retrying(path: &Path) -> std::io::Result<()> {
 ///
 /// The flag is only half the fix — see [`advance_to_fetched_tip`], which had
 /// to stop using `reset --hard` for the same reason.
-fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
-    let status = Command::new("git")
+fn clone(url: &str, dest: &Path, cap: u64) -> Result<(), CacheError> {
+    let mut command = Command::new("git");
+    command
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-c")
@@ -902,9 +907,47 @@ fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
         .arg(url)
         .arg(dest)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdout(Stdio::null())
-        .status()
+        .stdout(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Isolate git and any transport/index-pack descendants so crossing
+        // the cap can stop the entire transfer, not merely its direct shell.
+        command.process_group(0);
+    }
+
+    let mut child = command
+        .spawn()
         .map_err(|e| CacheError::Git(format!("spawning git clone: {e}")))?;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                terminate_clone(&mut child)?;
+                return Err(CacheError::Git(format!(
+                    "waiting for git clone {:?}: {e}",
+                    redact_repo_url(url)
+                )));
+            }
+        }
+
+        let size = match dir_size(dest) {
+            Ok(size) => size,
+            // Git creates the destination itself; it is legitimately absent
+            // for the first few polls after spawn.
+            Err(CacheError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                terminate_clone(&mut child)?;
+                return Err(e);
+            }
+        };
+        if size > cap {
+            terminate_clone(&mut child)?;
+            return Err(CacheError::CloneTooLarge { bytes: size, cap });
+        }
+        std::thread::sleep(CLONE_SIZE_POLL_INTERVAL);
+    };
     if !status.success() {
         return Err(CacheError::Git(format!(
             "git clone {:?} failed (exit {status})",
@@ -912,6 +955,43 @@ fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
         )));
     }
     Ok(())
+}
+
+/// Stop and reap an in-flight clone. On Unix the child is its own process
+/// group, so the signal also reaches transport and index-pack descendants.
+fn terminate_clone(child: &mut std::process::Child) -> Result<(), CacheError> {
+    #[cfg(unix)]
+    let kill_result = {
+        let pid = child.id();
+        // SAFETY: `pid` names the live child we spawned into its own process
+        // group; negating it targets that group, and `kill` borrows no Rust
+        // memory or descriptors.
+        let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            let group_error = std::io::Error::last_os_error();
+            if group_error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                child.kill()
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let kill_result = child.kill();
+
+    // Always attempt to reap, including when the process exited between the
+    // preceding `try_wait` and the kill signal.
+    let wait_result = child.wait();
+    if let Err(e) = kill_result {
+        return Err(CacheError::Git(format!(
+            "stopping oversized git clone: {e}"
+        )));
+    }
+    wait_result
+        .map(|_| ())
+        .map_err(|e| CacheError::Git(format!("reaping stopped git clone: {e}")))
 }
 
 /// Advance the cache clone's `HEAD` to the tip `fetch` just brought in.
@@ -1796,6 +1876,84 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
+    /// Issue #2073: the clone cap must stop the transfer while `git clone`
+    /// is still running, not only reject the completed checkout afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_clone_interrupts_an_inflight_transfer_at_the_size_cap() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        let finished = dir.path().join("clone-finished");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+
+        let script = format!(
+            r#"#!/bin/sh
+for arg in "$@"; do dest="$arg"; done
+mkdir -p "$dest/.git/objects/pack"
+i=0
+while [ "$i" -lt 128 ]; do
+  dd if=/dev/zero of="$dest/.git/objects/pack/chunk-$i" bs=4096 count=1 2>/dev/null
+  i=$((i + 1))
+  sleep 0.01
+done
+printf 'finished\n' > '{}'
+"#,
+            finished.display()
+        );
+        let git_path = bin_dir.join("git");
+        std::fs::write(&git_path, script).expect("write fake git");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&git_path)
+            .expect("fake git metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&git_path, permissions).expect("chmod fake git");
+
+        let prior_path = std::env::var("PATH").ok();
+        let path = match &prior_path {
+            Some(path) => format!("{}:{path}", bin_dir.display()),
+            None => bin_dir.display().to_string(),
+        };
+        std::env::set_var("PATH", path);
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path().join("scratch"));
+        std::env::set_var("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES", "16384");
+        let result = ensure_clone("https://example.invalid/oversized.git");
+        match prior_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        std::env::remove_var("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES");
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+
+        let err = result.expect_err("the in-flight clone must cross the configured cap");
+        let bytes = match err {
+            CacheError::CloneTooLarge { bytes, cap: 16_384 } => bytes,
+            other => panic!("expected CloneTooLarge at the configured cap, got {other:?}"),
+        };
+        assert!(bytes > 16_384, "the measured transfer crossed the cap");
+        assert!(
+            bytes < 128 * 4096,
+            "the child must be stopped before writing its full payload: {bytes}"
+        );
+        assert!(
+            !finished.exists(),
+            "the clone child must be terminated before its completion marker"
+        );
+
+        let namespace = staging_namespace_path(&dir.path().join("scratch"));
+        let leftovers = std::fs::read_dir(namespace)
+            .expect("read staging namespace")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| is_staging_wrapper_name(name))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "failed clone left staging: {leftovers:?}"
+        );
+    }
+
     fn test_git(repo: &Path, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
@@ -2405,7 +2563,7 @@ mod tests {
 
         // A genuine owned slot.
         let slot = root.join("owned-slot");
-        clone(url, &slot).expect("clone slot");
+        clone(url, &slot, clone_max_bytes()).expect("clone slot");
         std::fs::write(slot.join(MARKER_FILE), b"").expect("marker");
 
         let validated = revalidate_owned_slot(&slot).expect("owned slot validates");
@@ -2463,7 +2621,7 @@ mod tests {
 
         // A genuine owned slot.
         let slot = root.join("owned-slot");
-        clone(url, &slot).expect("clone slot");
+        clone(url, &slot, clone_max_bytes()).expect("clone slot");
         std::fs::write(slot.join(MARKER_FILE), b"").expect("marker");
 
         let validated = revalidate_owned_slot(&slot).expect("owned slot validates");

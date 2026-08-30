@@ -44,7 +44,8 @@ impl Default for IngestInclude {
 /// Options for one ingest pass.
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
-    /// Local path to the git repository to walk.
+    /// Local path to the git repository to walk, or merely the working
+    /// directory for source-bound `gh` commands when commits are excluded.
     pub repo: PathBuf,
     /// Expected GitHub `owner/repo` derived from the caller's canonical
     /// remote source. Local-path and administrative callers leave this
@@ -345,7 +346,29 @@ pub async fn run_ingest(
     registry: &VerbRegistry,
     opts: IngestOptions,
 ) -> Result<IngestReport> {
-    run_ingest_with_commit_recovery(runtime, token, registry, opts, |_repo, _err| Ok(None)).await
+    run_ingest_inner(runtime, token, registry, opts, true, |_repo, _err| Ok(None)).await
+}
+
+/// Run a remote issues/pull-requests-only pass without consulting the
+/// command working directory's `origin` when the parsed source has no
+/// GitHub identity. The handler supplies a source-bound identity whenever
+/// one exists; an absent one must degrade safely rather than borrow an
+/// unrelated checkout identity from the daemon's current directory.
+pub(crate) async fn run_remote_api_ingest(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
+    opts: IngestOptions,
+) -> Result<IngestReport> {
+    if opts.include.commits {
+        return Err(anyhow!(
+            "remote API-only ingest cannot include commit history"
+        ));
+    }
+    run_ingest_inner(runtime, token, registry, opts, false, |_repo, _err| {
+        Ok(None)
+    })
+    .await
 }
 
 /// Same one-shot ingest pass as `run_ingest`, but a classified
@@ -357,6 +380,17 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     token: &NamespaceToken,
     registry: &VerbRegistry,
     opts: IngestOptions,
+    recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send,
+) -> Result<IngestReport> {
+    run_ingest_inner(runtime, token, registry, opts, true, recover).await
+}
+
+async fn run_ingest_inner(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
+    opts: IngestOptions,
+    derive_github_repo_from_origin: bool,
     mut recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send,
 ) -> Result<IngestReport> {
     let mut report = IngestReport {
@@ -397,7 +431,11 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     // §5). The successful probe returns the exact owner/repo later passed via
     // `--repo`, so PATH presence is never mistaken for remote usability.
     if opts.include.issues || opts.include.pull_requests {
-        let gh_probe = probe_gh_repository(&opts.repo, opts.expected_github_repo.as_deref());
+        let gh_probe = probe_gh_repository(
+            &opts.repo,
+            opts.expected_github_repo.as_deref(),
+            derive_github_repo_from_origin,
+        );
         if let Ok(gh_repo) = &gh_probe {
             report.gh_available = Some(true);
             if opts.include.pull_requests && !budget.exhausted() {
@@ -820,10 +858,12 @@ async fn link_references(
 fn probe_gh_repository(
     repo: &Path,
     expected: Option<&str>,
+    derive_from_origin: bool,
 ) -> std::result::Result<String, &'static str> {
     let expected = match expected {
         Some(expected) => validate_owner_repo(expected)?,
-        None => github_repository_from_origin(repo)?,
+        None if derive_from_origin => github_repository_from_origin(repo)?,
+        None => return Err("remote source has no usable github.com repository identity"),
     };
     let output = Command::new("gh")
         .args([

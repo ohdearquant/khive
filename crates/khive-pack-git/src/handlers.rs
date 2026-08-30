@@ -1,8 +1,8 @@
 //! `git.digest` verb handler (ADR-088 Amendment 1).
 //!
 //! Resolves the `source` argument (local path or `https://` URL, cloning/
-//! fetching remote sources into the scratch cache), resolves or auto-creates
-//! the repo-anchor `project` entity, then drives the shared
+//! fetching a remote only when commits need a repository), resolves or
+//! auto-creates the repo-anchor `project` entity, then drives the shared
 //! `ingest::run_ingest` core with a bounded, cursor-resumable pass.
 
 use std::path::Path;
@@ -16,8 +16,8 @@ use khive_storage::types::{SqlStatement, SqlValue};
 
 use crate::cache::{self, CacheError};
 use crate::ingest::{
-    resolve_project_id, run_ingest, run_ingest_with_commit_recovery, CacheRepairStrategy,
-    GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
+    resolve_project_id, run_ingest, run_ingest_with_commit_recovery, run_remote_api_ingest,
+    CacheRepairStrategy, GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
 };
 use crate::source::{
     canonical_remote_identity, parse_source, redact_repo_url, remote_url_to_slug, repo_basename,
@@ -151,19 +151,28 @@ impl GitPack {
             Some(v) => parse_include(v)?,
         };
 
-        // Resolve a local repo path -- remote sources clone/fetch into the
-        // scratch cache first (ADR-088 Amendment 1 §Remote-URL mode).
+        // Commits need a repository to walk. Issues and pull requests are
+        // source-bound `gh` API reads, so a remote API-only request uses a
+        // neutral working directory and never clones unused git history.
         let (repo_path, expected_github_repo) = match &source {
             DigestSource::Local(p) => (p.clone(), None),
             DigestSource::Remote { canonical, gh_slug } => {
-                let cloned = cache::ensure_clone(canonical).map_err(|e| {
-                    RuntimeError::InvalidInput(format!(
-                        "remote clone/fetch of {:?} failed: {e}",
-                        redact_repo_url(canonical)
-                    ))
-                })?;
+                let repo = if include.commits {
+                    cache::ensure_clone(canonical).map_err(|e| {
+                        RuntimeError::InvalidInput(format!(
+                            "remote clone/fetch of {:?} failed: {e}",
+                            redact_repo_url(canonical)
+                        ))
+                    })?
+                } else {
+                    std::env::current_dir().map_err(|e| {
+                        RuntimeError::InvalidInput(format!(
+                            "resolving a working directory for remote GitHub ingest: {e}"
+                        ))
+                    })?
+                };
                 (
-                    cloned,
+                    repo,
                     gh_slug
                         .as_ref()
                         .map(|(owner, repo)| format!("{owner}/{repo}")),
@@ -212,12 +221,15 @@ impl GitPack {
         // is never a candidate for self-heal (issue #765).
         let mut report = match &source {
             DigestSource::Local(_) => run_ingest(self.runtime(), token, registry, opts).await,
-            DigestSource::Remote { canonical, .. } => {
+            DigestSource::Remote { canonical, .. } if include.commits => {
                 let mut recovery = RemoteCommitRecovery::new(canonical.clone());
                 run_ingest_with_commit_recovery(self.runtime(), token, registry, opts, {
                     move |repo, err| recovery.repair(repo, err)
                 })
                 .await
+            }
+            DigestSource::Remote { .. } => {
+                run_remote_api_ingest(self.runtime(), token, registry, opts).await
             }
         }
         .map_err(digest_failure_to_runtime)?;

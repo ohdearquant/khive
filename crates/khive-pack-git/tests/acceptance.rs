@@ -6488,6 +6488,83 @@ async fn digest_verb_local_cursor_read_failure_is_not_remote_listing_skip() {
 /// Presence on PATH is insufficient: an installed but unauthenticated (or
 /// repo-incompatible) `gh` reports `gh_available:false`, skips requested
 /// remote sources, never starts a walker, and does not echo probe stderr.
+#[cfg(unix)]
+#[tokio::test]
+async fn digest_remote_issues_only_never_invokes_git_clone() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin_dir = dir.path().join("bin");
+    let scratch = dir.path().join("scratch");
+    let git_log = dir.path().join("git-args.log");
+    let gh_log = dir.path().join("gh-args.log");
+    std::fs::create_dir_all(&bin_dir).expect("bin dir");
+
+    let git_script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 97\n",
+        git_log.display()
+    );
+    let gh_script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1 $2" in
+  "repo view")
+    echo '{{"nameWithOwner":"fixture/repository","url":"https://github.com/fixture/repository"}}'
+    ;;
+  "issue list")
+    echo '[]'
+    ;;
+  *)
+    exit 98
+    ;;
+esac
+"#,
+        gh_log.display()
+    );
+    for (name, script) in [("git", git_script), ("gh", gh_script)] {
+        let path = bin_dir.join(name);
+        std::fs::write(&path, script).expect("write command stub");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path)
+            .expect("stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod stub");
+    }
+
+    let _path_guard = PathGuard::install(&bin_dir);
+    std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", &scratch);
+    let result = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": "https://github.com/fixture/repository",
+                "include": ["issues"]
+            }),
+        )
+        .await;
+    std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+
+    let response = result.expect("issues-only remote digest must not require a clone");
+    assert_eq!(response["gh_available"], true, "{response}");
+    assert_eq!(response["history_exhausted"], true, "{response}");
+    assert_eq!(response["sources"]["issues"]["state"], "completed");
+    assert!(response["sources"]["commits"].is_null(), "{response}");
+    assert!(
+        !git_log.exists(),
+        "issues-only remote digest must never invoke git: {}",
+        std::fs::read_to_string(&git_log).unwrap_or_default()
+    );
+    let gh_invocations = std::fs::read_to_string(gh_log).expect("gh invocation log");
+    assert!(
+        gh_invocations
+            .lines()
+            .all(|line| line.contains("fixture/repository")),
+        "every gh call stays source-bound: {gh_invocations:?}"
+    );
+}
+
 #[tokio::test]
 async fn digest_verb_installed_but_unusable_gh_is_reported_false_without_leaking_stderr() {
     let _guard = ENV_MUTEX.lock().await;
