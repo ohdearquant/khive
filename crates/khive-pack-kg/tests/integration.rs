@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
+use khive_runtime::presentation::{present, PresentationMode};
 use khive_runtime::{
     arm_prefix_resolve_fail_scoped, EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken,
     ParamDef, RuntimeError, VerbCategory, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
@@ -243,6 +244,150 @@ async fn create_entity_alias_paper_normalizes_to_document() {
         kind,
         Some("document"),
         "alias 'paper' must normalize to 'document'; got: {result}"
+    );
+}
+
+// entity_type alias resolution (e.g. the built-in `method` -> `function`
+// mapping, ADR-085) is deliberate — but it must never be invisible. A caller
+// who wrote `method` must see `function` come back, not silently get data
+// they didn't write.
+#[tokio::test]
+async fn create_entity_type_alias_method_normalizes_and_is_echoed() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Tokenizer.encode",
+                "entity_kind": "concept",
+                "entity_type": "method",
+            }),
+        )
+        .await
+        .expect("entity_type alias 'method' must succeed");
+    assert_eq!(
+        result.get("entity_type").and_then(Value::as_str),
+        Some("function"),
+        "stored entity_type must be the canonical 'function'; got: {result}"
+    );
+    let applied = result.get("entity_type_normalized").unwrap_or_else(|| {
+        panic!("response must echo the applied alias substitution; got: {result}")
+    });
+    assert_eq!(
+        applied.get("requested").and_then(Value::as_str),
+        Some("method"),
+        "echoed normalization must name what the caller requested; got: {applied}"
+    );
+    assert_eq!(
+        applied.get("stored").and_then(Value::as_str),
+        Some("function"),
+        "echoed normalization must name what was actually stored; got: {applied}"
+    );
+}
+
+// A cosmetic-only difference (case/hyphen/space folding to the SAME word)
+// must not be flagged as an alias substitution — only a genuine word
+// substitution (a different registered alias) counts.
+#[tokio::test]
+async fn create_entity_type_case_only_difference_is_not_flagged_as_normalized() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Some Algorithm",
+                "entity_kind": "concept",
+                "entity_type": "Algorithm",
+            }),
+        )
+        .await
+        .expect("entity_type 'Algorithm' must succeed");
+    assert_eq!(
+        result.get("entity_type").and_then(Value::as_str),
+        Some("algorithm")
+    );
+    assert!(
+        result.get("entity_type_normalized").is_none(),
+        "case-only folding must not be reported as an alias substitution; got: {result}"
+    );
+}
+
+// Repeated, leading, and trailing separators (space/hyphen/underscore) are
+// cosmetic — same word as the canonical registry entry once collapsed and
+// stripped — and must not be flagged as an alias substitution either. This
+// pins the fix for `normalize_for_comparison` diverging from the registry's
+// own `to_snake_case`: a naive space/hyphen-only substitution turns
+// "--Algorithm__" into "__algorithm__" (never collapsing or stripping), which
+// then compares unequal to the stored "algorithm" and misreports a purely
+// cosmetic normalization as a genuine alias substitution.
+#[tokio::test]
+async fn create_entity_type_repeated_leading_trailing_separators_are_not_flagged_as_normalized() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Some Other Algorithm",
+                "entity_kind": "concept",
+                "entity_type": "--Algorithm__",
+            }),
+        )
+        .await
+        .expect("entity_type '--Algorithm__' must succeed");
+    assert_eq!(
+        result.get("entity_type").and_then(Value::as_str),
+        Some("algorithm")
+    );
+    assert!(
+        result.get("entity_type_normalized").is_none(),
+        "repeated/leading/trailing separator folding must not be reported as an alias \
+         substitution; got: {result}"
+    );
+}
+
+// Bulk create must surface the same alias visibility even when `verbose` is
+// left at its default `false` — the atomic-path summary response is the
+// only place a non-verbose bulk caller ever sees the applied entity_type.
+#[tokio::test]
+async fn create_bulk_entity_type_alias_echoed_without_verbose() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "BulkMethod", "entity_type": "method"},
+                    {"kind": "concept", "name": "BulkPlain"},
+                ]
+            }),
+        )
+        .await
+        .expect("bulk create must succeed");
+    assert_eq!(result.get("created").and_then(Value::as_u64), Some(2));
+    let normalized = result
+        .get("entity_type_normalized")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "bulk response must echo entity_type aliasing even without verbose; got: {result}"
+            )
+        });
+    assert_eq!(
+        normalized.len(),
+        1,
+        "only the 'method' item aliased; got: {result}"
+    );
+    assert_eq!(normalized[0].get("index").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        normalized[0].get("requested").and_then(Value::as_str),
+        Some("method")
+    );
+    assert_eq!(
+        normalized[0].get("stored").and_then(Value::as_str),
+        Some("function")
     );
 }
 
@@ -5866,6 +6011,7 @@ static FAKE_SUBHANDLER_HANDLERS: [HandlerDef; 2] = [
             param_type: "string",
             required: false,
             description: "Internal embedding input.",
+            resolution_mode: khive_types::IdResolutionMode::NotApplicable,
         }],
     },
 ];
@@ -14499,4 +14645,55 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
              {writer_contention:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn update_empty_string_property_survives_agent_echo_and_readback() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Empty property update target",
+                "properties": {"summary": "before"}
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"].as_str().expect("created id").to_string();
+
+    let updated = pack
+        .dispatch("update", json!({"id": id, "properties": {"summary": ""}}))
+        .await
+        .expect("empty-string property update must succeed");
+    assert_eq!(
+        updated["properties"]["summary"],
+        json!(""),
+        "canonical update response must reflect the stored empty string"
+    );
+
+    let fetched = pack
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("readback must succeed");
+    assert_eq!(
+        fetched["properties"]["summary"],
+        json!(""),
+        "canonical readback must retain the empty string"
+    );
+
+    let agent_echo = present(updated, PresentationMode::Agent, 0);
+    assert_eq!(
+        agent_echo["properties"]["summary"],
+        json!(""),
+        "Agent update echo must not render the property as deleted: {agent_echo}"
+    );
+
+    let agent_readback = present(fetched, PresentationMode::Agent, 0);
+    assert_eq!(
+        agent_readback["properties"]["summary"],
+        json!(""),
+        "Agent readback must retain the same empty-string value: {agent_readback}"
+    );
 }

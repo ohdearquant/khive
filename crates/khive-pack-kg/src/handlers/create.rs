@@ -5,10 +5,10 @@ use serde_json::{json, Value};
 use khive_runtime::{EntityCreateSpec, NamespaceToken, RuntimeError, VerbRegistry};
 
 use super::common::{
-    canonical_entity_kind, canonical_note_kind, deser, immutable_event_error,
-    normalize_entity_timestamps, parse_relation, reconcile_specific, remap_note_status,
-    resolve_kind_spec, resolve_uuid_unfiltered, to_json, validate_entity_type, validate_weight,
-    CreateParams, KindSpec,
+    canonical_entity_kind, canonical_note_kind, describe_entity_type_normalization, deser,
+    immutable_event_error, normalize_entity_timestamps, parse_relation, reconcile_specific,
+    remap_note_status, resolve_kind_spec, resolve_uuid_unfiltered, to_json, validate_entity_type,
+    validate_weight, CreateParams, KindSpec,
 };
 use crate::KgPack;
 
@@ -142,6 +142,7 @@ impl KgPack {
                 // Build EntityCreateSpec for every entry, resolving kind/entity_type at
                 // the handler layer (same helpers used by the single-entity path).
                 let mut specs: Vec<EntityCreateSpec> = Vec::with_capacity(attempted);
+                let mut entity_type_normalized: Vec<Value> = Vec::new();
                 for (idx, entry) in entries.into_iter().enumerate() {
                     // Resolve the item's own kind.
                     let item_kind_spec = resolve_kind_spec(&entry.kind, registry).map_err(|e| {
@@ -175,6 +176,16 @@ impl KgPack {
                             .map_err(|e| {
                                 RuntimeError::InvalidInput(format!("items[{idx}]: {e}"))
                             })?;
+                    if let Some(applied) = describe_entity_type_normalization(
+                        entry.entity_type.as_deref(),
+                        validated_type.as_deref(),
+                    ) {
+                        let mut applied = applied;
+                        if let Some(obj) = applied.as_object_mut() {
+                            obj.insert("index".to_string(), serde_json::json!(idx));
+                        }
+                        entity_type_normalized.push(applied);
+                    }
                     specs.push(EntityCreateSpec {
                         kind: canonical,
                         entity_type: validated_type,
@@ -198,11 +209,17 @@ impl KgPack {
                         resp["entities"] = serde_json::to_value(&entities)
                             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
                     }
+                    if !entity_type_normalized.is_empty() {
+                        resp["entity_type_normalized"] =
+                            serde_json::Value::Array(entity_type_normalized);
+                    }
                     return super::common::to_json(&resp);
                 } else {
                     // Non-atomic: best-effort, per-item errors collected.
                     let mut results: Vec<serde_json::Value> = Vec::new();
                     let mut error_list: Vec<serde_json::Value> = Vec::new();
+                    let mut failed_indices: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
                     for (idx, spec) in specs.into_iter().enumerate() {
                         match self.runtime.create_many(token, vec![spec]).await {
                             Ok(mut v) => {
@@ -217,12 +234,19 @@ impl KgPack {
                                 }
                             }
                             Err(e) => {
+                                failed_indices.insert(idx);
                                 error_list.push(
                                     serde_json::json!({"index": idx, "error": format!("{e}")}),
                                 );
                             }
                         }
                     }
+                    entity_type_normalized.retain(|entry| {
+                        entry
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .is_none_or(|idx| !failed_indices.contains(&(idx as usize)))
+                    });
                     let mut resp = serde_json::json!({
                         "attempted": attempted,
                         "created": results.len(),
@@ -230,6 +254,10 @@ impl KgPack {
                         "failed": error_list.len(),
                         "errors": error_list,
                     });
+                    if !entity_type_normalized.is_empty() {
+                        resp["entity_type_normalized"] =
+                            serde_json::Value::Array(entity_type_normalized);
+                    }
                     if verbose {
                         resp["entities"] = serde_json::Value::Array(
                             results.into_iter().filter(|v| !v.is_null()).collect(),
@@ -369,6 +397,10 @@ impl KgPack {
                 let tags = p.tags.unwrap_or_default();
                 let validated_type =
                     validate_entity_type(&canonical, p.entity_type.as_deref(), registry)?;
+                let entity_type_normalized = describe_entity_type_normalization(
+                    p.entity_type.as_deref(),
+                    validated_type.as_deref(),
+                );
                 let (entity, embedding_report) = self
                     .runtime
                     .create_entity_with_embedding_report(
@@ -382,11 +414,13 @@ impl KgPack {
                     )
                     .await?;
                 let id = entity.id;
-                (
-                    normalize_entity_timestamps(to_json(&entity)?),
-                    id,
-                    embedding_report.any_truncated(),
-                )
+                let mut entity_json = normalize_entity_timestamps(to_json(&entity)?);
+                if let Some(applied) = entity_type_normalized {
+                    if let Some(obj) = entity_json.as_object_mut() {
+                        obj.insert("entity_type_normalized".to_string(), applied);
+                    }
+                }
+                (entity_json, id, embedding_report.any_truncated())
             }
             "note" => {
                 let canonical = sub_kind

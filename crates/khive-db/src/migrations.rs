@@ -144,6 +144,8 @@ const V19_UP: &str = include_str!("../sql/019-list-cursor-backfill-repair.sql");
 
 const V20_UP: &str = include_str!("../sql/020-blob-gc-claims.sql");
 
+const V22_UP: &str = include_str!("../sql/022-notes-unread-probe-recipient.sql");
+
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
 const V21_ATTACHMENT_FENCES_UP: &str = include_str!("../sql/021-attachments-b-claim-fences.sql");
@@ -303,6 +305,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         // The runner special-cases it below; exposing the stage DDL here keeps
         // the ledger entry self-describing for migration inspection tooling.
         up: V21_STAGE_UP,
+    },
+    VersionedMigration {
+        version: 22,
+        name: "notes_unread_probe_recipient",
+        up: V22_UP,
     },
 ];
 
