@@ -205,6 +205,104 @@ impl PackRuntime for AlphaPack {
     }
 }
 
+/// Cross-pack name probe for the khive#2217 effect census. The handlers are
+/// deliberately no-ops: this test exercises the registry's reviewed
+/// name/category classification under a forced audit refusal, not the real
+/// packs' domain behavior (which the source census audits separately).
+struct CrossPackCensusProbe;
+
+impl Pack for CrossPackCensusProbe {
+    const NAME: &'static str = "cross-pack-census-probe";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[
+        HandlerDef {
+            name: "gtd.tasks",
+            description: "reported side-effect-free GTD read",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "gtd.next",
+            description: "reported side-effect-free GTD read",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "comm.inbox",
+            description: "reported side-effect-free comm read",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "memory.recall",
+            description: "Assertive handler with serve-accounting writes",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "db_diagnostics",
+            description: "Assertive handler with PASSIVE checkpoint I/O",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "knowledge.search",
+            description: "Assertive handler with ANN maintenance",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "knowledge.suggest",
+            description: "Assertive handler with ANN maintenance",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "knowledge.compose",
+            description: "Assertive handler that can invoke ANN maintenance",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+    ];
+}
+
+#[async_trait]
+impl PackRuntime for CrossPackCensusProbe {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+    fn note_kinds(&self) -> &'static [&'static str] {
+        Self::NOTE_KINDS
+    }
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        Self::ENTITY_KINDS
+    }
+    fn handlers(&self) -> &'static [HandlerDef] {
+        Self::HANDLERS
+    }
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: Value,
+        _registry: &khive_runtime::pack::VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        Ok(serde_json::json!({
+            "pack": "cross-pack-census-probe",
+            "verb": verb,
+        }))
+    }
+}
+
 fn mk_event(verb: &str) -> Event {
     Event::new(
         "local",
@@ -233,9 +331,9 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
     }
 }
 
-// Both tests in this file arm `fault_injection`'s process-global
+// Every test in this file arms `fault_injection`'s process-global
 // `SUPERVISOR_SLEEP_BEFORE_SPAWN` flag; running them concurrently races one
-// test's arm against the other's supervisor loop consuming it.
+// test's arm against another supervisor loop consuming it.
 #[serial]
 #[tokio::test]
 async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
@@ -357,6 +455,115 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
             .writer_contention
             .audit_admission_unresolved_obligations,
         Some(audit_admission_unresolved_obligation_count()),
+    );
+
+    drop(occupant);
+    drop(filler);
+}
+
+/// khive#2217: the three read names observed live must all survive a forced
+/// `QueueAdmissionExhausted` outcome, while Assertive handlers whose nominal
+/// read path has an incidental durable/accounting effect stay fail-closed.
+/// The negative half prevents a category-only widening from passing.
+#[serial]
+#[tokio::test]
+async fn reported_cross_pack_reads_degrade_while_incidental_assertives_stay_strict() {
+    let store = Arc::new(MemoryEventStore::default());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(CrossPackCensusProbe);
+    builder.with_event_store(store);
+    builder.with_audit_batch_config(AuditBatchConfig {
+        max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("registry builds");
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("event store configured, so the batch seam is too");
+
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let occupant_batch = audit_batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("census.occupant"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snap = audit_batch.test_snapshot();
+        snap.pending_rows == 0 && snap.in_flight_generation.is_some()
+    })
+    .await;
+
+    let filler_batch = audit_batch.clone();
+    let filler = tokio::spawn(async move {
+        filler_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("census.filler"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        audit_batch.test_snapshot().pending_rows == 1
+    })
+    .await;
+
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
+    for verb in ["gtd.tasks", "gtd.next", "comm.inbox"] {
+        let result = registry
+            .dispatch(verb, Value::Null)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{verb} must survive forced audit admission refusal: {error}")
+            });
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "pack": "cross-pack-census-probe",
+                "verb": verb,
+            })
+        );
+    }
+    assert_eq!(
+        audit_admission_refused_obligation_count(),
+        before_refused + 3,
+        "each reported read's refused audit row must take the counted degradation path"
+    );
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved,
+        "forced queue refusal must not move the deadline-expiry counter"
+    );
+
+    for verb in [
+        "memory.recall",
+        "db_diagnostics",
+        "knowledge.search",
+        "knowledge.suggest",
+        "knowledge.compose",
+    ] {
+        let error = match registry.dispatch(verb, Value::Null).await {
+            Ok(result) => panic!(
+                "{verb} must stay fail-closed under forced audit admission refusal; \
+                 unexpected result: {result}"
+            ),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("audit obligation commit failed")
+                && message.contains("QueueAdmissionExhausted"),
+            "{verb} must fail for the saturated audit obligation, got: {message}"
+        );
+    }
+    assert_eq!(
+        audit_admission_refused_obligation_count(),
+        before_refused + 3,
+        "excluded Assertive handlers must not increment admission-degrade counters"
     );
 
     drop(occupant);

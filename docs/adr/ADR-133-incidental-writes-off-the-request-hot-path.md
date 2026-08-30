@@ -619,7 +619,8 @@ it would change what usage gets accounted.
 
 ## Amendment 1 (2026-08-26): A Named, Bounded Exception to D4/INV-1 for Admission-Pressure Reads
 
-**Status**: Accepted, implemented alongside PR #2228 (khive#2147/khive#2217/khive#2208).
+**Status**: Accepted, implemented alongside PR #2228 and extended across the reviewed
+cross-pack Assertive surface for khive#2217 (khive#2147/khive#2208).
 
 D2 states: _"A dispatch must not report success when the record that accounts for, authorizes, or
 audits it did not commit"_ (`ADR-133:297-298`), and D4/INV-1 states the same as a system-wide
@@ -628,7 +629,7 @@ once: never dropped, never volatile at return, never falsely acknowledged, never
 (`ADR-133:436-438`), with failure mode 3 named explicitly as _"**Falsely acknowledged** — the
 operation reports success when the record did not commit"_ (`ADR-133:375`).
 
-This amendment qualifies both sentences for one narrow, named case: the eleven read verbs on
+This amendment qualifies both sentences for one narrow, named case: the 39 reviewed read verbs on
 `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` (`crates/khive-runtime/src/pack.rs`; the full list and
 rationale are in ADR-103 Amendment 3), and only when the row's own commit did not resolve before
 the dispatch returned because the audit lane's admission was transiently exhausted or the caller's
@@ -671,7 +672,7 @@ loss from an unresolved one — see ADR-103 Amendment 3.
 **What does not change:** D4/INV-1 continues to hold without qualification for every write, every
 non-allowlisted Assertive handler, gate-denial rows, unknown-verb rows, and `git.digest` receipts.
 D2's "must not report success" sentence is unqualified for a persistent commit failure on any row,
-including the eleven allowlisted verbs — the exception is admission pressure specifically, not
+including the 39 allowlisted verbs — the exception is admission pressure specifically, not
 store failure generally.
 
 This amendment does not revisit "Split the audit row so accounting lives in its own record" from

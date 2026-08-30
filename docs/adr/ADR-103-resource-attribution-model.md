@@ -900,7 +900,8 @@ accepted placement for future implementation, not a shipped operator knob.
 
 ## Amendment 3 (2026-08-26): Admission-Pressure Read-Cost Undercount for an Explicit Allowlist
 
-**Status**: Accepted, implemented alongside PR #2228 (khive#2147/khive#2217/khive#2208).
+**Status**: Accepted, implemented alongside PR #2228 and extended across the reviewed
+cross-pack Assertive surface for khive#2217 (khive#2147/khive#2208).
 
 Decision (b) established that accounting rides the per-dispatch audit row: `resource.cost_unit`
 lives in the same `EventKind::Audit` row the dispatch's own audit obligation writes
@@ -914,13 +915,33 @@ itself, for a fixed, named set of read verbs.
 Under audit-lane admission pressure — `AuditTerminalReason::QueueAdmissionExhausted` (the row was
 refused before it could be enqueued) or `AuditTerminalReason::AdmissionDeadlineExpired` (the
 caller's bounded wait for the row's commit elapsed while the row was still pending or in-flight) —
-the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`
-(`crates/khive-runtime/src/pack.rs`: `get`, `list`, `stats`, `search`, `neighbors`, `traverse`,
-`context`, `query`, `resolve`, `whoami`, `verbs`) may be dropped best-effort instead of failing the
-dispatch. The caller still receives the read's successful result.
+the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` may be
+dropped best-effort instead of failing the dispatch. The caller still receives the read's
+successful result. The fixed, reviewed set currently contains 39 verbs, grouped by owning pack:
+
+- agent: `agent.observe`;
+- blob: `blob.get`, `blob.stat`;
+- brain: `brain.event_counts`, `brain.profiles`, `brain.profile`, `brain.resolve`,
+  `brain.bindings`;
+- comm: `comm.delivered`, `comm.inbox`, `comm.unread`, `comm.thread`, `comm.health`,
+  `comm.probe`;
+- gtd: `gtd.next`, `gtd.tasks`;
+- kg: `get`, `list`, `stats`, `search`, `neighbors`, `traverse`, `context`, `query`,
+  `resolve`, `whoami`, `verbs`;
+- knowledge: `knowledge.get`, `knowledge.list`, `knowledge.stats`, `knowledge.fold`,
+  `knowledge.topic`;
+- moodboard: `moodboard.model`, `moodboard.search`, `moodboard.preference`;
+- schedule: `schedule.agenda`;
+- session: `session.list`, `session.resume`, `session.export`.
+
+The cross-pack source census classifies every current public Assertive handler exactly once.
+`memory.recall` (serve-ledger/accounting writes), `db_diagnostics` (PASSIVE checkpoint I/O), and
+`knowledge.search` / `knowledge.suggest` / `knowledge.compose` (persistent ANN
+consumer/checkpoint maintenance) remain explicitly fail-closed. A new Assertive handler is not
+eligible until its side effects are reviewed and the closed census is updated.
 
 **Consequence, stated precisely:** `brain.event_counts`'s `total_cost_unit` and
-`cost_unit_by_verb` aggregation (Amendment 1) undercount those eleven verbs by the `cost_unit` of
+`cost_unit_by_verb` aggregation (Amendment 1) undercount those 39 verbs by the `cost_unit` of
 every row dropped this way — but the two terminal reasons above are not the same fact, and
 conflating them into one counter would report a number no operator could act on:
 

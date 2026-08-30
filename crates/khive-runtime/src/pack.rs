@@ -1482,14 +1482,17 @@ impl VerbRegistry {
     /// (khive#2147/khive#2217). `VerbCategory::Assertive` alone is NOT a
     /// sound proxy for "safe to drop this dispatch's own audit row under
     /// audit-lane admission pressure": several Assertive handlers have
-    /// their own accounting-bearing side effects. Two known examples,
-    /// deliberately excluded here:
+    /// their own durable or accounting-bearing side effects. The reviewed
+    /// exclusions are:
     /// - `memory.recall` dispatches `brain.record_serve` as a background
     ///   write; degrading `memory.recall`'s row raises the risk that a
     ///   serve goes unaccounted for if the ledger dispatch itself later
     ///   also races admission pressure.
     /// - `db_diagnostics` may backfill WAL frames via a PASSIVE checkpoint
     ///   probe — physical I/O, not a pure in-memory read.
+    /// - `knowledge.search`, `knowledge.suggest`, and auto
+    ///   `knowledge.compose` may start persistent ANN consumer/checkpoint
+    ///   maintenance from their nominal read path.
     ///
     /// What membership here means, precisely: the verb performs no domain
     /// mutation, so its OWN per-dispatch audit/accounting row may be dropped
@@ -1502,14 +1505,37 @@ impl VerbRegistry {
     /// commit or fail on their own terms, unaffected by whether this
     /// dispatch's own audit row degrades.
     ///
-    /// Every entry here MUST be declared `VerbCategory::Assertive` in
-    /// `khive-pack-kg/src/handler_defs.rs` — enforced by the
-    /// `admission_degrade_safe_verbs_are_registered_assertive` census test
-    /// below, which re-derives the classification from that file's live
-    /// source rather than trusting this list's own claim. Adding a verb
-    /// from a different pack requires extending that test's source scan,
-    /// not just this list.
+    /// Every entry here MUST be declared `VerbCategory::Assertive` in its
+    /// pack's live vocabulary. The
+    /// `admission_degrade_safe_assertive_census_matches_live_pack_sources`
+    /// test below scans every pack that currently declares public Assertive
+    /// handlers and requires every such handler to be classified exactly
+    /// once as safe or as a known incidental writer. A new Assertive verb
+    /// therefore fails closed both at runtime and in the source census until
+    /// it receives an explicit side-effect review.
     const ADMISSION_DEGRADE_SAFE_VERBS: &'static [&'static str] = &[
+        // agent
+        "agent.observe",
+        // blob
+        "blob.get",
+        "blob.stat",
+        // brain
+        "brain.event_counts",
+        "brain.profiles",
+        "brain.profile",
+        "brain.resolve",
+        "brain.bindings",
+        // comm
+        "comm.delivered",
+        "comm.inbox",
+        "comm.unread",
+        "comm.thread",
+        "comm.health",
+        "comm.probe",
+        // gtd
+        "gtd.next",
+        "gtd.tasks",
+        // kg
         "get",
         "list",
         "stats",
@@ -1521,6 +1547,22 @@ impl VerbRegistry {
         "resolve",
         "whoami",
         "verbs",
+        // knowledge (ANN-maintaining search/suggest/compose are excluded)
+        "knowledge.get",
+        "knowledge.list",
+        "knowledge.stats",
+        "knowledge.fold",
+        "knowledge.topic",
+        // moodboard
+        "moodboard.model",
+        "moodboard.search",
+        "moodboard.preference",
+        // schedule
+        "schedule.agenda",
+        // session
+        "session.list",
+        "session.resume",
+        "session.export",
     ];
 
     /// Whether `verb` is both declared [`VerbCategory::Assertive`] (the
@@ -4000,30 +4042,34 @@ pub(crate) mod tests {
     use crate::ActorRef;
     use khive_types::Pack;
 
-    /// Verbs known, by prior review (khive#2147/khive#2217 round 1), to have
-    /// their own accounting-bearing side effect despite being declared
+    /// Verbs known, by cross-pack source review (khive#2147/khive#2217), to have
+    /// their own durable or accounting-bearing side effect despite being declared
     /// `VerbCategory::Assertive` — see [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s
     /// doc for why each is excluded. `VerbCategory::Assertive` alone cannot
     /// distinguish these from a genuinely side-effect-free read (that is the
     /// whole reason the allowlist exists instead of a bare category check),
     /// so this denylist is the mechanizable guard against silently
     /// reintroducing one of them: a category-only census would stay green if
-    /// either name were re-added to the allowlist.
-    const KNOWN_INCIDENTAL_WRITE_VERBS: &[&str] = &["memory.recall", "db_diagnostics"];
+    /// any name were re-added to the allowlist.
+    const KNOWN_INCIDENTAL_WRITE_VERBS: &[&str] = &[
+        "db_diagnostics",
+        "knowledge.compose",
+        "knowledge.search",
+        "knowledge.suggest",
+        "memory.recall",
+    ];
 
     /// khive-runtime links no real pack crates in its own test binary (see
     /// the comment on `CommProbeFactory` below), so
     /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`] cannot be checked
-    /// against a live registered `HandlerDef` here. Instead this
-    /// re-derives each opted-in verb's classification from
-    /// `khive-pack-kg/src/handler_defs.rs`'s live source — the same
-    /// fail-closed pattern as `adr133_writer_census.rs`'s
-    /// `reclassify_from_live_source`. Every entry in the allowlist is
-    /// currently declared in that one file; a verb from a different pack
-    /// would need this scan extended to that pack's source first.
+    /// against a live registered `HandlerDef` here. Instead this re-derives
+    /// the complete public Assertive surface from each owning pack's live
+    /// source — the same fail-closed pattern as `adr133_writer_census.rs`'s
+    /// `reclassify_from_live_source`.
     ///
-    /// This test proves category membership (`VerbCategory::Assertive`) and
-    /// non-membership in [`KNOWN_INCIDENTAL_WRITE_VERBS`]. It does NOT prove
+    /// This test proves category membership (`VerbCategory::Assertive`),
+    /// non-membership in [`KNOWN_INCIDENTAL_WRITE_VERBS`], and exhaustive
+    /// classification of every currently public Assertive handler. It does NOT prove
     /// general effect-purity: an Assertive handler may still emit its own
     /// observability/config events on an independent, best-effort background
     /// path (`search`'s `SearchExecuted` telemetry, `context`'s one-time
@@ -4033,56 +4079,136 @@ pub(crate) mod tests {
     /// dispatch's own audit row. Proving general effect-purity would require
     /// an explicit per-handler effect/accounting capability tag, which is
     /// out of scope here (see ADR-103 Amendment 3's "why this is accepted"
-    /// section); this census instead locks down the two properties that are
-    /// mechanizable today: declared category, and the one known-bad-name
-    /// regression class.
+    /// section); this census instead locks down the properties that are
+    /// mechanizable today: declared category and an exhaustive, reviewed
+    /// safe-versus-incidental classification.
     #[test]
-    fn admission_degrade_safe_verbs_are_registered_assertive() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../khive-pack-kg/src/handler_defs.rs"
-        );
-        let source =
-            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+    fn admission_degrade_safe_assertive_census_matches_live_pack_sources() {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::{Path, PathBuf};
 
-        for verb in VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS {
-            assert!(
-                !KNOWN_INCIDENTAL_WRITE_VERBS.contains(verb),
-                "admission-degrade-safe verb {verb:?} is a known incidental-write verb \
-                 (khive#2147/khive#2217 round 1); it must not be re-added to \
-                 ADMISSION_DEGRADE_SAFE_VERBS even though it is VerbCategory::Assertive"
-            );
-            // Anchored to exactly 8 leading spaces: that is the indentation
-            // `HandlerDef { name: ... }` top-level fields use in this file,
-            // versus 16 for a nested `ParamDef { name: ... }` — several
-            // handlers (e.g. `search`) declare a `query`/`kind`/... param
-            // whose own `name:` field would otherwise collide with a verb
-            // of the same name declared later in the file.
-            let needle = format!("\n        name: \"{verb}\",");
-            let name_pos = source.find(&needle).unwrap_or_else(|| {
-                panic!(
-                    "admission-degrade-safe verb {verb:?} has no top-level `HandlerDef` in \
-                     khive-pack-kg/src/handler_defs.rs; update the allowlist or this \
-                     census's source path"
-                )
+        fn collect_rust_sources(dir: &Path, sources: &mut Vec<PathBuf>) {
+            let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+                panic!("failed to read source directory {}: {e}", dir.display())
             });
-            // Each `HandlerDef` literal in this file declares `category:`
-            // shortly after `name:`, well before the next handler's own
-            // `name:` field — bound the scan to the text up to the next
-            // `HandlerDef {` (or EOF) so a later handler's category can
-            // never be misattributed to this one.
-            let block_end = source[name_pos..]
-                .find("HandlerDef {")
-                .map(|offset| name_pos + offset)
-                .unwrap_or(source.len());
-            let block = &source[name_pos..block_end];
-            assert!(
-                block.contains("VerbCategory::Assertive"),
-                "admission-degrade-safe verb {verb:?} is declared in \
-                 khive-pack-kg/src/handler_defs.rs but is not VerbCategory::Assertive; \
-                 admission degradation must not silently apply to a write-capable verb"
-            );
+            for entry in entries {
+                let entry = entry.unwrap_or_else(|e| {
+                    panic!("failed to read entry under {}: {e}", dir.display())
+                });
+                let path = entry.path();
+                let file_type = entry.file_type().unwrap_or_else(|e| {
+                    panic!("failed to stat source entry {}: {e}", path.display())
+                });
+                if file_type.is_dir() {
+                    collect_rust_sources(&path, sources);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    sources.push(path);
+                }
+            }
         }
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates_dir = manifest_dir
+            .parent()
+            .expect("khive-runtime manifest must live under the workspace crates directory");
+        let mut handler_sources = Vec::new();
+        let crate_entries = std::fs::read_dir(crates_dir).unwrap_or_else(|e| {
+            panic!(
+                "failed to enumerate pack crates under {}: {e}",
+                crates_dir.display()
+            )
+        });
+        for entry in crate_entries {
+            let entry = entry.unwrap_or_else(|e| {
+                panic!("failed to read entry under {}: {e}", crates_dir.display())
+            });
+            if !entry
+                .file_type()
+                .unwrap_or_else(|e| {
+                    panic!("failed to stat crate entry {}: {e}", entry.path().display())
+                })
+                .is_dir()
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("khive-pack-")
+            {
+                continue;
+            }
+            collect_rust_sources(&entry.path().join("src"), &mut handler_sources);
+        }
+        handler_sources.sort_unstable();
+        assert!(
+            !handler_sources.is_empty(),
+            "cross-pack Assertive census found no pack source files"
+        );
+
+        let mut live_assertive = BTreeMap::<String, String>::new();
+        for path in handler_sources {
+            let relative_path = path
+                .strip_prefix(crates_dir)
+                .expect("pack source must be inside the workspace crates directory")
+                .display()
+                .to_string();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+
+            // Exactly four spaces identify array-level `HandlerDef` literals;
+            // their fields then have exactly eight. Nested `ParamDef` literals
+            // use deeper indentation and cannot be mistaken for handler names.
+            for block in source.split("\n    HandlerDef {").skip(1) {
+                let name = block.lines().find_map(|line| {
+                    line.strip_prefix("        name: \"")
+                        .and_then(|rest| rest.strip_suffix("\","))
+                });
+                let visibility = block
+                    .lines()
+                    .find_map(|line| line.strip_prefix("        visibility: "));
+                let category = block
+                    .lines()
+                    .find_map(|line| line.strip_prefix("        category: "));
+                let (Some(name), Some(visibility), Some(category)) = (name, visibility, category)
+                else {
+                    continue;
+                };
+                if !visibility.contains("Visibility::Verb")
+                    || !category.contains("VerbCategory::Assertive")
+                {
+                    continue;
+                }
+
+                let prior = live_assertive.insert(name.to_string(), relative_path.clone());
+                assert!(
+                    prior.is_none(),
+                    "public Assertive verb {name:?} is declared in both {prior:?} and \
+                     {relative_path}; the registry surface must remain collision-free"
+                );
+            }
+        }
+
+        let safe: BTreeSet<&str> = VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            safe.len(),
+            VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS.len(),
+            "ADMISSION_DEGRADE_SAFE_VERBS contains duplicate names"
+        );
+        let incidental: BTreeSet<&str> = KNOWN_INCIDENTAL_WRITE_VERBS.iter().copied().collect();
+        assert!(
+            safe.is_disjoint(&incidental),
+            "a public Assertive verb cannot be both admission-degrade-safe and an incidental writer: {:?}",
+            safe.intersection(&incidental).collect::<Vec<_>>()
+        );
+
+        let classified: BTreeSet<&str> = safe.union(&incidental).copied().collect();
+        let live: BTreeSet<&str> = live_assertive.keys().map(String::as_str).collect();
+        assert_eq!(
+            classified, live,
+            "every public Assertive handler must be classified exactly once after a live-source \
+             effect review; live declarations: {live_assertive:#?}"
+        );
     }
 
     static COMM_PROBE_GRANTED: std::sync::atomic::AtomicBool =

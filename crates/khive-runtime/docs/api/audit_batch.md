@@ -65,11 +65,13 @@ are terminal for the generation, not retried.
 `DispatchObligation` row produced by a verb that is both `VerbCategory::Assertive` AND explicitly
 opted in via `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` (an explicit, fail-closed allowlist —
 `Assertive` alone is not a sound proxy, since some Assertive handlers have their own
-accounting-bearing side effects; see that constant's doc comment), either reason degrades to
-best-effort instead of failing the dispatch — the read performed no domain write, so discarding
-its already-computed result to protect an obligation it does not need as strictly as a write does
-inverts the point of serving it (khive#2147, khive#2217). Every other obligation failure, and
-every failure for a non-opted-in verb, is unaffected — write-side hard-fail semantics are
+durable or accounting-bearing side effects; see that constant's doc comment), either reason
+degrades to best-effort instead of failing the dispatch — the read performed no domain write, so
+discarding its already-computed result to protect an obligation it does not need as strictly as a
+write does inverts the point of serving it (khive#2147, khive#2217). A closed live-source census
+classifies every public Assertive handler as either allowlisted or an incidental-effect exclusion,
+so newly added Assertive verbs remain fail-closed until reviewed. Every other obligation failure,
+and every failure for a non-opted-in verb, is unaffected — write-side hard-fail semantics are
 unchanged.
 
 ## Supervision and failure ownership (owner ruling R1)
