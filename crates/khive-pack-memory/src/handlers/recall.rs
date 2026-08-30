@@ -1866,9 +1866,9 @@ mod tests {
              error with {{:?}} formatting, got: {reason:?}"
         );
 
-        // Arm 2 — bounded-wait timeout: a cold model (no index ever ensured)
-        // with a near-zero readiness wait expires the bounded wait and
-        // degrades to FTS-only with the timeout recorded as the reason.
+        // Arm 2 — bounded-wait timeout: hold the cold model's real detached
+        // ensure task unresolved so the receiver cannot win the timeout race.
+        let build_hook = super::super::common::retrieval_failpoints::hold_ann_build(COLD_MODEL);
         let outcome2 = super::super::common::collect_model_ann_hits(
             &rt,
             &ann,
@@ -1884,6 +1884,20 @@ mod tests {
         )
         .await
         .expect("the wrapper must degrade to FTS-only, never propagate a retrieval failure");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_hook.wait_entered(),
+        )
+        .await
+        .expect("detached ANN build must reach the test hook");
+        build_hook.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_hook.wait_completed(),
+        )
+        .await
+        .expect("detached ANN build must finish after the hook releases it");
 
         assert!(
             outcome2.degraded,
@@ -1923,6 +1937,7 @@ mod tests {
 
         let pack = MemoryPack::new(rt.clone());
         let ann_handle = pack.ann.clone();
+        let build_hook = super::super::common::retrieval_failpoints::hold_ann_build(MODEL);
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
@@ -1958,20 +1973,25 @@ mod tests {
             );
         }
 
-        // The detached build must keep running after the timed-out recall
-        // returns — poll the ANN cache directly (mirrors ann.rs's own
-        // #812/#844 convergence tests) rather than sleeping a fixed amount.
+        // The detached build must keep running after the timed-out recall.
+        // Its test-only completion signal is the pass condition; the outer
+        // timeout is only a hang failsafe.
         let key = crate::ann::AnnKey::new(MODEL);
-        let mut warmed = false;
-        for _ in 0..300 {
-            if crate::ann::is_current(&ann_handle, &key).await {
-                warmed = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_hook.wait_entered(),
+        )
+        .await
+        .expect("detached ANN build must reach the test hook");
+        build_hook.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_hook.wait_completed(),
+        )
+        .await
+        .expect("detached ANN build must finish after the hook releases it");
         assert!(
-            warmed,
+            crate::ann::is_current(&ann_handle, &key).await,
             "the detached build must eventually install a fresh ANN index for \
              {MODEL} instead of being dropped on timeout (#836)"
         );
