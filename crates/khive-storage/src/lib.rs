@@ -58,6 +58,7 @@ pub use types::StorageResult;
 pub use vectors::VectorStore;
 
 pub use types::{
+    BatchWriteError, BatchWriteErrorClass, BatchWriteErrorCount, BatchWriteRetryability,
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
     EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
     IndexRebuildScope, LinkId, MissingEndpoints, NeighborHit, NeighborQuery, OrphanSweepConfig,
@@ -68,8 +69,9 @@ pub use types::{
     TextTermStats, TextTermStatsRequest, TimeRange, TraversalExecutionBudget, TraversalOptions,
     TraversalRequest, VectorIndexKind, VectorMetadataFilter, VectorRecord, VectorSearchHit,
     VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo, DEFAULT_TRAVERSAL_LIMIT,
-    MAX_SPARSE_SEARCH_TOP_K, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS,
-    MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
+    MAX_BATCH_WRITE_ERROR_DETAILS, MAX_BATCH_WRITE_ERROR_MESSAGE_CHARS, MAX_SPARSE_SEARCH_TOP_K,
+    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS,
+    MAX_TRAVERSAL_WORK,
 };
 
 pub use khive_types::{

@@ -11355,8 +11355,7 @@ backend = "kg-backend"
                 Ok(khive_storage::BatchWriteSummary {
                     attempted: n,
                     affected: n,
-                    failed: 0,
-                    first_error: String::new(),
+                    ..khive_storage::BatchWriteSummary::default()
                 })
             }
 

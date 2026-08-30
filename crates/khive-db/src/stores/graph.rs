@@ -10,11 +10,11 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
-    MissingEndpoints, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor,
-    SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget,
-    TraversalOptions, TraversalRequest,
+    BatchWriteErrorClass, BatchWriteRetryability, BatchWriteSummary, DeleteMode,
+    DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage, EdgeSortField, GraphPath,
+    GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome, MissingEndpoints, NeighborHit,
+    NeighborQuery, Page, PageRequest, PathNode, SeekCursor, SeekPage, SortDirection, SortOrder,
+    SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions, TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -1112,8 +1112,7 @@ fn batch_upsert_edges(
     Ok(BatchWriteSummary {
         attempted,
         affected,
-        failed: 0,
-        first_error: String::new(),
+        ..BatchWriteSummary::default()
     })
 }
 
@@ -1197,15 +1196,45 @@ fn batch_upsert_edges_guarded(
             canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
         let missing = edge_endpoints_exist(conn, source_id, target_id)?;
         if missing.any() {
+            let message = format!(
+                "batch entry {index}: edge endpoint no longer exists at write time: source \
+                 {source_id} or target {target_id}"
+            );
+            let mut summary = BatchWriteSummary {
+                attempted,
+                ..BatchWriteSummary::default()
+            };
+            // Preserve the legacy first_error contract even when the bad edge
+            // is not first in input order. The details themselves remain in
+            // input order below.
+            summary.first_error = message.clone();
+            for (failed_index, failed_edge) in edges.iter().enumerate() {
+                let (class, retryability, detail) = if failed_index == index {
+                    (
+                        BatchWriteErrorClass::InvalidInput,
+                        BatchWriteRetryability::Permanent,
+                        message.clone(),
+                    )
+                } else {
+                    (
+                        BatchWriteErrorClass::BatchAborted,
+                        BatchWriteRetryability::Unknown,
+                        format!(
+                            "batch entry {failed_index} was not written because guarded batch \
+                             entry {index} was refused"
+                        ),
+                    )
+                };
+                summary.record_failure(
+                    failed_index,
+                    Some(failed_edge.id.to_string()),
+                    class,
+                    retryability,
+                    detail,
+                );
+            }
             return Ok(GuardedBatchOutcome {
-                summary: BatchWriteSummary {
-                    attempted,
-                    affected: 0,
-                    failed: attempted,
-                    first_error: format!(
-                        "batch entry {index}: edge endpoint no longer exists at write time: source {source_id} or target {target_id}"
-                    ),
-                },
+                summary,
                 refused: Some(GuardedBatchRefusal {
                     entry_index: index,
                     missing,
@@ -1227,8 +1256,7 @@ fn batch_upsert_edges_guarded(
         summary: BatchWriteSummary {
             attempted,
             affected,
-            failed: 0,
-            first_error: String::new(),
+            ..BatchWriteSummary::default()
         },
         refused: None,
     })

@@ -6197,8 +6197,7 @@ pub(crate) mod tests {
             Ok(BatchWriteSummary {
                 attempted,
                 affected,
-                failed: 0,
-                first_error: String::new(),
+                ..BatchWriteSummary::default()
             })
         }
         async fn get_event(&self, id: uuid::Uuid) -> khive_storage::StorageResult<Option<Event>> {
@@ -7311,8 +7310,7 @@ pub(crate) mod tests {
             Ok(BatchWriteSummary {
                 attempted,
                 affected: attempted,
-                failed: 0,
-                first_error: String::new(),
+                ..BatchWriteSummary::default()
             })
         }
         async fn get_event(&self, id: uuid::Uuid) -> khive_storage::StorageResult<Option<Event>> {

@@ -574,9 +574,10 @@ fn batch_upsert_notes(
     notes: &[Note],
     attempted: u64,
 ) -> Result<BatchWriteSummary, rusqlite::Error> {
-    let mut affected = 0u64;
-    let mut failed = 0u64;
-    let mut first_error = String::new();
+    let mut summary = BatchWriteSummary {
+        attempted,
+        ..BatchWriteSummary::default()
+    };
 
     // Prepare the UPSERT once for the whole batch — `Connection::execute`
     // re-parses and re-plans the statement on every call, which dominates
@@ -584,7 +585,7 @@ fn batch_upsert_notes(
     // 50k conflicts; see PR #1082 review).
     let mut stmt = conn.prepare_cached(NOTE_UPSERT_SQL)?;
 
-    for note in notes {
+    for (index, note) in notes.iter().enumerate() {
         let id_str = note.id.to_string();
         let kind_str = note.kind.to_string();
         let status_str = note.status.clone();
@@ -610,23 +611,16 @@ fn batch_upsert_notes(
         ]) {
             Ok(_) => {
                 assign_note_seq(conn, &id_str)?;
-                affected += 1;
+                summary.affected = summary.affected.saturating_add(1);
             }
             Err(e) => {
-                if first_error.is_empty() {
-                    first_error = e.to_string();
-                }
-                failed += 1;
+                let (class, retryability) = super::classify_batch_sqlite_error(&e);
+                summary.record_failure(index, Some(id_str), class, retryability, e.to_string());
             }
         }
     }
 
-    Ok(BatchWriteSummary {
-        attempted,
-        affected,
-        failed,
-        first_error,
-    })
+    Ok(summary)
 }
 
 /// Assign a note id its durable, non-reusing sequence number the first time

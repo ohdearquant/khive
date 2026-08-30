@@ -4112,6 +4112,35 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
         "b (the batch entry's target) must be reported missing"
     );
     assert!(!refusal.missing.source, "a was never deleted");
+    assert_eq!(outcome.summary.failed, 2);
+    assert_eq!(outcome.summary.errors.len(), 2);
+    assert_eq!(outcome.summary.errors[0].item_id, Some(ids[0].to_string()));
+    assert_eq!(outcome.summary.errors[1].item_id, Some(ids[1].to_string()));
+    assert_eq!(
+        outcome.summary.errors[0].class,
+        BatchWriteErrorClass::InvalidInput
+    );
+    assert_eq!(
+        outcome.summary.errors[0].retryability,
+        BatchWriteRetryability::Permanent
+    );
+    assert_eq!(
+        outcome.summary.errors[1].class,
+        BatchWriteErrorClass::BatchAborted
+    );
+    assert_eq!(
+        outcome.summary.errors[1].retryability,
+        BatchWriteRetryability::Unknown
+    );
+    assert_eq!(
+        outcome
+            .summary
+            .error_counts
+            .iter()
+            .map(|count| count.count)
+            .sum::<u64>(),
+        outcome.summary.failed
+    );
 
     for id in ids {
         assert!(
