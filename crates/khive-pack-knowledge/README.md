@@ -73,7 +73,7 @@ let report = reindex_knowledge(&runtime, &token, opts, None, None).await?;
 | `knowledge.search` / `knowledge.suggest` / `knowledge.compose`                    | TF-IDF search, domain suggestion, briefing assembly      |
 | `knowledge.fold`                                                                  | Knapsack selection of scored candidates against a budget |
 | `knowledge.edit`                                                                  | Upsert one atom's sections without wiping the rest       |
-| `knowledge.import`                                                                | Validate/import atlas markdown with stable path identity |
+| `knowledge.import`                                                                | Import atlas markdown with frontmatter/path identity     |
 | `knowledge.challenge` / `knowledge.adjudicate`                                    | Dispute and resolve a section's content                  |
 | `knowledge.learn` / `knowledge.cite` / `knowledge.topic`                          | Register/link/browse `concept` entities                  |
 | `knowledge.feedback`                                                              | Apply per-section signals to posterior weights           |

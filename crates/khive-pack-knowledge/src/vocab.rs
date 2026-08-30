@@ -479,7 +479,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.import",
-        description: "Validate and ingest atlas markdown file(s) with stable path identity",
+        description: "Validate and ingest atlas markdown with canonical-frontmatter or path identity",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -501,7 +501,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "chunk_strategy",
                 param_type: "string",
                 required: false,
-                description: "\"section\" (atom plus parsed section rows, default) or \"atom\" (whole markdown in one atom, no section rows)",
+                description: "\"section\" (atom plus parsed section rows, default) or \"atom\" (post-frontmatter markdown body in one atom, no section rows)",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

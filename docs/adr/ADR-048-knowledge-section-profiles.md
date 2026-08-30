@@ -16,7 +16,7 @@ compose/suggest, hooks, lint, export, and observability phases.
 | Section write-side embedding backfill                         | shipped  | `kkernel reindex` and `knowledge.edit` (inline atom-scoped re-embed) populate `knowledge_sections.embedding` via breadcrumb-enriched embed text (ADR-051 phase 1). Direct section-cosine scoring in `knowledge.search` and `knowledge.compose` is shipped (ADR-051 phase 2). Profile-weighted compose and the Vamana section ANN snapshot remain deferred. |
 | V22 lifecycle/source fields                                   | shipped  | Status/source columns on atoms, status columns on sections/domains, status indexes, and finalized atom backfill to `reviewed`.                                                                                                                                                                                                                             |
 | `knowledge.edit`                                              | shipped  | Upserts sections content-addressed by `content_hash`; identical content is idempotent, distinct content inserts a sibling row, and existing siblings (including verified ones) are left untouched.                                                                                                                                                         |
-| `knowledge.import`                                            | shipped  | Supports bounded, validate-first `atlas_md` file/directory import. Directory identities derive from root-relative paths; `section` creates section rows and `atom` preserves the whole markdown in one atom with no section rows.                                                                                                                          |
+| `knowledge.import`                                            | shipped  | Supports bounded, validate-first `atlas_md` file/directory import. Delimited frontmatter identity takes precedence over the root-relative path fallback; `section` creates section rows and `atom` preserves the markdown body in one atom with no section rows.                                                                                           |
 | `knowledge.challenge` / `knowledge.adjudicate`                | shipped  | Challenge moves eligible sections to `disputed` and increments atom `dispute_count`; adjudicate requires disputed sections and resolves accept -> `verified`, reject -> `reviewed`.                                                                                                                                                                        |
 | Brain section posterior primitives                            | shipped  | Brain state, fold, feedback parsing, and `brain.create_profile(seed_priors.section_posteriors)` exist for section posteriors.                                                                                                                                                                                                                              |
 | `knowledge.suggest` / `knowledge.compose` profile weighting   | deferred | `suggest` is domain-oriented search with optional Vamana signal; `compose` uses explicit `domain_ids`/`atom_ids` and formats atom-body markdown. Neither resolves `brain` profiles or emits section-weighted manifests.                                                                                                                                    |
@@ -779,14 +779,15 @@ Two new verbs support corpus maintenance:
 knowledge.import(
   path="/path/to/atoms/",
   format="atlas_md",      # atlas markdown with ## section headers
-  chunk_strategy="section" # atom plus section rows, or "atom" for byte-exact whole-file content
+  chunk_strategy="section" # atom plus section rows, or "atom" for byte-exact body content
 )
 ```
 
 Parses markdown headings with the atlas section-type normalization map. The path is one `.md`
 file or a bounded directory tree; glob patterns are not part of the shipped wire contract.
-Directory atom identity derives from the root-relative file path as governed by the import
-integrity amendment below.
+Delimited YAML frontmatter may declare the canonical atom identity and metadata; otherwise,
+directory atom identity derives from the root-relative file path. The import amendments below
+govern precedence and collision behavior.
 
 **`knowledge.edit`** — agent-driven atom editing:
 
@@ -1387,10 +1388,11 @@ The chunk strategies have distinct preservation contracts:
 
 - `section` creates one atom per file and eligible section rows. A section shorter than the
   governed 80-character minimum is intentionally omitted and counted in `sections_skipped`.
-- `atom` stores the complete UTF-8 markdown document byte-for-byte as atom content, including
-  boundary whitespace, headings, and section bodies, and creates zero section rows. Parsed
-  headings count as discovered structure, not as skipped sections, because section-row creation
-  was not requested.
+- `atom` stores the UTF-8 markdown body byte-for-byte as atom content, including boundary
+  whitespace, headings, and section bodies, and creates zero section rows. For documents without
+  delimiter-bounded frontmatter, the body is the complete file, preserving the prior whole-file
+  contract. Parsed headings count as discovered structure, not as skipped sections, because
+  section-row creation was not requested.
 
 Successful responses retain `imported_atoms`, `imported_sections`, and `files_processed` and add
 the following counters:
@@ -1406,6 +1408,39 @@ the following counters:
 
 On a successful response, `files_processed` is the number of file-level atom upserts completed;
 it is no longer populated from discovery alone.
+
+## Amendment: Canonical Frontmatter Identity and Body Mapping (2026-08-29)
+
+For `format="atlas_md"`, an optional YAML mapping delimited by a leading `---` line and a closing
+`---` or `...` line is metadata, not atom content. The canonical identity keys are `id`,
+`atlas_id`, and `atlas-id`. They are aliases: every non-null alias present in one document must be
+a non-empty string and all present aliases must agree. A declared identity is normalized with the
+same slug function used for path components and takes precedence over the root-relative path
+fallback. Its original spelling is retained in `properties.atlas_id` and
+`source_uri="atlas:<id>"`. A legacy loose `atlas_id:` line remains a provenance hint for documents
+without delimited frontmatter, but it does not replace their path-derived slug.
+
+Frontmatter maps to an atom as follows:
+
+| Frontmatter field                       | Atom field                                                                              |
+| --------------------------------------- | --------------------------------------------------------------------------------------- |
+| `id`, `atlas_id`, or `atlas-id`         | normalized `slug`; original value in `properties.atlas_id` and `source_uri`             |
+| `name` (falling back to `title`)        | `name`, ahead of the first level-one markdown heading                                   |
+| `tags` string or string array           | `tags`; a string is split on commas                                                     |
+| `properties` mapping                    | merged into `properties`                                                                |
+| any other string-keyed top-level values | retained as structured `properties`; top-level values win over same-named nested values |
+
+Importer-owned `properties.source_path` and canonical `properties.atlas_id` overwrite spoofed
+frontmatter values. Both chunk strategies parse headings and content from the post-frontmatter
+body. In `atom` mode that body is stored byte-for-byte; a document without frontmatter therefore
+remains byte-for-byte compatible with the earlier whole-file contract.
+
+All files are parsed and mapped before any write. Collision detection runs on the final slug after
+frontmatter precedence, so two different sources declaring identities that normalize to the same
+slug reject the entire request and name both paths. Re-importing a canonical ID whose normalized
+slug already exists updates that row and preserves its UUID. If a different live slug in the same
+namespace already claims the normalized identity through `source_uri` or an identity property,
+the request is ambiguous and fails before writes instead of creating a duplicate.
 
 ## References
 

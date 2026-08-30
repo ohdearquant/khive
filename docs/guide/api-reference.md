@@ -1856,22 +1856,25 @@ request(ops="[{\"tool\":\"knowledge.edit\",\"args\":{\"id\":\"rope\",\"sections\
 
 ### `knowledge.import` — Commissive
 
-Validate and ingest atlas markdown file(s) with stable root-relative identity.
+Validate and ingest atlas markdown file(s) with canonical-frontmatter or stable path identity.
 
-| Param            | Type   | Required | Notes                                                                           |
-| ---------------- | ------ | -------- | ------------------------------------------------------------------------------- |
-| `path`           | string | yes      | Filesystem path to a `.md` file or bounded directory tree.                      |
-| `format`         | string | no       | Only `atlas_md` supported (default).                                            |
-| `chunk_strategy` | string | no       | `section` (atom plus section rows) or `atom` (whole markdown, no section rows). |
+| Param            | Type   | Required | Notes                                                                          |
+| ---------------- | ------ | -------- | ------------------------------------------------------------------------------ |
+| `path`           | string | yes      | Filesystem path to a `.md` file or bounded directory tree.                     |
+| `format`         | string | no       | Only `atlas_md` supported (default).                                           |
+| `chunk_strategy` | string | no       | `section` (atom plus section rows) or `atom` (markdown body, no section rows). |
 
 ```
 request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
 ```
 
-Directory slugs use normalized root-relative components joined by `--`; source paths are
-retained in `properties.source_path`. Traversal and source validation complete before writes,
-normalization collisions fail closed, and symlinks are not followed. Root directory symlinks are
-rejected with or without a trailing separator. Entry, depth, and file-limit errors include the
+Leading delimiter-bounded YAML frontmatter is metadata rather than body content. Its agreeing
+`id`/`atlas_id`/`atlas-id` aliases take identity precedence; `name`/`title`, `tags`, nested
+`properties`, and other metadata map into atom fields. Without a canonical ID, directory slugs use
+normalized root-relative components joined by `--`. Source paths are retained in
+`properties.source_path`. Traversal and source validation complete before writes, final-slug and
+existing-identity conflicts fail closed, and symlinks are not followed. Root directory symlinks
+are rejected with or without a trailing separator. Entry, depth, and file-limit errors include the
 exact failing path plus current and configured traversal counts. Successful responses add
 `entries_visited`, `files_discovered`, `files_skipped`, `traversal_errors`, `sections_discovered`,
 and `sections_skipped` to the existing import counters.

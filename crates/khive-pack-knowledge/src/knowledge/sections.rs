@@ -333,7 +333,10 @@ struct PreparedSection {
 #[derive(Debug)]
 struct PreparedImportFile {
     slug: String,
+    source_path: String,
+    canonical_id: Option<String>,
     name: String,
+    tags: Vec<String>,
     atom_content: String,
     properties: serde_json::Map<String, Value>,
     source_uri: String,
@@ -341,6 +344,173 @@ struct PreparedImportFile {
     sections: Vec<PreparedSection>,
     sections_discovered: usize,
     sections_skipped: usize,
+}
+
+#[derive(Debug, Default)]
+struct ImportFrontmatter {
+    canonical_id: Option<String>,
+    name: Option<String>,
+    tags: Vec<String>,
+    properties: serde_json::Map<String, Value>,
+}
+
+fn frontmatter_error(source_path: &str, message: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "invalid YAML frontmatter in import source {source_path:?}: {message}"
+    ))
+}
+
+fn frontmatter_string(
+    value: Option<Value>,
+    field: &str,
+    source_path: &str,
+) -> Result<Option<String>, RuntimeError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(frontmatter_error(
+                    source_path,
+                    format!("{field:?} must not be empty"),
+                ))
+            } else {
+                Ok(Some(value.to_string()))
+            }
+        }
+        Some(_) => Err(frontmatter_error(
+            source_path,
+            format!("{field:?} must be a string or null"),
+        )),
+    }
+}
+
+fn frontmatter_tags(value: Option<Value>, source_path: &str) -> Result<Vec<String>, RuntimeError> {
+    let raw_tags = match value {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(value)) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(Value::Array(values)) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+                Value::String(_) => Err(frontmatter_error(
+                    source_path,
+                    "\"tags\" entries must not be empty",
+                )),
+                _ => Err(frontmatter_error(
+                    source_path,
+                    "\"tags\" entries must be strings",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(frontmatter_error(
+                source_path,
+                "\"tags\" must be a string, an array of strings, or null",
+            ))
+        }
+    };
+
+    Ok(raw_tags)
+}
+
+/// Split delimiter-bounded YAML metadata from a markdown document and map the
+/// canonical fields used by `knowledge.import`. A document without a leading
+/// `---` delimiter has no frontmatter and is returned byte-for-byte.
+fn split_import_frontmatter<'a>(
+    content: &'a str,
+    source_path: &str,
+) -> Result<(ImportFrontmatter, &'a str), RuntimeError> {
+    let mut lines = content.split_inclusive('\n');
+    let Some(first_line) = lines.next() else {
+        return Ok((ImportFrontmatter::default(), content));
+    };
+    let delimiter = first_line.trim_end_matches(['\r', '\n']);
+    if delimiter != "---" {
+        return Ok((ImportFrontmatter::default(), content));
+    }
+
+    let header_start = first_line.len();
+    let mut cursor = header_start;
+    let mut header_end = None;
+    let mut body_start = None;
+    for line in lines {
+        let line_without_ending = line.trim_end_matches(['\r', '\n']);
+        if line_without_ending == "---" || line_without_ending == "..." {
+            header_end = Some(cursor);
+            body_start = Some(cursor + line.len());
+            break;
+        }
+        cursor += line.len();
+    }
+    let (header_end, body_start) = header_end.zip(body_start).ok_or_else(|| {
+        frontmatter_error(source_path, "missing closing `---` or `...` delimiter")
+    })?;
+
+    let header = &content[header_start..header_end];
+    let yaml = if header.trim().is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(header).map_err(|error| frontmatter_error(source_path, error))?;
+        serde_json::to_value(yaml).map_err(|error| frontmatter_error(source_path, error))?
+    };
+    let Value::Object(mut fields) = yaml else {
+        return Err(frontmatter_error(
+            source_path,
+            "the top-level value must be a mapping",
+        ));
+    };
+
+    let mut canonical_id = None;
+    for alias in ["id", "atlas_id", "atlas-id"] {
+        if let Some(value) = frontmatter_string(fields.remove(alias), alias, source_path)? {
+            if let Some(existing) = &canonical_id {
+                if existing != &value {
+                    return Err(frontmatter_error(
+                        source_path,
+                        format!("identity aliases disagree: {existing:?} does not match {value:?}"),
+                    ));
+                }
+            } else {
+                canonical_id = Some(value);
+            }
+        }
+    }
+
+    let explicit_name = frontmatter_string(fields.remove("name"), "name", source_path)?;
+    let title = frontmatter_string(fields.remove("title"), "title", source_path)?;
+    let name = explicit_name.or(title);
+    let tags = frontmatter_tags(fields.remove("tags"), source_path)?;
+    let mut properties = match fields.remove("properties") {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(properties)) => properties,
+        Some(_) => {
+            return Err(frontmatter_error(
+                source_path,
+                "\"properties\" must be a mapping or null",
+            ))
+        }
+    };
+    // Preserve format-specific metadata that has no first-class atom column.
+    // Top-level values win so a concise frontmatter edit predictably updates a
+    // same-named value previously nested under `properties`.
+    properties.extend(fields);
+
+    Ok((
+        ImportFrontmatter {
+            canonical_id,
+            name,
+            tags,
+            properties,
+        },
+        &content[body_start..],
+    ))
 }
 
 /// Open `file` for reading without following a symlink at its final
@@ -442,20 +612,33 @@ fn prepare_import_file(
     total_bytes: &mut u64,
 ) -> Result<PreparedImportFile, RuntimeError> {
     let content = read_import_file(file, &identity.source_path, total_bytes)?;
-    let (atom_name, atom_body, parsed_sections) = parse_atlas_md(&content);
-    let atlas_id = extract_atlas_id(&content);
-    let name = if atom_name.is_empty() {
-        identity
-            .slug
-            .rsplit("--")
-            .next()
-            .unwrap_or(&identity.slug)
-            .replace('-', " ")
+    let (frontmatter, markdown_body) = split_import_frontmatter(&content, &identity.source_path)?;
+    let (atom_name, atom_body, parsed_sections) = parse_atlas_md(markdown_body);
+    let canonical_id = frontmatter.canonical_id;
+    let slug = if let Some(id) = &canonical_id {
+        let slug = to_slug(id);
+        if slug.is_empty() {
+            return Err(frontmatter_error(
+                &identity.source_path,
+                format!("canonical identity {id:?} normalizes to an empty slug"),
+            ));
+        }
+        slug
     } else {
-        atom_name
+        identity.slug
     };
+    // Preserve the pre-frontmatter loose `atlas_id:` hint for provenance, but
+    // only delimiter-bounded identity metadata is authoritative for the slug.
+    let atlas_id = canonical_id.clone().or_else(|| extract_atlas_id(&content));
+    let name = frontmatter.name.unwrap_or_else(|| {
+        if atom_name.is_empty() {
+            slug.rsplit("--").next().unwrap_or(&slug).replace('-', " ")
+        } else {
+            atom_name
+        }
+    });
     let atom_content = if chunk_strategy == "atom" {
-        content
+        markdown_body.to_string()
     } else if atom_body.split_whitespace().count() >= super::util::MIN_ATOM_CONTENT_WORDS {
         atom_body
     } else {
@@ -481,7 +664,7 @@ fn prepare_import_file(
     } else {
         "imported"
     };
-    let mut properties = serde_json::Map::new();
+    let mut properties = frontmatter.properties;
     properties.insert(
         "source_path".to_string(),
         Value::String(identity.source_path.clone()),
@@ -513,16 +696,22 @@ fn prepare_import_file(
         (Vec::new(), 0)
     };
 
-    khive_runtime::secret_gate::check(&identity.slug)?;
+    khive_runtime::secret_gate::check(&slug)?;
     khive_runtime::secret_gate::check(&name)?;
+    khive_runtime::secret_gate::check_tags(&frontmatter.tags)?;
     khive_runtime::secret_gate::check(&atom_content)?;
-    khive_runtime::secret_gate::check_json(&Value::Object(properties.clone()))?;
+    let properties_value = Value::Object(properties.clone());
+    khive_runtime::secret_gate::check_json(&properties_value)?;
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&properties_value))?;
     khive_runtime::secret_gate::check(&source_uri)?;
     khive_runtime::secret_gate::check(source_type)?;
 
     Ok(PreparedImportFile {
-        slug: identity.slug,
+        slug,
+        source_path: identity.source_path,
+        canonical_id,
         name,
+        tags: frontmatter.tags,
         atom_content,
         properties,
         source_uri,
@@ -531,6 +720,100 @@ fn prepare_import_file(
         sections_discovered,
         sections_skipped,
     })
+}
+
+fn existing_atom_identity_keys(row: &khive_storage::types::SqlRow) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    if let Some(source_uri) = row_str(row, "source_uri") {
+        if let Some(id) = source_uri.strip_prefix("atlas:") {
+            identifiers.push(id.to_string());
+        }
+    }
+
+    let properties = match row.get("properties") {
+        Some(SqlValue::Text(properties)) => serde_json::from_str::<Value>(properties).ok(),
+        Some(SqlValue::Json(properties)) => Some(properties.clone()),
+        _ => None,
+    };
+    if let Some(Value::Object(properties)) = properties {
+        for key in ["atlas_id", "atlas-id", "id"] {
+            if let Some(Value::String(id)) = properties.get(key) {
+                identifiers.push(id.clone());
+            }
+        }
+    }
+
+    identifiers
+        .into_iter()
+        .map(|id| to_slug(id.trim()))
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// Reject a canonical identity already claimed by another live slug. Matching
+/// the target slug is the ordinary idempotent update path; a different slug is
+/// ambiguous and must not turn one declared document into a duplicate atom.
+async fn validate_existing_import_identities(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    prepared_files: &[PreparedImportFile],
+) -> Result<(), RuntimeError> {
+    if !prepared_files
+        .iter()
+        .any(|prepared| prepared.canonical_id.is_some())
+    {
+        return Ok(());
+    }
+
+    let namespace = token.namespace().as_str().to_string();
+    let mut reader = runtime
+        .sql()
+        .reader()
+        .await
+        .map_err(|error| sql_err("knowledge.import identity preflight reader", error))?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT slug, source_uri, properties FROM knowledge_atoms \
+                  WHERE namespace = ?1 AND deleted_at IS NULL"
+                .into(),
+            params: vec![SqlValue::Text(namespace)],
+            label: Some("knowledge.import.identity_preflight".into()),
+        })
+        .await
+        .map_err(|error| sql_err("knowledge.import identity preflight", error))?;
+
+    let mut slugs_by_identity: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        let Some(existing_slug) = row_str(row, "slug") else {
+            continue;
+        };
+        for identity in existing_atom_identity_keys(row) {
+            let slugs = slugs_by_identity.entry(identity).or_default();
+            if !slugs.contains(&existing_slug) {
+                slugs.push(existing_slug.clone());
+            }
+        }
+    }
+
+    for prepared in prepared_files {
+        let Some(canonical_id) = &prepared.canonical_id else {
+            continue;
+        };
+        if let Some(existing_slugs) = slugs_by_identity.get(&prepared.slug) {
+            if let Some(existing_slug) = existing_slugs
+                .iter()
+                .find(|existing_slug| *existing_slug != &prepared.slug)
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "canonical import identity {canonical_id:?} in {:?} maps to slug {:?}, \
+                     but existing atom {:?} claims the same identity; refusing to create a duplicate",
+                    prepared.source_path, prepared.slug, existing_slug
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn extract_atlas_id(content: &str) -> Option<String> {
@@ -900,17 +1183,8 @@ impl KnowledgeHandlers {
         };
 
         let mut identities = Vec::with_capacity(discovery.files.len());
-        let mut sources_by_slug = BTreeMap::new();
         for file in &discovery.files {
             let identity = import_source_identity(md_path, file, root_is_file)?;
-            if let Some(previous_source) =
-                sources_by_slug.insert(identity.slug.clone(), identity.source_path.clone())
-            {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "normalized slug collision for {:?}: {:?} and {:?}",
-                    identity.slug, previous_source, identity.source_path
-                )));
-            }
             identities.push((file.clone(), identity));
         }
 
@@ -924,6 +1198,21 @@ impl KnowledgeHandlers {
                 &mut total_bytes,
             )?);
         }
+
+        // Canonical frontmatter identity takes precedence over the path fallback,
+        // so collision validation must run after every file has been parsed.
+        let mut sources_by_slug = BTreeMap::new();
+        for prepared in &prepared_files {
+            if let Some(previous_source) =
+                sources_by_slug.insert(prepared.slug.clone(), prepared.source_path.clone())
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "normalized slug collision for {:?}: {:?} and {:?}",
+                    prepared.slug, previous_source, prepared.source_path
+                )));
+            }
+        }
+        validate_existing_import_identities(runtime, token, &prepared_files).await?;
 
         let sections_discovered = prepared_files
             .iter()
@@ -941,6 +1230,7 @@ impl KnowledgeHandlers {
                 "atoms": [{
                     "slug": prepared.slug,
                     "name": prepared.name,
+                    "tags": prepared.tags,
                     "content": prepared.atom_content,
                     "properties": Value::Object(prepared.properties.clone()),
                     "source_uri": prepared.source_uri,
