@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import json
+import os
 import pathlib
+import subprocess
+import tempfile
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -73,6 +77,53 @@ class BenchTrackWorkflowTests(unittest.TestCase):
         self.assertEqual(len(quick_commands), 1)
         self.assertIn("--benches", quick_commands[0])
         self.assertIn("--criterion-dir crates/target/criterion", workflow)
+
+
+class NpmReleaseWorkflowTests(unittest.TestCase):
+    def test_release_publishes_cli_alias_after_exact_version_umbrella(self):
+        workflow = workflow_text("release.yml")
+
+        self.assertIn("ALIAS_VERSION=$(node -p", workflow)
+        self.assertIn("ALIAS_KHIVE_VERSION=$(node -p", workflow)
+        self.assertIn('if [ "$VERSION" != "$ALIAS_VERSION" ]', workflow)
+        self.assertIn('if [ "$VERSION" != "$ALIAS_KHIVE_VERSION" ]', workflow)
+
+        umbrella_publish = workflow.index("- name: Publish khive (umbrella)")
+        alias_rewrite = workflow.index("- name: Set CLI alias version and khive dependency")
+        alias_publish = workflow.index("- name: Publish @khive-ai/cli (compatibility alias)")
+        self.assertLess(umbrella_publish, alias_rewrite)
+        self.assertLess(alias_rewrite, alias_publish)
+        self.assertIn("working-directory: npm/cli-alias", workflow[alias_publish:])
+
+    def test_local_publish_dry_run_includes_cli_alias_after_umbrella(self):
+        publish_script = REPO_ROOT / "scripts" / "npm-publish.sh"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            npm_stub = pathlib.Path(temp_dir) / "npm"
+            npm_stub.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = view ]; then exit 1; fi\n"
+                "echo \"unexpected npm command: $*\" >&2\n"
+                "exit 97\n"
+            )
+            npm_stub.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{temp_dir}:{env['PATH']}"
+            completed = subprocess.run(
+                ["bash", str(publish_script), "--dry-run"],
+                cwd=REPO_ROOT,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        version = json.loads((REPO_ROOT / "npm" / "package.json").read_text())["version"]
+        umbrella = f"[dry-run] would publish khive@{version}"
+        alias = f"[dry-run] would publish @khive-ai/cli@{version}"
+        self.assertIn(umbrella, completed.stdout)
+        self.assertIn(alias, completed.stdout)
+        self.assertLess(completed.stdout.index(umbrella), completed.stdout.index(alias))
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# Publish khive npm packages: platform binaries + main package.
+# Publish khive npm packages: platform binaries + main package + CLI alias.
 #
 # Usage:
-#   ./npm-publish.sh              # publish all (platform packages first, then main)
+#   ./npm-publish.sh              # publish all (platforms, main, then CLI alias)
 #   ./npm-publish.sh --dry-run    # show what would be published without uploading
 #
 # Prerequisites:
@@ -14,7 +14,8 @@ set -euo pipefail
 #
 # The script publishes platform packages BEFORE the main package because
 # the main package lists them as optionalDependencies — npm resolves them
-# at install time, so they must already exist on the registry.
+# at install time, so they must already exist on the registry. The CLI alias
+# publishes last because it depends on `khive` at the exact same version.
 
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -25,6 +26,16 @@ fi
 cd "$(dirname "$0")/.."
 
 VERSION=$(jq -r .version npm/package.json)
+ALIAS_VERSION=$(jq -r .version npm/cli-alias/package.json)
+ALIAS_KHIVE_VERSION=$(jq -r .dependencies.khive npm/cli-alias/package.json)
+if [[ "$ALIAS_VERSION" != "$VERSION" ]]; then
+    echo "ERROR: npm/cli-alias version ${ALIAS_VERSION} does not match khive ${VERSION}" >&2
+    exit 1
+fi
+if [[ "$ALIAS_KHIVE_VERSION" != "$VERSION" ]]; then
+    echo "ERROR: @khive-ai/cli depends on khive ${ALIAS_KHIVE_VERSION}, expected ${VERSION}" >&2
+    exit 1
+fi
 echo "Publishing khive v${VERSION} to npm..."
 
 # Platform packages — publish each one that has binaries in bin/.
@@ -93,5 +104,20 @@ else
 fi
 
 echo ""
+echo "--- CLI alias ---"
+if npm view "@khive-ai/cli@${VERSION}" version 2>/dev/null | grep -q "${VERSION}"; then
+    echo "  @khive-ai/cli@${VERSION} already on npm — skipping"
+else
+    if $DRY_RUN; then
+        echo "  [dry-run] would publish @khive-ai/cli@${VERSION}"
+    else
+        echo "  Publishing @khive-ai/cli@${VERSION}..."
+        (cd npm/cli-alias && npm publish --access public)
+        echo "  Published @khive-ai/cli@${VERSION}"
+    fi
+fi
+
+echo ""
 echo "=== Done ==="
 echo "Verify: npm view khive@${VERSION}"
+echo "Verify: npm view @khive-ai/cli@${VERSION}"
