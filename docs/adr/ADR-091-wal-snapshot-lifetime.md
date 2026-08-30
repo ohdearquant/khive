@@ -1496,3 +1496,33 @@ Operator controls are `KHIVE_REQUEST_READ_TIMEOUT_SECS` (default 30, valid
 second-stage join bound above). These bound read work and interrupt
 settlement only. They do not change write admission, commit, rollback,
 checkpoint, or TRUNCATE policy.
+
+### 2026-08-30 amendment (Amendment 13): pooled file-backed snapshots
+
+ADR-165 Slice 2 and issues #2024/#1987 replace the ordinary file-backed
+standalone/cached-reader population with the pre-opened reader pool. Every typed
+store read and every ordinary read-only `SqlBridge` operation now owns one
+`ReaderGuard` for exactly its interruptible operation. Returning a guard
+finalizes the statement, clears connection-global read state, restores or
+replaces the connection, and only then returns shared reader admission. There
+is no standalone fallback on saturation. This shrinks the ordinary WAL-pin
+population to the fixed pool and removes idle logical `SqlReader` handles from
+the SQLite connection census entirely.
+
+Amendment 7's explicit transaction rule remains. A caller-requested top-level
+deferred read transaction is the sole request-path standalone-reader exception:
+its standalone connection, admission permit, `tx_registry` span, maximum-age
+guard, and cleanup lifecycle remain one unit until terminal control or
+fail-closed disposal. Boot-time inspection before pool construction and a
+diagnostic that truly requires an independent snapshot are the closed
+infrastructure exceptions. The current PASSIVE diagnostic probe uses its
+separately documented standalone writer because checkpoint backfill is not a
+read-only snapshot.
+
+Pool-scoped diagnostics expose configured and available reader admission,
+pooled versus standalone route counts, separately attributed infrastructure
+opens, admission timeouts, active/peak/completed pooled checkouts, and maximum
+completed pooled hold time. The counters reset with pool reconstruction; point-
+in-time capacity/availability and active values are explicitly not lifetime
+counters. Completed hold time includes reset/replacement, so it measures the
+whole interval during which a checkout could withhold reusable capacity.

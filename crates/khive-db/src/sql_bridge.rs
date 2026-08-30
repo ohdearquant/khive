@@ -1,9 +1,12 @@
 //! SqlAccess bridge: connects `ConnectionPool` to `khive_storage::SqlAccess`.
 //!
 //! Two modes:
-//! - **File-backed**: Opens standalone connections per reader/writer handle under pool-wide caps.
-//!   Cross-statement atomicity goes through `atomic_unit`, which drives a single
-//!   registered raw transaction span rather than a caller-held per-tx connection.
+//! - **File-backed**: ordinary reads check out pooled readers per operation.
+//!   The only standalone-reader exception is an explicitly admitted multi-call
+//!   deferred read transaction; standalone writer handles remain capped at one.
+//!   Cross-statement write atomicity goes through `atomic_unit`, which drives a
+//!   single registered raw transaction span rather than a caller-held per-tx
+//!   connection.
 //! - **Memory**: Uses pool-backed approach (acquire pool connection per-query inside `spawn_blocking`).
 
 use std::any::Any;
@@ -18,7 +21,7 @@ use khive_storage::{AtomicUnitOp, StorageCapability};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::SqliteError;
-use crate::pool::ConnectionPool;
+use crate::pool::{ConnectionPool, StandaloneReaderPurpose};
 
 // =============================================================================
 // Shared helpers
@@ -773,14 +776,36 @@ fn map_rusqlite_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Sql, op, e)
 }
 
-/// How an elapsed handle-slot deadline is classified. ADR-005 pins the
-/// raw-SQL reader admission paths (`sql_bridge.reader_open` and
-/// `sql_bridge.reader_operation`) to `StorageError::Timeout`; every other
-/// handle slot reports the typed `AdmissionTimeout`.
+/// How an elapsed handle-slot deadline is classified. ADR-005 pins the closed
+/// raw-SQL standalone exception (`sql_bridge.reader_open`) and reads on a
+/// standalone writer (`sql_bridge.reader_operation`) to
+/// `StorageError::Timeout`; ordinary reader-pool saturation reports the typed
+/// `AdmissionTimeout` through `ConnectionPool::resolve_reader_checkout`.
 #[derive(Clone, Copy)]
 enum SlotTimeoutClass {
     Admission,
     ReaderContract,
+}
+
+async fn acquire_reader_handle_slot(
+    pool: &ConnectionPool,
+    operation: &'static str,
+    class: SlotTimeoutClass,
+) -> Result<OwnedSemaphorePermit, StorageError> {
+    let result = acquire_handle_slot(
+        pool.sql_bridge_reader_slots(),
+        pool.config().checkout_timeout,
+        operation,
+        class,
+    )
+    .await;
+    if matches!(
+        &result,
+        Err(StorageError::Timeout { .. } | StorageError::AdmissionTimeout { .. })
+    ) {
+        pool.record_reader_admission_timeout();
+    }
+    result
 }
 
 async fn acquire_handle_slot(
@@ -811,7 +836,7 @@ async fn acquire_handle_slot(
 // =============================================================================
 
 fn open_standalone_reader(pool: &ConnectionPool) -> Result<rusqlite::Connection, StorageError> {
-    pool.open_standalone_reader()
+    pool.open_standalone_reader(StandaloneReaderPurpose::ExplicitSqlReadTransaction)
         .map_err(|error| StorageError::driver(StorageCapability::Sql, "open_reader", error))
 }
 
@@ -877,7 +902,7 @@ async fn open_standalone_writer_on_blocking(
 }
 
 // =============================================================================
-// File-backed: SqliteReader (standalone connection)
+// File-backed: pooled SqliteReader with an explicit transaction exception
 // =============================================================================
 
 const CACHED_READ_TRANSACTION_LABEL: &str = "sql_bridge_cached_read_transaction";
@@ -905,10 +930,9 @@ struct CachedReadTransaction {
 struct StandaloneHandle {
     conn: rusqlite::Connection,
     /// Present only for a standalone read-write handle, whose one-permit
-    /// connection budget remains handle-scoped. Read-only connections are
-    /// cached without a retained permit; each ordinary read operation acquires
-    /// the shared permit, while an explicit read transaction retains that
-    /// operation's permit in `read_transaction_slot` until its terminal call.
+    /// connection budget remains handle-scoped. Read-only connections exist
+    /// only for explicit deferred transactions and retain reader admission in
+    /// `read_transaction_slot` until terminal control.
     _retained_slot: Option<OwnedSemaphorePermit>,
     /// Present only while a cached read-only connection owns one explicit
     /// multi-call read transaction. Field order is load-bearing: Rust drops
@@ -931,18 +955,24 @@ impl StandaloneHandle {
 }
 
 struct SqliteReader {
+    /// Present only for the ADR-005/ADR-091 explicitly admitted multi-call
+    /// deferred transaction. Ordinary reads never populate this field and
+    /// route through `ConnectionPool::reader` for each operation.
     handle: Option<StandaloneHandle>,
     pool: Arc<ConnectionPool>,
+    /// Fail-loud compatibility state after a transaction connection could not
+    /// be restored safely. `None` normally means "pooled ordinary route";
+    /// this bit distinguishes that from "exceptional connection consumed".
+    poisoned: bool,
 }
 
-async fn open_cached_reader_handle(
+async fn open_explicit_read_transaction_handle(
     pool: Arc<ConnectionPool>,
 ) -> khive_storage::types::StorageResult<StandaloneHandle> {
     let open_slot = crate::await_request_read_phase(
         "sql_bridge.reader_open",
-        acquire_handle_slot(
-            pool.sql_bridge_reader_slots(),
-            pool.config().checkout_timeout,
+        acquire_reader_handle_slot(
+            &pool,
             "sql_bridge.reader_open",
             SlotTimeoutClass::ReaderContract,
         ),
@@ -961,20 +991,74 @@ async fn open_cached_reader_handle(
     })
 }
 
+impl SqliteReader {
+    /// Select the standalone path only for a live or newly requested explicit
+    /// deferred transaction. `false` means the caller must execute this
+    /// operation through the bounded reader pool.
+    async fn use_explicit_transaction_handle(
+        &mut self,
+        transaction_control: Option<CachedReadTransactionControl>,
+        operation: &'static str,
+    ) -> khive_storage::types::StorageResult<bool> {
+        if self.poisoned {
+            return Err(StorageError::Pool {
+                operation: operation.into(),
+                message: "connection already consumed".into(),
+            });
+        }
+        if self.handle.is_some() {
+            return Ok(true);
+        }
+        match transaction_control {
+            None => Ok(false),
+            Some(CachedReadTransactionControl::BeginDeferred) => {
+                self.handle =
+                    Some(open_explicit_read_transaction_handle(Arc::clone(&self.pool)).await?);
+                Ok(true)
+            }
+            Some(CachedReadTransactionControl::Finish(keyword))
+            | Some(CachedReadTransactionControl::Unsupported(keyword)) => {
+                Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Sql,
+                    operation: operation.into(),
+                    message: format!(
+                        "cached read-only handle has no admitted transaction for transaction \
+                         control ({keyword})"
+                    ),
+                })
+            }
+        }
+    }
+
+    /// A standalone connection exists only for one explicit transaction.
+    /// Close it immediately after a failed BEGIN, COMMIT/ROLLBACK, age
+    /// eviction, or cancellation cleanup restores autocommit. A later
+    /// ordinary query must return to pooled routing instead of silently
+    /// retaining a standalone cache.
+    fn close_inactive_transaction_handle(&mut self) {
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_cached_reader() && !handle.has_read_transaction())
+        {
+            drop(self.handle.take());
+        }
+    }
+}
+
 /// Run one file-backed read while coupling its connection state to the active
 /// reader permit.
 ///
-/// An ordinary cached read is admitted for one call and must return to
-/// autocommit before its permit is released. A successful top-level deferred
-/// `BEGIN` instead moves that operation permit into the handle; subsequent
+/// This path serves only the explicit deferred read-transaction exception and
+/// reader-supertrait calls on a standalone read-write handle. Ordinary
+/// read-only traffic uses [`run_pool_reader_query`]. A successful top-level
+/// deferred `BEGIN` moves its operation permit into the handle; subsequent
 /// reads reuse it until `COMMIT`/`END`/`ROLLBACK` restores autocommit. The
 /// connection is declared before that retained permit, so dropping or
 /// cancelling the handle closes SQLite first and releases admission second.
-/// Standalone read-write handles are exempt from cached-reader transaction
-/// state because their writer permit remains held across legitimate manual
-/// transactions. Their reader-supertrait calls still take ordinary active-read
-/// admission; once the connection is outside autocommit, that acquisition and
-/// the SELECT are completion-preserving rather than request-cancellable.
+/// A standalone writer's reader calls still take active-reader admission; once
+/// its connection is outside autocommit, the acquisition and SELECT are
+/// completion-preserving rather than request-cancellable.
 async fn execute_standalone_read<R, F>(
     handle: &mut Option<StandaloneHandle>,
     pool: Arc<ConnectionPool>,
@@ -1012,9 +1096,8 @@ where
         // reader budget, but request cancellation cannot skip that admission
         // and strand the transaction between statements.
         Some(
-            acquire_handle_slot(
-                pool.sql_bridge_reader_slots(),
-                pool.config().checkout_timeout,
+            acquire_reader_handle_slot(
+                &pool,
                 "sql_bridge.reader_operation",
                 SlotTimeoutClass::ReaderContract,
             )
@@ -1024,9 +1107,8 @@ where
         Some(
             crate::await_request_read_phase(
                 "sql_bridge.reader_operation",
-                acquire_handle_slot(
-                    pool.sql_bridge_reader_slots(),
-                    pool.config().checkout_timeout,
+                acquire_reader_handle_slot(
+                    &pool,
                     "sql_bridge.reader_operation",
                     SlotTimeoutClass::ReaderContract,
                 ),
@@ -1340,7 +1422,27 @@ impl khive_storage::SqlReader for SqliteReader {
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
         let transaction_control = cached_read_transaction_control(&statement.sql);
-        execute_standalone_read(
+        if !self
+            .use_explicit_transaction_handle(transaction_control, "query_row")
+            .await?
+        {
+            return run_pool_reader_query(
+                Arc::clone(&self.pool),
+                "sql_bridge.reader_operation",
+                move |scope, conn| {
+                    execute_query_row_interruptibly(
+                        scope,
+                        conn,
+                        &statement,
+                        "query_row",
+                        false,
+                        true,
+                    )
+                },
+            )
+            .await;
+        }
+        let result = execute_standalone_read(
             &mut self.handle,
             Arc::clone(&self.pool),
             "query_row",
@@ -1356,7 +1458,12 @@ impl khive_storage::SqlReader for SqliteReader {
                 )
             },
         )
-        .await
+        .await;
+        if self.handle.is_none() {
+            self.poisoned = true;
+        }
+        self.close_inactive_transaction_handle();
+        result
     }
 
     async fn query_all(
@@ -1364,7 +1471,20 @@ impl khive_storage::SqlReader for SqliteReader {
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
         let transaction_control = cached_read_transaction_control(&statement.sql);
-        execute_standalone_read(
+        if !self
+            .use_explicit_transaction_handle(transaction_control, "query_all")
+            .await?
+        {
+            return run_pool_reader_query(
+                Arc::clone(&self.pool),
+                "sql_bridge.reader_operation",
+                move |scope, conn| {
+                    execute_query_interruptibly(scope, conn, &statement, "query_all", false, true)
+                },
+            )
+            .await;
+        }
+        let result = execute_standalone_read(
             &mut self.handle,
             Arc::clone(&self.pool),
             "query_all",
@@ -1380,7 +1500,12 @@ impl khive_storage::SqlReader for SqliteReader {
                 )
             },
         )
-        .await
+        .await;
+        if self.handle.is_none() {
+            self.poisoned = true;
+        }
+        self.close_inactive_transaction_handle();
+        result
     }
 
     async fn query_page(
@@ -1389,7 +1514,28 @@ impl khive_storage::SqlReader for SqliteReader {
         page: PageRequest,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
         let transaction_control = cached_read_transaction_control(&statement.sql);
-        execute_standalone_read(
+        if !self
+            .use_explicit_transaction_handle(transaction_control, "query_page")
+            .await?
+        {
+            return run_pool_reader_query(
+                Arc::clone(&self.pool),
+                "sql_bridge.reader_operation",
+                move |scope, conn| {
+                    execute_query_page_interruptibly(
+                        scope,
+                        conn,
+                        &statement,
+                        &page,
+                        "query_page",
+                        false,
+                        true,
+                    )
+                },
+            )
+            .await;
+        }
+        let result = execute_standalone_read(
             &mut self.handle,
             Arc::clone(&self.pool),
             "query_page",
@@ -1406,7 +1552,12 @@ impl khive_storage::SqlReader for SqliteReader {
                 )
             },
         )
-        .await
+        .await;
+        if self.handle.is_none() {
+            self.poisoned = true;
+        }
+        self.close_inactive_transaction_handle();
+        result
     }
 
     async fn query_scalar(
@@ -1437,17 +1588,12 @@ impl khive_storage::SqlReader for SqliteReader {
 struct SqliteWriter {
     /// `None` at construction when a `WriterTaskHandle` was obtained (ADR-136
     /// D1 gate 1: queue-first `writer()` skips the standalone open in that
-    /// case). Lazily opened by [`SqliteWriter::ensure_conn`] on first read
-    /// (`query_row`/`query_all`/`query_page`) — production callers do read
-    /// through a `writer()` handle (e.g. `khive-pack-comm` and
-    /// `khive-pack-gtd`), so the `SqlReader` supertrait's lazy-open path is
-    /// live, not just a capability formality. An eagerly opened read-write
-    /// connection retains its one-permit writer budget for the handle's
-    /// lifetime. A lazily opened read-only connection is cached without a
-    /// permit; every ordinary query acquires one for exactly the blocking
-    /// operation. An explicit deferred read transaction retains its opening
-    /// permit across queries until terminal control. In either state,
-    /// cancellation cannot release admission before SQLite finishes/closes.
+    /// case). Ordinary `SqlReader` supertrait calls then use pooled readers;
+    /// this slot is populated only while such a queue-backed handle owns an
+    /// explicit deferred read transaction. An eagerly opened read-write
+    /// connection (the no-writer-task branch) retains its one-permit writer
+    /// budget for the handle's lifetime and must serve its reads on that same
+    /// connection to preserve manual-transaction visibility.
     handle: Option<StandaloneHandle>,
     /// ADR-067 Component A: when the write queue is enabled, `execute_batch`
     /// routes the whole caller-supplied statement list through the
@@ -1463,41 +1609,48 @@ struct SqliteWriter {
     /// captured at construction so the standalone-path busy/locked mapping
     /// below doesn't need a `&ConnectionPool` reference to report against.
     db: String,
-    /// Needed only for [`Self::ensure_conn`]'s lazy standalone-connection
-    /// open when `handle` was skipped at construction (`writer_task`
-    /// present).
+    /// Reader-pool owner and explicit-transaction exception source.
     pool: Arc<ConnectionPool>,
 }
 
 impl SqliteWriter {
-    /// Return the open handle if present, else lazily open a standalone
-    /// **read-only** handle now. See the `handle` field doc comment for when
-    /// this lazy path is reached — it is only reached from the `SqlReader`
-    /// methods (`query_row`/`query_all`/`query_page`), never from a
-    /// `SqlWriter` method: every `SqlWriter` method on this type either
-    /// routes through `writer_task` (when present, the same condition that
-    /// causes `handle` to start `None`) or uses the writer connection opened
-    /// eagerly at construction (when `writer_task` is absent). Opening a
-    /// read-only connection here (ADR-136 D1 gate 3 amendment) closes the
-    /// gap where a caller holding a queue-backed writer handle could issue
-    /// an `INSERT ... RETURNING` (or any other DML) through `query_row` /
-    /// `query_all` / `query_page` and have it execute on an untracked
-    /// read-write connection, outside the `WriterTask` — SQLite rejects DML
-    /// against a read-only connection instead. The lazy open acquires a
-    /// pool-wide READER permit rather than the one-permit writer budget:
-    /// the connection cannot write, and charging it against the writer
-    /// budget would let a queue-backed handle's reads block standalone
-    /// writers. The reader permit covers the open itself, then each ordinary
-    /// query independently or one admitted explicit read-transaction lifetime.
-    /// Associated function rather than a `&self` method so the caller can
-    /// pass a cloned pool handle and keep no borrow of `SqliteWriter` live
-    /// across the permit await — `&SqliteWriter` is not `Sync` (the held
-    /// `rusqlite::Connection` is not), and the `SqlReader` futures must
-    /// stay `Send`.
-    async fn ensure_conn(
-        pool: Arc<ConnectionPool>,
-    ) -> khive_storage::types::StorageResult<StandaloneHandle> {
-        open_cached_reader_handle(pool).await
+    async fn use_queue_read_transaction_handle(
+        &mut self,
+        transaction_control: Option<CachedReadTransactionControl>,
+        operation: &'static str,
+    ) -> khive_storage::types::StorageResult<bool> {
+        if self.handle.is_some() {
+            return Ok(true);
+        }
+        match transaction_control {
+            None => Ok(false),
+            Some(CachedReadTransactionControl::BeginDeferred) => {
+                self.handle =
+                    Some(open_explicit_read_transaction_handle(Arc::clone(&self.pool)).await?);
+                Ok(true)
+            }
+            Some(CachedReadTransactionControl::Finish(keyword))
+            | Some(CachedReadTransactionControl::Unsupported(keyword)) => {
+                Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Sql,
+                    operation: operation.into(),
+                    message: format!(
+                        "cached read-only handle has no admitted transaction for transaction \
+                         control ({keyword})"
+                    ),
+                })
+            }
+        }
+    }
+
+    fn close_inactive_queue_read_transaction_handle(&mut self) {
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_cached_reader() && !handle.has_read_transaction())
+        {
+            drop(self.handle.take());
+        }
     }
 }
 
@@ -1507,8 +1660,47 @@ impl khive_storage::SqlReader for SqliteWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
-        if self.handle.is_none() && self.writer_task.is_some() {
-            self.handle = Some(Self::ensure_conn(Arc::clone(&self.pool)).await?);
+        if self.writer_task.is_some() {
+            let transaction_control = cached_read_transaction_control(&statement.sql);
+            if !self
+                .use_queue_read_transaction_handle(transaction_control, "writer.query_row")
+                .await?
+            {
+                return run_pool_reader_query(
+                    Arc::clone(&self.pool),
+                    "sql_bridge.reader_operation",
+                    move |scope, conn| {
+                        execute_query_row_interruptibly(
+                            scope,
+                            conn,
+                            &statement,
+                            "writer.query_row",
+                            false,
+                            true,
+                        )
+                    },
+                )
+                .await;
+            }
+            let result = execute_standalone_read(
+                &mut self.handle,
+                Arc::clone(&self.pool),
+                "writer.query_row",
+                transaction_control,
+                move |scope, conn, rollback, interruptible| {
+                    execute_query_row_interruptibly(
+                        scope,
+                        conn,
+                        &statement,
+                        "writer.query_row",
+                        rollback,
+                        interruptible,
+                    )
+                },
+            )
+            .await;
+            self.close_inactive_queue_read_transaction_handle();
+            return result;
         }
         let transaction_control = cached_read_transaction_control(&statement.sql);
         execute_standalone_read(
@@ -1534,8 +1726,47 @@ impl khive_storage::SqlReader for SqliteWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        if self.handle.is_none() && self.writer_task.is_some() {
-            self.handle = Some(Self::ensure_conn(Arc::clone(&self.pool)).await?);
+        if self.writer_task.is_some() {
+            let transaction_control = cached_read_transaction_control(&statement.sql);
+            if !self
+                .use_queue_read_transaction_handle(transaction_control, "writer.query_all")
+                .await?
+            {
+                return run_pool_reader_query(
+                    Arc::clone(&self.pool),
+                    "sql_bridge.reader_operation",
+                    move |scope, conn| {
+                        execute_query_interruptibly(
+                            scope,
+                            conn,
+                            &statement,
+                            "writer.query_all",
+                            false,
+                            true,
+                        )
+                    },
+                )
+                .await;
+            }
+            let result = execute_standalone_read(
+                &mut self.handle,
+                Arc::clone(&self.pool),
+                "writer.query_all",
+                transaction_control,
+                move |scope, conn, rollback, interruptible| {
+                    execute_query_interruptibly(
+                        scope,
+                        conn,
+                        &statement,
+                        "writer.query_all",
+                        rollback,
+                        interruptible,
+                    )
+                },
+            )
+            .await;
+            self.close_inactive_queue_read_transaction_handle();
+            return result;
         }
         let transaction_control = cached_read_transaction_control(&statement.sql);
         execute_standalone_read(
@@ -1562,8 +1793,49 @@ impl khive_storage::SqlReader for SqliteWriter {
         statement: SqlStatement,
         page: PageRequest,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        if self.handle.is_none() && self.writer_task.is_some() {
-            self.handle = Some(Self::ensure_conn(Arc::clone(&self.pool)).await?);
+        if self.writer_task.is_some() {
+            let transaction_control = cached_read_transaction_control(&statement.sql);
+            if !self
+                .use_queue_read_transaction_handle(transaction_control, "writer.query_page")
+                .await?
+            {
+                return run_pool_reader_query(
+                    Arc::clone(&self.pool),
+                    "sql_bridge.reader_operation",
+                    move |scope, conn| {
+                        execute_query_page_interruptibly(
+                            scope,
+                            conn,
+                            &statement,
+                            &page,
+                            "writer.query_page",
+                            false,
+                            true,
+                        )
+                    },
+                )
+                .await;
+            }
+            let result = execute_standalone_read(
+                &mut self.handle,
+                Arc::clone(&self.pool),
+                "writer.query_page",
+                transaction_control,
+                move |scope, conn, rollback, interruptible| {
+                    execute_query_page_interruptibly(
+                        scope,
+                        conn,
+                        &statement,
+                        &page,
+                        "writer.query_page",
+                        rollback,
+                        interruptible,
+                    )
+                },
+            )
+            .await;
+            self.close_inactive_queue_read_transaction_handle();
+            return result;
         }
         let transaction_control = cached_read_transaction_control(&statement.sql);
         execute_standalone_read(
@@ -2390,10 +2662,10 @@ async fn run_manual_atomic_unit(
 /// Bridges `ConnectionPool` to `khive_storage::SqlAccess`.
 ///
 /// Dispatches based on whether the pool is file-backed or in-memory:
-/// - File-backed: cached standalone reader connections with ordinary
-///   operation-scoped admission and explicitly admitted multi-call read
-///   transactions, plus standalone writer connections capped at one live
-///   handle; atomic units drive a single registered raw transaction span.
+/// - File-backed: pooled ordinary reader operations and a lazy standalone
+///   connection only for explicitly admitted multi-call read transactions,
+///   plus standalone writer connections capped at one live handle; atomic
+///   units drive a single registered raw transaction span.
 /// - In-memory: pool-backed connections per query (single shared connection).
 pub struct SqlBridge {
     pool: Arc<ConnectionPool>,
@@ -2421,8 +2693,9 @@ impl khive_storage::SqlAccess for SqlBridge {
     ) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlReader>> {
         if self.is_file_backed {
             Ok(Box::new(SqliteReader {
-                handle: Some(open_cached_reader_handle(Arc::clone(&self.pool)).await?),
+                handle: None,
                 pool: Arc::clone(&self.pool),
+                poisoned: false,
             }))
         } else {
             Ok(Box::new(PoolBackedReader {
@@ -2484,9 +2757,10 @@ impl khive_storage::SqlAccess for SqlBridge {
             // A standalone read-write connection is opened only when there is
             // no queue handle to route writes through — `SqliteWriter`'s
             // `SqlReader` methods (`query_row`/`query_all`/`query_page`)
-            // lazily open a read-only one on first use in the handle-present
-            // case; production callers do read through a `writer()` handle,
-            // so this lazy path is live (see `SqliteWriter::ensure_conn`).
+            // use pooled readers in the queue-backed case and lazily open the
+            // closed standalone exception only for an explicit deferred read
+            // transaction. Production callers do read through a `writer()`
+            // handle, so both routes are live.
             // The standalone open acquires the pool-wide one-permit writer
             // budget first, and the permit travels in the handle for the
             // handle's whole lifetime — a queue-backed handle holds no
@@ -2768,10 +3042,10 @@ mod tests {
             )
             .unwrap();
         let held_reader = pool.reader().expect("hold the sole pooled reader");
-        // Deliberately force the pool-backed bridge over this file pool: the
-        // held guard and `PoolBackedReader::reader_until` then contend for the
-        // exact same one-connection queue (not the standalone semaphore).
-        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+        // Production-shaped file-backed raw-SQL reads must use the same pool
+        // admission as typed stores. Before ADR-165 Slice 2, `reader()` opened
+        // a standalone connection and this held pooled reader was invisible.
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
         let mut waiting_reader = bridge.reader().await.unwrap();
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let waiting = tokio::spawn(crate::scope_request_read_cancellation(
@@ -2849,7 +3123,7 @@ mod tests {
         // and must run `checkout_timeout` to exhaustion — no cancellation.
         let held_reader = pool.reader().expect("hold the sole pooled reader");
 
-        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
         let mut contender = bridge.reader().await.unwrap();
         let blocked = contender
             .query_row(SqlStatement {
@@ -2884,8 +3158,13 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
         let mut reader = SqliteReader {
-            handle: Some(open_cached_reader_handle(Arc::clone(&pool)).await.unwrap()),
+            handle: Some(
+                open_explicit_read_transaction_handle(Arc::clone(&pool))
+                    .await
+                    .unwrap(),
+            ),
             pool: Arc::clone(&pool),
+            poisoned: false,
         };
         let mut contender = bridge.reader().await.unwrap();
         let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3499,6 +3778,140 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(tx_registry)]
+    async fn file_bridge_attributes_ordinary_pool_reads_and_explicit_transaction_exception() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("sql_bridge_reader_routes.db")),
+                max_readers: 1,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut reader = bridge.reader().await.unwrap();
+
+        assert_eq!(
+            pool.reader_acquisition_snapshot(),
+            crate::pool::ReaderAcquisitionSnapshot {
+                reader_admission_capacity: 1,
+                available_reader_admission_slots: 1,
+                ..crate::pool::ReaderAcquisitionSnapshot::default()
+            },
+            "constructing or retaining an idle raw-SQL reader must open nothing"
+        );
+
+        let value = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT 1".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(value, Some(SqlValue::Integer(1))));
+        let ordinary = pool.reader_acquisition_snapshot();
+        assert_eq!(ordinary.pooled_checkouts, 1);
+        assert_eq!(ordinary.completed_pooled_checkouts, 1);
+        assert_eq!(ordinary.standalone_opens, 0);
+
+        reader
+            .query_all(SqlStatement {
+                sql: "BEGIN DEFERRED".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("the documented explicit transaction exception opens");
+        let begun = pool.reader_acquisition_snapshot();
+        assert_eq!(begun.pooled_checkouts, 1);
+        assert_eq!(begun.standalone_opens, 1);
+
+        reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT 2".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("transaction query reuses its one exceptional connection");
+        reader
+            .query_all(SqlStatement {
+                sql: "COMMIT".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("COMMIT closes the explicit transaction exception");
+        let committed = pool.reader_acquisition_snapshot();
+        assert_eq!(committed.reader_admission_capacity, 1);
+        assert_eq!(committed.available_reader_admission_slots, 1);
+        assert_eq!(committed.acquisitions, begun.acquisitions);
+        assert_eq!(committed.pooled_checkouts, begun.pooled_checkouts);
+        assert_eq!(committed.standalone_opens, begun.standalone_opens);
+        assert_eq!(
+            committed.completed_pooled_checkouts, begun.completed_pooled_checkouts,
+            "queries and COMMIT inside one explicit transaction must not acquire another reader"
+        );
+
+        reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT 3".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("ordinary traffic returns to the reader pool after COMMIT");
+        let after = pool.reader_acquisition_snapshot();
+        assert_eq!(after.pooled_checkouts, 2);
+        assert_eq!(after.completed_pooled_checkouts, 2);
+        assert_eq!(after.standalone_opens, 1);
+        assert_eq!(after.active_pooled_checkouts, 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_reader_open_timeout_is_visible_without_a_standalone_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("sql_bridge_reader_open_timeout.db")),
+                max_readers: 1,
+                checkout_timeout: std::time::Duration::from_millis(20),
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut logical_reader = bridge.reader().await.unwrap();
+        let held = pool.reader().expect("hold the shared reader budget");
+
+        let blocked = logical_reader
+            .query_all(SqlStatement {
+                sql: "BEGIN DEFERRED".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                &blocked,
+                Err(StorageError::Timeout { operation })
+                    if operation.as_ref() == "sql_bridge.reader_open"
+            ),
+            "the compatible explicit-transaction open phase must stay visible; got {blocked:?}"
+        );
+
+        let snapshot = pool.reader_acquisition_snapshot();
+        assert_eq!(snapshot.checkout_timeouts, 1);
+        assert_eq!(snapshot.pooled_checkouts, 1);
+        assert_eq!(snapshot.standalone_opens, 0);
+        assert_eq!(snapshot.active_pooled_checkouts, 1);
+        assert_eq!(snapshot.available_reader_admission_slots, 0);
+        drop(held);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(tx_registry)]
     async fn cached_read_transaction_retains_one_permit_until_commit_or_rollback() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
@@ -3572,11 +3985,11 @@ mod tests {
         assert!(
             matches!(
                 &blocked,
-                Err(StorageError::Timeout { operation })
+                Err(StorageError::AdmissionTimeout { operation, .. })
                     if operation.as_ref() == "sql_bridge.reader_operation"
             ),
             "a second logical read must contend with the admitted transaction \
-             and time out with the ADR-005 reader contract error; got {blocked:?}"
+             and fail at the bounded pooled-admission stage; got {blocked:?}"
         );
 
         reader
@@ -3702,6 +4115,7 @@ mod tests {
                 read_transaction_slot: None,
             }),
             pool: Arc::clone(&pool),
+            poisoned: false,
         };
 
         let begin = reader
@@ -3753,6 +4167,7 @@ mod tests {
                 read_transaction_slot: None,
             }),
             pool: Arc::clone(&pool),
+            poisoned: false,
         };
 
         reader
@@ -3878,8 +4293,8 @@ mod tests {
                     && message.contains("transaction control")
                     && message.contains("SAVEPOINT")
             ),
-            "a queue-backed writer's cached read-only connection must reject transaction \
-             control; got {rejected:?}"
+            "a queue-backed writer without an explicit read transaction must reject nested \
+             transaction control; got {rejected:?}"
         );
         assert_eq!(
             pool.sql_bridge_reader_slots().available_permits(),
@@ -4116,6 +4531,7 @@ mod tests {
                 read_transaction_slot: None,
             }),
             pool: Arc::clone(&pool),
+            poisoned: false,
         };
 
         reader
@@ -4237,8 +4653,13 @@ mod tests {
         let origin_view = database_tx_view(&pool);
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
         let mut reader = SqliteReader {
-            handle: Some(open_cached_reader_handle(Arc::clone(&pool)).await.unwrap()),
+            handle: Some(
+                open_explicit_read_transaction_handle(Arc::clone(&pool))
+                    .await
+                    .unwrap(),
+            ),
             pool: Arc::clone(&pool),
+            poisoned: false,
         };
         let mut contender = bridge.reader().await.unwrap();
 
@@ -4449,12 +4870,22 @@ mod tests {
             .unwrap();
 
         let mut reader = SqliteReader {
-            handle: Some(open_cached_reader_handle(Arc::clone(&pool)).await.unwrap()),
+            handle: Some(
+                open_explicit_read_transaction_handle(Arc::clone(&pool))
+                    .await
+                    .unwrap(),
+            ),
             pool: Arc::clone(&pool),
+            poisoned: false,
         };
         let mut contender = SqliteReader {
-            handle: Some(open_cached_reader_handle(Arc::clone(&pool)).await.unwrap()),
+            handle: Some(
+                open_explicit_read_transaction_handle(Arc::clone(&pool))
+                    .await
+                    .unwrap(),
+            ),
             pool: Arc::clone(&pool),
+            poisoned: false,
         };
         let udf_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         register_khive_test_slow_udf(
@@ -4678,6 +5109,7 @@ mod tests {
                 read_transaction_slot: None,
             }),
             pool: Arc::clone(&pool),
+            poisoned: false,
         };
 
         let rejected = reader
@@ -4709,13 +5141,8 @@ mod tests {
             "the permit may be released only after the stale transaction is gone"
         );
         assert!(
-            reader
-                .handle
-                .as_ref()
-                .expect("successful rollback should preserve the cached handle")
-                .conn
-                .is_autocommit(),
-            "the restored idle connection must not retain a WAL snapshot"
+            reader.handle.is_none(),
+            "the restored connection must close instead of surviving as an idle standalone cache"
         );
 
         let value = reader
@@ -4725,7 +5152,7 @@ mod tests {
                 label: None,
             })
             .await
-            .expect("the cleaned cached reader must remain usable");
+            .expect("the cleaned reader must remain usable through the pooled route");
         assert!(matches!(value, Some(SqlValue::Integer(9))));
     }
 
@@ -6706,16 +7133,13 @@ mod tests {
         );
     }
 
-    /// Queue-backed reads charge the READER permit budget for connection
-    /// open and query operations, and a cancelled queue-backed
-    /// read is followed by a successful lazy reopen — the documented
-    /// contrast with standalone handles, whose consumed connection makes
-    /// every later call fail. Arm 1 saturates the one reader permit and
-    /// asserts the queue-backed read times out on the READER budget (not
-    /// the writer budget). Arm 2 aborts an in-flight read and asserts the
-    /// next read on the same handle succeeds by reopening.
+    /// Queue-backed ordinary reads use the pooled reader budget rather than a
+    /// cached standalone connection. Arm 1 saturates the one reader permit and
+    /// proves the failure is a visible pooled-admission timeout. Arm 2 proves
+    /// a handle with no exceptional transaction connection remains reusable
+    /// through the pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn queue_backed_read_uses_reader_budget_and_reopens_after_cancel() {
+    async fn queue_backed_read_uses_pool_budget_and_remains_reusable_after_saturation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queue_backed_reader_budget.db");
         let config = PoolConfig {
@@ -6765,22 +7189,23 @@ mod tests {
         assert!(
             matches!(
                 &starved,
-                Err(StorageError::Timeout { operation })
-                    if operation.as_ref() == "sql_bridge.reader_open"
+                Err(StorageError::AdmissionTimeout { operation, .. })
+                    if operation.as_ref() == "sql_bridge.reader_operation"
             ),
             "queue-backed read with reader permits saturated must time out \
-             on the reader budget with the ADR-005 reader contract error; \
+             at the shared pooled-reader admission stage; \
              got {starved:?}"
         );
+        let saturated = pool.reader_acquisition_snapshot();
+        assert_eq!(saturated.checkout_timeouts, 1);
+        assert_eq!(saturated.standalone_opens, 0);
         drop(held);
 
         // Arm 2: a queue-backed handle in the exact post-cancelled-read
-        // state — `handle: None` because the cancelled call took the boxed
-        // connection out and never returned it — must serve the next read by
-        // lazily reopening, never a hard "connection already consumed"
-        // failure (that contract is standalone-only; the doc names the
-        // contrast). Constructed directly so the state is deterministic
-        // rather than racing an abort against ensure_conn.
+        // state — `handle: None` — must serve the next ordinary read through
+        // the pool, never a hard "connection already consumed" failure (that
+        // contract is specific to a poisoned explicit-transaction reader).
+        // Constructed directly so the state is deterministic.
         let writer_task = pool
             .writer_task_handle()
             .expect("queue-enabled file pool must offer a writer task")
@@ -6799,25 +7224,20 @@ mod tests {
                 label: None,
             })
             .await
-            .expect("read on a queue-backed handle with no resident connection must reopen")
+            .expect("read on a queue-backed handle with no transaction connection must pool")
             .expect("seeded row must be visible");
         assert!(
             matches!(&row.columns[0].value, SqlValue::Text(v) if v == "seed"),
-            "reopened read must return the seeded row; got {:?}",
+            "pooled read must return the seeded row; got {:?}",
             row.columns[0].value
         );
     }
 
     /// ADR-136 D1 gate 3 amendment: `SqlWriter::query_row`/`query_all` carry
     /// no read-only restriction at the trait level — a caller could hand a
-    /// DML-with-RETURNING statement to `query_row` expecting it to behave
-    /// like any other query. Under a queue-backed handle, the standalone
-    /// connection `SqliteWriter::ensure_conn` lazily opens must be
-    /// read-only, so SQLite rejects the statement outright instead of
-    /// quietly mutating the row on an untracked connection outside the
-    /// `WriterTask`. Red-proof: reverting `ensure_conn` to
-    /// `open_standalone_writer` makes this test fail (the UPDATE succeeds
-    /// and mutates the row).
+    /// DML-with-RETURNING statement to `query_row`. A queue-backed handle now
+    /// sends ordinary reads through a pooled read-only connection, so SQLite
+    /// rejects the statement instead of mutating on an untracked writer.
     #[tokio::test]
     async fn writer_query_row_rejects_dml_with_returning_on_queue_backed_handle() {
         let dir = tempfile::tempdir().unwrap();

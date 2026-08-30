@@ -606,6 +606,50 @@ snapshot (ADR-091), but their count is no longer a `max_readers` contract:
 callers that retain arbitrarily many handles remain responsible for their
 process's file-descriptor budget.
 
+## Amendment: pooled file-backed reads (2026-08-30)
+
+Issues #2024 and #1987 supersede the 2026-08-09 amendment's ordinary
+cached-connection route while preserving its explicit transaction lifecycle.
+A file-backed `SqlAccess::reader()` now owns no SQLite connection while idle.
+Each ordinary `query_row`, `query_all`, or `query_page` checks out a pre-opened
+`ConnectionPool` reader for exactly that operation; ordinary reads through a
+queue-backed `SqlWriter` do the same. All typed SQLite stores use the identical
+pool route for file-backed and in-memory reads. Pool exhaustion returns the
+existing bounded admission error and MUST NOT fall back to a standalone open.
+
+The reader admission semaphore is now the pool-wide total reader budget, not a
+raw-SQL-only budget. A pooled guard acquires one permit before taking a pooled
+connection and releases it only after reset/replacement. The single preserved
+request-path standalone exception — an explicit top-level deferred read
+transaction — acquires from the same budget, lazily opens its connection on
+`BEGIN`, and closes it after terminal control restores autocommit. Boot-time
+schema/model inspection before a pool exists and diagnostics that truly require
+an independent snapshot are the only infrastructure exceptions. The exception
+set is a closed, crate-private enum; ordinary traffic has no fallback variant.
+
+`KHIVE_CHECKOUT_TIMEOUT_SECS` (default five seconds) bounds each admission
+attempt. A pooled wait that expires before any statement begins returns
+retryable `StorageError::AdmissionTimeout`; request cancellation remains
+`StorageError::Timeout`. The standalone explicit-transaction open retains the
+compatible `StorageError::Timeout` at `sql_bridge.reader_open`. An operation
+that performs several sequential reads can therefore spend several bounded
+admission windows in aggregate; no individual attempt exceeds its configured
+window and none responds to saturation by opening a fresh connection.
+
+Route and contention evidence is additive under
+`db_diagnostics.reader_contention`: configured/available admission slots,
+pooled checkouts, request and infrastructure standalone opens, admission
+timeouts, active/peak/completed pooled checkouts, and maximum completed pooled
+hold time. Counters are pool-scoped and reset only with pool reconstruction;
+the active and available fields are point-in-time. Hold duration includes
+connection reset/replacement before reuse. Cooperative cancellation is not
+miscounted as admission saturation.
+
+The earlier `multiple_long_lived_idle_cached_readers...` fixture remains a WAL
+lifetime regression, but idle handles are now stronger: they own neither a
+snapshot nor a SQLite connection. Explicit transactions keep the existing
+registry, maximum-age, cancellation, cleanup, and fail-closed rules.
+
 ## Amendment: request-scoped cancellation of SQLite reads (2026-08-11)
 
 Issues #1895, #1843, and #1893 supersede this ADR's statements that a cancelled

@@ -290,3 +290,22 @@ Each slice lands with:
    the high-water mark; Slice 3 — ANN route counter carries the traffic, fallback near
    zero warm; Slice 4 — zero note-search dispatches to the session backend.
 3. The corresponding ADR-166 mechanism invariant merged and green in the same PR.
+
+### Slice 2 implementation note (2026-08-30)
+
+Slice 2 is implemented by the change closing #2024 and #1987. All nine
+SQLite-backed typed-store read seams (the six named in the original inventory,
+plus attachments, sparse vectors, and agent-process records) share one pooled
+helper. Ordinary file-backed raw-SQL reads and reads through a queue-backed
+writer use the same pool. `open_standalone_reader` is crate-private and requires
+a value from the closed exception enum; no saturation path has a standalone
+fallback.
+
+The reader admission semaphore now covers both pooled guards and the explicit
+raw-SQL deferred-transaction exception, so their combined concurrency cannot
+exceed the configured reader budget. `db_diagnostics.reader_contention` exposes
+capacity/availability, pooled and separately attributed standalone routes,
+admission timeouts, and pooled checkout hold lifecycle. Deterministic regressions
+hold the sole pooled reader to prove file-backed typed/raw reads block at shared
+admission, distinguish retryable saturation from request cancellation, assert
+ordinary reads leave standalone opens flat, and prove completed hold evidence.

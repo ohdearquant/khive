@@ -14567,7 +14567,7 @@ async fn query_page_size_validation_alias_and_hard_cap_are_explicit() {
     assert_eq!(legacy.get("page_size").and_then(Value::as_u64), Some(7));
 }
 
-// ---- db_diagnostics: ADR-133 D8 additive writer-contention fields ----
+// ---- db_diagnostics: ADR-165 reader + ADR-133 writer contention fields ----
 
 #[tokio::test]
 async fn db_diagnostics_runtime_audit_fields_are_additive() {
@@ -14577,6 +14577,31 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
         .dispatch("db_diagnostics", json!({}))
         .await
         .expect("db_diagnostics must succeed against an in-memory backend");
+
+    let reader_contention = report
+        .get("reader_contention")
+        .expect("reader_contention section must be present");
+    for field in [
+        "reader_admission_capacity",
+        "available_reader_admission_slots",
+        "reader_acquisitions",
+        "pooled_reader_checkouts",
+        "standalone_reader_opens",
+        "infrastructure_standalone_reader_opens",
+        "reader_checkout_timeouts",
+        "active_pooled_reader_checkouts",
+        "peak_active_pooled_reader_checkouts",
+        "completed_pooled_reader_checkouts",
+        "max_completed_reader_hold_micros",
+    ] {
+        let value = reader_contention.get(field).unwrap_or_else(|| {
+            panic!("reader_contention.{field} must be present in the wire payload")
+        });
+        assert!(
+            value.is_u64(),
+            "reader_contention.{field} must be a non-negative integer, got {value:?}"
+        );
+    }
 
     let writer_contention = report
         .get("writer_contention")

@@ -491,6 +491,11 @@ pub struct ConnectionPool {
     /// acquisition boundaries means new verbs inherit instrumentation without
     /// per-verb classification (ADR-133 D8 / issue #1389).
     writer_acquisition_counters: Arc<WriterAcquisitionCounters>,
+    /// Pool-scoped reader route, saturation, and hold-lifecycle counters.
+    /// Instrumentation lives at the acquisition boundary so every typed
+    /// store and raw-SQL caller inherits it without per-verb bookkeeping
+    /// (ADR-165 Slice 2 / ADR-166 G2).
+    reader_acquisition_counters: ReaderAcquisitionCounters,
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
@@ -552,8 +557,13 @@ enum ReaderLease<'pool> {
 /// Returns the connection to the pool on drop.
 pub struct ReaderGuard<'pool> {
     lease: Option<ReaderLease<'pool>>,
+    /// One permit from the pool-wide reader budget, shared with the explicit
+    /// raw-SQL transaction exception. Returned only after the connection has
+    /// been reset/replaced and made reusable.
+    admission_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     pool: &'pool ConnectionPool,
     reusable: bool,
+    checked_out_at: Instant,
 }
 
 impl<'pool> ReaderGuard<'pool> {
@@ -605,6 +615,153 @@ impl<'pool> Drop for ReaderGuard<'pool> {
                 self.pool.retire_pooled_writer(&guard);
             }
             ReaderLease::Shared(_guard) => {}
+        }
+
+        // A checkout remains active until reset/replacement returned the
+        // connection to service (or the degraded writer guard was released),
+        // not merely until the caller's query closure returned.
+        drop(self.admission_slot.take());
+        self.pool
+            .reader_acquisition_counters
+            .record_checkout_completed(self.checked_out_at.elapsed());
+    }
+}
+
+/// Why a caller is allowed to bypass the pooled reader queue.
+///
+/// This is deliberately a closed, crate-private list. Ordinary request reads
+/// have no variant: they must use [`ConnectionPool::reader`] and surface its
+/// bounded admission timeout without falling back to a fresh connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // The closed ADR list includes infrastructure paths not instantiated today.
+pub(crate) enum StandaloneReaderPurpose {
+    /// ADR-005/ADR-091's explicit, multi-call deferred raw-SQL transaction.
+    ExplicitSqlReadTransaction,
+    /// Boot-time schema/model-registry inspection before a runtime pool can
+    /// own the read. Kept separate from request traffic in diagnostics.
+    BootSchemaProbe,
+    /// An operator diagnostic that requires a physically independent
+    /// snapshot. Kept separate from request traffic in diagnostics.
+    DiagnosticsIndependentSnapshot,
+}
+
+impl StandaloneReaderPurpose {
+    fn is_infrastructure(self) -> bool {
+        matches!(
+            self,
+            Self::BootSchemaProbe | Self::DiagnosticsIndependentSnapshot
+        )
+    }
+}
+
+/// Process-local reader acquisition and hold lifecycle since one
+/// [`ConnectionPool`] was constructed.
+///
+/// Counters are monotonic and reset only when the pool is reconstructed.
+/// `active_pooled_checkouts` is the point-in-time number of live
+/// [`ReaderGuard`] values. Hold duration includes connection reset or
+/// replacement on return, because the slot is not reusable before then.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReaderAcquisitionSnapshot {
+    /// Configured process-local admission budget shared by pooled readers and
+    /// the explicit raw-SQL read-transaction exception.
+    pub reader_admission_capacity: usize,
+    /// Point-in-time permits not held by either pooled readers or explicit
+    /// raw-SQL read transactions.
+    pub available_reader_admission_slots: usize,
+    /// Successful request-path reader acquisitions (pooled plus the explicit
+    /// raw-SQL transaction exception; infrastructure opens excluded).
+    pub acquisitions: u64,
+    /// Successful bounded pooled-reader checkouts.
+    pub pooled_checkouts: u64,
+    /// Successful request-path standalone opens from the closed exception
+    /// list (currently explicit raw-SQL deferred transactions only).
+    pub standalone_opens: u64,
+    /// Successful boot/diagnostic standalone opens, attributed separately so
+    /// request traffic cannot be inferred from infrastructure activity.
+    pub infrastructure_standalone_opens: u64,
+    /// Reader-admission waits that exhausted `checkout_timeout` before any
+    /// query began. Covers pooled checkout and the closed raw-SQL exception;
+    /// cooperative request cancellation is intentionally excluded.
+    pub checkout_timeouts: u64,
+    /// Pooled checkouts live at the instant this snapshot was taken.
+    pub active_pooled_checkouts: u64,
+    /// High-water mark of concurrent pooled checkouts.
+    pub peak_active_pooled_checkouts: u64,
+    /// Pooled guards that completed their full return/reset lifecycle.
+    pub completed_pooled_checkouts: u64,
+    /// Longest completed checkout hold, including return/reset, in
+    /// microseconds. Diagnostic evidence only; never a test timing gate.
+    pub max_completed_hold_micros: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReaderAcquisitionCounters {
+    pooled_checkouts: AtomicU64,
+    standalone_opens: AtomicU64,
+    infrastructure_standalone_opens: AtomicU64,
+    checkout_timeouts: AtomicU64,
+    active_pooled_checkouts: AtomicU64,
+    peak_active_pooled_checkouts: AtomicU64,
+    completed_pooled_checkouts: AtomicU64,
+    max_completed_hold_micros: AtomicU64,
+}
+
+impl ReaderAcquisitionCounters {
+    fn record_pooled_checkout(&self) {
+        self.pooled_checkouts.fetch_add(1, Ordering::Relaxed);
+        let active = self
+            .active_pooled_checkouts
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.peak_active_pooled_checkouts
+            .fetch_max(active, Ordering::Relaxed);
+    }
+
+    fn record_checkout_timeout(&self) {
+        self.checkout_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_standalone_open(&self, purpose: StandaloneReaderPurpose) {
+        if purpose.is_infrastructure() {
+            self.infrastructure_standalone_opens
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.standalone_opens.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_checkout_completed(&self, hold: Duration) {
+        let previous = self.active_pooled_checkouts.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "reader active-checkout counter underflow");
+        self.completed_pooled_checkouts
+            .fetch_add(1, Ordering::Relaxed);
+        let micros = u64::try_from(hold.as_micros()).unwrap_or(u64::MAX);
+        self.max_completed_hold_micros
+            .fetch_max(micros, Ordering::Relaxed);
+    }
+
+    fn snapshot(
+        &self,
+        reader_admission_capacity: usize,
+        available_reader_admission_slots: usize,
+    ) -> ReaderAcquisitionSnapshot {
+        let pooled_checkouts = self.pooled_checkouts.load(Ordering::Relaxed);
+        let standalone_opens = self.standalone_opens.load(Ordering::Relaxed);
+        ReaderAcquisitionSnapshot {
+            reader_admission_capacity,
+            available_reader_admission_slots,
+            acquisitions: pooled_checkouts.saturating_add(standalone_opens),
+            pooled_checkouts,
+            standalone_opens,
+            infrastructure_standalone_opens: self
+                .infrastructure_standalone_opens
+                .load(Ordering::Relaxed),
+            checkout_timeouts: self.checkout_timeouts.load(Ordering::Relaxed),
+            active_pooled_checkouts: self.active_pooled_checkouts.load(Ordering::Relaxed),
+            peak_active_pooled_checkouts: self.peak_active_pooled_checkouts.load(Ordering::Relaxed),
+            completed_pooled_checkouts: self.completed_pooled_checkouts.load(Ordering::Relaxed),
+            max_completed_hold_micros: self.max_completed_hold_micros.load(Ordering::Relaxed),
         }
     }
 }
@@ -840,6 +997,7 @@ impl ConnectionPool {
             checkpoint_ownership: CheckpointOwnershipGate::new(),
             pooled_writer_retired: AtomicBool::new(false),
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
+            reader_acquisition_counters: ReaderAcquisitionCounters::default(),
             readers,
             max_readers,
             config,
@@ -903,9 +1061,51 @@ impl ConnectionPool {
     where
         C: Fn() -> bool,
     {
+        let started = Instant::now();
+        let mut admission_attempt = 0u32;
+        let admission_slot = loop {
+            if should_stop() {
+                return Ok(None);
+            }
+            match Arc::clone(&self.sql_bridge_reader_slots).try_acquire_owned() {
+                Ok(slot) => break slot,
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(SqliteError::InvalidData(
+                        "reader admission semaphore is closed".to_string(),
+                    ));
+                }
+                Err(tokio::sync::TryAcquireError::NoPermits) => {}
+            }
+            if started.elapsed() >= self.config.checkout_timeout {
+                self.reader_acquisition_counters.record_checkout_timeout();
+                return Err(pool_exhausted_error(
+                    self.config.checkout_timeout,
+                    self.max_readers,
+                ));
+            }
+            match admission_attempt {
+                0..=7 => {
+                    let spins = 1usize << admission_attempt;
+                    for _ in 0..spins {
+                        std::hint::spin_loop();
+                    }
+                }
+                8..=15 => thread::yield_now(),
+                _ => {
+                    let remaining = self
+                        .config
+                        .checkout_timeout
+                        .saturating_sub(started.elapsed());
+                    let sleep =
+                        Duration::from_micros(50 * (1u64 << (admission_attempt - 16).min(6)));
+                    thread::sleep(sleep.min(remaining).min(Duration::from_millis(2)));
+                }
+            }
+            admission_attempt = admission_attempt.saturating_add(1);
+        };
+
         if self.max_readers == 0 {
             self.ensure_pooled_writer_active()?;
-            let started = Instant::now();
             loop {
                 if should_stop() {
                     return Ok(None);
@@ -915,6 +1115,7 @@ impl ConnectionPool {
                     .checkout_timeout
                     .saturating_sub(started.elapsed());
                 if remaining.is_zero() {
+                    self.reader_acquisition_counters.record_checkout_timeout();
                     return Err(pool_exhausted_error(
                         self.config.checkout_timeout,
                         self.max_readers,
@@ -925,16 +1126,18 @@ impl ConnectionPool {
                     .try_lock_for(remaining.min(Duration::from_millis(2)))
                 {
                     self.ensure_pooled_writer_active()?;
+                    self.reader_acquisition_counters.record_pooled_checkout();
                     return Ok(Some(ReaderGuard {
                         lease: Some(ReaderLease::Shared(guard)),
+                        admission_slot: Some(admission_slot),
                         pool: self,
                         reusable: true,
+                        checked_out_at: Instant::now(),
                     }));
                 }
             }
         }
 
-        let started = Instant::now();
         let mut attempt = 0u32;
 
         loop {
@@ -942,14 +1145,18 @@ impl ConnectionPool {
                 return Ok(None);
             }
             if let Some(conn) = self.readers.pop() {
+                self.reader_acquisition_counters.record_pooled_checkout();
                 return Ok(Some(ReaderGuard {
                     lease: Some(ReaderLease::Pooled(conn)),
+                    admission_slot: Some(admission_slot),
                     pool: self,
                     reusable: true,
+                    checked_out_at: Instant::now(),
                 }));
             }
 
             if started.elapsed() >= self.config.checkout_timeout {
+                self.reader_acquisition_counters.record_checkout_timeout();
                 return Err(pool_exhausted_error(
                     self.config.checkout_timeout,
                     self.max_readers,
@@ -1073,6 +1280,23 @@ impl ConnectionPool {
         self.writer_acquisition_counters.snapshot()
     }
 
+    /// Snapshot reader acquisition, saturation, and hold lifecycle outcomes
+    /// since this pool was constructed. Counters reset only with pool
+    /// reconstruction.
+    pub fn reader_acquisition_snapshot(&self) -> ReaderAcquisitionSnapshot {
+        self.reader_acquisition_counters.snapshot(
+            self.max_readers.max(1),
+            self.sql_bridge_reader_slots.available_permits(),
+        )
+    }
+
+    /// Record one pool-wide reader-admission wait that exhausted the configured
+    /// checkout timeout outside [`Self::reader_until`] (currently the explicit
+    /// raw-SQL read-transaction exception and reads on a standalone writer).
+    pub(crate) fn record_reader_admission_timeout(&self) {
+        self.reader_acquisition_counters.record_checkout_timeout();
+    }
+
     /// Clone the pool-scoped counter set for the lifetime-owned writer task.
     pub(crate) fn writer_acquisition_counters(&self) -> Arc<WriterAcquisitionCounters> {
         Arc::clone(&self.writer_acquisition_counters)
@@ -1147,7 +1371,8 @@ impl ConnectionPool {
         }
     }
 
-    /// Pool-wide permits for file-backed raw-SQL reader opens and active reads.
+    /// Pool-wide admission permits shared by pooled readers, the explicit
+    /// raw-SQL read-transaction exception, and reads on standalone writers.
     pub(crate) fn sql_bridge_reader_slots(&self) -> Arc<Semaphore> {
         Arc::clone(&self.sql_bridge_reader_slots)
     }
@@ -1537,11 +1762,17 @@ impl ConnectionPool {
             .await
     }
 
-    /// Open a standalone read-only connection to the same file-backed database.
+    /// Open a standalone read-only connection for one enumerated structural
+    /// exception to pooled-reader routing.
     ///
-    /// Companion to `open_standalone_writer` for stores that also need an
-    /// independent reader connection outside the pooled reader queue.
-    pub fn open_standalone_reader(&self) -> Result<Connection, SqliteError> {
+    /// There is intentionally no public/generic standalone-reader fallback.
+    /// Ordinary request reads use [`Self::reader`] and surface bounded pool
+    /// exhaustion. Adding a purpose variant or call site is therefore an
+    /// explicit review event (ADR-165 Slice 2).
+    pub(crate) fn open_standalone_reader(
+        &self,
+        purpose: StandaloneReaderPurpose,
+    ) -> Result<Connection, SqliteError> {
         let path = self.read_connection_path()?;
 
         let conn = Connection::open_with_flags(
@@ -1552,6 +1783,8 @@ impl ConnectionPool {
         )?;
         configure_reader_connection(&conn, &self.config)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        self.reader_acquisition_counters
+            .record_standalone_open(purpose);
         Ok(conn)
     }
 
@@ -2349,7 +2582,9 @@ mod tests {
         assert_eq!(body, "committed-only-in-wal");
         drop(reader);
 
-        let standalone = pool.open_standalone_reader().unwrap();
+        let standalone = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .unwrap();
         let count: i64 = standalone
             .query_row("SELECT COUNT(*) FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
@@ -2437,7 +2672,9 @@ mod tests {
             .unwrap();
         assert_eq!(body, "visible-through-target-wal");
         drop(reader);
-        let standalone = pool.open_standalone_reader().unwrap();
+        let standalone = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .unwrap();
         let count: i64 = standalone
             .query_row("SELECT COUNT(*) FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
@@ -2503,7 +2740,9 @@ mod tests {
             .unwrap();
         assert_eq!(body, "checkpointed");
         drop(reader);
-        let standalone = pool.open_standalone_reader().unwrap();
+        let standalone = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .unwrap();
         let count: i64 = standalone
             .query_row("SELECT COUNT(*) FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
@@ -3429,6 +3668,79 @@ mod tests {
                 writer_task_side_effects_unknown: 0,
             },
             "the public standalone boundary must contribute to the aggregate exactly once"
+        );
+    }
+
+    #[test]
+    fn reader_snapshot_tracks_pool_saturation_hold_lifecycle_and_exception_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader_acquisition_counters.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            max_readers: 1,
+            checkout_timeout: Duration::from_millis(2),
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool");
+
+        assert_eq!(
+            pool.reader_acquisition_snapshot(),
+            ReaderAcquisitionSnapshot {
+                reader_admission_capacity: 1,
+                available_reader_admission_slots: 1,
+                ..ReaderAcquisitionSnapshot::default()
+            }
+        );
+
+        let held = pool.reader().expect("first pooled checkout succeeds");
+        assert_eq!(
+            pool.reader_acquisition_snapshot(),
+            ReaderAcquisitionSnapshot {
+                reader_admission_capacity: 1,
+                available_reader_admission_slots: 0,
+                acquisitions: 1,
+                pooled_checkouts: 1,
+                active_pooled_checkouts: 1,
+                peak_active_pooled_checkouts: 1,
+                ..ReaderAcquisitionSnapshot::default()
+            }
+        );
+
+        let timeout = match pool.reader() {
+            Ok(_) => panic!("the sole live checkout must exhaust bounded admission"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &timeout,
+                SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                    if code.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "reader saturation must keep the pool-exhausted classification: {timeout}"
+        );
+        drop(held);
+
+        let explicit = pool
+            .open_standalone_reader(StandaloneReaderPurpose::ExplicitSqlReadTransaction)
+            .expect("explicit read-transaction exception opens");
+        drop(explicit);
+        let infrastructure = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .expect("infrastructure exception opens");
+        drop(infrastructure);
+
+        let snapshot = pool.reader_acquisition_snapshot();
+        assert_eq!(snapshot.acquisitions, 2);
+        assert_eq!(snapshot.pooled_checkouts, 1);
+        assert_eq!(snapshot.standalone_opens, 1);
+        assert_eq!(snapshot.infrastructure_standalone_opens, 1);
+        assert_eq!(snapshot.checkout_timeouts, 1);
+        assert_eq!(snapshot.active_pooled_checkouts, 0);
+        assert_eq!(snapshot.peak_active_pooled_checkouts, 1);
+        assert_eq!(snapshot.completed_pooled_checkouts, 1);
+        assert!(
+            snapshot.max_completed_hold_micros > 0,
+            "the held checkout's completed lifecycle must expose nonzero hold evidence"
         );
     }
 
