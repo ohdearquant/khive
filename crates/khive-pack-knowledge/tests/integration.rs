@@ -1790,6 +1790,266 @@ async fn list_respects_limit_and_offset() {
     );
 }
 
+#[tokio::test]
+async fn list_fields_projects_atom_and_domain_keys_only() {
+    let f = pack(rt());
+    let large_content = format!(
+        "{} {}",
+        "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+        "payload".repeat(32_000)
+    );
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "projected-atom",
+            "name": "Projected Atom",
+            "content": large_content,
+        }] }),
+    )
+    .await
+    .expect("upsert projected atom");
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{
+            "slug": "projected-domain",
+            "name": "Projected Domain",
+            "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+        }] }),
+    )
+    .await
+    .expect("upsert projected domain");
+
+    for kind in ["atom", "domain"] {
+        let response = f
+            .dispatch(
+                "knowledge.list",
+                json!({
+                    "type": kind,
+                    "fields": ["id", "slug"],
+                    "after": "",
+                    "limit": 10,
+                }),
+            )
+            .await
+            .expect("projected cursor list");
+        let results = response["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 1, "one {kind} result");
+        let object = results[0].as_object().expect("projected object");
+        let keys: std::collections::HashSet<&str> = object.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            std::collections::HashSet::from(["id", "slug"]),
+            "projection must return exactly the requested fields"
+        );
+        assert_eq!(response["order"], "created_at_asc_id_asc");
+        assert!(response["next_after"].is_null());
+        assert!(
+            serde_json::to_vec(&response)
+                .expect("serialize response")
+                .len()
+                < 1_024,
+            "key-only response must not carry the large atom content"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_projection_and_cursor_inputs_are_strict() {
+    let f = pack(rt());
+
+    let empty_fields = f
+        .dispatch("knowledge.list", json!({ "fields": [] }))
+        .await
+        .expect_err("empty fields must fail")
+        .to_string();
+    assert!(empty_fields.contains("fields") && empty_fields.contains("non-empty"));
+
+    let unknown_field = f
+        .dispatch(
+            "knowledge.list",
+            json!({ "type": "atom", "fields": ["slug", "description"] }),
+        )
+        .await
+        .expect_err("atom-only projection vocabulary must be enforced")
+        .to_string();
+    assert!(unknown_field.contains("description") && unknown_field.contains("atom"));
+
+    let mixed_modes = f
+        .dispatch("knowledge.list", json!({ "after": "", "offset": 0 }))
+        .await
+        .expect_err("offset and cursor modes must be exclusive")
+        .to_string();
+    assert!(mixed_modes.contains("mutually exclusive"));
+
+    let prefix_cursor = f
+        .dispatch("knowledge.list", json!({ "after": "deadbeef" }))
+        .await
+        .expect_err("cursor prefixes must fail")
+        .to_string();
+    assert!(prefix_cursor.contains("full UUID"));
+
+    let missing_cursor = f
+        .dispatch(
+            "knowledge.list",
+            json!({ "after": "ffffffff-ffff-4fff-bfff-ffffffffffff" }),
+        )
+        .await
+        .expect_err("missing cursor rows must fail")
+        .to_string();
+    assert!(missing_cursor.contains("cursor") && missing_cursor.contains("not found"));
+}
+
+/// #2220: seek pagination must not let a concurrent insert shift the remaining
+/// pre-existing rows. An insert behind the issued boundary belongs to a fresh
+/// walk; an insert ahead of it may extend this live walk. Both are forced onto
+/// the same timestamp so the UUID tiebreak is load-bearing.
+#[tokio::test]
+async fn list_cursor_walk_has_no_gaps_or_duplicates_during_concurrent_inserts() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let content = "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity";
+    let atoms: Vec<Value> = (0..12)
+        .map(|n| {
+            json!({
+                "slug": format!("cursor-original-{n:02}"),
+                "name": format!("Cursor Original {n}"),
+                "content": content,
+            })
+        })
+        .collect();
+    f.dispatch("knowledge.upsert_atoms", json!({ "atoms": atoms }))
+        .await
+        .expect("seed cursor atoms");
+
+    let shared_created_at = 1_750_000_000_000_000_i64;
+    {
+        let mut writer = runtime.sql().writer().await.expect("open writer");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE knowledge_atoms SET created_at = ?1".into(),
+                params: vec![SqlValue::Integer(shared_created_at)],
+                label: Some("test.knowledge_list_cursor.shared_timestamp".into()),
+            })
+            .await
+            .expect("force shared timestamp");
+    }
+
+    let original_ids: std::collections::HashSet<String> = {
+        let mut reader = runtime.sql().reader().await.expect("open reader");
+        reader
+            .query_all(SqlStatement {
+                sql: "SELECT id FROM knowledge_atoms WHERE tags NOT LIKE '%type:domain%'".into(),
+                params: vec![],
+                label: Some("test.knowledge_list_cursor.original_ids".into()),
+            })
+            .await
+            .expect("read original ids")
+            .into_iter()
+            .filter_map(|row| match row.get("id") {
+                Some(SqlValue::Text(id)) => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(original_ids.len(), 12);
+
+    let first_page = f
+        .dispatch(
+            "knowledge.list",
+            json!({
+                "after": "",
+                "limit": 3,
+                "fields": ["id", "slug"],
+            }),
+        )
+        .await
+        .expect("first cursor page");
+    let mut seen: Vec<String> = first_page["results"]
+        .as_array()
+        .expect("first results")
+        .iter()
+        .map(|row| row["id"].as_str().expect("id").to_string())
+        .collect();
+    let mut after = first_page["next_after"]
+        .as_str()
+        .expect("non-terminal first cursor")
+        .to_string();
+
+    const BEHIND_ID: &str = "00000000-0000-4000-8000-000000000000";
+    const AHEAD_ID: &str = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+    {
+        let mut writer = runtime.sql().writer().await.expect("open insert writer");
+        writer
+            .execute_batch(vec![
+                SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, created_at, updated_at) VALUES (?1, 'local', 'cursor-behind', 'Cursor Behind', ?2, ?3, ?3)".into(),
+                    params: vec![
+                        SqlValue::Text(BEHIND_ID.into()),
+                        SqlValue::Text(content.into()),
+                        SqlValue::Integer(shared_created_at),
+                    ],
+                    label: Some("test.knowledge_list_cursor.insert_behind".into()),
+                },
+                SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, created_at, updated_at) VALUES (?1, 'local', 'cursor-ahead', 'Cursor Ahead', ?2, ?3, ?3)".into(),
+                    params: vec![
+                        SqlValue::Text(AHEAD_ID.into()),
+                        SqlValue::Text(content.into()),
+                        SqlValue::Integer(shared_created_at),
+                    ],
+                    label: Some("test.knowledge_list_cursor.insert_ahead".into()),
+                },
+            ])
+            .await
+            .expect("insert concurrent rows");
+    }
+
+    for _ in 0..10 {
+        let page = f
+            .dispatch(
+                "knowledge.list",
+                json!({
+                    "after": after,
+                    "limit": 3,
+                    "fields": ["id", "slug"],
+                }),
+            )
+            .await
+            .expect("next cursor page");
+        assert_eq!(page["order"], "created_at_asc_id_asc");
+        for row in page["results"].as_array().expect("page results") {
+            assert_eq!(row.as_object().expect("projected row").len(), 2);
+            seen.push(row["id"].as_str().expect("id").to_string());
+        }
+        match page["next_after"].as_str() {
+            Some(next) => after = next.to_string(),
+            None => break,
+        }
+    }
+
+    let unique: std::collections::HashSet<String> = seen.iter().cloned().collect();
+    assert_eq!(
+        unique.len(),
+        seen.len(),
+        "cursor pages must not duplicate rows"
+    );
+    assert!(
+        original_ids.is_subset(&unique),
+        "every row present before the walk must be returned exactly once"
+    );
+    assert!(
+        unique.contains(AHEAD_ID),
+        "an ahead insert extends the live walk"
+    );
+    assert!(
+        !unique.contains(BEHIND_ID),
+        "an insert behind an issued boundary belongs to the next walk"
+    );
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    assert_eq!(seen, sorted, "equal-timestamp cursor order must be id ASC");
+}
+
 /// #1671: a full offset sweep over `knowledge.list` must enumerate every atom
 /// exactly once — no duplicates, no misses across page boundaries — even when
 /// all atoms share one `created_at` value (the column the primary sort key

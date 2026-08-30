@@ -215,10 +215,37 @@ namespace-agnostic. Returns 404 if not found.
 #### `knowledge.list` — paginated listing
 
 ```
-list(type?: "atom"|"domain", limit?: 20, offset?: 0) → {results: [...], total: N, limit, offset}
+list(
+  type?: "atom"|"domain",
+  limit?: 20,
+  offset?: 0,
+  after?: <full-uuid|"">,
+  fields?: [<field>, ...]
+) → {results: [...], total: N, limit, offset?, order, next_after?}
 ```
 
-Default type is `atom`. Limit capped at 500.
+Default type is `atom`. Limit is capped at 500. Legacy offset pages have a
+declared total order of `created_at DESC, id DESC`.
+
+Completeness-sensitive consumers use keyset mode: pass `after=""` on the first
+request, then round-trip each non-null `next_after` full UUID. Cursor pages seek
+by `created_at ASC, id ASC`; `after` and `offset` are mutually exclusive. This is
+a live traversal rather than an MVCC snapshot. Inserts whose key is behind an
+already-issued boundary belong to a fresh walk, while inserts ahead of the
+boundary may extend the current walk. Existing rows are not shifted, skipped,
+or duplicated by those inserts. A cursor remains usable if its row is
+soft-deleted, but a missing, wrong-type, or out-of-namespace cursor fails.
+Callers must retain the same type and status filters for the whole walk.
+The walk is complete when `next_after` is null. `total` is recomputed for each
+request and can change during a live walk, so it is not a completion signal.
+
+`fields` is a strict, non-empty response projection. Atom fields are `id`,
+`namespace`, `slug`, `name`, `content`, `tags`, `properties`, `status`,
+`source_uri`, `source_type`, `finalized`, `kind`, `created_at`, and `updated_at`.
+Domain fields are `id`, `namespace`, `slug`, `name`, `description`, `tags`,
+`members`, `kind`, `created_at`, and `updated_at`. Projection is applied at the
+SQL boundary: `fields=["id","slug"]` selects no atom content, apart from hidden
+`id`/`created_at` pagination keys that are not rendered unless requested.
 
 #### `knowledge.delete_atoms` — soft delete
 

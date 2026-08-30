@@ -157,6 +157,15 @@ pub(crate) struct ListParams {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offset: Option<usize>,
+    /// Keyset cursor for a stable full-store walk. An empty string starts
+    /// cursor mode; subsequent requests pass the prior page's `next_after`
+    /// full UUID.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// Exact response projection. Storage reads select only these columns plus
+    /// hidden pagination keys, so key-only walks do not hydrate atom content.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
     #[serde(default)]
     pub status: Option<Value>,
     #[serde(default)]
