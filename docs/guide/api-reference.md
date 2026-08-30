@@ -1749,9 +1749,11 @@ request(ops="knowledge.stats()")
 
 Backfill embeddings + FTS for atoms/domains.
 
-The response includes `truncation_by_model`, keyed by every model that completed embedding work.
-Each value contains `truncated` and `discarded_bytes` counters derived from the actual embedding
-outcomes; atom source content remains complete in SQL and FTS.
+The response includes `truncation_by_model`, keyed by every model that completed embedding work,
+and `fts_rebuilt`, which acknowledges a requested FTS repair only after both external-content
+indexes pass FTS5's rank-1 integrity check. Each truncation value contains `truncated` and
+`discarded_bytes` counters derived from the actual embedding outcomes; atom source content remains
+complete in SQL and FTS.
 
 | Param         | Type            | Required | Notes                                                   |
 | ------------- | --------------- | -------- | ------------------------------------------------------- |
@@ -1759,9 +1761,10 @@ outcomes; atom source content remains complete in SQL and FTS.
 | `batch_size`  | integer         | no       | Default 500, max 1000.                                  |
 | `insert_only` | bool            | no       | Deprecated no-op, accepted for API compatibility only.  |
 | `rebuild_ann` | bool            | no       | Rebuild the in-memory Vamana ANN index (default false). |
+| `rebuild_fts` | bool            | no       | Globally rebuild and verify atom + section FTS (default false). |
 
 ```
-request(ops="knowledge.index(rebuild_ann=true)")
+request(ops="knowledge.index(rebuild_fts=true, rebuild_ann=true)")
 ```
 
 ### `knowledge.fold` — Assertive

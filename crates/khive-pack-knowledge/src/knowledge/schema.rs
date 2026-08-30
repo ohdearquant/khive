@@ -197,6 +197,8 @@ pub(crate) struct IndexParams {
     pub insert_only: Option<bool>,
     #[serde(default)]
     pub rebuild_ann: Option<bool>,
+    #[serde(default)]
+    pub rebuild_fts: Option<bool>,
 }
 
 // ── fold ─────────────────────────────────────────────────────────────────────

@@ -85,6 +85,9 @@ V1 baseline at v0.2.8. The live post-consolidation sequence is:
 - **V21 (Phase 4b)**: Adds first-class attachments, backfills role `content`,
   switches blob GC claim fences to attachment writes, and drops
   `entities.content_ref` after verified application backfill.
+- **V22**: Adds the recipient-leading unread-notes probe index.
+- **V23**: Recreates atom FTS against a live-row external-content view with
+  transition-symmetric triggers and rebuilds both knowledge FTS indexes.
 
 The historical pre-consolidation allocation table remains in ADR-015 for
 provenance; its version numbers do not describe the live migration array.

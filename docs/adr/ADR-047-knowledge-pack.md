@@ -165,8 +165,12 @@ An FTS5 external-content virtual table (`fts_knowledge`) indexes slug, name,
 and content from `knowledge_atoms` via triggers that sync on
 insert/update/delete. The trigram tokenizer enables substring matching.
 
-Soft-deleted atoms (non-null `deleted_at`) are excluded from the FTS index via
-a `WHEN new.deleted_at IS NULL` guard on the insert trigger.
+Soft-deleted atoms (non-null `deleted_at`) are excluded from the FTS index. V23
+names a live-row view (`knowledge_atoms_fts_content`) as the external content
+object, so FTS5's index and its content object cover the same rows. Transition-
+symmetric triggers remove a document only when the old row was live and insert
+one only when the new row is live; soft-delete → hard-delete is therefore a
+no-op at the FTS layer, while resurrection inserts exactly once.
 
 ### 1b. Concept tier: three verbs, no new kinds
 
@@ -237,10 +241,14 @@ stats() → {atoms: N, domains: N, ...}
 #### `knowledge.index` — backfill embeddings + FTS
 
 ```
-index(ids?: [<slug|uuid>], batch_size?: 500, insert_only?: false) → {indexed: N}
+index(ids?: [<slug|uuid>], batch_size?: 500, insert_only?: false,
+      rebuild_ann?: false, rebuild_fts?: false) → {indexed: N, fts_rebuilt: bool}
 ```
 
-Backfills default-model embedding vectors and FTS content. The knowledge retrieval
+Backfills default-model embedding vectors. `rebuild_fts=true` globally rebuilds
+`fts_knowledge` and `fts_sections`, then runs each external-content table's
+rank-1 FTS5 integrity check before acknowledging `fts_rebuilt=true`; `ids=[]`
+provides an FTS-only maintenance call. The knowledge retrieval
 paths read only the default model, so secondary registered models are not embedded
 until a model-aware or fused knowledge read path exists. When `ids` is omitted,
 indexes the entire corpus in batches. `insert_only` skips the delete-then-reinsert

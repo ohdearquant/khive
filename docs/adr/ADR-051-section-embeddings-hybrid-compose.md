@@ -155,6 +155,12 @@ section_type, namespace, atom_id`. Embedding-only UPDATEs during section reindex
 no longer churn the FTS5 index (was the root cause of WAL bloat and FTS
 corruption at scale).
 
+V2 changed future trigger behavior but did not repair an index that had already
+diverged, nor the external-content pitfall where rows predate their triggers.
+V23 closes that historical repair gap by rebuilding `fts_sections` during
+migration and through the explicit `knowledge.index(rebuild_fts=true)` operator
+path, which also runs the rank-1 FTS5 integrity check.
+
 ### ANN warm-start
 
 ANN warm-start is owned by the **daemon** process (`kkernel mcp --daemon`), not by

@@ -446,7 +446,9 @@ binary.
 `kkernel reindex` rebuilds embedding vectors and FTS documents for entities, notes, and (unless
 excluded) the knowledge corpus. The graph entity/note pass fans out across every embedding engine
 registered in the resolved config; knowledge atoms and sections use the default engine that their
-read paths query. Engine resolution is the same one `kkernel mcp` uses (§1). Full flag reference
+read paths query. The knowledge pass also rebuilds `fts_knowledge` and `fts_sections` from their
+external content and requires both FTS5 rank-1 integrity checks to pass before reporting success.
+Engine resolution is the same one `kkernel mcp` uses (§1). Full flag reference
 (`reindex.rs:134-194`):
 
 | Flag                              | Default                                     | Effect                                                                                  |

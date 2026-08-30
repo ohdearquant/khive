@@ -314,8 +314,9 @@ search retrieves via the default embedder's ANN, so the knowledge pass always
 uses the default embedder (fanning out would write vectors search never reads).
 
 The knowledge pass calls the `khive_pack_knowledge::reindex_knowledge` library
-entry directly (the full-corpus `knowledge.index` handler) and rebuilds the
-Vamana ANN snapshot — no verb-DSL shell required.
+entry directly (the full-corpus `knowledge.index` handler), rebuilds the Vamana
+ANN snapshot, and rebuilds plus rank-1 integrity-checks both external-content
+knowledge FTS indexes — no verb-DSL shell required.
 
 ```bash
 kkernel reindex --db ~/.khive/khive.db --knowledge-only      # just the corpus
@@ -327,6 +328,7 @@ low-level verb is still available via `exec`:
 
 ```bash
 kkernel exec 'knowledge.index(ids=["my-slug", "<uuid>"])' --db ~/.khive/khive.db
+kkernel exec 'knowledge.index(ids=[], rebuild_fts=true)' --db ~/.khive/khive.db
 ```
 
 > Stop the MCP daemon before a large reindex to avoid SQLite write contention:

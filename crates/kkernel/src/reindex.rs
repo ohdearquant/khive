@@ -727,6 +727,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
             sections: do_sections,
             drop_existing,
             rebuild_ann: true,
+            rebuild_fts: true,
             batch_size: Some(batch_size),
         };
         match khive_pack_knowledge::reindex_knowledge(

@@ -149,6 +149,14 @@ above remains the historical pre-consolidation record.
 |     V19 | #1649              | list_cursor_backfill_repair        | shipped |
 |     V20 | ADR-091 / #1850    | blob_gc_claims                     | shipped |
 |     V21 | ADR-121 / ADR-160  | attachments_first_class            | shipped |
+|     V22 | #2166              | notes_unread_probe_recipient       | shipped |
+|     V23 | #2273              | knowledge_fts_repair               | shipped |
+
+> **V23 record (2026-08-29)**: `knowledge_fts_repair` recreates atom FTS against
+> the live-row `knowledge_atoms_fts_content` view, installs symmetric lifecycle
+> triggers, and rebuilds both knowledge external-content indexes. This makes
+> rank-1 FTS5 integrity checks meaningful while repairing historical section
+> drift that V2's trigger-only change could not heal.
 
 > **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
 > array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,

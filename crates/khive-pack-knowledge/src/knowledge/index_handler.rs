@@ -23,13 +23,23 @@ impl KnowledgeHandlers {
     ) -> Result<Value, RuntimeError> {
         let p: IndexParams = deser(params)?;
         let rebuild_ann = p.rebuild_ann.unwrap_or(false);
+        let rebuild_fts = p.rebuild_fts.unwrap_or(false);
         let ns = token.namespace().as_str().to_owned();
+
+        if rebuild_fts {
+            rebuild_fts_indexes(runtime).await?;
+        }
 
         let default_model_name = runtime.default_embedder_name();
         if default_model_name.is_empty() {
-            return Ok(
-                json!({ "indexed": 0, "skipped": 0, "failed": 0, "total": 0, "reason": "no embedding model configured" }),
-            );
+            return Ok(json!({
+                "indexed": 0,
+                "skipped": 0,
+                "failed": 0,
+                "total": 0,
+                "fts_rebuilt": rebuild_fts,
+                "reason": "no embedding model configured",
+            }));
         }
         let sql = runtime.sql();
         let batch_size = p.batch_size.unwrap_or(DEFAULT_EMBED_BATCH).clamp(1, 1000);
@@ -217,9 +227,51 @@ impl KnowledgeHandlers {
             "total": total,
             "ann_vectors": ann_count,
             "ann_failed": ann_failed,
+            "fts_rebuilt": rebuild_fts,
             "truncation_by_model": truncation_by_model,
         }))
     }
+}
+
+/// Rebuild both external-content FTS indexes and verify that each one matches
+/// its content object. The writer batch is atomic: callers never receive a
+/// successful repair acknowledgement after only one index was rebuilt.
+async fn rebuild_fts_indexes(runtime: &KhiveRuntime) -> Result<(), RuntimeError> {
+    let mut writer = runtime
+        .sql()
+        .writer()
+        .await
+        .map_err(|e| sql_err("knowledge FTS rebuild writer", e))?;
+    writer
+        .execute_batch(vec![
+            SqlStatement {
+                sql: "INSERT INTO fts_knowledge(fts_knowledge) VALUES('rebuild')".into(),
+                params: vec![],
+                label: Some("knowledge.index.fts_knowledge.rebuild".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO fts_sections(fts_sections) VALUES('rebuild')".into(),
+                params: vec![],
+                label: Some("knowledge.index.fts_sections.rebuild".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO fts_knowledge(fts_knowledge, rank) \
+                      VALUES('integrity-check', 1)"
+                    .into(),
+                params: vec![],
+                label: Some("knowledge.index.fts_knowledge.integrity".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO fts_sections(fts_sections, rank) \
+                      VALUES('integrity-check', 1)"
+                    .into(),
+                params: vec![],
+                label: Some("knowledge.index.fts_sections.integrity".into()),
+            },
+        ])
+        .await
+        .map_err(|e| sql_err("knowledge FTS rebuild", e))?;
+    Ok(())
 }
 
 /// One default-model indexing outcome, counted in vectors.
