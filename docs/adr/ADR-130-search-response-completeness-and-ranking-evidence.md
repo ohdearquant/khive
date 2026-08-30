@@ -478,7 +478,7 @@ now honour the field's value rather than a constant, and a caller that acts on
 8. Retry-policy tests proving `search_incomplete` is not retried by default;
    generic error-retry client behaviour is covered by this row. **Amended: see
    Amendment 2 §6** — the default is unchanged, but a test asserting
-   `retryable` is *always* `false` now contradicts the record; assert the
+   `retryable` is _always_ `false` now contradicts the record; assert the
    default and the all-timeout case separately.
 9. Compatibility-alias contract tests: `partial=true` present beside every
    `status="partial"` success and absent on `complete` in v0.8.0.
@@ -579,7 +579,7 @@ When `retryable=true`, the error object MUST additionally carry
 elapses.
 
 The field is mandatory rather than optional because §3's answer to the
-amplification argument depends on the *server* naming the pace; an absent field
+amplification argument depends on the _server_ naming the pace; an absent field
 returns that decision to the client, which is the situation the retry contract
 already distrusts. A surface with no better estimate MUST therefore emit a
 documented default floor rather than omitting the field — "the server always
@@ -595,14 +595,14 @@ backend, and its arithmetic stands: ten callers at five searches per second,
 retrying three times, can turn 50 logical searches per second into 150 attempts
 per second. That figure is not disputed here, and one part of it is conceded
 below: absent admission control, delays alone do not lower it. What follows is
-why conditional retryability *under §4* does not leave that outcome standing.
+why conditional retryability _under §4_ does not leave that outcome standing.
 
 **Backoff bounds the instantaneous burst, and only that.** Read as an
 instantaneous rate, the 150/sec figure requires the three retries for one logical
 request to be issued without delay, so that one request's retries stack on the
 next request's first attempt. Under §4's mandatory backoff those attempts are
 spread across the backoff window, which removes the burst. That disposes of the
-*transient* case — a blip that resolves inside one backoff window, where the
+_transient_ case — a blip that resolves inside one backoff window, where the
 retries land after recovery and cost the failing backend nothing.
 
 **It does not dispose of the sustained case, and this amendment does not claim it
@@ -614,7 +614,7 @@ ramp; it does not lower the plateau. The sustained case is answered by the
 breaker below, not by this bullet.
 
 What `retry_after_ms` contributes here is narrower than pacing away the volume:
-it makes the *server* the party that sets the interval, which is what lets the
+it makes the _server_ the party that sets the interval, which is what lets the
 breaker's own recovery probe and the clients' reissue schedule agree instead of
 being chosen independently by every caller.
 
@@ -631,7 +631,7 @@ on the compliant.
 
 **The breaker, not backoff, is the load control for a sustained outage — and it
 makes that case strictly better.** Circuit-breaker admission opens after
-consecutive timeouts and suppresses attempts *including first attempts*. That
+consecutive timeouts and suppresses attempts _including first attempts_. That
 last property is what distinguishes it from every retry-shaping rule: it removes
 load the current contract cannot reach, because `retryable=false` governs only
 reissues and says nothing about first attempts.
@@ -654,7 +654,7 @@ Decision §6. It does not claim backoff lowers the sustained-outage rate — the
 second bullet concedes it does not. And it does not claim clients will comply,
 nor that admission control reaches those who do not: the breaker is a client-side
 obligation, so a client that ignores `retryable` ignores the breaker too. The
-answer for that population is not enforcement but *inertness* — it behaves
+answer for that population is not enforcement but _inertness_ — it behaves
 identically before and after this amendment, because it already ignores
 `retryable=false` today.
 
@@ -751,7 +751,7 @@ single constant `backend_error`, so a reader that ignored the new object was
 unaffected. That form shipped in v0.8.0, which means a strict reader may have
 pinned `kind` to that one value. Widening it to a closed two-value vocabulary
 makes such a reader reject a well-formed response, so the widening is a breaking
-change *for that reader* and takes the next release rather than a point update.
+change _for that reader_ and takes the next release rather than a point update.
 `retry_after_ms` is a new field and would be additive on its own; it ships in the
 same release as the vocabulary change because §2 makes the two jointly
 observable — a `retryable=true` response is exactly one whose legs all typed as
