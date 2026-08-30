@@ -379,6 +379,32 @@ async fn request_tool_description_contains_dynamic_verb_catalog() -> anyhow::Res
     Ok(())
 }
 
+#[tokio::test]
+async fn request_tool_description_declares_comm_read_dependency_contract() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let listed = client.list_tools(None).await?;
+    let request = listed
+        .tools
+        .iter()
+        .find(|t| t.name == "request")
+        .expect("request tool must be present");
+    let desc = request.description.as_deref().unwrap_or("");
+
+    assert!(
+        desc.contains("comm.read") && desc.contains("comm.mark_read"),
+        "the request surface must name state-mutating read acknowledgements: {desc}"
+    );
+    assert!(
+        desc.contains("does not wait for or depend on comm.send/comm.reply"),
+        "the parallel sibling-independence hazard must be explicit: {desc}"
+    );
+    assert!(
+        desc.contains("comm.reply delivers first") && desc.contains("use a chain"),
+        "the contract must give both safe sequencing alternatives: {desc}"
+    );
+    Ok(())
+}
+
 // ── KG verbs round-tripped through the DSL ──────────────────────────────────
 
 #[tokio::test]
