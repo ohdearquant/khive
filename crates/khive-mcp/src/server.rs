@@ -3827,6 +3827,7 @@ fn fit_rendered_batch_envelope(
             "results".to_string(),
             serde_json::Value::Array(out_results.clone()),
         );
+        refresh_frame_budget_outcome(&mut out_map);
         if response_value_fits_daemon_frame(
             &serde_json::Value::Object(out_map.clone()),
             served_config_id,
@@ -3862,9 +3863,20 @@ fn frame_budget_omission(entry: &Value) -> Value {
         }
     }
     if ok {
+        // Once the result is discarded, the operation is not a usable
+        // success. In particular, a pager must not interpret the missing
+        // payload as an empty terminal page. Surface a small, typed safe-retry
+        // error and let the caller reduce its limit or result size.
+        omitted.insert("ok".to_string(), Value::Bool(false));
         omitted.insert(
-            "result_omitted".to_string(),
-            json!("operation succeeded; result omitted because the response frame budget was exceeded"),
+            "error".to_string(),
+            json!({
+                "kind": "response_frame_budget_exceeded",
+                "code": "response_frame_budget_exceeded",
+                "message": "operation result exceeded the daemon response frame budget; reduce limit or result size and retry",
+                "retryable": true,
+                "max_frame_bytes": khive_runtime::daemon::MAX_FRAME_BYTES,
+            }),
         );
     } else {
         // ADR-130 §Compatibility (MCP envelope builder): `search_incomplete`
@@ -3888,6 +3900,37 @@ fn frame_budget_omission(entry: &Value) -> Value {
         }
     }
     Value::Object(omitted)
+}
+
+/// Rebuild aggregate outcome fields after the transport layer turns one or
+/// more oversized successes into explicit failures.
+fn refresh_frame_budget_outcome(map: &mut serde_json::Map<String, Value>) {
+    let Some(results) = map.get("results").and_then(Value::as_array) else {
+        return;
+    };
+    let total = results.len();
+    let succeeded = results
+        .iter()
+        .filter(|entry| entry.get("ok").and_then(Value::as_bool) == Some(true))
+        .count();
+    let aborted = results
+        .iter()
+        .filter(|entry| {
+            entry.get("ok").and_then(Value::as_bool) == Some(false)
+                && entry.get("aborted").and_then(Value::as_bool) == Some(true)
+        })
+        .count();
+    let failed = total.saturating_sub(succeeded + aborted);
+    map.insert(
+        "summary".to_string(),
+        json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "aborted": aborted,
+        }),
+    );
+    map.insert("status".to_string(), json!(batch_status(failed, aborted)));
 }
 
 fn serialized_response_len(value: &Value) -> usize {
@@ -5149,7 +5192,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_dispatch_degrades_result_larger_than_frame() {
+    async fn daemon_dispatch_rejects_result_larger_than_frame_as_retryable() {
         let server = large_result_test_server();
         let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
         let response = dispatch_large_result_through_daemon(
@@ -5160,9 +5203,16 @@ mod tests {
         .await;
 
         let envelope: Value = serde_json::from_str(&response).expect("response envelope");
-        assert_eq!(envelope["results"][0]["ok"], true);
+        assert_eq!(envelope["results"][0]["ok"], false);
         assert!(envelope["results"][0].get("result").is_none());
-        assert!(envelope["results"][0].get("result_omitted").is_some());
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        assert_eq!(envelope["results"][0]["error"]["retryable"], true);
+        assert_eq!(envelope["summary"]["succeeded"], 0);
+        assert_eq!(envelope["summary"]["failed"], 1);
+        assert_eq!(envelope["status"], "partial");
         assert!(rendered_response_fits_daemon_frame(
             &response,
             &server.config_id
@@ -5229,7 +5279,7 @@ mod tests {
             },
         }));
 
-        assert_eq!(omitted["ok"], json!(true));
+        assert_eq!(omitted["ok"], json!(false));
         assert_eq!(omitted["status"], json!("partial"));
         assert_eq!(omitted["partial"], json!(true));
         assert_eq!(omitted["missing_backends"], json!(["archive"]));
@@ -5238,7 +5288,11 @@ mod tests {
             json!("storage unavailable")
         );
         assert!(omitted.get("result").is_none());
-        assert!(omitted.get("result_omitted").is_some());
+        assert_eq!(
+            omitted["error"]["kind"],
+            json!("response_frame_budget_exceeded")
+        );
+        assert_eq!(omitted["error"]["retryable"], json!(true));
     }
 
     #[test]
@@ -5401,10 +5455,14 @@ mod tests {
             "status": "complete",
         }));
 
-        assert_eq!(omitted["ok"], json!(true));
+        assert_eq!(omitted["ok"], json!(false));
         assert_eq!(omitted["status"], json!("complete"));
         assert!(omitted.get("partial").is_none());
         assert!(omitted.get("result").is_none());
+        assert_eq!(
+            omitted["error"]["code"],
+            json!("response_frame_budget_exceeded")
+        );
     }
 
     /// ADR-130 §Compatibility: the `search_incomplete` error is small and

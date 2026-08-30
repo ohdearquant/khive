@@ -51,8 +51,9 @@ operation is successful but its operation envelope also carries:
 
 The advisory is part of a typed intercepted-dispatch outcome, not an optional
 mutex slot. The same value flows through single, batch, and chain execution;
-presentation transforms only `result`, and daemon frame-budget omission keeps
-the bounded diagnostics even if the result itself must be omitted. If no hit
+presentation transforms only `result`, and daemon frame-budget handling keeps
+the bounded diagnostics if an oversized result becomes a typed retryable frame
+error. If no hit
 survives filtering, `missing_backends` and `backend_errors` instead live inside
 the `search_incomplete` error. Complete searches omit both fields. At most 16
 causes and one per-operation wire budget are retained; truncation is explicit

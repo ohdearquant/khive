@@ -454,7 +454,10 @@ the batch summary, and MUST NOT be injected into `result`. Advisory objects
 have stable `code`, `severity`, `component`, `reason`, and `message` fields.
 Presentation and output-format transforms apply only to `result`, so callers
 receive advisory objects unchanged. Frame-budget degradation preserves the
-array even if an oversized `result` is replaced by `result_omitted`.
+array even if an oversized `result` is replaced by a typed retryable
+`response_frame_budget_exceeded` error. That replacement changes `ok` to false
+and refreshes the batch summary; a discarded result is never reported as a
+successful empty response.
 
 The first governed advisory is
 `audit_persistence_skipped_read_only` (ADR-028 Amendment A2). It appears on
