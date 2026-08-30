@@ -475,6 +475,8 @@ jobs:
     defaults:
       run:
         working-directory: crates
+    env:
+      WASMTIME_VERSION: v46.0.1
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -486,11 +488,36 @@ jobs:
           cache-on-failure: true
       # Pinned exact version (same rationale as the cargo-deny/gitleaks pins
       # above): a wasm-parity gate's tooling must not silently drift.
+      - name: Cache wasmtime
+        id: cache-wasmtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.wasmtime
+          key: wasmtime-${{ runner.os }}-${{ runner.arch }}-${{ env.WASMTIME_VERSION }}
       - name: Install wasmtime (pinned)
+        if: steps.cache-wasmtime.outputs.cache-hit != 'true'
         run: |
-          set -o pipefail
-          curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version v46.0.1
-          "$HOME/.wasmtime/bin/wasmtime" --version
+          set -euo pipefail
+          archive="$RUNNER_TEMP/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz"
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-max-time 300 \
+            --output "$archive" \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz"
+          mkdir -p "$HOME/.wasmtime/bin"
+          tar -xJf "$archive" \
+            -C "$HOME/.wasmtime/bin" \
+            --strip-components=1 \
+            "wasmtime-${WASMTIME_VERSION}-x86_64-linux/wasmtime"
+      - name: Verify wasmtime version
+        run: |
+          set -euo pipefail
+          expected_version="${WASMTIME_VERSION#v}"
+          actual_version="$("$HOME/.wasmtime/bin/wasmtime" --version)"
+          if [[ "$actual_version" != "wasmtime ${expected_version}"* ]]; then
+            echo "expected wasmtime ${expected_version}, got: ${actual_version}" >&2
+            exit 1
+          fi
+          echo "$actual_version"
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
       - name: wasm32-unknown-unknown compile check (ADR-101 D5)
         run: cargo check -p khive-changeset --target wasm32-unknown-unknown
