@@ -591,6 +591,27 @@ The durable fix for listing verbosity remains per-verb response contracts (listi
 project selection fields, acknowledgements return acknowledgements); this amendment makes
 the view layer honest in the interim rather than lossy.
 
+## Amendment 3 (2026-08-29): Agent JSON redundancy reduction
+
+The default MCP combination, `presentation=agent, format=json`, previously kept
+top-level fields duplicated verbatim inside each record's `properties` object. This
+made the most common machine-readable response materially larger than the equivalent
+`auto` view, especially for GTD listings, without preserving additional information.
+
+This amendment supersedes §7's format-only gate: the §7 reductions now apply to every
+Agent-presentation success payload, including JSON. Agent JSON therefore omits
+`full_id`, elides `namespace="local"`, and removes child `properties` entries that
+exactly duplicate top-level siblings. Additive property keys remain. JSON retains its
+machine-walkable type and field-value encoding; only the enumerated view reductions
+apply.
+
+`presentation=verbose, format=json` remains the canonical lossless escape hatch and
+continues to emit the full handler shape. Human JSON also remains unreduced. Error
+entries are unchanged. `$prev` substitution remains safe because chains resolve from
+canonical handler results before presentation and format preparation at the response
+boundary. In a compounded response, JSON result payloads stay JSON values rather than
+rendered strings; the same reduction policy is applied directly to those values.
+
 ## References
 
 - ADR-016 (Request DSL) — short-UUID-prefix resolution; `$prev` chain semantics; `RequestParams`

@@ -36,9 +36,9 @@ use khive_request::{
     ParsedRequest, PrevFailure, TypedJsonOp,
 };
 use khive_runtime::{
-    present, render_format, InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError,
-    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
-    VerbRegistry, VerbRegistryBuilder,
+    prepare_format_value, present, render_format, InterceptedDispatchResult, KhiveRuntime,
+    OutputFormat, PackLoadError, PackRegistry, PresentationMode, RuntimeConfig, RuntimeError,
+    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_types::RefusalReason;
 
@@ -3732,7 +3732,7 @@ fn render_batch_entry(
         .and_then(|format| *format)
         .unwrap_or(batch_format);
     let is_ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    if !is_ok || per_op_format == OutputFormat::Json {
+    if !is_ok {
         return entry.clone();
     }
 
@@ -3754,14 +3754,16 @@ fn render_batch_entry(
     };
     let mut rendered_entry = entry.clone();
     if let Value::Object(ref mut fields) = rendered_entry {
-        fields.insert(
-            "result".to_string(),
+        let formatted = if per_op_format == OutputFormat::Json {
+            prepare_format_value(result.clone(), per_op_format, effective_presentation)
+        } else {
             Value::String(render_format(
                 result.clone(),
                 per_op_format,
                 effective_presentation,
-            )),
-        );
+            ))
+        };
+        fields.insert("result".to_string(), formatted);
     }
     rendered_entry
 }

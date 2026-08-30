@@ -22,8 +22,9 @@ use serde_json::{Map, Value};
 /// `OutputFormat` controls how the resulting `serde_json::Value` is serialized
 /// or rendered to the wire string.
 ///
-/// Default is [`OutputFormat::Json`] on every surface: compact, lossless,
-/// shape-stable machine contract.
+/// Default is [`OutputFormat::Json`] on every surface: compact and
+/// machine-walkable. Verbose JSON is lossless; Agent JSON additionally applies
+/// the enumerated redundancy reductions from ADR-078 Amendment 3.
 ///
 /// Note: `Yaml` is a clean follow-up — implemented as a 3-variant enum
 /// (`Json`, `Auto`, `Table`) per ADR-078 §"yaml" which permits omission when
@@ -31,7 +32,8 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
-    /// Compact JSON (`serde_json::to_string`). Lossless machine contract. Default.
+    /// Compact JSON (`serde_json::to_string`). Default; lossless in Verbose
+    /// presentation and redundancy-reduced in Agent presentation.
     #[default]
     Json,
     /// Shape-aware: markdown table for homogeneous record arrays (with
@@ -64,25 +66,40 @@ const PROPERTY_HOIST_FIELDS: &[&str] = &["trigger_at", "due", "status"];
 /// Error envelopes (`ok=false`) are never passed here — the caller must handle
 /// them as compact JSON directly (ADR-078 §8.2).
 ///
-/// When `format` is [`OutputFormat::Json`], returns compact JSON (`serde_json::to_string`).
-/// When `format` is [`OutputFormat::Auto`] or [`OutputFormat::Table`], applies the
-/// redundancy-reduction pre-pass (§7) — unless `presentation` is [`PresentationMode::Verbose`]
-/// — then dispatches to the shape-aware renderer. Verbose also disables cell
-/// truncation in the table renderer (§3a).
+/// Agent presentation applies the redundancy-reduction pre-pass (§7) for every
+/// format, including JSON. Auto/table also apply it for Human presentation;
+/// Verbose remains canonical and unreduced. The prepared value is then encoded
+/// as compact JSON or dispatched to the shape-aware renderer. Verbose also
+/// disables cell truncation in the table renderer (§3a).
 pub fn render_format(value: Value, format: OutputFormat, presentation: PresentationMode) -> String {
+    let value = prepare_format_value(value, format, presentation);
     match format {
         OutputFormat::Json => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
         OutputFormat::Auto | OutputFormat::Table => {
-            // Skip the redundancy-reduction pre-pass in Verbose mode: full
-            // canonical shape must pass through unchanged.
-            let verbose = presentation == PresentationMode::Verbose;
-            let reduced = if verbose {
-                value
-            } else {
-                apply_redundancy_drop(value)
-            };
-            render_auto(reduced, !verbose)
+            render_auto(value, presentation != PresentationMode::Verbose)
         }
+    }
+}
+
+/// Prepare a successful result for its requested format at the wire boundary.
+///
+/// JSON remains a JSON value in compounded response envelopes, so the MCP seam
+/// uses this helper directly instead of round-tripping through a serialized
+/// string. Keeping the policy here prevents the single-value and compounded
+/// paths from drifting.
+pub fn prepare_format_value(
+    value: Value,
+    format: OutputFormat,
+    presentation: PresentationMode,
+) -> Value {
+    let reduce = match format {
+        OutputFormat::Json => presentation == PresentationMode::Agent,
+        OutputFormat::Auto | OutputFormat::Table => presentation != PresentationMode::Verbose,
+    };
+    if reduce {
+        apply_redundancy_drop(value)
+    } else {
+        value
     }
 }
 
@@ -93,9 +110,9 @@ pub fn render_format(value: Value, format: OutputFormat, presentation: Presentat
 /// Applies at most ONE pass over the value. This function is the canonical
 /// entry for the pre-pass; the per-record logic lives in `drop_record`.
 ///
-/// Applied only when `format` ∈ {`auto`, `table`} AND `presentation` ≠ `Verbose`.
-/// Callers are responsible for checking those conditions; this function applies
-/// unconditionally.
+/// Applied for Agent presentation in every format and for non-Verbose
+/// auto/table output. Callers are responsible for checking those conditions;
+/// this function applies unconditionally.
 pub fn apply_redundancy_drop(value: Value) -> Value {
     match value {
         Value::Object(_) => drop_record(value),
@@ -1360,16 +1377,16 @@ mod tests {
 
     // ── ADR-078: OutputFormat tests ───────────────────────────────────────────
 
-    /// (a) json format preserves full shape (no field dropped, no transformation).
+    /// (a) verbose json preserves full shape (no field dropped, no transformation).
     #[test]
-    fn format_json_preserves_full_shape() {
+    fn format_verbose_json_preserves_full_shape() {
         let v = json!({
             "full_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
             "namespace": "local",
             "properties": {"k": "v"},
             "title": "test"
         });
-        let rendered = render_format(v.clone(), OutputFormat::Json, PresentationMode::Agent);
+        let rendered = render_format(v.clone(), OutputFormat::Json, PresentationMode::Verbose);
         let parsed: Value = serde_json::from_str(&rendered).unwrap();
         // full_id must not be dropped in json mode.
         assert!(
@@ -1385,33 +1402,23 @@ mod tests {
         assert!(parsed.get("properties").is_some());
     }
 
-    /// (a-vs-auto) auto mode drops redundant fields that json mode preserves.
+    /// (a-agent-json) Agent JSON applies the same view-only redundancy reduction.
     #[test]
-    fn format_auto_drops_versus_json_keeps() {
+    fn format_agent_json_drops_redundancy() {
         let v = json!({
             "full_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
             "namespace": "local",
-            "title": "test"
+            "title": "test",
+            "status": "next",
+            "properties": {"status": "next", "additive": true}
         });
-        let json_rendered = render_format(v.clone(), OutputFormat::Json, PresentationMode::Agent);
-        let auto_rendered = render_format(v.clone(), OutputFormat::Auto, PresentationMode::Agent);
-        // json keeps both; auto drops namespace="local" and full_id.
-        let json_parsed: Value = serde_json::from_str(&json_rendered).unwrap();
-        assert!(
-            json_parsed.get("full_id").is_some(),
-            "json must keep full_id"
-        );
-        assert_eq!(
-            json_parsed.get("namespace").and_then(Value::as_str),
-            Some("local")
-        );
-        // Auto mode elides namespace=local and drops full_id.
-        // The value itself is a single record → rendered as compact JSON.
-        assert!(!auto_rendered.contains("full_id"), "auto must drop full_id");
-        assert!(
-            !auto_rendered.contains("namespace"),
-            "auto must elide namespace=local"
-        );
+        let rendered = render_format(v, OutputFormat::Json, PresentationMode::Agent);
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert!(parsed.get("full_id").is_none());
+        assert!(parsed.get("namespace").is_none());
+        assert_eq!(parsed["status"], json!("next"));
+        assert!(parsed["properties"].get("status").is_none());
+        assert_eq!(parsed["properties"]["additive"], json!(true));
     }
 
     /// (b1) homogeneous record array → markdown table with header + separator + rows.
