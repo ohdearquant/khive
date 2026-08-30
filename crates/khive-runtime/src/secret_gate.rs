@@ -77,10 +77,9 @@ impl std::fmt::Display for SecretMatch {
 /// is not — the common case for the detectors below, which key off SHAPE
 /// near a trigger word rather than a known credential prefix — the fix is to
 /// break up the flagged token so it no longer reads as one contiguous
-/// high-entropy value: put it on its own line away from words like
-/// key/secret/auth/token, or insert a space/punctuation inside a long path or
-/// identifier (e.g. `workspaces / 20260705 / topic` instead of one glued
-/// token).
+/// high-entropy value: separate it from words like key/secret/auth/token with
+/// a sentence or paragraph boundary, or use an explicit repository revision
+/// reference for a source hash.
 fn block_guidance(detector: &'static str) -> &'static str {
     match detector {
         "high-entropy-token"
@@ -89,9 +88,9 @@ fn block_guidance(detector: &'static str) -> &'static str {
         | "hex-credential-token" => {
             "If this is a real credential, remove it before writing. If it is not \
              (e.g. a file path, UUID, or hash that happens to sit near a word like \
-             key/secret/auth/token), reword so the token is not glued directly next \
-             to that word — e.g. move it to its own line, or insert a space or word \
-             between them."
+             key/secret/auth/token), put the candidate in a separate sentence or \
+             paragraph from those words, or express a source hash as an explicit \
+             commit/revision reference."
         }
         _ => {
             "If this is a real credential, remove it before writing; store secrets \
@@ -922,13 +921,30 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             continue;
         }
 
-        let vcs_reference_exempt = is_git_revision_reference(text, token_offset, raw_token)
-            && !has_clause_credential_label(
-                text,
-                token_offset,
-                raw_token,
-                ClauseValueKind::VcsReference,
-            );
+        let repository_revision_reference = is_repository_revision_reference(raw_token);
+        let vcs_reference_exempt = if repository_revision_reference {
+            !has_direct_repository_credential_label(text, token_offset, raw_token)
+        } else {
+            is_git_revision_reference(text, token_offset, raw_token)
+                && !has_clause_credential_label(
+                    text,
+                    token_offset,
+                    raw_token,
+                    ClauseValueKind::VcsReference,
+                )
+        };
+
+        // Dense mathematical notation has the same mixed-character entropy
+        // profile as an opaque token. Exempt a syntactically recognizable
+        // LaTeX fragment only when it contains no credential-shaped run and
+        // the immediately preceding field does not label it as a credential
+        // (#1988). Known-prefix detectors have already run before this layer.
+        if near_trigger
+            && is_latex_fragment_without_credential_run(token)
+            && !has_immediate_credential_label(text, token_offset)
+        {
+            continue;
+        }
 
         // Step 3. Hex API keys aren't caught by the entropy heuristic (hex tops out at
         // 4.0 bits/char, below ENTROPY_THRESHOLD 4.5); flag credential-shaped hex directly.
@@ -1012,6 +1028,14 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             }
         }
 
+        // Canonical repository links and href commit targets are source
+        // coordinates, not standalone values. The direct-label guard above
+        // keeps `api key: <revision URL>` fail-closed; technical prose such as
+        // `key-scoped source` can safely retain the citation (#2076).
+        if vcs_reference_exempt {
+            continue;
+        }
+
         // Step 8: structured-identifier exemption, off-trigger only. Must run after the
         // UUID/hex checks and before the entropy computation (an identifier can exceed
         // ENTROPY_THRESHOLD on Shannon entropy alone).
@@ -1088,12 +1112,98 @@ fn is_git_revision_reference(text: &str, token_offset: usize, raw_token: &str) -
         && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn is_exact_hex_revision(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Repository-native revision coordinates embedded in a URL/HTML token.
+///
+/// This intentionally recognizes only exact 40-hex revisions after a
+/// canonical repository path marker, plus an exact `href=<40hex>` target.
+/// Arbitrary query values, prefixes, and credential-length hex elsewhere in
+/// markup remain subject to the normal detector.
+fn is_repository_revision_reference(raw_token: &str) -> bool {
+    let token = wrapper_strip_repeated(raw_token);
+    let low = token.to_ascii_lowercase();
+
+    for marker in ["/blob/", "/tree/", "/commit/", "/commits/"] {
+        let mut from = 0usize;
+        while let Some(relative) = low[from..].find(marker) {
+            let value_start = from + relative + marker.len();
+            let remainder = &token[value_start..];
+            let value_end = remainder
+                .bytes()
+                .position(|byte| !byte.is_ascii_hexdigit())
+                .unwrap_or(remainder.len());
+            if is_exact_hex_revision(&remainder[..value_end]) {
+                return true;
+            }
+            from = value_start.min(low.len());
+            if from == low.len() {
+                break;
+            }
+        }
+    }
+
+    for (prefix, quote) in [("href=\"", '"'), ("href='", '\'')] {
+        if let Some(start) = low.find(prefix) {
+            let value = &token[start + prefix.len()..];
+            if let Some(end) = value.find(quote) {
+                if is_exact_hex_revision(&value[..end]) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn trailing_identifier(text: &str) -> &str {
     let trimmed = text.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
     trimmed
         .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .next()
         .unwrap_or_default()
+}
+
+/// Return whether the identifier immediately preceding a candidate is a
+/// credential label. This deliberately does not walk through narrative prose:
+/// notation such as `key estimate uses \\operatorname{softmax}` contains a
+/// trigger word, but does not assign the LaTeX fragment to that word.
+fn has_immediate_credential_label(text: &str, token_offset: usize) -> bool {
+    let before = text[..token_offset].trim_end();
+    let before = before
+        .strip_suffix(':')
+        .or_else(|| before.strip_suffix('='))
+        .unwrap_or(before);
+    let label = trailing_identifier(before).to_ascii_lowercase();
+
+    label == "token"
+        || COMPOUND_TRIGGER_WORDS
+            .iter()
+            .any(|trigger| label.contains(trigger))
+        || TRIGGER_WORDS
+            .iter()
+            .any(|trigger| contains_bounded_word(&label, trigger))
+}
+
+/// A repository revision URL/href is exempt from broad trigger proximity,
+/// but never from a direct credential label. When a value separator is
+/// present immediately before the reference, only its actual field label is
+/// authoritative: narrative shapes such as `key-scoped source citation:`
+/// must not turn the earlier adjective into the citation value's label.
+fn has_direct_repository_credential_label(
+    text: &str,
+    token_offset: usize,
+    raw_token: &str,
+) -> bool {
+    let before = text[..token_offset].trim_end();
+    if before.ends_with(':') || before.ends_with('=') {
+        return has_immediate_credential_label(text, token_offset);
+    }
+
+    has_clause_credential_label(text, token_offset, raw_token, ClauseValueKind::VcsReference)
 }
 
 /// Words the clause walk in [`has_clause_credential_label`] steps over when
@@ -1476,6 +1586,35 @@ fn is_plausible_file_path(token: &str) -> bool {
         .filter(|segment| !segment.is_empty())
         .count();
     segment_count >= 2 || (path.starts_with('/') && segment_count == 1)
+}
+
+/// Narrow high-entropy exemption for mathematical notation (#1988).
+///
+/// A fragment needs both a LaTeX control sequence and several structural
+/// delimiters. Any embedded credential-length hex or independently
+/// high-entropy alphanumeric run disables the exemption, so wrapping an
+/// opaque value in `\texttt{...}` does not launder it.
+fn is_latex_fragment_without_credential_run(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let has_control_sequence = bytes
+        .windows(2)
+        .any(|pair| pair[0] == b'\\' && pair[1].is_ascii_alphabetic());
+    let structural_count = bytes
+        .iter()
+        .filter(|byte| matches!(byte, b'\\' | b'{' | b'}' | b'^' | b'_'))
+        .count();
+    if !has_control_sequence || structural_count < 3 {
+        return false;
+    }
+
+    if normalized_hex_credential_span(token).is_some() {
+        return false;
+    }
+
+    !token
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|run| run.len() >= MIN_ENTROPY_LEN)
+        .any(|run| shannon_entropy(run.as_bytes()) >= ENTROPY_THRESHOLD)
 }
 
 fn is_line_location_suffix(suffix: &str) -> bool {
@@ -3132,6 +3271,88 @@ mod tests {
             "a detector name in an earlier sentence must not trigger: {:?}",
             scan(content)
         );
+    }
+
+    #[test]
+    fn issue_2076_allows_repository_revision_links_near_prose_triggers() {
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let contents = [
+            format!(
+                "key-scoped source citation: \
+                 https://github.com/acme/widgets/blob/{revision}/src/runtime/mod.rs"
+            ),
+            format!("auth-bound rendering keeps <a href=\"{revision}\">the commit link</a> intact"),
+        ];
+
+        for content in contents {
+            assert!(
+                check(&content).is_ok(),
+                "repository revision reference must pass: {content:?}, got {:?}",
+                scan(&content)
+            );
+        }
+    }
+
+    #[test]
+    fn issue_2076_repository_revision_links_do_not_hide_labeled_secrets() {
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let contents = [
+            format!("api key: https://github.com/acme/widgets/blob/{revision}/src/runtime/mod.rs"),
+            format!("secret key: href=\"{revision}\""),
+        ];
+
+        for content in contents {
+            assert!(
+                check(&content).is_err(),
+                "a direct credential label must still block: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_2076_guidance_names_a_boundary_that_changes_the_predicate() {
+        let guidance = block_guidance("high-entropy-token");
+        assert!(guidance.contains("sentence") || guidance.contains("paragraph"));
+        assert!(
+            !guidance.contains("own line"),
+            "a single newline remains inside the trigger window"
+        );
+    }
+
+    #[test]
+    fn issue_1988_allows_dense_latex_fragments_near_math_vocabulary() {
+        let latex = r"\operatorname{Spec}_{H_0^1(\Omega)}(K_N(\tau_{\omega}))^{1/2}";
+        assert!(latex.len() >= MIN_ENTROPY_LEN);
+        assert!(shannon_entropy(latex.as_bytes()) >= ENTROPY_THRESHOLD);
+        let content = format!("the attention key estimate uses {latex}");
+
+        assert!(
+            check(&content).is_ok(),
+            "LaTeX structure must not be mistaken for a credential: {:?}",
+            scan(&content)
+        );
+    }
+
+    #[test]
+    fn issue_1988_latex_exemption_does_not_hide_credential_runs() {
+        let credential = "a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4";
+        let content = format!(r"api key: \texttt{{{credential}}}");
+
+        assert!(
+            check(&content).is_err(),
+            "credential-shaped runs inside LaTeX must remain blocked"
+        );
+    }
+
+    #[test]
+    fn issue_1988_published_secret_vectors_remain_fail_closed() {
+        // RFC 8032 Ed25519ph example secret. Published status cannot be
+        // inferred from shape, so exact vectors remain blocked unless a
+        // caller uses the separately audited exemption contract.
+        let published = "833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42";
+        let content = format!("RFC 8032 secret key test vector: {published}");
+
+        assert!(check(&content).is_err());
     }
 
     #[test]
@@ -5674,14 +5895,14 @@ mod tests {
     }
 
     #[test]
-    fn block_message_shape_guidance_mentions_rewording() {
+    fn block_message_shape_guidance_names_effective_boundary() {
         let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
         let content = format!("auth header {opaque}");
         let m = scan(&content).unwrap();
         let rendered = m.to_string();
         assert!(
-            rendered.contains("reword") || rendered.contains("own line"),
-            "shape-based detector guidance must suggest rewording/splitting: {rendered}"
+            rendered.contains("sentence") || rendered.contains("paragraph"),
+            "shape-based detector guidance must name an effective context boundary: {rendered}"
         );
     }
 }

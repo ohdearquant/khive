@@ -10,9 +10,10 @@ module doc-comment carries only a concise summary and points here.
 
 Allowlist (false-positive suppression) — **all of the following are prose-context exemptions,
 not unconditional passes: a credential trigger word in the surrounding window dominates, with
-exactly two narrow trigger-context exceptions (file paths and VCS revisions, defined below),
-both of which run only after the reconstruction checks and only outside credential-value syntax
-per the clause-label guard.** A UUID or a sha-prefixed content hash sitting directly beside
+narrow trigger-context exceptions for file paths, VCS revisions, and recognizable LaTeX fragments
+(defined below). The path and revision exceptions run only after the reconstruction checks and
+outside credential-value syntax; the LaTeX exception rejects credential-shaped inner runs and
+direct credential labels.** A UUID or a sha-prefixed content hash sitting directly beside
 "api_key"/"secret"/"auth" is exactly as ambiguous as any other high-entropy candidate and falls
 through to explicit detection instead of being silently allowed.
 
@@ -80,8 +81,11 @@ through to explicit detection instead of being silently allowed.
   credential-value syntax (see the clause-label guard below).
 - VCS revisions (trigger-context, narrow): a 40-hex value attached to an explicit VCS coordinate
   marker (`commit`, `revision`, `rev`, `sha` — immediately preceding word, or `marker:value` in
-  one token) is treated as a public VCS coordinate near a trigger word, again only outside
-  credential-value syntax. The exemption is a _flag over the hex-credential-shape checks only_,
+  one token), embedded as the revision segment of a canonical repository URL (`/blob/`, `/tree/`,
+  `/commit/`, or `/commits/`), or used as the exact value of an HTML `href` is treated as a public
+  VCS coordinate near a trigger word. URL and `href` forms are still refused when their immediate
+  field label is credential-shaped; ordinary marker forms retain the broader clause-label guard.
+  The exemption is a _flag over the hex-credential-shape checks only_,
   never an early skip of the whole check sequence. For the bare-marker form (`commit <hex>`) the
   exempt hex value is a plain alphanumeric token, so it still participates in fragment
   reconstruction anchored at neighboring tokens: a split credential hiding one fragment behind
@@ -95,8 +99,19 @@ through to explicit detection instead of being silently allowed.
   guard below disables the exemption and the shape checks fire directly. The bare marker word
   itself (form `commit <hex>`) is skipped entirely — a fixed English marker word is not
   attacker-controlled credential material. Generic `hash`/`sha256` prose does not rescue a token.
+- LaTeX fragments (trigger-context, narrow): dense mathematical notation is exempt only when the
+  token contains an alphabetic control sequence plus several structural LaTeX characters
+  (`\\`, braces, superscript, or subscript syntax). The exemption is refused when an immediate
+  field label names a credential, when a normalized credential-length hex value is present, or
+  when any embedded alphanumeric run is itself long and high-entropy. This admits formulas in
+  prose such as `key estimate uses \\operatorname{softmax}` without letting decorative LaTeX wrap
+  an opaque credential. Exact public RFC or vendor test-vector values deliberately remain
+  fail-closed when they have a blocked secret shape: publication alone is not mechanically
+  distinguishable from a live credential. Such corpora need a separate, audited exemption
+  contract or a human-reviewed ingestion path.
 
-Both narrow exemptions above are gated by a **clause-label guard** (`has_clause_credential_label`):
+The path and ordinary-marker VCS exemptions above are gated by a **clause-label guard**
+(`has_clause_credential_label`):
 the exemption is refused when the candidate carries an inline credential shape
 (`api_key=<value>`) or when a credential label is reachable by walking backwards through the
 current clause. The walk steps over connector words that commonly sit between a label and its
@@ -169,6 +184,11 @@ does not, so the common assignment shape `api key:\n<value>` remains blocked. Th
 detector name or other credential vocabulary in an earlier sentence from supplying trigger
 context to an unrelated identifier on a later line. Inline assignment/label checks on the
 candidate itself remain independent of the surrounding window.
+
+Caller guidance names those same effective boundaries: move a non-secret candidate into a
+separate sentence or paragraph, or express a source hash as an explicit commit/revision reference.
+It does not recommend merely moving a value to its own line because a single newline intentionally
+does not change the predicate.
 
 Accepted false positives,
 conservative direction: the walk has no grammar — ANY trigger word reachable inside the
