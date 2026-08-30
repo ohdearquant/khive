@@ -283,7 +283,8 @@ request(ops="comm.send(to=\"email:prof.sheng@example.edu\", subject=\"Draft read
 
 `comm.send` itself only writes the note; it does not talk to SMTP directly.
 A background outbox loop polls every 5 seconds for undelivered outbound
-notes:
+notes. A note is eligible only when it has no terminal `delivery` value and
+its optional RFC 3339 `next_attempt_at` deadline is due:
 
 ```
 list(namespace=<ingest_namespace>, kind="message", direction="outbound", delivered=false, limit=200)
@@ -297,6 +298,17 @@ sent over SMTP, using the note's `subject`, `content`, and any
 `thread_id`/`in_reply_to_message_id`/`references_chain` properties to set the
 RFC 822 `Message-ID`, `In-Reply-To`, and `References` headers so replies group
 correctly in native mail clients.
+
+Delivery outcomes are durable note properties. Success records
+`delivery="delivered"` and `delivered_at`; a definitive configuration,
+authentication, allowlist, SMTP 5xx, or transport-specific client rejection
+records terminal `delivery="failed"`, `failed_at`, and `last_error`. Network
+failures, token-endpoint pressure, SMTP 4xx responses, Telegram 408/429/5xx
+responses, and similar transient errors leave the note pending, increment
+`delivery_attempts`, and set `next_attempt_at` using exponential backoff from
+5 seconds to a 30-minute ceiling. Polls skip the note until that deadline.
+There is no attempt-count promotion to failure; a later successful delivery
+clears `delivery_attempts` and `next_attempt_at`.
 
 ### How inbound ingestion works
 

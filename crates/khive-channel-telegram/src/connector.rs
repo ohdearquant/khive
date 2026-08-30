@@ -45,7 +45,28 @@ struct TelegramApiResponse<T> {
     #[serde(default)]
     result: Option<T>,
     #[serde(default)]
+    error_code: Option<u16>,
+    #[serde(default)]
     description: Option<String>,
+}
+
+fn telegram_api_error<T>(
+    method: &str,
+    status: reqwest::StatusCode,
+    response: &TelegramApiResponse<T>,
+) -> ChannelError {
+    let code = response.error_code.unwrap_or(status.as_u16());
+    let message = format!(
+        "{method} failed: status={status}, error_code={:?}, description={:?}",
+        response.error_code, response.description
+    );
+    if code == 408 || code == 429 || code >= 500 {
+        ChannelError::Transport(message)
+    } else if (400..500).contains(&code) {
+        ChannelError::PermanentTransport(message)
+    } else {
+        ChannelError::Transport(message)
+    }
 }
 
 /// Injectable seam for the two Bot API methods this adapter uses.
@@ -150,10 +171,7 @@ impl TelegramConnector for LiveTelegramConnector {
         })?;
 
         if !status.is_success() || !parsed.ok {
-            return Err(ChannelError::Transport(format!(
-                "sendMessage failed: status={status}, description={:?}",
-                parsed.description
-            )));
+            return Err(telegram_api_error("sendMessage", status, &parsed));
         }
         Ok(())
     }
@@ -183,10 +201,7 @@ impl TelegramConnector for LiveTelegramConnector {
         })?;
 
         if !status.is_success() || !parsed.ok {
-            return Err(ChannelError::Transport(format!(
-                "getUpdates failed: status={status}, description={:?}",
-                parsed.description
-            )));
+            return Err(telegram_api_error("getUpdates", status, &parsed));
         }
         Ok(parsed.result.unwrap_or_default())
     }
@@ -267,6 +282,13 @@ mod tests {
     /// body with `200 OK` and a matching `Content-Length`. No HTTP
     /// framework dependency needed for these connector-level tests.
     fn spawn_one_shot_server(response_body: &'static str) -> String {
+        spawn_one_shot_server_with_status("200 OK", response_body)
+    }
+
+    fn spawn_one_shot_server_with_status(
+        status_line: &'static str,
+        response_body: &'static str,
+    ) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -275,7 +297,7 @@ mod tests {
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf);
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response_body.len(),
                     response_body
                 );
@@ -283,6 +305,36 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn send_message_classifies_rate_limit_as_transient() {
+        let base_url = spawn_one_shot_server_with_status(
+            "429 Too Many Requests",
+            r#"{"ok":false,"error_code":429,"description":"Too Many Requests"}"#,
+        );
+        let connector = LiveTelegramConnector::with_base_url("token".to_string(), base_url);
+
+        let error = connector.send_message(555, "hi").await.unwrap_err();
+        assert!(matches!(error, ChannelError::Transport(_)));
+        assert_eq!(
+            error.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Transient
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_classifies_api_client_error_as_permanent() {
+        let base_url =
+            spawn_one_shot_server(r#"{"ok":false,"error_code":400,"description":"Bad Request"}"#);
+        let connector = LiveTelegramConnector::with_base_url("token".to_string(), base_url);
+
+        let error = connector.send_message(555, "hi").await.unwrap_err();
+        assert!(matches!(error, ChannelError::PermanentTransport(_)));
+        assert_eq!(
+            error.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Permanent
+        );
     }
 
     /// Same as [`spawn_one_shot_server`], but also captures the request

@@ -129,6 +129,14 @@ fn reject_crlf(value: &str) -> Result<&str, ChannelError> {
     Ok(value)
 }
 
+fn classify_smtp_send_error(is_permanent: bool, message: String) -> ChannelError {
+    if is_permanent {
+        ChannelError::PermanentTransport(message)
+    } else {
+        ChannelError::Transport(message)
+    }
+}
+
 /// Build the outbound RFC 822 message, applying thread-correlation, Message-ID, and
 /// reply-threading headers.
 ///
@@ -240,10 +248,9 @@ impl SmtpConnector for LettreSmtp {
             }
         };
 
-        transport
-            .send(msg)
-            .await
-            .map_err(|e| ChannelError::Transport(format!("SMTP send failed: {e}")))?;
+        transport.send(msg).await.map_err(|error| {
+            classify_smtp_send_error(error.is_permanent(), format!("SMTP send failed: {error}"))
+        })?;
 
         Ok(())
     }
@@ -383,6 +390,23 @@ mod tests {
         assert_eq!(locked[0].0, "from@example.com");
         assert_eq!(locked[0].1, "to@example.com");
         assert_eq!(locked[0].2, "Hello");
+    }
+
+    #[test]
+    fn smtp_reply_classification_keeps_4xx_transient_and_5xx_permanent() {
+        let transient = classify_smtp_send_error(false, "450 mailbox unavailable".to_string());
+        assert!(matches!(transient, ChannelError::Transport(_)));
+        assert_eq!(
+            transient.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Transient
+        );
+
+        let permanent = classify_smtp_send_error(true, "550 recipient rejected".to_string());
+        assert!(matches!(permanent, ChannelError::PermanentTransport(_)));
+        assert_eq!(
+            permanent.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Permanent
+        );
     }
 
     #[tokio::test]

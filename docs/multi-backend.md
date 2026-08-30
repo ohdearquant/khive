@@ -430,7 +430,11 @@ The scan applies each channel's recipient prefix before its row limit, so one
 channel's backlog cannot starve another's, and delivery outcomes are recorded
 as terminal `properties.delivery` states (`delivered` with `delivered_at` and
 the transport message id, or `failed` with `failed_at`/`last_error` for
-permanent rejections such as a recipient outside the allowlist). If the comm
+permanent rejections such as a recipient outside the allowlist). Transient
+transport failures remain pending with an incremented `delivery_attempts`,
+`last_error`, and a bounded exponential `next_attempt_at`; both email and
+Telegram scans skip those rows until the deadline is due. A successful send
+clears the attempt counter and deadline. If the comm
 runtime is not writable, no external send task starts, avoiding a send
 followed by an inevitably failed delivery mark.
 

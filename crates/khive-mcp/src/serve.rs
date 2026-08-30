@@ -1201,7 +1201,8 @@ enum HeartbeatOutcome {
 fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
     match err {
         khive_channel::ChannelError::Auth(_) => "auth",
-        khive_channel::ChannelError::Transport(_) => "transport",
+        khive_channel::ChannelError::Transport(_)
+        | khive_channel::ChannelError::PermanentTransport(_) => "transport",
         khive_channel::ChannelError::Config(_)
         | khive_channel::ChannelError::UnauthorizedSender(_)
         | khive_channel::ChannelError::InvalidEnvelope(_) => "config",
@@ -1380,6 +1381,47 @@ fn note_already_delivered(props: &serde_json::Map<String, serde_json::Value>) ->
     delivered_at_set || terminal_delivery
 }
 
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+const OUTBOUND_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+const OUTBOUND_RETRY_CEILING: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+async fn record_outbound_send_failure(
+    runtime: &khive_runtime::KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    note_id: uuid::Uuid,
+    error: &khive_channel::ChannelError,
+) -> khive_runtime::RuntimeResult<khive_storage::note::Note> {
+    use khive_channel::DeliveryFailureClass;
+
+    match error.delivery_failure_class() {
+        DeliveryFailureClass::Transient => {
+            runtime
+                .mark_outbound_message_transient_failure(
+                    token,
+                    note_id,
+                    chrono::Utc::now(),
+                    error.to_string(),
+                    OUTBOUND_RETRY_BASE,
+                    OUTBOUND_RETRY_CEILING,
+                )
+                .await
+        }
+        DeliveryFailureClass::Permanent => {
+            runtime
+                .mark_outbound_message_failed(
+                    token,
+                    note_id,
+                    chrono::Utc::now().to_rfc3339(),
+                    error.to_string(),
+                )
+                .await
+        }
+    }
+}
+
 /// Background task that delivers undelivered outbound email notes every 5 seconds.
 ///
 /// Implements AT-LEAST-ONCE delivery: the `external_id` (= RFC 822 Message-ID) is
@@ -1418,7 +1460,7 @@ async fn channel_outbox_loop(
     };
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(OUTBOUND_RETRY_BASE).await;
         channel_outbox_once(
             email_channel.as_ref(),
             &runtime,
@@ -1628,12 +1670,32 @@ async fn channel_outbox_once(
                     ),
                 }
             }
-            Err(error) => tracing::warn!(
-                note_id = %note_id,
-                recipient = %recipient,
-                error = %error,
-                "outbox loop: send failed; will retry next cycle"
-            ),
+            Err(error) => {
+                let mark_result = match uuid::Uuid::parse_str(&note_id) {
+                    Ok(uuid) => record_outbound_send_failure(runtime, &token, uuid, &error)
+                        .await
+                        .map(|_| ()),
+                    Err(parse_error) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                        "note id {note_id} is not a valid UUID: {parse_error}"
+                    ))),
+                };
+                match mark_result {
+                    Ok(()) => tracing::warn!(
+                        note_id = %note_id,
+                        recipient = %recipient,
+                        error = %error,
+                        classification = ?error.delivery_failure_class(),
+                        "outbox loop: send failure recorded"
+                    ),
+                    Err(mark_error) => tracing::warn!(
+                        note_id = %note_id,
+                        recipient = %recipient,
+                        error = %error,
+                        mark_error = %mark_error,
+                        "outbox loop: send failed and retry state could not be recorded"
+                    ),
+                }
+            }
         }
     }
 }
@@ -1861,9 +1923,6 @@ async fn telegram_outbox_loop(
     runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
 ) {
-    use chrono::Utc;
-    use khive_channel::{Channel, ChannelEnvelope};
-
     let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
         Ok(ns) => ns,
         Err(e) => {
@@ -1877,94 +1936,93 @@ async fn telegram_outbox_loop(
     };
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(OUTBOUND_RETRY_BASE).await;
+        telegram_outbox_once(telegram_channel.as_ref(), &runtime, &namespace).await;
+    }
+}
 
-        // Scan through the comm-routed runtime handle, not the wire `list`
-        // verb — see `channel_outbox_once` for the backend-routing rationale.
-        let token = match runtime.authorize(namespace.clone()) {
-            Ok(token) => token,
-            Err(e) => {
-                tracing::warn!(error = %e, "telegram outbox loop: namespace authorization failed");
-                continue;
-            }
+#[cfg(feature = "channel-telegram")]
+async fn telegram_outbox_once(
+    telegram_channel: &dyn khive_channel::Channel,
+    runtime: &khive_runtime::KhiveRuntime,
+    namespace: &khive_runtime::Namespace,
+) {
+    use khive_channel::ChannelEnvelope;
+
+    let token = match runtime.authorize(namespace.clone()) {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::warn!(error = %error, "telegram outbox loop: namespace authorization failed");
+            return;
+        }
+    };
+    let notes = match runtime
+        .list_undelivered_outbound_messages(&token, Some("telegram:"), 200)
+        .await
+    {
+        Ok(notes) => notes,
+        Err(error) => {
+            tracing::warn!(error = %error, "telegram outbox loop: outbox scan failed");
+            return;
+        }
+    };
+
+    for note in notes {
+        let Some(props) = note
+            .properties
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
         };
-        let notes = match runtime
-            .list_undelivered_outbound_messages(&token, Some("telegram:"), 200)
-            .await
-        {
-            Ok(notes) => notes,
-            Err(e) => {
-                tracing::warn!(error = %e, "telegram outbox loop: outbox scan failed");
-                continue;
-            }
+        if props.get("direction").and_then(serde_json::Value::as_str) != Some("outbound") {
+            continue;
+        }
+        let Some(to_actor) = props
+            .get("to_actor")
+            .and_then(serde_json::Value::as_str)
+            .filter(|actor| actor.starts_with("telegram:"))
+        else {
+            continue;
         };
-        let notes: Vec<serde_json::Value> = notes
-            .iter()
-            .filter_map(|note| serde_json::to_value(note).ok())
-            .collect();
+        if note_already_delivered(props) {
+            continue;
+        }
 
-        for note_val in notes {
-            let props = match note_val.get("properties") {
-                Some(serde_json::Value::Object(m)) => m.clone(),
-                _ => continue,
-            };
-
-            if props.get("direction").and_then(|v| v.as_str()) != Some("outbound") {
-                continue;
-            }
-
-            let to_actor = match props.get("to_actor").and_then(|v| v.as_str()) {
-                Some(a) if a.starts_with("telegram:") => a.to_string(),
-                _ => continue,
-            };
-
-            if note_already_delivered(&props) {
-                continue;
-            }
-
-            let note_id = match note_val.get("id").and_then(|v| v.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-
-            let content = match note_val.get("content").and_then(|v| v.as_str()) {
-                Some(c) => c.to_string(),
-                None => continue,
-            };
-
-            let env = ChannelEnvelope::new("telegram:bot", to_actor, content);
-
-            match telegram_channel.send(env).await {
-                Ok(()) => {
-                    let delivered_at = Utc::now().to_rfc3339();
-                    let mark_result = match uuid::Uuid::parse_str(&note_id) {
-                        Ok(uuid) => runtime
-                            .mark_outbound_message_delivered(&token, uuid, delivered_at, None)
-                            .await
-                            .map(|_| ()),
-                        Err(e) => Err(khive_runtime::RuntimeError::InvalidInput(format!(
-                            "note id {note_id} is not a valid UUID: {e}"
-                        ))),
-                    };
-                    match mark_result {
-                        Ok(_) => {
-                            tracing::info!(note_id = %note_id, "telegram outbox loop: delivered");
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                note_id = %note_id,
-                                error = %e,
-                                "telegram outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
-                            );
-                        }
-                    }
+        let envelope = ChannelEnvelope::new("telegram:bot", to_actor, note.content.clone());
+        match telegram_channel.send(envelope).await {
+            Ok(()) => {
+                match runtime
+                    .mark_outbound_message_delivered(
+                        &token,
+                        note.id,
+                        chrono::Utc::now().to_rfc3339(),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => tracing::info!(note_id = %note.id, "telegram outbox loop: delivered"),
+                    Err(error) => tracing::warn!(
+                        note_id = %note.id,
+                        error = %error,
+                        "telegram outbox loop: failed to set delivered_at (AT-LEAST-ONCE: will retry)"
+                    ),
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        note_id = %note_id,
-                        error = %e,
-                        "telegram outbox loop: send failed; will retry next cycle"
-                    );
+            }
+            Err(error) => {
+                match record_outbound_send_failure(runtime, &token, note.id, &error).await {
+                    Ok(_) => tracing::warn!(
+                        note_id = %note.id,
+                        error = %error,
+                        classification = ?error.delivery_failure_class(),
+                        "telegram outbox loop: send failure recorded"
+                    ),
+                    Err(mark_error) => tracing::warn!(
+                        note_id = %note.id,
+                        error = %error,
+                        mark_error = %mark_error,
+                        "telegram outbox loop: send failed and retry state could not be recorded"
+                    ),
                 }
             }
         }
@@ -10618,6 +10676,222 @@ backend = "kg-backend"
                 .unwrap()
                 .clone();
             assert!(note_already_delivered(&props));
+        }
+    }
+
+    #[cfg(all(feature = "channel-email", feature = "channel-telegram"))]
+    mod outbound_retry_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+        use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken};
+        use khive_storage::note::Note;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone, Copy)]
+        enum SendOutcome {
+            Success,
+            Transient,
+            Permanent,
+        }
+
+        struct ScriptedChannel {
+            outcome: SendOutcome,
+            sends: AtomicUsize,
+        }
+
+        impl ScriptedChannel {
+            fn new(outcome: SendOutcome) -> Self {
+                Self {
+                    outcome,
+                    sends: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl Channel for ScriptedChannel {
+            fn kind(&self) -> &'static str {
+                "scripted"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                match self.outcome {
+                    SendOutcome::Success => Ok(()),
+                    SendOutcome::Transient => {
+                        Err(ChannelError::Transport("temporary pressure".to_string()))
+                    }
+                    SendOutcome::Permanent => Err(ChannelError::PermanentTransport(
+                        "recipient rejected".to_string(),
+                    )),
+                }
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                Ok(Vec::new())
+            }
+        }
+
+        fn runtime() -> (KhiveRuntime, NamespaceToken, Namespace) {
+            let runtime = KhiveRuntime::memory().expect("runtime");
+            runtime.install_pack_owned_note_kinds(vec!["message".to_string()]);
+            let namespace = Namespace::parse("local").unwrap();
+            let token = runtime.authorize(namespace.clone()).expect("authorize");
+            (runtime, token, namespace)
+        }
+
+        async fn seed_outbound(
+            runtime: &KhiveRuntime,
+            token: &NamespaceToken,
+            to_actor: &str,
+            extra: serde_json::Value,
+        ) -> uuid::Uuid {
+            let mut properties = serde_json::json!({
+                "direction": "outbound",
+                "to_actor": to_actor,
+                "subject": "subject",
+            });
+            properties
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let mut note = Note::new("local", "message", "body");
+            note.properties = Some(properties);
+            let id = note.id;
+            runtime
+                .notes(token)
+                .unwrap()
+                .upsert_note(note)
+                .await
+                .expect("seed note");
+            id
+        }
+
+        #[tokio::test]
+        async fn email_transient_failure_persists_backoff_and_immediate_rescan_skips() {
+            let (runtime, token, namespace) = runtime();
+            let id = seed_outbound(
+                &runtime,
+                &token,
+                "email:recipient@example.com",
+                serde_json::json!({}),
+            )
+            .await;
+            let channel = ScriptedChannel::new(SendOutcome::Transient);
+
+            channel_outbox_once(
+                &channel,
+                &runtime,
+                &namespace,
+                "sender@example.com",
+                "example.com",
+                &["recipient@example.com".to_string()],
+            )
+            .await;
+            channel_outbox_once(
+                &channel,
+                &runtime,
+                &namespace,
+                "sender@example.com",
+                "example.com",
+                &["recipient@example.com".to_string()],
+            )
+            .await;
+
+            assert_eq!(channel.sends.load(Ordering::SeqCst), 1);
+            let note = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap();
+            let properties = note.properties.unwrap();
+            assert_eq!(properties["delivery_attempts"].as_u64(), Some(1));
+            assert!(properties["next_attempt_at"].as_str().is_some());
+            assert!(properties.get("delivery").is_none());
+        }
+
+        #[tokio::test]
+        async fn telegram_transient_and_permanent_outcomes_have_durable_parity() {
+            let (runtime, token, namespace) = runtime();
+            let transient_id = seed_outbound(
+                &runtime,
+                &token,
+                "telegram:maintainer",
+                serde_json::json!({}),
+            )
+            .await;
+            let transient = ScriptedChannel::new(SendOutcome::Transient);
+            telegram_outbox_once(&transient, &runtime, &namespace).await;
+
+            let note = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(transient_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                note.properties.unwrap()["delivery_attempts"].as_u64(),
+                Some(1)
+            );
+
+            let permanent_id = seed_outbound(
+                &runtime,
+                &token,
+                "telegram:maintainer",
+                serde_json::json!({}),
+            )
+            .await;
+            let permanent = ScriptedChannel::new(SendOutcome::Permanent);
+            telegram_outbox_once(&permanent, &runtime, &namespace).await;
+
+            let note = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(permanent_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                note.properties.unwrap()["delivery"].as_str(),
+                Some("failed")
+            );
+        }
+
+        #[tokio::test]
+        async fn telegram_success_clears_retry_state() {
+            let (runtime, token, namespace) = runtime();
+            let id = seed_outbound(
+                &runtime,
+                &token,
+                "telegram:maintainer",
+                serde_json::json!({
+                    "delivery_attempts": 2,
+                    "next_attempt_at": "2000-01-01T00:00:00Z",
+                }),
+            )
+            .await;
+            let channel = ScriptedChannel::new(SendOutcome::Success);
+            telegram_outbox_once(&channel, &runtime, &namespace).await;
+
+            let note = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap();
+            let properties = note.properties.unwrap();
+            assert_eq!(properties["delivery"].as_str(), Some("delivered"));
+            assert!(properties.get("delivery_attempts").is_none());
+            assert!(properties.get("next_attempt_at").is_none());
         }
     }
 
