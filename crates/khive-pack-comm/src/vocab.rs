@@ -264,7 +264,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.unread",
-        description: "Count-only view of the caller's unread inbound messages (same filter as inbox(status=\"unread\"), no message payloads).",
+        description: "Bounded count-only view of the caller's unread inbound messages (same filter as inbox(status=\"unread\"), no message payloads). Exact below count_cap=1000; count_saturated=true means at least that many.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],

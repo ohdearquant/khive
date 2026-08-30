@@ -177,11 +177,15 @@ admits legacy outbound rows without `from_actor`. `to_actor` is an optional
 exact recipient filter for the sent box. Read `status` and sender filters are
 inbox-only and are rejected with `box="sent"`, while `to_actor` is rejected for
 the default inbox, so a misplaced filter cannot silently return the wrong box.
-The existing envelope remains stable. For the default inbox, `unread_count` is
-the exact caller's mailbox-wide unread count — independent of the page window
-and of `status` and sender filters. Its partial-index-backed count is bounded
-by the unread population rather than total mailbox size. It is zero for the
-sent box because outbound rows have no recipient read state.
+The existing envelope fields remain stable. For the default inbox,
+`unread_count` is the caller's mailbox-wide unread count — independent of the
+page window and of `status` and sender filters — and is exact below
+`unread_count_cap` (1,000). `unread_count_saturated=false` means the number is
+exact, including when it equals the cap; `true` means the value is the lower
+bound "at least 1,000". The addressed and legacy-recipient partitions are
+counted through cap-limited subqueries in one storage snapshot. The sent box
+reports zero and `unread_count_saturated=false` because outbound rows have no
+recipient read state.
 
 Every caller is filtered by `to_actor = caller OR to_actor IS NULL`. A
 configured actor therefore sees messages addressed to that actor plus legacy
@@ -208,6 +212,11 @@ is inclusive and `before` is exclusive, both RFC 3339 and both evaluated against
 the top-level note `created_at` exposed in the response, not optional transport
 metadata in `properties.sent_at`. Empty substring filters are rejected, and a
 missing/non-string subject does not match `subject_contains`.
+
+Each underlying filtered-note window is count-free: storage runs the limited
+row query only and declines an exact page total. One lookahead row supplies
+`has_more`, so a small inbox page no longer performs a full matching-set
+`COUNT(*)` before reading its rows.
 
 `fields` is the same strict, non-empty projection used by `comm.thread`.
 Omitting it preserves the full message object. The accepted top-level names are

@@ -10152,6 +10152,8 @@ async fn i66_unread_counts_only_matching_inbound_unread() {
         .await
         .expect("unread succeeds");
     assert_eq!(unread_before["count"], 2);
+    assert_eq!(unread_before["count_cap"], 1_000);
+    assert_eq!(unread_before["count_saturated"], false);
     assert_eq!(unread_before["actor"], "lambda:b");
 
     let inbox = registry_b
@@ -10178,6 +10180,7 @@ async fn i66_unread_counts_only_matching_inbound_unread() {
         .await
         .expect("unread succeeds");
     assert_eq!(unread_after["count"], 1);
+    assert_eq!(unread_after["count_saturated"], false);
 }
 
 /// `comm.unread` is caller-scoped and rejects the removed `assignee` override.
@@ -10238,6 +10241,8 @@ async fn i66_inbox_response_carries_unread_count() {
         inbox["unread_count"], 1,
         "unread_count must be present and match count when status=unread"
     );
+    assert_eq!(inbox["unread_count_cap"], 1_000);
+    assert_eq!(inbox["unread_count_saturated"], false);
 }
 
 #[tokio::test]
@@ -10266,11 +10271,12 @@ async fn i1931_inbox_unread_count_is_mailbox_wide() {
             inbox["unread_count"], 3,
             "unread_count must not be bounded by limit={limit}"
         );
+        assert_eq!(inbox["unread_count_saturated"], false);
     }
 }
 
 #[tokio::test]
-async fn i1931_inbox_unread_count_does_not_saturate_at_old_probe_cap() {
+async fn i2214_unread_count_saturates_with_explicit_cap_metadata() {
     let backend = shared_backend();
     let (_registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
     let (registry_b, rt_b) = build_actor_registry(backend, "lambda:b");
@@ -10301,9 +10307,19 @@ async fn i1931_inbox_unread_count_does_not_saturate_at_old_probe_cap() {
         .expect("inbox succeeds");
     assert_eq!(inbox["count"], 1);
     assert_eq!(
-        inbox["unread_count"], 1_001,
-        "unread_count must remain exact beyond the removed probe cap"
+        inbox["unread_count"], 1_000,
+        "unread_count becomes a documented lower bound above the work cap"
     );
+    assert_eq!(inbox["unread_count_cap"], 1_000);
+    assert_eq!(inbox["unread_count_saturated"], true);
+
+    let unread = registry_b
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread succeeds");
+    assert_eq!(unread["count"], 1_000);
+    assert_eq!(unread["count_cap"], 1_000);
+    assert_eq!(unread["count_saturated"], true);
 }
 
 /// Explicit JSON null has the same fail-open inbox visibility as an absent
@@ -10348,7 +10364,8 @@ async fn i2166_unread_count_includes_explicit_null_recipient() {
     );
 }
 
-/// `limit=0` is the count-only inbox path: it returns no message payloads but still reports the caller's real unread total.
+/// `limit=0` is the count-only inbox path: it returns no message payloads but
+/// still reports the caller's bounded mailbox-wide unread count.
 #[tokio::test]
 async fn i66_inbox_limit_zero_carries_real_unread_count() {
     let backend = shared_backend();
@@ -10371,8 +10388,10 @@ async fn i66_inbox_limit_zero_carries_real_unread_count() {
     assert_eq!(inbox["count"], 0);
     assert_eq!(
         inbox["unread_count"], 1,
-        "limit=0 must return the caller's real unread count"
+        "limit=0 must return the caller's unread count below the cap"
     );
+    assert_eq!(inbox["unread_count_cap"], 1_000);
+    assert_eq!(inbox["unread_count_saturated"], false);
 }
 
 /// A send must land the outbound + inbound note, an FTS document for each, and one vector row PER registered embedding model for EACH note, all inside the single atomic unit.
@@ -12882,6 +12901,8 @@ async fn sent_box_fields_projection_applies_and_unread_count_is_zero() {
         sent["unread_count"], 0,
         "sent rows have no recipient read state, so the sent box reports zero; got {sent}"
     );
+    assert_eq!(sent["unread_count_cap"], 1_000);
+    assert_eq!(sent["unread_count_saturated"], false);
     let message = sent["messages"][0].as_object().expect("message object");
     let expected: std::collections::BTreeSet<&str> = ["id", "to_actor", "subject", "direction"]
         .into_iter()

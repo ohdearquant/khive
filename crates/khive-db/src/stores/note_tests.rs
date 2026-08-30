@@ -1,6 +1,7 @@
 use super::*;
 use crate::pool::PoolConfig;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+use serial_test::serial;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn deny_commit(ctx: AuthContext<'_>) -> Authorization {
@@ -17,6 +18,15 @@ fn deny_rollback(ctx: AuthContext<'_>) -> Authorization {
         AuthAction::Transaction {
             operation: TransactionOperation::Rollback,
         } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }
+}
+
+fn deny_count_function(ctx: AuthContext<'_>) -> Authorization {
+    match ctx.action {
+        AuthAction::Function { function_name } if function_name.eq_ignore_ascii_case("count") => {
+            Authorization::Deny
+        }
         _ => Authorization::Allow,
     }
 }
@@ -586,6 +596,7 @@ async fn assert_page_count_and_items_share_snapshot(query: SnapshotPageQuery) {
 }
 
 #[tokio::test]
+#[serial]
 async fn note_page_count_and_items_share_one_snapshot_during_concurrent_insert() {
     for query in [SnapshotPageQuery::Basic, SnapshotPageQuery::Filtered] {
         assert_page_count_and_items_share_snapshot(query).await;
@@ -593,11 +604,245 @@ async fn note_page_count_and_items_share_one_snapshot_during_concurrent_insert()
 }
 
 #[tokio::test]
-async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update() {
+async fn filtered_count_free_page_runs_without_count_over_large_match_set() {
     use khive_storage::note::PropertyFilter as NotePropFilter;
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("note-filter-count-snapshot.db");
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("note-count-free-large-filter.db")),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+    // Use the pooled-reader mode so the authorizer installed below is the
+    // exact connection both control and count-free queries execute on.
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
+    let namespace = format!("count-free-large-{}", Uuid::new_v4().simple());
+    let notes = (0..2_000)
+        .map(|index| {
+            let mut note = make_note_with_props(
+                &namespace,
+                "message",
+                &format!("message-{index}"),
+                serde_json::json!({"direction": "inbound"}),
+            );
+            note.created_at = index;
+            note
+        })
+        .collect();
+    let summary = store.upsert_notes(notes).await.unwrap();
+    assert_eq!(summary.failed, 0, "large filtered seed failed: {summary:?}");
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![NotePropFilter {
+            json_path: "$.direction".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text("inbound".to_string()),
+        }],
+        ..NoteFilter::default()
+    };
+    {
+        let reader = pool.reader().unwrap();
+        reader.conn().authorizer(Some(deny_count_function)).unwrap();
+    }
+
+    let request = PageRequest {
+        offset: 0,
+        limit: 6,
+    };
+    let exact_control = store
+        .query_notes_filtered(&namespace, &filter, request.clone())
+        .await;
+    assert!(
+        exact_control.is_err(),
+        "control exact-count page must be rejected by the count authorizer"
+    );
+
+    let page = store
+        .query_notes_filtered_count_free(&namespace, &filter, request)
+        .await
+        .expect("count-free page must not invoke SQLite count");
+    assert_eq!(page.total, None);
+    assert_eq!(page.items.len(), 6, "caller receives its lookahead row");
+    assert_eq!(page.items[0].content, "message-1999");
+    assert_eq!(page.items[5].content, "message-1994");
+
+    let reader = pool.reader().unwrap();
+    reader
+        .conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn filtered_count_free_page_keeps_one_statement_snapshot_and_total_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("note-count-free-snapshot.db")),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+    let store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
+    let namespace = format!("count-free-snapshot-{}", Uuid::new_v4().simple());
+    let mut initial = Vec::new();
+    for content in ["a", "b", "c"] {
+        let mut note = make_note_with_props(
+            &namespace,
+            "message",
+            content,
+            serde_json::json!({"page_case": true}),
+        );
+        note.created_at = 10;
+        initial.push(note);
+    }
+    let mut expected_ids: Vec<_> = initial.iter().map(|note| note.id).collect();
+    expected_ids.sort();
+    store.upsert_notes(initial).await.unwrap();
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![khive_storage::note::PropertyFilter {
+            json_path: "$.page_case".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Bool(true),
+        }],
+        ..NoteFilter::default()
+    };
+    let (reached_rx, proceed_tx) =
+        page_snapshot_seam::install("query_notes_filtered_count_free", namespace.clone());
+    let query_task = {
+        let store = Arc::clone(&store);
+        let namespace = namespace.clone();
+        let filter = filter.clone();
+        tokio::spawn(async move {
+            store
+                .query_notes_filtered_count_free(
+                    &namespace,
+                    &filter,
+                    PageRequest {
+                        offset: 0,
+                        limit: 3,
+                    },
+                )
+                .await
+        })
+    };
+
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .expect("waiting for the row-step seam must not panic")
+        .expect("count-free query must step its first row");
+
+    let mut concurrent = make_note_with_props(
+        &namespace,
+        "message",
+        "concurrent",
+        serde_json::json!({"page_case": true}),
+    );
+    concurrent.created_at = 11;
+    let concurrent_id = concurrent.id;
+    store
+        .upsert_note(concurrent)
+        .await
+        .expect("WAL writer must commit while the page statement is paused");
+    proceed_tx.send(()).unwrap();
+
+    let page = query_task.await.unwrap().unwrap();
+    page_snapshot_seam::uninstall();
+    assert_eq!(page.total, None);
+    assert_eq!(
+        page.items.iter().map(|note| note.id).collect::<Vec<_>>(),
+        expected_ids,
+        "the lookahead page must retain id-ascending tie order on its pinned snapshot"
+    );
+
+    let after = store
+        .query_notes_filtered_count_free(
+            &namespace,
+            &filter,
+            PageRequest {
+                offset: 0,
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.items[0].id, concurrent_id);
+    assert_eq!(
+        after.items[1..]
+            .iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SnapshotCountQuery {
+    Exact,
+    Bounded,
+}
+
+impl SnapshotCountQuery {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Exact => "count_notes_filtered_in_snapshot",
+            Self::Bounded => "count_notes_filtered_bounded_in_snapshot",
+        }
+    }
+}
+
+async fn run_snapshot_count_query(
+    store: &SqlNoteStore,
+    query: SnapshotCountQuery,
+    namespace: &str,
+    filters: &[NoteFilter],
+) -> Result<Vec<u64>, StorageError> {
+    match query {
+        SnapshotCountQuery::Exact => {
+            store
+                .count_notes_filtered_in_snapshot(namespace, filters)
+                .await
+        }
+        SnapshotCountQuery::Bounded => store
+            .count_notes_filtered_bounded_in_snapshot(namespace, filters, 10)
+            .await
+            .map(|counts| {
+                counts
+                    .into_iter()
+                    .map(|count| {
+                        assert!(!count.saturated, "one-row partition cannot hit cap");
+                        assert_eq!(count.cap, 10);
+                        count.count
+                    })
+                    .collect()
+            }),
+    }
+}
+
+async fn assert_filtered_count_partitions_share_snapshot(query: SnapshotCountQuery) {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(format!("note-filter-count-snapshot-{query:?}.db"));
     let pool = Arc::new(
         ConnectionPool::new(PoolConfig {
             path: Some(path),
@@ -658,16 +903,14 @@ async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update()
     ];
 
     let (reached_rx, proceed_tx) =
-        page_snapshot_seam::install("count_notes_filtered_in_snapshot", namespace.clone());
+        page_snapshot_seam::install(query.operation(), namespace.clone());
     let query_task = {
         let store = Arc::clone(&store);
         let namespace = namespace.clone();
         let filters = filters.clone();
-        tokio::spawn(async move {
-            store
-                .count_notes_filtered_in_snapshot(&namespace, &filters)
-                .await
-        })
+        tokio::spawn(
+            async move { run_snapshot_count_query(&store, query, &namespace, &filters).await },
+        )
     };
 
     tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
@@ -696,14 +939,69 @@ async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update()
 
     assert_eq!(counts, vec![1, 0], "both partitions must use one snapshot");
 
-    let after = store
-        .count_notes_filtered_in_snapshot(&namespace, &filters)
+    let after = run_snapshot_count_query(&store, query, &namespace, &filters)
         .await
         .unwrap();
     assert_eq!(
         after,
         vec![0, 1],
         "the committed update must appear afterward"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update() {
+    for query in [SnapshotCountQuery::Exact, SnapshotCountQuery::Bounded] {
+        assert_filtered_count_partitions_share_snapshot(query).await;
+    }
+}
+
+#[tokio::test]
+async fn bounded_filtered_count_is_exact_at_cap_and_saturates_above_it() {
+    use khive_storage::BoundedCount;
+
+    let store = setup_memory_store();
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        ..NoteFilter::default()
+    };
+    for index in 0..5 {
+        store
+            .upsert_note(make_note("default", "message", &format!("message-{index}")))
+            .await
+            .unwrap();
+    }
+
+    let exact = store
+        .count_notes_filtered_bounded_in_snapshot("default", std::slice::from_ref(&filter), 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        exact,
+        vec![BoundedCount {
+            count: 5,
+            cap: 5,
+            saturated: false,
+        }],
+        "a population equal to the cap is still exact"
+    );
+
+    store
+        .upsert_note(make_note("default", "message", "over-cap"))
+        .await
+        .unwrap();
+    let saturated = store
+        .count_notes_filtered_bounded_in_snapshot("default", &[filter], 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        saturated,
+        vec![BoundedCount {
+            count: 5,
+            cap: 5,
+            saturated: true,
+        }]
     );
 }
 
@@ -1945,11 +2243,19 @@ async fn page_offset_over_i64max_rejected() {
     );
 
     let filtered_result = store
-        .query_notes_filtered("ns1", &NoteFilter::default(), oversized)
+        .query_notes_filtered("ns1", &NoteFilter::default(), oversized.clone())
         .await;
     assert!(
         matches!(filtered_result, Err(StorageError::InvalidInput { .. })),
         "query_notes_filtered: expected InvalidInput, got {filtered_result:?}"
+    );
+
+    let count_free_result = store
+        .query_notes_filtered_count_free("ns1", &NoteFilter::default(), oversized)
+        .await;
+    assert!(
+        matches!(count_free_result, Err(StorageError::InvalidInput { .. })),
+        "query_notes_filtered_count_free: expected InvalidInput, got {count_free_result:?}"
     );
 }
 
