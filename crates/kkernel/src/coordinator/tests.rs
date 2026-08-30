@@ -14,7 +14,7 @@ use khive_runtime::{
 use khive_score::DeterministicScore;
 use khive_storage::types::Direction;
 use khive_storage::EdgeRelation;
-use khive_types::namespace::Namespace;
+use khive_types::{namespace::Namespace, SubstrateKind};
 
 use super::dispatch::bounded_backend_cause_for_log;
 use super::{BackendRegistry, LocatorCache, SubstrateCoordinator, SubstrateCoordinatorService};
@@ -194,6 +194,62 @@ fn registry_register_dedup() {
     assert!(reg.register(backend_id("main"), Arc::clone(&rt)));
     assert!(!reg.register(backend_id("main"), Arc::clone(&rt)));
     assert_eq!(reg.len(), 1);
+}
+
+#[test]
+fn registry_rejects_an_explicit_empty_served_kind_declaration() {
+    let mut registry = BackendRegistry::new();
+    let error = registry
+        .register_with_served_kinds(backend_id("main"), memory_runtime(), Some(BTreeSet::new()))
+        .expect_err("an explicit empty declaration must fail closed");
+
+    assert!(error.to_string().contains("served kinds must not be empty"));
+    assert!(registry.is_empty());
+}
+
+#[test]
+fn registry_without_a_served_kind_declaration_is_conservatively_included() {
+    let mut registry = BackendRegistry::new();
+    let id = backend_id("legacy");
+    assert!(registry.register(id.clone(), memory_runtime()));
+
+    let entry = registry.get(&id).expect("registered backend");
+    for kind in SubstrateKind::ALL {
+        assert!(entry.serves(kind), "absent declaration must serve {kind}");
+    }
+}
+
+#[tokio::test]
+async fn fan_out_search_uses_served_kind_metadata_before_dispatch() {
+    let mut registry = BackendRegistry::new();
+    registry
+        .register_with_served_kinds(
+            backend_id("notes"),
+            memory_runtime(),
+            Some(BTreeSet::from([SubstrateKind::Note])),
+        )
+        .expect("valid note-serving backend");
+    registry
+        .register_with_served_kinds(
+            backend_id("entities-only"),
+            memory_runtime(),
+            Some(BTreeSet::from([SubstrateKind::Entity])),
+        )
+        .expect("valid entity-serving backend");
+    let coordinator = SubstrateCoordinator::new(registry).with_panicking_backend("entities-only");
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "note",
+        "query": "dispatch-filter-probe",
+        "limit": 10,
+    }));
+
+    let (_entity_hits, _note_hits, per_backend) = coordinator
+        .fan_out_search(&request, &Namespace::local())
+        .await;
+
+    assert_eq!(per_backend.len(), 1);
+    assert_eq!(per_backend[0].backend_id.as_str(), "notes");
+    assert!(per_backend[0].error.is_none());
 }
 
 #[test]

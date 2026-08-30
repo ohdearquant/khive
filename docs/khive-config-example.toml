@@ -186,6 +186,9 @@ fusion_weight = 0.5
 # name = "main"                # unique; referenced by [packs.<name>].backend
 # kind = "sqlite"              # "sqlite" (default) or "memory" (testing only — lost on restart)
 # path = "~/.khive/khive.db"   # sqlite only; a leading ~ expands to $HOME
+# served_kinds = ["entity", "note", "event"]
+#                               # optional nonempty closed dispatch declaration;
+#                               # omit to conservatively serve every substrate
 # read_only = false            # open the backend read-only
 #
 # NOTE: `cache_mb` and `journal_mode` are recognized by the parser but NOT yet
@@ -197,6 +200,7 @@ fusion_weight = 0.5
 # name = "knowledge"
 # kind = "sqlite"
 # path = "~/.khive/knowledge.db"
+# served_kinds = ["entity", "note"]
 
 # ── [packs.<name>] — per-pack backend assignment (ADR-028) ───────────────────────
 #

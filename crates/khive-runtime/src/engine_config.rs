@@ -4,9 +4,10 @@
 //! `[[engines]]` array for arbitrary-N embedding engine registration. Falls back
 //! to `KHIVE_EMBEDDING_MODEL` env vars when no config file is present.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use khive_types::namespace::Namespace;
+use khive_types::{namespace::Namespace, SubstrateKind};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -49,6 +50,9 @@ pub enum ConfigError {
 
     #[error("invalid backend name {name:?}: {reason}")]
     InvalidBackendName { name: String, reason: String },
+
+    #[error("backend {name:?}: `served_kinds` must not be empty when declared")]
+    EmptyBackendServedKinds { name: String },
 
     #[error(
         "[packs.{pack}].backend = {backend:?} references an unknown backend; \
@@ -266,6 +270,12 @@ pub struct BackendConfig {
     pub cache_mb: Option<u32>,
     /// SQLite journal mode (e.g. `"wal"`).
     pub journal_mode: Option<String>,
+    /// Substrate kinds this backend serves.
+    ///
+    /// Omission preserves conservative fan-out to this backend. An explicit
+    /// declaration is closed over [`SubstrateKind`] and must not be empty.
+    #[serde(default)]
+    pub served_kinds: Option<BTreeSet<SubstrateKind>>,
     /// Open the backend read-only. Defaults to `false`.
     #[serde(default)]
     pub read_only: bool,
@@ -843,6 +853,15 @@ impl KhiveConfig {
                         reason: error.to_string(),
                     }
                 })?;
+                if backend
+                    .served_kinds
+                    .as_ref()
+                    .is_some_and(BTreeSet::is_empty)
+                {
+                    return Err(ConfigError::EmptyBackendServedKinds {
+                        name: backend.name.clone(),
+                    });
+                }
                 if !seen_backends.insert(backend.name.clone()) {
                     return Err(ConfigError::DuplicateBackendName {
                         name: backend.name.clone(),
@@ -2129,6 +2148,76 @@ kind = "memory"
             matches!(config_error_root(&err), ConfigError::InvalidBackendName { ref name, .. } if name.is_empty()),
             "expected InvalidBackendName for the empty name, got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_backend_served_kinds_absent_and_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "legacy"
+kind = "memory"
+
+[[backends]]
+name = "notes"
+kind = "memory"
+served_kinds = ["note", "event"]
+"#,
+        );
+        let config = KhiveConfig::load(Some(&path))
+            .expect("valid served-kind declarations")
+            .expect("config file found");
+
+        assert!(config.backends[0].served_kinds.is_none());
+        assert_eq!(
+            config.backends[1].served_kinds,
+            Some(BTreeSet::from([SubstrateKind::Note, SubstrateKind::Event]))
+        );
+    }
+
+    #[test]
+    fn test_empty_backend_served_kinds_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "main"
+kind = "memory"
+served_kinds = []
+"#,
+        );
+        let error = KhiveConfig::load(Some(&path))
+            .expect_err("an explicit empty served-kind declaration must fail closed");
+
+        assert!(matches!(
+            config_error_root(&error),
+            ConfigError::EmptyBackendServedKinds { name } if name == "main"
+        ));
+    }
+
+    #[test]
+    fn test_unknown_backend_served_kind_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "main"
+kind = "memory"
+served_kinds = ["asset"]
+"#,
+        );
+        let error = KhiveConfig::load(Some(&path))
+            .expect_err("served-kind declarations use a closed vocabulary");
+
+        assert!(matches!(
+            config_error_root(&error),
+            ConfigError::Parse { .. }
+        ));
+        assert!(error.to_string().contains("unknown variant `asset`"));
     }
 
     #[test]

@@ -3880,6 +3880,7 @@ id = "lambda:fallback"
                     path: Some(std::path::PathBuf::from("/tmp/khive-parity-main.db")),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -3888,6 +3889,7 @@ id = "lambda:fallback"
                     path: Some(std::path::PathBuf::from("/tmp/khive-parity-sessions.db")),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -3993,6 +3995,7 @@ id = "lambda:fallback"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -4001,6 +4004,7 @@ id = "lambda:fallback"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -4134,6 +4138,7 @@ id = "lambda:fallback"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
