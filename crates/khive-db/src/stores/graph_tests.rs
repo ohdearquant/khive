@@ -410,6 +410,26 @@ async fn test_upsert_and_get_edge() {
     assert!((fetched.weight - 0.8).abs() < 1e-9);
 }
 
+#[tokio::test]
+async fn insert_edge_if_absent_preserves_the_natural_key_winner() {
+    let store = setup_memory_store();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let winner = make_edge(source, target, EdgeRelation::DependsOn, 1.0);
+    let winner_id = winner.id;
+    let mut loser = make_edge(source, target, EdgeRelation::DependsOn, 0.25);
+    loser.metadata = Some(serde_json::json!({"kind": "loser"}));
+    let loser_id = loser.id;
+
+    assert!(store.insert_edge_if_absent(winner).await.unwrap());
+    assert!(!store.insert_edge_if_absent(loser).await.unwrap());
+
+    let persisted = store.get_edge(winner_id).await.unwrap().unwrap();
+    assert!((persisted.weight - 1.0).abs() < f64::EPSILON);
+    assert_eq!(persisted.metadata, None);
+    assert!(store.get_edge(loser_id).await.unwrap().is_none());
+}
+
 /// The base `PRIMARY KEY (namespace, id)` alone would let two namespaces
 /// hold the same edge id; the list-cursor ledger (`graph_edges_seq`) and the
 /// multi-namespace cursor merge in the runtime both key on `id` alone, so a

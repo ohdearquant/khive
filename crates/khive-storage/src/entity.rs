@@ -131,6 +131,20 @@ pub struct EntityFilter {
 pub trait EntityStore: Send + Sync + 'static {
     /// Insert or update a single entity.
     async fn upsert_entity(&self, entity: Entity) -> StorageResult<()>;
+    /// Insert an entity only when no row with its id or another conflicting
+    /// key exists. Returns `true` when this call inserted the row and `false`
+    /// when an existing row won the race. The existing row is never updated.
+    ///
+    /// The default returns `Unsupported` rather than falling back to
+    /// [`EntityStore::upsert_entity`], because an upsert would overwrite the
+    /// winning row and violate this method's conditional-insert contract.
+    async fn insert_entity_if_absent(&self, _entity: Entity) -> StorageResult<bool> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Entities,
+            operation: "insert_entity_if_absent".into(),
+            message: "this backend does not implement conditional entity insert".into(),
+        })
+    }
     /// Atomically insert/update an entity and all supplied attachment roles.
     async fn upsert_entity_with_attachments(
         &self,

@@ -1618,3 +1618,36 @@ Acceptance:
    error names both the unknown argument and the four accepted fields.
 2. An omitted language filter over a Rust-only fixture reports exactly `["rust"]`, never the full
    supported-language allow-list.
+
+## Amendment 8 (2026-08-30): concurrent map-ingest rebasing
+
+Separate `code.ingest` calls may target the same map database concurrently. Each handler opens a
+target runtime for the requested database, and parallel MCP dispatch does not serialize those
+independent read phases. Deterministic UUIDs prevent duplicate logical rows, but they do not make a
+full-row read followed by an unconditional upsert safe: the later upsert can erase properties or
+edge evidence added by the other call.
+
+Every code-map entity and edge read-modify-write now uses a bounded fresh-read rebase. The caller
+expresses a semantic delta (for example, add one unresolved specifier, merge one dependency kind,
+or refresh only the fields owned by a sweep). The mutation reads the current live or tombstoned
+row, reapplies that delta, and attempts either conditional insert for an absent row or guarded
+replacement for an existing row. A refused insert or replacement discards the attempted full row,
+then reads and reapplies the delta again; no stale serialized row is retried. The retry bound is 16
+row-level attempts and does not rerun file discovery, parsing, or an ingest request.
+
+Each successful replacement advances `updated_at` strictly beyond the revision it observed, even
+when two sweeps supply the same or an older wall-clock timestamp. Entity secret-gate checks retain
+their existing per-write behavior. FTS indexing and report counters run only after one row write
+wins, so a compare-and-swap refusal is not reported as an additional ingest effect. Existing
+authorization, deterministic identities, deletion/revival policy, event behavior, schema, and
+public success/error wire shapes are unchanged.
+
+Acceptance:
+
+1. Two separate runtimes are forced to read the same entity revision and concurrently add
+   different unresolved specifiers; the final row contains both additions and each caller reports
+   exactly one row/FTS effect.
+2. Two separate runtimes are forced to read the same dependency-edge revision and concurrently add
+   different evidence kinds; the final metadata contains both additions and its revision advances.
+3. Conditional entity insertion and edge insertion (including a natural-key collision) leave the
+   first inserted row untouched when a competing insert loses.

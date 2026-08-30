@@ -19,6 +19,20 @@ use crate::types::{
 pub trait GraphStore: Send + Sync + 'static {
     /// Insert or update a single edge.
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
+    /// Insert an edge only when neither its id nor natural key already
+    /// exists. Returns `true` when this call inserted the row and `false`
+    /// when an existing row won the race. The existing row is never updated.
+    ///
+    /// The default returns `Unsupported` rather than falling back to
+    /// [`GraphStore::upsert_edge`], because an upsert would overwrite the
+    /// winning row and violate this method's conditional-insert contract.
+    async fn insert_edge_if_absent(&self, _edge: Edge) -> StorageResult<bool> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "insert_edge_if_absent".into(),
+            message: "this backend does not implement conditional edge insert".into(),
+        })
+    }
     /// Insert or update a batch of edges.
     async fn upsert_edges(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
     /// Replace an edge only when the persisted row still matches the

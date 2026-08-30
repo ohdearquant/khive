@@ -127,6 +127,21 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
     }
 }
 
+/// Conditional-insert companion to [`edge_upsert_statement`]. Conflicts on
+/// either the id or natural key leave the existing edge untouched so callers
+/// can read the winner and explicitly reapply their intended delta.
+pub fn edge_insert_if_absent_statement(edge: &Edge) -> SqlStatement {
+    let mut statement = edge_upsert_statement(edge);
+    statement.sql = "INSERT INTO graph_edges \
+              (namespace, id, source_id, target_id, relation, weight, \
+               created_at, updated_at, deleted_at, metadata, target_backend) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+              ON CONFLICT DO NOTHING"
+        .to_string();
+    statement.label = Some("edge-insert-if-absent".to_string());
+    statement
+}
+
 /// Full-edge compare-and-swap update used after caller-side normalization
 /// was derived from a read snapshot. Unlike [`edge_upsert_statement`], this
 /// never inserts and cannot overwrite a row whose revision or deletion
@@ -1488,6 +1503,16 @@ impl GraphStore for SqlGraphStore {
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn insert_edge_if_absent(&self, edge: Edge) -> Result<bool, StorageError> {
+        let statement = edge_insert_if_absent_statement(&edge);
+        self.with_writer("insert_edge_if_absent", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }
