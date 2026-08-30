@@ -786,13 +786,13 @@ tracked issue before this amendment merges:
   exemption. **Owner reference:** `(follow-on issue: #2058)`.
 - **Integrate the git redaction surface.** Define whether it remains permanently mask-only or gains
   a final stored target with the same stamp and atomic success-event guarantees; no exemption is
-  allowed until then. **Owner reference:** `(follow-on issue: #2059)`.
+  allowed until then. **Owner reference:** `(follow-on issue: #2059)`. **Resolved by Amendment 2.**
 - **Integrate the session redaction surface.** Define whether it remains permanently mask-only or
   gains a final stored target with the same stamp and atomic success-event guarantees; no exemption
-  is allowed until then. **Owner reference:** `(follow-on issue: #2060)`.
+  is allowed until then. **Owner reference:** `(follow-on issue: #2060)`. **Resolved by Amendment 2.**
 - **Integrate the MCP redaction surface.** Preserve current masking until a final stored target,
   stamp location, and atomic success-event boundary are specified and implemented; no exemption is
-  allowed until then. **Owner reference:** `(follow-on issue: #2061)`.
+  allowed until then. **Owner reference:** `(follow-on issue: #2061)`. **Resolved by Amendment 2.**
 
 The five obligations are disjoint: #2058 through #2061 own exactly their named surfaces, and #2057
 owns every other excluded property-bearing path. Closing #2057 neither closes nor is blocked by the
@@ -903,3 +903,64 @@ amendment with an explicit source of truth and acceptance fixture.
   non-executable; silently dropping a failed best-effort audit is also rejected.
 - Interpreting staleness as age is rejected because no clock, threshold, or revocation authority is
   defined.
+
+## Amendment 2 (2026-08-29): Permanent mask-only redaction surfaces
+
+This amendment resolves the three redact-not-block surface obligations #2059, #2060, and #2061.
+Git ingest, session mirroring, and MCP diagnostics remain **permanently mask-only**. None is an
+admission-capable finalizer surface, none can consume a manifest match, and none can synthesize the
+reserved `khive:secret_gate` property or an exemption-success event.
+
+The executable declaration is `secret_gate::RedactionSurface` plus
+`redaction_surface_contract`. Every named call site enters the canonical detector through
+`mask_for_redaction_surface`; the returned value contains the ordinary redaction marker for every
+detected span. The wrapper deliberately has no manifest, stamp, or event input or output. Adding an
+admission mode or a fourth named surface requires an ADR amendment and an exhaustive contract-test
+change, not an untyped boolean or caller option.
+
+### 1. Git ingest (#2059)
+
+- **Final stored target:** the normalized commit, issue, and pull-request entity/note fields built
+  by git ingest. Detector-matching bytes are replaced before those candidates reach runtime writes.
+  Remote URL userinfo/query redaction remains an additional, independent normalization step.
+- **Stamp location:** none. Masked records never carry `khive:secret_gate` merely because masking
+  occurred.
+- **Atomic success event:** none. A normal git-ingest write can emit its existing domain/audit
+  effects, but there is no exemption admission to attest.
+- **Readback:** consumers receive the masked stored fields. The pre-mask text is not recoverable
+  through the record and no posture annotation claims that it was allowlisted.
+
+### 2. Session mirror (#2060)
+
+- **Final stored target:** `session_messages.text` and `session_messages.raw`, plus the parsed title
+  projections that share the same masker. Masking occurs while constructing the parsed event,
+  before the mirror writes it.
+- **Stamp location:** none. Session rows have no exemption posture property.
+- **Atomic success event:** none. Mirror persistence remains idempotent under its existing cursor
+  and row semantics; masking is a deterministic transformation, not an admitted exemption.
+- **Readback:** only the masked text/raw projections are returned. The mirror never retains an
+  alternate unmasked payload for later recovery.
+
+### 3. MCP diagnostics (#2061)
+
+- **Final stored target:** none. The named surface is a bounded caller-visible backend diagnostic
+  in the response envelope, not a durable knowledge record.
+- **Stamp location:** none.
+- **Atomic success event:** none. Transport sanitization happens independently of operation result
+  persistence and cannot assert exemption success.
+- **Readback:** not applicable. The bounded diagnostic is masked before it is returned; truncation
+  and omission metadata remain transport concerns and do not create a durable redaction record.
+
+### 4. Security and acceptance invariants
+
+1. A detector match on any named surface is replaced by the canonical redaction marker.
+2. The masked output passes the ordinary blocking scanner; no detected credential survives.
+3. Every named surface reports `PermanentMaskOnly`, a null stamp property, and a null atomic
+   success event through the executable contract.
+4. Git and session declare their actual durable targets; MCP declares no durable target.
+5. Caller identity, verb, namespace, path, and request arguments cannot switch these modes.
+
+These choices are conservative and one-way: permanently mask-only surfaces may lose false-positive
+content, but they cannot become a laundering channel for manifest exemptions. A future need to
+preserve exact bytes must introduce a separately reviewed final stored target with atomic
+record/stamp/success-event semantics; it cannot reuse these masking wrappers.

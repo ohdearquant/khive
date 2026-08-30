@@ -9,6 +9,10 @@ use chrono::DateTime;
 use khive_runtime::secret_gate;
 use serde_json::{Map, Value};
 
+fn mask_session_mirror(text: &str) -> std::borrow::Cow<'_, str> {
+    secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::SessionMirror, text)
+}
+
 /// A single parsed event, source-agnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedEvent {
@@ -146,8 +150,8 @@ pub fn parse_cc_line(line: &str) -> Option<ParsedEvent> {
     // Apply masking to the raw line and the extracted text, reusing the
     // canonical write-time secret detector (khive-runtime) — never a second,
     // weaker masker.
-    let raw = secret_gate::mask_secrets(trimmed).into_owned();
-    let text = text.map(|t| secret_gate::mask_secrets(&t).into_owned());
+    let raw = mask_session_mirror(trimmed).into_owned();
+    let text = text.map(|t| mask_session_mirror(&t).into_owned());
 
     Some(ParsedEvent {
         uuid,
@@ -225,7 +229,7 @@ pub fn parse_codex_line(line: &str, session_id: &str, abs_byte_offset: u64) -> O
                 .map(str::to_string);
 
             let uuid = format!("{session_id}:{abs_byte_offset}");
-            let raw = secret_gate::mask_secrets(trimmed).into_owned();
+            let raw = mask_session_mirror(trimmed).into_owned();
 
             Some(ParsedEvent {
                 uuid,
@@ -257,12 +261,12 @@ pub fn parse_codex_line(line: &str, session_id: &str, abs_byte_offset: u64) -> O
 
             let text = extract_text(payload.get("content"));
             let text = text.map(|t| {
-                let masked = secret_gate::mask_secrets(&t).into_owned();
+                let masked = mask_session_mirror(&t).into_owned();
                 truncate(&masked, 500)
             });
 
             let uuid = format!("{session_id}:{abs_byte_offset}");
-            let raw = secret_gate::mask_secrets(trimmed).into_owned();
+            let raw = mask_session_mirror(trimmed).into_owned();
 
             Some(ParsedEvent {
                 uuid,
@@ -398,7 +402,7 @@ fn parse_claude_ai_conversation(
                 .and_then(Value::as_str)
                 .filter(|summary| !summary.is_empty())
         })
-        .map(|title| secret_gate::mask_secrets(title).into_owned());
+        .map(|title| mask_session_mirror(title).into_owned());
     let conversation_created_at_micros = conversation
         .get("created_at")
         .and_then(parse_rfc3339_micros)
@@ -552,8 +556,8 @@ fn build_claude_ai_event(
         is_sidechain: !current_path.contains(&uuid),
         role,
         msg_type: "message".to_string(),
-        text: Some(secret_gate::mask_secrets(&text).into_owned()),
-        raw: secret_gate::mask_secrets(&raw_json).into_owned(),
+        text: Some(mask_session_mirror(&text).into_owned()),
+        raw: mask_session_mirror(&raw_json).into_owned(),
         created_at_micros,
         cwd: None,
         git_branch: None,
@@ -834,8 +838,8 @@ fn build_chatgpt_event(
     let is_sidechain = !ctx.current_path.contains(node_id);
 
     let raw_json = serde_json::to_string(node).unwrap_or_default();
-    let raw = secret_gate::mask_secrets(&raw_json).into_owned();
-    let text = secret_gate::mask_secrets(&text).into_owned();
+    let raw = mask_session_mirror(&raw_json).into_owned();
+    let text = mask_session_mirror(&text).into_owned();
 
     Some(ParsedEvent {
         uuid,

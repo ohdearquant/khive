@@ -202,12 +202,19 @@ impl SearchDegradation {
     }
 }
 
+fn mask_mcp_diagnostic(text: &str) -> std::borrow::Cow<'_, str> {
+    khive_runtime::secret_gate::mask_for_redaction_surface(
+        khive_runtime::secret_gate::RedactionSurface::McpDiagnostic,
+        text,
+    )
+}
+
 fn bounded_backend_error_message(message: &str) -> String {
     let bounded_input: String = message
         .chars()
         .take(MAX_BACKEND_ERROR_INPUT_CHARS)
         .collect();
-    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    let masked = mask_mcp_diagnostic(&bounded_input);
     if masked.trim().is_empty() {
         return MISSING_BACKEND_ERROR_MESSAGE.to_string();
     }
@@ -228,7 +235,7 @@ fn bounded_backend_error_key(backend_id: &str) -> (String, bool, bool, usize) {
         .chars()
         .take(MAX_BACKEND_ERROR_INPUT_CHARS)
         .collect();
-    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    let masked = mask_mcp_diagnostic(&bounded_input);
     let backend_id_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
     let sanitized = if masked.trim().is_empty() {
         "masked-backend"

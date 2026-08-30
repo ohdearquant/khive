@@ -257,6 +257,21 @@ needs:
 CJK/accented prose always counts as a boundary in both modes (only ASCII alphanumerics — plus
 underscore when `underscore_is_word_char` is `true` — are treated as word characters).
 
+## Named redaction surfaces
+
+ADR-115 Amendment 2 declares three permanent mask-only surfaces through the public
+`RedactionSurface` enum and `redaction_surface_contract`:
+
+- `GitIngest` stores masked commit/issue/pull-request entity and note fields.
+- `SessionMirror` stores masked `session_messages.text` and `session_messages.raw` projections.
+- `McpDiagnostic` returns a bounded masked diagnostic and has no durable stored target.
+
+Each call site uses `mask_for_redaction_surface`. Every contract has mode `PermanentMaskOnly`, no
+stamp property, and no atomic exemption-success event. The wrapper has no manifest input and cannot
+return an exemption outcome. The Git and session surfaces persist only their masked values; MCP
+diagnostics are response data and are not durable records. Adding an admission mode is an ADR-level
+contract change, not a caller-selectable sensitivity option.
+
 ## mask_secrets
 
 A transcript line cannot be rejected wholesale, so each credential span is replaced in place

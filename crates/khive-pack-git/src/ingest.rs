@@ -21,6 +21,10 @@ use crate::hook;
 use crate::refs;
 use crate::source::remote_url_to_slug;
 
+fn mask_git_ingest(text: &str) -> std::borrow::Cow<'_, str> {
+    secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::GitIngest, text)
+}
+
 /// Which record kinds a `run_ingest` pass processes. `Default` selects all
 /// three — the CLI's historical behavior and the `git.digest` verb's default
 /// (ADR-088 Amendment 1).
@@ -1380,7 +1384,7 @@ fn parse_touched_files(bytes: &[u8]) -> Result<HashMap<String, Vec<String>>> {
         if let Some(header) = token.strip_prefix(TOUCHED_HEADER_PREFIX) {
             if header.len() < 40 || !header[..40].iter().all(u8::is_ascii_hexdigit) {
                 let lossy = String::from_utf8_lossy(header);
-                let masked = secret_gate::mask_secrets(lossy.as_ref());
+                let masked = mask_git_ingest(lossy.as_ref());
                 let display = refs::truncate_chars(masked.as_ref(), 80);
                 return Err(anyhow!(
                     "git log --name-only output contains a malformed commit header {:?}",
@@ -1410,7 +1414,7 @@ fn parse_touched_files(bytes: &[u8]) -> Result<HashMap<String, Vec<String>>> {
             // is secret-masked the same way stored changed_paths are —
             // never raw token bytes in a log/error path.
             let lossy = String::from_utf8_lossy(token);
-            let masked = secret_gate::mask_secrets(lossy.as_ref());
+            let masked = mask_git_ingest(lossy.as_ref());
             let display = refs::truncate_chars(masked.as_ref(), 80);
             return Err(anyhow!(
                 "git log --name-only output contains a path token before any \
@@ -1692,12 +1696,12 @@ impl MaskedCommitFields {
         Self {
             sha: sha.clone(),
             short_sha: short_sha.clone(),
-            author: secret_gate::mask_secrets(author).into_owned(),
-            author_email: secret_gate::mask_secrets(author_email).into_owned(),
+            author: mask_git_ingest(author).into_owned(),
+            author_email: mask_git_ingest(author_email).into_owned(),
             committed_at: committed_at.clone(),
             parents: parents.clone(),
-            subject: secret_gate::mask_secrets(subject).into_owned(),
-            body: secret_gate::mask_secrets(body).into_owned(),
+            subject: mask_git_ingest(subject).into_owned(),
+            body: mask_git_ingest(body).into_owned(),
         }
     }
 }
@@ -1874,7 +1878,7 @@ async fn ingest_commits(
                 }
                 canonical
             })
-            .map(|path| secret_gate::mask_secrets(path).into_owned())
+            .map(|path| mask_git_ingest(path).into_owned())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -2248,15 +2252,15 @@ impl MaskedIssueFields {
 
         Self {
             number,
-            title: secret_gate::mask_secrets(&title).into_owned(),
-            body: secret_gate::mask_secrets(&body.unwrap_or_default()).into_owned(),
+            title: mask_git_ingest(&title).into_owned(),
+            body: mask_git_ingest(&body.unwrap_or_default()).into_owned(),
             author_login: author
                 .and_then(|a| a.login)
-                .map(|login| secret_gate::mask_secrets(&login).into_owned()),
+                .map(|login| mask_git_ingest(&login).into_owned()),
             labels: labels
                 .unwrap_or_default()
                 .into_iter()
-                .map(|l| secret_gate::mask_secrets(&l.name).into_owned())
+                .map(|l| mask_git_ingest(&l.name).into_owned())
                 .collect(),
             created_at: canonical_issue_timestamp("createdAt", number, created_at, warnings),
             closed_at: canonical_issue_timestamp("closedAt", number, closed_at, warnings),
@@ -2461,17 +2465,17 @@ impl MaskedPrFields {
         } = pr;
         Self {
             number,
-            title: secret_gate::mask_secrets(&title).into_owned(),
-            body: secret_gate::mask_secrets(&body.unwrap_or_default()).into_owned(),
+            title: mask_git_ingest(&title).into_owned(),
+            body: mask_git_ingest(&body.unwrap_or_default()).into_owned(),
             author_login: author
                 .and_then(|a| a.login)
-                .map(|login| secret_gate::mask_secrets(&login).into_owned()),
+                .map(|login| mask_git_ingest(&login).into_owned()),
             created_at,
             merged_at,
             closed_at,
             updated_at: canonical_pr_updated_at(number, updated_at, warnings),
-            base_ref_name: base_ref_name.map(|r| secret_gate::mask_secrets(&r).into_owned()),
-            head_ref_name: head_ref_name.map(|r| secret_gate::mask_secrets(&r).into_owned()),
+            base_ref_name: base_ref_name.map(|r| mask_git_ingest(&r).into_owned()),
+            head_ref_name: head_ref_name.map(|r| mask_git_ingest(&r).into_owned()),
             merge_commit_oid: merge_commit.and_then(|m| m.oid),
         }
     }

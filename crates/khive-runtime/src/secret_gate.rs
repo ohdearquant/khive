@@ -277,14 +277,75 @@ fn scan(text: &str) -> Option<SecretMatch> {
     scan_match(text).map(|(slice, detector)| build_match(detector, slice))
 }
 
+/// A named redact-not-block surface whose contract is intentionally separate
+/// from manifest-backed write admission (ADR-115 Amendment 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactionSurface {
+    /// Git ingestion stores only masked commit, issue, and pull-request text.
+    GitIngest,
+    /// Session mirroring stores only masked `text` and `raw` projections.
+    SessionMirror,
+    /// MCP diagnostics are bounded caller-visible transport data, not records.
+    McpDiagnostic,
+}
+
+/// Whether a redaction surface can consume a secret-gate exemption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactionSurfaceMode {
+    /// Always apply the canonical masker; never synthesize a stamp or event.
+    PermanentMaskOnly,
+}
+
+/// Machine-readable contract for a named redaction surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedactionSurfaceContract {
+    pub mode: RedactionSurfaceMode,
+    /// Durable target containing the masked result, if this is a write surface.
+    pub final_stored_target: Option<&'static str>,
+    /// Reserved stamp location; absent for permanent mask-only surfaces.
+    pub stamp_property: Option<&'static str>,
+    /// Atomic exemption-success event; absent when admission cannot occur.
+    pub atomic_success_event: Option<&'static str>,
+}
+
+/// Return the closed contract for a named redact-not-block surface.
+pub const fn redaction_surface_contract(surface: RedactionSurface) -> RedactionSurfaceContract {
+    let final_stored_target = match surface {
+        RedactionSurface::GitIngest => Some("final git-ingest entity/note fields"),
+        RedactionSurface::SessionMirror => Some("session_messages.text and session_messages.raw"),
+        RedactionSurface::McpDiagnostic => None,
+    };
+
+    RedactionSurfaceContract {
+        mode: RedactionSurfaceMode::PermanentMaskOnly,
+        final_stored_target,
+        stamp_property: None,
+        atomic_success_event: None,
+    }
+}
+
+/// Apply the canonical detector to a named permanent mask-only surface.
+///
+/// This wrapper makes the non-admission decision executable at each call site:
+/// it has no manifest input, cannot return an exemption outcome, and cannot
+/// synthesize the runtime-owned `khive:secret_gate` property or success event.
+pub fn mask_for_redaction_surface(
+    surface: RedactionSurface,
+    text: &str,
+) -> std::borrow::Cow<'_, str> {
+    match redaction_surface_contract(surface).mode {
+        RedactionSurfaceMode::PermanentMaskOnly => mask_secrets(text),
+    }
+}
+
 /// Redact every detected secret span in `text`, replacing each with
 /// `***MASKED***`.
 ///
 /// This is the masking counterpart to [`check`]: where `check` hard-blocks a
-/// write on the first match, `mask_secrets` is for content that must be STORED
-/// with credentials stripped (the session mirror). It reuses the SAME
-/// canonical detector set as `check`/`scan`, so callers must never maintain a
-/// second, weaker masker.
+/// write on the first match, `mask_secrets` is for content that must be emitted
+/// or stored with credentials stripped. Named Git/session/MCP callers enter it
+/// through [`mask_for_redaction_surface`]. It reuses the SAME canonical detector
+/// set as `check`/`scan`, so callers must never maintain a second, weaker masker.
 ///
 /// Returns `Cow::Borrowed` when no secret is present (the common case), avoiding
 /// an allocation. Spans are discovered left to right against the ORIGINAL text,
@@ -4412,6 +4473,44 @@ mod tests {
             "clean text must not allocate"
         );
         assert_eq!(masked, clean);
+    }
+
+    #[test]
+    fn named_redaction_surfaces_are_permanently_mask_only() {
+        let contracts = [
+            (
+                RedactionSurface::GitIngest,
+                Some("final git-ingest entity/note fields"),
+            ),
+            (
+                RedactionSurface::SessionMirror,
+                Some("session_messages.text and session_messages.raw"),
+            ),
+            (RedactionSurface::McpDiagnostic, None),
+        ];
+
+        for (surface, expected_target) in contracts {
+            let contract = redaction_surface_contract(surface);
+            assert_eq!(contract.mode, RedactionSurfaceMode::PermanentMaskOnly);
+            assert_eq!(contract.final_stored_target, expected_target);
+            assert_eq!(contract.stamp_property, None);
+            assert_eq!(contract.atomic_success_event, None);
+        }
+    }
+
+    #[test]
+    fn named_redaction_surfaces_mask_without_exemption_admission() {
+        let content = format!("credential: {}", openai_project_key_fixture());
+
+        for surface in [
+            RedactionSurface::GitIngest,
+            RedactionSurface::SessionMirror,
+            RedactionSurface::McpDiagnostic,
+        ] {
+            let masked = mask_for_redaction_surface(surface, &content);
+            assert!(masked.contains(REDACTION_MARKER));
+            assert!(check(masked.as_ref()).is_ok());
+        }
     }
 
     #[test]

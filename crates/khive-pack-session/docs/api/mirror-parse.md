@@ -56,9 +56,11 @@ unknown internal blocks are not display text. The parser then appends a
 distinct top-level `text` value because agent turns can carry tool blocks and
 a separate final answer at the same time; when `text` exactly duplicates a
 text block it is emitted only once. Older exports that use `role` instead of
-`sender` retain the same user/assistant normalization. Every extracted text
-and serialized raw message is passed through the canonical secret masker
-before it becomes a `ParsedEvent`.
+`sender` retain the same user/assistant normalization. Every extracted text and serialized raw
+message is passed through the typed `SessionMirror` permanent mask-only surface before it becomes a
+`ParsedEvent`. Per ADR-115 Amendment 2 the final stored targets are `session_messages.text` and
+`session_messages.raw`; the surface has no exemption lookup, posture stamp, or atomic
+exemption-success event.
 Malformed conversations are skipped individually; invalid JSON or a non-array
 top level returns `None` so the ingest cursor cannot advance.
 
