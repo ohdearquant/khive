@@ -124,26 +124,29 @@ class Edge(_Record):
     kind: EdgeRelation
     members: list[Incidence] = Field(default_factory=list)
 
-    def _by_role(self, role: str) -> Incidence | None:
-        return next((m for m in self.members if m.role == role), None)
-
-    # -- binary-edge conveniences -----------------------------------------
+    # -- membership reads (roles are data, not schema) ---------------------
 
     @property
-    def source(self) -> Incidence | None:
-        return self._by_role("source")
+    def node_ids(self) -> list[str]:
+        return [m.node_id for m in self.members]
 
-    @property
-    def target(self) -> Incidence | None:
-        return self._by_role("target")
+    def with_role(self, role: str) -> list[Incidence]:
+        return [m for m in self.members if m.role == role]
 
+    def others(self, node_id: str) -> list[Incidence]:
+        """Everyone else in this edge — the neighbor set as seen from one node."""
+        return [m for m in self.members if m.node_id != node_id]
+
+    # Sugar for the two-incidence case only; None on hyperedges.
     @property
     def source_id(self) -> str | None:
-        return self.source.node_id if self.source else None
+        ms = self.with_role("source")
+        return ms[0].node_id if len(ms) == 1 else None
 
     @property
     def target_id(self) -> str | None:
-        return self.target.node_id if self.target else None
+        ms = self.with_role("target")
+        return ms[0].node_id if len(ms) == 1 else None
 
     def weight_for(self, node_id: str) -> float:
         """This edge's weight relative to one participating node."""

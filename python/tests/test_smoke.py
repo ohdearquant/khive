@@ -59,6 +59,14 @@ def test_hyperedge_three_members(db: Khive):
     )
     assert len(edge.members) == 3
     assert edge.weight_for(xs[2].id) == 0.2
+    assert edge.source_id is None, "hyperedges have members, not a source/target"
+
+    # The hyperedge must be REAL topology: reachable from any member,
+    # exposing every co-member with that co-member's own weight.
+    hits = db.graph.incident(xs[2].id, kind="composed_with")
+    assert any(e.id == edge.id for e in hits), "edge must be found from a non-source member"
+    neighbors = {m.node_id: m.weight for _, m in db.graph.co_members(xs[2].id)}
+    assert neighbors[xs[0].id] == 1.0 and neighbors[xs[1].id] == 0.6
 
 
 def test_note_and_search(db: Khive):

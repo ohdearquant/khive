@@ -353,6 +353,26 @@ class _Graph:
         )
         return _page(raw, _edge_from_wire)
 
+    # -- incidence-aware reads (client-side PROTOTYPE) ---------------------
+    # The target engine computes these as an incidence join server-side:
+    #   neighbors(x) = incidences[node=x] JOIN incidences[same edge, node!=x]
+    # Until that lands, these scan the edge list client-side. Correct on any
+    # edge arity; O(edges) — fine for experiments, not for a big store.
+
+    def incident(self, node_id: str, *, kind: str | None = None) -> list[Edge]:
+        """Every edge this node participates in, whatever its arity."""
+        page = self.edges(limit=1000)
+        return [
+            e
+            for e in page.items
+            if node_id in e.node_ids and (kind is None or e.kind.value == kind)
+        ]
+
+    def co_members(self, node_id: str) -> list[tuple[Edge, Incidence]]:
+        """(edge, other-member) pairs — the hypergraph neighbor view,
+        each neighbor carrying ITS OWN weight in the shared edge."""
+        return [(e, m) for e in self.incident(node_id) for m in e.others(node_id)]
+
 
 def _json_pretty(value: Any) -> str:
     return json.dumps(value, indent=2, default=str)
