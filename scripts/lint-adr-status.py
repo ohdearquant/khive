@@ -88,12 +88,15 @@ SECTION_HEADING = re.compile(r"^#{2,6}\s+\S")
 # Fenced code blocks and HTML comments are display text, not declarations. A
 # line-based parser with no notion of either counts a status-shaped example
 # inside them as real, which lets an ADR with no visible header status pass.
-# A fence closes only on the opener's own character, at least as long as the
-# opener, with nothing but whitespace after (CommonMark). Treating any
-# fence-prefixed line as a toggle lets `~~~not-a-closing-fence` inside a
-# backtick block end the block early, turning fenced display text back into
-# visible text — which reads a fenced-only status as a real declaration.
-FENCE_OPEN = re.compile(r"^\s*(?P<chars>`{3,}|~{3,})")
+# Fence lines follow CommonMark: at most three spaces of indentation (a
+# tab or a fourth space makes the line indented code, not a fence), and a
+# backtick fence's info string may not contain a backtick. A fence closes
+# only on the opener's own character, at least as long as the opener, with
+# only spaces or tabs after. Any looser recognition lets a lookalike line —
+# an opposite-character fence, an info-text or shorter run, or a 4-space
+# indented one — end a block early, turning fenced display text back into
+# visible text, which reads a fenced-only status as a real declaration.
+FENCE_OPEN = re.compile(r"^ {0,3}(?P<chars>`{3,}|~{3,})(?P<info>.*)$")
 # The cap exists so a special file or an oversized substitute cannot make CI
 # read without bound; a plausible ADR is orders of magnitude smaller.
 MAX_ADR_BYTES = 1 << 20
@@ -198,10 +201,12 @@ def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
             continue
         if not in_comment:
             opener = FENCE_OPEN.match(line)
-            if opener:
+            if opener and not (
+                opener.group("chars")[0] == "`" and "`" in opener.group("info")
+            ):
                 chars = opener.group("chars")
                 fence_close = re.compile(
-                    rf"^\s*{re.escape(chars[0])}{{{len(chars)},}}\s*$"
+                    rf"^ {{0,3}}{re.escape(chars[0])}{{{len(chars)},}}[ \t]*$"
                 )
                 visible.append(None)
                 fence_marker.append(True)
@@ -405,11 +410,13 @@ MUST_FAIL = {
         "## Context\n"
     ),
     # Fence-breaking lines INSIDE the block: an opposite-character fence line,
-    # a same-character line with info text, and a SHORTER same-character run.
-    # None of them closes the block under CommonMark, so the only status text
-    # stays fenced display text and the record declares nothing — a parser
-    # that toggles on any fence-prefixed line closes the block early, reads
-    # the status as visible, and wrongly accepts this file.
+    # a same-character line with info text, a SHORTER same-character run, and
+    # a 4-space-indented same-character run. None of them closes the block
+    # under CommonMark, so the only status text stays fenced display text and
+    # the record declares nothing — a parser that toggles on any
+    # fence-prefixed line, or accepts arbitrary closer indentation, closes
+    # the block early, reads the status as visible, and wrongly accepts this
+    # file.
     "ADR-907-fence-not-closed-by-lookalikes.md": (
         "# ADR-907: Something\n"
         "\n"
@@ -417,6 +424,7 @@ MUST_FAIL = {
         "~~~not-a-closing-fence\n"
         "```` info-text-means-not-a-closer\n"
         "```\n"
+        "    ````\n"
         "Status: accepted\n"
         "````\n"
         "\n"
@@ -523,6 +531,30 @@ MUST_PASS = {
         "~~~\n"
         "Status: proposed\n"
         "```\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A 4-space-indented fence lookalike is indented code, not an opener
+    # (CommonMark). A parser that opens on it swallows the real declaration
+    # below and rejects this record as declaring nothing.
+    "ADR-918-indented-fence-lookalike-not-an-opener.md": (
+        "# ADR-918: Something\n"
+        "\n"
+        "    ```text\n"
+        "\n"
+        "**Status**: Accepted\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A backtick fence's info string may not contain a backtick (CommonMark);
+    # such a line is inline code, not an opener. A parser that opens on it
+    # swallows the real declaration below.
+    "ADR-919-backtick-info-not-an-opener.md": (
+        "# ADR-919: Something\n"
+        "\n"
+        "```a`b`\n"
+        "\n"
+        "**Status**: Accepted\n"
         "\n"
         "## Context\n"
     ),
