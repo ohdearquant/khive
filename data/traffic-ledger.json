@@ -245,13 +245,43 @@
       "unique_clones": 143,
       "views": 74,
       "unique_views": 16
+    },
+    "2026-08-27": {
+      "clones": 6799,
+      "unique_clones": 30,
+      "views": 99,
+      "unique_views": 11
+    },
+    "2026-08-28": {
+      "clones": 5567,
+      "unique_clones": 77,
+      "views": 20,
+      "unique_views": 6
+    },
+    "2026-08-29": {
+      "clones": 6359,
+      "unique_clones": 95,
+      "views": 59,
+      "unique_views": 3
+    },
+    "2026-08-30": {
+      "clones": 4652,
+      "unique_clones": 87,
+      "views": 32,
+      "unique_views": 8
+    },
+    "2026-08-31": {
+      "clones": 218,
+      "unique_clones": 65,
+      "views": 30,
+      "unique_views": 9
     }
   },
   "last_snapshot": {
-    "taken_at": "2026-08-27T08:04:28Z",
-    "clones_14d": 31035,
-    "unique_clones_14d": 620,
-    "views_14d": 837,
-    "unique_views_14d": 78
+    "taken_at": "2026-09-01T05:30:19Z",
+    "clones_14d": 51164,
+    "unique_clones_14d": 685,
+    "views_14d": 580,
+    "unique_views_14d": 88
   }
 }
