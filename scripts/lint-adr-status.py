@@ -77,10 +77,21 @@ KNOWN_STATUSES = (
 
 # `**Status**:` / `- Status:` / `- **Status:**` / bare `Status:`
 INLINE_STATUS = re.compile(r"^\s*(?:-\s*)?\*{0,2}\s*status\s*\*{0,2}\s*:", re.IGNORECASE)
+# The same label ANYWHERE in a line. One line carrying two of these carries two
+# declarations, and taking only the first would silently prefer one of them —
+# the exact defect this lint exists to reject when the copies sit on two lines.
+INLINE_STATUS_ANYWHERE = re.compile(r"\*{0,2}\bstatus\s*\*{0,2}\s*:", re.IGNORECASE)
 # `## Status`, any heading level, nothing else on the line
 HEADING_STATUS = re.compile(r"^#{1,6}\s+status\s*$", re.IGNORECASE)
 # Any other `## ` heading closes the document header.
 SECTION_HEADING = re.compile(r"^#{2,6}\s+\S")
+# Fenced code blocks and HTML comments are display text, not declarations. A
+# line-based parser with no notion of either counts a status-shaped example
+# inside them as real, which lets an ADR with no visible header status pass.
+FENCE = re.compile(r"^\s*(```|~~~)")
+# The cap exists so a special file or an oversized substitute cannot make CI
+# read without bound; a plausible ADR is orders of magnitude smaller.
+MAX_ADR_BYTES = 1 << 20
 
 
 class Declaration:
@@ -101,18 +112,44 @@ def header_declarations(lines: list[str]) -> list[Declaration]:
     preferring one of them.
     """
     found: list[Declaration] = []
+    in_fence = False
+    in_comment = False
     for i, line in enumerate(lines):
+        # Fence and HTML-comment state first: nothing inside either is a
+        # declaration, and a fence marker must not be read as a value either.
+        if FENCE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        stripped = line.strip()
+        if stripped.startswith("<!--"):
+            if "-->" not in stripped:
+                in_comment = True
+            continue
         if SECTION_HEADING.match(line) and not HEADING_STATUS.match(line):
             break
         if HEADING_STATUS.match(line):
             for j in range(i + 1, len(lines)):
+                if FENCE.match(lines[j]):
+                    break  # a fenced value is display text, not a declaration
                 if lines[j].strip():
                     found.append(Declaration(j + 1, lines[j].strip(), "heading"))
                     break
             continue
         if INLINE_STATUS.match(line):
-            value = line.split(":", 1)[1].strip()
-            found.append(Declaration(i + 1, value, "inline"))
+            # Every label on the line is a declaration. Taking only the first
+            # would let `**Status**: accepted **Status**: proposed` pass as a
+            # single valid declaration whose rider swallows the second one.
+            labels = list(INLINE_STATUS_ANYWHERE.finditer(line))
+            for k, m in enumerate(labels):
+                end = labels[k + 1].start() if k + 1 < len(labels) else len(line)
+                value = line[m.end() : end].strip()
+                found.append(Declaration(i + 1, value, "inline"))
     return found
 
 
@@ -125,14 +162,55 @@ def status_word(value: str) -> str | None:
     """
     cleaned = value.lstrip("*").strip().lower()
     for word in KNOWN_STATUSES:
-        if cleaned.startswith(word):
-            return word
+        if not cleaned.startswith(word):
+            continue
+        # Token boundary: the character after the matched word must not extend
+        # it. Without this, `acceptedish` passes as `accepted`. Riders remain
+        # fine — `/`, ` `, `(`, `\` and end-of-value are all boundaries.
+        rest = cleaned[len(word) :]
+        if rest and (rest[0].isalnum() or rest[0] == "_"):
+            continue
+        return word
     return None
+
+
+def read_adr_contained(path: Path) -> str | None:
+    """Read an ADR without following links or trusting the file's shape.
+
+    This runs in CI on pull-request content, so the file under a trusted name
+    may be an attacker's: a symlink pointing out of the tree (whose contents
+    would then be echoed into public CI logs by the messages below), or a
+    special file that blocks the read forever. `O_NOFOLLOW` refuses the link at
+    open time rather than racing a separate check; `fstat` on the open
+    descriptor refuses non-regular files; the read is capped at MAX_ADR_BYTES.
+    `None` means the file was refused — the caller reports that as a failure,
+    never as a clean skip.
+    """
+    import os
+    import stat as stat_mod
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode) or st.st_size > MAX_ADR_BYTES:
+            return None
+        return os.read(fd, MAX_ADR_BYTES).decode("utf-8", errors="replace")
+    finally:
+        os.close(fd)
 
 
 def check_file(path: Path) -> list[str]:
     """Rule violations in one ADR, as printable messages. Empty means it passes."""
-    lines = path.read_text(encoding="utf-8").splitlines()
+    text = read_adr_contained(path)
+    if text is None:
+        return [
+            f"{path.name}: refused — not a regular readable file under the size cap "
+            f"(symlinks, special files, and oversized files are not lintable ADRs)."
+        ]
+    lines = text.splitlines()
     decls = header_declarations(lines)
     name = path.name
 
@@ -223,6 +301,39 @@ MUST_FAIL = {
         "\n"
         "## Context\n"
     ),
+    # A malformed value that merely BEGINS with a lifecycle word. A prefix
+    # match without a token boundary reads this as `accepted`.
+    "ADR-904-token-boundary.md": (
+        "# ADR-904: Something\n"
+        "\n"
+        "**Status**: acceptedish\n"
+        "\n"
+        "## Context\n"
+    ),
+    # Two declarations on ONE line. A first-match parser reads this as a single
+    # valid declaration whose rider swallows the second — the same undecided
+    # authority as ADR-902, hidden by line packing.
+    "ADR-905-two-on-one-line.md": (
+        "# ADR-905: Something\n"
+        "\n"
+        "**Status**: accepted **Status**: proposed\n"
+        "\n"
+        "## Context\n"
+    ),
+    # The only status-shaped text is display text: a fenced example and an HTML
+    # comment. Neither is a declaration, so the record declares nothing and
+    # must fail — a fence-blind parser passes it.
+    "ADR-906-fenced-status-only.md": (
+        "# ADR-906: Something\n"
+        "\n"
+        "```markdown\n"
+        "Status: accepted\n"
+        "```\n"
+        "\n"
+        "<!-- Status: accepted -->\n"
+        "\n"
+        "## Context\n"
+    ),
 }
 
 MUST_PASS = {
@@ -271,6 +382,20 @@ MUST_PASS = {
         "# ADR-914: Something\n"
         "\n"
         "**Status**: Accepted/Ratified (2026-06-19)\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A fenced example in the header must not displace or duplicate the real
+    # declaration beside it — the fence-tracking fix must ignore display text
+    # without breaking a legitimate header that contains both.
+    "ADR-915-real-status-plus-fenced-example.md": (
+        "# ADR-915: Something\n"
+        "\n"
+        "**Status**: Accepted\n"
+        "\n"
+        "```text\n"
+        "Status: proposed   <- example output, not a declaration\n"
+        "```\n"
         "\n"
         "## Context\n"
     ),
@@ -323,7 +448,38 @@ def self_test() -> int:
             )
             problems += 1
 
-    total = len(MUST_FAIL) + len(MUST_PASS) + 1
+        # Symlink arm: a link under a trusted ADR name must be REFUSED, never
+        # read. The target is a real file with a valid header, so a parser that
+        # follows the link would report a clean pass — refusal is the only
+        # correct outcome, and it must arrive as a failure, not a skip.
+        target = Path(tmp) / "outside-the-adr-dir.md"
+        target.write_text("# X\n\n**Status**: accepted\n\n## Context\n", encoding="utf-8")
+        link = adr_dir / "ADR-907-symlink.md"
+        link.symlink_to(target)
+        if not check_file(link):
+            print("SELF-TEST: a symlinked ADR was linted instead of refused.", file=sys.stderr)
+            problems += 1
+        link.unlink()
+
+        # Non-empty tree arm: the CLI path is check_tree, and a self-test that
+        # only ever calls check_file cannot see a regression in discovery or
+        # aggregation. One passing and one failing record: rc must be 1.
+        (adr_dir / "ADR-920-pass.md").write_text(
+            "# ADR-920\n\n**Status**: accepted\n\n## Context\n", encoding="utf-8"
+        )
+        (adr_dir / "ADR-921-fail.md").write_text(
+            "# ADR-921\n\n**Date**: 2026-01-01\n\n## Context\n", encoding="utf-8"
+        )
+        print("lint-adr-status self-test: the next lines are the expected "
+              "mixed-tree failure report.", file=sys.stderr)
+        if check_tree(adr_dir) != 1:
+            print(
+                "SELF-TEST: a tree with one failing record did not exit 1 from check_tree.",
+                file=sys.stderr,
+            )
+            problems += 1
+
+    total = len(MUST_FAIL) + len(MUST_PASS) + 3
     print(f"lint-adr-status self-test: {total - problems}/{total} cases correct.")
     return 1 if problems else 0
 
