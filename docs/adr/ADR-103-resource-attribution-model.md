@@ -995,16 +995,16 @@ each brace-scoped and found write-free — are `wait_for_inbox_response`
 transitive callees below these named helpers are covered by the criterion's enforcement point
 (the census test and review of the handlers' own code), not by this table.
 
-| Verb | Category | Handler extent scanned | Dispatch-path writes | Eligible |
-|---|---|---|---|---|
-| `gtd.tasks` | Assertive | `crates/khive-pack-gtd/src/handlers.rs:1434-1618` | none | yes |
-| `gtd.next` | Assertive | `crates/khive-pack-gtd/src/handlers.rs:1291-1358` | none | yes |
-| `comm.inbox` | Assertive | `crates/khive-pack-comm/src/handlers.rs:462-681` | none | yes |
-| `comm.unread` | Assertive | `crates/khive-pack-comm/src/handlers.rs:841-853` | none | yes |
-| `comm.thread` | Assertive | `crates/khive-pack-comm/src/handlers.rs:1511-1834` | none (comment mentions only) | yes |
-| `comm.delivered` | Assertive | `crates/khive-pack-comm/src/handlers.rs:401-460` | none | yes |
-| `comm.probe` | Assertive | `crates/khive-pack-comm/src/handlers.rs:2838-2869` | none (doc-comment mention only) | yes |
-| `comm.health` | Assertive | `crates/khive-pack-comm/src/handlers.rs:2645-2836` | none | yes |
+| Verb             | Category  | Handler extent scanned                             | Dispatch-path writes            | Eligible |
+| ---------------- | --------- | -------------------------------------------------- | ------------------------------- | -------- |
+| `gtd.tasks`      | Assertive | `crates/khive-pack-gtd/src/handlers.rs:1434-1618`  | none                            | yes      |
+| `gtd.next`       | Assertive | `crates/khive-pack-gtd/src/handlers.rs:1291-1358`  | none                            | yes      |
+| `comm.inbox`     | Assertive | `crates/khive-pack-comm/src/handlers.rs:462-681`   | none                            | yes      |
+| `comm.unread`    | Assertive | `crates/khive-pack-comm/src/handlers.rs:841-853`   | none                            | yes      |
+| `comm.thread`    | Assertive | `crates/khive-pack-comm/src/handlers.rs:1511-1834` | none (comment mentions only)    | yes      |
+| `comm.delivered` | Assertive | `crates/khive-pack-comm/src/handlers.rs:401-460`   | none                            | yes      |
+| `comm.probe`     | Assertive | `crates/khive-pack-comm/src/handlers.rs:2838-2869` | none (doc-comment mention only) | yes      |
+| `comm.health`    | Assertive | `crates/khive-pack-comm/src/handlers.rs:2645-2836` | none                            | yes      |
 
 ### Named exclusions, with reasons
 
