@@ -678,3 +678,28 @@ This amendment does not revisit "Split the audit row so accounting lives in its 
 Alternatives considered above — that remains rejected for the reasons stated there (a migration,
 and it breaks the response/audit-payload identity property). The accepted trade here is a bounded,
 measured undercount over that redesign.
+
+## Amendment 2 (2026-09-01): Extending Amendment 1's Verb Set to Operational Reads
+
+**Status**: Proposed.
+
+Amendment 1's exception to D2 and D4/INV-1 was scoped to the eleven verbs on
+`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`. ADR-103 Amendment 4 extends that list with eight
+operational read verbs (`gtd.tasks`, `gtd.next`, `comm.inbox`, `comm.unread`, `comm.thread`,
+`comm.delivered`, `comm.probe`, `comm.health`), each individually reviewed against the same
+criterion: declared `VerbCategory::Assertive` and no write-shaped operation on the dispatch path.
+The per-verb evidence table, the two named exclusions (`comm.heartbeat`, whose primary effect is
+a persist; `comm.cursor_get`, whose dispatch path checks out the writer and runs a schema-ensure
+script), and the incident measurement motivating the extension live in ADR-103 Amendment 4.
+
+Nothing else in Amendment 1 changes. The exception remains:
+
+- reads only, for the two transient admission terminal reasons only, never persistent store
+  failure;
+- opt-in per verb and fail-closed by default (`admission_degrade_safe`), so the eight additions
+  are deliberate review products, not a loosening of the default posture;
+- counted on the same two disjoint diagnostics counters, so the undercount stays measurable.
+
+D4/INV-1 continues to hold without qualification for every write, every non-allowlisted Assertive
+handler, gate-denial rows, unknown-verb rows, and `git.digest` receipts — the sentence is
+unchanged; only the enumerated verb set it excepts has grown, by review.
