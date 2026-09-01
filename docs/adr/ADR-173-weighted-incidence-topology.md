@@ -65,7 +65,7 @@ two-row special case rather than the schema.**
    fact.
 4. **Traversal is an incidence join.** `neighbors(x)` =
    `incidences[node_id = x] ⋈ incidences[same edge, node_id ≠ x]`; the
-   result pairs each co-member with *its own* weight in the shared edge.
+   result pairs each co-member with _its own_ weight in the shared edge.
    Degree = incidence count. Relation filters apply on the edge row's
    `kind` as before.
 5. **Weights are stored absolute; normalization is the algorithm's.**

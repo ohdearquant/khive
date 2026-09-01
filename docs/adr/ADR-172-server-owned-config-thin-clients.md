@@ -13,7 +13,7 @@ wins), builds its own backend map from the `[[backends]]` /
 opening the store files directly. The serving daemon is an optimization,
 not an authority: `crates/kkernel/src/exec.rs` states the contract in its
 opening comment — the caller's config fingerprint is checked against the
-daemon's, and *"a mismatch falls back to local"*. The daemon wire enforces
+daemon's, and _"a mismatch falls back to local"_. The daemon wire enforces
 the same coupling: `DaemonRequestFrame.config_id` is equality-checked
 against the daemon's own id (`crates/khive-runtime/src/daemon.rs`), so a
 client is only served if its config byte-for-byte agrees with the server's.
@@ -29,7 +29,7 @@ The consequences follow mechanically:
 2. **Divergence fails toward a second writer.** When a copy drifts, the
    fingerprint mismatch does not fail the request — it silently activates
    the caller's embedded engine, which then writes the store files under
-   its *own* backend map. A backend split performed by editing config
+   its _own_ backend map. A backend split performed by editing config
    copies is one missed copy away from a process quietly writing a table
    back into the store it was just split out of. This is the single-writer
    guarantee's structural hole, and historical writer-contention incidents
@@ -61,7 +61,7 @@ no fallback.**
 3. **No local fallback.** For a socket-capable caller, an unreachable
    daemon is a connection error. The embedded-engine fallback in the exec
    path is removed; the only process that constructs a runtime over the
-   configured backends is the daemon itself. (`kkernel` may *start* the
+   configured backends is the daemon itself. (`kkernel` may _start_ the
    daemon when none is running — auto-spawn replaces embed as the
    cold-start story.)
 4. **`config_id` demotes from precondition to fact.** The daemon reports
