@@ -111,34 +111,20 @@ def header_declarations(lines: list[str]) -> list[Declaration]:
     is what lets the caller reject a second declaration instead of silently
     preferring one of them.
     """
+    visible, fence_marker = visible_view(lines)
     found: list[Declaration] = []
-    in_fence = False
-    in_comment = False
-    for i, line in enumerate(lines):
-        # Fence and HTML-comment state first: nothing inside either is a
-        # declaration, and a fence marker must not be read as a value either.
-        if FENCE.match(line):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        if in_comment:
-            if "-->" in line:
-                in_comment = False
-            continue
-        stripped = line.strip()
-        if stripped.startswith("<!--"):
-            if "-->" not in stripped:
-                in_comment = True
+    for i, line in enumerate(visible):
+        if fence_marker[i] or line is None:
             continue
         if SECTION_HEADING.match(line) and not HEADING_STATUS.match(line):
             break
         if HEADING_STATUS.match(line):
             for j in range(i + 1, len(lines)):
-                if FENCE.match(lines[j]):
+                if fence_marker[j]:
                     break  # a fenced value is display text, not a declaration
-                if lines[j].strip():
-                    found.append(Declaration(j + 1, lines[j].strip(), "heading"))
+                v = visible[j]
+                if v is not None and v.strip():
+                    found.append(Declaration(j + 1, v.strip(), "heading"))
                     break
             continue
         if INLINE_STATUS.match(line):
@@ -151,6 +137,62 @@ def header_declarations(lines: list[str]) -> list[Declaration]:
                 value = line[m.end() : end].strip()
                 found.append(Declaration(i + 1, value, "inline"))
     return found
+
+
+def strip_comments(line: str, in_comment: bool) -> tuple[str, bool]:
+    """The text of one line with HTML-comment spans removed, plus the state.
+
+    Character-position based, not `startswith`: a comment that opens after
+    other text on the line (`Some text <!-- hidden`) must still open, or every
+    status-shaped line until the matching `-->` is parsed as a declaration.
+    A declaration BEFORE the comment opener on the same line survives.
+    """
+    out: list[str] = []
+    i = 0
+    while True:
+        if in_comment:
+            j = line.find("-->", i)
+            if j == -1:
+                return "".join(out), True
+            i = j + 3
+            in_comment = False
+        else:
+            j = line.find("<!--", i)
+            if j == -1:
+                out.append(line[i:])
+                return "".join(out), False
+            out.append(line[i:j])
+            i = j + 4
+            in_comment = True
+
+
+def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
+    """Per-line declaration-relevant text: fences and comments removed.
+
+    `visible[i]` is the line with comment spans stripped, or None inside a
+    fenced block; `fence_marker[i]` marks the fence delimiters themselves.
+    Fence markers inside a comment do not toggle fence state, and comment
+    openers inside a fence do not open a comment — each construct is display
+    text within the other.
+    """
+    visible: list[str | None] = []
+    fence_marker: list[bool] = []
+    in_fence = False
+    in_comment = False
+    for line in lines:
+        if not in_comment and FENCE.match(line):
+            in_fence = not in_fence
+            visible.append(None)
+            fence_marker.append(True)
+            continue
+        if in_fence:
+            visible.append(None)
+            fence_marker.append(False)
+            continue
+        text, in_comment = strip_comments(line, in_comment)
+        visible.append(text)
+        fence_marker.append(False)
+    return visible, fence_marker
 
 
 def status_word(value: str) -> str | None:
@@ -174,23 +216,33 @@ def status_word(value: str) -> str | None:
     return None
 
 
-def read_adr_contained(path: Path) -> str | None:
+def read_adr_contained(path: Path, base_dir: Path) -> str | None:
     """Read an ADR without following links or trusting the file's shape.
 
     This runs in CI on pull-request content, so the file under a trusted name
-    may be an attacker's: a symlink pointing out of the tree (whose contents
-    would then be echoed into public CI logs by the messages below), or a
-    special file that blocks the read forever. `O_NOFOLLOW` refuses the link at
-    open time rather than racing a separate check; `fstat` on the open
-    descriptor refuses non-regular files; the read is capped at MAX_ADR_BYTES.
-    `None` means the file was refused — the caller reports that as a failure,
-    never as a clean skip.
+    may be an attacker's: a path outside the ADR tree, a symlink pointing out
+    of the tree (whose contents would then be echoed into public CI logs by
+    the messages below), or a special file that blocks the read.
+
+    Containment first: the path itself must live directly under `base_dir` —
+    O_NOFOLLOW and fstat validate the FILE, not the PATH, and neither stops a
+    caller handed `../../secrets.md`. Then `O_NOFOLLOW` refuses a symlink at
+    open time rather than racing a separate check, and `O_NONBLOCK` makes the
+    open RETURN on a FIFO instead of blocking until a writer appears — without
+    it, CI hangs at `os.open` and the `S_ISREG` rejection below is never
+    reached (O_NOFOLLOW covers links only, it does nothing for FIFOs).
+    `O_NONBLOCK` is a no-op for regular-file reads, so the capped read below
+    is unaffected. `None` means the file was refused — the caller reports
+    that as a failure, never as a clean skip.
     """
     import os
     import stat as stat_mod
 
+    resolved_parent = Path(os.path.realpath(path.parent))
+    if resolved_parent != Path(os.path.realpath(base_dir)):
+        return None
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
@@ -202,13 +254,14 @@ def read_adr_contained(path: Path) -> str | None:
         os.close(fd)
 
 
-def check_file(path: Path) -> list[str]:
+def check_file(path: Path, base_dir: Path | None = None) -> list[str]:
     """Rule violations in one ADR, as printable messages. Empty means it passes."""
-    text = read_adr_contained(path)
+    text = read_adr_contained(path, base_dir if base_dir is not None else ADR_DIR)
     if text is None:
         return [
             f"{path.name}: refused — not a regular readable file under the size cap "
-            f"(symlinks, special files, and oversized files are not lintable ADRs)."
+            f"inside the ADR directory (out-of-tree paths, symlinks, special files, "
+            f"and oversized files are not lintable ADRs)."
         ]
     lines = text.splitlines()
     decls = header_declarations(lines)
@@ -248,7 +301,7 @@ def check_tree(adr_dir: Path) -> int:
 
     failures: list[str] = []
     for path in paths:
-        failures.extend(check_file(path))
+        failures.extend(check_file(path, base_dir=adr_dir))
 
     for message in failures:
         print(f"ERROR: {message}", file=sys.stderr)
@@ -334,6 +387,19 @@ MUST_FAIL = {
         "\n"
         "## Context\n"
     ),
+    # A comment that OPENS MID-LINE. Open-detection keyed on startswith never
+    # flips the state here, so the status on the next line — inside the
+    # comment — is read as a real declaration. The record declares nothing
+    # visible and must fail.
+    "ADR-908-midline-comment.md": (
+        "# ADR-908: Something\n"
+        "\n"
+        "Some text <!-- opening mid-line\n"
+        "**Status**: proposed\n"
+        "-->\n"
+        "\n"
+        "## Context\n"
+    ),
 }
 
 MUST_PASS = {
@@ -399,6 +465,17 @@ MUST_PASS = {
         "\n"
         "## Context\n"
     ),
+    # A declaration BEFORE a comment that opens later on the same line must
+    # survive comment stripping — the mid-line-open fix must not eat the text
+    # ahead of the opener, and the trailing annotation must not read as a
+    # second declaration.
+    "ADR-916-status-then-trailing-comment.md": (
+        "# ADR-916: Something\n"
+        "\n"
+        "**Status**: Accepted <!-- reviewed 2026-09-01, Status: proposed was rejected -->\n"
+        "\n"
+        "## Context\n"
+    ),
 }
 
 
@@ -411,7 +488,7 @@ def self_test() -> int:
         for name, body in MUST_FAIL.items():
             path = adr_dir / name
             path.write_text(body, encoding="utf-8")
-            if not check_file(path):
+            if not check_file(path, base_dir=adr_dir):
                 print(f"SELF-TEST: {name} was accepted but must fail.", file=sys.stderr)
                 problems += 1
             path.unlink()
@@ -419,7 +496,7 @@ def self_test() -> int:
         for name, body in MUST_PASS.items():
             path = adr_dir / name
             path.write_text(body, encoding="utf-8")
-            failures = check_file(path)
+            failures = check_file(path, base_dir=adr_dir)
             if failures:
                 print(
                     f"SELF-TEST: {name} must pass but was rejected: {failures[0]}",
@@ -456,10 +533,40 @@ def self_test() -> int:
         target.write_text("# X\n\n**Status**: accepted\n\n## Context\n", encoding="utf-8")
         link = adr_dir / "ADR-907-symlink.md"
         link.symlink_to(target)
-        if not check_file(link):
+        if not check_file(link, base_dir=adr_dir):
             print("SELF-TEST: a symlinked ADR was linted instead of refused.", file=sys.stderr)
             problems += 1
         link.unlink()
+
+        # FIFO arm: os.open on a FIFO with no writer BLOCKS unless the open is
+        # non-blocking, and a blocked open never reaches the S_ISREG rejection
+        # — CI hangs instead of failing. The alarm turns a regression back
+        # into a loud failure rather than a silent hang.
+        import os as os_mod
+        import signal
+
+        fifo = adr_dir / "ADR-909-fifo.md"
+        os_mod.mkfifo(fifo)
+        signal.alarm(10)
+        try:
+            if not check_file(fifo, base_dir=adr_dir):
+                print("SELF-TEST: a FIFO under an ADR name was linted instead of refused.",
+                      file=sys.stderr)
+                problems += 1
+        finally:
+            signal.alarm(0)
+            fifo.unlink()
+
+        # Containment arm: a path OUTSIDE the ADR directory must be refused
+        # even when the file itself is a perfectly regular, valid ADR —
+        # O_NOFOLLOW and fstat validate the file, only the path check
+        # validates the path.
+        outside = Path(tmp) / "ADR-910-outside.md"
+        outside.write_text("# X\n\n**Status**: accepted\n\n## Context\n", encoding="utf-8")
+        if not check_file(outside, base_dir=adr_dir):
+            print("SELF-TEST: an out-of-tree path was linted instead of refused.",
+                  file=sys.stderr)
+            problems += 1
 
         # Non-empty tree arm: the CLI path is check_tree, and a self-test that
         # only ever calls check_file cannot see a regression in discovery or
@@ -479,7 +586,7 @@ def self_test() -> int:
             )
             problems += 1
 
-    total = len(MUST_FAIL) + len(MUST_PASS) + 3
+    total = len(MUST_FAIL) + len(MUST_PASS) + 5
     print(f"lint-adr-status self-test: {total - problems}/{total} cases correct.")
     return 1 if problems else 0
 
