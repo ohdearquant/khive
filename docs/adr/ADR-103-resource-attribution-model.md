@@ -988,12 +988,18 @@ write-shaped call on the dispatch path). The review evidence is a lexical scan f
 (comment-only mentions excluded), at the revision this amendment was drafted against.
 
 **Evidence depth, stated precisely:** the scan covers each handler's full brace-scoped extent
-PLUS each helper the handler calls that could carry a write off-extent. The helpers so scanned —
-each brace-scoped and found write-free — are `wait_for_inbox_response`
-(`crates/khive-pack-comm/src/handlers.rs:683-731`), `count_unread_messages` (`:855-905`), and
-`notes_seq_high_water_mark` (`:2871-2887`). A lexical scan answers the question it encodes:
-transitive callees below these named helpers are covered by the criterion's enforcement point
-(the census test and review of the handlers' own code), not by this table.
+PLUS each direct helper the handlers call that could carry a write off-extent. The helpers so
+scanned — each brace-scoped and found write-free — are `wait_for_inbox_response`
+(`crates/khive-pack-comm/src/handlers.rs:683-731`), `query_inbox_response` (`:734-837`),
+`count_unread_messages` (`:855-905`), `load_quarantine_counts` (`:2544-2609`),
+`notes_seq_high_water_mark` (`:2871-2887`), `query_probe` (`:2889-2986`),
+`fetch_all_matching_tasks` (`crates/khive-pack-gtd/src/handlers.rs:802-839`), and
+`diagnose_tasks` (`crates/khive-pack-gtd/src/dependency.rs:46-88`). An earlier draft named only
+three of these; review found the enumeration incomplete against its own claim, and the other
+five were scanned with the same instrument before this text was corrected — all clean, table
+unchanged. A lexical scan answers the question it encodes: transitive callees below these named
+helpers are covered by the criterion's enforcement point (the census test and review of the
+handlers' own code), not by this table.
 
 | Verb             | Category  | Handler extent scanned                             | Dispatch-path writes            | Eligible |
 | ---------------- | --------- | -------------------------------------------------- | ------------------------------- | -------- |
