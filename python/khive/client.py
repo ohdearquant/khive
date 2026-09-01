@@ -18,11 +18,12 @@ Write semantics, stated once because every experiment depends on them:
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
 from .errors import BatchError, OperationError
-from .models import Edge, EdgeRelation, Entity, Incidence, Note, OpResult, Page
+from .models import Attachment, Edge, EdgeRelation, Entity, Incidence, Note, OpResult, Page
 from .ops import encode, op
 from .transport import Session, SocketTransport, Transport
 
@@ -102,6 +103,7 @@ class Khive:
         self.entities = _Entities(self)
         self.notes = _Notes(self)
         self.graph = _Graph(self)
+        self.blobs = _Blobs(self)
 
     # -- raw planes --------------------------------------------------------
 
@@ -372,6 +374,63 @@ class _Graph:
         """(edge, other-member) pairs — the hypergraph neighbor view,
         each neighbor carrying ITS OWN weight in the shared edge."""
         return [(e, m) for e in self.incident(node_id) for m in e.others(node_id)]
+
+
+class _Blobs:
+    """Content-addressed blob store: bytes in, BLAKE3 ContentRef out.
+
+    Storage backend (local file tree vs S3) is the daemon's config, not the
+    client's concern — same put/get/stat either way. Idempotent: identical
+    bytes return the identical ref without a re-write."""
+
+    def __init__(self, db: Khive) -> None:
+        self._db = db
+
+    def put(self, data: bytes) -> str:
+        raw = _one(
+            self._db.session.request(
+                encode([op("blob.put", bytes=base64.b64encode(data).decode())])
+            )
+        )
+        return raw["content_ref"]
+
+    def get(self, content_ref: str) -> bytes:
+        raw = _one(self._db.session.request(encode([op("blob.get", content_ref=content_ref)])))
+        return base64.b64decode(raw["bytes"])
+
+    def stat(self, content_ref: str) -> dict[str, Any]:
+        return _one(self._db.session.request(encode([op("blob.stat", content_ref=content_ref)])))
+
+    # -- attachments (PROTOTYPE carrier) -----------------------------------
+    # The db has a first-class attachments table keyed (record, role), but
+    # no public verb writes it yet. Until that verb lands, the attachment
+    # descriptor rides in the record's properties["attachments"][role] and
+    # the bytes live in the blob store — same information, migratable.
+
+    def attach(
+        self,
+        record_id: str,
+        data: bytes,
+        *,
+        role: str = "attachment",
+        media_type: str | None = None,
+    ) -> Attachment:
+        ref = self.put(data)
+        att = Attachment(content_ref=ref, role=role, media_type=media_type, size=len(data))
+        rec = _one(self._db.session.request(encode([op("get", id=record_id)])))
+        atts = dict((rec.get("properties") or {}).get("attachments") or {})
+        atts[role] = att.model_dump(exclude_none=True)
+        props = dict(rec.get("properties") or {})
+        props["attachments"] = atts
+        _one(self._db.session.request(encode([op("update", id=record_id, properties=props)])))
+        return att
+
+    def attachment(self, record_id: str, role: str = "attachment") -> bytes:
+        rec = _one(self._db.session.request(encode([op("get", id=record_id)])))
+        atts = (rec.get("properties") or {}).get("attachments") or {}
+        if role not in atts:
+            raise KeyError(f"record {record_id} has no attachment role {role!r}")
+        return self.get(atts[role]["content_ref"])
 
 
 def _json_pretty(value: Any) -> str:
