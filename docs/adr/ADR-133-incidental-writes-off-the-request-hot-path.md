@@ -703,3 +703,8 @@ Nothing else in Amendment 1 changes. The exception remains:
 D4/INV-1 continues to hold without qualification for every write, every non-allowlisted Assertive
 handler, gate-denial rows, unknown-verb rows, and `git.digest` receipts — the sentence is
 unchanged; only the enumerated verb set it excepts has grown, by review.
+
+The exception's enumerated verb set is authoritative in ADR-103 Amendment 4, which also requires
+the extended census test to assert list-to-enumeration equality and per-entry handler resolution —
+so a branch widening the constant without a signed amendment fails the census rather than widening
+this exception silently.

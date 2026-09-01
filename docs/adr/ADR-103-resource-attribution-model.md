@@ -983,20 +983,28 @@ amplified the outage: clients retried failed reads into an already-saturated adm
 
 Extend `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` with eight operational read verbs, each
 individually reviewed under Amendment 3's criterion (declared `VerbCategory::Assertive` AND no
-write-shaped call on the dispatch path). The review evidence is a lexical scan of each handler's
-full extent for `INSERT|UPDATE|DELETE|writer()|write_|upsert|persist|execute_script|mark_`
-(comment-only mentions excluded), at the revision this amendment was drafted against:
+write-shaped call on the dispatch path). The review evidence is a lexical scan for
+`INSERT|UPDATE|DELETE|writer()|write_|upsert|persist|execute_script|mark_`
+(comment-only mentions excluded), at the revision this amendment was drafted against.
+
+**Evidence depth, stated precisely:** the scan covers each handler's full brace-scoped extent
+PLUS each helper the handler calls that could carry a write off-extent. The helpers so scanned —
+each brace-scoped and found write-free — are `wait_for_inbox_response`
+(`crates/khive-pack-comm/src/handlers.rs:683-731`), `count_unread_messages` (`:855-905`), and
+`notes_seq_high_water_mark` (`:2871-2887`). A lexical scan answers the question it encodes:
+transitive callees below these named helpers are covered by the criterion's enforcement point
+(the census test and review of the handlers' own code), not by this table.
 
 | Verb | Category | Handler extent scanned | Dispatch-path writes | Eligible |
 |---|---|---|---|---|
-| `gtd.tasks` | Assertive | `khive-pack-gtd/src/handlers.rs:1434-1618` | none | yes |
-| `gtd.next` | Assertive | `khive-pack-gtd/src/handlers.rs:1291-1358` | none | yes |
-| `comm.inbox` | Assertive | `khive-pack-comm/src/handlers.rs:462-681` | none | yes |
-| `comm.unread` | Assertive | `khive-pack-comm/src/handlers.rs:841-853` | none | yes |
-| `comm.thread` | Assertive | `khive-pack-comm/src/handlers.rs:1511-1834` | none (comment mentions only) | yes |
-| `comm.delivered` | Assertive | `khive-pack-comm/src/handlers.rs:401-460` | none | yes |
-| `comm.probe` | Assertive | `khive-pack-comm/src/handlers.rs:2838-2869` | none (doc-comment mention only) | yes |
-| `comm.health` | Assertive | `khive-pack-comm/src/handlers.rs:2645-2836` | none | yes |
+| `gtd.tasks` | Assertive | `crates/khive-pack-gtd/src/handlers.rs:1434-1618` | none | yes |
+| `gtd.next` | Assertive | `crates/khive-pack-gtd/src/handlers.rs:1291-1358` | none | yes |
+| `comm.inbox` | Assertive | `crates/khive-pack-comm/src/handlers.rs:462-681` | none | yes |
+| `comm.unread` | Assertive | `crates/khive-pack-comm/src/handlers.rs:841-853` | none | yes |
+| `comm.thread` | Assertive | `crates/khive-pack-comm/src/handlers.rs:1511-1834` | none (comment mentions only) | yes |
+| `comm.delivered` | Assertive | `crates/khive-pack-comm/src/handlers.rs:401-460` | none | yes |
+| `comm.probe` | Assertive | `crates/khive-pack-comm/src/handlers.rs:2838-2869` | none (doc-comment mention only) | yes |
+| `comm.health` | Assertive | `crates/khive-pack-comm/src/handlers.rs:2645-2836` | none | yes |
 
 ### Named exclusions, with reasons
 
@@ -1006,7 +1014,7 @@ full extent for `INSERT|UPDATE|DELETE|writer()|write_|upsert|persist|execute_scr
   failures during the incident were the mechanism working as specified.
 - **`comm.cursor_get` — excluded as-is, with a named precondition.** Although declared Assertive,
   its dispatch path checks out the writer connection and runs a schema-ensure
-  `execute_script` (`khive-pack-comm/src/handlers.rs:3009-3011`) before its SELECT. Two
+  `execute_script` (`crates/khive-pack-comm/src/handlers.rs:3009-3011`) before its SELECT. Two
   consequences: it performs a write-shaped operation per dispatch, and under writer contention its
   body stalls on the writer checkout — so degrading its audit row would not have made it
   incident-safe anyway. Precondition for a future amendment: move the schema-ensure to
@@ -1025,16 +1033,36 @@ reads.
 
 ### Mechanical requirements
 
-1. The eight verbs join `ADMISSION_DEGRADE_SAFE_VERBS` under their full namespaced names —
-   `admission_degrade_safe` matches on the dispatch verb string and cross-checks the category by
-   walking every registered pack's handlers, so cross-pack membership needs no lookup change.
+1. **Canonical entry form**: an allowlist entry is the handler's registered `name` — the exact
+   dispatch verb string — which is BARE for the KG base pack (`"get"`, `"list"`, ...) and
+   NAMESPACED for every other pack (`"gtd.tasks"`, `"comm.inbox"`, ...). The eight additions use
+   their namespaced names. `admission_degrade_safe` matches on the dispatch verb string and
+   cross-checks the category by walking every registered pack's handlers, so cross-pack
+   membership needs no lookup change — but a mis-spelled or dead entry silently never matches,
+   which is why requirement 2 makes resolution an asserted property rather than an assumption.
 2. The census test (`admission_degrade_safe_verbs_are_registered_assertive`) currently re-derives
-   classifications from `khive-pack-kg/src/handler_defs.rs` alone; per its own documentation,
+   classifications from `crates/khive-pack-kg/src/handler_defs.rs` alone; per its own documentation,
    adding verbs from other packs REQUIRES extending its source scan to
-   `khive-pack-comm/src/vocab.rs` and `khive-pack-gtd/src/vocab.rs`. The extension must also
-   assert the two named exclusions cannot be silently re-added, exactly as the existing test does
-   for `memory.recall` and `db_diagnostics`.
+   `crates/khive-pack-comm/src/vocab.rs` and `crates/khive-pack-gtd/src/vocab.rs`. The extended
+   census must additionally assert (a) that EVERY allowlist entry resolves to exactly one
+   registered handler — so a dead entry fails loud instead of silently never matching; (b) that
+   the allowlist equals THIS amendment's enumeration exactly (the eleven Amendment 3 verbs plus
+   the eight named here) — so an unreviewed addition on any branch fails the census rather than
+   widening the D4/INV-1 exception silently; and (c) that the two named exclusions cannot be
+   silently re-added, exactly as the existing test does for `memory.recall` and `db_diagnostics`.
 3. The Amendment 3 undercount consequence now covers nineteen verbs; the two disjoint diagnostics
    counters are unchanged and already verb-agnostic.
+
+### Enumeration authority and in-flight coordination
+
+The authoritative enumeration of the exception's verb set is this document, not the constant in
+`crates/khive-runtime/src/pack.rs`; requirement 2(b) is what keeps the two mechanically equal. At
+drafting time at least one in-flight branch carries a WIDER allowlist (namespaced comm and gtd
+entries plus `agent.observe`, `blob.get`, `blob.stat`, and five `brain.*` verbs) with no per-verb
+review of the additions. Sequencing: such a branch must either trim its allowlist to this
+amendment's enumeration before landing, or its additional verbs must first receive the same
+per-verb review (category + brace-scoped dispatch-path scan + named helpers) in a stacked
+amendment signed before that branch lands. The census equality assertion enforces this
+mechanically: a wider list fails the test until its amendment exists.
 
 ADR-133 Amendment 2 carries the corresponding qualification of D4/INV-1 scope.
