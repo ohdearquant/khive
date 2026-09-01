@@ -88,7 +88,12 @@ SECTION_HEADING = re.compile(r"^#{2,6}\s+\S")
 # Fenced code blocks and HTML comments are display text, not declarations. A
 # line-based parser with no notion of either counts a status-shaped example
 # inside them as real, which lets an ADR with no visible header status pass.
-FENCE = re.compile(r"^\s*(```|~~~)")
+# A fence closes only on the opener's own character, at least as long as the
+# opener, with nothing but whitespace after (CommonMark). Treating any
+# fence-prefixed line as a toggle lets `~~~not-a-closing-fence` inside a
+# backtick block end the block early, turning fenced display text back into
+# visible text — which reads a fenced-only status as a real declaration.
+FENCE_OPEN = re.compile(r"^\s*(?P<chars>`{3,}|~{3,})")
 # The cap exists so a special file or an oversized substitute cannot make CI
 # read without bound; a plausible ADR is orders of magnitude smaller.
 MAX_ADR_BYTES = 1 << 20
@@ -171,24 +176,36 @@ def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
 
     `visible[i]` is the line with comment spans stripped, or None inside a
     fenced block; `fence_marker[i]` marks the fence delimiters themselves.
-    Fence markers inside a comment do not toggle fence state, and comment
-    openers inside a fence do not open a comment — each construct is display
-    text within the other.
+    A block closes only on its opener's own character, at least as many of
+    them, and nothing but whitespace after (CommonMark); other fence-shaped
+    lines inside the block are content. Fence openers inside a comment do not
+    open a fence, and comment openers inside a fence do not open a comment —
+    each construct is display text within the other.
     """
     visible: list[str | None] = []
     fence_marker: list[bool] = []
-    in_fence = False
+    fence_close: re.Pattern[str] | None = None
     in_comment = False
     for line in lines:
-        if not in_comment and FENCE.match(line):
-            in_fence = not in_fence
-            visible.append(None)
-            fence_marker.append(True)
+        if fence_close is not None:
+            if fence_close.match(line):
+                fence_close = None
+                visible.append(None)
+                fence_marker.append(True)
+            else:
+                visible.append(None)
+                fence_marker.append(False)
             continue
-        if in_fence:
-            visible.append(None)
-            fence_marker.append(False)
-            continue
+        if not in_comment:
+            opener = FENCE_OPEN.match(line)
+            if opener:
+                chars = opener.group("chars")
+                fence_close = re.compile(
+                    rf"^\s*{re.escape(chars[0])}{{{len(chars)},}}\s*$"
+                )
+                visible.append(None)
+                fence_marker.append(True)
+                continue
         text, in_comment = strip_comments(line, in_comment)
         visible.append(text)
         fence_marker.append(False)
@@ -387,6 +404,24 @@ MUST_FAIL = {
         "\n"
         "## Context\n"
     ),
+    # Fence-breaking lines INSIDE the block: an opposite-character fence line,
+    # a same-character line with info text, and a SHORTER same-character run.
+    # None of them closes the block under CommonMark, so the only status text
+    # stays fenced display text and the record declares nothing — a parser
+    # that toggles on any fence-prefixed line closes the block early, reads
+    # the status as visible, and wrongly accepts this file.
+    "ADR-907-fence-not-closed-by-lookalikes.md": (
+        "# ADR-907: Something\n"
+        "\n"
+        "````markdown\n"
+        "~~~not-a-closing-fence\n"
+        "```` info-text-means-not-a-closer\n"
+        "```\n"
+        "Status: accepted\n"
+        "````\n"
+        "\n"
+        "## Context\n"
+    ),
     # A comment that OPENS MID-LINE. Open-detection keyed on startswith never
     # flips the state here, so the status on the next line — inside the
     # comment — is read as a real declaration. The record declares nothing
@@ -473,6 +508,21 @@ MUST_PASS = {
         "# ADR-916: Something\n"
         "\n"
         "**Status**: Accepted <!-- reviewed 2026-09-01, Status: proposed was rejected -->\n"
+        "\n"
+        "## Context\n"
+    ),
+    # Fence lookalikes in the HEADER region must not close the block early: a
+    # parser that toggles on any fence-prefixed line sees the fenced example
+    # status as a second visible declaration and raises a false duplicate.
+    "ADR-917-header-fence-with-lookalikes.md": (
+        "# ADR-917: Something\n"
+        "\n"
+        "**Status**: Accepted\n"
+        "\n"
+        "```text\n"
+        "~~~\n"
+        "Status: proposed\n"
+        "```\n"
         "\n"
         "## Context\n"
     ),
