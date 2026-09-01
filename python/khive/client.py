@@ -22,7 +22,7 @@ import json
 from typing import Any
 
 from .errors import BatchError, OperationError
-from .models import Edge, EdgeRelation, Entity, Note, OpResult, Page
+from .models import Edge, EdgeRelation, Entity, Incidence, Note, OpResult, Page
 from .ops import encode, op
 from .transport import Session, SocketTransport, Transport
 
@@ -45,10 +45,19 @@ def _edge_from_wire(row: dict[str, Any]) -> Edge:
     row = dict(row)
     if "kind" not in row and "relation" in row:
         row["kind"] = row.pop("relation")
-    if "weight" in row:
-        props = dict(row.get("properties") or {})
-        props.setdefault("weight", row.pop("weight"))
-        row["properties"] = props
+    if "members" not in row:
+        # Reconstruct incidences. Per-node weights round-trip through
+        # metadata["incidences"]; absent that, the legacy edge-level weight
+        # is all we have and both endpoints inherit it.
+        stored = (row.get("metadata") or {}).get("incidences")
+        if stored:
+            row["members"] = stored
+        else:
+            w = row.pop("weight", 1.0)
+            row["members"] = [
+                {"node_id": row.pop("source_id"), "role": "source", "weight": w},
+                {"node_id": row.pop("target_id"), "role": "target", "weight": w},
+            ]
     return Edge.model_validate(row)
 
 
@@ -247,21 +256,49 @@ class _Graph:
         target_id: str,
         kind: EdgeRelation | str,
         *,
-        weight: float | None = None,
+        source_weight: float = 1.0,
+        target_weight: float = 1.0,
         metadata: dict[str, Any] | None = None,
     ) -> Edge:
+        """Binary directed edge — the two-incidence special case."""
+        return self.hyperlink(
+            kind,
+            members=[
+                Incidence(node_id=source_id, role="source", weight=source_weight),
+                Incidence(node_id=target_id, role="target", weight=target_weight),
+            ],
+            metadata=metadata,
+        )
+
+    def hyperlink(
+        self,
+        kind: EdgeRelation | str,
+        *,
+        members: list[Incidence],
+        metadata: dict[str, Any] | None = None,
+    ) -> Edge:
+        """One edge over N weighted incidences.
+
+        TEMPORARY wire mapping: the daemon stores flat binary edges, so the
+        full incidence list rides in metadata["incidences"] and the flat
+        columns carry source/target (first two members) with the source's
+        weight. Deletes when graph_incidences lands server-side."""
+        if len(members) < 2:
+            raise ValueError("an edge needs at least two members")
+        src, tgt = members[0], members[1]
+        meta = dict(metadata or {})
+        meta["incidences"] = [m.model_dump() for m in members]
         raw = _one(
             self._db.session.request(
                 encode(
                     [
                         op(
                             "link",
-                            source_id=source_id,
-                            target_id=target_id,
-                            # wire still says `relation`; the interface says kind
+                            source_id=src.node_id,
+                            target_id=tgt.node_id,
                             relation=str(getattr(kind, "value", kind)),
-                            weight=weight,
-                            metadata=metadata,
+                            weight=src.weight,
+                            metadata=meta,
                         )
                     ]
                 )

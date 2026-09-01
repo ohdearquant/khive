@@ -94,16 +94,63 @@ class Note(_Record):
             raise TypeError(f"kind must be a string, got {type(v)}")
         return v
 
+class Incidence(BaseModel):
+    """One node's participation in one edge (weighted incidence).
+
+    Weight is a property of the (node, edge) pair, NOT of the edge: the same
+    edge can matter differently to each node it touches (edge-dependent
+    vertex weights). A binary edge has two incidences (roles source/target);
+    a hyperedge has N; a symmetric relation uses role "member"."""
+
+    model_config = ConfigDict(extra="allow")
+
+    node_id: str
+    role: str = "member"  # "source" / "target" for binary directed edges
+    weight: float = 1.0
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("properties", mode="before")
+    @classmethod
+    def _null_map(cls, v: Any) -> Any:
+        return {} if v is None else v
+
+
 class Edge(_Record):
-    """A typed directed edge between two records."""
+    """A typed relation among records. `kind` is the relation; membership —
+    including per-node weight — lives on the incidences. Binary directed
+    edges are the two-incidence special case; hyperedges are just more
+    incidences."""
 
     kind: EdgeRelation
-    source_id: str
-    target_id: str
+    members: list[Incidence] = Field(default_factory=list)
+
+    def _by_role(self, role: str) -> Incidence | None:
+        return next((m for m in self.members if m.role == role), None)
+
+    # -- binary-edge conveniences -----------------------------------------
 
     @property
-    def weight(self) -> float:
-        return self.properties.get("weight", 1.0)
+    def source(self) -> Incidence | None:
+        return self._by_role("source")
+
+    @property
+    def target(self) -> Incidence | None:
+        return self._by_role("target")
+
+    @property
+    def source_id(self) -> str | None:
+        return self.source.node_id if self.source else None
+
+    @property
+    def target_id(self) -> str | None:
+        return self.target.node_id if self.target else None
+
+    def weight_for(self, node_id: str) -> float:
+        """This edge's weight relative to one participating node."""
+        for m in self.members:
+            if m.node_id == node_id:
+                return m.weight
+        raise KeyError(f"{node_id} is not a member of edge {self.id}")
 
 class Page(BaseModel, Generic[T]):
     """One page of results. `total=None` means the server skipped the count."""

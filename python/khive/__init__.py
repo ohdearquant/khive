@@ -16,13 +16,14 @@ from .errors import (
     RequestRejected,
     TransportError,
 )
-from .models import Edge, EdgeRelation, Entity, Note, OpResult, Page
+from .models import Edge, EdgeRelation, Entity, Incidence, Note, OpResult, Page
 from .ops import encode, op
 from .transport import Session, SocketTransport, Transport
 
 __all__ = [
     "Khive",
     "Entity",
+    "Incidence",
     "Note",
     "Edge",
     "EdgeRelation",

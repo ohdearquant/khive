@@ -25,11 +25,17 @@ def test_entity_crud_and_edges(db: Khive):
     b = db.entities.create(kind="concept", name="smoke-target")
     assert a.id and b.id and a.id != b.id, "server must mint distinct ids"
 
-    edge = db.graph.link(a.id, b.id, "extends", weight=0.9)
+    edge = db.graph.link(a.id, b.id, "extends", source_weight=0.9, target_weight=0.4)
     assert edge.source_id == a.id and edge.target_id == b.id
     assert edge.kind.value == "extends", "an edge's kind IS its relation"
-    assert edge.weight == 0.9, "weight must surface through properties"
+    assert edge.weight_for(a.id) == 0.9 and edge.weight_for(b.id) == 0.4, (
+        "weight is per-incidence: the same edge weighs differently per node"
+    )
     assert edge.namespace and edge.updated_at, "edges carry the full record core"
+
+    fetched = db.graph.edges(limit=50)
+    mine = next(e for e in fetched.items if e.id == edge.id)
+    assert mine.weight_for(b.id) == 0.4, "per-node weights must survive a round-trip"
 
     back = db.entities.get(a.id)
     assert back.name == "smoke-source"
@@ -37,6 +43,22 @@ def test_entity_crud_and_edges(db: Khive):
     neighborhood = db.graph.neighbors(a.id)
     text = str(neighborhood)
     assert b.id in text, f"neighbor read must surface the linked node: {text[:300]}"
+
+
+def test_hyperedge_three_members(db: Khive):
+    from khive import Incidence
+
+    xs = [db.entities.create(kind="concept", name=f"hyper-{i}") for i in range(3)]
+    edge = db.graph.hyperlink(
+        "composed_with",
+        members=[
+            Incidence(node_id=xs[0].id, weight=1.0),
+            Incidence(node_id=xs[1].id, weight=0.6),
+            Incidence(node_id=xs[2].id, weight=0.2),
+        ],
+    )
+    assert len(edge.members) == 3
+    assert edge.weight_for(xs[2].id) == 0.2
 
 
 def test_note_and_search(db: Khive):
