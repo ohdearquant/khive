@@ -7817,7 +7817,6 @@ async fn git_pack_adr_entity_type_validates_through_create() {
 /// Without the git pack loaded, `adr` is not a registered Document subtype —
 /// proving the acceptance above is genuine pack composition, not a builtin.
 #[tokio::test]
-#[serial_test::serial(config_ledger)]
 async fn adr_entity_type_rejected_without_git_pack_loaded() {
     let rt = rt();
     let mut builder = VerbRegistryBuilder::new();

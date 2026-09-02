@@ -570,6 +570,7 @@ mod recall_future_footprint_tests {
     use khive_runtime::{Namespace, VerbRegistryBuilder};
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn deadline_wrapper_does_not_embed_the_recall_pipeline() {
         // Measure on an explicitly roomy stack so the regression reports the
         // historical inline footprint instead of aborting the test process.
@@ -852,6 +853,7 @@ mod ann_route_tests {
     /// See `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_second_call_uses_warm_ann_route() {
         let tmp = tempfile::Builder::new()
             .prefix("khive-memory-ann-route-")
@@ -1015,6 +1017,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn prune_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1045,6 +1048,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_update_reindex_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1072,6 +1076,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_delete_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1101,6 +1106,7 @@ mod note_mutation_hook_tests {
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_merge_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);

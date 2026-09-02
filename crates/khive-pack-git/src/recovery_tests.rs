@@ -607,7 +607,6 @@ async fn local_source_never_repairs_even_when_recovery_would_succeed() {
 /// this direct unit guards the helper itself so a future refactor of it
 /// can't silently break the assertions that depend on it.
 #[test]
-#[serial_test::serial(config_ledger)]
 fn head_sha_reads_the_real_current_commit() {
     let _env = env_guard_sync();
     let dir = tempfile::tempdir().expect("tempdir");

@@ -451,6 +451,7 @@ pub(crate) mod tests {
 
     /// T6a: a multi-backend server MUST route `link` through the coordinator.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn t6a_multi_backend_server_routes_link_through_coordinator() {
         let (registry, _runtime) = make_registry();
         let coord = MockCoordinator::multi_backend();
@@ -485,6 +486,7 @@ pub(crate) mod tests {
 
     /// T6b: a multi-backend server MUST route `search` through the coordinator.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn t6b_multi_backend_server_routes_search_through_coordinator() {
         let (registry, _runtime) = make_registry();
         let coord = MockCoordinator::multi_backend();
@@ -512,6 +514,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_search_forwards_the_complete_validated_filter_contract() {
         let (registry, _runtime) = make_registry();
         let coord = MockCoordinator::multi_backend();
@@ -574,6 +577,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_search_rejects_filters_for_the_wrong_substrate() {
         for ops in [
             r#"search(kind="entity", query="x", note_kind="observation")"#,
@@ -613,6 +617,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn degraded_search_advisory_survives_single_batch_chain_and_presentation() {
         let cases = [
             (r#"search(kind="note", query="x")"#, None),
@@ -666,6 +671,7 @@ pub(crate) mod tests {
     /// (no backend failure) search with zero merged hits is a genuine
     /// no-match — `ok: true`, `status: "complete"`, empty `result`.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn search_complete_empty_reports_status_complete_and_stays_ok() {
         let (registry, _runtime) = make_registry();
         let coord = MockCoordinator::empty_multi_backend();
@@ -698,6 +704,7 @@ pub(crate) mod tests {
     /// failed and nothing survived — the operation must fail outright with
     /// `error.kind: "search_incomplete"`, never a successful empty result.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn search_degraded_empty_returns_search_incomplete_error() {
         let (registry, _runtime) = make_registry();
         let coord = MockCoordinator::degraded_empty_multi_backend("archive");
@@ -742,6 +749,7 @@ pub(crate) mod tests {
     /// `min_score` removed it — completeness is judged AFTER filtering, so
     /// this is also `search_incomplete`, not a successful empty result.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn search_degraded_hit_removed_by_min_score_returns_search_incomplete() {
         let (registry, _runtime) = make_registry();
         // `degraded_multi_backend` returns one hit with score 0.0 (Default).
@@ -778,6 +786,7 @@ pub(crate) mod tests {
     /// entity_kind/note_kind), `name`, and `created_at` — not just the
     /// compatibility subset.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_search_rows_carry_kg_handler_row_shape_parity() {
         for (kind, kind_field) in [("entity", "entity_kind"), ("note", "note_kind")] {
             let (registry, _runtime) = make_registry();
@@ -949,6 +958,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_search_serializes_entity_and_note_sources() {
         for (kind, expected_source) in [("entity", "both"), ("note", "vector")] {
             let (registry, _runtime) = make_registry();
@@ -987,6 +997,7 @@ pub(crate) mod tests {
     /// per-op error rather than silently returning unfiltered results (see
     /// crates/khive-mcp/docs/api/coordinator.md#t6d for the regression this guards).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn t6d_malformed_tags_return_per_op_error_in_multi_backend() {
         let (registry, _runtime) = make_registry();
         let coord = MockCoordinator::multi_backend();
@@ -1033,6 +1044,7 @@ pub(crate) mod tests {
     /// `namespace` must fail closed and never reach the coordinator (see
     /// crates/khive-mcp/docs/api/coordinator.md#t6e-namespace for the RUNTIME-AUD-002 regression).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn t6e_multi_backend_search_malformed_namespace_fails_closed() {
         let cases: [(&str, &str); 5] = [
             ("null", "null"),
@@ -1091,6 +1103,7 @@ pub(crate) mod tests {
 
     /// T6f / PR #549 blocker: same as T6e but for `link`'s namespace argument.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn t6f_multi_backend_link_malformed_namespace_fails_closed() {
         let cases: [(&str, &str); 5] = [
             ("null", "null"),
@@ -1152,6 +1165,7 @@ pub(crate) mod tests {
     /// T6c: a single-backend server must NOT route through the coordinator
     /// (zero-change invariant: unchanged from pre-coordinator code).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn t6c_single_backend_server_bypasses_coordinator() {
         let (registry, runtime) = make_registry();
         let coord = MockCoordinator::single_backend_instance();
@@ -1195,6 +1209,7 @@ pub(crate) mod tests {
     /// with a per-op error, not silently wrapped by `as u32` (see
     /// crates/khive-mcp/docs/api/coordinator.md#t6e-limit for the MCP-AUD-003 regression).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn t6e_multi_backend_search_limit_matches_single_backend_u32_contract() {
         let (registry, _runtime) = make_registry();
         let coord = MockCoordinator::multi_backend();
@@ -1241,6 +1256,7 @@ pub(crate) mod tests {
     /// T6e companion: a valid-but-huge `u32` limit (`u32::MAX`) must still
     /// reach the coordinator, capped at 100.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn t6e_multi_backend_search_limit_u32_max_is_capped_at_100() {
         let (registry, _runtime) = make_registry();
         let coord = MockCoordinator::multi_backend();

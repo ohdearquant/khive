@@ -4052,6 +4052,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn wire_dispatch_retains_raw_one_mib_input_limit() {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
@@ -4109,6 +4110,7 @@ mod tests {
     ///   records `None` instead of `Some(vec!["kg", "gtd"])`.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn restricted_registry_pack_list_reaches_forward_seam() {
         thread_local! {
             static SPY_CAPTURED_PACKS: std::cell::RefCell<Option<Option<Vec<String>>>> =
@@ -4180,6 +4182,7 @@ mod tests {
     /// adapter's `packs.as_deref()` argument to `None` reddens this test.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn restricted_registry_pack_list_reaches_real_adapter_boundary() {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
@@ -4224,6 +4227,7 @@ mod tests {
     /// must never share one warm daemon even when every `RuntimeConfig` field
     /// is otherwise identical.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_ann_fresh_tail_policy_differs() {
         let config = RuntimeConfig::no_embeddings();
 
@@ -4239,6 +4243,7 @@ mod tests {
     /// runtimes differing only in that field writes an instant wrong by the
     /// offset between the zones. Identity must separate them.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_display_timezone_differs() {
         // One base, cloned, for the reason spelled out on the test below — and
         // it matters MORE here. This assertion is `assert_ne!`, so the shared
@@ -4269,6 +4274,7 @@ mod tests {
     /// The other direction, so the assertion above cannot pass for an
     /// incidental reason: identical zones must still collapse to one identity.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_matches_when_display_timezone_matches() {
         // ONE base, cloned — not two constructor calls. `RuntimeConfig::default`
         // reads `HOME` to build `db_path`, and `db_path` is folded into the id,
@@ -4301,6 +4307,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_treats_absent_and_explicit_default_blob_hydration_budget_as_equivalent() {
         use khive_runtime::engine_config::RuntimeSectionConfig;
         use khive_runtime::{runtime_config_from_khive_config, KhiveConfig};
@@ -4325,6 +4332,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_resolved_blob_hydration_budget_differs() {
         let config = RuntimeConfig::no_embeddings();
         let mut changed = config.clone();
@@ -4513,6 +4521,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn canonical_request_deadline_wrapper_does_not_embed_dispatch_pipeline() {
         // Construct the generators on an explicitly roomy stack so this
         // regression reports their footprint instead of reproducing the LLVM
@@ -4580,6 +4589,7 @@ mod tests {
     // the canonical scope reached the database; the test below independently
     // pins absolute Tokio-deadline ordering.
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
     async fn local_exec_dispatch_installs_the_default_request_read_deadline() {
         let server = slow_sql_read_test_server();
         let expected = request_read_timeout();
@@ -4603,6 +4613,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
     async fn replay_dispatch_installs_the_default_request_read_deadline() {
         let server = slow_sql_read_test_server();
         let expected = request_read_timeout();
@@ -4811,6 +4822,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn duplicate_digest_batch_and_chain_share_request_group_but_keep_distinct_receipts() {
         assert_request_group_receipts(
             r#"[git.digest(marker="first"), git.digest(marker="second")]"#,
@@ -4851,6 +4863,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn typed_serial_dispatch_retains_full_batch_write_conflict_preflight() {
         let ops = vec![
             typed_test_op("update", json!({"id": "same-id", "name": "new"})),
@@ -4901,6 +4914,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn typed_serial_dispatch_retains_one_aggregate_response_budget() {
         let result_bytes = BATCH_RESPONSE_BUDGET_BYTES / 3 - 4096;
         let ops: Vec<TypedJsonOp> = (0..12)
@@ -4969,6 +4983,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_preserves_input_order() {
         let count = MAX_BATCH_CONCURRENCY + 3;
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -4996,6 +5011,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_enforces_aggregate_response_budget() {
         assert_eq!(
             BATCH_RESPONSE_BUDGET_BYTES,
@@ -5077,6 +5093,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn save_to_writes_full_results_without_inline_response_budgeting() {
         let server = large_result_test_server();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5121,6 +5138,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn local_dispatch_returns_result_larger_than_daemon_frame() {
         let server = large_result_test_server();
         let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
@@ -5150,6 +5168,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn daemon_dispatch_degrades_result_larger_than_frame() {
         let server = large_result_test_server();
         let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
@@ -5171,6 +5190,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn read_only_audit_advisory_decorates_success_but_not_help_or_error() {
         let mut builder = VerbRegistryBuilder::new();
         builder.with_read_only_audit_store();
@@ -5214,6 +5234,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn frame_budget_omission_preserves_search_degradation_advisory() {
         let omitted = frame_budget_omission(&json!({
             "ok": true,
@@ -5270,6 +5291,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn backend_error_evidence_has_aggregate_budget_and_exact_key_parity() {
         fn degraded_result(reverse: bool) -> CoordSearchResult {
             let mut per_backend: Vec<crate::coordinator::BackendSearchResult> = (0
@@ -5350,6 +5372,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn backend_id_credentials_are_absent_from_wire_and_warning() {
         let secret = format!("archive auth token sk_live_{}", "c".repeat(32));
         let result = CoordSearchResult {
@@ -5394,6 +5417,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn frame_budget_omission_preserves_complete_search_status() {
         let omitted = frame_budget_omission(&json!({
             "ok": true,
@@ -5412,6 +5436,7 @@ mod tests {
     /// typed — it must survive frame-budget omission untransformed, not
     /// collapse to the generic omitted-error string.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn frame_budget_omission_preserves_search_incomplete_error_untransformed() {
         let error = json!({
             "kind": "search_incomplete",
@@ -5438,6 +5463,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn frame_budget_omission_still_collapses_other_large_errors() {
         let omitted = frame_budget_omission(&json!({
             "ok": false,
@@ -5455,6 +5481,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn daemon_batch_keeps_rendered_result_when_compact_result_exceeds_frame() {
         let server = large_result_test_server();
         let row_bytes = khive_runtime::daemon::MAX_FRAME_BYTES / 2;
@@ -5479,6 +5506,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn daemon_frame_fitting_preserves_reason_when_error_body_is_omitted() {
         let entry = json!({
             "ok": false,
@@ -5504,6 +5532,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn auto_rendered_batch_stays_within_daemon_frame_cap() {
         // Auto renders a single record as compact JSON, so a lone object can
         // no longer balloon past its compact form (the kv-block renderer is
@@ -5581,6 +5610,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_op_error_does_not_abort_siblings() {
         let count = 5;
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -5617,6 +5647,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_never_exceeds_concurrency_limit() {
         let count = MAX_BATCH_CONCURRENCY * 3;
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -5660,6 +5691,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn single_pack_verbs_unchanged() {
         let catalog = build_verb_catalog([
             t("kg", "create", "Create an entity or note."),
@@ -5672,6 +5704,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn duplicate_verb_concatenates_descriptions_with_pack_attribution() {
         let catalog = build_verb_catalog([
             t("kg", "create", "Create an entity or note."),
@@ -5695,6 +5728,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn catalog_is_sorted_alphabetically() {
         let catalog = build_verb_catalog([
             t("kg", "search", "Search."),
@@ -5864,6 +5898,7 @@ mod tests {
     /// serving or writing the wrong project's data.
     #[test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     fn config_id_does_not_collide_across_projects_with_same_relative_backend_path() {
         use khive_runtime::{BackendId, BackendKind, KhiveConfig, Namespace};
 
@@ -5916,6 +5951,7 @@ mod tests {
     /// - read-only `/.../archive.db`
     /// - writable `/.../archive.db:read_only`
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_does_not_confuse_read_only_mode_with_a_path_suffix() {
         use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
 
@@ -5974,6 +6010,7 @@ mod tests {
     /// identity, avoiding an unnecessary one-time fallback/restart for the
     /// overwhelmingly common configuration shape.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_preserves_legacy_topology_spelling_when_delimiter_free() {
         use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
 
@@ -6021,6 +6058,7 @@ mod tests {
     /// embedding policy it does not implement. Absent/false keeps the
     /// pre-existing spelling so already-deployed configs keep their id.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_pack_no_embed_differs() {
         use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
 
@@ -6068,6 +6106,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_separates_effective_read_only_storage_modes() {
         use khive_runtime::{BackendId, BackendKind, KhiveConfig, Namespace};
 
@@ -6121,6 +6160,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_auto_detects_chmod_read_only_single_backend() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -6154,6 +6194,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn runtime_owned_config_id_keeps_captured_writable_mode_after_post_open_chmod() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -6220,6 +6261,7 @@ mod tests {
     /// project serve requests meant for the other's database.
     #[test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     fn config_id_does_not_collide_across_projects_with_same_relative_db_override() {
         use khive_runtime::Namespace;
 
@@ -6476,6 +6518,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn chain_with_deep_accumulated_prev_result_errors_cleanly() {
         // Real end-to-end reproduction: chain N `create` ops where each step's
         // `properties.inner` embeds the previous op's full `properties` via
@@ -6554,6 +6597,7 @@ mod tests {
     // ── request-boundary regression: raw controls survive wire decoding ─────
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_boundary_raw_control_bytes_reach_handler() {
         // Simulates the actual MCP wire: a JSON-RPC client sends the tool's
         // `ops` argument as a JSON string using the standard JSON `\n`
@@ -6651,6 +6695,7 @@ mod tests {
     /// the caller supplied none.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn wire_daemon_frame_forwards_request_id() {
         let server = make_daemon_save_to_test_server();
 
@@ -6700,6 +6745,7 @@ mod tests {
     /// daemon-forward path.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_no_daemon_fallback_preserves_request_id_in_audit_event() {
         clear_daemon_env();
         std::env::set_var("KHIVE_NO_DAEMON", "1");
@@ -6739,6 +6785,7 @@ mod tests {
     /// survives that path too.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_save_to_bypass_preserves_request_id_in_audit_event() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6798,6 +6845,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_save_to_bypasses_daemon_forwarding_and_writes_manifest() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6863,6 +6911,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_parse_error_stays_typed_with_warm_daemon_available() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6930,6 +6979,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_returns_ambiguous_forward_error_without_local_double_dispatch() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7046,6 +7096,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_strict_fallback_lands_as_failed_op_envelope_not_rpc_error() {
         clear_daemon_env();
         crate::daemon::reset_fallback_counters();
@@ -7235,6 +7286,7 @@ mod tests {
     /// genuine no-match and a populated result — with no possible "partial"
     /// state for a lone backend. Other verbs must not gain a `status` field.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn single_backend_search_reports_status_complete() {
         let server = in_memory_kg_server();
 
@@ -7314,6 +7366,7 @@ mod tests {
     /// `visible_namespaces`, widened with `local` — mirrors the normal
     /// registry dispatch path's default-case widening.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn coordinator_search_visibility_widens_to_registry_defaults_when_no_identity() {
         let registry =
             registry_with_visible_namespaces(vec![
@@ -7334,6 +7387,7 @@ mod tests {
     /// baked defaults entirely (ADR-096 Fork 1) — the registry's "tenant-a"
     /// must NOT leak into a request identity scoped to "tenant-b" only.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn coordinator_search_visibility_widens_to_identity_visible_namespaces() {
         let registry =
             registry_with_visible_namespaces(vec![
@@ -7365,6 +7419,7 @@ mod tests {
     /// the caller's full `visible_namespaces` set, silently overriding the
     /// caller's intended narrowing.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn coordinator_search_visibility_narrows_to_empty_when_namespace_explicit() {
         let registry =
             registry_with_visible_namespaces(vec![
@@ -7384,6 +7439,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn unknown_verb_with_invalid_namespace_is_not_classified_as_verb_refused() {
         let server = in_memory_kg_server();
         let response = server
@@ -7407,6 +7463,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_status_is_success_when_every_op_in_batch_succeeds() {
         let server = in_memory_kg_server();
         let resp = server
@@ -7432,6 +7489,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_status_is_partial_when_a_batch_op_fails() {
         let server = in_memory_kg_server();
         // The second op targets an unknown kind and fails; the first succeeds.
@@ -7462,6 +7520,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_status_is_partial_when_a_chain_op_is_aborted() {
         let server = in_memory_kg_server();
         let resp = server
@@ -7523,6 +7582,7 @@ mod request_read_cancellation_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn stdio_eof_cancels_root_and_request_read_before_rmcp_drain() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use tokio::io::AsyncWriteExt;
@@ -7580,6 +7640,7 @@ mod request_read_cancellation_tests {
     /// An idle stdio bridge — pipe still open, no request sent — must
     /// be reaped the same way a real EOF is, not held open indefinitely.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn stdio_idle_timeout_cancels_root_without_eof() {
         use rmcp::transport::async_rw::AsyncRwTransport;
 
@@ -7672,6 +7733,7 @@ mod request_read_cancellation_tests {
     /// admitted the duplicate would leave `root` uncancelled and this test
     /// would exhaust its bound.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn stdio_refuses_a_second_outstanding_obligation_under_one_request_id() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use tokio::io::AsyncWriteExt;
@@ -7759,6 +7821,7 @@ mod request_read_cancellation_tests {
     /// Idle reaping is off and the pipe is never closed, so the refusal is the
     /// only thing that can end this session.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn stdio_refuses_a_reused_id_whose_obligation_is_already_stale() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use tokio::io::AsyncWriteExt;
@@ -7862,6 +7925,7 @@ mod request_read_cancellation_tests {
     /// Nothing here waits on the idle timer: it is disabled, so the only thing
     /// that can bound this queue is the staleness drop.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn stdio_obligation_queue_drops_entries_past_their_ttl() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use tokio::io::AsyncWriteExt;
@@ -7924,6 +7988,7 @@ mod request_read_cancellation_tests {
     /// responses cannot make the transport's outstanding state grow without
     /// limit. The third request is rejected before rmcp can spawn its handler.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn stdio_closes_when_outstanding_request_limit_is_reached() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use tokio::io::AsyncWriteExt;
@@ -8012,6 +8077,7 @@ mod request_read_cancellation_tests {
     /// windows), `"quick"` (or anything else) completes immediately — used
     /// to admit a second request while the first is still running.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn rmcp_cancellation_token_reaches_request_read_scope() {
         let token = tokio_util::sync::CancellationToken::new();
         let token_for_scope = token.clone();
@@ -8033,6 +8099,7 @@ mod request_read_cancellation_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn already_cancelled_rmcp_token_is_visible_without_yielding() {
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
@@ -8050,6 +8117,7 @@ mod request_read_cancellation_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_tool_path_honors_an_already_cancelled_rmcp_token() {
         std::env::set_var("KHIVE_NO_DAEMON", "1");
         let runtime = KhiveRuntime::new(RuntimeConfig {
@@ -8133,6 +8201,7 @@ mod request_read_cancellation_tests {
     /// and not the bound. A bound whose expiry is never observed is a claim,
     /// so this drives a real write against a peer that has stopped reading.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn response_write_past_its_deadline_is_abandoned_and_closes_the_session() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use rmcp::transport::Transport;
@@ -8180,6 +8249,7 @@ mod request_read_cancellation_tests {
     /// also pass against a deadline that fired on every response regardless of
     /// whether the peer was reading.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn response_write_inside_its_deadline_succeeds_and_leaves_the_session_open() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use rmcp::transport::Transport;
@@ -8235,6 +8305,7 @@ mod request_read_cancellation_tests {
     /// keeps the stream alive until both halves drop. Separate pipes for the
     /// read source and the write sink are what let the peer close exactly one.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn response_write_that_fails_fast_closes_the_session() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use rmcp::transport::Transport;
@@ -8297,6 +8368,7 @@ mod request_read_cancellation_tests {
     /// it, this test would pass against a transport that cancelled on every
     /// write, successful ones included.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn notification_write_that_fails_fast_also_closes_the_session() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use rmcp::transport::Transport;
@@ -8348,6 +8420,7 @@ mod request_read_cancellation_tests {
     /// would pass against a transport that cancelled on every write rather than
     /// on every FAILED write, which is a far worse rule than either.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn notification_write_to_a_reading_peer_leaves_the_session_open() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use rmcp::transport::Transport;
@@ -8455,6 +8528,7 @@ mod request_read_cancellation_tests {
     /// that boundary, which is the arm that would go red if the scope were
     /// dropped.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn an_interrupted_write_leaves_the_session_open_and_the_writer_usable() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use rmcp::transport::Transport;
@@ -8528,6 +8602,7 @@ mod request_read_cancellation_tests {
     /// wait on an answer that is not coming and could not tell that from a slow
     /// one. Closing is what turns that into an EOF it can act on.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn an_interrupted_response_still_closes_the_session() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use rmcp::transport::Transport;

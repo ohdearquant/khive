@@ -3553,14 +3553,16 @@ mod tests {
     }
 
     /// `true` if `text` contains a call to `name` — `name` immediately
-    /// followed by `(` (optional whitespace between), a non-identifier
-    /// character (or start of text) before it, and not inside a string
-    /// literal. Anchoring both boundaries matters here specifically because
-    /// `spawn_daemon_with_exe(` is a prefix-shaped substring of
-    /// `spawn_daemon_with_exe_and_config(` up to the `_and_config` suffix —
-    /// a plain `contains` check would still tell them apart by luck (the
-    /// character after `exe` differs), but a boundary check makes that
-    /// non-collision load-bearing instead of incidental.
+    /// followed by `(` (optional whitespace between, including newlines —
+    /// `rustfmt` is free to break a long call onto its own line), a
+    /// non-identifier character (or start of text) before it, and not
+    /// inside a string literal. Anchoring both boundaries matters here
+    /// specifically because `spawn_daemon_with_exe(` is a prefix-shaped
+    /// substring of `spawn_daemon_with_exe_and_config(` up to the
+    /// `_and_config` suffix — a plain `contains` check would still tell
+    /// them apart by luck (the character after `exe` differs), but a
+    /// boundary check makes that non-collision load-bearing instead of
+    /// incidental.
     fn calls_name_for_census(text: &str, name: &str) -> bool {
         fn is_ident_byte(b: u8) -> bool {
             b.is_ascii_alphanumeric() || b == b'_'
@@ -3573,7 +3575,7 @@ mod tests {
             let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
             let after = idx + name.len();
             let mut j = after;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
             }
             let after_ok = j < bytes.len() && bytes[j] == b'(';
@@ -3584,6 +3586,15 @@ mod tests {
             search_from = idx + 1;
         }
         false
+    }
+
+    /// Regression for a scanner that only tolerated a space/tab between a
+    /// seam name and its `(` — see the identical fix and rationale for
+    /// `khive-runtime`'s `calls_name`.
+    #[test]
+    fn calls_name_for_census_matches_across_a_newline_before_the_parenthesis() {
+        let text = "fn wraps_it() {\n    spawn_daemon_with_exe\n        (exe)\n}";
+        assert!(calls_name_for_census(text, "spawn_daemon_with_exe"));
     }
 
     /// The name of the function whose signature starts at `sig_line`

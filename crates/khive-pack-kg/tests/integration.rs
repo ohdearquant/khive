@@ -11219,6 +11219,7 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
 // ---- context (ADR-089): entity-anchored graph context in one call ----
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_requires_query_or_entity_ids() {
     let pack = pack();
     let err = pack
@@ -11235,6 +11236,7 @@ async fn context_requires_query_or_entity_ids() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_empty_entity_ids_and_absent_query_is_rejected() {
     let pack = pack();
     let err = pack
@@ -11245,6 +11247,7 @@ async fn context_empty_entity_ids_and_absent_query_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_anchor_carries_full_entity_record() {
     let pack = pack();
     let a = pack
@@ -11286,6 +11289,7 @@ async fn context_entity_ids_anchor_carries_full_entity_record() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_random_nonexistent_uuid_is_rejected() {
     // a syntactically valid but nonexistent UUID must
     // error, not silently vanish from the response.
@@ -11312,6 +11316,7 @@ async fn context_entity_ids_random_nonexistent_uuid_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_note_uuid_is_rejected_as_non_entity() {
     // A note's UUID is syntactically a valid UUID but not an entity substrate;
     // it must be rejected, not silently dropped.
@@ -11345,6 +11350,7 @@ async fn context_entity_ids_note_uuid_is_rejected_as_non_entity() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_edge_uuid_is_rejected_as_non_entity() {
     // An edge's UUID is syntactically a valid UUID but not an entity substrate;
     // it must be rejected, not silently dropped.
@@ -11394,6 +11400,7 @@ async fn context_entity_ids_edge_uuid_is_rejected_as_non_entity() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_unresolvable_prefix_is_rejected() {
     // A hex-looking prefix that matches nothing must error at resolution time
     // (existing resolve_uuid_async behavior), not fall through silently.
@@ -11406,6 +11413,7 @@ async fn context_entity_ids_unresolvable_prefix_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_unresolvable_name_is_rejected() {
     // A non-hex string that resolves through the name-lookup fallback and
     // matches nothing must error, not fall through silently.
@@ -11424,6 +11432,7 @@ async fn context_entity_ids_unresolvable_name_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_hop1_neighbor_carries_relation_direction_hop_and_null_via() {
     let pack = pack();
     let a = pack
@@ -11471,6 +11480,7 @@ async fn context_hop1_neighbor_carries_relation_direction_hop_and_null_via() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_default_direction_is_both_unlike_neighbors_outgoing_default() {
     let pack = pack();
     let a = pack
@@ -11512,6 +11522,7 @@ async fn context_default_direction_is_both_unlike_neighbors_outgoing_default() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_hops_two_expands_second_hop_with_via_set_to_hop1_parent() {
     let pack = pack();
     let a = pack
@@ -11585,6 +11596,7 @@ async fn context_hops_two_expands_second_hop_with_via_set_to_hop1_parent() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_hops_zero_does_not_expand_even_with_edges_present() {
     let pack = pack();
     let a = pack
@@ -11618,6 +11630,7 @@ async fn context_hops_zero_does_not_expand_even_with_edges_present() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_dedup_across_anchors_neighbor_appears_once_under_first_anchor() {
     let pack = pack();
     let a = pack
@@ -11682,6 +11695,7 @@ async fn context_dedup_across_anchors_neighbor_appears_once_under_first_anchor()
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_anchor_never_relisted_as_neighbor_of_another_anchor() {
     let pack = pack();
     let a = pack
@@ -11725,6 +11739,7 @@ async fn context_anchor_never_relisted_as_neighbor_of_another_anchor() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_explicit_entity_ids_never_clamped_by_limit() {
     let pack = pack();
     let mut ids = Vec::new();
@@ -11755,6 +11770,7 @@ async fn context_explicit_entity_ids_never_clamped_by_limit() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_query_selects_anchors_via_hybrid_search() {
     let pack = pack();
     pack.dispatch(
@@ -11791,6 +11807,7 @@ async fn context_query_selects_anchors_via_hybrid_search() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_query_and_entity_ids_combine_explicit_ids_first_then_search_fills() {
     let pack = pack();
     let explicit = pack
@@ -11834,6 +11851,7 @@ async fn context_query_and_entity_ids_combine_explicit_ids_first_then_search_fil
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_query_fill_reaches_limit_after_top_hit_duplicates_explicit_anchor() {
     // if the query's top hit is also an explicit anchor,
     // the query leg must still fill up to `limit` DISTINCT non-explicit anchors
@@ -11894,6 +11912,7 @@ async fn context_query_fill_reaches_limit_after_top_hit_duplicates_explicit_anch
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_relations_filter_restricts_expansion() {
     let pack = pack();
     let a = pack
@@ -11951,6 +11970,7 @@ async fn context_relations_filter_restricts_expansion() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_symmetric_relation_direction_is_reported_as_both() {
     let pack = pack();
     let a = pack
@@ -11994,6 +12014,7 @@ async fn context_symmetric_relation_direction_is_reported_as_both() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_fanout_caps_neighbors_per_node_per_hop() {
     let pack = pack();
     let a = pack
@@ -12038,6 +12059,7 @@ async fn context_fanout_caps_neighbors_per_node_per_hop() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_direction_outgoing_fanout_keeps_highest_weight_not_node_id_order() {
     // khive-runtime's neighbors_with_query re-sorts hits by
     // (node_id, edge_id) for dedup and, before this fix, never restored the
@@ -12121,6 +12143,7 @@ async fn context_direction_outgoing_fanout_keeps_highest_weight_not_node_id_orde
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_both_direction_mixed_weights_interleave_in_global_order() {
     // ADR-089 context-verb optimization (single UNION ALL query for
     // direction="both" expand, replacing two separate direction-scoped
@@ -12239,6 +12262,7 @@ async fn context_both_direction_mixed_weights_interleave_in_global_order() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_budget_truncation_sets_flag_and_dropped_counts() {
     let pack = pack();
     let a = pack
@@ -12289,6 +12313,7 @@ async fn context_budget_truncation_sets_flag_and_dropped_counts() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_bloated_anchor_neighbors_do_not_starve_a_later_relevant_anchor() {
     // Regression test: a higher-ranked anchor with a large neighbor fan-out must
     // not consume the entire budget and push a lower-ranked (but still
@@ -12385,6 +12410,7 @@ async fn context_bloated_anchor_neighbors_do_not_starve_a_later_relevant_anchor(
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_ample_budget_reports_no_truncation() {
     let pack = pack();
     let a = pack
@@ -12423,6 +12449,7 @@ async fn context_ample_budget_reports_no_truncation() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_out_of_range_params_are_clamped_not_rejected() {
     let pack = pack();
     let a = pack
@@ -12447,6 +12474,7 @@ async fn context_out_of_range_params_are_clamped_not_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_unknown_relation_in_filter_is_rejected() {
     let pack = pack();
     let a = pack
