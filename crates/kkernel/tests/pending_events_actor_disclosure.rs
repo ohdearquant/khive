@@ -1,5 +1,5 @@
 //! Black-box regression test for the `kkernel exec --pending-events`
-//! resolved-actor disclosure (issue #2277 follow-up).
+//! resolved-actor disclosure.
 
 use std::process::Command;
 
@@ -11,7 +11,7 @@ fn kkernel_bin() -> &'static str {
 fn exec_pending_events_discloses_resolved_actor_before_drain() {
     let home = tempfile::Builder::new()
         .prefix("kkernel-pending-events-home-")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(std::env::temp_dir())
         .expect("isolated HOME under /private/tmp");
     let db_path = home.path().join("scratch.db");
 
