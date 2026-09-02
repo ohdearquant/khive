@@ -142,12 +142,14 @@ supply the same token to your own browser session before loading a repository:
 sessionStorage.setItem("khive.showcase.accessToken", "a-long-random-operator-secret");
 ```
 
-The UI sends it as the bearer credential on snapshot requests. Without it the protected
-route answers 404 and the UI falls back to the curated static bundle, so the token never
-ships in the client build. An absent or mismatched token is indistinguishable
-from an unconfigured catalog: both routes fail closed to the same sanitized 404. Without
-`KHIVE_SHOWCASE_ACCESS_TOKEN` set, no request can be authorized, regardless of what
-credentials it presents.
+With a token present, the UI sends it as the bearer credential on snapshot requests, and
+only a 404 from the protected route falls back to the curated static bundle. Without a
+token the UI does not request the protected route for an entry that has a curated asset;
+it loads that asset directly, so the token never ships in the client build. Entries that
+exist only in the configured catalog still probe the route so an honest miss is reported.
+An absent or mismatched token is indistinguishable from an unconfigured catalog: both
+routes fail closed to the same sanitized 404. Without `KHIVE_SHOWCASE_ACCESS_TOKEN` set,
+no request can be authorized, regardless of what credentials it presents.
 
 ```bash
 curl -H "Authorization: Bearer $KHIVE_SHOWCASE_ACCESS_TOKEN" \
