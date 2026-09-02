@@ -3071,7 +3071,7 @@ impl VerbRegistry {
     /// Whether a response lost to the daemon frame budget may be truthfully
     /// advertised as safe to re-issue: the verb is [`VerbCategory::Assertive`]
     /// (no institutional commitment was made) and is not on
-    /// [`Self::SIDE_EFFECTING_ASSERTIVE_VERBS`] (no persisted write to
+    /// `Self::SIDE_EFFECTING_ASSERTIVE_VERBS` (no persisted write to
     /// duplicate on a second dispatch). An unregistered verb name resolves to
     /// `None` from [`Self::verb_category`] and fails closed here.
     ///
