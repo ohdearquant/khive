@@ -9,9 +9,11 @@ directions. Admission is peer-uid: the daemon only serves connections from
 its own uid, so there is no credential in the frame — `namespace` and
 `actor_id` are attribution inputs, not authentication.
 
-`Transport` is the seam a remote (HTTP) implementation will plug into
-later: everything above it — models, ops, the client facade — is
-transport-agnostic. Only `SocketTransport` exists today.
+`Transport` is the seam a remote (HTTP) implementation plugs into:
+everything above it — models, ops, the client facade — is
+transport-agnostic. `SocketTransport` talks to a local daemon;
+`HttpTransport` (below) talks to a khive-cloud deployment over
+`POST /v1/request`.
 
 Handshake: on first use the client sends a `metrics_only` frame (the one
 request the daemon answers regardless of `config_id`) to learn the daemon's
@@ -28,7 +30,7 @@ import socket
 import struct
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from .errors import (
     ConfigMismatch,
@@ -36,6 +38,7 @@ from .errors import (
     ProtocolMismatch,
     RequestRejected,
     TransportError,
+    raise_for_status,
 )
 
 PROTOCOL_VERSION = 4
@@ -70,7 +73,7 @@ class SocketTransport(Transport):
                 sock.connect(str(self.path))
                 sock.sendall(struct.pack(">I", len(payload)) + payload)
                 raw = self._read_frame(sock)
-        except (OSError, socket.timeout) as exc:
+        except (TimeoutError, OSError) as exc:
             raise TransportError(f"khived at {self.path}: {exc}") from exc
         try:
             return json.loads(raw.decode("utf-8"))
@@ -93,6 +96,123 @@ class SocketTransport(Transport):
                 raise TransportError(f"connection closed after {len(buf)} of {n} bytes")
             buf.extend(chunk)
         return bytes(buf)
+
+
+def _cloud_config_id(base_url: str) -> str:
+    return "http:" + base_url.rstrip("/")
+
+
+def _stringify_op_errors(envelope: Any) -> Any:
+    """Flatten khive-cloud's `{"code","message"}` per-op error objects to a
+    string, in place, so each entry still validates against
+    `OpResult.error: str | None` (`client.py` is unmodified — this is the
+    wire-adapter's job, same as `client._edge_from_wire`)."""
+    if not isinstance(envelope, dict):
+        return envelope
+    for entry in envelope.get("results", []):
+        if not isinstance(entry, dict):
+            continue
+        err = entry.get("error")
+        if isinstance(err, dict):
+            code = err.get("code")
+            message = err.get("message", str(err))
+            entry["error"] = f"{code}: {message}" if code else str(message)
+    return envelope
+
+
+class HttpTransport(Transport):
+    """Talks to a khive-cloud deployment over `POST {base_url}/v1/request`.
+
+    The cloud has no local engine config to hand-shake against, so a
+    `metrics_only` frame is answered without a POST: `served_config_id` is
+    derived deterministically from the base URL (stable across calls, so
+    `Session`'s config-coherence check is trivially satisfied) and `metrics`
+    is `GET /health`'s body. Every other frame is forwarded as
+    `{"ops": frame["ops"]}` to `/v1/request`; `config_mismatch` never occurs
+    on this transport since the config id is a pure function of the URL.
+
+    The API key is sent only as the `Authorization` header — never logged,
+    never in `repr`, never folded into an error message.
+    """
+
+    def __init__(self, base_url: str, api_key: str, *, timeout: float = 30.0) -> None:
+        import httpx
+
+        self._base_url = base_url.rstrip("/")
+        self._client = httpx.Client(
+            base_url=self._base_url,
+            headers={"Authorization": f"ApiKey {api_key}"},
+            timeout=timeout,
+        )
+
+    def round_trip(self, frame: dict[str, Any], timeout: float) -> dict[str, Any]:
+        if frame.get("metrics_only"):
+            response = self._client.get("/health", timeout=timeout)
+            raise_for_status(response.status_code, response.text, str(response.url))
+            return {
+                "ok": True,
+                "served_config_id": _cloud_config_id(self._base_url),
+                "protocol_version": PROTOCOL_VERSION,
+                "metrics": response.json(),
+            }
+        response = self._client.post(
+            "/v1/request", json={"ops": frame.get("ops", "")}, timeout=timeout
+        )
+        raise_for_status(response.status_code, response.text, str(response.url))
+        return {"ok": True, "result": _stringify_op_errors(response.json())}
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
+class AsyncHttpTransport:
+    """Async twin of `HttpTransport`.
+
+    Not a `Transport` subclass — `Transport.round_trip` is synchronous and
+    `Session` drives it synchronously, so this is used directly by callers
+    who are already inside an event loop rather than through `Session`.
+    """
+
+    def __init__(self, base_url: str, api_key: str, *, timeout: float = 30.0) -> None:
+        import httpx
+
+        self._base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(
+            base_url=self._base_url,
+            headers={"Authorization": f"ApiKey {api_key}"},
+            timeout=timeout,
+        )
+
+    async def round_trip(self, frame: dict[str, Any], timeout: float) -> dict[str, Any]:
+        if frame.get("metrics_only"):
+            response = await self._client.get("/health", timeout=timeout)
+            raise_for_status(response.status_code, response.text, str(response.url))
+            return {
+                "ok": True,
+                "served_config_id": _cloud_config_id(self._base_url),
+                "protocol_version": PROTOCOL_VERSION,
+                "metrics": response.json(),
+            }
+        response = await self._client.post(
+            "/v1/request", json={"ops": frame.get("ops", "")}, timeout=timeout
+        )
+        raise_for_status(response.status_code, response.text, str(response.url))
+        return {"ok": True, "result": _stringify_op_errors(response.json())}
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()
 
 
 class Session:
