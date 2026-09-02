@@ -85,6 +85,7 @@ fn build_text_corpus() -> Vec<TextDocument> {
         .map(|i| TextDocument {
             subject_id: Uuid::new_v4(),
             kind: SubstrateKind::Note,
+            record_kind: None,
             namespace: NAMESPACE.to_string(),
             title: Some(gen_title(i)),
             body: gen_body(&mut rng, i),
@@ -449,6 +450,7 @@ fn bench_fts_upsert_batch(c: &mut Criterion) {
                             .map(|i| TextDocument {
                                 subject_id: Uuid::new_v4(),
                                 kind: SubstrateKind::Note,
+                                record_kind: None,
                                 namespace: NAMESPACE.to_string(),
                                 title: Some(gen_title(i)),
                                 body: gen_body(&mut rng, i),
