@@ -38,12 +38,12 @@ The arm order was ABBA: default, pure, pure, default.
 The table reports each arm's median MiB/s, followed by the midpoint of the two
 arm medians. `pure delta` compares those midpoints.
 
-| Payload | default A1 / A2 | pure B1 / B2 | midpoint default | midpoint pure | pure delta |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 B | 773.28 / 736.93 | 744.43 / 807.34 | 755.11 | 775.89 | +2.8% |
-| 4 KiB | 1644.56 / 1526.62 | 793.29 / 773.98 | 1585.59 | 783.64 | -50.6% |
-| 1 MiB | 1636.77 / 1658.35 | 788.86 / 779.78 | 1647.56 | 784.32 | -52.4% |
-| 64 MiB | 1660.80 / 1693.69 | 770.57 / 773.77 | 1677.25 | 772.17 | -54.0% |
+| Payload |   default A1 / A2 |    pure B1 / B2 | midpoint default | midpoint pure | pure delta |
+| ------: | ----------------: | --------------: | ---------------: | ------------: | ---------: |
+|    64 B |   773.28 / 736.93 | 744.43 / 807.34 |           755.11 |        775.89 |      +2.8% |
+|   4 KiB | 1644.56 / 1526.62 | 793.29 / 773.98 |          1585.59 |        783.64 |     -50.6% |
+|   1 MiB | 1636.77 / 1658.35 | 788.86 / 779.78 |          1647.56 |        784.32 |     -52.4% |
+|  64 MiB | 1660.80 / 1693.69 | 770.57 / 773.77 |          1677.25 |        772.17 |     -54.0% |
 
 The 64-byte arm does not show a stable regression under this resolution. For
 4 KiB through 64 MiB, `pure` delivers about 46-49% of the default backend's
