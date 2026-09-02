@@ -162,6 +162,34 @@ reconcile them by inference.
 The practical consequence is that a stored value echoed back verbatim already reads as the date
 the caller wrote, so D1 closes the observed defect on its own, without waiting for D2.
 
+**D6. Ship the complete IANA timezone table as an unconditional dependency and account for it as
+a deliberate binary-size budget.** Runtime configuration accepts any IANA timezone name, and
+date-only anchoring uses that configuration in the runtime, GTD, and brain packs. A compile-time
+zone filter would therefore make the validity of the same configuration depend on how a binary
+was built. A cargo feature that removes timezone-aware behavior would add a second configuration
+contract through those crates and is not justified by the measured saving.
+
+The footprint was re-measured on 2026-08-29 from source revision
+`1c23c96a5d6fa306740cfcc8108d6a114e98890c`, using `chrono-tz 0.10.4`, Rust 1.98.0,
+and an arm64 macOS 27.0 host. Both `kkernel` binaries used the workspace release profile
+(`opt-level=3`, thin LTO, one codegen unit). The control enabled `chrono-tz`'s
+`filter-by-regex` feature and selected only `UTC`, `America/New_York`, `Asia/Tokyo`,
+`America/Havana`, and `America/Santiago`; all other source and build settings were identical.
+Because the toolchain's `rust-objcopy` could not load its `libLLVM.dylib`, both artifacts were
+symmetrically stripped with `/usr/bin/strip -S` before comparison.
+
+| Build                                 | Bytes      | Difference from full |
+| ------------------------------------- | ---------- | -------------------- |
+| Complete IANA table                   | 42,248,960 | —                    |
+| Five-zone representative filtered set | 41,078,144 | -1,170,816           |
+
+The complete-table premium over that representative subset is 1.117 MiB, or 2.771% of the
+complete-table binary. This is a conservative estimate of the table's removable footprint
+because the control still contains five zones and their linked aliases. It validates the earlier
+rough statement of “about 1.2 MB / 3%.” The accepted budget is therefore approximately 1.2 MB
+and 3% on a comparable optimized build; it is a decision record, not a cross-platform byte-exact
+CI limit. Re-measure when `chrono-tz` or the release-link profile changes materially.
+
 ## Rationale
 
 D1 before D2 is the whole point of the ordering. The defect the caller actually observes is
@@ -197,8 +225,8 @@ that wiring one function is sufficient.
 
 ### Negative
 
-- Resolving IANA zone names requires a zone database in the binary, which is a new dependency
-  and a size cost that should be measured before this lands.
+- Resolving arbitrary configured IANA zone names requires the complete zone database in the
+  binary. D6 accepts its measured 1.117 MiB / 2.771% premium on the reference release build.
 - The anchoring change is observable: the same date-only string written under two different
   configured zones produces two different instants. That is the intended reading, but it is a
   behaviour change and must be stated in release notes. The scope is worth stating exactly,
