@@ -39,7 +39,7 @@ const SEPARATION_ITERATIONS = 200;
 // Golden-angle spiral used both for the initial placement and for nudging a
 // settled point off a coordinate an earlier point already occupies.
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
-const MAX_SPIRAL_ATTEMPTS = 64;
+export const MAX_SPIRAL_ATTEMPTS = 64;
 
 // The rounded-coordinate grid inside the padded stage — the same rounding
 // `rounded()` applies to the values this module returns — has 54,001 x
@@ -81,12 +81,31 @@ function firstFreeGridCoordinate(
       if (!occupied.has(`${x},${y}`)) return { x, y };
     }
   }
-  // Unreachable: the grid has tens of millions more cells than the schema's
-  // 200-node maximum can ever occupy.
+  // Unreachable: the grid has 54,001 x 80,001 = 4,320,134,001 cells, over
+  // four billion more than the schema's 200-node maximum can ever occupy.
   return { x: MIN_X_GRID_UNITS / GRID_PRECISION, y: MIN_Y_GRID_UNITS / GRID_PRECISION };
 }
 
 type LayoutPoint = { x: number; y: number };
+
+/**
+ * The `attempt`-th golden-angle nudge of `point` for the node at `index`: the
+ * candidate `deduplicateSettledPositions` tries before falling back to the
+ * grid scan. Exported so the fallback test occupies exactly the candidates
+ * the production walk visits, whatever the formula becomes.
+ */
+export function spiralCandidate(
+  point: LayoutPoint,
+  index: number,
+  attempt: number,
+): LayoutPoint {
+  const angle = index * GOLDEN_ANGLE * 7 + attempt * GOLDEN_ANGLE;
+  const radius = 0.25 * attempt;
+  return {
+    x: clampToStageX(point.x + Math.cos(angle) * radius),
+    y: clampToStageY(point.y + Math.sin(angle) * radius),
+  };
+}
 
 // Walks settled points in order and nudges any point whose rounded
 // coordinate repeats an earlier one. The golden-angle spiral is tried first
@@ -107,10 +126,9 @@ export function deduplicateSettledPositions<T extends LayoutPoint>(
     let attempt = 0;
     while (occupiedCoordinates.has(key) && attempt < MAX_SPIRAL_ATTEMPTS) {
       attempt += 1;
-      const angle = index * GOLDEN_ANGLE * 7 + attempt * GOLDEN_ANGLE;
-      const radius = 0.25 * attempt;
-      point.x = clampToStageX(point.x + Math.cos(angle) * radius);
-      point.y = clampToStageY(point.y + Math.sin(angle) * radius);
+      const candidate = spiralCandidate(point, index, attempt);
+      point.x = candidate.x;
+      point.y = candidate.y;
       key = `${rounded(point.x)},${rounded(point.y)}`;
     }
     if (occupiedCoordinates.has(key)) {
