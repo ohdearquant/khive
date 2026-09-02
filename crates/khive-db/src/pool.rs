@@ -594,7 +594,7 @@ impl<'pool> ReaderGuard<'pool> {
         }
     }
 
-    /// Access the connection from outside `khive-db`. Unlike [`Self::conn`],
+    /// Access the connection from outside `khive-db`. Unlike the crate-private `conn`,
     /// this unconditionally marks the checkout dirty first, so `Drop` always
     /// pays the pristine-state scan (or, in degraded shared-lease mode, the
     /// settings/rollback verification) on return — an external caller has no
