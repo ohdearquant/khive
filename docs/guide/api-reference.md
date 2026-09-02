@@ -1722,15 +1722,15 @@ Paginated listing of atoms or domains. Offset pages are ordered by
 with `after=""`, then reuse each non-null `next_after`; cursor pages are ordered
 by `created_at ASC, id ASC` and are not shifted by concurrent inserts.
 
-| Param            | Type            | Required | Notes                                                                                                                                                                |
-| ---------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `type`           | string          | no       | `atom`\|`domain` (default `atom`).                                                                                                                                   |
-| `limit`          | integer         | no       | Default 20, max 500.                                                                                                                                                 |
-| `offset`         | integer         | no       | Legacy offset pagination; mutually exclusive with `after`.                                                                                                           |
-| `after`          | string          | no       | `""` starts keyset mode; otherwise the full UUID from `next_after`. Missing, wrong-type, and out-of-namespace cursors fail.                                           |
-| `fields`         | array\<string\> | no       | Strict non-empty projection. Use `["id","slug"]` for a key-only walk; unrequested content is not selected from storage.                                            |
-| `status`         | string/array    | no       | Atom status filter. Reuse it throughout a cursor walk.                                                                                                               |
-| `exclude_status` | string          | no       | Atom exclusion filter when `status` is absent. Reuse it throughout a cursor walk.                                                                                    |
+| Param            | Type            | Required | Notes                                                                                                                       |
+| ---------------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `type`           | string          | no       | `atom`\|`domain` (default `atom`).                                                                                          |
+| `limit`          | integer         | no       | Default 20, max 500.                                                                                                        |
+| `offset`         | integer         | no       | Legacy offset pagination; mutually exclusive with `after`.                                                                  |
+| `after`          | string          | no       | `""` starts keyset mode; otherwise the full UUID from `next_after`. Missing, wrong-type, and out-of-namespace cursors fail. |
+| `fields`         | array\<string\> | no       | Strict non-empty projection. Use `["id","slug"]` for a key-only walk; unrequested content is not selected from storage.     |
+| `status`         | string/array    | no       | Atom status filter. Reuse it throughout a cursor walk.                                                                      |
+| `exclude_status` | string          | no       | Atom exclusion filter when `status` is absent. Reuse it throughout a cursor walk.                                           |
 
 ```
 request(ops="knowledge.list(type=\"domain\", limit=50)")
