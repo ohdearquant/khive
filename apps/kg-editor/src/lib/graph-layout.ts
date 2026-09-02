@@ -23,10 +23,11 @@ const HORIZONTAL_PADDING = 23;
 const VERTICAL_PADDING = 10;
 const CENTER = 50;
 const ITERATIONS = 160;
-// Keep the established layout path for review and showcase-sized graphs, but
-// cap synchronous all-pairs work once graphs are large enough for the fixed
-// iteration counts to dominate the main thread. At the supported 200-node
-// maximum these budgets allow 12 force passes and 5 separation passes.
+// The small-graph layout (the review page and the repository showcase) runs
+// the full force simulation unconditionally; once a graph is large enough
+// that the fixed iteration counts start to dominate the main thread, cap the
+// synchronous all-pairs work instead. At the supported 200-node maximum
+// these budgets allow 12 force passes and 5 separation passes.
 const FULL_QUALITY_NODE_LIMIT = 64;
 const FORCE_PAIR_EVALUATION_BUDGET = 250_000;
 const SEPARATION_PAIR_EVALUATION_BUDGET = 100_000;
@@ -35,6 +36,22 @@ const SEPARATION_PAIR_EVALUATION_BUDGET = 100_000;
 // the deterministic cleanup pass that runs after the force settle.
 const MIN_SEPARATION = 7;
 const SEPARATION_ITERATIONS = 200;
+// Golden-angle spiral used both for the initial placement and for nudging a
+// settled point off a coordinate an earlier point already occupies.
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+const MAX_SPIRAL_ATTEMPTS = 64;
+
+// The rounded-coordinate grid inside the padded stage — the same rounding
+// `rounded()` applies to the values this module returns — has 54,001 x
+// 80,001 distinct cells at the current padding, far more than the 200-node
+// schema maximum. A deterministic row-major scan from the stage origin is
+// therefore guaranteed to reach an unoccupied cell after checking at most
+// `occupied.size + 1` candidates, since at most 199 cells can be occupied.
+const GRID_PRECISION = 1_000;
+const MIN_X_GRID_UNITS = Math.round(HORIZONTAL_PADDING * GRID_PRECISION);
+const MAX_X_GRID_UNITS = Math.round((100 - HORIZONTAL_PADDING) * GRID_PRECISION);
+const MIN_Y_GRID_UNITS = Math.round(VERTICAL_PADDING * GRID_PRECISION);
+const MAX_Y_GRID_UNITS = Math.round((100 - VERTICAL_PADDING) * GRID_PRECISION);
 
 function boundedPairIterations(
   nodeCount: number,
@@ -44,6 +61,67 @@ function boundedPairIterations(
   if (nodeCount <= FULL_QUALITY_NODE_LIMIT) return maximum;
   const pairCount = nodeCount * (nodeCount - 1) / 2;
   return Math.min(maximum, Math.max(1, Math.floor(pairEvaluationBudget / pairCount)));
+}
+
+function clampToStageX(value: number): number {
+  return Math.min(100 - HORIZONTAL_PADDING, Math.max(HORIZONTAL_PADDING, value));
+}
+
+function clampToStageY(value: number): number {
+  return Math.min(100 - VERTICAL_PADDING, Math.max(VERTICAL_PADDING, value));
+}
+
+function firstFreeGridCoordinate(
+  occupied: ReadonlySet<string>,
+): { x: number; y: number } {
+  for (let yUnits = MIN_Y_GRID_UNITS; yUnits <= MAX_Y_GRID_UNITS; yUnits += 1) {
+    for (let xUnits = MIN_X_GRID_UNITS; xUnits <= MAX_X_GRID_UNITS; xUnits += 1) {
+      const x = xUnits / GRID_PRECISION;
+      const y = yUnits / GRID_PRECISION;
+      if (!occupied.has(`${x},${y}`)) return { x, y };
+    }
+  }
+  // Unreachable: the grid has tens of millions more cells than the schema's
+  // 200-node maximum can ever occupy.
+  return { x: MIN_X_GRID_UNITS / GRID_PRECISION, y: MIN_Y_GRID_UNITS / GRID_PRECISION };
+}
+
+type LayoutPoint = { x: number; y: number };
+
+// Walks settled points in order and nudges any point whose rounded
+// coordinate repeats an earlier one. The golden-angle spiral is tried first
+// (it preserves the existing layouts, since it was already the only
+// mechanism in use); if all `MAX_SPIRAL_ATTEMPTS` spiral nudges are also
+// occupied — the stage-corner case described above, where a diagonal push
+// clamps straight back onto itself — fall back to the grid scan, which is
+// guaranteed to terminate. The returned positions are pairwise distinct by
+// construction.
+export function deduplicateSettledPositions<T extends LayoutPoint>(
+  points: readonly T[],
+): T[] {
+  const occupiedCoordinates = new Set<string>();
+  const deduped = points.map((point) => ({ ...point }));
+  for (let index = 0; index < deduped.length; index += 1) {
+    const point = deduped[index];
+    let key = `${rounded(point.x)},${rounded(point.y)}`;
+    let attempt = 0;
+    while (occupiedCoordinates.has(key) && attempt < MAX_SPIRAL_ATTEMPTS) {
+      attempt += 1;
+      const angle = index * GOLDEN_ANGLE * 7 + attempt * GOLDEN_ANGLE;
+      const radius = 0.25 * attempt;
+      point.x = clampToStageX(point.x + Math.cos(angle) * radius);
+      point.y = clampToStageY(point.y + Math.sin(angle) * radius);
+      key = `${rounded(point.x)},${rounded(point.y)}`;
+    }
+    if (occupiedCoordinates.has(key)) {
+      const free = firstFreeGridCoordinate(occupiedCoordinates);
+      point.x = free.x;
+      point.y = free.y;
+      key = `${rounded(point.x)},${rounded(point.y)}`;
+    }
+    occupiedCoordinates.add(key);
+  }
+  return deduped;
 }
 
 function compareText(left: string, right: string): number {
@@ -85,7 +163,6 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
 
   const random = seededRandom(GRAPH_LAYOUT_SEED);
   const phase = random() * Math.PI * 2;
-  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
   // Scale the spiral radius per axis by the padded half-extent of the stage
   // (not a flat pixel radius) so outer-ring nodes land inside bounds instead
   // of needing an immediate clamp — a large node count otherwise lands many
@@ -95,7 +172,7 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
   const points = orderedNodes.map((node, index) => {
     const ringFraction = Math.sqrt((index + 0.5) / orderedNodes.length);
     const radiusScale = 0.15 + 0.8 * ringFraction;
-    const angle = phase + index * goldenAngle + (random() - 0.5) * 0.08;
+    const angle = phase + index * GOLDEN_ANGLE + (random() - 0.5) * 0.08;
     return {
       node,
       x: CENTER + Math.cos(angle) * radiusScale * maxRadiusX,
@@ -222,34 +299,12 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
   // points still exactly coincident: a diagonal push at a stage corner can
   // be entirely absorbed by the boundary clamp on both axes, since any
   // offset that moves a point further into the corner clamps straight back
-  // to it, and no amount of extra passes resolves that on its own. Walk the
-  // settled points once and nudge any coordinate that repeats an earlier
-  // one along the same golden-angle spiral used for the initial placement
-  // (so nudges from different points don't line up) until it lands on a
-  // free spot.
-  const occupiedCoordinates = new Set<string>();
-  for (let index = 0; index < points.length; index += 1) {
-    const point = points[index];
-    let key = `${rounded(point.x)},${rounded(point.y)}`;
-    let attempt = 0;
-    while (occupiedCoordinates.has(key) && attempt < 64) {
-      attempt += 1;
-      const angle = index * goldenAngle * 7 + attempt * goldenAngle;
-      const radius = 0.25 * attempt;
-      point.x = Math.min(
-        100 - HORIZONTAL_PADDING,
-        Math.max(HORIZONTAL_PADDING, point.x + Math.cos(angle) * radius),
-      );
-      point.y = Math.min(
-        100 - VERTICAL_PADDING,
-        Math.max(VERTICAL_PADDING, point.y + Math.sin(angle) * radius),
-      );
-      key = `${rounded(point.x)},${rounded(point.y)}`;
-    }
-    occupiedCoordinates.add(key);
-  }
+  // to it, and no amount of extra passes resolves that on its own.
+  // deduplicateSettledPositions makes the returned positions pairwise
+  // distinct unconditionally, including that corner case.
+  const deduped = deduplicateSettledPositions(points);
 
-  return points.map(({ node, x, y }) => ({
+  return deduped.map(({ node, x, y }) => ({
     ...node,
     x: rounded(x),
     y: rounded(y),
