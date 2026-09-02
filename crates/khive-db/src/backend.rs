@@ -27,6 +27,50 @@ fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool,
     .map_err(SqliteError::Rusqlite)
 }
 
+/// Populate `table`'s [`text::rowid_map_table`] from `table` itself when the
+/// map is empty but the FTS table is not.
+///
+/// `StorageBackend::text()`/`text_with_tokenizer()` is called uncached on
+/// essentially every text-store access (`khive-runtime` builds a fresh
+/// `Fts5TextSearch` per call, never caching the `Arc`), so this check runs on
+/// the hot path — it must stay O(1), not scale with either table's row
+/// count, or it reintroduces the exact class of cost this migration exists
+/// to remove. `SELECT EXISTS(... LIMIT 1)` is an index probe that stops at
+/// the first row, unlike `COUNT(*)` which SQLite satisfies by walking every
+/// row of the smallest available index. The one-time backfill itself (a full
+/// scan of `table`) only runs the first time this backend opens a database
+/// that predates the map — from then on this function is a single cheap
+/// probe that finds a row and returns. `ORDER BY rowid` makes the highest
+/// rowid win `INSERT OR REPLACE` for any legacy duplicate `(namespace,
+/// subject_id)` pair, i.e. the most recently written row survives.
+fn ensure_fts_rowid_map_backfilled(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> Result<(), SqliteError> {
+    let map = text::rowid_map_table(table);
+    let map_has_a_row: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {map} LIMIT 1)"),
+        [],
+        |row| row.get(0),
+    )?;
+    if map_has_a_row {
+        return Ok(());
+    }
+    let fts_has_a_row: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+        [],
+        |row| row.get(0),
+    )?;
+    if !fts_has_a_row {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "INSERT OR REPLACE INTO {map} (namespace, subject_id, rowid) \
+         SELECT namespace, subject_id, rowid FROM {table} ORDER BY rowid ASC"
+    ))?;
+    Ok(())
+}
+
 fn validate_vector_table_columns(
     conn: &rusqlite::Connection,
     table: &str,
@@ -823,8 +867,8 @@ impl StorageBackend {
              )",
             table_key, tokenizer
         );
+        let table = format!("fts_{table_key}");
         if self.is_read_only() {
-            let table = format!("fts_{table_key}");
             let reader = self.pool.reader()?;
             if !sqlite_table_exists(reader.conn(), &table)? {
                 return Err(SqliteError::InvalidData(format!(
@@ -835,6 +879,8 @@ impl StorageBackend {
         } else {
             let writer = self.pool.try_writer()?;
             writer.conn().execute_batch(&ddl)?;
+            writer.conn().execute_batch(&text::rowid_map_ddl(&table))?;
+            ensure_fts_rowid_map_backfilled(writer.conn(), &table)?;
         }
 
         Ok(Arc::new(text::Fts5TextSearch::new(
@@ -1513,6 +1559,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// khive-runtime never caches the `Arc<dyn TextSearch>` `text()`/
+    /// `text_for_notes()` return — every one of its ~26 call sites in
+    /// `operations.rs`/`curation.rs` calls `StorageBackend::text()` fresh, so
+    /// `ensure_fts_rowid_map_backfilled`'s already-backfilled short-circuit
+    /// runs on essentially every text-store access. A first draft of that
+    /// function used `SELECT COUNT(*)` for the short-circuit — correct, but
+    /// `COUNT(*)` over an FTS5 table costs real per-call time proportional to
+    /// row count (measured directly: ~130ms per call at 200,000 rows, vs
+    /// ~0.01ms for the `EXISTS(...LIMIT 1)` this test pins), which would have
+    /// reintroduced a scan on the read path this whole migration exists to
+    /// remove. This test seeds enough rows that an O(n) short-circuit would
+    /// make repeated calls visibly slow, then bounds many repeated
+    /// `backend.text()` calls to a budget only a same-order-as-O(1)
+    /// short-circuit can meet.
+    #[tokio::test]
+    async fn text_repeated_open_after_backfill_does_not_scale_with_row_count() {
+        let backend = StorageBackend::memory().unwrap();
+        let store = backend.text("hot_path_reopen").unwrap();
+
+        let body = "the quick brown fox jumps over the lazy dog ".repeat(35);
+        for _ in 0..5_000 {
+            let doc = khive_storage::types::TextDocument {
+                subject_id: uuid::Uuid::new_v4(),
+                kind: khive_types::SubstrateKind::Note,
+                record_kind: Some("memory".to_string()),
+                title: None,
+                body: body.clone(),
+                tags: vec![],
+                namespace: "test_ns".to_string(),
+                metadata: None,
+                updated_at: chrono::Utc::now(),
+            };
+            store.upsert_document(doc).await.unwrap();
+        }
+
+        // First call after seeding backfills the map (a real, one-time full
+        // scan) — not part of what this test bounds.
+        let _ = backend.text("hot_path_reopen").unwrap();
+
+        let start = std::time::Instant::now();
+        for _ in 0..500 {
+            let _ = backend.text("hot_path_reopen").unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "500 repeated backend.text() calls over a 5,000-row table took {elapsed:?} — \
+             an O(1) already-backfilled short-circuit should clear this budget by a wide \
+             margin; an O(row-count) short-circuit (e.g. `COUNT(*)`) would not"
+        );
     }
 
     #[test]

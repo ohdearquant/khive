@@ -23,15 +23,54 @@ use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
 
+/// Name of the sidecar rowid map for a given FTS table: `{namespace,
+/// subject_id} -> rowid`, `WITHOUT ROWID`, `PRIMARY KEY (namespace,
+/// subject_id)`.
+///
+/// `namespace` and `subject_id` are declared `UNINDEXED` in every FTS5 DDL
+/// (trigram-tokenized production tables cannot index them without polluting
+/// text queries with UUID fragments), so a point lookup on either column is a
+/// full virtual-table scan of `table` — this sidecar turns it into a
+/// primary-key lookup instead. `table` must already be a trusted, sanitized
+/// table name.
+pub fn rowid_map_table(table: &str) -> String {
+    format!("{table}_rowids")
+}
+
+/// DDL for [`rowid_map_table`]'s sidecar. `IF NOT EXISTS` so every creation
+/// site (backend ensure-path, migrations, test helpers) can call it
+/// unconditionally. `table` must already be a trusted, sanitized table name.
+pub fn rowid_map_ddl(table: &str) -> String {
+    let map = rowid_map_table(table);
+    format!(
+        "CREATE TABLE IF NOT EXISTS {map} (\
+         namespace TEXT NOT NULL, \
+         subject_id TEXT NOT NULL, \
+         rowid INTEGER NOT NULL, \
+         PRIMARY KEY (namespace, subject_id)\
+         ) WITHOUT ROWID"
+    )
+}
+
 /// The exact `DELETE` this store's `delete_document` issues, for a given
 /// FTS table (ADR-099 B3 r6 structural cut — see `entity.rs`'s sibling
-/// block). `table` must already be a trusted, sanitized table name (this
-/// mirrors `delete_document`'s own pre-existing lack of a placeholder for
-/// table names — `format!` is required since table identifiers cannot be
-/// bound as SQL parameters).
+/// block). Looks the target row's rowid up in [`rowid_map_table`] first (a
+/// primary-key lookup) instead of scanning `table` for `namespace`/
+/// `subject_id`, which are `UNINDEXED` FTS5 columns. `table` must already be
+/// a trusted, sanitized table name (this mirrors `delete_document`'s own
+/// pre-existing lack of a placeholder for table names — `format!` is
+/// required since table identifiers cannot be bound as SQL parameters).
+///
+/// Callers that also need the sidecar's own row removed (a real delete, not
+/// half of an upsert) must additionally run [`delete_document_map_statement`]
+/// — see [`delete_document_statements`] for the paired, order-safe form.
 pub fn delete_document_statement(table: &str, namespace: &str, subject_id: Uuid) -> SqlStatement {
+    let map = rowid_map_table(table);
     SqlStatement {
-        sql: format!("DELETE FROM {table} WHERE namespace = ?1 AND subject_id = ?2"),
+        sql: format!(
+            "DELETE FROM {table} WHERE rowid IN \
+             (SELECT rowid FROM {map} WHERE namespace = ?1 AND subject_id = ?2)"
+        ),
         params: vec![
             SqlValue::Text(namespace.to_string()),
             SqlValue::Text(subject_id.to_string()),
@@ -40,10 +79,54 @@ pub fn delete_document_statement(table: &str, namespace: &str, subject_id: Uuid)
     }
 }
 
+/// Remove `(namespace, subject_id)`'s row from `table`'s [`rowid_map_table`].
+///
+/// Order matters relative to [`delete_document_statement`]: that statement's
+/// subquery still needs this row, so run it first, then this one, in the same
+/// transaction. Use [`delete_document_statements`] to get both in the correct
+/// order.
+pub fn delete_document_map_statement(
+    table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+) -> SqlStatement {
+    let map = rowid_map_table(table);
+    SqlStatement {
+        sql: format!("DELETE FROM {map} WHERE namespace = ?1 AND subject_id = ?2"),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(subject_id.to_string()),
+        ],
+        label: Some(format!("fts-delete-map-{table}")),
+    }
+}
+
+/// The full, order-safe deletion of one FTS document: index 0 (the FTS row,
+/// looked up through the map) MUST execute before index 1 (the map row
+/// itself) in the same transaction/connection — index 0's subquery reads the
+/// row index 1 removes. Callers that only need the FTS row gone as half of a
+/// delete-then-insert upsert (the map row gets overwritten by the following
+/// insert's `INSERT OR REPLACE`, so removing it first is redundant) can use
+/// [`delete_document_statement`] alone.
+pub fn delete_document_statements(
+    table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+) -> [SqlStatement; 2] {
+    [
+        delete_document_statement(table, namespace, subject_id),
+        delete_document_map_statement(table, namespace, subject_id),
+    ]
+}
+
 /// Build the `INSERT` half of the FTS delete-then-insert upsert.
 ///
 /// `table` must be a trusted, sanitized table name because SQL identifiers
 /// cannot be bound as parameters.
+///
+/// This statement alone leaves [`rowid_map_table`] out of date — pair it with
+/// [`insert_document_map_statement`] (or use [`insert_document_statements`]
+/// for the order-safe combination) so the sidecar tracks the new rowid.
 pub fn insert_document_statement(table: &str, document: &TextDocument) -> SqlStatement {
     let tags_json = tags_to_json(&document.tags);
     let metadata_json = document.metadata.as_ref().map(|v| v.to_string());
@@ -74,7 +157,49 @@ pub fn insert_document_statement(table: &str, document: &TextDocument) -> SqlSta
     }
 }
 
-/// Ensure the FTS5 virtual table for `table_key` exists.
+/// Upsert `(namespace, subject_id)`'s [`rowid_map_table`] row to point at the
+/// rowid the connection's most recent successful `INSERT` produced.
+///
+/// Must run immediately after the FTS `INSERT` it tracks, on the same
+/// connection, with nothing else written in between: `last_insert_rowid()` is
+/// connection-scoped and reports whichever `INSERT` ran last. `INSERT OR
+/// REPLACE` means this is safe to call whether or not a map row for this key
+/// already exists (the ordinary upsert case does: the old row is overwritten
+/// with the new rowid rather than requiring a prior delete).
+pub fn insert_document_map_statement(
+    table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+) -> SqlStatement {
+    let map = rowid_map_table(table);
+    SqlStatement {
+        sql: format!(
+            "INSERT OR REPLACE INTO {map} (namespace, subject_id, rowid) \
+             VALUES (?1, ?2, last_insert_rowid())"
+        ),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(subject_id.to_string()),
+        ],
+        label: Some(format!("fts-insert-map-{table}")),
+    }
+}
+
+/// The full, order-safe insertion of one FTS document: index 0 (the FTS
+/// `INSERT`) MUST execute immediately before index 1 (the rowid-map upsert)
+/// on the same connection, with no other write between them — see
+/// [`insert_document_map_statement`]'s adjacency contract. Every insert path
+/// (create, and the insert half of an upsert) must go through this pair, or
+/// the sidecar map silently falls out of sync with the FTS table it indexes.
+pub fn insert_document_statements(table: &str, document: &TextDocument) -> [SqlStatement; 2] {
+    [
+        insert_document_statement(table, document),
+        insert_document_map_statement(table, &document.namespace, document.subject_id),
+    ]
+}
+
+/// Ensure the FTS5 virtual table for `table_key` (and its [`rowid_map_table`]
+/// sidecar) exist.
 ///
 /// Used in tests to set up an in-memory FTS5 table without the full `StorageBackend`.
 #[cfg(test)]
@@ -97,7 +222,8 @@ pub(crate) fn ensure_fts5_schema(
          )",
         table_name
     );
-    conn.execute_batch(&ddl)
+    conn.execute_batch(&ddl)?;
+    conn.execute_batch(&rowid_map_ddl(&table_name))
 }
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
@@ -733,11 +859,15 @@ fn upsert_document_dml(
     table: &str,
     document: &TextDocument,
 ) -> Result<(), rusqlite::Error> {
-    let statements = [
-        delete_document_statement(table, &document.namespace, document.subject_id),
-        insert_document_statement(table, document),
-    ];
-    for statement in statements {
+    // Delete (old rowid, via the map) -> insert (new rowid) -> map upsert
+    // (new rowid). The map's own row for this key needs no separate delete:
+    // `INSERT OR REPLACE` in the third statement overwrites it in place.
+    let statement = delete_document_statement(table, &document.namespace, document.subject_id);
+    let mut stmt = conn.prepare(&statement.sql)?;
+    bind_params(&mut stmt, &statement.params)?;
+    stmt.raw_execute()?;
+
+    for statement in insert_document_statements(table, document) {
         let mut stmt = conn.prepare(&statement.sql)?;
         bind_params(&mut stmt, &statement.params)?;
         stmt.raw_execute()?;
@@ -759,15 +889,24 @@ fn batch_upsert_documents_dml(
     documents: &[TextDocument],
     attempted: u64,
 ) -> Result<BatchWriteSummary, rusqlite::Error> {
+    let map = rowid_map_table(table);
+    // Delete via the map's primary key instead of a `namespace`/`subject_id`
+    // scan of the (UNINDEXED on those columns) FTS table itself.
     let del_sql = format!(
-        "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-        table
+        "DELETE FROM {table} WHERE rowid IN \
+         (SELECT rowid FROM {map} WHERE namespace = ?1 AND subject_id = ?2)"
     );
     let ins_sql = format!(
         "INSERT INTO {} \
          (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         table
+    );
+    // `INSERT OR REPLACE` — no separate delete of the map's own row needed;
+    // see `upsert_document_dml`'s matching comment.
+    let map_ins_sql = format!(
+        "INSERT OR REPLACE INTO {map} (namespace, subject_id, rowid) \
+         VALUES (?1, ?2, last_insert_rowid())"
     );
 
     let mut affected = 0u64;
@@ -798,6 +937,7 @@ fn batch_upsert_documents_dml(
                     &doc.record_kind,
                 ],
             )?;
+            conn.execute(&map_ins_sql, rusqlite::params![namespace, &id_str])?;
             Ok::<(), rusqlite::Error>(())
         })();
 
@@ -919,12 +1059,20 @@ impl TextSearch for Fts5TextSearch {
         namespace: &str,
         subject_id: Uuid,
     ) -> Result<bool, StorageError> {
-        let statement = delete_document_statement(&self.table_name, namespace, subject_id);
+        let [fts_statement, map_statement] =
+            delete_document_statements(&self.table_name, namespace, subject_id);
 
         self.with_writer("fts_delete", move |conn| {
-            let mut stmt = conn.prepare(&statement.sql)?;
-            bind_params(&mut stmt, &statement.params)?;
-            Ok(stmt.raw_execute()? > 0)
+            let mut stmt = conn.prepare(&fts_statement.sql)?;
+            bind_params(&mut stmt, &fts_statement.params)?;
+            let deleted = stmt.raw_execute()? > 0;
+            drop(stmt);
+
+            let mut map_stmt = conn.prepare(&map_statement.sql)?;
+            bind_params(&mut map_stmt, &map_statement.params)?;
+            map_stmt.raw_execute()?;
+
+            Ok(deleted)
         })
         .await
     }
@@ -938,10 +1086,12 @@ impl TextSearch for Fts5TextSearch {
         let table = self.table_name.clone();
 
         self.with_reader("fts_get", move |conn| {
+            let map = rowid_map_table(&table);
             let sql = format!(
-                "SELECT subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind \
-                 FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                table
+                "SELECT t.subject_id, t.kind, t.title, t.body, t.tags, t.namespace, \
+                 t.metadata, t.updated_at, t.record_kind \
+                 FROM {table} AS t JOIN {map} AS m ON m.rowid = t.rowid \
+                 WHERE m.namespace = ?1 AND m.subject_id = ?2"
             );
             let mut stmt = conn.prepare(&sql)?;
             let mut rows = stmt.query(rusqlite::params![namespace, subject_id.to_string()])?;
@@ -1647,11 +1797,22 @@ fn rename_namespace_dml(
     let del_sql = format!("DELETE FROM {} WHERE namespace = ?1", table);
     conn.execute(&del_sql, rusqlite::params![old_ns])?;
 
+    // The rows just deleted above are gone from `table` entirely (whole
+    // namespace, not a single subject), so their map entries are pure
+    // leftovers now — clear them before reinserting under `new_ns`.
+    let map = rowid_map_table(table);
+    let map_del_sql = format!("DELETE FROM {map} WHERE namespace = ?1");
+    conn.execute(&map_del_sql, rusqlite::params![old_ns])?;
+
     let ins_sql = format!(
         "INSERT INTO {} \
          (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         table
+    );
+    let map_ins_sql = format!(
+        "INSERT OR REPLACE INTO {map} (namespace, subject_id, rowid) \
+         VALUES (?1, ?2, last_insert_rowid())"
     );
     for row in &rows {
         conn.execute(
@@ -1668,6 +1829,7 @@ fn rename_namespace_dml(
                 row.record_kind,
             ],
         )?;
+        conn.execute(&map_ins_sql, rusqlite::params![new_ns, row.subject_id])?;
     }
 
     Ok(moved)

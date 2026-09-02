@@ -50,6 +50,10 @@ fn setup_trigram_store(table_key: &str) -> Fts5TextSearch {
             table_name
         );
         writer.conn().execute_batch(&ddl).unwrap();
+        writer
+            .conn()
+            .execute_batch(&rowid_map_ddl(&table_name))
+            .unwrap();
     }
 
     Fts5TextSearch::new(pool, false, table_key.to_string())
@@ -216,6 +220,237 @@ async fn test_delete_document() {
 
     let doc = store.get_document("test_ns", id1).await.unwrap();
     assert!(doc.is_none());
+}
+
+/// The pre-fix `DELETE` scanned the whole FTS5 virtual
+/// table because `namespace`/`subject_id` are `UNINDEXED` columns; the
+/// rowid-map version resolves the same lookup through the map's primary key
+/// instead. This test pins both plan shapes as strings measured against a
+/// live `EXPLAIN QUERY PLAN`, not shapes it merely expects, and keeps the OLD
+/// statement inline as the control so a future edit to either builder cannot
+/// silently make this comparison meaningless.
+#[test]
+fn delete_statement_plan_uses_the_map_not_a_table_scan() {
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    ensure_fts5_schema(&conn, "plan_check").expect("schema");
+    let table = "fts_plan_check";
+
+    // The exact statement `delete_document_statement` issued before this fix.
+    // `VIRTUAL TABLE INDEX 0:` with NO trailing operator is FTS5's plan label
+    // for an unconstrained cursor: every row is opened and tested, because
+    // `namespace`/`subject_id` are UNINDEXED and xBestIndex has nothing to
+    // push down. That bare, operator-less form is the control this test
+    // pins — measured live, not assumed.
+    const OLD_DELETE_SQL: &str = "DELETE FROM {table} WHERE namespace = ?1 AND subject_id = ?2";
+    let old_sql = OLD_DELETE_SQL.replace("{table}", table);
+    let old_plan = explain_query_plan(
+        &conn,
+        &old_sql,
+        &["local", "00000000-0000-0000-0000-000000000000"],
+    );
+    let unconstrained_scan = format!("SCAN {table} VIRTUAL TABLE INDEX 0:");
+    assert!(
+        old_plan
+            .iter()
+            .any(|step| step.trim_end() == unconstrained_scan.trim_end()),
+        "control (pre-fix) plan must be an unconstrained FTS5 scan: {old_plan:?}"
+    );
+
+    let new_statement = delete_document_statement(
+        table,
+        "local",
+        Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap(),
+    );
+    let new_plan = explain_query_plan(
+        &conn,
+        &new_statement.sql,
+        &["local", "00000000-0000-0000-0000-000000000000"],
+    );
+    assert!(
+        !new_plan.iter().any(|step| step.trim_end() == unconstrained_scan.trim_end()),
+        "fixed plan must not fall back to the unconstrained FTS5 scan the control used: {new_plan:?}"
+    );
+    assert!(
+        new_plan
+            .iter()
+            .any(|step| step.contains("SEARCH fts_plan_check_rowids USING PRIMARY KEY")),
+        "fixed plan must search the rowid map by its primary key: {new_plan:?}"
+    );
+    assert!(
+        new_plan
+            .iter()
+            .any(|step| step.contains(&format!("SCAN {table} VIRTUAL TABLE INDEX 0:="))),
+        "fixed plan's FTS5 access must be constrained (rowid equality driven by the map's \
+         primary-key search), not the bare unconstrained cursor: {new_plan:?}"
+    );
+}
+
+/// Runs `EXPLAIN QUERY PLAN` for `sql` bound with `params` (all bound as
+/// text — sufficient for this file's plan-shape assertions) and returns each
+/// step's human-readable `detail` column.
+fn explain_query_plan(conn: &rusqlite::Connection, sql: &str, params: &[&str]) -> Vec<String> {
+    let plan_sql = format!("EXPLAIN QUERY PLAN {sql}");
+    let mut stmt = conn.prepare(&plan_sql).expect("prepare EXPLAIN QUERY PLAN");
+    let params: Vec<&dyn rusqlite::types::ToSql> = params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt
+        .query_map(params.as_slice(), |row| row.get::<_, String>(3))
+        .expect("query plan rows");
+    rows.collect::<Result<Vec<_>, _>>()
+        .expect("collect plan steps")
+}
+
+/// `insert_document_map_statement`'s `last_insert_rowid()` must
+/// resolve to the FTS5 `INSERT` that ran immediately before it on the same
+/// connection — this is the whole correctness argument for keeping the two
+/// statements adjacent instead of assuming SQLite's `INSERT`-then-read-back
+/// contract without checking it against the actual FTS5 virtual table
+/// implementation.
+#[test]
+fn last_insert_rowid_reflects_the_fts5_insert() {
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    ensure_fts5_schema(&conn, "rowid_check").expect("schema");
+    let table = "fts_rowid_check";
+
+    let doc = make_document(Uuid::new_v4(), "Title", "Body");
+    let insert_stmt = insert_document_statement(table, &doc);
+    {
+        let mut stmt = conn.prepare(&insert_stmt.sql).expect("prepare fts insert");
+        crate::sql_bridge::bind_params(&mut stmt, &insert_stmt.params).expect("bind fts insert");
+        stmt.raw_execute().expect("insert fts row");
+    }
+    let observed_rowid = conn.last_insert_rowid();
+
+    let actual_rowid: i64 = conn
+        .query_row(
+            &format!("SELECT rowid FROM {table} WHERE subject_id = ?1"),
+            rusqlite::params![doc.subject_id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("read back inserted row's rowid");
+    assert_eq!(
+        observed_rowid, actual_rowid,
+        "last_insert_rowid() must equal the FTS5 insert's own rowid"
+    );
+}
+
+/// Not a CI test — a manual scale measurement, run with:
+/// `cargo test -p khive-db --lib scale_measurement_delete_by_subject -- --ignored --nocapture`
+///
+/// Builds a 200,000-row, ~1.6 KB-body `fts_notes`-shaped table on disk under
+/// `/private/tmp/` (production-shaped: file-backed, trigram-tokenized,
+/// non-trivial body text — an in-memory table or tiny bodies would not
+/// reproduce the overflow-page I/O the pre-fix scan pays for), then times
+/// 100 deletes by subject through the OLD (pre-fix, literal) statement and
+/// 100 through the NEW (rowid-map) statement, against the same corpus.
+#[test]
+#[ignore = "manual scale measurement, not a CI assertion — see doc comment"]
+fn scale_measurement_delete_by_subject() {
+    let path = std::path::PathBuf::from(format!(
+        "/private/tmp/khive-fts-scale-{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).expect("open scratch db under /private/tmp");
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE fts_notes USING fts5(\
+         subject_id UNINDEXED, kind UNINDEXED, title, body, tags UNINDEXED, \
+         namespace UNINDEXED, metadata UNINDEXED, updated_at UNINDEXED, record_kind, \
+         tokenize = 'trigram')",
+    )
+    .expect("create production-shaped fts_notes");
+    conn.execute_batch(&rowid_map_ddl("fts_notes"))
+        .expect("create rowid map");
+
+    const ROW_COUNT: usize = 200_000;
+    const DELETE_COUNT: usize = 100;
+    let body_filler = "the quick brown fox jumps over the lazy dog ".repeat(35); // ~1.6 KB
+    let ids: Vec<Uuid> = (0..ROW_COUNT).map(|_| Uuid::new_v4()).collect();
+
+    let seed_start = std::time::Instant::now();
+    conn.execute_batch("BEGIN").expect("begin seed");
+    {
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO fts_notes \
+                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+                 VALUES (?1, 'note', '', ?2, '[]', 'local', NULL, 0, 'memory')",
+            )
+            .expect("prepare seed insert");
+        for id in &ids {
+            let body = format!("{body_filler}{id}");
+            insert
+                .execute(rusqlite::params![id.to_string(), body])
+                .expect("insert seed row");
+        }
+    }
+    conn.execute_batch("COMMIT").expect("commit seed");
+    conn.execute_batch(
+        "INSERT OR REPLACE INTO fts_notes_rowids (namespace, subject_id, rowid) \
+         SELECT namespace, subject_id, rowid FROM fts_notes ORDER BY rowid ASC",
+    )
+    .expect("backfill rowid map");
+    eprintln!(
+        "seeded {ROW_COUNT} rows (~{} bytes/body) in {:?}",
+        body_filler.len(),
+        seed_start.elapsed()
+    );
+
+    // OLD: the literal statement `delete_document_statement` issued before
+    // this fix — namespace/subject_id are UNINDEXED, so this is a full scan.
+    const OLD_DELETE_SQL: &str = "DELETE FROM fts_notes WHERE namespace = ?1 AND subject_id = ?2";
+    let old_start = std::time::Instant::now();
+    {
+        let mut stmt = conn.prepare(OLD_DELETE_SQL).expect("prepare old delete");
+        for id in &ids[0..DELETE_COUNT] {
+            let affected = stmt
+                .execute(rusqlite::params!["local", id.to_string()])
+                .expect("old delete");
+            assert_eq!(affected, 1);
+        }
+    }
+    let old_elapsed = old_start.elapsed();
+
+    // NEW: the rowid-map statement, against the (now 200,000 - 100 row, i.e.
+    // still effectively 200,000-row) same corpus.
+    let new_statement_sql = delete_document_statement("fts_notes", "local", ids[DELETE_COUNT]).sql;
+    let new_start = std::time::Instant::now();
+    {
+        let mut fts_stmt = conn
+            .prepare(&new_statement_sql)
+            .expect("prepare new delete");
+        let mut map_stmt = conn
+            .prepare("DELETE FROM fts_notes_rowids WHERE namespace = ?1 AND subject_id = ?2")
+            .expect("prepare new delete map");
+        for id in &ids[DELETE_COUNT..DELETE_COUNT * 2] {
+            let affected = fts_stmt
+                .execute(rusqlite::params!["local", id.to_string()])
+                .expect("new delete");
+            assert_eq!(affected, 1);
+            map_stmt
+                .execute(rusqlite::params!["local", id.to_string()])
+                .expect("new delete map row");
+        }
+    }
+    let new_elapsed = new_start.elapsed();
+
+    let ratio = old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64().max(1e-9);
+    eprintln!(
+        "{DELETE_COUNT} deletes by subject over {ROW_COUNT} rows: \
+         OLD (full scan) = {old_elapsed:?}, NEW (rowid map) = {new_elapsed:?}, ratio = {ratio:.1}x"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+
+    assert!(
+        new_elapsed < old_elapsed,
+        "the rowid-map delete must be faster than the full-scan delete at this scale \
+         (old={old_elapsed:?}, new={new_elapsed:?})"
+    );
 }
 
 #[tokio::test]
@@ -2973,6 +3208,8 @@ fn memory_kind_match_work_is_bounded_by_memory_corpus() {
              )",
         )
         .expect("production-shaped trigram table");
+        conn.execute_batch(&rowid_map_ddl("fts_notes"))
+            .expect("production-shaped rowid map");
 
         conn.execute_batch("BEGIN").expect("begin seed");
         {
