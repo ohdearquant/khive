@@ -922,12 +922,10 @@ async fn refresh_rotated_segment(
             bridge.commit_digest,
             bridge.generation,
             bridge.epoch_baseline,
-            bridge.namespace_set.clone(),
             bridge.index.last_applied_seq().unwrap_or(0),
         )
     });
-    let Some((Some(incumbent_digest), generation, epoch_baseline, namespace_set, incumbent_seq)) =
-        incumbent
+    let Some((Some(incumbent_digest), generation, epoch_baseline, incumbent_seq)) = incumbent
     else {
         return;
     };
@@ -976,8 +974,11 @@ async fn refresh_rotated_segment(
     });
 
     match replacement {
-        Ok(mut bridge) => {
-            bridge.set_namespace_set(namespace_set);
+        Ok(bridge) => {
+            // Do not carry the incumbent's namespace_set onto the rotated
+            // bridge: a peer's checkpoint can cover namespaces this process
+            // never observed. Leave the conservative empty set `load` set,
+            // so recall keeps over-fetching until it repopulates.
             if install_replacing(ann, key, bridge).await {
                 tracing::debug!(
                     model = %key.model,
@@ -3250,6 +3251,53 @@ mod tests {
             .expect("search replacement");
         assert_eq!(hits.first().map(|hit| hit.0), Some(new_id));
         assert_eq!(bridge.generation, 7, "local generation fence is preserved");
+    }
+
+    /// A peer's rotated checkpoint can cover namespaces this process never
+    /// queried. Adopting it must not inherit the incumbent's narrower
+    /// namespace_set — recall's over-fetch decision trusts an empty set as
+    /// "assume non-visible namespaces exist" and a stale narrow set as
+    /// "corpus fully accounted for", so carrying the incumbent's set forward
+    /// would hide eligible memories from namespaces the peer's checkpoint
+    /// added.
+    #[tokio::test]
+    async fn rotation_tick_resets_namespace_set_instead_of_inheriting_incumbent() {
+        const MODEL: &str = "memory-rotation-namespace-reset-test-model";
+        let rt = test_runtime_with_hash_embedder(MODEL, 4);
+        let ann = new_shared();
+        let key = AnnKey::new(MODEL);
+        let dir = ann_segment_dir(&rt, MODEL).expect("file-backed segment directory");
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+
+        tiny_bridge(old_id, 7)
+            .save_atomic(&dir)
+            .expect("persist first generation");
+        let mut incumbent = AnnBridge::load(&dir)
+            .expect("load first mmap generation")
+            .with_generation(7);
+        // Simulate a bridge this process actually built: it only ever
+        // observed namespace "ns-a".
+        incumbent.set_namespace_set(HashSet::from(["ns-a".to_string()]));
+        assert!(install_replacing(&ann, &key, incumbent).await);
+
+        // The peer's rotated checkpoint carries data from a namespace this
+        // process never saw.
+        tiny_bridge(new_id, 7)
+            .save_atomic(&dir)
+            .expect("rotate peer checkpoint covering an unseen namespace");
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        let installed = ann.indexes.read().await;
+        let bridge = installed.get(&key).expect("rotated bridge installed");
+        assert!(
+            bridge.namespace_set.is_empty(),
+            "rotation must not carry the incumbent's namespace_set {:?} onto a peer \
+             checkpoint of unknown namespace coverage; recall requires the conservative \
+             empty set to keep over-fetching for eligible visible memories",
+            bridge.namespace_set
+        );
     }
 
     /// A strictly older generation than the installed entry must never replace it (pre-#750 bug shape).
