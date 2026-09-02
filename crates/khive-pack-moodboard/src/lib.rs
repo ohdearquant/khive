@@ -70,12 +70,18 @@ mod tests {
     #[test]
     fn lattice_provenance_version_matches_all_exact_workspace_pins() {
         let workspace_manifest_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.toml");
-        let Ok(manifest_source) = std::fs::read_to_string(workspace_manifest_path) else {
-            println!(
-                "workspace Cargo.toml not found at {workspace_manifest_path} \
-                 (published crate archive does not carry it); skipping the pin check"
-            );
-            return;
+        let manifest_source = match std::fs::read_to_string(workspace_manifest_path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                println!(
+                    "workspace Cargo.toml not found at {workspace_manifest_path} \
+                     (published crate archive does not carry it); skipping the pin check"
+                );
+                return;
+            }
+            Err(error) => {
+                panic!("workspace Cargo.toml at {workspace_manifest_path} is unreadable: {error}")
+            }
         };
         let manifest: toml::Value = manifest_source
             .parse()
