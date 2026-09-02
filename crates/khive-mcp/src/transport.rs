@@ -24,6 +24,8 @@ mod counted_outstanding_entries {
 
     use super::{HashMap, OutstandingRequest, RequestId};
 
+    // Every method that reaches an element counts it; a traversal method,
+    // should one be added, must count each element it yields.
     #[derive(Default)]
     pub(super) struct OutstandingEntries {
         inner: HashMap<RequestId, OutstandingRequest>,
@@ -461,17 +463,19 @@ mod outstanding_request_tests {
         }
     }
 
-    fn assert_population_independent_work(
+    // Exact counts are the oracle: a counter that stops incrementing reads 0
+    // and a scan reads the population, so neither can pass as keyed work.
+    fn assert_keyed_work(
         operation: &str,
+        expected_touches: usize,
         small_touches: usize,
         large_touches: usize,
     ) {
-        let maximum_large_touches = small_touches.saturating_mul(2).max(1);
         assert!(
-            large_touches <= maximum_large_touches,
-            "{operation} element touches grew with outstanding-request population: \
-             {SMALL_POPULATION} entries required {small_touches}, {LARGE_POPULATION} entries \
-             required {large_touches}; maximum allowed is {maximum_large_touches}"
+            small_touches == expected_touches && large_touches == expected_touches,
+            "{operation} must touch exactly {expected_touches} element(s) at any population: \
+             {SMALL_POPULATION} entries touched {small_touches}, {LARGE_POPULATION} entries \
+             touched {large_touches}"
         );
     }
 
@@ -480,13 +484,16 @@ mod outstanding_request_tests {
         let small = measure_tracker_work(SMALL_POPULATION);
         let large = measure_tracker_work(LARGE_POPULATION);
 
-        for (operation, small_touches, large_touches) in [
-            ("contains", small.contains, large.contains),
-            ("admit", small.admit, large.admit),
-            ("retire", small.retire, large.retire),
-            ("non-stale sweep", small.sweep, large.sweep),
+        // contains: one lookup. admit: the duplicate check, the newest link
+        // update, the insert. retire (middle): the removal plus both neighbour
+        // links. sweep with nothing stale: one look at the oldest entry.
+        for (operation, expected_touches, small_touches, large_touches) in [
+            ("contains", 1, small.contains, large.contains),
+            ("admit", 3, small.admit, large.admit),
+            ("retire", 3, small.retire, large.retire),
+            ("non-stale sweep", 1, small.sweep, large.sweep),
         ] {
-            assert_population_independent_work(operation, small_touches, large_touches);
+            assert_keyed_work(operation, expected_touches, small_touches, large_touches);
         }
     }
 
