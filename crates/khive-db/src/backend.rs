@@ -802,6 +802,7 @@ impl StorageBackend {
              namespace UNINDEXED, \
              metadata UNINDEXED, \
              updated_at UNINDEXED, \
+             record_kind, \
              tokenize = '{}'\
              )",
             table_key, tokenizer
@@ -1356,6 +1357,7 @@ mod tests {
         let doc = khive_storage::types::TextDocument {
             subject_id: id,
             kind: khive_types::SubstrateKind::Entity,
+            record_kind: None,
             title: Some("Test Title".to_string()),
             body: "This is a searchable document about Rust.".to_string(),
             tags: vec!["rust".to_string()],
@@ -1395,6 +1397,7 @@ mod tests {
         let doc = khive_storage::types::TextDocument {
             subject_id: id,
             kind: khive_types::SubstrateKind::Note,
+            record_kind: None,
             title: None,
             body: "Hello world.".to_string(),
             tags: vec![],
@@ -1534,6 +1537,7 @@ mod tests {
         let doc = TextDocument {
             subject_id: uuid::Uuid::new_v4(),
             kind: SubstrateKind::Entity,
+            record_kind: None,
             title: Some("Title".to_string()),
             body: "Body text.".to_string(),
             tags: vec![],
@@ -1727,6 +1731,7 @@ mod tests {
         let doc = khive_storage::types::TextDocument {
             subject_id: entity_id,
             kind: khive_types::SubstrateKind::Entity,
+            record_kind: None,
             title: Some("Issue1029Repro".to_string()),
             body: "issue 1029 repro body".to_string(),
             tags: vec![],
@@ -1820,6 +1825,7 @@ mod tests {
         let doc = khive_storage::types::TextDocument {
             subject_id: entity_id,
             kind: khive_types::SubstrateKind::Entity,
+            record_kind: None,
             title: Some("Issue1029TwoPools".to_string()),
             body: "issue 1029 two-pool repro body".to_string(),
             tags: vec![],
@@ -1914,6 +1920,7 @@ mod tests {
         let doc = khive_storage::types::TextDocument {
             subject_id: uuid::Uuid::new_v4(),
             kind: khive_types::SubstrateKind::Entity,
+            record_kind: None,
             title: Some("Issue1029Starved".to_string()),
             body: "issue 1029 starvation diagnostic body".to_string(),
             tags: vec![],

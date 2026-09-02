@@ -2389,15 +2389,27 @@ fn coordinator_search_visibility(
 }
 
 /// Preserve the established flat-string payload for ordinary runtime errors,
-/// while carrying every typed safe-retry write failure structurally through
-/// every MCP execution mode. Pool checkout and queue saturation happen before
-/// admission; writer-task BEGIN contention happens after queue acceptance but
-/// before the operation closure runs. None can leave a partial side effect.
+/// while carrying typed write admission and writer-request finality through
+/// every MCP execution mode. Finality is independent of retryability: a proven
+/// rollback makes duplicate effects impossible but retains the source error's
+/// transient policy, while an unverified rollback remains terminal and
+/// ambiguous.
 fn runtime_error_value(error: RuntimeError) -> Value {
     match error {
         RuntimeError::Khive(k) => serde_json::to_value(&k)
             .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
         other => {
+            if let Some(context) = other.writer_task_failure_context() {
+                return json!({
+                    "kind": "storage",
+                    "code": context.stage,
+                    "stage": context.stage,
+                    "message": other.to_string(),
+                    "retryable": context.retryable,
+                    "request_state": context.request_state.to_string(),
+                    "task_terminated": context.task_terminated,
+                });
+            }
             let Some(context) = other.retryable_failure_context() else {
                 return json!(other.to_string());
             };
