@@ -394,7 +394,8 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
         // configured bounded retries exist for — treating them as terminal
         // would abandon a generation on the first blip of a daemon restart.
         StorageError::Pool { .. } | StorageError::Timeout { .. } => RetryDecision::Retry,
-        StorageError::WriterTaskTerminated { request_state } => match request_state {
+        StorageError::WriterTaskRequestFailed { request_state, .. }
+        | StorageError::WriterTaskTerminated { request_state } => match request_state {
             WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack => {
                 RetryDecision::Retry
             }

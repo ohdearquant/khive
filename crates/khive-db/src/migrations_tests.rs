@@ -1035,6 +1035,153 @@ fn v22_upgrades_pre_index_database_for_read_only_open() {
     validate_schema_is_current(&read_only).expect("migrated read-only schema validates");
 }
 
+#[test]
+fn v23_backfills_indexed_record_kinds_and_preserves_unmatched_fts_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pre-record-kind.db");
+
+    {
+        let mut conn = Connection::open(&path).expect("create pre-V23 database");
+        migrate_through(&mut conn, 20);
+        stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+        finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+
+        let v22 = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 22)
+            .expect("V22 migration");
+        let tx = conn.transaction().expect("begin V22 migration");
+        tx.execute_batch(v22.up).expect("apply V22 migration");
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![v22.version, v22.name],
+        )
+        .expect("record V22 migration");
+        tx.commit().expect("commit V22 migration");
+        assert_eq!(read_schema_version(&conn).expect("read V22 ledger"), 22);
+        assert!(!column_exists(&conn, "fts_notes", "record_kind"));
+
+        conn.execute(
+            "INSERT INTO notes \
+             (id, namespace, kind, status, content, created_at, updated_at) \
+             VALUES ('memory-id', 'local', 'memory', 'active', 'common recall token', 1, 1)",
+            [],
+        )
+        .expect("insert memory note");
+        conn.execute(
+            "INSERT INTO notes \
+             (id, namespace, kind, status, content, created_at, updated_at) \
+             VALUES ('message-id', 'local', 'message', 'active', 'common recall token', 1, 1)",
+            [],
+        )
+        .expect("insert message note");
+        conn.execute(
+            "INSERT INTO notes \
+             (id, namespace, kind, status, content, created_at, updated_at, deleted_at) \
+             VALUES ('deleted-memory-id', 'local', 'memory', 'deleted', \
+                     'common recall token', 1, 2, 2)",
+            [],
+        )
+        .expect("insert soft-deleted memory note");
+        conn.execute(
+            "INSERT INTO entities \
+             (id, namespace, kind, name, tags, created_at, updated_at) \
+             VALUES ('concept-id', 'local', 'concept', 'Common concept', '[]', 1, 1)",
+            [],
+        )
+        .expect("insert concept entity");
+
+        let insert_legacy_fts = |table: &str, id: &str, body: &str| {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} \
+                     (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
+                     VALUES (?1, ?2, '', ?3, '[]', 'local', NULL, 1)"
+                ),
+                rusqlite::params![
+                    id,
+                    if table == "fts_notes" {
+                        "note"
+                    } else {
+                        "entity"
+                    },
+                    body
+                ],
+            )
+            .expect("insert legacy FTS row");
+        };
+        insert_legacy_fts("fts_notes", "memory-id", "common recall token");
+        insert_legacy_fts("fts_notes", "message-id", "common recall token");
+        insert_legacy_fts("fts_notes", "deleted-memory-id", "common recall token");
+        insert_legacy_fts("fts_notes", "stale-id", "common recall token");
+        insert_legacy_fts("fts_entities", "concept-id", "common concept token");
+
+        assert_eq!(
+            run_migrations(&mut conn).expect("apply V23 record-kind migration"),
+            23
+        );
+        assert!(column_exists(&conn, "fts_notes", "record_kind"));
+        assert!(column_exists(&conn, "fts_entities", "record_kind"));
+
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_notes'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rebuilt FTS DDL");
+        assert!(table_sql.contains("record_kind"), "{table_sql}");
+        assert!(
+            !table_sql.contains("record_kind UNINDEXED"),
+            "record_kind must participate in the FTS index: {table_sql}"
+        );
+
+        let rows = conn
+            .prepare(
+                "SELECT subject_id, record_kind FROM fts_notes \
+                 ORDER BY subject_id",
+            )
+            .expect("prepare backfill read")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query backfilled rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect backfilled rows");
+        assert_eq!(
+            rows,
+            vec![
+                ("deleted-memory-id".to_string(), String::new()),
+                ("memory-id".to_string(), "memory".to_string()),
+                ("message-id".to_string(), "message".to_string()),
+                ("stale-id".to_string(), String::new()),
+            ],
+            "V23 must preserve every prior FTS row while classifying live records"
+        );
+        let memory_matches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_notes \
+                 WHERE fts_notes MATCH 'record_kind : \"memory\" AND common'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query indexed memory classifier");
+        assert_eq!(memory_matches, 1);
+        let entity_kind: String = conn
+            .query_row(
+                "SELECT record_kind FROM fts_entities WHERE subject_id = 'concept-id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read entity classifier");
+        assert_eq!(entity_kind, "concept");
+    }
+
+    let read_only = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open V23 database read-only");
+    validate_schema_is_current(&read_only).expect("V23 read-only schema validates");
+}
+
 // ── V5: external_id unique index tests ──────────────────────────────────────
 
 fn index_exists(conn: &Connection, name: &str) -> bool {
