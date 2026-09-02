@@ -1117,8 +1117,8 @@ fn v23_backfills_indexed_record_kinds_and_preserves_unmatched_fts_rows() {
         insert_legacy_fts("fts_entities", "concept-id", "common concept token");
 
         assert_eq!(
-            run_migrations(&mut conn).expect("apply V23 record-kind migration"),
-            23
+            run_migrations(&mut conn).expect("apply V23 record-kind migration and later"),
+            24
         );
         assert!(column_exists(&conn, "fts_notes", "record_kind"));
         assert!(column_exists(&conn, "fts_entities", "record_kind"));
