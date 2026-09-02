@@ -63,6 +63,45 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
         self.assertEqual(permissions, {"contents: write", "pull-requests: write"})
 
 
+class WasmtimeParityWorkflowTests(unittest.TestCase):
+    def test_pinned_runtime_is_cached_retried_and_verified(self):
+        workflow = workflow_text("ci.yml")
+        job = indented_block(workflow, "wasm-parity", 2)
+
+        self.assertIn("WASMTIME_VERSION: v46.0.1", job)
+        self.assertIn("uses: actions/cache@v4", job)
+        self.assertIn("id: cache-wasmtime", job)
+        self.assertIn("path: ~/.wasmtime", job)
+        self.assertIn(
+            "key: wasmtime-${{ runner.os }}-${{ runner.arch }}-"
+            "${{ env.WASMTIME_VERSION }}",
+            job,
+        )
+        self.assertIn(
+            "if: steps.cache-wasmtime.outputs.cache-hit != 'true'", job
+        )
+        self.assertIn("set -euo pipefail", job)
+        self.assertIn("--retry 5", job)
+        self.assertIn("--retry-all-errors", job)
+        self.assertIn("releases/download/${WASMTIME_VERSION}", job)
+        self.assertNotIn("wasmtime.dev/install.sh", job)
+        self.assertIn('case "$RUNNER_ARCH" in', job)
+        self.assertIn('X64) wasmtime_arch="x86_64" ;;', job)
+        self.assertIn('ARM64) wasmtime_arch="aarch64" ;;', job)
+        self.assertNotIn("x86_64-linux.tar.xz", job)
+
+        verify_start = job.index("- name: Verify wasmtime version")
+        verify_step = job[verify_start : job.index("- name:", verify_start + 1)]
+        self.assertNotIn("if:", verify_step)
+        self.assertIn('expected_version="${WASMTIME_VERSION#v}"', verify_step)
+        self.assertIn('actual_version="${actual_version%% *}"', verify_step)
+        self.assertIn(
+            'if [[ "$actual_version" != "$expected_version" ]]; then', verify_step
+        )
+        self.assertNotIn('"wasmtime ${expected_version}"*', verify_step)
+        self.assertIn('echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"', verify_step)
+
+
 class BenchTrackWorkflowTests(unittest.TestCase):
     def test_component_runner_limits_quick_flag_to_bench_targets(self):
         workflow = workflow_text("bench-component.yml")
