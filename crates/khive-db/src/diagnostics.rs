@@ -440,6 +440,68 @@ pub fn wal_pin_attribution(_db_path: &Path, _sweep_interval: Duration) -> WalPin
     WalPinAttribution::unavailable("WAL-pin attribution requires a Unix platform")
 }
 
+/// One typed snapshot of reader route, saturation, and hold-lifecycle signals.
+///
+/// Every field is pool-scoped. Monotonic counters reset only when the
+/// [`ConnectionPool`] is reconstructed; the active value is point-in-time.
+/// Infrastructure standalone opens are kept separate from request traffic so
+/// a boot/schema probe cannot make a hot path look like it churned readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ReaderContentionDiagnostics {
+    /// Configured total reader admission budget shared by pooled readers and
+    /// explicit raw-SQL read transactions.
+    pub reader_admission_capacity: usize,
+    /// Point-in-time permits not held when this snapshot was captured.
+    pub available_reader_admission_slots: usize,
+    /// Successful request-path acquisitions (pooled plus enumerated
+    /// standalone request exceptions; infrastructure excluded).
+    pub reader_acquisitions: u64,
+    /// Successful bounded pooled-reader checkouts.
+    pub pooled_reader_checkouts: u64,
+    /// Successful request-path standalone reader opens. Under ADR-165 Slice
+    /// 2 this is limited to the explicit raw-SQL read-transaction exception.
+    pub standalone_reader_opens: u64,
+    /// Successful standalone opens owned by an enumerated boot/diagnostic
+    /// infrastructure exception.
+    pub infrastructure_standalone_reader_opens: u64,
+    /// Pool-wide reader-admission waits that exhausted `checkout_timeout`
+    /// before work began. Cooperative request cancellation is excluded.
+    pub reader_checkout_timeouts: u64,
+    /// Pooled reader guards live when the snapshot was captured.
+    pub active_pooled_reader_checkouts: u64,
+    /// Highest observed concurrent pooled-reader guard count.
+    pub peak_active_pooled_reader_checkouts: u64,
+    /// Pooled guards that completed return/reset.
+    pub completed_pooled_reader_checkouts: u64,
+    /// Longest completed hold, including return/reset, in microseconds.
+    pub max_completed_reader_hold_micros: u64,
+    /// A disqualified pooled-reader return whose replacement connection then
+    /// also failed to open, permanently shrinking the physical pool by one
+    /// slot below `max_readers`. Non-zero here means the pool has fewer
+    /// physical reader connections than configured.
+    pub reader_replacement_open_failures: u64,
+}
+
+impl ReaderContentionDiagnostics {
+    fn snapshot(pool: &ConnectionPool) -> Self {
+        let reader = pool.reader_acquisition_snapshot();
+        Self {
+            reader_admission_capacity: reader.reader_admission_capacity,
+            available_reader_admission_slots: reader.available_reader_admission_slots,
+            reader_acquisitions: reader.acquisitions,
+            pooled_reader_checkouts: reader.pooled_checkouts,
+            standalone_reader_opens: reader.standalone_opens,
+            infrastructure_standalone_reader_opens: reader.infrastructure_standalone_opens,
+            reader_checkout_timeouts: reader.checkout_timeouts,
+            active_pooled_reader_checkouts: reader.active_pooled_checkouts,
+            peak_active_pooled_reader_checkouts: reader.peak_active_pooled_checkouts,
+            completed_pooled_reader_checkouts: reader.completed_pooled_checkouts,
+            max_completed_reader_hold_micros: reader.max_completed_hold_micros,
+            reader_replacement_open_failures: reader.reader_replacement_open_failures,
+        }
+    }
+}
+
 /// One typed snapshot of writer-contention signals.
 ///
 /// `writer_acquisitions` is the aggregate of the three explicit connection
@@ -664,7 +726,8 @@ fn graph_edge_integrity(conn: &Connection) -> rusqlite::Result<GraphEdgeIntegrit
     )
 }
 
-/// The full database-integrity, writer-contention, and WAL/checkpoint payload.
+/// The full database-integrity, reader/writer-contention, and WAL/checkpoint
+/// payload.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DbDiagnostics {
     pub build: BuildIdentity,
@@ -675,6 +738,8 @@ pub struct DbDiagnostics {
     pub checkpoint_counters: CheckpointCounters,
     pub checkpoint_probe: Option<CheckpointProbe>,
     pub checkpoint_probe_error: Option<String>,
+    /// Reader route, checkout saturation, and hold-lifecycle signals.
+    pub reader_contention: ReaderContentionDiagnostics,
     /// Writer-pool and best-effort audit persistence signals.
     pub writer_contention: WriterContentionDiagnostics,
     pub graph_edge_integrity: Option<GraphEdgeIntegrity>,
@@ -761,6 +826,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
 ) -> StorageResult<DbDiagnostics> {
     crate::ensure_request_read_active("db_diagnostics")?;
     let counters = checkpoint_counters();
+    let reader_contention = ReaderContentionDiagnostics::snapshot(&pool);
     let writer_contention = WriterContentionDiagnostics::snapshot(
         &pool,
         Some(audit_append_failures),
@@ -778,6 +844,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
             checkpoint_probe_error: Some(
                 "in-memory database: no WAL file and no checkpoint to probe".to_string(),
             ),
+            reader_contention,
             writer_contention,
             graph_edge_integrity: None,
             graph_edge_integrity_error: Some(
@@ -808,6 +875,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
         checkpoint_probe_error: inspection.checkpoint_probe_error,
+        reader_contention,
         writer_contention,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
@@ -823,6 +891,7 @@ fn collect_inner(
     runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
 ) -> DbDiagnostics {
     let counters = checkpoint_counters();
+    let reader_contention = ReaderContentionDiagnostics::snapshot(pool);
     let writer_contention = WriterContentionDiagnostics::snapshot(
         pool,
         audit_append_failures,
@@ -839,6 +908,7 @@ fn collect_inner(
             checkpoint_probe_error: Some(
                 "in-memory database: no WAL file and no checkpoint to probe".to_string(),
             ),
+            reader_contention,
             writer_contention,
             graph_edge_integrity: None,
             graph_edge_integrity_error: Some(
@@ -859,6 +929,7 @@ fn collect_inner(
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
         checkpoint_probe_error: inspection.checkpoint_probe_error,
+        reader_contention,
         writer_contention,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
@@ -1361,6 +1432,7 @@ mod tests {
     fn collect_on_a_file_backed_db_carries_build_identity_and_every_counter() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (pool, _path) = seeded_pool(&dir);
+        let reader_admission_capacity = pool.max_readers().max(1);
 
         let report = collect(
             &pool,
@@ -1411,6 +1483,24 @@ mod tests {
         assert_eq!(report.writer_contention.writer_task_acquisitions, 0);
         assert_eq!(report.writer_contention.writer_acquisition_timeouts, 0);
         assert_eq!(
+            report.reader_contention,
+            ReaderContentionDiagnostics {
+                reader_admission_capacity,
+                available_reader_admission_slots: reader_admission_capacity,
+                reader_acquisitions: 0,
+                pooled_reader_checkouts: 0,
+                standalone_reader_opens: 0,
+                infrastructure_standalone_reader_opens: 0,
+                reader_checkout_timeouts: 0,
+                active_pooled_reader_checkouts: 0,
+                peak_active_pooled_reader_checkouts: 0,
+                completed_pooled_reader_checkouts: 0,
+                max_completed_reader_hold_micros: 0,
+                reader_replacement_open_failures: 0,
+            },
+            "the diagnostics probe itself must not masquerade as request reader traffic"
+        );
+        assert_eq!(
             report.graph_edge_integrity,
             Some(GraphEdgeIntegrity {
                 duplicate_edge_id_groups: 0,
@@ -1427,6 +1517,56 @@ mod tests {
                 .audit_append_failures_unavailable_reason
                 .is_some(),
             "a direct khive-db snapshot must not fabricate a runtime audit count"
+        );
+    }
+
+    #[test]
+    fn diagnostics_exposes_reader_saturation_and_completed_hold_evidence() {
+        let pool = ConnectionPool::new(PoolConfig {
+            checkout_timeout: Duration::from_millis(2),
+            ..PoolConfig::default()
+        })
+        .expect("in-memory pool");
+        let held = pool.reader().expect("first reader checkout");
+        assert!(
+            pool.reader().is_err(),
+            "the live checkout must exhaust the one-slot degraded reader budget"
+        );
+        drop(held);
+
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("9.9.9", None),
+            Duration::from_secs(30),
+        );
+        let reader = report.reader_contention;
+        assert_eq!(reader.reader_admission_capacity, 1);
+        assert_eq!(reader.available_reader_admission_slots, 1);
+        assert_eq!(reader.reader_acquisitions, 1);
+        assert_eq!(reader.pooled_reader_checkouts, 1);
+        assert_eq!(reader.standalone_reader_opens, 0);
+        assert_eq!(reader.infrastructure_standalone_reader_opens, 0);
+        assert_eq!(reader.reader_checkout_timeouts, 1);
+        assert_eq!(reader.active_pooled_reader_checkouts, 0);
+        assert_eq!(reader.peak_active_pooled_reader_checkouts, 1);
+        assert_eq!(reader.completed_pooled_reader_checkouts, 1);
+        assert!(reader.max_completed_reader_hold_micros > 0);
+
+        let json = serde_json::to_value(&report).expect("report serializes");
+        assert_eq!(
+            json.pointer("/reader_contention/reader_admission_capacity"),
+            Some(&serde_json::json!(1)),
+            "the operator wire payload must expose the reader admission budget"
+        );
+        assert_eq!(
+            json.pointer("/reader_contention/reader_checkout_timeouts"),
+            Some(&serde_json::json!(1)),
+            "the operator wire payload must expose the reader timeout phase"
+        );
+        assert!(
+            json.pointer("/reader_contention/max_completed_reader_hold_micros")
+                .is_some(),
+            "the operator wire payload must expose completed hold-time evidence"
         );
     }
 

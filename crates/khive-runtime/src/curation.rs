@@ -996,7 +996,11 @@ impl KhiveRuntime {
             crate::retrieval::EmbeddingTruncationReport::default()
         };
 
-        let event_store = self.events(token)?;
+        let event_token =
+            token.with_namespace(crate::Namespace::parse(&entity.namespace).map_err(|error| {
+                RuntimeError::Internal(format!("entity namespace invalid: {error}"))
+            })?);
+        let event_store = self.events(&event_token)?;
         let event = khive_storage::event::Event::new(
             entity.namespace.clone(),
             "update",
@@ -1251,7 +1255,11 @@ impl KhiveRuntime {
 
         // Dry-run is a read-only preview: it must not append a merge event.
         if !dry_run {
-            let event_store = self.events(token)?;
+            let event_token =
+                token.with_namespace(crate::Namespace::parse(&updated_entity.namespace).map_err(
+                    |error| RuntimeError::Internal(format!("entity namespace invalid: {error}")),
+                )?);
+            let event_store = self.events(&event_token)?;
             // Mirror the wire-level strategy spelling from MergeParams so consumers
             // can round-trip the policy string back into a request.
             let policy_str = match strategy {
@@ -2116,7 +2124,11 @@ impl KhiveRuntime {
 
         // Dry-run is a read-only preview: it must not append a merge event.
         if !dry_run {
-            let event_store = self.events(token)?;
+            let event_token =
+                token.with_namespace(crate::Namespace::parse(&updated_note.namespace).map_err(
+                    |error| RuntimeError::Internal(format!("note namespace invalid: {error}")),
+                )?);
+            let event_store = self.events(&event_token)?;
             // Mirror the wire-level strategy spelling from MergeParams so consumers
             // can round-trip the policy string back into a request.
             let policy_str = match strategy {
