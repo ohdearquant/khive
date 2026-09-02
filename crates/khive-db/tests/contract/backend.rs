@@ -308,6 +308,7 @@ async fn test_text_search(backend: &StorageBackend) {
     let doc = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Entity,
+        record_kind: None,
         title: Some("Rust Programming".to_string()),
         body: "The Rust language provides memory safety without GC.".to_string(),
         tags: vec!["rust".to_string()],
