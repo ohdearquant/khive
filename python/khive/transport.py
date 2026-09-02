@@ -168,6 +168,20 @@ def _parse_envelope(response: Any) -> dict[str, Any]:
     return payload
 
 
+def _is_minimal_aborted_entry(entry: Any) -> bool:
+    """Whether `entry` is the cloud's minimal aborted-chain-entry shape:
+    `{"ok": false, "aborted": true}`, with no `tool` — an op that was never
+    dispatched because an earlier op in the same chain failed. `OpResult`
+    requires `tool`, so this shape needs its own admission rule rather than
+    going through `OpResult.model_validate` like an ordinary entry."""
+    return (
+        isinstance(entry, dict)
+        and entry.get("ok") is False
+        and entry.get("aborted") is True
+        and "tool" not in entry
+    )
+
+
 def _validate_envelope_results(envelope: dict[str, Any], url: str) -> dict[str, Any]:
     """Reject an envelope whose result entries do not match `OpResult`.
 
@@ -176,8 +190,18 @@ def _validate_envelope_results(envelope: dict[str, Any], url: str) -> dict[str, 
     `{"code","message"}` object — a top-level-only check would otherwise let
     e.g. `{"results": [42]}` or an entry missing `ok`/`tool` reach the caller
     as a successful response.
+
+    A minimal aborted entry (see `_is_minimal_aborted_entry`) is admitted
+    without going through `OpResult`, but normalized in place to carry
+    `tool: ""` first — `models.py` stays untouched, so this is the seam that
+    keeps every entry (aborted or not) satisfying `OpResult.tool: str`
+    exactly as the socket transport's daemon-native aborted entries already
+    do, giving both transports the same caller-visible object.
     """
     for index, entry in enumerate(envelope["results"]):
+        if _is_minimal_aborted_entry(entry):
+            entry["tool"] = ""
+            continue
         try:
             OpResult.model_validate(entry)
         except ValidationError as exc:
@@ -187,21 +211,37 @@ def _validate_envelope_results(envelope: dict[str, Any], url: str) -> dict[str, 
     return envelope
 
 
-def _stringify_op_errors(envelope: Any) -> Any:
+def _stringify_op_errors(envelope: Any, url: str) -> Any:
     """Flatten khive-cloud's `{"code","message"}` per-op error objects to a
     string, in place, so each entry still validates against
     `OpResult.error: str | None` (`client.py` is unmodified — this is the
-    wire-adapter's job, same as `client._edge_from_wire`)."""
+    wire-adapter's job, same as `client._edge_from_wire`).
+
+    Validates the error object's shape first: `code`, when present, and
+    `message` must both be strings — anything else is a malformed cloud
+    entry, not a value to flatten and pass along.
+    """
     if not isinstance(envelope, dict):
         return envelope
-    for entry in envelope.get("results", []):
+    for index, entry in enumerate(envelope.get("results", [])):
         if not isinstance(entry, dict):
             continue
         err = entry.get("error")
-        if isinstance(err, dict):
-            code = err.get("code")
-            message = err.get("message", str(err))
-            entry["error"] = f"{code}: {message}" if code else str(message)
+        if not isinstance(err, dict):
+            continue
+        code = err.get("code")
+        if code is not None and not isinstance(code, str):
+            raise TransportError(
+                f"response from {url} has a malformed error object at index {index}: "
+                f"'code' must be a string, got {type(code).__name__}"
+            )
+        message = err.get("message")
+        if not isinstance(message, str):
+            raise TransportError(
+                f"response from {url} has a malformed error object at index {index}: "
+                f"'message' must be a string, got {type(message).__name__}"
+            )
+        entry["error"] = f"{code}: {message}" if code else message
     return envelope
 
 
@@ -287,7 +327,7 @@ class HttpTransport(Transport):
         except httpx.HTTPError as exc:
             raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
         raise_for_status(response.status_code, response.text, str(response.url))
-        envelope = _stringify_op_errors(_parse_envelope(response))
+        envelope = _stringify_op_errors(_parse_envelope(response), str(response.url))
         _validate_envelope_results(envelope, str(response.url))
         return {"ok": True, "result": envelope}
 
@@ -359,7 +399,7 @@ class AsyncHttpTransport:
         except httpx.HTTPError as exc:
             raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
         raise_for_status(response.status_code, response.text, str(response.url))
-        envelope = _stringify_op_errors(_parse_envelope(response))
+        envelope = _stringify_op_errors(_parse_envelope(response), str(response.url))
         _validate_envelope_results(envelope, str(response.url))
         return {"ok": True, "result": envelope}
 

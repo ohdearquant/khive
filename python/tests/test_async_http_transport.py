@@ -154,6 +154,54 @@ def test_non_dict_result_entry_raises_transport_error():
     _run(_inner())
 
 
+def test_chained_abort_returns_minimal_entry(rest_server, api_key):
+    async def _inner():
+        transport = AsyncHttpTransport(rest_server.url, api_key)
+        try:
+            response = await transport.round_trip(
+                {"ops": json.dumps("[nope() | stats()]")}, timeout=5.0
+            )
+        finally:
+            await transport.aclose()
+        return response["result"]["results"]
+
+    results = _run(_inner())
+    assert results[0]["ok"] is False and results[0]["tool"] == "nope"
+    assert results[1] == {"ok": False, "aborted": True, "tool": ""}
+
+
+def test_malformed_error_object_bad_code_type_raises_transport_error():
+    async def _inner():
+        body = json.dumps(
+            {"results": [{"ok": False, "tool": "x", "error": {"code": [], "message": {}}}]}
+        ).encode()
+        with _malformed_server(body) as url:
+            transport = AsyncHttpTransport(url, "key")
+            try:
+                with pytest.raises(TransportError):
+                    await transport.round_trip({"ops": encode([op("x")])}, timeout=5.0)
+            finally:
+                await transport.aclose()
+
+    _run(_inner())
+
+
+def test_malformed_error_object_missing_message_raises_transport_error():
+    async def _inner():
+        body = json.dumps(
+            {"results": [{"ok": False, "tool": "x", "error": {"code": "boom"}}]}
+        ).encode()
+        with _malformed_server(body) as url:
+            transport = AsyncHttpTransport(url, "key")
+            try:
+                with pytest.raises(TransportError):
+                    await transport.round_trip({"ops": encode([op("x")])}, timeout=5.0)
+            finally:
+                await transport.aclose()
+
+    _run(_inner())
+
+
 def test_non_json_2xx_body_raises_transport_error():
     async def _inner():
         with _malformed_server(b"not json at all") as url:

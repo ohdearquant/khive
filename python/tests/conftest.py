@@ -8,13 +8,14 @@ database, socket, and pid file, all pointed at via `KHIVE_SOCKET` /
 The `rest_server`/`mcp_server` fixtures below fake khive-cloud's two
 transports offline: a real REST endpoint over `http.server`, and a real MCP
 `request` tool over a streamable-HTTP `uvicorn` server — both gated by the
-same `Authorization: ApiKey <key>` scheme as the live deployment, and both
-dispatching through `_dispatch_ops`, which enforces the real `ops` wire
-contract (one request DSL string — see `_dsl_fake.py`) rather than accepting
-whatever a not-yet-fixed client happens to send. Neither import their
-optional dependency (`uvicorn`, `mcp`'s `FastMCP`) at module scope, so
-collecting this file never requires the `cloud` extra; only actually
-requesting `mcp_server` does.
+same `Authorization: ApiKey <key>` scheme as the live deployment, on every
+route including the health check, and both dispatching through
+`_dispatch_ops`, which enforces the real `ops` wire contract (one request
+DSL string — see `_dsl_fake.py`) rather than accepting whatever a submitted
+renderer happens to send. Neither import their optional dependency
+(`uvicorn`, `mcp`'s `FastMCP`) at module scope, so collecting this file
+never requires the `cloud` extra; only actually requesting `mcp_server`
+does.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from typing import Any
 
 import pytest
 
-from _dsl_fake import DslParseError, parse_dsl
+from _dsl_fake import DslParseError, parse_dsl_with_mode
 
 API_KEY = "test-key-123"
 
@@ -46,13 +47,15 @@ def _dispatch_ops(ops: Any) -> tuple[int, dict[str, Any]]:
 
     `ops` must be one request DSL string (`verb(k=v, ...)`, or a
     `[op1, op2]` batch) — the real contract, measured against a live
-    deployment: a non-string `ops` 422s, and the client's OLD internal
+    deployment: a non-string `ops` 422s, and the client's old internal
     JSON ops-array form (`[{"tool": ..., "args": {...}}]`) 400s with
     `unknown verb: Missing 'verb' field in JSON` rather than being silently
     accepted. Answers a handful of well-known verb names; `rate_limited`/
     `boom` simulate whole-request HTTP failures (429/500) rather than a
     per-op error, since those are transport-level, not dispatch-level, on
-    the real server.
+    the real server. In a chain, an earlier failure aborts the rest of the
+    chain: the measured wire marks each unattempted op `{"ok": false,
+    "aborted": true}`, with no `tool` field.
     """
     if not isinstance(ops, str):
         kind = "sequence" if isinstance(ops, list) else type(ops).__name__
@@ -68,13 +71,17 @@ def _dispatch_ops(ops: Any) -> tuple[int, dict[str, Any]]:
     ):
         return 400, {"error": "unknown verb: Missing 'verb' field in JSON"}
     try:
-        calls = parse_dsl(ops)
+        calls, mode = parse_dsl_with_mode(ops)
     except DslParseError as exc:
         return 400, {"error": f"unparseable ops: {exc}"}
     if not calls:
         return 400, {"error": f"unparseable ops: {ops!r}"}
     results: list[dict[str, Any]] = []
+    abort_rest = False
     for tool, _args in calls:
+        if abort_rest:
+            results.append({"ok": False, "aborted": True})
+            continue
         if tool == "stats":
             results.append(
                 {"ok": True, "tool": "stats", "result": {"entities": 1, "edges": 0, "notes": 0}}
@@ -91,8 +98,10 @@ def _dispatch_ops(ops: Any) -> tuple[int, dict[str, Any]]:
                     "error": {"code": "verb_not_found", "message": "unknown verb 'nope'"},
                 }
             )
+            if mode == "chain":
+                abort_rest = True
         elif tool == "later":
-            results.append({"ok": False, "tool": "later", "aborted": True})
+            results.append({"ok": False, "aborted": True})
         elif tool == "rate_limited":
             return 429, {"error": "rate limit exceeded"}
         elif tool == "boom":
@@ -105,6 +114,8 @@ def _dispatch_ops(ops: Any) -> tuple[int, dict[str, Any]]:
                     "error": {"code": "verb_not_found", "message": f"unknown verb {tool!r}"},
                 }
             )
+            if mode == "chain":
+                abort_rest = True
     succeeded = sum(1 for r in results if r.get("ok"))
     failed = sum(1 for r in results if not r.get("ok") and not r.get("aborted"))
     aborted = sum(1 for r in results if r.get("aborted"))
@@ -139,6 +150,9 @@ class _RestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
+            if not self._authorized():
+                self._send_json(401, {"error": "unauthorized"})
+                return
             self._send_json(200, {"status": "ok"})
             return
         self._send_json(404, {"error": "not found"})

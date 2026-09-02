@@ -23,6 +23,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from .errors import AuthError, KhiveError
+from .transport import _check_base_url_security
 
 _TRANSPORT_LOGGER = "mcp.client.streamable_http"
 
@@ -80,16 +81,26 @@ def _as_khive_error(exc: Exception, url: str) -> KhiveError:
 
 
 @asynccontextmanager
-async def mcp_session(base_url: str, api_key: str) -> AsyncIterator[Any]:
+async def mcp_session(
+    base_url: str, api_key: str, *, allow_insecure: bool = False
+) -> AsyncIterator[Any]:
     """Async context manager yielding an initialized `mcp.ClientSession`.
 
     Usage: ``async with mcp_session(url, key) as session: ...``
+
+    By default a plain `http://` base URL is refused unless its host is
+    loopback (`127.0.0.1`, `::1`, `localhost`) — the same guard
+    `HttpTransport` applies, checked here before any client is built, since
+    the `Authorization` header carrying the API key is identical either way.
+    Pass `allow_insecure=True` to talk to a non-loopback host over `http://`
+    anyway.
 
     Exception translation (transport/session failures → `khive` errors) is
     scoped to setup, before the yield: an exception raised inside the
     caller's ``async with`` body propagates unchanged instead of being
     rewritten as a generic `KhiveError` on generator exit.
     """
+    _check_base_url_security(base_url, allow_insecure)
     import httpx
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
@@ -159,10 +170,12 @@ async def mcp_session(base_url: str, api_key: str) -> AsyncIterator[Any]:
         transport_log.removeFilter(termination_filter)
 
 
-async def alist_tool_names(base_url: str, api_key: str) -> list[str]:
+async def alist_tool_names(
+    base_url: str, api_key: str, *, allow_insecure: bool = False
+) -> list[str]:
     """`tools/list`, returning just the tool names."""
     url = base_url.rstrip("/") + "/mcp"
-    async with mcp_session(base_url, api_key) as session:
+    async with mcp_session(base_url, api_key, allow_insecure=allow_insecure) as session:
         try:
             result = await session.list_tools()
         except Exception as exc:
@@ -170,10 +183,12 @@ async def alist_tool_names(base_url: str, api_key: str) -> list[str]:
         return [tool.name for tool in result.tools]
 
 
-async def acall_request(base_url: str, api_key: str, ops: str) -> Any:
+async def acall_request(
+    base_url: str, api_key: str, ops: str, *, allow_insecure: bool = False
+) -> Any:
     """Call the `request` tool with the given ops DSL and parse its JSON reply."""
     url = base_url.rstrip("/") + "/mcp"
-    async with mcp_session(base_url, api_key) as session:
+    async with mcp_session(base_url, api_key, allow_insecure=allow_insecure) as session:
         try:
             result = await session.call_tool("request", {"ops": ops})
         except Exception as exc:
@@ -199,11 +214,13 @@ def _run_sync(make_coro: Any) -> Any:
     )
 
 
-def mcp_list_tools(base_url: str, api_key: str) -> list[str]:
+def mcp_list_tools(base_url: str, api_key: str, *, allow_insecure: bool = False) -> list[str]:
     """Sync convenience over `alist_tool_names` (`asyncio.run` under the hood)."""
-    return _run_sync(lambda: alist_tool_names(base_url, api_key))
+    return _run_sync(lambda: alist_tool_names(base_url, api_key, allow_insecure=allow_insecure))
 
 
-def mcp_request(base_url: str, api_key: str, ops: str) -> Any:
+def mcp_request(base_url: str, api_key: str, ops: str, *, allow_insecure: bool = False) -> Any:
     """Sync convenience over `acall_request` (`asyncio.run` under the hood)."""
-    return _run_sync(lambda: acall_request(base_url, api_key, ops))
+    return _run_sync(
+        lambda: acall_request(base_url, api_key, ops, allow_insecure=allow_insecure)
+    )

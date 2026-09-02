@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from contextlib import contextmanager
@@ -229,6 +230,56 @@ def test_send_dsl_with_delimiters_sent_verbatim(rest_server, api_key):
         "tool": "search",
         "result": {"items": []},
     }
+
+
+def test_chained_abort_returns_minimal_entry(db: Khive):
+    results = db.raw("[nope() | stats()]")
+    assert [(r.ok, r.tool) for r in results] == [(False, "nope"), (False, "")]
+    assert results[1].result is None
+    assert results[1].error is None
+    assert results[1].model_extra.get("aborted") is True
+
+
+def test_chained_abort_same_object_sync_and_async(rest_server, api_key):
+    """A chain whose second op aborts produces the identical caller-visible
+    aborted entry whether it is dispatched through the sync or the async
+    HTTP transport — both funnel through the same `_validate_envelope_results`
+    normalization."""
+    dsl = "[nope() | stats()]"
+
+    async def _async_side():
+        from khive import AsyncHttpTransport
+
+        transport = AsyncHttpTransport(rest_server.url, api_key)
+        try:
+            response = await transport.round_trip({"ops": json.dumps(dsl)}, timeout=5.0)
+        finally:
+            await transport.aclose()
+        return response["result"]["results"][1]
+
+    sync_transport = HttpTransport(rest_server.url, api_key)
+    sync_entry = sync_transport.send_dsl(dsl, timeout=5.0)["result"]["results"][1]
+    async_entry = asyncio.run(_async_side())
+
+    assert sync_entry == async_entry == {"ok": False, "aborted": True, "tool": ""}
+
+
+def test_malformed_error_object_bad_code_type_raises_transport_error():
+    body = json.dumps(
+        {"results": [{"ok": False, "tool": "x", "error": {"code": [], "message": {}}}]}
+    ).encode()
+    with _malformed_server(body) as url:
+        handle = Khive(transport=HttpTransport(url, "key"))
+        with pytest.raises(TransportError):
+            handle.raw([op("x")])
+
+
+def test_malformed_error_object_missing_message_raises_transport_error():
+    body = json.dumps({"results": [{"ok": False, "tool": "x", "error": {"code": "boom"}}]}).encode()
+    with _malformed_server(body) as url:
+        handle = Khive(transport=HttpTransport(url, "key"))
+        with pytest.raises(TransportError):
+            handle.raw([op("x")])
 
 
 def test_non_loopback_http_base_url_refused():

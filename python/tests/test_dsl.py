@@ -12,7 +12,7 @@ from khive.dsl import render_dsl
 from khive.errors import TransportError
 from khive.ops import op
 
-from _dsl_fake import parse_dsl
+from _dsl_fake import DslParseError, PrevRef, parse_dsl
 
 
 def test_bare_string():
@@ -53,7 +53,11 @@ def test_two_op_batch():
 
 
 def test_chained_pair():
-    assert render_dsl([op("stats"), op("whoami")], chained=True) == "[stats() | whoami()]"
+    assert render_dsl([op("stats"), op("whoami")], chained=True) == "stats() | whoami()"
+
+
+def test_single_op_chained_renders_bare():
+    assert render_dsl([op("stats")], chained=True) == "stats()"
 
 
 def test_control_character_raises_transport_error():
@@ -107,6 +111,19 @@ def test_dsl_string_elements_render_verbatim_beside_dicts():
         ("whoami", {}),
         ("search", {"query": "x"}),
     ]
+
+
+def test_mixed_dsl_string_and_op_dict_pack_verb_accepted():
+    rendered = render_dsl(["whoami()", op("blob.put", bytes="x")])
+    assert rendered == '[whoami(), blob.put(bytes="x")]'
+    assert parse_dsl(rendered) == [("whoami", {}), ("blob.put", {"bytes": "x"})]
+
+
+def test_mixed_dsl_string_and_op_dict_double_nested_verb_rejected():
+    rendered = render_dsl(["whoami()", 'a.b.c(x="1")'])
+    assert rendered == '[whoami(), a.b.c(x="1")]'
+    with pytest.raises(DslParseError):
+        parse_dsl(rendered)
 
 
 def test_entry_without_tool_name_raises_transport_error():
@@ -171,3 +188,60 @@ def test_round_trip_additional_value_shapes(args):
     [(verb, parsed_args)] = parse_dsl(rendered)
     assert verb == "verb"
     assert parsed_args == args
+
+
+@pytest.mark.parametrize(
+    "prev_like",
+    [
+        "$prev",
+        "$prev.id",
+        "$prev.a.b.c",
+        "$prev[0]",
+        "$prev[0].id",
+        "$prev.not_actually_a_reference_just_starts_this_way",
+    ],
+)
+def test_prev_shaped_literal_round_trips_top_level(prev_like):
+    """A caller's own string that merely starts like a `$prev` reference
+    renders as an escaped literal and decodes back to the exact original
+    text — never as a chain reference — at the argument's own top level."""
+    rendered = render_dsl([op("verb", query=prev_like)])
+    [(verb, parsed_args)] = parse_dsl(rendered)
+    assert verb == "verb"
+    assert parsed_args == {"query": prev_like}
+
+
+@pytest.mark.parametrize(
+    "prev_like",
+    [
+        "$prev",
+        "$prev.id",
+        "$prev[0]",
+    ],
+)
+def test_prev_shaped_literal_round_trips_nested(prev_like):
+    """The same escape applies at any depth of an array or object argument."""
+    rendered = render_dsl(
+        [op("verb", tags=[prev_like], properties={"note": prev_like})]
+    )
+    [(verb, parsed_args)] = parse_dsl(rendered)
+    assert verb == "verb"
+    assert parsed_args == {"tags": [prev_like], "properties": {"note": prev_like}}
+
+
+def test_intentional_prev_reference_in_a_chain_still_parses_as_a_reference():
+    """Control for the two tests above: a caller who deliberately writes a
+    `$prev` reference as raw DSL text inside a chain must still get a
+    reference back, not a literal — the escape only applies to values
+    `render_dsl` itself renders from Python values, never to DSL text a
+    caller already holds."""
+    [(_get_verb, _get_args), (verb, args)] = parse_dsl('[get(id="x") | update(id=$prev.id)]')
+    assert verb == "update"
+    assert args == {"id": PrevRef("id")}
+
+
+def test_prev_reference_outside_a_chain_is_rejected():
+    with pytest.raises(DslParseError):
+        parse_dsl('update(id=$prev.id)')
+    with pytest.raises(DslParseError):
+        parse_dsl('[update(id=$prev.id), other()]')

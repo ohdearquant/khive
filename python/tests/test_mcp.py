@@ -16,6 +16,7 @@ from khive.mcp import (
     _TRANSPORT_LOGGER,
     _AcceptedTerminationFilter,
     _as_khive_error,
+    _check_base_url_security,
     mcp_list_tools,
     mcp_request,
     mcp_session,
@@ -36,6 +37,59 @@ def test_mcp_wrong_key_raises_auth_error(mcp_server):
     with pytest.raises(AuthError) as exc_info:
         mcp_request(mcp_server.url, "wrong-key", "stats()")
     assert exc_info.value.status == 401
+
+
+def test_mcp_session_refuses_non_loopback_http_without_allow_insecure(monkeypatch):
+    def _must_not_connect(*args, **kwargs):
+        raise AssertionError("must not construct an httpx client before the URL guard runs")
+
+    monkeypatch.setattr("httpx.AsyncClient", _must_not_connect)
+
+    async def _inner():
+        async with mcp_session("http://example.test", "key"):
+            pass
+
+    with pytest.raises(ValueError, match="http.*example.test"):
+        asyncio.run(_inner())
+
+
+def test_mcp_session_allow_insecure_bypasses_url_guard(monkeypatch):
+    built: list[bool] = []
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            built.append(True)
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr("httpx.AsyncClient", _FakeAsyncClient)
+
+    async def _inner():
+        # The URL guard is bypassed; the fake client has no real transport
+        # underneath, so `streamable_http_client`/`session.initialize()` fail
+        # downstream — that failure proves the guard did not block it.
+        with pytest.raises(Exception):
+            async with mcp_session("http://example.test", "key", allow_insecure=True):
+                pass
+
+    asyncio.run(_inner())
+    assert built, "the client must have been constructed once the guard was bypassed"
+
+
+def test_mcp_session_https_scheme_bypasses_guard_without_allow_insecure():
+    # `_check_base_url_security` exempts every `https://` URL regardless of
+    # host — verified directly, since standing up a real TLS endpoint here
+    # would require network access this suite does not have.
+    _check_base_url_security("https://example.test", False)
+
+
+def test_mcp_session_loopback_http_admitted_without_allow_insecure(mcp_server, api_key):
+    # `mcp_server.url` is `http://127.0.0.1:<port>` and every other MCP test
+    # in this file calls it with `allow_insecure` left at its default
+    # (`False`); this test names that guard behavior explicitly.
+    result = mcp_request(mcp_server.url, api_key, "stats()")
+    assert result["summary"]["succeeded"] == 1
 
 
 def test_mcp_session_context_manager(mcp_server, api_key):
@@ -74,7 +128,7 @@ def test_alist_tool_names_translates_call_time_failure(monkeypatch):
             raise RuntimeError("network blip")
 
     @asynccontextmanager
-    async def _fake_session(base_url, api_key):
+    async def _fake_session(base_url, api_key, *, allow_insecure=False):
         yield _FailingSession()
 
     monkeypatch.setattr(mcp_module, "mcp_session", _fake_session)
@@ -88,7 +142,7 @@ def test_acall_request_translates_call_time_failure(monkeypatch):
             raise RuntimeError("network blip")
 
     @asynccontextmanager
-    async def _fake_session(base_url, api_key):
+    async def _fake_session(base_url, api_key, *, allow_insecure=False):
         yield _FailingSession()
 
     monkeypatch.setattr(mcp_module, "mcp_session", _fake_session)
