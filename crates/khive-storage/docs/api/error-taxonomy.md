@@ -12,7 +12,7 @@ at first write rather than a `tokio::spawn`-outside-runtime panic. Flag-off
 callers never see this variant — `writer_task_handle` only attempts to spawn
 when `PoolConfig::write_queue_enabled` is set.
 
-## `WriterTaskTerminated` and `WriterTaskRequestState`
+## Writer-request finality
 
 `WriterTaskTerminated { request_state }` is the public error returned when a
 single-writer request cannot complete because its writer-task instance has terminated or the
@@ -22,7 +22,7 @@ what the execution seam can prove about the individual request:
 | State                   | Meaning                                                                                                                 |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `NotStarted`            | The request was not accepted, or it was drained from the closed queue without invoking its operation closure            |
-| `TransactionRolledBack` | A transaction-wrapped operation panicked, and the writer task successfully rolled back its enclosing SQLite transaction |
+| `TransactionRolledBack` | The writer successfully rolled back the request's enclosing SQLite transaction; no wrapped database write committed       |
 | `SideEffectsUnknown`    | The operation may have started, and the task cannot prove its final transaction or side-effect state                    |
 
 A top-level operation has no enclosing transaction, so a panic is always
@@ -42,26 +42,35 @@ its rendered `writer task terminated` prefix retain their historical names for w
 compatibility.
 
 If rollback after a non-panic operation or commit failure succeeds and restores autocommit mode,
-no terminal error is introduced: the caller receives the original operation error or the existing
-retryable commit pool error, and the writer remains available. A caught operation panic remains
-terminal even when its transaction was provably rolled back.
+the caller receives
+`WriterTaskRequestFailed { request_state: TransactionRolledBack, source }`.
+This wrapper carries the proof that the request left no committed SQLite effect without claiming
+the writer task terminated. The writer remains available, and the request closure is never
+re-executed internally. `source` is the original operation error or the typed
+`writer_task_commit` pool error. `capability()`, `is_retryable()`, and the specialized FTS/UNIQUE
+classifiers delegate to that source: rollback finality makes replay effect-safe but does not make a
+deterministic error transient. A caught operation panic remains terminal even when its transaction
+was provably rolled back.
 
-This error has no storage capability attribution (`capability()` returns
+`WriterTaskTerminated` has no storage capability attribution (`capability()` returns
 `None`) and is not automatically retryable (`is_retryable()` returns `false`).
 In particular, callers must not blindly retry `SideEffectsUnknown`: the first
 attempt may have committed a side effect. Retry decisions belong to the
 operation's idempotency contract.
 
-Neither `WriterTaskTerminated` nor `WriterTaskRequestState` has a serialized
-wire representation. Runtime and MCP error envelopes continue to flatten this
-storage error through `Display`; the rendered form is
-`writer task terminated (request_state=<state>)`, where `<state>` is one of
-`not_started`, `transaction_rolled_back`, or `side_effects_unknown`. This adds
-typed in-process information without changing the enclosing runtime/MCP error
-schema. `StorageError` is a public enum without `#[non_exhaustive]`, so adding
-this variant is nevertheless a Rust source-compatibility change for downstream
-code that exhaustively matches every variant; those matches must add a
-`WriterTaskTerminated` arm.
+`RuntimeError::writer_task_failure_context()` preserves the request state, source retryability, and
+whether the writer seam terminated. MCP serializes that context with stable
+`writer_task_request_failed` / `writer_task_terminated` code and stage fields plus
+`request_state`, `task_terminated`, and `retryable`. The events socket protocol carries the same
+request-failed versus task-terminated disposition and reconstructs the matching storage variant.
+
+The rendered forms remain stable:
+
+- `writer task request failed (request_state=<state>): <source>`
+- `writer task terminated (request_state=<state>)`
+
+`StorageError` is a public enum without `#[non_exhaustive]`, so
+`WriterTaskRequestFailed` is a Rust source-compatibility change for downstream exhaustive matches.
 
 ## Bounded blob read failures
 

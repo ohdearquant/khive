@@ -4751,7 +4751,7 @@ impl KhiveRuntime {
         };
 
         // Route index cleanup through the RECORD's namespace, not the caller's.
-        let record_tok = NamespaceToken::for_namespace(
+        let record_tok = token.with_namespace(
             khive_types::Namespace::parse(&note.namespace)
                 .map_err(|e| RuntimeError::Internal(format!("note namespace invalid: {e}")))?,
         );
@@ -4798,7 +4798,7 @@ impl KhiveRuntime {
             deleted
         };
         if deleted {
-            let event_store = self.events(token)?;
+            let event_store = self.events(&record_tok)?;
             let event = khive_storage::event::Event::new(
                 record_ns.clone(),
                 "delete",
@@ -5111,7 +5111,7 @@ impl KhiveRuntime {
         };
 
         // Route cascade and index cleanup through the RECORD's namespace, not the caller's.
-        let record_tok = NamespaceToken::for_namespace(
+        let record_tok = token.with_namespace(
             khive_types::Namespace::parse(&entity.namespace)
                 .map_err(|e| RuntimeError::Internal(format!("entity namespace invalid: {e}")))?,
         );
@@ -5141,7 +5141,7 @@ impl KhiveRuntime {
             deleted
         };
         if deleted {
-            let event_store = self.events(token)?;
+            let event_store = self.events(&record_tok)?;
             let ns = entity.namespace.clone();
             let event = khive_storage::event::Event::new(
                 ns.clone(),
@@ -5725,7 +5725,7 @@ impl KhiveRuntime {
         // namespace so that endpoint validation, raw-SQL predicates, and graph routing
         // all address the correct backend partition.
         let record_ns: String = edge.namespace.clone();
-        let record_tok = NamespaceToken::for_namespace(
+        let record_tok = token.with_namespace(
             khive_types::Namespace::parse(&record_ns)
                 .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
         );
@@ -5969,7 +5969,7 @@ impl KhiveRuntime {
 
         // Derive record_ns / record_tok from the fetched edge (mirrors update_edge).
         let record_ns: String = edge.namespace.clone();
-        let record_tok = NamespaceToken::for_namespace(
+        let record_tok = token.with_namespace(
             khive_types::Namespace::parse(&record_ns)
                 .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
         );
@@ -13409,6 +13409,7 @@ mod tests {
             .count(TextFilter {
                 ids: vec![],
                 kinds: vec![],
+                record_kinds: vec![],
                 namespaces: vec![ns.clone()],
             })
             .await
@@ -13522,6 +13523,7 @@ mod tests {
             .count(TextFilter {
                 ids: vec![],
                 kinds: vec![],
+                record_kinds: vec![],
                 namespaces: vec![ns.clone()],
             })
             .await

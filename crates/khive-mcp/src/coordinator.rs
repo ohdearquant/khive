@@ -385,11 +385,9 @@ pub(crate) mod tests {
         builder.with_gate(gate);
         builder.with_default_namespace(default_ns.as_str());
         builder.with_actor_id(actor_id);
-        let token = runtime
-            .authorize(RuntimeNamespace::local())
-            .expect("authorize event store");
-        let event_store = runtime.events(&token).expect("in-memory event store");
-        builder.with_event_store(event_store);
+        builder
+            .with_runtime_event_store(&runtime)
+            .expect("configure trusted runtime audit store");
         khive_runtime::PackRegistry::register_packs(
             &["kg".to_string()],
             runtime.clone(),

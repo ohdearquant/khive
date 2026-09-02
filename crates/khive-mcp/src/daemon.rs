@@ -229,7 +229,9 @@ struct ConfigIdFields<'a> {
     blob_hydration_bytes: &'a str,
     backend: &'a str,
     outbound: &'a str,
+    gate: &'a str,
     git_write: &'a str,
+    display_timezone: &'a str,
     backends: Option<&'a str>,
     pack_backends: Option<&'a str>,
 }
@@ -246,7 +248,13 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
 
     let base = base.strip_prefix("packs=[")?;
     let (packs, rest) = base.split_once("];db=")?;
+    let (rest, display_timezone) = rest
+        .rsplit_once(";display_tz=")
+        .unwrap_or((rest, "<legacy-absent>"));
     let (rest, git_write) = rest.rsplit_once(";git_write=")?;
+    let (rest, gate) = rest
+        .rsplit_once(";gate=")
+        .unwrap_or((rest, "<legacy-absent>"));
     let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
     let outbound = outbound.strip_suffix(']')?;
     let (rest, backend) = rest.rsplit_once(";backend=")?;
@@ -270,7 +278,9 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         blob_hydration_bytes,
         backend,
         outbound,
+        gate,
         git_write,
+        display_timezone,
         backends,
         pack_backends,
     })
@@ -300,8 +310,12 @@ fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static s
         "backend"
     } else if client.outbound != daemon.outbound {
         "outbound"
+    } else if client.gate != daemon.gate {
+        "gate"
     } else if client.git_write != daemon.git_write {
         "git_write"
+    } else if client.display_timezone != daemon.display_timezone {
+        "display_tz"
     } else if client.backends != daemon.backends {
         "backends"
     } else if client.pack_backends != daemon.pack_backends {
@@ -2389,6 +2403,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::test_harness::{
         clear_daemon_env, connect_when_ready, exchange, HarnessDispatch, InProcessDaemonHandle,
         InProcessDaemonLauncher, RecoveryTestGuard,
@@ -2814,6 +2830,26 @@ mod tests {
             first_config_mismatch_field(&client, Some(&daemon)),
             "outbound"
         );
+    }
+
+    #[test]
+    fn first_config_mismatch_field_names_caller_enrollment_policy() {
+        let base = RuntimeConfig::no_embeddings();
+        let enrolled = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(
+                vec!["lambda:enrolled".to_string()],
+                false,
+            )),
+            ..base.clone()
+        };
+        let revoked = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(Vec::new(), false)),
+            ..base
+        };
+        let client = crate::server::compute_config_id_with_ann_fresh_tail(&enrolled, None, true);
+        let daemon = crate::server::compute_config_id_with_ann_fresh_tail(&revoked, None, true);
+
+        assert_eq!(first_config_mismatch_field(&client, Some(&daemon)), "gate");
     }
 
     #[test]

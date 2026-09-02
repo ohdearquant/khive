@@ -57,10 +57,10 @@ impl Clone for Fixture {
 
 fn pack_with_events() -> Fixture {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let tok = rt.authorize(khive_runtime::Namespace::local()).unwrap();
-    let event_store = rt.events(&tok).expect("event store must be available");
     let mut builder = VerbRegistryBuilder::new();
-    builder.with_event_store(event_store);
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("configure trusted runtime audit store");
     builder.register(KgPack::new(rt));
     Fixture {
         registry: builder.build().expect("registry build must succeed"),
@@ -13717,10 +13717,10 @@ async fn list_proposal_limit_over_cap_reports_effective_limit() {
 #[tokio::test]
 async fn list_proposals_offset_sweep_covers_all_exactly_once() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let tok = rt.authorize(Namespace::local()).unwrap();
-    let event_store = rt.events(&tok).expect("event store must be available");
     let mut builder = VerbRegistryBuilder::new();
-    builder.with_event_store(event_store);
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("configure trusted runtime audit store");
     builder.register(KgPack::new(rt.clone()));
     let f = Fixture {
         registry: builder.build().expect("registry build must succeed"),

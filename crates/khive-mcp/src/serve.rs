@@ -537,15 +537,15 @@ fn ingest_namespace_from_env() -> String {
 
 /// Resolve the default inbound actor for fresh (uncorrelated) email messages.
 ///
-/// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"lambda:leo"` when the
+/// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"local"` when the
 /// variable is unset or blank. Called once at server startup alongside
-/// `ingest_namespace_from_env`.
+/// `ingest_namespace_from_env`, and defaults to the same neutral value.
 #[cfg(feature = "channel-email")]
 fn default_inbound_actor_from_env() -> String {
     std::env::var("KHIVE_EMAIL_DEFAULT_ACTOR")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "lambda:leo".to_string())
+        .unwrap_or_else(|| "local".to_string())
 }
 
 /// Parse the outbox allowlist from `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS`.
@@ -2878,10 +2878,8 @@ async fn build_registry_for_multi_backend_inner(
 
     if default_runtime.is_read_only() {
         builder.with_read_only_audit_store();
-    } else if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
-        if let Ok(event_store) = default_runtime.events(&tok) {
-            builder.with_event_store(event_store);
-        }
+    } else if let Err(error) = builder.with_runtime_event_store(&default_runtime) {
+        tracing::warn!(%error, "registry audit event store is unavailable");
     }
 
     khive_runtime::PackRegistry::register_packs_with_runtimes(
@@ -8999,6 +8997,43 @@ region = "us-east-1"
         outcome.expect("test body panicked");
     }
 
+    // --- default_inbound_actor_from_env ---
+
+    #[cfg(feature = "channel-email")]
+    mod default_inbound_actor_tests {
+        use super::*;
+
+        #[test]
+        #[serial]
+        fn default_inbound_actor_defaults_to_local() {
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            assert_eq!(
+                default_inbound_actor_from_env(),
+                "local",
+                "an unset actor must resolve to the neutral namespace, not to any particular \
+                 deployment's identity"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn default_inbound_actor_reads_env_var() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "lambda:mybot");
+            let actor = default_inbound_actor_from_env();
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            assert_eq!(actor, "lambda:mybot");
+        }
+
+        #[test]
+        #[serial]
+        fn default_inbound_actor_ignores_blank_env_var() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "  ");
+            let actor = default_inbound_actor_from_env();
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            assert_eq!(actor, "local", "blank env var must fall back to default");
+        }
+    }
+
     // --- ingest_namespace_from_env (Fix 4: namespace env var) ---
 
     #[cfg(feature = "channel-email")]
@@ -10416,7 +10451,7 @@ backend = "kg-backend"
                 "content": "hello",
                 "channel_kind": "email",
                 "external_id": "test-msg-1",
-                "default_inbound_actor": "lambda:leo",
+                "default_inbound_actor": "lambda:mybot",
             });
             registry
                 .dispatch("comm.ingest", ingest_params)
