@@ -457,11 +457,20 @@ receive advisory objects unchanged. Frame-budget degradation preserves the
 array even if an oversized `result` is replaced by a typed
 `response_frame_budget_exceeded` error. That replacement changes `ok` to false
 and refreshes the batch summary; a discarded result is never reported as a
-successful empty response. The error is `retryable` only for an `Assertive`
-verb (no persisted side effect to duplicate); every other verb already
-committed its effect, so the entry instead carries `executed: true` and
-`retryable: false`, and the caller should read the outcome back rather than
-retry. This decision is made after the whole request has run — in a chain,
+successful empty response. This is never a pace-and-retry condition — an
+identical reissue exceeds the identical budget identically — so `retryable`
+is always `false`; the surface has no published `retry_after_ms`/backoff/
+breaker policy for this failure class to offer under the general retry
+contract. The entry instead carries `recoverable`, naming what the caller
+can actually do: `reduce_result_size` for an `Assertive` verb with no
+persisted side effect of its own (narrow the request and reissue it), or
+`read_outcome` for every other verb — it already committed its effect (or,
+for an unregistered verb name, cannot be proven not to have), so the entry
+also carries `executed: true` and the caller should read the outcome back
+rather than reissue the call. A short, audited list of `Assertive` verbs
+that schedule a persisted write on every dispatch (for example a serve
+ledger or telemetry event) is excluded from `reduce_result_size` the same
+way. This decision is made after the whole request has run — in a chain,
 every later operation has already executed by the time a frame-budget
 omission is applied to an earlier entry, so a later entry reports its real
 outcome and the omission itself is never a chain-abort trigger.

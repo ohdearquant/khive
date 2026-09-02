@@ -37,8 +37,8 @@ use khive_request::{
 };
 use khive_runtime::{
     present, render_format, InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError,
-    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbCategory,
-    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
+    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
+    VerbRegistry, VerbRegistryBuilder,
 };
 use khive_types::RefusalReason;
 
@@ -3876,38 +3876,53 @@ fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
     if ok {
         // Once the result is discarded, the operation is not a usable
         // success. In particular, a pager must not interpret the missing
-        // payload as an empty terminal page. Surface a small, typed error and
-        // let the caller read the outcome back or retry, depending on
-        // whether the verb already committed a change.
+        // payload as an empty terminal page. Surface a small, typed error
+        // and tell the caller what to actually do about it: reissue with a
+        // narrower request, or read the already-committed outcome back.
         //
         // This decision runs after `run_parsed` has already dispatched the
         // operation (and, in a chain, every operation after it) — the frame
         // budget is checked at render time, once the full envelope is known.
-        // A `Directive`/`Commissive`/`Declaration` verb already committed its
-        // effect before the transport discovered the response was too large,
-        // so advertising it as retryable risks a duplicate mutation; only an
-        // `Assertive` verb (or an unregistered/unknown tool name, which
-        // cannot be proven side-effect-free) is safe to advertise as
-        // retryable. This is the one sanctioned use of `VerbCategory` for a
-        // transport decision — see its doc comment in `khive-types`.
+        // A frame-budget overflow is never a transient, pace-and-retry
+        // condition: reissuing the identical request exceeds the identical
+        // budget identically. `retryable` therefore always stays `false`
+        // here — ADR-130 §2/§4 tie a `true` value to a published
+        // `retry_after_ms`/backoff/breaker contract this failure class does
+        // not have — and `recoverable` carries the actual guidance instead.
+        // A `Directive`/`Commissive`/`Declaration` verb (or an unregistered/
+        // unknown tool name, which cannot be proven side-effect-free)
+        // already committed its effect before the transport discovered the
+        // response was too large, so it fails closed to `read_outcome`; an
+        // `Assertive` verb with nothing to duplicate is told
+        // `reduce_result_size` instead. `is_retry_safe_after_frame_omission`
+        // (`khive-runtime`) additionally excludes a short, audited list of
+        // `Assertive` verbs that schedule a persisted write on every
+        // dispatch (`memory.recall`'s serve ledger, `search`'s
+        // `SearchExecuted` telemetry) — see its doc comment and
+        // `VerbCategory`'s doc comment in `khive-types`.
         omitted.insert("ok".to_string(), Value::Bool(false));
         let tool = entry.get("tool").and_then(Value::as_str);
-        let retryable = tool.is_some_and(|verb| {
-            matches!(registry.verb_category(verb), Some(VerbCategory::Assertive))
-        });
-        let message = if retryable {
-            "operation result exceeded the daemon response frame budget; reduce limit or \
-             result size and retry"
+        let retry_safe = tool.is_some_and(|verb| registry.is_retry_safe_after_frame_omission(verb));
+        let (message, recoverable) = if retry_safe {
+            (
+                "operation result exceeded the daemon response frame budget; reduce limit \
+                 or result size and reissue the request",
+                "reduce_result_size",
+            )
         } else {
             omitted.insert("executed".to_string(), Value::Bool(true));
-            "operation completed but its result exceeded the daemon response frame budget; \
-             read the outcome back instead of retrying the operation"
+            (
+                "operation completed but its result exceeded the daemon response frame \
+                 budget; read the outcome back instead of reissuing the operation",
+                "read_outcome",
+            )
         };
         let mut error = serde_json::Map::from_iter([
             ("kind".to_string(), json!("response_frame_budget_exceeded")),
             ("code".to_string(), json!("response_frame_budget_exceeded")),
             ("message".to_string(), json!(message)),
-            ("retryable".to_string(), json!(retryable)),
+            ("retryable".to_string(), json!(false)),
+            ("recoverable".to_string(), json!(recoverable)),
             (
                 "max_frame_bytes".to_string(),
                 json!(khive_runtime::daemon::MAX_FRAME_BYTES),
@@ -4507,6 +4522,15 @@ mod tests {
                 description: "records a small committed write, for chain-ordering tests",
                 visibility: khive_runtime::Visibility::Verb,
                 category: khive_runtime::VerbCategory::Commissive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "memory.recall",
+                description: "test double matching the real memory.recall verb's name and \
+                               Assertive category, to exercise the qualified pack.verb name \
+                               through the real registry lookup",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
                 params: &[],
             },
         ];
@@ -5290,7 +5314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_dispatch_rejects_result_larger_than_frame_as_retryable() {
+    async fn daemon_dispatch_marks_oversized_read_result_reducible_and_not_retryable() {
         let server = large_result_test_server();
         let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
         let response = dispatch_large_result_through_daemon(
@@ -5307,10 +5331,58 @@ mod tests {
             envelope["results"][0]["error"]["kind"],
             "response_frame_budget_exceeded"
         );
-        assert_eq!(envelope["results"][0]["error"]["retryable"], true);
+        // A frame-budget overflow is never a pace-and-retry condition —
+        // reissuing the identical request overflows identically — so
+        // `retryable` stays false even for a side-effect-free `Assertive`
+        // verb; `recoverable` carries the actual guidance.
+        assert_eq!(envelope["results"][0]["error"]["retryable"], false);
+        assert_eq!(
+            envelope["results"][0]["error"]["recoverable"],
+            "reduce_result_size"
+        );
+        assert!(envelope["results"][0].get("executed").is_none());
         assert_eq!(envelope["summary"]["succeeded"], 0);
         assert_eq!(envelope["summary"]["failed"], 1);
         assert_eq!(envelope["status"], "partial");
+        assert!(rendered_response_fits_daemon_frame(
+            &response,
+            &server.config_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_dispatch_marks_oversized_side_effecting_assertive_verb_non_retryable_and_executed(
+    ) {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!("memory.recall(bytes={result_bytes})"),
+            None,
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        assert_eq!(envelope["results"][0]["ok"], false);
+        assert!(envelope["results"][0].get("result").is_none());
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        // `memory.recall` is declared `Assertive`, but every dispatch
+        // schedules a persisted `brain.record_serve` write
+        // (`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`); a lost response
+        // must not be advertised as safe to reissue, or a caller acting on
+        // that advice duplicates the serve-ledger write. This also proves
+        // the omission decision resolves a qualified `pack.verb` name
+        // (containing a `.`) through the same registry lookup as a bare
+        // verb name.
+        assert_eq!(envelope["results"][0]["error"]["retryable"], false);
+        assert_eq!(
+            envelope["results"][0]["error"]["recoverable"],
+            "read_outcome"
+        );
+        assert_eq!(envelope["results"][0]["executed"], true);
         assert!(rendered_response_fits_daemon_frame(
             &response,
             &server.config_id
@@ -5337,8 +5409,12 @@ mod tests {
         );
         // `large_write` is Commissive: it already committed its change before
         // the transport discovered the response was too large to return, so
-        // a caller must not be told it is safe to retry the operation.
+        // a caller must not be told it is safe to reissue the operation.
         assert_eq!(envelope["results"][0]["error"]["retryable"], false);
+        assert_eq!(
+            envelope["results"][0]["error"]["recoverable"],
+            "read_outcome"
+        );
         assert_eq!(envelope["results"][0]["executed"], true);
         assert!(rendered_response_fits_daemon_frame(
             &response,
@@ -5535,9 +5611,13 @@ mod tests {
             omitted["error"]["kind"],
             json!("response_frame_budget_exceeded")
         );
-        // `search` is Assertive: no persisted side effect to duplicate, so
-        // the caller may safely retry with a narrower query.
-        assert_eq!(omitted["error"]["retryable"], json!(true));
+        // `search` is Assertive, but the kg pack's real handler schedules a
+        // best-effort `SearchExecuted` telemetry event on every dispatch
+        // with no dedup key (`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`),
+        // so a lost response must not be advertised as safe to reissue.
+        assert_eq!(omitted["error"]["retryable"], json!(false));
+        assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
+        assert_eq!(omitted["executed"], json!(true));
     }
 
     #[test]
@@ -5784,6 +5864,7 @@ mod tests {
         assert_eq!(omitted["ok"], json!(false));
         assert_eq!(omitted["executed"], json!(true));
         assert_eq!(omitted["error"]["retryable"], json!(false));
+        assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
         assert_eq!(
             omitted["error"]["kind"],
             json!("response_frame_budget_exceeded")
@@ -5805,6 +5886,7 @@ mod tests {
         assert_eq!(omitted["ok"], json!(false));
         assert_eq!(omitted["executed"], json!(true));
         assert_eq!(omitted["error"]["retryable"], json!(false));
+        assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
     }
 
     #[tokio::test]

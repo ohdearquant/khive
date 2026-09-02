@@ -39,13 +39,22 @@ pub enum Visibility {
 /// use the category of their parent verb or `Assertive` as a sensible default.
 ///
 /// The category is a documentation / introspection tag. It is NOT used for
-/// permission checking or transport routing. The one sanctioned exception is
-/// deciding whether a post-dispatch transport failure (a result the caller
-/// never received) is safe to advertise as retryable: `Assertive` verbs have
-/// no persisted side effect to duplicate, so a lost response can be retried
-/// outright; every other category already committed a change before the
-/// transport failed, so retrying would repeat it (`VerbRegistry::verb_category`
-/// in `khive-runtime`, consumed by the MCP daemon's frame-budget omission).
+/// permission checking. It is one input — never the sole proof — to two
+/// narrow, sanctioned runtime decisions, both in `khive-runtime`'s
+/// `VerbRegistry`:
+/// - `admission_degrade_safe` treats `Assertive` as a necessary condition
+///   for letting a dispatch's own audit row degrade under transient
+///   admission pressure, combined with an explicit per-verb allowlist.
+/// - `is_retry_safe_after_frame_omission` treats `Assertive` as a necessary
+///   condition for telling a caller that a response lost to the MCP
+///   daemon's frame budget is safe to re-issue, combined with an explicit
+///   exclusion list.
+///
+/// Both combine the category with an audited list rather than trusting it
+/// alone, because several `Assertive` handlers schedule their own persisted
+/// or accounting-bearing side effect on every dispatch (`memory.recall`'s
+/// serve ledger, `search`'s `SearchExecuted` telemetry) that the speech-act
+/// classification cannot see.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerbCategory {
     /// Speaker represents a state of affairs — retrieves and presents facts.

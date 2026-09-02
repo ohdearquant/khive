@@ -123,14 +123,20 @@ beside `result`. Check this operation-level advisory even when `ok` and the
 aggregate request `status` report success. It survives batch/chain execution,
 presentation modes, and daemon frame-budget handling. If any successful result
 cannot fit the daemon response frame, that entry becomes an explicit
-`error.kind="response_frame_budget_exceeded"` failure. For an `Assertive`
-(read-only) verb this carries `retryable: true`; reduce the verb's `limit` or
-result size and retry. Every other verb already committed its effect before
-the transport discovered the response was too large, so the entry instead
-carries `executed: true` and `retryable: false` — read the outcome back
-rather than retry the operation. The batch summary is updated, so a discarded
-page is never counted as succeeded. A degraded empty result instead carries
-the same diagnostics inside `error.kind="search_incomplete"`.
+`error.kind="response_frame_budget_exceeded"` failure with `retryable: false`
+— reissuing the identical request overflows the identical budget identically,
+so this is never advertised as a pace-and-retry condition. The entry instead
+carries `recoverable`: for a read-only `Assertive` verb with no persisted
+side effect of its own, `recoverable: "reduce_result_size"` — narrow the
+verb's `limit` or result size and reissue it. Every other verb — including a
+handful of `Assertive` verbs that schedule their own persisted write on every
+dispatch, such as `memory.recall`'s serve-ledger accounting — already
+committed its effect (or, for an unregistered verb name, cannot be proven
+not to have), so the entry instead carries `executed: true` and
+`recoverable: "read_outcome"` — read the outcome back rather than reissue
+the operation. The batch summary is updated, so a discarded page is never
+counted as succeeded. A degraded empty result instead carries the same
+diagnostics inside `error.kind="search_incomplete"`.
 
 The inline `results`/`summary` envelope is the default. Set the optional
 `save_to` parameter to sink the full results to a JSONL file instead; `request`
