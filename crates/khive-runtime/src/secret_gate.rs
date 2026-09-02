@@ -15,8 +15,10 @@
 //!    secret keys, URL userinfo (`scheme://user:pass@`).
 //! 2. **High-entropy token heuristic** — base64/hex/base64url runs ≥ 24 chars
 //!    near a trigger word (key, secret, password, credential, bearer, auth,
-//!    apikey, api_key, access_key, private_key). The word `token` alone is
-//!    NOT a trigger, to avoid blocking `tokenizer_*`, `token_count`, etc.
+//!    apikey, api_key, access_key, private_key). A standalone `token` still
+//!    triggers opaque entropy detection, but does not by itself label a UUID
+//!    as a credential; compound identifiers such as `tokenizer_*` and
+//!    `token_count` remain excluded.
 //!
 //! Credential-shaped labels and assignments dominate the allowlist below.
 //! Public VCS revisions and plausible file paths remain exempt in ordinary
@@ -953,7 +955,8 @@ fn check_entropy_heuristic<'a>(
         // `shannon_entropy` over its bytes is a true per-character entropy.
 
         // Compute the trigger window before any shape-based allowlist decision.
-        // UUID and base64 content-hash exemptions remain trigger-sensitive.
+        // UUIDs require credential-label context rather than a generic mention
+        // of `token`; base64 content-hash exemptions remain trigger-sensitive.
         // VCS revisions and file paths use narrower syntactic context below.
         let window_start = floor_char_boundary(text, tok_offset.saturating_sub(TRIGGER_WINDOW));
         let window_end = floor_char_boundary(text, tok_offset + raw_token.len() + TRIGGER_WINDOW);
@@ -967,17 +970,26 @@ fn check_entropy_heuristic<'a>(
         let near_trigger = contains_trigger(&window[..raw_start])
             || contains_trigger(&window[raw_end..])
             || has_inline_credential_trigger(raw_token);
+        let uuid_near_credential_label = contains_credential_label_trigger(&window[..raw_start])
+            || contains_credential_label_trigger(&window[raw_end..])
+            || has_inline_credential_trigger(raw_token);
 
-        // Step 1 (see doc: per-token flagging sequence). UUID/content-hash checks fall
-        // through to detection near a trigger rather than being silently passed —
-        // hex-shaped entropy alone (<=4.0 bits/char) can never reach ENTROPY_THRESHOLD.
-        if near_trigger && value_candidates(token).any(is_uuid_canonical) {
+        // Step 1 (see doc: per-token flagging sequence). UUIDs fall through only
+        // beside an explicit credential label; the generic word `token` remains
+        // trigger context for opaque values but is common in design prose. Content
+        // hashes retain the broader trigger rule. Hex-shaped entropy alone (<=4.0
+        // bits/char) can never reach ENTROPY_THRESHOLD.
+        let has_uuid_candidate = value_candidates(token).any(is_uuid_canonical);
+        if uuid_near_credential_label && has_uuid_candidate {
             return Some((token, "uuid-near-trigger"));
         }
         if near_trigger && value_candidates(token).any(is_base64_content_hash) {
             return Some((token, "content-hash-near-trigger"));
         }
-        if !near_trigger && (is_uuid_canonical(token) || is_base64_content_hash(token)) {
+        if !uuid_near_credential_label && is_uuid_canonical(token) {
+            continue;
+        }
+        if !near_trigger && is_base64_content_hash(token) {
             continue;
         }
 
@@ -1760,6 +1772,19 @@ fn contains_trigger(text: &str) -> bool {
         .any(|tw| contains_bounded_word(&low, tw))
         || contains_compound_trigger(&low)
         || has_standalone_token(&low)
+        || has_token_assignment(&low)
+        || has_assignment_credential_trigger(&low)
+}
+
+/// UUID-shaped values need an explicit credential label. A standalone mention
+/// of `token` is intentionally omitted because it is common design language;
+/// assignment forms such as `token=<uuid>` remain authoritative.
+fn contains_credential_label_trigger(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    TRIGGER_WORDS
+        .iter()
+        .any(|tw| contains_bounded_word(&low, tw))
+        || contains_compound_trigger(&low)
         || has_token_assignment(&low)
         || has_assignment_credential_trigger(&low)
 }
@@ -5290,6 +5315,37 @@ mod tests {
              (not a genuine 'auth' mention) must now pass; got {:?}",
             scan(content)
         );
+    }
+
+    #[test]
+    fn allows_uuid_on_line_after_benign_token_contract_title() {
+        let content = "Design language and token contract\n550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            check(content).is_ok(),
+            "a generic token-contract title must not make a next-line UUID look like a secret; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn generic_token_uuid_exemption_keeps_strong_credential_controls() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let cases = [
+            (format!("service token {opaque}"), "high-entropy-token"),
+            (format!("token={opaque}"), "high-entropy-token"),
+            (format!("token={uuid}"), "uuid-near-trigger"),
+            (format!("api_key {uuid}"), "uuid-near-trigger"),
+        ];
+
+        for (content, detector) in cases {
+            assert_eq!(
+                scan(&content).map(|matched| matched.detector),
+                Some(detector),
+                "credential-shaped control must remain blocked: {content:?}"
+            );
+        }
     }
 
     // ── UUID/hash value extraction from assignment and wrapper syntax ───────

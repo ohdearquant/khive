@@ -41,24 +41,24 @@
 # optional — the defaults apply when the section is absent.
 
 [actor]
-# Attribution identity. Must be a valid namespace string ("local", "lambda:khive",
+# Attribution identity. Must be a valid namespace string ("local", "lambda:mybot",
 # …). Validated at load — an invalid value is a startup error, not a silent
 # fallback. Absent → `local`. Overridden by --actor / KHIVE_ACTOR. A non-`local` id
 # does NOT route writes; it only widens the default read scope (see below).
-# id = "lambda:khive"
+# id = "lambda:mybot"
 
 # Human-readable label. Surfaced in introspection and logs only; never used for
 # routing.
-# display_name = "khive lambda"
+# display_name = "my bot"
 
 # Widen the DEFAULT multi-record READ scope to {local} ∪ these namespaces
 # (ADR-007 Rev 4 Rule 3b). Writes stay pinned to `local`. An explicit `namespace=`
 # request parameter is a precise escape and is not widened by this list.
-# visible_namespaces = ["lambda:khive", "local"]
+# visible_namespaces = ["lambda:mybot", "local"]
 
 # Namespaces this actor's comm.send / comm.reply may deliver INTO. Empty (default)
 # denies all cross-namespace delivery. Each entry must be a valid namespace.
-# allowed_outbound_namespaces = ["lambda:leo"]
+# allowed_outbound_namespaces = ["lambda:otherbot"]
 
 # ── [runtime] — runtime knobs ────────────────────────────────────────────────────
 
@@ -280,7 +280,7 @@ fusion_weight = 0.5
 #   KHIVE_EMAIL_MAINTAINER_ADDRESS=you@example.com
 #                                Required. Comma-separated allowlist of senders whose inbound mail
 #                                is accepted; the first entry is primary.
-#   KHIVE_EMAIL_DEFAULT_ACTOR=lambda:leo      Actor for new inbound mail with no thread match.
+#   KHIVE_EMAIL_DEFAULT_ACTOR=local           Actor for new inbound mail with no thread match.
 #   KHIVE_EMAIL_INGEST_NAMESPACE=local        Namespace stamped on channel messages.
 #   KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS=you@example.com
 #                                Comma-separated outbound allowlist. Default: the maintainer address.

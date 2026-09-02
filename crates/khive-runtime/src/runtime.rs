@@ -1115,15 +1115,15 @@ impl KhiveRuntime {
                 }
                 // The primary check authorizes writes to `primary` only. Each
                 // extra namespace grants read visibility, so each one takes
-                // its own gate check before it may enter the minted set — a
-                // token must never carry visibility the gate was not asked
-                // about. Any deny or gate error refuses the whole mint,
-                // naming the offending namespace (fail-closed).
+                // its own Read-classified gate check before it may enter the
+                // minted set — a token must never carry visibility the gate
+                // was not asked about. Any deny or gate error refuses the
+                // whole mint, naming the offending namespace (fail-closed).
                 for extra in &extra_visible {
                     let extra_req = GateRequest::new(
                         actor.clone(),
                         extra.clone(),
-                        "authorize",
+                        "authorize.visible",
                         serde_json::Value::Null,
                     );
                     match self.config.gate.check(&extra_req) {
@@ -2332,8 +2332,64 @@ mod tests {
         );
     }
 
+    /// Grants Write on the primary namespace and Read, but not Write, on the
+    /// extra namespace. The pseudo-verb split is what lets a right-aware gate
+    /// express ADR-129's asymmetric authority contract.
+    #[derive(Debug)]
+    struct ReadOnlyExtraGate {
+        primary: &'static str,
+        extra: &'static str,
+    }
+
+    impl khive_gate::Gate for ReadOnlyExtraGate {
+        fn check(
+            &self,
+            req: &khive_gate::GateRequest,
+        ) -> Result<khive_gate::GateDecision, khive_gate::GateError> {
+            let allowed = match req.verb.as_str() {
+                "authorize" => req.namespace.as_str() == self.primary,
+                "authorize.visible" => req.namespace.as_str() == self.extra,
+                _ => false,
+            };
+            if allowed {
+                Ok(khive_gate::GateDecision::allow())
+            } else {
+                Ok(khive_gate::GateDecision::Deny {
+                    reason: format!(
+                        "{} denied for namespace {:?}",
+                        req.verb,
+                        req.namespace.as_str()
+                    ),
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn authorize_with_visibility_allows_read_only_extra_namespace() {
+        let primary = Namespace::parse("lambda:caller").expect("primary");
+        let extra = Namespace::parse("lambda:read-only").expect("extra");
+        let config = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            gate: Arc::new(ReadOnlyExtraGate {
+                primary: "lambda:caller",
+                extra: "lambda:read-only",
+            }),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let rt = KhiveRuntime::new(config).expect("memory runtime");
+
+        let token = rt
+            .authorize_with_visibility(primary, vec![extra.clone()])
+            .expect("Write on primary and Read on extra must mint");
+        assert!(token.visible_namespaces().contains(&extra));
+    }
+
     /// Denies exactly one namespace; every other request is allowed. Lets the
-    /// tests below prove a refusal comes from the per-extra visibility check
+    /// test below prove a refusal comes from the per-extra visibility check
     /// rather than from the primary authorization.
     #[derive(Debug)]
     struct DenyNamespaceGate {
@@ -2356,7 +2412,7 @@ mod tests {
     }
 
     #[test]
-    fn authorize_with_visibility_gate_checks_every_extra_namespace() {
+    fn authorize_with_visibility_denies_missing_extra_read() {
         let config = RuntimeConfig {
             db_path: None,
             packs: vec!["kg".to_string()],
