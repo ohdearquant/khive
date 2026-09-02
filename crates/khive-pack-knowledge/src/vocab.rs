@@ -35,7 +35,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "atoms",
                 param_type: "array<object>",
                 required: true,
-                description: "List of atoms: {slug, name, content, tags?, properties?, finalized?}",
+                description: "List of atoms: {slug, name, content, tags?, properties?, source_uri?, source_type?, finalized?}. On update, omitted source/finalized fields are preserved; null clears a source or resets finalized to false without demoting lifecycle status.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
