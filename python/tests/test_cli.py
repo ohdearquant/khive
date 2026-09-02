@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -27,18 +28,14 @@ def test_cli_whoami(rest_server, api_key, capsys):
 
 
 def test_cli_exec_prints_envelope(rest_server, api_key, capsys):
-    rc = cli.main(
-        ["--url", rest_server.url, "--api-key", api_key, "exec", '[{"tool": "stats", "args": {}}]']
-    )
+    rc = cli.main(["--url", rest_server.url, "--api-key", api_key, "exec", "stats()"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["summary"]["succeeded"] == 1
 
 
 def test_cli_exec_nonzero_exit_on_op_failure(rest_server, api_key, capsys):
-    rc = cli.main(
-        ["--url", rest_server.url, "--api-key", api_key, "exec", '[{"tool": "nope", "args": {}}]']
-    )
+    rc = cli.main(["--url", rest_server.url, "--api-key", api_key, "exec", "nope()"])
     assert rc == 1
     out = json.loads(capsys.readouterr().out)
     assert out["summary"]["failed"] == 1
@@ -52,7 +49,7 @@ def test_cli_exec_nonzero_exit_on_aborted(rest_server, api_key, capsys):
             "--api-key",
             api_key,
             "exec",
-            '[{"tool": "stats", "args": {}}, {"tool": "later", "args": {}}]',
+            "[stats(), later()]",
         ]
     )
     assert rc == 1
@@ -100,17 +97,18 @@ def test_cli_tools(mcp_server, api_key, capsys):
 
 
 def test_installed_console_script_subprocess(rest_server, api_key):
+    script = Path(sys.executable).parent / "khive-cloud"
+    if not script.exists():
+        pytest.skip("khive-cloud console script not installed in this environment")
     result = subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "khive.cli",
+            str(script),
             "--url",
             rest_server.url,
             "--api-key",
             api_key,
             "exec",
-            '[{"tool": "stats", "args": {}}]',
+            "stats()",
         ],
         capture_output=True,
         text=True,

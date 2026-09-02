@@ -68,7 +68,7 @@ def _cmd_exec(args: argparse.Namespace) -> int:
     api_key = _require_api_key(args)
     transport = HttpTransport(base_url, api_key)
     try:
-        response = transport.round_trip({"ops": args.ops}, timeout=30.0)
+        response = transport.send_dsl(args.ops, timeout=30.0)
         envelope = response["result"]
         _print_json(envelope)
         summary = envelope.get("summary", {})
@@ -107,8 +107,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_whoami = sub.add_parser("whoami", help="print the caller's resolved identity")
     p_whoami.set_defaults(func=_cmd_whoami)
 
-    p_exec = sub.add_parser("exec", help="run an ops DSL or JSON string")
-    p_exec.add_argument("ops")
+    p_exec = sub.add_parser("exec", help="run a request DSL string")
+    p_exec.add_argument(
+        "ops", help="a request DSL string, e.g. 'stats()' or '[whoami(), stats()]'"
+    )
     p_exec.set_defaults(func=_cmd_exec)
 
     p_tools = sub.add_parser("tools", help="list MCP tool names")

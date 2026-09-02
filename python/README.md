@@ -45,7 +45,8 @@ The same `Khive` facade works against a remote khive-cloud deployment over
 ```python
 import khive
 
-db = khive.cloud("https://khive-cloud.example", api_key)
+url = "https://khive-cloud.example"
+db = khive.cloud(url, api_key)
 # equivalent: khive.Khive(transport=khive.HttpTransport(url, api_key))
 
 db.stats()

@@ -1,9 +1,8 @@
 """Live integration test against a real khive-cloud deployment.
 
-Skipped unless both KHIVE_CLOUD_API_KEY and KHIVE_CLOUD_URL are set. Written
-but not run as part of this change: no live key was available while writing
-it (see the IMPL_REPORT). Asserts envelope/result SHAPE only — `whoami`'s
-field set is changing server-side, so no field is pinned.
+Skipped unless both KHIVE_CLOUD_API_KEY and KHIVE_CLOUD_URL are set. Asserts
+envelope/result SHAPE only — `whoami`'s field set is changing server-side, so
+no field is pinned.
 """
 
 from __future__ import annotations

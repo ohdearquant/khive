@@ -8,10 +8,13 @@ database, socket, and pid file, all pointed at via `KHIVE_SOCKET` /
 The `rest_server`/`mcp_server` fixtures below fake khive-cloud's two
 transports offline: a real REST endpoint over `http.server`, and a real MCP
 `request` tool over a streamable-HTTP `uvicorn` server — both gated by the
-same `Authorization: ApiKey <key>` scheme as the live deployment. Neither
-import their optional dependency (`uvicorn`, `mcp`'s `FastMCP`) at module
-scope, so collecting this file never requires the `cloud` extra; only
-actually requesting `mcp_server` does.
+same `Authorization: ApiKey <key>` scheme as the live deployment, and both
+dispatching through `_dispatch_ops`, which enforces the real `ops` wire
+contract (one request DSL string — see `_dsl_fake.py`) rather than accepting
+whatever a not-yet-fixed client happens to send. Neither import their
+optional dependency (`uvicorn`, `mcp`'s `FastMCP`) at module scope, so
+collecting this file never requires the `cloud` extra; only actually
+requesting `mcp_server` does.
 """
 
 from __future__ import annotations
@@ -33,27 +36,45 @@ from typing import Any
 
 import pytest
 
+from _dsl_fake import DslParseError, parse_dsl
+
 API_KEY = "test-key-123"
 
 
-def _dispatch_ops(ops: str) -> tuple[int, dict[str, Any]]:
+def _dispatch_ops(ops: Any) -> tuple[int, dict[str, Any]]:
     """A tiny fake op-dispatcher mirroring khive-cloud's envelope shape.
 
-    Parses the JSON array form `[{"tool": ..., "args": {...}}, ...]` (the
-    only encoding this client emits) and answers a handful of well-known
-    tool names; `rate_limited`/`boom` simulate whole-request HTTP failures
-    (429/500) rather than a per-op error, since those are transport-level,
-    not dispatch-level, on the real server.
+    `ops` must be one request DSL string (`verb(k=v, ...)`, or a
+    `[op1, op2]` batch) — the real contract, measured against a live
+    deployment: a non-string `ops` 422s, and the client's OLD internal
+    JSON ops-array form (`[{"tool": ..., "args": {...}}]`) 400s with
+    `unknown verb: Missing 'verb' field in JSON` rather than being silently
+    accepted. Answers a handful of well-known verb names; `rate_limited`/
+    `boom` simulate whole-request HTTP failures (429/500) rather than a
+    per-op error, since those are transport-level, not dispatch-level, on
+    the real server.
     """
+    if not isinstance(ops, str):
+        kind = "sequence" if isinstance(ops, list) else type(ops).__name__
+        return 422, {"error": f"ops: invalid type: {kind}, expected a string"}
     try:
-        parsed = json.loads(ops) if ops else None
+        maybe_json = json.loads(ops) if ops else None
     except ValueError:
-        parsed = None
-    if not isinstance(parsed, list) or not parsed:
+        maybe_json = None
+    if (
+        isinstance(maybe_json, list)
+        and maybe_json
+        and all(isinstance(e, dict) and "tool" in e for e in maybe_json)
+    ):
+        return 400, {"error": "unknown verb: Missing 'verb' field in JSON"}
+    try:
+        calls = parse_dsl(ops)
+    except DslParseError as exc:
+        return 400, {"error": f"unparseable ops: {exc}"}
+    if not calls:
         return 400, {"error": f"unparseable ops: {ops!r}"}
     results: list[dict[str, Any]] = []
-    for entry in parsed:
-        tool = entry.get("tool") if isinstance(entry, dict) else None
+    for tool, _args in calls:
         if tool == "stats":
             results.append(
                 {"ok": True, "tool": "stats", "result": {"entities": 1, "edges": 0, "notes": 0}}

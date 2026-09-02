@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from typing import Any
 
 from .errors import AuthError, KhiveError
@@ -43,10 +43,19 @@ def _root_cause(exc: BaseException) -> BaseException:
 
 
 def _as_khive_error(exc: Exception, url: str) -> KhiveError:
+    import httpx
+
     root = _root_cause(exc)
+    if isinstance(root, httpx.HTTPStatusError):
+        status = root.response.status_code
+        if status in (401, 403):
+            return AuthError(status, str(root), None, url)
+        return KhiveError(str(root))
     message = str(root)
-    if "401" in message or "Unauthorized" in message or "403" in message or "Forbidden" in message:
+    if "401" in message or "Unauthorized" in message:
         return AuthError(401, message, None, url)
+    if "403" in message or "Forbidden" in message:
+        return AuthError(403, message, None, url)
     return KhiveError(message)
 
 
@@ -55,6 +64,11 @@ async def mcp_session(base_url: str, api_key: str) -> AsyncIterator[Any]:
     """Async context manager yielding an initialized `mcp.ClientSession`.
 
     Usage: ``async with mcp_session(url, key) as session: ...``
+
+    Exception translation (transport/session failures → `khive` errors) is
+    scoped to setup, before the yield: an exception raised inside the
+    caller's ``async with`` body propagates unchanged instead of being
+    rewritten as a generic `KhiveError` on generator exit.
     """
     import httpx
     from mcp import ClientSession
@@ -62,19 +76,39 @@ async def mcp_session(base_url: str, api_key: str) -> AsyncIterator[Any]:
 
     url = base_url.rstrip("/") + "/mcp"
     headers = {"Authorization": f"ApiKey {api_key}"}
+    stack = AsyncExitStack()
     try:
-        async with httpx.AsyncClient(headers=headers) as http_client:
-            transport = streamable_http_client(url, http_client=http_client)
-            async with (
-                transport as (read, write, _get_session_id),
-                ClientSession(read, write) as session,
-            ):
-                await session.initialize()
-                yield session
-    except KhiveError:
+        http_client = await stack.enter_async_context(httpx.AsyncClient(headers=headers))
+        transport = streamable_http_client(url, http_client=http_client)
+        read, write, _get_session_id = await stack.enter_async_context(transport)
+        session = await stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+    except (Exception, asyncio.CancelledError) as exc:
+        # A bad key (or any other setup-time transport failure) often does
+        # not surface here: `session.initialize()` awaits a response that
+        # never arrives, and only gets a `CancelledError` when the
+        # streamable-HTTP transport's task group is torn down — the real
+        # cause (e.g. an `httpx.HTTPStatusError`) is only raised by that
+        # teardown. Close the stack now so that exception, if there is one,
+        # is the one translated; it is strictly more informative than a
+        # bare `CancelledError`.
+        close_exc: BaseException | None = None
+        try:
+            await stack.aclose()
+        except Exception as inner:
+            close_exc = inner
+        real_exc = close_exc or exc
+        if isinstance(real_exc, KhiveError):
+            raise real_exc
+        raise _as_khive_error(real_exc, url) from real_exc
+    try:
+        yield session
+    except BaseException:
+        with suppress(Exception):
+            await stack.aclose()
         raise
-    except Exception as exc:
-        raise _as_khive_error(exc, url) from exc
+    else:
+        await stack.aclose()
 
 
 async def alist_tool_names(base_url: str, api_key: str) -> list[str]:
