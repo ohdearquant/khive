@@ -791,9 +791,29 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics for the main
-database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal`
-sidecar file size, and a WAL-pin holder census. Takes no parameters.
+Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for the
+main database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the
+`-wal` sidecar file size, and a WAL-pin holder census. Takes no parameters.
+
+`reader_contention` is scoped to the main `ConnectionPool` and resets only when that pool is
+reconstructed. `reader_admission_capacity` and `available_reader_admission_slots` are the
+configured total budget and its point-in-time availability; pooled reads and the explicit
+raw-SQL deferred-transaction exception share it. `reader_acquisitions` is the sum of
+`pooled_reader_checkouts` and request-path `standalone_reader_opens`, while
+`infrastructure_standalone_reader_opens` is deliberately separate. Ordinary file-backed reads
+must leave `standalone_reader_opens` flat. `reader_checkout_timeouts` counts admission waits that
+exhausted `KHIVE_CHECKOUT_TIMEOUT_SECS` before work began, not cooperative request cancellation.
+`active_pooled_reader_checkouts`, `peak_active_pooled_reader_checkouts`,
+`completed_pooled_reader_checkouts`, and `max_completed_reader_hold_micros` expose concurrency
+and lifecycle evidence; completed hold includes connection reset/replacement before reuse.
+`reader_replacement_open_failures` counts a disqualified pooled-reader return whose replacement
+connection then also failed to open, permanently shrinking the physical pool by one slot below
+`max_readers`; non-zero here means the pool has fewer physical reader connections than
+configured, and each occurrence is also logged at `warn`.
+
+The timeout setting applies to each admission attempt. A verb that issues several sequential
+reads can spend more than one configured timeout in total wall time, but each attempt is bounded
+and saturation never falls back to opening a standalone connection.
 
 `writer_contention` contains monotonic counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
