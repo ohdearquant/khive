@@ -5,6 +5,8 @@
 **PR**: #171
 **Amends**: [ADR-015](ADR-015-schema-migrations.md) -- adds schema version 4
 **Depends on**: [ADR-031](ADR-031-multi-engine-retrieval.md), [ADR-044](ADR-044-vector-store-extensions.md), [ADR-052](ADR-052-ann-production-lifecycle.md)
+**Amended**: 2026-08-30, schema V23 adds an indexed granular record-kind
+classifier to the shared entity and note FTS tables (#1907).
 
 ---
 
@@ -195,6 +197,33 @@ Both sweeps are no-ops on databases that have no stale partitions.
   where the global index is heavily dominated by foreign-namespace vectors, additional retry rounds
   may increase recall latency.
 
+## 2026-08-30 Amendment: Indexed Record-Kind Classifier (Schema V23)
+
+The shared tables remain the canonical FTS topology, but substrate `kind`
+(`entity` or `note`) is not selective enough for pack-owned corpora. In
+particular, memory recall previously ran its text MATCH over every note posting
+and applied note kind `memory` only after candidate retrieval.
+
+Schema V23 appends an indexed `record_kind` column to `fts_entities` and
+`fts_notes`. The runtime stamps the base entity or note kind on every FTS write.
+The migration rebuilds both virtual tables in one versioned transaction,
+backfills the classifier by joining base records, and preserves unmatched FTS
+rows with an empty classifier so unscoped search semantics do not change.
+
+`TextFilter.record_kinds` has a two-part contract:
+
+1. Backends push supported granular kinds into the MATCH expression so FTS5
+   intersects classifier and query postings before ranking.
+2. Backends retain an exact `record_kind IN (...)` row predicate because the
+   production trigram tokenizer provides substring rather than equality
+   semantics. Classifiers shorter than one trigram skip only the MATCH
+   optimization and still use the exact predicate.
+
+Memory recall supplies `record_kind="memory"` to ranked, unranked,
+rank-within-cap, count, and term-statistics paths. Candidate work is therefore
+proportional to the matching memory corpus rather than matching notes of every
+pack.
+
 ---
 
 ## Alternatives Considered
@@ -217,5 +246,6 @@ is the canonical pattern for FTS5 multi-tenant tables in SQLite.
 - [ADR-044](ADR-044-vector-store-extensions.md) -- vector store extensions; ANN lifecycle
 - [ADR-052](ADR-052-ann-production-lifecycle.md) -- ANN production lifecycle; snapshot management
 - `crates/khive-db/sql/004-fts-consolidation.sql` -- the V4 migration SQL
+- `crates/khive-db/sql/023-fts-record-kind.sql` -- the V23 classifier rebuild
 - `crates/khive-db/src/migrations.rs` -- V4 registered as `fts_consolidation` at version 4
 - `crates/kkernel/src/reindex.rs` -- stale partition sweep implementation
