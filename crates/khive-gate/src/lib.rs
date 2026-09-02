@@ -10,7 +10,7 @@ mod obligation;
 mod request;
 
 pub use actor::ActorRef;
-pub use audit::{AuditDecision, AuditEvent};
+pub use audit::{ArgumentOrigin, AuditArgumentIdentity, AuditDecision, AuditEvent};
 pub use context::GateContext;
 pub use decision::GateDecision;
 pub use error::{GateError, GateValidationError};

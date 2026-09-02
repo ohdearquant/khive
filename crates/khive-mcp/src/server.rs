@@ -1909,10 +1909,11 @@ impl KhiveMcpServer {
                     let op_identity = identity_owned.clone();
                     let op_mode = mode_for_op(i);
                     let task_tool = op.tool.clone();
+                    let audit_context = operation_audit_context(i, &op.args);
                     BatchTask {
                         index: i,
                         tool: task_tool,
-                        future: async move {
+                        future: khive_runtime::audit_context::scope_operation(audit_context, async move {
                         // ADR-103 Amendment 2: one dispatch-accounting context
                         // per op; the entry is stamped with the frozen usage
                         // snapshot after dispatch resolves.
@@ -2034,7 +2035,7 @@ impl KhiveMcpServer {
                         .await;
                         stamp_usage(&mut entry, &usage_ctx);
                         entry
-                        },
+                        }),
                     }
                 });
                 let results =
@@ -2085,10 +2086,14 @@ impl KhiveMcpServer {
                     } else {
                         op_mode
                     };
+                    let audit_context = operation_audit_context(i, &op.args);
                     let usage_ctx = khive_runtime::usage::UsageContext::new();
-                    match khive_runtime::usage::scope(
-                        usage_ctx.clone(),
-                        self.dispatch_op(op, prev_result.as_ref(), from_wire, identity),
+                    match khive_runtime::audit_context::scope_operation(
+                        audit_context,
+                        khive_runtime::usage::scope(
+                            usage_ctx.clone(),
+                            self.dispatch_op(op, prev_result.as_ref(), from_wire, identity),
+                        ),
                     )
                     .await
                     {
@@ -2147,6 +2152,47 @@ impl KhiveMcpServer {
                 })
             }
         }
+    }
+}
+
+fn operation_audit_context(
+    index: usize,
+    arguments: &std::collections::BTreeMap<String, ArgValue>,
+) -> khive_runtime::audit_context::OperationAuditContext {
+    let argument_origins = arguments
+        .iter()
+        .map(|(name, value)| (name.clone(), argument_origin(value)))
+        .collect();
+    khive_runtime::audit_context::OperationAuditContext {
+        index: u32::try_from(index).expect("request operation count is bounded below u32::MAX"),
+        argument_origins,
+    }
+}
+
+fn argument_origin(argument: &ArgValue) -> khive_runtime::ArgumentOrigin {
+    fn count(argument: &ArgValue, literals: &mut usize, references: &mut usize) {
+        match argument {
+            ArgValue::Value(_) => *literals += 1,
+            ArgValue::PrevRef { .. } => *references += 1,
+            ArgValue::Array(items) => {
+                for item in items {
+                    count(item, literals, references);
+                }
+            }
+            ArgValue::Object(fields) => {
+                for (_, value) in fields {
+                    count(value, literals, references);
+                }
+            }
+        }
+    }
+
+    let (mut literals, mut references) = (0, 0);
+    count(argument, &mut literals, &mut references);
+    match (literals > 0, references > 0) {
+        (true, false) | (false, false) => khive_runtime::ArgumentOrigin::Literal,
+        (false, true) => khive_runtime::ArgumentOrigin::ResolvedReference,
+        (true, true) => khive_runtime::ArgumentOrigin::Mixed,
     }
 }
 
@@ -2241,6 +2287,9 @@ async fn dispatch_via_coordinator_inner(
                         // already authorized this namespace before handler-level
                         // search validation runs inside the intercepted closure.
                         let request = ValidatedSearchRequest::from_value(handler_args, registry)?;
+                        khive_runtime::audit_context::record_effective_arguments(
+                            &request.effective_arguments(),
+                        );
                         let coord_result = coord
                             .fan_out_search(&request, &namespace, &extra_visible)
                             .await;
@@ -4751,7 +4800,7 @@ mod tests {
         (KhiveMcpServer::from_registry(registry), store, project_id)
     }
 
-    async fn assert_request_group_receipts(ops: &str) {
+    async fn assert_request_group_receipts(ops: &str, expected_second_origin: &str) {
         let (server, store, project_id) = request_group_digest_test_server();
         let response = server
             .dispatch_request_local(RequestParams {
@@ -4802,10 +4851,33 @@ mod tests {
                 && event.payload["resource"]["request_id"] == json!(16_470)
         }));
 
+        let mut operation_indices = Vec::new();
         let mut markers: Vec<&str> = page
             .items
             .iter()
             .map(|event| {
+                let operation_index = event.payload["operation_index"]
+                    .as_u64()
+                    .expect("audit rows identify their operation within the request group");
+                operation_indices.push(operation_index);
+                assert_eq!(
+                    event.payload["argument_origins"]["marker"],
+                    json!(if operation_index == 0 {
+                        "literal"
+                    } else {
+                        expected_second_origin
+                    }),
+                    "audit rows distinguish literal arguments from resolved chain references"
+                );
+                let resolved = event.payload["resolved_arguments"]
+                    .as_object()
+                    .expect("audit rows identify resolved arguments without storing values");
+                let effective = event.payload["effective_arguments"].as_object().expect(
+                    "audit rows identify effective handler arguments without storing values",
+                );
+                assert_eq!(resolved["digest"], effective["digest"]);
+                assert_eq!(resolved["keys"], json!(["marker"]));
+                assert_eq!(effective["keys"], json!(["marker"]));
                 assert_eq!(
                     event.payload["result"]["receipt_id"],
                     json!(event.id),
@@ -4822,8 +4894,11 @@ mod tests {
                 marker
             })
             .collect();
+        operation_indices.sort_unstable();
+        assert_eq!(operation_indices, vec![0, 1]);
         markers.sort_unstable();
-        assert_eq!(markers, vec!["first", "second"]);
+        assert_eq!(markers.len(), 2);
+        assert!(markers.contains(&"first"));
         assert!(returned_by_marker.is_empty());
         assert_ne!(page.items[0].id, page.items[1].id);
     }
@@ -4832,12 +4907,86 @@ mod tests {
     async fn duplicate_digest_batch_and_chain_share_request_group_but_keep_distinct_receipts() {
         assert_request_group_receipts(
             r#"[git.digest(marker="first"), git.digest(marker="second")]"#,
+            "literal",
         )
         .await;
         assert_request_group_receipts(
-            r#"git.digest(marker="first") | git.digest(marker="second")"#,
+            r#"git.digest(marker="first") | git.digest(marker=$prev.receipt_id)"#,
+            "resolved_reference",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn task_create_audit_distinguishes_resolved_and_hook_finalized_arguments() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local");
+        let store = runtime.events(&token).expect("event store");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(khive_pack_gtd::GtdPack::new(runtime.clone()));
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("task-create registry");
+        runtime.install_edge_rules(registry.all_edge_rules());
+        let server = KhiveMcpServer::from_registry(registry);
+
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"create(kind="task", title="Ship audit attribution", priority="p1")"#
+                    .to_string(),
+                request_id: Some(20_470),
+                ..Default::default()
+            })
+            .await
+            .expect("task create succeeds");
+        let envelope: Value = serde_json::from_str(&response).expect("JSON response");
+        assert_eq!(envelope["summary"]["succeeded"], 1, "{envelope}");
+
+        let page = store
+            .query_events(
+                EventFilter {
+                    verbs: vec!["create".to_string()],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query create audit");
+        assert_eq!(page.items.len(), 1);
+        let payload = &page.items[0].payload;
+        assert_eq!(payload["operation_index"], 0);
+        assert_eq!(payload["argument_origins"]["kind"], "literal");
+        assert_eq!(payload["argument_origins"]["title"], "literal");
+        assert_eq!(payload["argument_origins"]["priority"], "literal");
+        assert_eq!(
+            payload["resolved_arguments"]["keys"],
+            json!(["kind", "priority", "title"])
+        );
+        let effective_keys = payload["effective_arguments"]["keys"]
+            .as_array()
+            .expect("effective top-level keys");
+        for key in [
+            "content",
+            "name",
+            "namespace",
+            "note_kind",
+            "properties",
+            "salience",
+        ] {
+            assert!(
+                effective_keys.contains(&json!(key)),
+                "missing {key}: {payload}"
+            );
+        }
+        assert_ne!(
+            payload["resolved_arguments"]["digest"], payload["effective_arguments"]["digest"],
+            "post-gate task hook mutation must be reconstructible without storing values"
+        );
     }
 
     async fn dispatch_large_result_through_daemon(

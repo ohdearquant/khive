@@ -847,3 +847,48 @@ The revised sections above (principle 5, the dispatch sketch, §"Gate `Err`: fai
 the pack-policy rule, the rationale, the consequences bullet, and Amendment 2's context)
 were updated in the same change that landed the behaviour, per ADR-129 Stage 1a's
 documentation requirement.
+
+---
+
+## Amendment 4 (2026-08-30) — Argument semantics and forensic identities
+
+### Context
+
+`GateRequest.args` is built at the dispatch boundary, before pack-level validation and
+canonicalization. A `KindHook::prepare_create` can finalize a create envelope after an allow
+decision, and multi-backend search constructs `ValidatedSearchRequest` inside the intercepted
+post-gate closure. Moving those stateful, registry-dependent operations ahead of the gate would
+change normal dispatch ordering and could perform handler work for a request that authorization
+must refuse.
+
+Composed MCP requests add another distinction: `$prev` is resolved before the gate, so the gate
+sees the resolved value but not whether the caller wrote that value literally or obtained it from
+the prior operation.
+
+### Decision
+
+1. The authorization contract is actor/namespace/verb scoped. `GateRequest.args` remains the
+   resolved transport envelope at dispatch entry: after MCP `$prev` substitution, but before
+   handler validation, defaults, kind hooks, or coordinator canonicalization.
+2. `input.args` is therefore **not an authoritative representation of effective semantic
+   arguments**. A policy must not assume that argument-conditioned authorization over this field
+   describes the final handler request. Semantic constraints belong at the handler seam unless a
+   future amendment introduces a shared pre-gate canonicalizer or a second gate check.
+3. Durable audit events add a zero-based `operation_index`, per-top-level `argument_origins`
+   (`literal`, `resolved_reference`, or `mixed`), and non-reversible identities for both
+   `resolved_arguments` and `effective_arguments`. The identity is a BLAKE3 digest of a
+   secret-masked canonical JSON projection plus a bounded, sorted list of masked top-level keys;
+   argument values are never persisted.
+4. `effective_arguments` is added only after an allowed operation reaches its pack/coordinator.
+   Denied, gate-unavailable, and unknown-verb rows retain the resolved identity but have no
+   effective handler identity because no handler request existed.
+
+### Consequences
+
+- Existing Rego input shape and gate-before-handler ordering remain compatible.
+- A forensic query can map same-verb rows sharing one `request_id` back to parser positions and
+  distinguish a literal value from a resolved chain reference.
+- Hook/canonicalization drift is visible as differing resolved/effective digests without placing
+  caller values or credentials in the event store.
+- A future semantic-argument authorization design requires an explicit contract change; it cannot
+  silently reinterpret today's raw-envelope `input.args`.

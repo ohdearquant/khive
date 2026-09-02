@@ -11,11 +11,17 @@ input.actor.kind        # deployment-defined, non-empty actor kind
 input.actor.id          # caller id
 input.namespace         # khive namespace as a string
 input.verb              # verb being dispatched
-input.args              # raw JSON args for the verb
+input.args              # resolved transport args; pre-validation/canonicalization
 input.context.session_id   # optional
 input.context.timestamp    # optional RFC3339
 input.context.source       # optional ("mcp", "cli", ...)
 ```
+
+`input.args` preserves the stable raw-envelope policy input: MCP `$prev` references have been
+resolved, but handler defaults, kind hooks, and coordinator validation/canonicalization have not
+run. Policies MUST NOT treat it as the authoritative effective semantic request. The supported
+authorization scope is actor, namespace, and verb; semantic argument invariants are enforced at
+the handler seam. See ADR-018 Amendment 4.
 
 ## Decision Shape
 

@@ -8,6 +8,12 @@ reintroduce. The boundary constructs the KG pack's public
 `ValidatedSearchRequest` once, before fan-out, rather than parsing an ad-hoc
 subset of the search JSON.
 
+Gate ordering follows normal registry dispatch: authorization sees the resolved transport envelope
+first, then `ValidatedSearchRequest` performs semantic validation and canonicalization inside the
+allowed intercepted closure. Per ADR-018 Amendment 4, `input.args` is non-authoritative for final
+semantic authorization. The durable audit records masked identities for both shapes, so the
+ordering remains observable without persisting search terms or filter values.
+
 ## Complete search-filter contract (#1377)
 
 The validated request represents `kind`, `query`, `limit`, `entity_kind`,

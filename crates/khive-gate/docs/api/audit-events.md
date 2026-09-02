@@ -14,10 +14,20 @@ tracing and, when configured, to the runtime event store.
 | `obligations`                | policy obligations on allow; always `[]` on deny or gate unavailability |
 | `gate_impl`                  | backend name from `Gate::impl_name`                                     |
 | `session_id`                 | request-context correlation token when present                          |
+| `operation_index`            | zero-based parser position within a request group, when available       |
+| `argument_origins`           | top-level literal / resolved-reference / mixed provenance               |
+| `resolved_arguments`         | masked canonical digest and bounded keys for the pre-gate envelope      |
+| `effective_arguments`        | masked canonical digest and bounded keys after handler canonicalization |
 
 Field names are a public wire contract. Adding a field is compatible; removing or renaming one
 requires an architectural compatibility decision. `obligations` is always serialized so non-Rust
 consumers never need to distinguish absence from an empty array.
+
+Argument values are never stored. Each identity hashes a secret-masked, recursively key-sorted JSON
+projection with BLAKE3 and exposes only bounded, sorted, secret-masked top-level keys. A differing
+resolved/effective digest proves that post-gate validation or a kind hook changed the handler
+request without disclosing the values. `effective_arguments` is absent when no handler or
+coordinator ran (deny, gate outage, or unknown verb).
 
 ## `AuditEvent::from_check`
 
