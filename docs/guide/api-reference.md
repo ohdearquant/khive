@@ -1759,12 +1759,12 @@ indexes pass FTS5's rank-1 integrity check. Each truncation value contains `trun
 `discarded_bytes` counters derived from the actual embedding outcomes; atom source content remains
 complete in SQL and FTS.
 
-| Param         | Type            | Required | Notes                                                   |
-| ------------- | --------------- | -------- | ------------------------------------------------------- |
-| `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.             |
-| `batch_size`  | integer         | no       | Default 500, max 1000.                                  |
-| `insert_only` | bool            | no       | Deprecated no-op, accepted for API compatibility only.  |
-| `rebuild_ann` | bool            | no       | Rebuild the in-memory Vamana ANN index (default false). |
+| Param         | Type            | Required | Notes                                                           |
+| ------------- | --------------- | -------- | --------------------------------------------------------------- |
+| `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.                     |
+| `batch_size`  | integer         | no       | Default 500, max 1000.                                          |
+| `insert_only` | bool            | no       | Deprecated no-op, accepted for API compatibility only.          |
+| `rebuild_ann` | bool            | no       | Rebuild the in-memory Vamana ANN index (default false).         |
 | `rebuild_fts` | bool            | no       | Globally rebuild and verify atom + section FTS (default false). |
 
 ```
