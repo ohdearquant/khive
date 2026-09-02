@@ -55,6 +55,12 @@ kkernel mcp --db :memory: --no-embed
 Key flags: `--db`, `--actor`/`--namespace`, `--no-embed`, `--pack` (repeatable),
 `--config`, `--daemon`, `--transport <name>`, `--bind <addr>`.
 
+Every successful startup writes the resolved actor to stderr as
+`actor: "<id>" (resolved; attributed)` or explicitly marks the unattributed
+`local` fallback. This line is emitted at the forced `khive.boot` log target,
+so it remains visible under the default `--log warn` setting without touching
+the MCP stdout protocol.
+
 ### Transports are registerable
 
 `--transport` selects a foreground transport by name from a registry
@@ -253,6 +259,10 @@ kkernel exec 'create(kind="concept", name="X")' \
   --actor lambda:worker --expect-actor lambda:worker
 kkernel exec 'stats()' --expect-actor lambda:worker  # validate config/env resolution
 ```
+
+Before a successful dispatch, `exec` also writes the resolved actor line to
+stderr. This is symmetrical for attributed and `local` identities and leaves
+the JSON result on stdout unchanged.
 
 ---
 

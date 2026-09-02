@@ -423,6 +423,7 @@ pub async fn run_pending_events_with_config(
                 return Err(error.context("pending-events: build server"));
             }
         };
+    tracing::info!(target: "khive.boot", "{}", crate::serve::resolved_actor_disclosure(server.actor_id()));
     let rt = schedule_rt.ok_or_else(|| {
         anyhow::anyhow!(
             "pending-events: resolved pack set does not include \"schedule\"; nothing to drain"

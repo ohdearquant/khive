@@ -239,6 +239,22 @@ impl StorageBackend {
         }
     }
 
+    /// Read the applied schema version through the pool's ordinary reader or
+    /// writer, without running migrations. Unlike
+    /// [`migrations::inspect_schema_version`](crate::migrations::inspect_schema_version),
+    /// this goes through the already-open pool rather than a fresh boot-time
+    /// snapshot connection, so it tolerates a WAL sidecar left by this same
+    /// backend's own recent writes.
+    pub fn schema_version(&self) -> Result<u32, SqliteError> {
+        if self.is_read_only() {
+            let reader = self.pool.reader()?;
+            crate::migrations::read_schema_version(reader.conn())
+        } else {
+            let writer = self.pool.try_writer()?;
+            crate::migrations::read_schema_version(writer.conn())
+        }
+    }
+
     /// Inspect the coordinated V21 attachment cutover state.
     pub fn attachment_cutover_status(
         &self,
@@ -911,10 +927,92 @@ fn ann_root_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_storage::types::{SqlStatement, SqlValue};
+    use khive_storage::types::{EdgeFilter, SqlStatement, SqlValue};
+    use khive_storage::{EntityFilter, EventFilter};
 
     #[cfg(unix)]
     use khive_storage::test_support::freeze_snapshot_sidecars;
+
+    #[tokio::test]
+    async fn hot_path_guard_g2_file_backed_read_suite_uses_only_pooled_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = StorageBackend::sqlite(dir.path().join("hot_path_g2.db")).unwrap();
+        backend.prepare_core_schema().unwrap();
+
+        // Construct every store named by ADR-165 Slice 2 before the counter
+        // baseline. Accessor-time DDL/validation is not request read traffic.
+        let entities = backend.entities().unwrap();
+        let notes = backend.notes().unwrap();
+        let graph = backend.graph().unwrap();
+        let events = backend.events().unwrap();
+        let text = backend
+            .text_with_tokenizer("hot_path_g2", "unicode61")
+            .unwrap();
+        let agents = backend.agents().unwrap();
+        let attachments = backend.attachments().unwrap();
+        let sparse = backend.sparse("hot_path_g2").unwrap();
+        #[cfg(feature = "vectors")]
+        let vectors = backend.vectors("hot_path_g2", "test-model", 2).unwrap();
+        let sql = backend.sql();
+
+        let before = backend.pool().reader_acquisition_snapshot();
+        assert_eq!(
+            entities
+                .count_entities("local", EntityFilter::default())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(notes.count_notes("local", None).await.unwrap(), 0);
+        assert_eq!(graph.count_edges(EdgeFilter::default()).await.unwrap(), 0);
+        assert_eq!(
+            events.count_events(EventFilter::default()).await.unwrap(),
+            0
+        );
+        assert!(text
+            .get_document("local", uuid::Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(agents.get("no-such-agent").await.unwrap().is_none());
+        assert!(attachments
+            .get_attachment(uuid::Uuid::new_v4(), "primary")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(sparse.count().await.unwrap(), 0);
+        #[cfg(feature = "vectors")]
+        assert_eq!(vectors.count().await.unwrap(), 0);
+
+        let mut raw = sql.reader().await.unwrap();
+        assert!(matches!(
+            raw.query_scalar(SqlStatement {
+                sql: "SELECT 1".into(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .unwrap(),
+            Some(SqlValue::Integer(1))
+        ));
+
+        let after = backend.pool().reader_acquisition_snapshot();
+        let expected_pooled_delta = 9 + u64::from(cfg!(feature = "vectors"));
+        assert_eq!(
+            after.pooled_checkouts - before.pooled_checkouts,
+            expected_pooled_delta,
+            "each ordinary file-backed read must check out exactly one pooled reader"
+        );
+        assert_eq!(
+            after.standalone_opens, before.standalone_opens,
+            "ADR-166 G2: ordinary file-backed read verbs must not open standalone readers"
+        );
+        assert_eq!(after.active_pooled_checkouts, 0);
+        assert_eq!(
+            after.completed_pooled_checkouts - before.completed_pooled_checkouts,
+            expected_pooled_delta
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
