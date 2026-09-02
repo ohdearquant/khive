@@ -454,10 +454,17 @@ the batch summary, and MUST NOT be injected into `result`. Advisory objects
 have stable `code`, `severity`, `component`, `reason`, and `message` fields.
 Presentation and output-format transforms apply only to `result`, so callers
 receive advisory objects unchanged. Frame-budget degradation preserves the
-array even if an oversized `result` is replaced by a typed retryable
+array even if an oversized `result` is replaced by a typed
 `response_frame_budget_exceeded` error. That replacement changes `ok` to false
 and refreshes the batch summary; a discarded result is never reported as a
-successful empty response.
+successful empty response. The error is `retryable` only for an `Assertive`
+verb (no persisted side effect to duplicate); every other verb already
+committed its effect, so the entry instead carries `executed: true` and
+`retryable: false`, and the caller should read the outcome back rather than
+retry. This decision is made after the whole request has run — in a chain,
+every later operation has already executed by the time a frame-budget
+omission is applied to an earlier entry, so a later entry reports its real
+outcome and the omission itself is never a chain-abort trigger.
 
 The first governed advisory is
 `audit_persistence_skipped_read_only` (ADR-028 Amendment A2). It appears on

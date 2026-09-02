@@ -3020,6 +3020,20 @@ impl VerbRegistry {
         khive_types::VerbPresentationPolicy::Standard
     }
 
+    /// Resolve the declared [`VerbCategory`] for a verb name.
+    ///
+    /// Walks all registered handlers (including subhandlers) for the first
+    /// matching name and returns its speech-act category. Returns `None` for
+    /// an unregistered verb name, so a caller deciding transport-level
+    /// behavior (e.g. whether a post-dispatch condition is safe to retry)
+    /// can fail closed on an unknown verb instead of guessing a category.
+    pub fn verb_category(&self, verb: &str) -> Option<VerbCategory> {
+        self.packs
+            .iter()
+            .find_map(|pack| pack.handlers().iter().find(|h| h.name == verb))
+            .map(|handler| handler.category)
+    }
+
     /// Returns `true` if the named verb exists and is tagged
     /// `Visibility::Subhandler` (internal / operator-only).
     ///

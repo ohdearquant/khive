@@ -111,7 +111,10 @@ For example, a parallel batch can return:
 
 A failure in a parallel batch does not stop its siblings. In a chain, entries
 after the failure are returned as `{ "ok": false, "tool": "...", "aborted": true }`;
-the summary records their count in `aborted`.
+the summary records their count in `aborted`. A daemon frame-budget omission
+(below) is decided after the whole request has already run, so it never
+triggers this abort — any later chain entry already executed and is reported
+with its real outcome.
 
 A successful multi-backend search can still be incomplete when one backend is
 unavailable. In that case the search entry includes `"partial": true` and a
@@ -120,10 +123,14 @@ beside `result`. Check this operation-level advisory even when `ok` and the
 aggregate request `status` report success. It survives batch/chain execution,
 presentation modes, and daemon frame-budget handling. If any successful result
 cannot fit the daemon response frame, that entry becomes an explicit
-`error.kind="response_frame_budget_exceeded"` failure with `retryable: true`;
-reduce the verb's `limit` or result size and retry. The batch summary is updated,
-so a discarded page is never counted as succeeded. A degraded empty result
-instead carries the same diagnostics inside `error.kind="search_incomplete"`.
+`error.kind="response_frame_budget_exceeded"` failure. For an `Assertive`
+(read-only) verb this carries `retryable: true`; reduce the verb's `limit` or
+result size and retry. Every other verb already committed its effect before
+the transport discovered the response was too large, so the entry instead
+carries `executed: true` and `retryable: false` — read the outcome back
+rather than retry the operation. The batch summary is updated, so a discarded
+page is never counted as succeeded. A degraded empty result instead carries
+the same diagnostics inside `error.kind="search_incomplete"`.
 
 The inline `results`/`summary` envelope is the default. Set the optional
 `save_to` parameter to sink the full results to a JSONL file instead; `request`

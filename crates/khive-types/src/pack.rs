@@ -39,7 +39,13 @@ pub enum Visibility {
 /// use the category of their parent verb or `Assertive` as a sensible default.
 ///
 /// The category is a documentation / introspection tag. It is NOT used for
-/// permission checking, transport routing, or return-shape selection.
+/// permission checking or transport routing. The one sanctioned exception is
+/// deciding whether a post-dispatch transport failure (a result the caller
+/// never received) is safe to advertise as retryable: `Assertive` verbs have
+/// no persisted side effect to duplicate, so a lost response can be retried
+/// outright; every other category already committed a change before the
+/// transport failed, so retrying would repeat it (`VerbRegistry::verb_category`
+/// in `khive-runtime`, consumed by the MCP daemon's frame-budget omission).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerbCategory {
     /// Speaker represents a state of affairs — retrieves and presents facts.

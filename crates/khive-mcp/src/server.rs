@@ -37,8 +37,8 @@ use khive_request::{
 };
 use khive_runtime::{
     present, render_format, InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError,
-    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
-    VerbRegistry, VerbRegistryBuilder,
+    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbCategory,
+    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_types::RefusalReason;
 
@@ -3706,7 +3706,7 @@ fn render_result(
                 .collect();
             let out_map = match daemon_frame_config_id {
                 Some(config_id) => {
-                    fit_rendered_batch_envelope(map, results, out_results, config_id)
+                    fit_rendered_batch_envelope(map, results, out_results, config_id, registry)
                 }
                 None => {
                     let mut out_map = map.clone();
@@ -3790,6 +3790,7 @@ fn fit_rendered_batch_envelope(
     compact_results: &[Value],
     mut out_results: Vec<Value>,
     served_config_id: &str,
+    registry: &VerbRegistry,
 ) -> serde_json::Map<String, Value> {
     let mut out_map = map.clone();
     out_map.insert(
@@ -3841,7 +3842,7 @@ fn fit_rendered_batch_envelope(
         .collect();
     by_size.sort_unstable_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
     for (index, _) in by_size {
-        out_results[index] = frame_budget_omission(&compact_results[index]);
+        out_results[index] = frame_budget_omission(&compact_results[index], registry);
         out_map.insert(
             "results".to_string(),
             serde_json::Value::Array(out_results.clone()),
@@ -3857,26 +3858,13 @@ fn fit_rendered_batch_envelope(
     out_map
 }
 
-fn frame_budget_omission(entry: &Value) -> Value {
+fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
     let ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let mut omitted = serde_json::Map::new();
     // `reason` is stable machine metadata, not payload detail. It is tiny and
     // must survive even when a large result/error body is omitted to fit the
     // daemon frame.
-    for key in [
-        "ok",
-        "tool",
-        "usage",
-        "aborted",
-        "reason",
-        "status",
-        "partial",
-        "missing_backends",
-        "backend_errors",
-        "backend_errors_truncated",
-        "backend_errors_omitted",
-        "advisories",
-    ] {
+    for key in ["ok", "tool", "usage", "aborted", "reason", "advisories"] {
         if let Some(value) = entry.get(key) {
             omitted.insert(key.to_string(), value.clone());
         }
@@ -3884,19 +3872,62 @@ fn frame_budget_omission(entry: &Value) -> Value {
     if ok {
         // Once the result is discarded, the operation is not a usable
         // success. In particular, a pager must not interpret the missing
-        // payload as an empty terminal page. Surface a small, typed safe-retry
-        // error and let the caller reduce its limit or result size.
+        // payload as an empty terminal page. Surface a small, typed error and
+        // let the caller read the outcome back or retry, depending on
+        // whether the verb already committed a change.
+        //
+        // This decision runs after `run_parsed` has already dispatched the
+        // operation (and, in a chain, every operation after it) — the frame
+        // budget is checked at render time, once the full envelope is known.
+        // A `Directive`/`Commissive`/`Declaration` verb already committed its
+        // effect before the transport discovered the response was too large,
+        // so advertising it as retryable risks a duplicate mutation; only an
+        // `Assertive` verb (or an unregistered/unknown tool name, which
+        // cannot be proven side-effect-free) is safe to advertise as
+        // retryable. This is the one sanctioned use of `VerbCategory` for a
+        // transport decision — see its doc comment in `khive-types`.
         omitted.insert("ok".to_string(), Value::Bool(false));
-        omitted.insert(
-            "error".to_string(),
-            json!({
-                "kind": "response_frame_budget_exceeded",
-                "code": "response_frame_budget_exceeded",
-                "message": "operation result exceeded the daemon response frame budget; reduce limit or result size and retry",
-                "retryable": true,
-                "max_frame_bytes": khive_runtime::daemon::MAX_FRAME_BYTES,
-            }),
-        );
+        let tool = entry.get("tool").and_then(Value::as_str);
+        let retryable = tool.is_some_and(|verb| {
+            matches!(registry.verb_category(verb), Some(VerbCategory::Assertive))
+        });
+        let message = if retryable {
+            "operation result exceeded the daemon response frame budget; reduce limit or \
+             result size and retry"
+        } else {
+            omitted.insert("executed".to_string(), Value::Bool(true));
+            "operation completed but its result exceeded the daemon response frame budget; \
+             read the outcome back instead of retrying the operation"
+        };
+        let mut error = serde_json::Map::from_iter([
+            ("kind".to_string(), json!("response_frame_budget_exceeded")),
+            ("code".to_string(), json!("response_frame_budget_exceeded")),
+            ("message".to_string(), json!(message)),
+            ("retryable".to_string(), json!(retryable)),
+            (
+                "max_frame_bytes".to_string(),
+                json!(khive_runtime::daemon::MAX_FRAME_BYTES),
+            ),
+        ]);
+        // ADR-130 defines `status`/`partial`/`missing_backends`/`backend_errors*`
+        // only on a successful search entry. Once `ok` flips to false here
+        // they no longer belong at the top level; fold any that were present
+        // into `error.search` instead of dropping the diagnostic outright.
+        let search_fields: serde_json::Map<String, Value> = [
+            "status",
+            "partial",
+            "missing_backends",
+            "backend_errors",
+            "backend_errors_truncated",
+            "backend_errors_omitted",
+        ]
+        .into_iter()
+        .filter_map(|key| entry.get(key).map(|value| (key.to_string(), value.clone())))
+        .collect();
+        if !search_fields.is_empty() {
+            error.insert("search".to_string(), Value::Object(search_fields));
+        }
+        omitted.insert("error".to_string(), Value::Object(error));
     } else {
         // ADR-130 §Compatibility (MCP envelope builder): `search_incomplete`
         // is small and typed — it must survive omission untransformed rather
@@ -4430,13 +4461,29 @@ mod tests {
         const NAME: &'static str = "large-result-test";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
-            name: "large_result",
-            description: "returns a caller-sized test result",
-            visibility: khive_runtime::Visibility::Verb,
-            category: khive_runtime::VerbCategory::Assertive,
-            params: &[],
-        }];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "large_result",
+                description: "returns a caller-sized test result",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "large_write",
+                description: "returns a caller-sized test result for a state-changing verb",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Commissive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "record_write",
+                description: "records a small committed write, for chain-ordering tests",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Commissive,
+                params: &[],
+            },
+        ];
     }
 
     #[async_trait::async_trait]
@@ -4459,11 +4506,17 @@ mod tests {
 
         async fn dispatch(
             &self,
-            _verb: &str,
+            verb: &str,
             params: Value,
             _registry: &VerbRegistry,
             _token: &khive_runtime::NamespaceToken,
         ) -> Result<Value, RuntimeError> {
+            if verb == "record_write" {
+                return Ok(json!({
+                    "committed": true,
+                    "marker": params.get("marker").cloned().unwrap_or(Value::Null),
+                }));
+            }
             if let Some(bytes) = params
                 .get("table_bytes")
                 .and_then(Value::as_u64)
@@ -5238,6 +5291,72 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn daemon_dispatch_marks_oversized_write_result_non_retryable_and_executed() {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!("large_write(bytes={result_bytes})"),
+            None,
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        assert_eq!(envelope["results"][0]["ok"], false);
+        assert!(envelope["results"][0].get("result").is_none());
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        // `large_write` is Commissive: it already committed its change before
+        // the transport discovered the response was too large to return, so
+        // a caller must not be told it is safe to retry the operation.
+        assert_eq!(envelope["results"][0]["error"]["retryable"], false);
+        assert_eq!(envelope["results"][0]["executed"], true);
+        assert!(rendered_response_fits_daemon_frame(
+            &response,
+            &server.config_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_chain_reports_later_write_truthfully_after_earlier_frame_budget_omission() {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!(r#"large_write(bytes={result_bytes}) | record_write(marker="second")"#),
+            None,
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        // The frame-budget decision is made at render time, after `run_parsed`
+        // has already dispatched every chain operation — `record_write` really
+        // ran and committed. Its entry must report that real outcome, not a
+        // fabricated `aborted: true`, even though the sibling entry before it
+        // is reported as failed.
+        assert_eq!(envelope["results"][0]["ok"], false);
+        assert_eq!(envelope["results"][0]["executed"], true);
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        assert_eq!(envelope["results"][1]["ok"], true);
+        assert_eq!(envelope["results"][1]["tool"], "record_write");
+        assert!(envelope["results"][1].get("aborted").is_none());
+        assert_eq!(envelope["results"][1]["result"]["committed"], true);
+        assert_eq!(envelope["results"][1]["result"]["marker"], "second");
+        assert_eq!(envelope["summary"]["total"], 2);
+        assert_eq!(envelope["summary"]["succeeded"], 1);
+        assert_eq!(envelope["summary"]["failed"], 1);
+        assert_eq!(envelope["summary"]["aborted"], 0);
+        // `batch_status` only distinguishes success/partial; a frame-budget
+        // omission must not be reported as an abort trigger.
+        assert_eq!(envelope["status"], "partial");
+    }
+
     #[test]
     fn read_only_audit_advisory_decorates_success_but_not_help_or_error() {
         let mut builder = VerbRegistryBuilder::new();
@@ -5274,36 +5393,115 @@ mod tests {
         assert!(response["results"][2].get("advisories").is_none());
         assert!(response["results"][3].get("advisories").is_none());
 
-        let omitted = frame_budget_omission(&response["results"][0]);
+        let omitted = frame_budget_omission(&response["results"][0], &registry);
         assert!(
             omitted.get("advisories").is_some(),
             "frame-budget degradation must preserve the warning"
         );
     }
 
+    /// Registry carrying just the verb categories the `frame_budget_omission`
+    /// unit tests below need to resolve: `search` (Assertive, matches the KG
+    /// pack) and `create` (Commissive, matches the KG pack).
+    struct FrameBudgetCategoryTestPack;
+
+    impl khive_types::Pack for FrameBudgetCategoryTestPack {
+        const NAME: &'static str = "frame-budget-category-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "search",
+                description: "test double matching the KG pack's Assertive search category",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "create",
+                description: "test double matching the KG pack's Commissive create category",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Commissive,
+                params: &[],
+            },
+        ];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for FrameBudgetCategoryTestPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({}))
+        }
+    }
+
+    fn frame_budget_category_test_registry() -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(FrameBudgetCategoryTestPack);
+        builder
+            .build()
+            .expect("frame-budget category test registry")
+    }
+
     #[test]
     fn frame_budget_omission_preserves_search_degradation_advisory() {
-        let omitted = frame_budget_omission(&json!({
-            "ok": true,
-            "tool": "search",
-            "result": "oversized",
-            "status": "partial",
-            "partial": true,
-            "missing_backends": ["archive"],
-            "backend_errors": {
-                "archive": {
-                    "kind": "backend_error",
-                    "message": "storage unavailable"
-                }
-            },
-        }));
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "search",
+                "result": "oversized",
+                "status": "partial",
+                "partial": true,
+                "missing_backends": ["archive"],
+                "backend_errors": {
+                    "archive": {
+                        "kind": "backend_error",
+                        "message": "storage unavailable"
+                    }
+                },
+            }),
+            &registry,
+        );
 
         assert_eq!(omitted["ok"], json!(false));
-        assert_eq!(omitted["status"], json!("partial"));
-        assert_eq!(omitted["partial"], json!(true));
-        assert_eq!(omitted["missing_backends"], json!(["archive"]));
+        // ADR-130 defines `status`/`partial`/`missing_backends`/`backend_errors`
+        // only on a successful search entry; once `ok` flips to false they no
+        // longer appear at the top level, but the diagnostic survives under
+        // `error.search`.
+        assert!(omitted.get("status").is_none());
+        assert!(omitted.get("partial").is_none());
+        assert!(omitted.get("missing_backends").is_none());
+        assert!(omitted.get("backend_errors").is_none());
+        assert_eq!(omitted["error"]["search"]["status"], json!("partial"));
+        assert_eq!(omitted["error"]["search"]["partial"], json!(true));
         assert_eq!(
-            omitted["backend_errors"]["archive"]["message"],
+            omitted["error"]["search"]["missing_backends"],
+            json!(["archive"])
+        );
+        assert_eq!(
+            omitted["error"]["search"]["backend_errors"]["archive"]["message"],
             json!("storage unavailable")
         );
         assert!(omitted.get("result").is_none());
@@ -5311,6 +5509,8 @@ mod tests {
             omitted["error"]["kind"],
             json!("response_frame_budget_exceeded")
         );
+        // `search` is Assertive: no persisted side effect to duplicate, so
+        // the caller may safely retry with a narrower query.
         assert_eq!(omitted["error"]["retryable"], json!(true));
     }
 
@@ -5467,17 +5667,22 @@ mod tests {
 
     #[test]
     fn frame_budget_omission_preserves_complete_search_status() {
-        let omitted = frame_budget_omission(&json!({
-            "ok": true,
-            "tool": "search",
-            "result": "oversized",
-            "status": "complete",
-        }));
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "search",
+                "result": "oversized",
+                "status": "complete",
+            }),
+            &registry,
+        );
 
         assert_eq!(omitted["ok"], json!(false));
-        assert_eq!(omitted["status"], json!("complete"));
+        assert!(omitted.get("status").is_none());
         assert!(omitted.get("partial").is_none());
         assert!(omitted.get("result").is_none());
+        assert_eq!(omitted["error"]["search"]["status"], json!("complete"));
         assert_eq!(
             omitted["error"]["code"],
             json!("response_frame_budget_exceeded")
@@ -5489,6 +5694,7 @@ mod tests {
     /// collapse to the generic omitted-error string.
     #[test]
     fn frame_budget_omission_preserves_search_incomplete_error_untransformed() {
+        let registry = frame_budget_category_test_registry();
         let error = json!({
             "kind": "search_incomplete",
             "message": "no-match was not established because selected backends failed",
@@ -5503,11 +5709,14 @@ mod tests {
             "backend_errors_truncated": true,
             "backend_errors_omitted": 2,
         });
-        let omitted = frame_budget_omission(&json!({
-            "ok": false,
-            "tool": "search",
-            "error": error,
-        }));
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": false,
+                "tool": "search",
+                "error": error,
+            }),
+            &registry,
+        );
 
         assert_eq!(omitted["ok"], json!(false));
         assert_eq!(omitted["error"], error);
@@ -5515,11 +5724,15 @@ mod tests {
 
     #[test]
     fn frame_budget_omission_still_collapses_other_large_errors() {
-        let omitted = frame_budget_omission(&json!({
-            "ok": false,
-            "tool": "create",
-            "error": { "kind": "invalid_input", "message": "x".repeat(10_000) },
-        }));
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": false,
+                "tool": "create",
+                "error": { "kind": "invalid_input", "message": "x".repeat(10_000) },
+            }),
+            &registry,
+        );
 
         assert_eq!(omitted["ok"], json!(false));
         assert_eq!(
@@ -5528,6 +5741,44 @@ mod tests {
                 "operation failed; error details omitted because the response frame budget was exceeded"
             )
         );
+    }
+
+    #[test]
+    fn frame_budget_omission_marks_commissive_verb_non_retryable() {
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "create",
+                "result": "oversized",
+            }),
+            &registry,
+        );
+
+        assert_eq!(omitted["ok"], json!(false));
+        assert_eq!(omitted["executed"], json!(true));
+        assert_eq!(omitted["error"]["retryable"], json!(false));
+        assert_eq!(
+            omitted["error"]["kind"],
+            json!("response_frame_budget_exceeded")
+        );
+    }
+
+    #[test]
+    fn frame_budget_omission_marks_unknown_verb_non_retryable() {
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "some_future_unregistered_verb",
+                "result": "oversized",
+            }),
+            &registry,
+        );
+
+        assert_eq!(omitted["ok"], json!(false));
+        assert_eq!(omitted["executed"], json!(true));
+        assert_eq!(omitted["error"]["retryable"], json!(false));
     }
 
     #[tokio::test]
@@ -5563,11 +5814,13 @@ mod tests {
             "reason": "gate-refusal",
         });
         let envelope = parallel_batch_envelope(vec![entry.clone()]);
+        let registry = frame_budget_category_test_registry();
         let fitted = fit_rendered_batch_envelope(
             envelope.as_object().expect("batch envelope object"),
             std::slice::from_ref(&entry),
             vec![entry.clone()],
             "test-config",
+            &registry,
         );
         let fitted = Value::Object(fitted);
 
