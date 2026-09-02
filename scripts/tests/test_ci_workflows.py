@@ -55,6 +55,57 @@ class UnlockedDependencyWorkflowTests(unittest.TestCase):
         self.assertIn("GITHUB_STEP_SUMMARY", workflow)
 
 
+class CoverageRatchetWorkflowTests(unittest.TestCase):
+    def test_measurement_job_reports_compute_unavailability(self):
+        workflow = workflow_text("ci.yml")
+        self.assertIn("  coverage-measurement:", workflow)
+        measurement = indented_block(workflow, "coverage-measurement", 2)
+
+        self.assertIn("name: Coverage measurement (advisory)", measurement)
+        self.assertIn("id: compute_coverage", measurement)
+        self.assertIn("continue-on-error: true", measurement)
+        self.assertIn(
+            "available: ${{ steps.compute_coverage.outcome == 'success' }}",
+            measurement,
+        )
+        self.assertIn("if: steps.compute_coverage.outcome != 'success'", measurement)
+        self.assertIn("Coverage measurement unavailable", measurement)
+        self.assertIn("GITHUB_STEP_SUMMARY", measurement)
+
+    def test_ratchet_requires_available_measurement_and_gate_tracks_both_jobs(self):
+        workflow = workflow_text("ci.yml")
+        measurement = indented_block(workflow, "coverage-measurement", 2)
+        ratchet = indented_block(workflow, "coverage-ratchet", 2)
+        gate = indented_block(workflow, "ci-gate", 2)
+
+        self.assertIn("needs: coverage-measurement", ratchet)
+        self.assertIn(
+            "if: needs.coverage-measurement.outputs.available == 'true'", ratchet
+        )
+        self.assertNotIn("cargo llvm-cov", ratchet)
+        self.assertIn("Check coverage does not regress", ratchet)
+        self.assertIn("- coverage-measurement", gate)
+        self.assertIn("- coverage-ratchet", gate)
+
+        self.assertIn(
+            "current: ${{ steps.compute_coverage.outputs.current }}", measurement
+        )
+        self.assertIn(
+            "CURRENT_COVERAGE: ${{ needs.coverage-measurement.outputs.current }}",
+            ratchet,
+        )
+
+    def test_measurement_reporting_step_is_best_effort(self):
+        workflow = workflow_text("ci.yml")
+        measurement = indented_block(workflow, "coverage-measurement", 2)
+        report_step = measurement.split(
+            "- name: Report unavailable coverage measurement", 1
+        )[1]
+
+        self.assertIn("continue-on-error: true", report_step)
+        self.assertIn("Coverage measurement unavailable", report_step)
+
+
 class AutoMergeGuardWorkflowTests(unittest.TestCase):
     def test_push_guard_has_only_required_write_permissions(self):
         workflow = workflow_text("ci.yml")
