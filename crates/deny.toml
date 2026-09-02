@@ -9,8 +9,9 @@
 # failed to *load* the DB on a CVSS 4.0 parse error — a DB-load failure, not a per-
 # advisory match. CI previously masked this with continue-on-error; advisory gating was
 # dormant. Fix (#208): the advisories step now runs a pinned cargo-deny 0.19.9, which
-# parses CVSS 4.0, loads the DB, and gates hard. The [advisories].ignore list below is
-# now ACTIVE. (RUSTSEC-2026-0073 is not in our tree and requires no ignore.)
+# parses CVSS 4.0, loads the DB, and gates hard. Advisory gating is now ACTIVE; the
+# [advisories].ignore list below is intentionally empty (RUSTSEC-2026-0073 is not in our
+# tree and requires no ignore).
 
 [graph]
 targets = [
