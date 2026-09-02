@@ -96,14 +96,14 @@ pub(super) mod retrieval_failpoints {
 
     pub fn hold_ann_build(model: &str) -> AnnBuildHook {
         let state = Arc::new(AnnBuildHookState::default());
-        let previous = ann_build_hooks()
-            .lock()
-            .unwrap()
-            .insert(model.to_owned(), Arc::clone(&state));
-        assert!(
-            previous.is_none(),
-            "detached ANN build hook already installed for {model}"
-        );
+        match ann_build_hooks().lock().unwrap().entry(model.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                panic!("detached ANN build hook already installed for {model}")
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Arc::clone(&state));
+            }
+        }
         AnnBuildHook {
             model: model.to_owned(),
             state,

@@ -1869,20 +1869,24 @@ mod tests {
         // Arm 2 — bounded-wait timeout: hold the cold model's real detached
         // ensure task unresolved so the receiver cannot win the timeout race.
         let build_hook = super::super::common::retrieval_failpoints::hold_ann_build(COLD_MODEL);
-        let outcome2 = super::super::common::collect_model_ann_hits(
-            &rt,
-            &ann,
-            &token,
-            "local",
-            &["local".to_string()],
-            COLD_MODEL.to_string(),
-            vec![0.0_f32; DIMS],
-            10,
-            40,
-            2,
-            0,
+        let outcome2 = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            super::super::common::collect_model_ann_hits(
+                &rt,
+                &ann,
+                &token,
+                "local",
+                &["local".to_string()],
+                COLD_MODEL.to_string(),
+                vec![0.0_f32; DIMS],
+                10,
+                40,
+                2,
+                0,
+            ),
         )
         .await
+        .expect("the readiness wait must stay bounded while the detached build is held")
         .expect("the wrapper must degrade to FTS-only, never propagate a retrieval failure");
 
         tokio::time::timeout(
