@@ -825,7 +825,34 @@ remain generic pool errors. `comm.send` preserves this typed retryable result
 without adding an outbound delivery probe: `comm.delivered` remains reserved
 for `SideEffectsUnknown`, where a write may already have committed.
 
-## Amendment 5 (2026-08-29): Bounded pre-execution BEGIN retry
+## Amendment 5 (2026-08-30): Ordinary proven-rollback finality
+
+This amendment supersedes Amendment 3's statement that a verified rollback after an ordinary
+operation or COMMIT error returns the unwrapped source error, and Amendment 2's flat-MCP-envelope
+claim. The finalizer must retain both facts:
+the original error determines capability and retry policy, while the verified rollback determines
+effect finality.
+
+After an operation error or COMMIT error, `ROLLBACK` success counts only when the same connection is
+back in autocommit mode. That path returns
+`StorageError::WriterTaskRequestFailed { request_state: TransactionRolledBack, source }`, where
+`source` is the original operation error or the `writer_task_commit` pool error. The wrapper is
+non-terminal: the drain loop receives no terminal state, the writer serves the next request, and
+the failed request closure is invoked exactly once. Its classifiers delegate to `source`; a proven
+rollback makes replay safe from duplicate SQLite effects but does not declare every source error
+transient.
+
+An unverified rollback remains `WriterTaskTerminated { request_state: SideEffectsUnknown }`, retires
+the writer seam, and never exposes the original error as though finality were known. Panic handling
+is unchanged: a caught wrapped panic is terminal even when its transaction rolls back.
+
+Runtime exposes the state, source retryability, and task-liveness bit as typed context. MCP emits
+that context under `writer_task_request_failed` or `writer_task_terminated`, with
+`request_state`, `task_terminated`, and `retryable` fields. Events protocol v3 carries a tagged
+request-failed versus task-terminated disposition, so `TransactionRolledBack` cannot be
+reconstructed as a terminal writer error merely because it crossed the daemon socket.
+
+## Amendment 6 (2026-08-29): Bounded pre-execution BEGIN retry
 
 The writer task absorbs a small, bounded number of the retry-safe refusals
 classified by Amendment 4. A transaction-wrapped request makes at most three

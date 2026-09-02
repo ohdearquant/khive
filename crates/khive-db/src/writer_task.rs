@@ -382,9 +382,12 @@ where
                 }
                 Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
                     RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
-                        result: Err(StorageError::Pool {
-                            operation: commit_operation.into(),
-                            message: commit_error.to_string(),
+                        result: Err(StorageError::WriterTaskRequestFailed {
+                            request_state: WriterTaskRequestState::TransactionRolledBack,
+                            source: Box::new(StorageError::Pool {
+                                operation: commit_operation.into(),
+                                message: commit_error.to_string(),
+                            }),
                         }),
                         terminal_state: None,
                         body,
@@ -405,7 +408,10 @@ where
         Ok(Err(operation_error)) => {
             match rollback_after_failure(conn, "request operation failure") {
                 RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
-                    result: Err(operation_error),
+                    result: Err(StorageError::WriterTaskRequestFailed {
+                        request_state: WriterTaskRequestState::TransactionRolledBack,
+                        source: Box::new(operation_error),
+                    }),
                     terminal_state: None,
                     body,
                     commit: Duration::ZERO,
@@ -1956,7 +1962,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(tx_registry)]
-    async fn operation_failure_with_successful_rollback_preserves_error_and_writer_continues() {
+    async fn operation_failure_with_successful_rollback_reports_finality_once_and_continues() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_task_operation_rollback.db");
         let pool = file_pool(&path);
@@ -1969,8 +1975,11 @@ mod tests {
         }
         let handle = spawn(&pool, 8).expect("writer task spawn");
 
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executions_in_op = Arc::clone(&executions);
         let original_error = handle
-            .send(|conn| -> Result<(), StorageError> {
+            .send(move |conn| -> Result<(), StorageError> {
+                executions_in_op.fetch_add(1, Ordering::SeqCst);
                 conn.execute("INSERT INTO t (id, v) VALUES (1, 'rolled-back')", [])
                     .map_err(|e| StorageError::Pool {
                         operation: "test_operation_error_insert".into(),
@@ -1981,13 +1990,23 @@ mod tests {
                 ))
             })
             .await;
-        assert!(
-            matches!(
-                &original_error,
-                Err(StorageError::Internal(message))
-                    if message == "intentional operation failure"
+        match &original_error {
+            Err(StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            }) => assert!(
+                matches!(source.as_ref(), StorageError::Internal(message)
+                    if message == "intentional operation failure"),
+                "the proven-rollback wrapper must retain the typed operation error: {source:?}"
             ),
-            "a confirmed rollback must preserve the operation error, got {original_error:?}"
+            other => panic!(
+                "a confirmed rollback must carry TransactionRolledBack and preserve the operation error, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "finality propagation must not replay the request closure"
         );
 
         let affected = handle
@@ -2001,6 +2020,11 @@ mod tests {
             .await
             .expect("the writer must continue after a confirmed rollback");
         assert_eq!(affected, 1);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "serving a follow-up request must not replay the rolled-back closure"
+        );
 
         let reader = pool.reader().expect("reader");
         let rolled_back: i64 = reader
@@ -2017,7 +2041,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(tx_registry)]
-    async fn commit_failure_with_successful_rollback_preserves_error_and_writer_continues() {
+    async fn commit_failure_with_successful_rollback_reports_finality_once_and_continues() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_task_commit_rollback.db");
         let pool = file_pool(&path);
@@ -2030,8 +2054,11 @@ mod tests {
         }
         let handle = spawn(&pool, 8).expect("writer task spawn");
 
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executions_in_op = Arc::clone(&executions);
         let commit_error = handle
-            .send(|conn| -> Result<usize, StorageError> {
+            .send(move |conn| -> Result<usize, StorageError> {
+                executions_in_op.fetch_add(1, Ordering::SeqCst);
                 let affected = conn
                     .execute("INSERT INTO t (id, v) VALUES (1, 'rolled-back')", [])
                     .map_err(|e| StorageError::Pool {
@@ -2046,14 +2073,19 @@ mod tests {
                 Ok(affected)
             })
             .await;
-        assert!(
-            matches!(
-                &commit_error,
-                Err(StorageError::Pool { operation, .. })
-                    if operation == "writer_task_commit"
+        match &commit_error {
+            Err(StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            }) => assert!(
+                matches!(source.as_ref(), StorageError::Pool { operation, .. }
+                    if operation == "writer_task_commit"),
+                "the proven-rollback wrapper must retain the typed COMMIT error: {source:?}"
             ),
-            "a confirmed rollback must preserve the commit error, got {commit_error:?}"
-        );
+            other => panic!(
+                "a confirmed rollback must carry TransactionRolledBack and preserve the COMMIT error, got {other:?}"
+            ),
+        }
         assert!(
             commit_error
                 .as_ref()
@@ -2061,6 +2093,11 @@ mod tests {
                 .is_retryable(),
             "the existing retryable commit-error contract must remain unchanged after a \
              confirmed rollback"
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "finality propagation must not replay the request closure"
         );
 
         let affected = handle
@@ -2079,6 +2116,11 @@ mod tests {
             .await
             .expect("the writer must continue after the failed COMMIT is rolled back");
         assert_eq!(affected, 1);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "serving a follow-up request must not replay the rolled-back closure"
+        );
 
         let reader = pool.reader().expect("reader");
         let rolled_back: i64 = reader
@@ -2141,9 +2183,12 @@ mod tests {
         let conn = Connection::open_in_memory().expect("in-memory connection");
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
             .unwrap();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executions_in_op = Arc::clone(&executions);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let request = WriteRequest {
-            op: Box::new(|conn| -> Result<usize, StorageError> {
+            op: Box::new(move |conn| -> Result<usize, StorageError> {
+                executions_in_op.fetch_add(1, Ordering::SeqCst);
                 let affected = conn
                     .execute("INSERT INTO t (id) VALUES (1)", [])
                     .map_err(|e| StorageError::Pool {
@@ -2177,6 +2222,7 @@ mod tests {
             .try_recv()
             .expect("active request must receive a typed terminal reply");
         assert_writer_task_terminal_state(reply, WriterTaskRequestState::SideEffectsUnknown);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
         assert!(
             !conn.is_autocommit(),
             "the denied COMMIT and ROLLBACK must leave the test connection poisoned"
@@ -2283,9 +2329,12 @@ mod tests {
         let conn = Connection::open_in_memory().expect("in-memory connection");
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
             .unwrap();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executions_in_op = Arc::clone(&executions);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let request = WriteRequest {
-            op: Box::new(|conn| -> Result<(), StorageError> {
+            op: Box::new(move |conn| -> Result<(), StorageError> {
+                executions_in_op.fetch_add(1, Ordering::SeqCst);
                 conn.authorizer(Some(deny_rollback))
                     .map_err(|e| StorageError::Pool {
                         operation: "test_install_authorizer".into(),
@@ -2315,6 +2364,7 @@ mod tests {
             .try_recv()
             .expect("active request must receive a typed terminal reply");
         assert_writer_task_terminal_state(reply, WriterTaskRequestState::SideEffectsUnknown);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
         assert!(
             !conn.is_autocommit(),
             "the denied ROLLBACK must leave the test connection poisoned"
