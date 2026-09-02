@@ -189,12 +189,13 @@ frozen `until`; temporary absence is not evidence that the pass failed or commit
    query material stripped from it. A clone/fetch failure hit later, while repairing a
    missing object during commit walking against an already-cached clone (a bounded
    refetch-then-reclone attempt), is not raised as `RemoteFetchError`. A git-level refetch
-   failure is followed by the one guarded reclone, and a reclone that succeeds lets the
-   ingest complete normally; only when that bounded repair ultimately fails (a non-git
-   refetch failure, or a failed reclone) is the failure wrapped as a plain error that
-   reaches the caller as `InvalidInput`. A source that cannot be parsed as a local path or
-   a remote URL also stays `InvalidInput`, and storage failures keep their existing error
-   types.
+   failure is followed by the one guarded reclone, and each successful repair earns exactly
+   one more snapshot attempt: the ingest completes normally only when that attempt
+   succeeds. When the bounded repair ultimately fails (a non-git refetch failure, a failed
+   reclone, or a snapshot that still fails after the reclone) the failure is wrapped as a
+   plain error that reaches the caller as `InvalidInput`; no third repair is attempted. A
+   source that cannot be parsed as a local path or a remote URL also stays `InvalidInput`,
+   and storage failures keep their existing error types.
 
 ### Accepted cache crash-residue rider (2026-08-09)
 
