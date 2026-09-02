@@ -172,7 +172,7 @@ containment and file identity after opening and reads at most 8 MiB plus one sen
 byte.
 
 This is a pinned DB-backed snapshot, not a live mutable query and not arbitrary URL
-ingest. See ADR-147 Amendments 1–4 and the repository-showcase CLI guide.
+ingest. See ADR-147 Amendments 1–5 and the repository-showcase CLI guide.
 
 ## Adapter boundary
 
