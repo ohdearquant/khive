@@ -3,7 +3,8 @@
 **Status**: accepted\
 **Date**: 2026-05-23\
 **Authors**: khive maintainers
-**Amended by**: [ADR-062](ADR-062-fts-ann-consolidation.md), which adds schema version 4.
+**Amended by**: [ADR-062](ADR-062-fts-ann-consolidation.md), which adds schema version 4
+and records the indexed FTS record-kind classifier added by schema version 23.
 
 ## Context
 
@@ -150,9 +151,10 @@ above remains the historical pre-consolidation record.
 |     V20 | ADR-091 / #1850    | blob_gc_claims                     | shipped |
 |     V21 | ADR-121 / ADR-160  | attachments_first_class            | shipped |
 |     V22 | #2166              | notes_unread_probe_recipient       | shipped |
-|     V23 | #2273              | knowledge_fts_repair               | shipped |
+|     V23 | ADR-062 / #1907    | fts_record_kind                    | shipped |
+|     V24 | #2273              | knowledge_fts_repair               | shipped |
 
-> **V23 record (2026-08-29)**: `knowledge_fts_repair` recreates atom FTS against
+> **V24 record (2026-08-29)**: `knowledge_fts_repair` recreates atom FTS against
 > the live-row `knowledge_atoms_fts_content` view, installs symmetric lifecycle
 > triggers, and rebuilds both knowledge external-content indexes. This makes
 > rank-1 FTS5 integrity checks meaningful while repairing historical section
@@ -207,6 +209,18 @@ above remains the historical pre-consolidation record.
 > is derived from the marker row's absence, never stored. The V21 ledger row is
 > inserted only in the final transaction that swaps claim fences and drops
 > `entities.content_ref`.
+
+> **V22 record (2026-08-30, #2166)**:
+> `notes_unread_probe_recipient` replaces the recipient-blind unread partial
+> index with a recipient-leading shape used by comm inbox projections.
+
+> **V23 record (2026-08-30, ADR-062 / #1907)**:
+> `fts_record_kind` rebuilds the two shared FTS5 tables with an indexed
+> granular `record_kind` classifier. Existing entity and note rows backfill the
+> classifier from their base-table `kind`; unmatched legacy FTS rows are
+> retained with an empty classifier. Memory recall can therefore intersect
+> `record_kind : "memory"` inside MATCH before ranking while an exact SQL
+> predicate remains the correctness backstop.
 
 > **Phase 4a compatibility record (2026-08-16, ADR-111 / ADR-160)**: the
 > separately deployed GC compatibility epoch gate does not add attachments,

@@ -146,7 +146,9 @@ const V20_UP: &str = include_str!("../sql/020-blob-gc-claims.sql");
 
 const V22_UP: &str = include_str!("../sql/022-notes-unread-probe-recipient.sql");
 
-const V23_UP: &str = include_str!("../sql/023-knowledge-fts-repair.sql");
+const V23_UP: &str = include_str!("../sql/023-fts-record-kind.sql");
+
+const V24_UP: &str = include_str!("../sql/024-knowledge-fts-repair.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -315,8 +317,13 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
     VersionedMigration {
         version: 23,
-        name: "knowledge_fts_repair",
+        name: "fts_record_kind",
         up: V23_UP,
+    },
+    VersionedMigration {
+        version: 24,
+        name: "knowledge_fts_repair",
+        up: V24_UP,
     },
 ];
 
