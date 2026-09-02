@@ -191,6 +191,6 @@ former file-only `open_standalone_reader` arm makes those tests fail. The only
 request-path standalone delta allowed by the guard is an explicitly requested
 multi-call deferred read transaction, tested separately from ordinary traffic.
 `hot_path_guard_g2_file_backed_read_suite_uses_only_pooled_readers` exercises
-entity, note, graph, event, text, raw-SQL, and (when enabled) vector reads through
-one file-backed backend and asserts one pooled checkout per operation with no
-standalone-open delta.
+entity, note, graph, event, text, agent, attachment, sparse, raw-SQL, and (when
+enabled) vector reads through one file-backed backend and asserts one pooled
+checkout per operation with no standalone-open delta.

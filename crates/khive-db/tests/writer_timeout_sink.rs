@@ -148,7 +148,6 @@ fn read_only_pool_does_not_claim_sink_and_later_writable_pool_can() {
     let count: i64 = read_only_pool
         .reader()
         .unwrap()
-        .tracked_conn()
         .query_row("SELECT COUNT(*) FROM inspected", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 1);

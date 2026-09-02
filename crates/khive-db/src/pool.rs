@@ -581,8 +581,9 @@ impl<'pool> ReaderGuard<'pool> {
     /// raw-SQL route that already calls [`Self::mark_dirty`] itself, so this
     /// stays crate-private: it is the untracked half of the pristine-return
     /// contract, and a caller outside the crate has no way to pay into that
-    /// contract by calling `mark_dirty` (also crate-private). Use
-    /// [`Self::tracked_conn`] instead outside `khive-db`.
+    /// contract by calling `mark_dirty` (also crate-private). A raw
+    /// `&Connection` is never handed to a caller outside `khive-db` — use
+    /// [`Self::query_row`] instead, which admits only read-shaped SQL.
     pub(crate) fn conn(&self) -> &Connection {
         match self
             .lease
@@ -594,15 +595,27 @@ impl<'pool> ReaderGuard<'pool> {
         }
     }
 
-    /// Access the connection from outside `khive-db`. Unlike the crate-private `conn`,
-    /// this unconditionally marks the checkout dirty first, so `Drop` always
-    /// pays the pristine-state scan (or, in degraded shared-lease mode, the
-    /// settings/rollback verification) on return — an external caller has no
-    /// other way to prove a raw statement it ran here left no connection-local
-    /// state behind.
-    pub fn tracked_conn(&self) -> &Connection {
+    /// Run one read-only statement against this reader lease and map the
+    /// first resulting row, for callers outside `khive-db`.
+    ///
+    /// Unlike a raw `Connection`, this never hands out a capability that can
+    /// change connection-local or database state: `sql` is checked against
+    /// the same allow-listed read-shape classifier
+    /// (`SELECT`/`WITH ... SELECT`/`VALUES`/`EXPLAIN`/a fixed read-only
+    /// `PRAGMA` set) the pooled `SqlReader` surface admits raw SQL through,
+    /// and anything else — `BEGIN`, DML, DDL, a setting `PRAGMA`, `ATTACH`
+    /// — is refused before it ever reaches SQLite. An admitted statement
+    /// still marks the checkout dirty unconditionally, so `Drop` always pays
+    /// the pristine-state scan (or, in degraded shared-lease mode, the
+    /// settings/rollback verification) on return.
+    pub fn query_row<T, P, F>(&self, sql: &str, params: P, f: F) -> Result<T, SqliteError>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        crate::sql_bridge::reader_capability_admits(sql).map_err(SqliteError::InvalidData)?;
         self.mark_dirty();
-        self.conn()
+        Ok(self.conn().query_row(sql, params, f)?)
     }
 
     /// Fail closed when connection-global state could not be restored after
@@ -3554,57 +3567,79 @@ mod tests {
         );
     }
 
-    /// `ReaderGuard::conn` is crate-private: `khive-db` internals prove their
-    /// own reads never mutate, and raw-SQL routes already call `mark_dirty`
-    /// themselves. A caller outside the crate has neither guarantee, so it
-    /// can only reach the connection through `tracked_conn`, which marks the
-    /// checkout dirty unconditionally before returning the reference. Before
-    /// that encapsulation, a caller with only the public `conn`/`Deref`
-    /// surface (no access to the crate-private `mark_dirty`) could create a
-    /// TEMP table or flip a connection-local setting and hand the connection
-    /// back clean, and `Drop` would skip the pristine-state scan entirely —
-    /// exactly this state would then have leaked into the next checkout.
+    /// `ReaderGuard::conn` is crate-private and no method on `ReaderGuard`
+    /// ever returns a raw `&Connection` to a caller outside `khive-db` — the
+    /// only public accessor, `query_row`, must refuse anything that is not
+    /// an admitted read shape before it reaches SQLite at all, not merely
+    /// mark the checkout dirty after the fact. Before that encapsulation, a
+    /// caller with a raw connection could open a transaction, run DML, or
+    /// flip connection-local state on a lease meant to be read-only; a
+    /// `BEGIN`, an `INSERT`, and a setting `PRAGMA` must each be refused
+    /// here, and the probe rows/state they would have written must not
+    /// exist afterward.
     #[test]
-    fn tracked_conn_marks_the_checkout_dirty_so_unmarked_state_cannot_leak() {
+    fn query_row_refuses_write_and_transaction_control_statements() {
         let pool = ConnectionPool::new(PoolConfig {
             path: None,
             ..PoolConfig::default()
         })
         .unwrap();
-
-        {
-            let reader = pool.reader().unwrap();
-            // No explicit `mark_dirty()` call here — `tracked_conn` alone
-            // must be enough for `Drop` to catch this.
-            reader
-                .tracked_conn()
-                .execute_batch(
-                    "CREATE TEMP TABLE tracked_conn_leak_probe(id INTEGER PRIMARY KEY); \
-                     PRAGMA cache_size = -1234;",
-                )
-                .unwrap();
-        }
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch("CREATE TABLE query_row_admission_probe(id INTEGER PRIMARY KEY);")
+            .unwrap();
 
         let reader = pool.reader().unwrap();
-        let temp_table_survived: i64 = reader
-            .conn()
+        for (label, sql) in [
+            ("BEGIN", "BEGIN"),
+            (
+                "INSERT",
+                "INSERT INTO query_row_admission_probe(id) VALUES (1)",
+            ),
+            (
+                "CREATE TEMP TABLE",
+                "CREATE TEMP TABLE query_row_admission_probe_temp(id INTEGER PRIMARY KEY)",
+            ),
+            ("setting PRAGMA", "PRAGMA journal_mode = OFF"),
+        ] {
+            let result = reader.query_row(sql, [], |row| row.get::<_, i64>(0));
+            assert!(
+                result.is_err(),
+                "query_row must refuse {label} ({sql:?}); got {result:?}"
+            );
+        }
+
+        let row_count: i64 = reader
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'tracked_conn_leak_probe'",
+                "SELECT COUNT(*) FROM query_row_admission_probe",
                 [],
                 |row| row.get(0),
             )
-            .unwrap();
+            .expect("an admitted SELECT must still succeed");
+        assert_eq!(
+            row_count, 0,
+            "a refused INSERT must never have reached SQLite"
+        );
+        let temp_table_survived: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master \
+                 WHERE name = 'query_row_admission_probe_temp'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("an admitted SELECT must still succeed");
         assert_eq!(
             temp_table_survived, 0,
-            "a TEMP table created through tracked_conn must not survive to the next checkout"
+            "a refused CREATE TEMP TABLE must never have reached SQLite"
         );
-        let cache_size: i64 = reader
-            .conn()
-            .query_row("PRAGMA cache_size", [], |row| row.get(0))
-            .unwrap();
+        let journal_mode: String = reader
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("the read-only journal_mode PRAGMA form must still be admitted");
         assert_ne!(
-            cache_size, -1234,
-            "a setting changed through tracked_conn must be restored to baseline, not leaked"
+            journal_mode.to_ascii_lowercase(),
+            "off",
+            "a refused setting PRAGMA must never have reached SQLite"
         );
     }
 

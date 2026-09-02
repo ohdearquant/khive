@@ -759,6 +759,43 @@ fn skip_balanced_parens(rest: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// Skip one SQLite identifier — unquoted (`[A-Za-z0-9_]+`, as
+/// [`next_sqlite_token`] already recognizes), double-quoted or
+/// backtick-quoted (both honoring the doubled-quote-character escape), or
+/// bracket-quoted (no escape; SQLite's bracket form ends at the first `]`) —
+/// and return the bytes after it. A quoted CTE name may contain any byte,
+/// including `(` and `)`, so the CTE-list walk must skip the identifier
+/// itself rather than tokenizing it the way an unquoted keyword is.
+fn skip_sqlite_identifier(rest: &[u8]) -> Option<&[u8]> {
+    match *rest.first()? {
+        quote @ (b'"' | b'`') => {
+            let mut idx = 1;
+            loop {
+                match *rest.get(idx)? {
+                    byte if byte == quote => {
+                        idx += 1;
+                        if rest.get(idx) == Some(&quote) {
+                            idx += 1; // doubled-quote escape inside the identifier
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => idx += 1,
+                }
+            }
+            Some(&rest[idx..])
+        }
+        b'[' => {
+            let mut idx = 1;
+            while *rest.get(idx)? != b']' {
+                idx += 1;
+            }
+            Some(&rest[idx + 1..])
+        }
+        _ => next_sqlite_token(rest).map(|(_, next)| next),
+    }
+}
+
 /// Walk past the common-table-expression list following `WITH [RECURSIVE]`
 /// and return the bytes starting at the main statement's own head keyword.
 /// Each CTE body is skipped as a balanced parenthesized region
@@ -774,8 +811,8 @@ fn skip_common_table_expressions(tail: &[u8]) -> Option<&[u8]> {
         }
     }
     loop {
-        // CTE name.
-        let (_name, next) = next_sqlite_token(rest)?;
+        // CTE name — unquoted or SQLite-quoted (`"..."`, `` `...` ``, `[...]`).
+        let next = skip_sqlite_identifier(rest)?;
         rest = skip_sqlite_empty_prefix(next);
         // Optional column-name list.
         if rest.first() == Some(&b'(') {
@@ -829,7 +866,7 @@ fn skip_common_table_expressions(tail: &[u8]) -> Option<&[u8]> {
 /// without `RETURNING` — so a `WITH` head is admitted only after walking past
 /// its CTE list ([`skip_common_table_expressions`]) and confirming the main
 /// statement underneath is itself `SELECT` or `VALUES`.
-fn reader_capability_admits(sql: &str) -> Result<(), String> {
+pub(crate) fn reader_capability_admits(sql: &str) -> Result<(), String> {
     let rest = skip_sqlite_empty_prefix(sql.as_bytes());
     let Some((head, tail)) = next_sqlite_token(rest) else {
         // No head token (empty/comment-only statement): let SQLite's own
@@ -3778,6 +3815,66 @@ mod tests {
                 "reader capability must still admit {control:?}: {result:?}"
             );
         }
+    }
+
+    /// A CTE name may be a SQLite-quoted identifier — double-quoted,
+    /// backtick-quoted, or bracket-quoted — and is not restricted to the
+    /// unquoted `[A-Za-z0-9_]+` shape `skip_common_table_expressions` uses to
+    /// recognize an ordinary keyword. A quoted name containing parentheses
+    /// must still be admitted when the statement underneath the CTE list is
+    /// a read, and refused when it is a write, exactly like an unquoted name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_reader_capability_admission_of_quoted_cte_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_quoted_cte_admission_probe.db")),
+            max_readers: 2,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE quoted_cte_admission_probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL);",
+            )
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let controls: [&str; 3] = [
+            "WITH \"my (cte)\"(v) AS (SELECT 1) SELECT v FROM \"my (cte)\"",
+            "WITH `my (cte)`(v) AS (SELECT 1) SELECT v FROM `my (cte)`",
+            "WITH [my (cte)](v) AS (SELECT 1) SELECT v FROM [my (cte)]",
+        ];
+        for control in controls {
+            let mut reader = bridge.reader().await.unwrap();
+            let result = reader
+                .query_all(SqlStatement {
+                    sql: control.into(),
+                    params: vec![],
+                    label: Some("quoted-cte-admission-control".into()),
+                })
+                .await;
+            assert!(
+                result.is_ok(),
+                "reader capability must admit a quoted CTE name in {control:?}: {result:?}"
+            );
+        }
+
+        let write_probe = "WITH \"my (cte)\"(v) AS (SELECT 1) \
+             INSERT INTO quoted_cte_admission_probe(id, value) SELECT 1, v FROM \"my (cte)\"";
+        let mut reader = bridge.reader().await.unwrap();
+        let result = reader
+            .query_all(SqlStatement {
+                sql: write_probe.into(),
+                params: vec![],
+                label: Some("quoted-cte-admission-probe".into()),
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "reader capability must refuse a write statement under a quoted CTE name: {result:?}"
+        );
     }
 
     /// Regression for the in-memory reader path: `PoolBackedReader` (the

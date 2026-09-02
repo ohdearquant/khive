@@ -1526,3 +1526,21 @@ completed pooled hold time. The counters reset with pool reconstruction; point-
 in-time capacity/availability and active values are explicitly not lifetime
 counters. Completed hold time includes reset/replacement, so it measures the
 whole interval during which a checkout could withhold reusable capacity.
+
+### 2026-09-02 amendment (Amendment 14): `ReaderGuard` is a read-only capability outside `khive-db`
+
+A `ReaderGuard` returned by `ConnectionPool::reader` never hands a raw
+`rusqlite::Connection` to a caller outside `khive-db`. Internally, typed
+stores and raw-SQL routes reach the connection through the crate-private
+`ReaderGuard::conn`, proven read-only either by construction or by an
+explicit `mark_dirty` call before any state-changing statement. The one
+public accessor, `ReaderGuard::query_row`, checks `sql` against the same
+allow-listed read-shape classifier the pooled `SqlReader` surface uses for
+raw SQL (`SELECT`, `WITH ... SELECT`, `VALUES`, `EXPLAIN`, and a fixed
+read-only `PRAGMA` set) before it reaches SQLite, and refuses `BEGIN`, DML,
+DDL, `ATTACH`, and setting `PRAGMA`s outright — a lease never becomes a
+vector for opening a transaction or mutating the database. An admitted
+statement still marks the checkout dirty unconditionally, so `Drop` pays the
+pristine-state scan (or, in degraded shared-lease mode, the settings/
+rollback verification) before the connection is reused or the shared lease
+is released.
