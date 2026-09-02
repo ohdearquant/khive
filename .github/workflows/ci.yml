@@ -498,26 +498,37 @@ jobs:
         if: steps.cache-wasmtime.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz"
+          case "$RUNNER_ARCH" in
+            X64) wasmtime_arch="x86_64" ;;
+            ARM64) wasmtime_arch="aarch64" ;;
+            *)
+              echo "unsupported runner architecture for the wasmtime release asset: $RUNNER_ARCH" >&2
+              exit 1
+              ;;
+          esac
+          asset="wasmtime-${WASMTIME_VERSION}-${wasmtime_arch}-linux"
+          archive="$RUNNER_TEMP/${asset}.tar.xz"
           curl --fail --silent --show-error --location \
             --retry 5 --retry-all-errors --retry-max-time 300 \
             --output "$archive" \
-            "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz"
+            "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/${asset}.tar.xz"
           mkdir -p "$HOME/.wasmtime/bin"
           tar -xJf "$archive" \
             -C "$HOME/.wasmtime/bin" \
             --strip-components=1 \
-            "wasmtime-${WASMTIME_VERSION}-x86_64-linux/wasmtime"
+            "${asset}/wasmtime"
       - name: Verify wasmtime version
         run: |
           set -euo pipefail
           expected_version="${WASMTIME_VERSION#v}"
-          actual_version="$("$HOME/.wasmtime/bin/wasmtime" --version)"
-          if [[ "$actual_version" != "wasmtime ${expected_version}"* ]]; then
-            echo "expected wasmtime ${expected_version}, got: ${actual_version}" >&2
+          actual_output="$("$HOME/.wasmtime/bin/wasmtime" --version)"
+          actual_version="${actual_output#wasmtime }"
+          actual_version="${actual_version%% *}"
+          if [[ "$actual_version" != "$expected_version" ]]; then
+            echo "expected wasmtime ${expected_version}, got: ${actual_output}" >&2
             exit 1
           fi
-          echo "$actual_version"
+          echo "$actual_output"
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
       - name: wasm32-unknown-unknown compile check (ADR-101 D5)
         run: cargo check -p khive-changeset --target wasm32-unknown-unknown

@@ -85,8 +85,21 @@ class WasmtimeParityWorkflowTests(unittest.TestCase):
         self.assertIn("--retry-all-errors", job)
         self.assertIn("releases/download/${WASMTIME_VERSION}", job)
         self.assertNotIn("wasmtime.dev/install.sh", job)
-        self.assertIn('expected_version="${WASMTIME_VERSION#v}"', job)
-        self.assertIn('echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"', job)
+        self.assertIn('case "$RUNNER_ARCH" in', job)
+        self.assertIn('X64) wasmtime_arch="x86_64" ;;', job)
+        self.assertIn('ARM64) wasmtime_arch="aarch64" ;;', job)
+        self.assertNotIn("x86_64-linux.tar.xz", job)
+
+        verify_start = job.index("- name: Verify wasmtime version")
+        verify_step = job[verify_start : job.index("- name:", verify_start + 1)]
+        self.assertNotIn("if:", verify_step)
+        self.assertIn('expected_version="${WASMTIME_VERSION#v}"', verify_step)
+        self.assertIn('actual_version="${actual_version%% *}"', verify_step)
+        self.assertIn(
+            'if [[ "$actual_version" != "$expected_version" ]]; then', verify_step
+        )
+        self.assertNotIn('"wasmtime ${expected_version}"*', verify_step)
+        self.assertIn('echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"', verify_step)
 
 
 class BenchTrackWorkflowTests(unittest.TestCase):
