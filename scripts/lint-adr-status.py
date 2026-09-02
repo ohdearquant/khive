@@ -83,15 +83,28 @@ INLINE_STATUS = re.compile(r"^\s*(?:-\s*)?\*{0,2}\s*status\s*\*{0,2}\s*:", re.IG
 INLINE_STATUS_ANYWHERE = re.compile(r"\*{0,2}\bstatus\s*\*{0,2}\s*:", re.IGNORECASE)
 # A backtick-delimited inline code span. CommonMark opens and closes a span on
 # a run of the SAME length, so a shorter or longer backtick run inside does
-# not close it early — the backreference enforces that.
+# not close it early — the backreference enforces that. This handles the
+# common case where a span opens and closes on one line; `strip_code_spans`
+# below carries the state of a span that does not close before end of line.
 INLINE_CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)*?\1")
-# The destination portion of a Markdown link, `](...)`. A status-shaped
-# substring inside a URL (a path segment, a query string) is not a label.
-LINK_DESTINATION = re.compile(r"\]\([^)]*\)")
-# `## Status`, any heading level, nothing else on the line
-HEADING_STATUS = re.compile(r"^#{1,6}\s+status\s*$", re.IGNORECASE)
-# Any other `## ` heading closes the document header.
-SECTION_HEADING = re.compile(r"^#{2,6}\s+\S")
+# A run of backticks, used by `strip_code_spans` to find span delimiters
+# one at a time rather than requiring both ends on the same line.
+BACKTICK_RUN = re.compile(r"`+")
+# The destination portion of a Markdown link, `](...)`, allowing one level of
+# balanced parentheses inside it (CommonMark permits nested parens in a link
+# destination). A status-shaped substring inside a URL (a path segment, a
+# query string) is not a label.
+LINK_DESTINATION = re.compile(r"\]\((?:[^()]|\([^()]*\))*\)")
+# A CommonMark autolink, `<scheme:rest>` — no angle brackets or whitespace
+# inside. A status-shaped substring inside one is a URL fragment, not a label.
+AUTOLINK = re.compile(r"<[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^<>\s]*>")
+# `## Status`, any heading level, nothing else on the line. Up to three
+# leading spaces are allowed, matching `SECTION_HEADING` below.
+HEADING_STATUS = re.compile(r"^ {0,3}#{1,6}\s+status\s*$", re.IGNORECASE)
+# Any other `## ` heading closes the document header. CommonMark allows up to
+# three leading spaces before an ATX heading's `#`s; a fourth space (or a
+# tab) makes it indented code instead, which `INDENTED_CODE` handles.
+SECTION_HEADING = re.compile(r"^ {0,3}#{2,6}\s+\S")
 # Fenced code blocks and HTML comments are display text, not declarations. A
 # line-based parser with no notion of either counts a status-shaped example
 # inside them as real, which lets an ADR with no visible header status pass.
@@ -197,37 +210,87 @@ def strip_comments(line: str, in_comment: bool) -> tuple[str, bool]:
 
 
 def strip_inline_noise(line: str) -> str:
-    """`line` with inline code spans and link destinations removed.
+    """`line` with inline code spans, link destinations, and autolinks removed.
 
     Used only for counting "Status:" labels on an already-matched header
-    line: a label inside a backtick-delimited code span or a Markdown link
-    destination (`](...)`) is display text or a URL fragment, not a second
-    declaration.
+    line: a label inside a backtick-delimited code span, a Markdown link
+    destination (`](...)`), or an autolink (`<scheme:...>`) is display text
+    or a URL fragment, not a second declaration.
     """
     line = INLINE_CODE_SPAN.sub("", line)
-    return LINK_DESTINATION.sub("", line)
+    line = LINK_DESTINATION.sub("", line)
+    return AUTOLINK.sub("", line)
+
+
+def strip_code_spans(line: str, open_ticks: str | None) -> tuple[str, str | None]:
+    """`line` with backtick code-span content removed, plus the carried span state.
+
+    A span opened by a run of N backticks stays open — including across a
+    line break within the same paragraph — until a run of exactly N
+    backticks is found (a shorter or longer run does not close it, same rule
+    as `INLINE_CODE_SPAN`). The caller resets `open_ticks` to None on a blank
+    line: a code span cannot cross a paragraph boundary, so an opener with no
+    closer before one is display text from there on, not a permanently
+    hidden span. Text outside spans, and text after a span closes, survives.
+    """
+    out: list[str] = []
+    i = 0
+    while True:
+        if open_ticks is not None:
+            close = re.search(rf"(?<!`){re.escape(open_ticks)}(?!`)", line[i:])
+            if close is None:
+                return "".join(out), open_ticks
+            i += close.end()
+            open_ticks = None
+            continue
+        m = BACKTICK_RUN.search(line, i)
+        if m is None:
+            out.append(line[i:])
+            return "".join(out), None
+        out.append(line[i : m.start()])
+        ticks = m.group()
+        close = re.search(rf"(?<!`){re.escape(ticks)}(?!`)", line[m.end() :])
+        if close is None:
+            return "".join(out), ticks
+        i = m.end() + close.end()
 
 
 def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
     """Per-line declaration-relevant text: fences, indented code, and comments removed.
 
-    `visible[i]` is the line with comment spans stripped, or None inside a
-    fenced or indented-code block; `hidden[i]` marks every line that carries
-    no declaration-relevant text at all — fence delimiters and indented-code
-    lines alike. A fenced block closes only on its opener's own character, at
-    least as many of them, and nothing but whitespace after (CommonMark);
-    other fence-shaped lines inside the block are content. Fence openers
-    inside a comment do not open a fence, and comment openers inside a fence
-    do not open a comment — each construct is display text within the other.
-    An indented-code line (see `INDENTED_CODE`) is recognised the same way,
-    only outside a fence and outside a comment; `prev_blank` tracks whether
-    the immediately preceding line was blank, which is what the simplified
-    indented-code rule keys on.
+    `visible[i]` is the line with comment spans and inline code spans
+    stripped, or None inside a fenced or indented-code block; `hidden[i]`
+    marks every line that carries no declaration-relevant text at all —
+    fence delimiters and indented-code lines alike. A fenced block closes
+    only on its opener's own character, at least as many of them, and
+    nothing but whitespace after (CommonMark); other fence-shaped lines
+    inside the block are content. Fence openers inside a comment do not open
+    a fence, and comment openers inside a fence do not open a comment — each
+    construct is display text within the other.
+
+    An indented-code line (see `INDENTED_CODE`) starts a region the same
+    way, only outside a fence and outside a comment: `prev_blank` tracks
+    whether the immediately preceding line was blank, which is what the
+    simplified indented-code rule keys on. Once a region has started,
+    `in_indented_code` keeps every following line hidden — including blank
+    lines inside it — for as long as each non-blank line stays indented 4+
+    spaces or led by a tab; the first non-blank, non-indented line ends the
+    region and is processed normally (it may itself open a fence or close
+    the header). Without tracking the region this way, only the FIRST
+    indented line after a blank would be hidden and a continuation line
+    (a second line of an indented example) would read as ordinary text.
+
+    A backtick code span (see `strip_code_spans`) that opens but does not
+    close on one line carries its open state into the next line the same
+    way, so a status label sitting on the second line of a multi-line span
+    is not read as a separate declaration.
     """
     visible: list[str | None] = []
     hidden: list[bool] = []
     fence_close: re.Pattern[str] | None = None
     in_comment = False
+    in_indented_code = False
+    code_open: str | None = None
     prev_blank = True
     for line in lines:
         if fence_close is not None:
@@ -252,13 +315,25 @@ def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
                 visible.append(None)
                 hidden.append(True)
                 prev_blank = False
+                in_indented_code = False
                 continue
+            if in_indented_code:
+                if line.strip() == "" or INDENTED_CODE.match(line):
+                    visible.append(None)
+                    hidden.append(True)
+                    prev_blank = line.strip() == ""
+                    continue
+                in_indented_code = False
             if prev_blank and INDENTED_CODE.match(line):
+                in_indented_code = True
                 visible.append(None)
                 hidden.append(True)
                 prev_blank = line.strip() == ""
                 continue
         text, in_comment = strip_comments(line, in_comment)
+        if line.strip() == "":
+            code_open = None  # a code span cannot cross a paragraph boundary
+        text, code_open = strip_code_spans(text, code_open)
         visible.append(text)
         hidden.append(False)
         prev_blank = line.strip() == ""
@@ -531,6 +606,40 @@ MUST_FAIL = {
         "\n"
         "## Context\n"
     ),
+    # The status-shaped line is the SECOND line of an indented-code block, not
+    # the first. A checker that only hides the line immediately after a blank
+    # (and forgets it is still inside the region on the next line) reads this
+    # continuation as ordinary text and declares "accepted" when the header in
+    # fact declares nothing.
+    "ADR-950-indented-continuation.md": (
+        "# ADR-950: Something\n"
+        "\n"
+        "    Example output:\n"
+        "    Status: accepted\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A section heading indented by up to three spaces is still an ATX heading
+    # under CommonMark. A checker that only recognises headings at column 0
+    # keeps scanning past it into the body, where the amendment-style status
+    # below is read as the header's own declaration.
+    "ADR-952-indented-heading-not-header.md": (
+        "# ADR-952: Something\n"
+        "\n"
+        "   ## Context\n"
+        "\n"
+        "Status: proposed\n"
+    ),
+    # The only status-shaped text is TAB-indented, which CommonMark also
+    # treats as indented code. Pins the tab branch of `INDENTED_CODE`, which
+    # ADR-930 above (spaces only) does not exercise.
+    "ADR-957-tab-indented-status-only.md": (
+        "# ADR-957: Something\n"
+        "\n"
+        "\tStatus: accepted\n"
+        "\n"
+        "## Context\n"
+    ),
 }
 
 MUST_PASS = {
@@ -603,7 +712,7 @@ MUST_PASS = {
     "ADR-916-status-then-trailing-comment.md": (
         "# ADR-916: Something\n"
         "\n"
-        "**Status**: Accepted <!-- reviewed 2026-09-01, Status: proposed was rejected -->\n"
+        "**Status**: Accepted <!-- earlier draft carried Status: proposed -->\n"
         "\n"
         "## Context\n"
     ),
@@ -674,6 +783,62 @@ MUST_PASS = {
         "# ADR-933: Something\n"
         "\n"
         "**Status**: Accepted (see [details](https://example.com/status:notes))\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A real header declaration followed by a multi-line indented example
+    # whose SECOND line carries the label. The whole region must stay hidden,
+    # not just its first line — the continuation counterpart of ADR-931.
+    "ADR-951-status-plus-indented-continuation.md": (
+        "# ADR-951: Something\n"
+        "\n"
+        "**Status**: Accepted\n"
+        "\n"
+        "    Example output:\n"
+        "    Status: accepted   <- indented example, not a declaration\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A real header declaration followed by an indented section heading and a
+    # body status. The indented heading must still end the header — the
+    # indentation-tolerant counterpart of ADR-952 above.
+    "ADR-953-status-plus-indented-heading-and-body-status.md": (
+        "# ADR-953: Something\n"
+        "\n"
+        "**Status**: Accepted\n"
+        "\n"
+        "   ## Context\n"
+        "\n"
+        "Status: proposed\n"
+    ),
+    # A "Status:" label on the SECOND line of a code span that opens on the
+    # line before. The span does not close until the backtick on line two, so
+    # the whole thing is display text, not a second declaration.
+    "ADR-954-multiline-code-span.md": (
+        "# ADR-954: Something\n"
+        "\n"
+        "**Status**: Accepted (see `example\n"
+        "Status: proposed`)\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A link destination containing one level of balanced parentheses. A
+    # parser that stops at the first `)` leaves the tail of the destination —
+    # including its own "status:" substring — unstripped and visible.
+    "ADR-955-nested-paren-link-destination.md": (
+        "# ADR-955: Something\n"
+        "\n"
+        "**Status**: Accepted [x](https://e.example/a(b)/status:notes)\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A "status:" substring inside a CommonMark autolink (`<scheme:...>`) is a
+    # URL fragment, not a rider declaration — the autolink counterpart of
+    # ADR-933's bracketed-link case.
+    "ADR-956-autolink-status-destination.md": (
+        "# ADR-956: Something\n"
+        "\n"
+        "**Status**: Accepted <https://e.example/status:notes>\n"
         "\n"
         "## Context\n"
     ),
@@ -765,6 +930,32 @@ def self_test() -> int:
             )
             problems += 1
 
+        # Symlinked base-PARENT arm: `docs/adr` reached through a symlinked
+        # `docs` component must be refused, even though `docs/adr` itself is
+        # a real directory — `symlinked_base_component` checks both `base_dir`
+        # and `base_dir.parent`, and the arm above only ever made `base_dir`
+        # itself a symlink, leaving the `.parent` branch unexercised. Its own
+        # scratch tree, separate from `sym_root` above.
+        sym_parent_root = Path(tmp) / "symlink-parent-arm"
+        real_storage = sym_parent_root / "actual-docs-storage"
+        real_adr = real_storage / "adr"
+        real_adr.mkdir(parents=True)
+        (real_adr / "ADR-941-valid.md").write_text(
+            "# ADR-941\n\n**Status**: accepted\n\n## Context\n", encoding="utf-8"
+        )
+        linked_docs = sym_parent_root / "docs"
+        linked_docs.symlink_to(real_storage)
+        parent_symlinked_adr_dir = linked_docs / "adr"
+        print("lint-adr-status self-test: the next line is the expected "
+              "symlinked-base-parent refusal.", file=sys.stderr)
+        if check_tree(parent_symlinked_adr_dir) == 0:
+            print(
+                "SELF-TEST: an ADR dir reached through a symlinked parent "
+                "was linted instead of refused.",
+                file=sys.stderr,
+            )
+            problems += 1
+
         # FIFO arm: os.open on a FIFO with no writer BLOCKS unless the open is
         # non-blocking, and a blocked open never reaches the S_ISREG rejection
         # — CI hangs instead of failing. The alarm turns a regression back
@@ -813,7 +1004,7 @@ def self_test() -> int:
             )
             problems += 1
 
-    total = len(MUST_FAIL) + len(MUST_PASS) + 6
+    total = len(MUST_FAIL) + len(MUST_PASS) + 7
     print(f"lint-adr-status self-test: {total - problems}/{total} cases correct.")
     return 1 if problems else 0
 
