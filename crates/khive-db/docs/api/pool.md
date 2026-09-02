@@ -161,10 +161,12 @@ to pooled routing for its next ordinary query.
   longest completed pooled hold in microseconds. Hold time includes reset or
   replacement because the connection is not reusable before that finishes.
 
-These fields make the #1987 first-window-then-timeout shape observable: capacity,
+These fields make a reader wait's shape observable end to end: capacity,
 availability, active/peak work, bounded failures, and completed hold evidence
-appear in one payload. A flat `standalone_reader_opens` counter across ordinary
-read verbs is ADR-166 G2's route invariant.
+appear in one payload, so a caller can distinguish an admission wait that
+resolves within its first window from one that times out. A flat
+`standalone_reader_opens` counter across ordinary read verbs is ADR-166 G2's
+route invariant.
 
 ### Writer handles and request cancellation
 

@@ -21,7 +21,7 @@ use khive_storage::{AtomicUnitOp, StorageCapability};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::SqliteError;
-use crate::pool::{ConnectionPool, StandaloneReaderPurpose};
+use crate::pool::{ConnectionPool, SharedReaderTransactionGuard, StandaloneReaderPurpose};
 
 // =============================================================================
 // Shared helpers
@@ -694,6 +694,123 @@ const READER_SETTING_PRAGMAS: [&str; 10] = [
     "page_size",
 ];
 
+/// Skip a fully parenthesized region starting at `rest[0] == b'('`,
+/// respecting SQL string/identifier quoting (`'...'` with `''` escapes,
+/// `"..."`/`` `...` `` with doubled-quote escapes, and `[...]` bracket
+/// identifiers) and line/block comments, so that a `)`, `(`, or `--` that
+/// merely appears inside a literal or comment is never mistaken for syntax.
+/// Returns the bytes after the matching `)`, or `None` if the region never
+/// closes (malformed or truncated SQL) — callers must fail closed on `None`.
+fn skip_balanced_parens(rest: &[u8]) -> Option<&[u8]> {
+    debug_assert_eq!(rest.first(), Some(&b'('));
+    let mut depth: u32 = 0;
+    let mut idx = 0;
+    loop {
+        match *rest.get(idx)? {
+            b'(' => {
+                depth += 1;
+                idx += 1;
+            }
+            b')' => {
+                depth -= 1;
+                idx += 1;
+                if depth == 0 {
+                    return Some(&rest[idx..]);
+                }
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                idx += 1;
+                loop {
+                    match *rest.get(idx)? {
+                        byte if byte == quote => {
+                            idx += 1;
+                            if rest.get(idx) == Some(&quote) {
+                                idx += 1; // doubled-quote escape inside the literal
+                            } else {
+                                break;
+                            }
+                        }
+                        _ => idx += 1,
+                    }
+                }
+            }
+            b'[' => {
+                idx += 1;
+                while *rest.get(idx)? != b']' {
+                    idx += 1;
+                }
+                idx += 1;
+            }
+            b'-' if rest.get(idx + 1) == Some(&b'-') => {
+                idx += 2;
+                while idx < rest.len() && rest[idx] != b'\n' {
+                    idx += 1;
+                }
+            }
+            b'/' if rest.get(idx + 1) == Some(&b'*') => {
+                idx += 2;
+                while idx + 1 < rest.len() && !(rest[idx] == b'*' && rest[idx + 1] == b'/') {
+                    idx += 1;
+                }
+                idx = (idx + 2).min(rest.len());
+            }
+            _ => idx += 1,
+        }
+    }
+}
+
+/// Walk past the common-table-expression list following `WITH [RECURSIVE]`
+/// and return the bytes starting at the main statement's own head keyword.
+/// Each CTE body is skipped as a balanced parenthesized region
+/// ([`skip_balanced_parens`]), so nested parens, string literals, and
+/// comments inside a CTE body never confuse the walk. Returns `None` if the
+/// CTE list is not well-formed enough to walk past safely — the caller must
+/// fail closed (refuse admission) rather than guess.
+fn skip_common_table_expressions(tail: &[u8]) -> Option<&[u8]> {
+    let mut rest = skip_sqlite_empty_prefix(tail);
+    if let Some((word, next)) = next_sqlite_token(rest) {
+        if word.eq_ignore_ascii_case(b"RECURSIVE") {
+            rest = skip_sqlite_empty_prefix(next);
+        }
+    }
+    loop {
+        // CTE name.
+        let (_name, next) = next_sqlite_token(rest)?;
+        rest = skip_sqlite_empty_prefix(next);
+        // Optional column-name list.
+        if rest.first() == Some(&b'(') {
+            rest = skip_sqlite_empty_prefix(skip_balanced_parens(rest)?);
+        }
+        let (as_keyword, next) = next_sqlite_token(rest)?;
+        if !as_keyword.eq_ignore_ascii_case(b"AS") {
+            return None;
+        }
+        rest = skip_sqlite_empty_prefix(next);
+        // Optional `[NOT] MATERIALIZED` hint (SQLite 3.35+).
+        if let Some((word, next)) = next_sqlite_token(rest) {
+            if word.eq_ignore_ascii_case(b"MATERIALIZED") {
+                rest = skip_sqlite_empty_prefix(next);
+            } else if word.eq_ignore_ascii_case(b"NOT") {
+                let (materialized, next) = next_sqlite_token(skip_sqlite_empty_prefix(next))?;
+                if !materialized.eq_ignore_ascii_case(b"MATERIALIZED") {
+                    return None;
+                }
+                rest = skip_sqlite_empty_prefix(next);
+            }
+        }
+        // CTE body.
+        if rest.first() != Some(&b'(') {
+            return None;
+        }
+        rest = skip_sqlite_empty_prefix(skip_balanced_parens(rest)?);
+        if rest.first() == Some(&b',') {
+            rest = skip_sqlite_empty_prefix(&rest[1..]);
+            continue;
+        }
+        return Some(rest);
+    }
+}
+
 /// Reject any raw SQL that is not one of a small allow-listed set of
 /// read-only statement shapes before it ever reaches a pooled reader
 /// connection.
@@ -707,7 +824,11 @@ const READER_SETTING_PRAGMAS: [&str; 10] = [
 /// which leave connection-local state that persists across pooled checkouts.
 /// Classification here instead runs on the statement head, admitting only
 /// `SELECT`, `WITH ... SELECT`, `VALUES`, `EXPLAIN [QUERY PLAN] <admitted>`,
-/// and the fixed `PRAGMA` allow-lists above.
+/// and the fixed `PRAGMA` allow-lists above. A `WITH` clause is not itself a
+/// read shape — SQLite also allows `WITH ... INSERT/UPDATE/DELETE`, with or
+/// without `RETURNING` — so a `WITH` head is admitted only after walking past
+/// its CTE list ([`skip_common_table_expressions`]) and confirming the main
+/// statement underneath is itself `SELECT` or `VALUES`.
 fn reader_capability_admits(sql: &str) -> Result<(), String> {
     let rest = skip_sqlite_empty_prefix(sql.as_bytes());
     let Some((head, tail)) = next_sqlite_token(rest) else {
@@ -715,11 +836,34 @@ fn reader_capability_admits(sql: &str) -> Result<(), String> {
         // prepare step surface that error rather than duplicating it here.
         return Ok(());
     };
-    if head.eq_ignore_ascii_case(b"SELECT")
-        || head.eq_ignore_ascii_case(b"VALUES")
-        || head.eq_ignore_ascii_case(b"WITH")
-    {
+    if head.eq_ignore_ascii_case(b"SELECT") || head.eq_ignore_ascii_case(b"VALUES") {
         return Ok(());
+    }
+    if head.eq_ignore_ascii_case(b"WITH") {
+        let Some(after_ctes) = skip_common_table_expressions(tail) else {
+            return Err(
+                "WITH statement's common-table-expression list could not be parsed; refusing \
+                 to admit it through the reader capability"
+                    .into(),
+            );
+        };
+        return match next_sqlite_token(after_ctes) {
+            Some((main_head, _))
+                if main_head.eq_ignore_ascii_case(b"SELECT")
+                    || main_head.eq_ignore_ascii_case(b"VALUES") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "WITH ... {:?} is not admitted through the reader capability; only a \
+                 read-only SELECT/VALUES body after the CTE list may run against a pooled \
+                 reader connection",
+                other.map_or_else(
+                    || "<none>".to_string(),
+                    |(main_head, _)| String::from_utf8_lossy(main_head).into_owned()
+                )
+            )),
+        };
     }
     if head.eq_ignore_ascii_case(b"EXPLAIN") {
         let mut rest = skip_sqlite_empty_prefix(tail);
@@ -1835,6 +1979,7 @@ impl khive_storage::SqlReader for SqliteWriter {
                 .use_queue_read_transaction_handle(transaction_control, "writer.query_row")
                 .await?
             {
+                admit_reader_capability_sql(&statement, transaction_control, "writer.query_row")?;
                 return run_pool_reader_query(
                     Arc::clone(&self.pool),
                     "sql_bridge.reader_operation",
@@ -1901,6 +2046,7 @@ impl khive_storage::SqlReader for SqliteWriter {
                 .use_queue_read_transaction_handle(transaction_control, "writer.query_all")
                 .await?
             {
+                admit_reader_capability_sql(&statement, transaction_control, "writer.query_all")?;
                 return run_pool_reader_query(
                     Arc::clone(&self.pool),
                     "sql_bridge.reader_operation",
@@ -1968,6 +2114,7 @@ impl khive_storage::SqlReader for SqliteWriter {
                 .use_queue_read_transaction_handle(transaction_control, "writer.query_page")
                 .await?
             {
+                admit_reader_capability_sql(&statement, transaction_control, "writer.query_page")?;
                 return run_pool_reader_query(
                     Arc::clone(&self.pool),
                     "sql_bridge.reader_operation",
@@ -2333,6 +2480,189 @@ where
 
 struct PoolBackedReader {
     pool: Arc<ConnectionPool>,
+    /// Present only while an admitted explicit deferred read transaction
+    /// (ADR-005/ADR-091) is open on the in-memory backend's single shared
+    /// connection. Retaining it here — instead of drawing a fresh checkout
+    /// per call, the way an ordinary read does — is what gives the span
+    /// real connection ownership: see [`SharedReaderTransactionGuard`] and
+    /// [`run_pool_backed_reader_query`].
+    transaction: Option<SharedReaderTransactionGuard>,
+}
+
+/// Decide what happened to a [`SharedReaderTransactionGuard`] after one
+/// statement ran against it and either retain it in `*transaction` (still
+/// mid-span) or let it drop naturally (span finished cleanly).
+///
+/// `expect_open_after` is the caller's terminal-state expectation: `true`
+/// for an ordinary read inside an already-open span (the transaction must
+/// still be open afterward), `false` for the statement that opens or closes
+/// the span. A mismatch poisons the guard — it is never handed back for
+/// reuse — and is folded into the returned error so a broken span is never
+/// reported as a successful read.
+fn finish_pool_backed_reader_step<T>(
+    transaction: &mut Option<SharedReaderTransactionGuard>,
+    guard: SharedReaderTransactionGuard,
+    expect_open_after: bool,
+    operation: &'static str,
+    result: khive_storage::types::StorageResult<T>,
+) -> khive_storage::types::StorageResult<T> {
+    let still_open = !guard.conn().is_autocommit();
+    if still_open == expect_open_after {
+        if still_open {
+            *transaction = Some(guard);
+        }
+        // Otherwise the span finished cleanly (or never opened); let `guard`
+        // drop here, returning the connection to the pool.
+        return result;
+    }
+    guard.poison();
+    let message = if expect_open_after {
+        "a read inside the pool-backed reader's admitted transaction unexpectedly ended it; \
+         the connection was discarded"
+    } else {
+        "transaction-ending control completed but the pool-backed reader's connection \
+         remained outside autocommit; the connection was discarded"
+    };
+    match result {
+        Err(error) => Err(error),
+        Ok(_) => Err(StorageError::InvalidInput {
+            capability: StorageCapability::Sql,
+            operation: operation.into(),
+            message: message.into(),
+        }),
+    }
+}
+
+/// Open the explicit deferred read-transaction span on the in-memory
+/// backend's shared connection and run the admitted `BEGIN DEFERRED`
+/// statement against it.
+async fn open_pool_backed_reader_transaction<T, F>(
+    transaction: &mut Option<SharedReaderTransactionGuard>,
+    pool: Arc<ConnectionPool>,
+    operation: &'static str,
+    query: F,
+) -> khive_storage::types::StorageResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &crate::read_cancellation::InterruptibleReadScope,
+            &rusqlite::Connection,
+            bool,
+            bool,
+        ) -> khive_storage::types::StorageResult<T>
+        + Send
+        + 'static,
+{
+    let (guard, result) = crate::read_cancellation::run_interruptible_read(
+        StorageCapability::Sql,
+        operation,
+        move |scope| {
+            let Some(guard) = pool
+                .checkout_shared_reader_transaction(|| scope.should_stop())
+                .map_err(|error| StorageError::driver(StorageCapability::Sql, operation, error))?
+            else {
+                return Err(StorageError::Timeout {
+                    operation: operation.into(),
+                });
+            };
+            let result = query(scope, guard.conn(), false, true);
+            if scope.cleanup_failed() {
+                guard.poison();
+            }
+            Ok((guard, result))
+        },
+    )
+    .await?;
+    finish_pool_backed_reader_step(transaction, guard, true, operation, result)
+}
+
+/// Route one raw-SQL call through the in-memory backend's `PoolBackedReader`.
+/// An ordinary read with no open span falls through to the regular per-call
+/// pooled checkout ([`run_pool_reader_query`]); every other combination
+/// (opening, continuing, or closing the explicit deferred read-transaction
+/// span) is handled here so the span retains one connection end to end.
+#[allow(clippy::too_many_lines)]
+async fn run_pool_backed_reader_query<T, F>(
+    transaction: &mut Option<SharedReaderTransactionGuard>,
+    pool: Arc<ConnectionPool>,
+    operation: &'static str,
+    transaction_control: Option<CachedReadTransactionControl>,
+    query: F,
+) -> khive_storage::types::StorageResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &crate::read_cancellation::InterruptibleReadScope,
+            &rusqlite::Connection,
+            bool,
+            bool,
+        ) -> khive_storage::types::StorageResult<T>
+        + Send
+        + 'static,
+{
+    if transaction.is_none() {
+        return match transaction_control {
+            None => {
+                run_pool_reader_query(pool, operation, move |scope, conn| {
+                    query(scope, conn, false, true)
+                })
+                .await
+            }
+            Some(CachedReadTransactionControl::Finish(keyword))
+            | Some(CachedReadTransactionControl::Unsupported(keyword)) => {
+                Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Sql,
+                    operation: operation.into(),
+                    message: format!(
+                        "pool-backed reader has no admitted transaction for transaction \
+                         control ({keyword})"
+                    ),
+                })
+            }
+            Some(CachedReadTransactionControl::BeginDeferred) => {
+                open_pool_backed_reader_transaction(transaction, pool, operation, query).await
+            }
+        };
+    }
+
+    match transaction_control {
+        Some(CachedReadTransactionControl::BeginDeferred) => {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Sql,
+                operation: operation.into(),
+                message: "pool-backed reader already owns an admitted read transaction; \
+                          nested BEGIN is not supported"
+                    .into(),
+            });
+        }
+        Some(CachedReadTransactionControl::Unsupported(keyword)) => {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Sql,
+                operation: operation.into(),
+                message: format!(
+                    "pool-backed reader's admitted read transaction does not support nested \
+                     or write-locking transaction control ({keyword})"
+                ),
+            });
+        }
+        None | Some(CachedReadTransactionControl::Finish(_)) => {}
+    }
+
+    let expect_open_after = transaction_control.is_none();
+    let guard = transaction.take().expect("checked Some above");
+    let (guard, result) = crate::read_cancellation::run_interruptible_read(
+        StorageCapability::Sql,
+        operation,
+        move |scope| {
+            let result = query(scope, guard.conn(), true, true);
+            if scope.cleanup_failed() {
+                guard.poison();
+            }
+            Ok((guard, result))
+        },
+    )
+    .await?;
+    finish_pool_backed_reader_step(transaction, guard, expect_open_after, operation, result)
 }
 
 #[async_trait]
@@ -2344,16 +2674,22 @@ impl khive_storage::SqlReader for PoolBackedReader {
         let transaction_control = cached_read_transaction_control(&statement.sql);
         admit_reader_capability_sql(&statement, transaction_control, "pool_reader.query_row")?;
         let pool = Arc::clone(&self.pool);
-        run_pool_reader_query(pool, "pool_reader.query_row", move |scope, conn| {
-            execute_query_row_interruptibly(
-                scope,
-                conn,
-                &statement,
-                "pool_reader.query_row",
-                false,
-                true,
-            )
-        })
+        run_pool_backed_reader_query(
+            &mut self.transaction,
+            pool,
+            "pool_reader.query_row",
+            transaction_control,
+            move |scope, conn, rollback, interruptible| {
+                execute_query_row_interruptibly(
+                    scope,
+                    conn,
+                    &statement,
+                    "pool_reader.query_row",
+                    rollback,
+                    interruptible,
+                )
+            },
+        )
         .await
     }
 
@@ -2364,16 +2700,22 @@ impl khive_storage::SqlReader for PoolBackedReader {
         let transaction_control = cached_read_transaction_control(&statement.sql);
         admit_reader_capability_sql(&statement, transaction_control, "pool_reader.query_all")?;
         let pool = Arc::clone(&self.pool);
-        run_pool_reader_query(pool, "pool_reader.query_all", move |scope, conn| {
-            execute_query_interruptibly(
-                scope,
-                conn,
-                &statement,
-                "pool_reader.query_all",
-                false,
-                true,
-            )
-        })
+        run_pool_backed_reader_query(
+            &mut self.transaction,
+            pool,
+            "pool_reader.query_all",
+            transaction_control,
+            move |scope, conn, rollback, interruptible| {
+                execute_query_interruptibly(
+                    scope,
+                    conn,
+                    &statement,
+                    "pool_reader.query_all",
+                    rollback,
+                    interruptible,
+                )
+            },
+        )
         .await
     }
 
@@ -2385,17 +2727,23 @@ impl khive_storage::SqlReader for PoolBackedReader {
         let transaction_control = cached_read_transaction_control(&statement.sql);
         admit_reader_capability_sql(&statement, transaction_control, "pool_reader.query_page")?;
         let pool = Arc::clone(&self.pool);
-        run_pool_reader_query(pool, "pool_reader.query_page", move |scope, conn| {
-            execute_query_page_interruptibly(
-                scope,
-                conn,
-                &statement,
-                &page,
-                "pool_reader.query_page",
-                false,
-                true,
-            )
-        })
+        run_pool_backed_reader_query(
+            &mut self.transaction,
+            pool,
+            "pool_reader.query_page",
+            transaction_control,
+            move |scope, conn, rollback, interruptible| {
+                execute_query_page_interruptibly(
+                    scope,
+                    conn,
+                    &statement,
+                    &page,
+                    "pool_reader.query_page",
+                    rollback,
+                    interruptible,
+                )
+            },
+        )
         .await
     }
 
@@ -2880,6 +3228,7 @@ impl khive_storage::SqlAccess for SqlBridge {
         } else {
             Ok(Box::new(PoolBackedReader {
                 pool: Arc::clone(&self.pool),
+                transaction: None,
             }))
         }
     }
@@ -3350,6 +3699,87 @@ mod tests {
         }
     }
 
+    /// A `WITH` clause is not by itself a read shape: SQLite accepts
+    /// `WITH ... INSERT/UPDATE/DELETE`, including with `RETURNING`, and the
+    /// admission classifier must walk past the common-table-expression list
+    /// to the main statement's own head keyword rather than admitting every
+    /// statement that merely starts with `WITH`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_reader_capability_admission_of_with_cte_dml_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_cte_dml_admission_probe.db")),
+            max_readers: 2,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE cte_dml_admission_probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL);",
+            )
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let probes: [&str; 4] = [
+            "WITH x(v) AS (SELECT 1) \
+             INSERT INTO cte_dml_admission_probe(id, value) SELECT 1, v FROM x",
+            "WITH x(v) AS (SELECT 1) \
+             INSERT INTO cte_dml_admission_probe(id, value) SELECT 1, v FROM x RETURNING id",
+            "WITH x(v) AS (SELECT 0) \
+             UPDATE cte_dml_admission_probe SET value = value + (SELECT v FROM x) WHERE id = 1",
+            "WITH x(v) AS (SELECT 1) \
+             DELETE FROM cte_dml_admission_probe WHERE id = (SELECT v FROM x)",
+        ];
+        let mut admitted = Vec::new();
+        for probe in probes {
+            let mut reader = bridge.reader().await.unwrap();
+            let result = reader
+                .query_all(SqlStatement {
+                    sql: probe.into(),
+                    params: vec![],
+                    label: Some("cte-dml-admission-probe".into()),
+                })
+                .await;
+            eprintln!("{probe:?} -> {result:?}");
+            admitted.push((probe, result.is_ok()));
+        }
+        eprintln!("WITH-DML reader capability admission per probe: {admitted:#?}");
+        for (probe, was_admitted) in &admitted {
+            assert!(
+                !was_admitted,
+                "reader capability must refuse {probe:?}; it is a WITH-prefixed write, not a read"
+            );
+        }
+
+        // Controls: ordinary and recursive read-only CTEs, including a
+        // multi-CTE chain and a CTE body containing string literals with
+        // commas (the shape produced by the graph traversal compiler), must
+        // still be admitted.
+        let controls: [&str; 3] = [
+            "WITH x(v) AS (SELECT 1) SELECT v FROM x",
+            "WITH RECURSIVE n(v) AS (VALUES(0) UNION ALL SELECT v + 1 FROM n WHERE v < 3) \
+             SELECT v FROM n",
+            "WITH a(v) AS (SELECT 1), b(v) AS (SELECT v FROM a WHERE ',' || 'x' NOT LIKE '%,%') \
+             SELECT v FROM b",
+        ];
+        for control in controls {
+            let mut reader = bridge.reader().await.unwrap();
+            let result = reader
+                .query_all(SqlStatement {
+                    sql: control.into(),
+                    params: vec![],
+                    label: Some("cte-dml-admission-control".into()),
+                })
+                .await;
+            assert!(
+                result.is_ok(),
+                "reader capability must still admit {control:?}: {result:?}"
+            );
+        }
+    }
+
     /// Regression for the in-memory reader path: `PoolBackedReader` (the
     /// `SqlBridge::reader` implementation used whenever `is_file_backed` is
     /// `false`) computed its admission classification differently from
@@ -3420,6 +3850,17 @@ mod tests {
             "PRAGMA writable_schema=ON",
             "CREATE TEMP TABLE t(x)",
             "SAVEPOINT nested_snapshot",
+            // A `WITH` head is not itself a read shape: SQLite also allows
+            // `WITH ... INSERT/UPDATE/DELETE`, with or without `RETURNING`,
+            // and the pool-backed route must refuse it exactly like the
+            // file-backed one does.
+            "WITH x(v) AS (SELECT 99) INSERT INTO pool_backed_reader_probe(value) SELECT v FROM x",
+            "WITH x(v) AS (SELECT 99) \
+             INSERT INTO pool_backed_reader_probe(value) SELECT v FROM x RETURNING value",
+            "WITH x(v) AS (SELECT 0) \
+             UPDATE pool_backed_reader_probe SET value = value + (SELECT v FROM x)",
+            "WITH x(v) AS (SELECT 1) \
+             DELETE FROM pool_backed_reader_probe WHERE value = (SELECT v FROM x)",
         ] {
             let mut reader = bridge.reader().await.unwrap();
             let result = reader
@@ -3434,6 +3875,102 @@ mod tests {
                 "pool-backed reader capability must refuse {probe:?}; got {result:?}"
             );
         }
+
+        // The refused probes above must not have left a stray write behind:
+        // exactly the one row inserted before the probe loop is still there.
+        let rows = bridge
+            .reader()
+            .await
+            .unwrap()
+            .query_all(SqlStatement {
+                sql: "SELECT value FROM pool_backed_reader_probe".into(),
+                params: vec![],
+                label: Some("pool-backed-reader-post-probe-read".into()),
+            })
+            .await
+            .expect("a plain read must still work after every probe above was refused");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a refused WITH-DML probe must not have committed a row"
+        );
+    }
+
+    /// An explicit deferred read-transaction span
+    /// (`begin_read_snapshot`/`end_read_snapshot` in `khive-pack-memory`)
+    /// that never reaches its own `COMMIT` — because the caller hit an error
+    /// mid-span and gave up on the read, or was cancelled — must still leave
+    /// the pool's connection rolled back to autocommit before it can be
+    /// reused. Before the span retained a real owned connection guard across
+    /// `.await` points, every `PoolBackedReader` call drew its own fresh
+    /// checkout: `BEGIN` and `COMMIT` could land on different checkouts, and
+    /// an abandoned span between them returned the connection to the pool
+    /// while still inside an open transaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_deferred_read_transaction_span_is_rolled_back_before_reuse() {
+        let config = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE abandoned_span_probe(value INTEGER NOT NULL); \
+                 INSERT INTO abandoned_span_probe VALUES (1);",
+            )
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+
+        {
+            let mut reader = bridge.reader().await.unwrap();
+            reader
+                .query_all(SqlStatement {
+                    sql: "BEGIN DEFERRED".into(),
+                    params: vec![],
+                    label: Some("abandoned-span-begin".into()),
+                })
+                .await
+                .expect("the span must open");
+            let failed = reader
+                .query_all(SqlStatement {
+                    sql: "SELECT value FROM abandoned_span_probe_missing_table".into(),
+                    params: vec![],
+                    label: Some("abandoned-span-failing-read".into()),
+                })
+                .await;
+            assert!(
+                failed.is_err(),
+                "the probe read against a nonexistent table must fail"
+            );
+            // `reader`, and the still-open transaction guard it owns, is
+            // dropped here without ever reaching `COMMIT`/`ROLLBACK`.
+        }
+
+        let writer = pool.writer().unwrap();
+        assert!(
+            writer.conn().is_autocommit(),
+            "an abandoned deferred-read span must be rolled back before its connection \
+             returns to service"
+        );
+        drop(writer);
+
+        let mut reader = bridge.reader().await.unwrap();
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT value FROM abandoned_span_probe".into(),
+                params: vec![],
+                label: Some("abandoned-span-post-recovery-read".into()),
+            })
+            .await
+            .expect("a fresh checkout must read normally after the abandoned span");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the original row must be intact; the abandoned span must not have committed \
+             anything"
+        );
     }
 
     /// A pooled-reader checkout that exhausts `checkout_timeout` WITHOUT any
@@ -7634,6 +8171,45 @@ mod tests {
         assert!(
             matches!(&val, Some(SqlValue::Text(v)) if v == "original"),
             "the rejected UPDATE...RETURNING must not have altered the row; got {val:?}"
+        );
+    }
+
+    /// The three queue-backed `SqlReader` methods on `SqliteWriter` classify
+    /// transaction control, but a queue-backed handle with no cached
+    /// transaction and no transaction-control statement falls through to the
+    /// same pooled reader route `PoolBackedReader`/`SqliteReader` use
+    /// (`run_pool_reader_query`) — without first running the statement
+    /// through `admit_reader_capability_sql`. A setting `PRAGMA` (unlike a
+    /// DML write) does not touch the main database file, so SQLite's own
+    /// read-only connection flag does not refuse it; without the admission
+    /// gate it would silently change connection-local state on a connection
+    /// this same pool later hands back out.
+    #[tokio::test]
+    async fn writer_query_row_rejects_setting_pragma_on_queue_backed_reader_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_reader_route_pragma_admission.db");
+        let config = PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(true),
+            write_routing_strict: true,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let mut w = bridge.writer().await.unwrap();
+        let result = w
+            .query_row(SqlStatement {
+                sql: "PRAGMA cache_size = -999".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "a setting PRAGMA through the queue-backed writer's reader route must be \
+             refused, exactly like it is through PoolBackedReader/SqliteReader; \
+             got {result:?}"
         );
     }
 

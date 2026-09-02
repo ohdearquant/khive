@@ -608,8 +608,8 @@ process's file-descriptor budget.
 
 ## Amendment: pooled file-backed reads (2026-08-30)
 
-Issues #2024 and #1987 supersede the 2026-08-09 amendment's ordinary
-cached-connection route while preserving its explicit transaction lifecycle.
+This amendment supersedes the 2026-08-09 amendment's ordinary cached-connection
+route while preserving its explicit transaction lifecycle.
 A file-backed `SqlAccess::reader()` now owns no SQLite connection while idle.
 Each ordinary `query_row`, `query_all`, or `query_page` checks out a pre-opened
 `ConnectionPool` reader for exactly that operation; ordinary reads through a

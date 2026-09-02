@@ -1499,7 +1499,7 @@ checkpoint, or TRUNCATE policy.
 
 ### 2026-08-30 amendment (Amendment 13): pooled file-backed snapshots
 
-ADR-165 Slice 2 and issues #2024/#1987 replace the ordinary file-backed
+ADR-165 Slice 2 replaces the ordinary file-backed
 standalone/cached-reader population with the pre-opened reader pool. Every typed
 store read and every ordinary read-only `SqlBridge` operation now owns one
 `ReaderGuard` for exactly its interruptible operation. Returning a guard

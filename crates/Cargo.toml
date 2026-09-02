@@ -94,7 +94,7 @@ dotenvy = "0.15"
 lattice-embed = "=0.9.0"
 lattice-inference = { version = "=0.9.0", default-features = false }
 lattice-fann = "=0.9.0"
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 rand = "0.8"
 rand_distr = "0.4"
 toml = "0.8"

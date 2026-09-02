@@ -293,8 +293,7 @@ Each slice lands with:
 
 ### Slice 2 implementation note (2026-08-30)
 
-Slice 2 is implemented by the change closing #2024 and #1987. All nine
-SQLite-backed typed-store read seams (the six named in the original inventory,
+All nine SQLite-backed typed-store read seams (the six named in the original inventory,
 plus attachments, sparse vectors, and agent-process records) share one pooled
 helper. Ordinary file-backed raw-SQL reads and reads through a queue-backed
 writer use the same pool. `open_standalone_reader` is crate-private and requires

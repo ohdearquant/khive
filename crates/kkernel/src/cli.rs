@@ -1504,12 +1504,12 @@ mod tests {
             khive_db::StorageBackend::sqlite(&main).expect("inspect blocked main backend");
         let main_conn = main_backend.pool().reader().expect("inspect blocked main");
         assert_eq!(
-            read_schema_version(main_conn.conn()).unwrap(),
+            read_schema_version(main_conn.tracked_conn()).unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1,
             "main must remain V20 when secondary inventory fails"
         );
         assert_eq!(
-            attachment_cutover_status(main_conn.conn()).unwrap(),
+            attachment_cutover_status(main_conn.tracked_conn()).unwrap(),
             AttachmentCutoverStatus::Pending
         );
         drop(main_conn);
@@ -1541,11 +1541,11 @@ mod tests {
                 khive_db::StorageBackend::sqlite(path).expect("inspect completed topology backend");
             let conn = backend.pool().reader().expect("inspect completed topology");
             assert_eq!(
-                read_schema_version(conn.conn()).unwrap(),
+                read_schema_version(conn.tracked_conn()).unwrap(),
                 khive_db::migrations::latest_schema_version()
             );
             assert_eq!(
-                attachment_cutover_status(conn.conn()).unwrap(),
+                attachment_cutover_status(conn.tracked_conn()).unwrap(),
                 AttachmentCutoverStatus::Complete
             );
         }
@@ -1579,11 +1579,11 @@ mod tests {
         let main_conn = main_backend.pool().reader().unwrap();
         let secondary_conn = secondary_backend.pool().reader().unwrap();
         assert_eq!(
-            read_schema_version(main_conn.conn()).unwrap(),
+            read_schema_version(main_conn.tracked_conn()).unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1
         );
         assert_eq!(
-            read_schema_version(secondary_conn.conn()).unwrap(),
+            read_schema_version(secondary_conn.tracked_conn()).unwrap(),
             khive_db::migrations::latest_schema_version()
         );
     }
@@ -1634,7 +1634,7 @@ mod tests {
         let backend = khive_db::StorageBackend::sqlite(&main).unwrap();
         let conn = backend.pool().reader().unwrap();
         assert_eq!(
-            read_schema_version(conn.conn()).unwrap(),
+            read_schema_version(conn.tracked_conn()).unwrap(),
             khive_db::migrations::latest_schema_version()
         );
     }

@@ -576,8 +576,14 @@ pub struct ReaderGuard<'pool> {
 }
 
 impl<'pool> ReaderGuard<'pool> {
-    /// Access the connection.
-    pub fn conn(&self) -> &Connection {
+    /// Access the connection from within `khive-db`. Every internal caller
+    /// is either a typed store (proven read-only by construction) or a
+    /// raw-SQL route that already calls [`Self::mark_dirty`] itself, so this
+    /// stays crate-private: it is the untracked half of the pristine-return
+    /// contract, and a caller outside the crate has no way to pay into that
+    /// contract by calling `mark_dirty` (also crate-private). Use
+    /// [`Self::tracked_conn`] instead outside `khive-db`.
+    pub(crate) fn conn(&self) -> &Connection {
         match self
             .lease
             .as_ref()
@@ -586,6 +592,17 @@ impl<'pool> ReaderGuard<'pool> {
             ReaderLease::Pooled(conn) => conn,
             ReaderLease::Shared(guard) => guard,
         }
+    }
+
+    /// Access the connection from outside `khive-db`. Unlike [`Self::conn`],
+    /// this unconditionally marks the checkout dirty first, so `Drop` always
+    /// pays the pristine-state scan (or, in degraded shared-lease mode, the
+    /// settings/rollback verification) on return — an external caller has no
+    /// other way to prove a raw statement it ran here left no connection-local
+    /// state behind.
+    pub fn tracked_conn(&self) -> &Connection {
+        self.mark_dirty();
+        self.conn()
     }
 
     /// Fail closed when connection-global state could not be restored after
@@ -602,14 +619,6 @@ impl<'pool> ReaderGuard<'pool> {
     }
 }
 
-impl<'pool> Deref for ReaderGuard<'pool> {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        self.conn()
-    }
-}
-
 impl<'pool> Drop for ReaderGuard<'pool> {
     fn drop(&mut self) {
         let Some(lease) = self.lease.take() else {
@@ -622,11 +631,7 @@ impl<'pool> Drop for ReaderGuard<'pool> {
             }
             ReaderLease::Pooled(conn) => {
                 close_connection_quietly(conn);
-                if let Ok(conn) = self.pool.open_reader_connection() {
-                    if let Err(conn) = self.pool.readers.push(conn) {
-                        close_connection_quietly(conn);
-                    }
-                }
+                self.pool.replace_discarded_reader_slot();
             }
             ReaderLease::Shared(guard) if !self.reusable => {
                 self.pool.retire_pooled_writer(&guard);
@@ -652,6 +657,149 @@ impl<'pool> Drop for ReaderGuard<'pool> {
         self.pool
             .reader_acquisition_counters
             .record_checkout_completed(self.checked_out_at.elapsed());
+    }
+}
+
+/// Owned, `'static` counterpart to [`ReaderGuard`]'s degraded-mode
+/// (`max_readers == 0`) lease. `ReaderGuard` borrows `&'pool ConnectionPool`
+/// and therefore cannot be retained across the separate `.await` points
+/// between a caller's `SqlReader` trait-method calls — every ordinary call
+/// through it draws a fresh checkout and returns it before the next call
+/// begins. That is fine for an ordinary read, but wrong for the explicit
+/// multi-call deferred read transaction (ADR-005/ADR-091): a `BEGIN
+/// DEFERRED` checked out and returned this way releases the pool's one
+/// physical connection to any concurrent caller — including a writer —
+/// before its own matching `COMMIT`/`ROLLBACK` runs, and an abandoned span
+/// (an error or cancellation between the two) leaves that connection sitting
+/// in the pool inside an open transaction with nothing left holding it. This
+/// type owns an `Arc`-rooted mutex guard instead of borrowing one, so it can
+/// be held by the caller across those `.await` points and give the whole
+/// span real, exclusive ownership of the one connection.
+pub(crate) struct SharedReaderTransactionGuard {
+    conn: parking_lot::ArcMutexGuard<parking_lot::RawMutex, Connection>,
+    admission_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    pool: Arc<ConnectionPool>,
+    checked_out_at: Instant,
+    /// Set once a statement executed against this connection could not
+    /// prove its own cleanup ran (SQLite progress-handler removal failure).
+    /// `Drop` then treats the connection exactly like a rollback failure:
+    /// poison the pool rather than let possibly-corrupted connection state
+    /// return to service.
+    poison: Cell<bool>,
+}
+
+impl SharedReaderTransactionGuard {
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Force poisoning on drop regardless of the connection's own
+    /// autocommit/pristine state.
+    pub(crate) fn poison(&self) {
+        self.poison.set(true);
+    }
+}
+
+impl Drop for SharedReaderTransactionGuard {
+    fn drop(&mut self) {
+        // An abandoned span must never let this connection return to
+        // service while still inside an open transaction — the next reader
+        // or writer to draw the pool's one physical connection would
+        // silently inherit it. Roll back first; only a verified return to
+        // autocommit, followed by the same pristine-state scan an ordinary
+        // dirty degraded checkout pays, allows reuse.
+        let mut restored = !self.poison.get();
+        if restored && !self.conn.is_autocommit() {
+            restored = self.conn.execute_batch("ROLLBACK").is_ok() && self.conn.is_autocommit();
+        }
+        if restored {
+            restored = restore_shared_reader_state(&self.conn, &self.pool.config);
+        }
+        if !restored {
+            self.pool.retire_pooled_writer(&self.conn);
+        }
+        drop(self.admission_slot.take());
+        self.pool
+            .reader_acquisition_counters
+            .record_checkout_completed(self.checked_out_at.elapsed());
+    }
+}
+
+impl ConnectionPool {
+    /// Check out the degraded-mode (`max_readers == 0`) pool's single
+    /// physical connection as an owned [`SharedReaderTransactionGuard`]
+    /// instead of a borrowed [`ReaderGuard`]. Mirrors the admission and
+    /// mutex-acquisition loop in [`Self::reader_until`]'s degraded branch —
+    /// the only difference is the guard type returned, so a caller can
+    /// retain this one across several separate `.await` points.
+    ///
+    /// Exists only for the in-memory backend's explicit deferred-read-
+    /// transaction bypass (`sql_bridge::PoolBackedReader`); ordinary reads
+    /// use [`Self::reader_until`].
+    pub(crate) fn checkout_shared_reader_transaction(
+        self: &Arc<Self>,
+        should_stop: impl Fn() -> bool,
+    ) -> Result<Option<SharedReaderTransactionGuard>, SqliteError> {
+        debug_assert_eq!(
+            self.max_readers, 0,
+            "the owned shared-reader-transaction guard exists only for the degraded, \
+             single-connection backend"
+        );
+        self.ensure_pooled_writer_active()?;
+        let started = Instant::now();
+        let admission_slot = loop {
+            if should_stop() {
+                return Ok(None);
+            }
+            match Arc::clone(&self.sql_bridge_reader_slots).try_acquire_owned() {
+                Ok(slot) => break slot,
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(SqliteError::InvalidData(
+                        "reader admission semaphore is closed".to_string(),
+                    ));
+                }
+                Err(tokio::sync::TryAcquireError::NoPermits) => {}
+            }
+            if started.elapsed() >= self.config.checkout_timeout {
+                self.reader_acquisition_counters.record_checkout_timeout();
+                return Err(pool_exhausted_error(
+                    self.config.checkout_timeout,
+                    self.max_readers,
+                ));
+            }
+            thread::yield_now();
+        };
+
+        loop {
+            if should_stop() {
+                return Ok(None);
+            }
+            let remaining = self
+                .config
+                .checkout_timeout
+                .saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                self.reader_acquisition_counters.record_checkout_timeout();
+                return Err(pool_exhausted_error(
+                    self.config.checkout_timeout,
+                    self.max_readers,
+                ));
+            }
+            if let Some(conn) = self
+                .writer
+                .try_lock_arc_for(remaining.min(Duration::from_millis(2)))
+            {
+                self.ensure_pooled_writer_active()?;
+                self.reader_acquisition_counters.record_pooled_checkout();
+                return Ok(Some(SharedReaderTransactionGuard {
+                    conn,
+                    admission_slot: Some(admission_slot),
+                    pool: Arc::clone(self),
+                    checked_out_at: Instant::now(),
+                    poison: Cell::new(false),
+                }));
+            }
+        }
     }
 }
 
@@ -1839,34 +1987,44 @@ impl ConnectionPool {
             return;
         }
 
-        let conn = if reset_reader_connection(&conn, dirty, &self.config)
+        if reset_reader_connection(&conn, dirty, &self.config)
             && reader_connection_is_healthy(&conn)
         {
-            Some(conn)
-        } else {
-            close_connection_quietly(conn);
-            match self.open_reader_connection() {
-                Ok(conn) => Some(conn),
-                Err(error) => {
-                    self.reader_acquisition_counters
-                        .record_reader_replacement_open_failure();
-                    tracing::warn!(
-                        %error,
-                        "sqlite-pool: disqualified reader's replacement connection failed to \
-                         open; the physical pool permanently shrinks by one slot below \
-                         max_readers"
-                    );
-                    None
-                }
-            }
-        };
+            self.enqueue_reader_slot(conn);
+            return;
+        }
 
-        if let Some(conn) = conn {
-            if let Err(conn) = self.readers.push(conn) {
-                eprintln!(
-                    "[sqlite-pool] reader pool queue full, discarding replacement connection"
+        close_connection_quietly(conn);
+        self.replace_discarded_reader_slot();
+    }
+
+    /// Push a connection back onto the physical reader queue, discarding it
+    /// (rather than growing the queue past its configured capacity) if the
+    /// queue is already full.
+    fn enqueue_reader_slot(&self, conn: Connection) {
+        if let Err(conn) = self.readers.push(conn) {
+            eprintln!("[sqlite-pool] reader pool queue full, discarding replacement connection");
+            close_connection_quietly(conn);
+        }
+    }
+
+    /// Open a fresh connection to refill one physical reader slot after its
+    /// previous occupant was closed and discarded — either disqualified on
+    /// an ordinary return ([`Self::return_reader`]) or abandoned by a
+    /// non-reusable checkout ([`ReaderGuard`]'s `Drop`). Both call sites
+    /// share this so a failed replacement is recorded and logged identically
+    /// either way, instead of one path silently shrinking the pool.
+    fn replace_discarded_reader_slot(&self) {
+        match self.open_reader_connection() {
+            Ok(conn) => self.enqueue_reader_slot(conn),
+            Err(error) => {
+                self.reader_acquisition_counters
+                    .record_reader_replacement_open_failure();
+                tracing::warn!(
+                    %error,
+                    "sqlite-pool: reader replacement connection failed to open; the physical \
+                     pool permanently shrinks by one slot below max_readers"
                 );
-                close_connection_quietly(conn);
             }
         }
     }
@@ -2669,6 +2827,7 @@ mod tests {
         );
         let reader = pool.reader().expect("dedicated read-only reader checkout");
         let count: i64 = reader
+            .conn()
             .query_row("SELECT COUNT(*) FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
@@ -2819,6 +2978,7 @@ mod tests {
         .unwrap();
         let reader = pool.reader().unwrap();
         let body: String = reader
+            .conn()
             .query_row("SELECT body FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
         assert_eq!(body, "committed-only-in-wal");
@@ -2910,6 +3070,7 @@ mod tests {
         .unwrap();
         let reader = pool.reader().unwrap();
         let body: String = reader
+            .conn()
             .query_row("SELECT body FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
         assert_eq!(body, "visible-through-target-wal");
@@ -2978,6 +3139,7 @@ mod tests {
         .unwrap();
         let reader = pool.reader().unwrap();
         let body: String = reader
+            .conn()
             .query_row("SELECT body FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
         assert_eq!(body, "checkpointed");
@@ -3021,6 +3183,7 @@ mod tests {
         {
             let reader = pool.reader().unwrap();
             let count: i64 = reader
+                .conn()
                 .query_row("SELECT COUNT(*) FROM live_row", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(count, 0);
@@ -3031,6 +3194,7 @@ mod tests {
             .unwrap();
         let reader = pool.reader().unwrap();
         let count: i64 = reader
+            .conn()
             .query_row("SELECT COUNT(*) FROM live_row", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
@@ -3079,15 +3243,18 @@ mod tests {
         {
             let reader = pool.reader().unwrap();
             reader
+                .conn()
                 .execute_batch("CREATE TEMP TABLE leaked_temp(id INTEGER PRIMARY KEY);")
                 .unwrap();
             reader
+                .conn()
                 .execute_batch(&format!(
                     "ATTACH DATABASE '{}' AS secret;",
                     secret_path.display()
                 ))
                 .unwrap();
             let leaked_count: i64 = reader
+                .conn()
                 .query_row("SELECT COUNT(*) FROM secret.secret_row", [], |row| {
                     row.get(0)
                 })
@@ -3103,6 +3270,7 @@ mod tests {
 
         let reader = pool.reader().unwrap();
         let temp_table_survived: i64 = reader
+            .conn()
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'leaked_temp'",
                 [],
@@ -3115,6 +3283,7 @@ mod tests {
         );
 
         let attachment_survived: i64 = reader
+            .conn()
             .query_row(
                 "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'secret'",
                 [],
@@ -3155,15 +3324,18 @@ mod tests {
         {
             let reader = pool.reader().unwrap();
             reader
+                .conn()
                 .execute_batch("CREATE TEMP TABLE leaked_temp(id INTEGER PRIMARY KEY);")
                 .unwrap();
             reader
+                .conn()
                 .execute_batch(
                     "PRAGMA writable_schema = ON; \
                      DELETE FROM sqlite_temp_master WHERE name = 'leaked_temp';",
                 )
                 .unwrap();
             let visible: i64 = reader
+                .conn()
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'leaked_temp'",
                     [],
@@ -3183,6 +3355,7 @@ mod tests {
         // `sqlite_temp_master` row delete. A fresh replacement connection
         // has no such table at all.
         let leaked_still_queryable = reader
+            .conn()
             .query_row("SELECT COUNT(*) FROM leaked_temp", [], |row| {
                 row.get::<_, i64>(0)
             })
@@ -3224,12 +3397,14 @@ mod tests {
             // A typed store never calls `run_pool_reader_query`, so it never
             // calls `mark_dirty` either — this checkout is returned clean.
             reader
+                .conn()
                 .execute_batch("CREATE TEMP TABLE survivor(id INTEGER PRIMARY KEY);")
                 .unwrap();
         }
 
         let reader = pool.reader().unwrap();
         let survived = reader
+            .conn()
             .query_row("SELECT COUNT(*) FROM survivor", [], |row| {
                 row.get::<_, i64>(0)
             })
@@ -3278,6 +3453,7 @@ mod tests {
                 .pragma_update(None, "cache_size", -64i64)
                 .unwrap();
             reader
+                .conn()
                 .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
                 .unwrap();
             reader.mark_dirty();
@@ -3285,9 +3461,11 @@ mod tests {
 
         let reader = pool.reader().unwrap();
         let busy_timeout: i64 = reader
+            .conn()
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         let cache_size: i64 = reader
+            .conn()
             .query_row("PRAGMA cache_size", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
@@ -3336,9 +3514,11 @@ mod tests {
         {
             let reader = pool.reader().unwrap();
             reader
+                .conn()
                 .execute_batch("CREATE TEMP TABLE leaked_temp(id INTEGER PRIMARY KEY);")
                 .unwrap();
             reader
+                .conn()
                 .execute_batch(&format!(
                     "ATTACH DATABASE '{}' AS secret;",
                     secret_path.display()
@@ -3349,6 +3529,7 @@ mod tests {
 
         let reader = pool.reader().unwrap();
         let temp_table_survived: i64 = reader
+            .conn()
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'leaked_temp'",
                 [],
@@ -3360,6 +3541,7 @@ mod tests {
             "a TEMP table must not survive a dirty degraded shared-reader-lease return"
         );
         let attachment_survived: i64 = reader
+            .conn()
             .query_row(
                 "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'secret'",
                 [],
@@ -3369,6 +3551,105 @@ mod tests {
         assert_eq!(
             attachment_survived, 0,
             "an ATTACHed database must not survive a dirty degraded shared-reader-lease return"
+        );
+    }
+
+    /// `ReaderGuard::conn` is crate-private: `khive-db` internals prove their
+    /// own reads never mutate, and raw-SQL routes already call `mark_dirty`
+    /// themselves. A caller outside the crate has neither guarantee, so it
+    /// can only reach the connection through `tracked_conn`, which marks the
+    /// checkout dirty unconditionally before returning the reference. Before
+    /// that encapsulation, a caller with only the public `conn`/`Deref`
+    /// surface (no access to the crate-private `mark_dirty`) could create a
+    /// TEMP table or flip a connection-local setting and hand the connection
+    /// back clean, and `Drop` would skip the pristine-state scan entirely —
+    /// exactly this state would then have leaked into the next checkout.
+    #[test]
+    fn tracked_conn_marks_the_checkout_dirty_so_unmarked_state_cannot_leak() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        {
+            let reader = pool.reader().unwrap();
+            // No explicit `mark_dirty()` call here — `tracked_conn` alone
+            // must be enough for `Drop` to catch this.
+            reader
+                .tracked_conn()
+                .execute_batch(
+                    "CREATE TEMP TABLE tracked_conn_leak_probe(id INTEGER PRIMARY KEY); \
+                     PRAGMA cache_size = -1234;",
+                )
+                .unwrap();
+        }
+
+        let reader = pool.reader().unwrap();
+        let temp_table_survived: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'tracked_conn_leak_probe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            temp_table_survived, 0,
+            "a TEMP table created through tracked_conn must not survive to the next checkout"
+        );
+        let cache_size: i64 = reader
+            .conn()
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(
+            cache_size, -1234,
+            "a setting changed through tracked_conn must be restored to baseline, not leaked"
+        );
+    }
+
+    /// A non-reusable checkout (marked via `discard()`, the cancellation
+    /// cleanup path in `read_cancellation.rs`) closes its connection and
+    /// tries to open a replacement to refill the physical pool slot. Before
+    /// this shared the same accounting `return_reader`'s disqualified-return
+    /// path uses, a failed replacement open here was silently swallowed: no
+    /// counter, no log, so `db_diagnostics` under-reported the lost
+    /// capacity.
+    #[test]
+    fn discarded_reader_replacement_open_failure_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("discard-replacement-failure.db");
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        let before = pool.reader_acquisition_snapshot();
+
+        let mut reader = pool.reader().unwrap();
+        reader.discard();
+        // The replacement open this triggers on drop must fail deterministically:
+        // remove the file a fresh SQLITE_OPEN_READ_ONLY open needs.
+        std::fs::remove_file(&path).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(sqlite_sidecar(&path, suffix));
+        }
+        drop(reader);
+
+        let after = pool.reader_acquisition_snapshot();
+        assert_eq!(
+            after.reader_replacement_open_failures - before.reader_replacement_open_failures,
+            1,
+            "a non-reusable checkout's failed replacement open must be recorded, not silently \
+             swallowed"
         );
     }
 

@@ -932,6 +932,9 @@ mod tests {
         let text = backend
             .text_with_tokenizer("hot_path_g2", "unicode61")
             .unwrap();
+        let agents = backend.agents().unwrap();
+        let attachments = backend.attachments().unwrap();
+        let sparse = backend.sparse("hot_path_g2").unwrap();
         #[cfg(feature = "vectors")]
         let vectors = backend.vectors("hot_path_g2", "test-model", 2).unwrap();
         let sql = backend.sql();
@@ -955,6 +958,13 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        assert!(agents.get("no-such-agent").await.unwrap().is_none());
+        assert!(attachments
+            .get_attachment(uuid::Uuid::new_v4(), "primary")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(sparse.count().await.unwrap(), 0);
         #[cfg(feature = "vectors")]
         assert_eq!(vectors.count().await.unwrap(), 0);
 
@@ -971,7 +981,7 @@ mod tests {
         ));
 
         let after = backend.pool().reader_acquisition_snapshot();
-        let expected_pooled_delta = 6 + u64::from(cfg!(feature = "vectors"));
+        let expected_pooled_delta = 9 + u64::from(cfg!(feature = "vectors"));
         assert_eq!(
             after.pooled_checkouts - before.pooled_checkouts,
             expected_pooled_delta,
