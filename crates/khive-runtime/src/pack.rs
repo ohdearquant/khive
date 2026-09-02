@@ -6930,6 +6930,7 @@ pub(crate) mod tests {
 
         let mut candidate_count = 0usize;
         let mut offenders = Vec::new();
+        let mut order_offenders = Vec::new();
 
         for (path, text) in &sources {
             let seam_names = file_seam_names(text, &base_seed);
@@ -6956,6 +6957,43 @@ pub(crate) mod tests {
                 let end = test_body_end(&lines, start, hard_limit);
                 let span = &lines[start..end];
                 let span_text = span.join("\n");
+
+                // `serial_test`'s derive sorts lock keys only *within* one
+                // `#[serial(...)]` attribute (`raw_args.sort()`), never
+                // across two attributes stacked on the same item. A test
+                // that takes the unkeyed group and `config_ledger` must
+                // therefore fix the acquisition order itself: two tests
+                // stacking the same pair of attributes in opposite textual
+                // order take the two locks in opposite order and deadlock
+                // each other, and every other serial test queues behind
+                // them. Checked unconditionally over every test span, not
+                // just config-ledger-reaching candidates below — the
+                // deadlock risk is about which attributes are stacked, not
+                // about whether this census's reachability heuristic can
+                // prove the seam call.
+                let unkeyed_attr_pos = span.iter().position(|line| {
+                    let trimmed = line.trim();
+                    trimmed == "#[serial]" || trimmed == "#[serial_test::serial]"
+                });
+                let config_ledger_attr_pos = span.iter().position(|line| {
+                    let trimmed = line.trim();
+                    trimmed == "#[serial(config_ledger)]"
+                        || trimmed == "#[serial_test::serial(config_ledger)]"
+                });
+                if let (Some(unkeyed_idx), Some(config_ledger_idx)) =
+                    (unkeyed_attr_pos, config_ledger_attr_pos)
+                {
+                    if config_ledger_idx < unkeyed_idx {
+                        let signature_offset = span
+                            .iter()
+                            .position(|line| is_fn_signature_line(line.trim_start()))
+                            .expect("test span has a function signature");
+                        let name = fn_name_from_signature(span[signature_offset].trim_start())
+                            .unwrap_or("<unknown>");
+                        order_offenders.push(format!("{}:{name}", path.display()));
+                    }
+                }
+
                 let matched_direct = seam_names
                     .iter()
                     .chain(crate_seams.into_iter().flatten())
@@ -7005,6 +7043,15 @@ pub(crate) mod tests {
             offenders.is_empty(),
             "config-ledger-reaching pack tests must use #[serial(config_ledger)]; \
              offenders: {offenders:?}"
+        );
+        assert!(
+            order_offenders.is_empty(),
+            "a test stacking the unkeyed #[serial] group with #[serial(config_ledger)] \
+             must take the unkeyed attribute first: serial_test's derive sorts lock \
+             keys only within one #[serial(...)] attribute, never across two \
+             attributes stacked on the same item, so a test taking these two locks in \
+             the opposite textual order deadlocks against every test that took them in \
+             the canonical order; offenders: {order_offenders:?}"
         );
     }
 

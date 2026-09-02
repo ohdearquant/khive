@@ -5160,8 +5160,8 @@ mod tests {
     /// contention as a source of flakiness — see "Writer-pool checkout
     /// contention under CI" in `crates/khive-mcp/docs/pending-events.md`.
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn replayable_action_dispatches_without_failure_at_trigger_time() {
         struct RestoreTimeout(Option<String>);
         impl Drop for RestoreTimeout {
@@ -7669,8 +7669,8 @@ mod tests {
     /// leave `run_pending_events_with_config` as the top-level error so
     /// `kkernel exec`'s refusal-envelope downcast recognizes it.
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn run_pending_events_keeps_db_override_conflict_top_level() {
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -7712,8 +7712,8 @@ mod tests {
     /// "pending-events: build server" context (an invalid explicit config
     /// surfaces as `config error: ...` underneath).
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn run_pending_events_wraps_non_conflict_build_errors_with_context() {
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -7750,8 +7750,8 @@ mod tests {
     /// the drain with defaults; the error surfaces wrapped in the generic
     /// build context, not as a `DatabaseOverrideConflict`.
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn run_pending_events_fails_loud_for_missing_explicit_config() {
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -7801,8 +7801,8 @@ mod tests {
     /// requesting anonymous" branch in `resolve_runtime_config` and silently
     /// discarding the configured `[actor] id`.
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
@@ -7852,8 +7852,8 @@ mod tests {
     /// --namespace". This documents why `run_pending_events` must not reuse
     /// that entry point for a synthesized, non-CLI-parsed namespace default.
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
@@ -7898,8 +7898,8 @@ mod tests {
     /// spuriously trips `enforce_strict_actor_mode` the way routing through
     /// `build_server`'s actor-clearing path would have.
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn wrapper_succeeds_under_strict_actor_mode_with_configured_project_actor() {
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");

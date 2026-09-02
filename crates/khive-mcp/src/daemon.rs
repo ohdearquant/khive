@@ -4123,8 +4123,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn daemon_round_trip_dispatches_and_enforces_config_id() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4728,8 +4728,8 @@ mod tests {
     // server's own construction-baked actor_id, unaffected by the identity-
     // override machinery introduced for daemon-forwarded requests.
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn local_dispatch_without_identity_context_uses_baked_actor() {
         clear_daemon_env();
 
@@ -5025,8 +5025,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn try_forward_inner_returns_parse_failure_when_daemon_closes_without_response() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5668,8 +5668,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn recovery_path_dispatches_real_request_exactly_once() {
         clear_daemon_env();
         reset_counters();
@@ -6730,8 +6730,8 @@ mod tests {
     // serve the exact same request.
 
     #[tokio::test]
-    #[serial_test::serial(config_ledger)]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn ambiguous_write_never_retries_against_freshly_spawned_daemon() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
