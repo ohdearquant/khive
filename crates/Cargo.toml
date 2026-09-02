@@ -110,6 +110,9 @@ tempfile = "3"
 lru = "0.18"
 sha2 = "0.10"
 hex = "0.4"
+# lattice-embed 0.9.0 activates `pure` for this shared instance. The measured
+# performance risk is accepted only while 0.9.0 is pinned; evidence and the
+# merged 0.10.0 exit are recorded in docs/benchmarks/blake3-pure-0.9.0.md.
 blake3 = { version = "1", default-features = false }
 # Cross-platform filesystem free-space query for BlobStore's fail-closed
 # floor check (khive#292). Pure Rust (rustix on Unix, windows-sys on
