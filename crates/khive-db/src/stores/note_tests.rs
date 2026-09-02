@@ -1280,8 +1280,14 @@ async fn atomic_note_property_patch_rolls_back_when_one_target_is_ineligible() {
         .await
         .expect_err("an ineligible target must abort the atomic patch");
     assert!(
-        matches!(&error, StorageError::Conflict { message, .. }
-            if message.contains(&ineligible_id.to_string())),
+        matches!(
+            &error,
+            StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            } if matches!(source.as_ref(), StorageError::Conflict { message, .. }
+                if message.contains(&ineligible_id.to_string()))
+        ),
         "the conflict must name the first failing id {ineligible_id}; got {error:?}"
     );
     assert!(!error.is_retryable(), "a precondition conflict is terminal");
@@ -1386,8 +1392,14 @@ async fn atomic_note_property_patch_writer_task_commits_and_rolls_back() {
         .await
         .expect_err("a later ineligible row must abort the writer-task transaction");
     assert!(
-        matches!(&error, StorageError::Conflict { message, .. }
-            if message.contains(&ineligible_id.to_string())),
+        matches!(
+            &error,
+            StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            } if matches!(source.as_ref(), StorageError::Conflict { message, .. }
+                if message.contains(&ineligible_id.to_string()))
+        ),
         "the conflict must name the first failing id {ineligible_id}; got {error:?}"
     );
     assert_eq!(
@@ -2018,7 +2030,11 @@ async fn pooled_transaction_commit_failure_with_verified_rollback_keeps_writer_u
     assert!(
         matches!(
             &result,
-            Err(StorageError::Pool { operation, .. }) if operation == "test_pooled_commit"
+            Err(StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            }) if matches!(source.as_ref(), StorageError::Pool { operation, .. }
+                if operation == "test_pooled_commit")
         ),
         "a denied COMMIT followed by a verified rollback must report the commit error: {result:?}"
     );

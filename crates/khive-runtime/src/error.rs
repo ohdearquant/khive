@@ -21,6 +21,14 @@ pub const WRITER_QUEUE_SATURATED_STAGE: &str = "writer_queue_saturated";
 /// queue accepted a request but before its operation closure ran.
 pub const WRITER_TASK_BEGIN_BUSY_STAGE: &str = "writer_task_begin_busy";
 
+/// Stable wire code/stage for an ordinary writer request whose operation or
+/// COMMIT failed after the task proved its transaction was rolled back.
+pub const WRITER_TASK_REQUEST_FAILED_STAGE: &str = "writer_task_request_failed";
+
+/// Stable wire code/stage for a request reported by a permanently retired
+/// writer seam.
+pub const WRITER_TASK_TERMINATED_STAGE: &str = "writer_task_terminated";
+
 /// Stable wire code/stage for a bounded storage-admission wait (a
 /// reader/writer handle slot or a pooled reader checkout) that elapsed
 /// before anything was acquired. The operation never started, so the
@@ -100,6 +108,24 @@ pub struct RetryableFailureContext {
     pub scope: Option<&'static str>,
     /// Server backoff hint when a governing contract defines one.
     pub retry_after_ms: Option<u64>,
+}
+
+/// Structured writer-request finality recovered from a storage error.
+///
+/// `request_state` answers whether effects are known absent or ambiguous;
+/// `task_terminated` separately answers whether the writer seam remains
+/// usable. `retryable` retains the source error's transient policy and must
+/// not be inferred from rollback finality alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterTaskFailureContext {
+    /// Stable MCP code/stage for the error family.
+    pub stage: &'static str,
+    /// What the writer can prove about this request's effects.
+    pub request_state: khive_storage::WriterTaskRequestState,
+    /// Whether the writer seam was permanently retired.
+    pub task_terminated: bool,
+    /// Whether the source failure is transient independently of finality.
+    pub retryable: bool,
 }
 
 impl From<AdmissionFailureContext> for RetryableFailureContext {
@@ -612,6 +638,35 @@ impl RuntimeError {
         None
     }
 
+    /// Recover writer-request finality without parsing the rendered storage
+    /// error. Ordinary proven rollbacks and terminal writer failures are
+    /// deliberately distinct even when they carry the same request state.
+    pub fn writer_task_failure_context(&self) -> Option<WriterTaskFailureContext> {
+        let Self::Storage(error) = self else {
+            return None;
+        };
+        match error {
+            khive_storage::StorageError::WriterTaskRequestFailed {
+                request_state,
+                source,
+            } => Some(WriterTaskFailureContext {
+                stage: WRITER_TASK_REQUEST_FAILED_STAGE,
+                request_state: *request_state,
+                task_terminated: false,
+                retryable: source.is_retryable(),
+            }),
+            khive_storage::StorageError::WriterTaskTerminated { request_state } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITER_TASK_TERMINATED_STAGE,
+                    request_state: *request_state,
+                    task_terminated: true,
+                    retryable: false,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Recover every typed failure for which this process can prove that
     /// retrying the one failed operation cannot duplicate a side effect.
     pub fn retryable_failure_context(&self) -> Option<RetryableFailureContext> {
@@ -781,6 +836,46 @@ mod channel_ingest_failure_class_tests {
             },
             "a rendered message resembling SecretDetected must remain Unknown unless its typed variant is SecretDetected"
         );
+    }
+
+    #[test]
+    fn writer_task_failure_context_separates_request_finality_from_task_liveness() {
+        use khive_storage::{StorageError, WriterTaskRequestState};
+
+        let rolled_back = RuntimeError::Storage(StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::TransactionRolledBack,
+            source: Box::new(StorageError::Pool {
+                operation: "writer_task_commit".into(),
+                message: "commit refused".into(),
+            }),
+        });
+        let rolled_back_context = rolled_back
+            .writer_task_failure_context()
+            .expect("proven rollback must remain typed through RuntimeError");
+        assert_eq!(
+            rolled_back_context.request_state,
+            WriterTaskRequestState::TransactionRolledBack
+        );
+        assert_eq!(
+            rolled_back_context.stage,
+            super::WRITER_TASK_REQUEST_FAILED_STAGE
+        );
+        assert!(!rolled_back_context.task_terminated);
+        assert!(rolled_back_context.retryable);
+
+        let unknown = RuntimeError::Storage(StorageError::WriterTaskTerminated {
+            request_state: WriterTaskRequestState::SideEffectsUnknown,
+        });
+        let unknown_context = unknown
+            .writer_task_failure_context()
+            .expect("ambiguous finality must remain typed through RuntimeError");
+        assert_eq!(
+            unknown_context.request_state,
+            WriterTaskRequestState::SideEffectsUnknown
+        );
+        assert_eq!(unknown_context.stage, super::WRITER_TASK_TERMINATED_STAGE);
+        assert!(unknown_context.task_terminated);
+        assert!(!unknown_context.retryable);
     }
 
     #[test]
