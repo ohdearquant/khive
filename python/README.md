@@ -73,24 +73,6 @@ async with mcp_session(url, api_key) as session:
     await session.call_tool("request", {"ops": "stats()"})
 ```
 
-### `khive-cloud` CLI
-
-The `cloud` extra also installs a `khive-cloud` script:
-
-```bash
-export KHIVE_CLOUD_URL=https://khive-cloud.example
-export KHIVE_CLOUD_API_KEY=sk_...
-
-khive-cloud whoami
-khive-cloud exec 'stats()'
-khive-cloud tools
-khive-cloud health   # no auth required
-```
-
-Exit codes: `0` ok, `1` a server or op error (including `exec` against ops
-whose envelope reports `summary.failed`/`aborted` > 0), `2` usage (missing
-`--url`/`--api-key` or their env vars).
-
 ## Scratch database
 
 Experiments should run against a scratch daemon, not a production store:

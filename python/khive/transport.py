@@ -202,9 +202,9 @@ class HttpTransport(Transport):
     def send_dsl(self, ops: str, *, timeout: float) -> dict[str, Any]:
         """Send an already-rendered DSL ops string verbatim.
 
-        Used by the `khive-cloud` CLI's `exec` command, whose input is DSL
-        text typed by the caller — not the client's internal ops-array form
-        that `round_trip` decodes and re-renders.
+        For callers that already hold DSL text (a script, a notebook, a
+        REPL). `round_trip` is the other path: it decodes the client's
+        internal ops-array form and renders it.
         """
         return self._post(ops, timeout)
 
