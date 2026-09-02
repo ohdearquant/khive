@@ -36,7 +36,10 @@ An always-machine-readable copy of this page is at
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
 `kkernel git-ingest` CLI drive. Its four verbs are `git.digest` (read/ingest) plus three
 write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that shell to system git
-with hardened, allowlisted argv construction.
+with hardened, allowlisted argv construction. A remote `git.digest` source whose clone or
+fetch fails returns a typed `RemoteFetchError` naming the redacted remote (ADR-088
+Amendment 1, Remote-URL mode, point 5); a source that parses as neither a local path nor a
+remote URL is `InvalidInput`.
 
 `workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
 

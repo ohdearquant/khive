@@ -175,6 +175,15 @@ frozen `until`; temporary absence is not evidence that the pass failed or commit
 4. Cleanup on eviction uses directory removal of the scratch path only (never touches
    user-owned paths).
 
+5. Failure contract (2026-09-02). A remote source whose clone or fetch setup fails
+   returns the typed `RemoteFetchError { remote, message }` rather than a generic error:
+   `remote` is the canonical URL with any embedded credentials and query string redacted,
+   and `message` is the underlying git failure. A source that cannot be parsed as a local
+   path or a remote URL stays `InvalidInput`, and storage failures keep their existing
+   error types, so callers can tell a network or authentication failure apart from a
+   malformed request without inspecting message text. The rendered error never contains
+   the credential or query material stripped from `remote`.
+
 ### Accepted cache crash-residue rider (2026-08-09)
 
 The staging-then-rename design can clean every ordinary error return, but no
