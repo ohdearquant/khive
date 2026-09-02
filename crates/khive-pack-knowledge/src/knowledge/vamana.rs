@@ -156,6 +156,20 @@ pub(crate) struct AnnState {
     checkpoint_locks: std::sync::Mutex<HashMap<AnnKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Idempotence guard for the pack-lifetime file-generation watcher.
     rotation_watch_started: AtomicBool,
+    /// Test-only rendezvous for `finish_warm`'s Ready publish (issue #2340
+    /// regression coverage) — see `run_finish_warm_ready_test_hook`.
+    #[cfg(test)]
+    test_finish_warm_ready_hook: std::sync::Mutex<Option<Arc<FinishWarmReadyTestHook>>>,
+}
+
+/// Test-only hook installed on an `AnnState` to drive a concurrent eviction
+/// attempt from inside `finish_warm`'s Ready critical section. See
+/// `run_finish_warm_ready_test_hook`.
+#[cfg(test)]
+pub(crate) struct FinishWarmReadyTestHook {
+    pub(crate) incumbent_digest: [u8; 32],
+    pub(crate) generation: u64,
+    pub(crate) handle_tx: tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>,
 }
 
 pub(crate) type SharedAnn = Arc<AnnState>;
@@ -170,6 +184,8 @@ pub(crate) fn new_shared() -> SharedAnn {
         force_rebuild: std::sync::Mutex::new(HashSet::new()),
         checkpoint_locks: std::sync::Mutex::new(HashMap::new()),
         rotation_watch_started: AtomicBool::new(false),
+        #[cfg(test)]
+        test_finish_warm_ready_hook: std::sync::Mutex::new(None),
     })
 }
 
@@ -410,33 +426,80 @@ fn finish_warm_state(permit: &mut AnnWarmPermit, next: AnnWarmState) {
 /// Finish a normally-returning warm from the worker's explicit outcome. A
 /// `Ready` outcome is still verified against the attempt's generation before
 /// publication into the lifecycle state.
+///
+/// The Ready decision and its publication into `warm_states` share one
+/// `indexes` read-lock critical section (issue #2340): the guard acquired
+/// below stays held across the `warm_states` transition, so a concurrent
+/// rotation eviction — which takes `indexes` write then `warm_states` under
+/// `evict_bridge_and_ready_state` — cannot run between the decision and the
+/// publish. Either the eviction's write-lock acquisition blocks until this
+/// guard drops (so it sees the just-published Ready state and can clean it
+/// up), or the eviction has already completed and removed the bridge before
+/// this guard is taken (so the decision below observes its absence and
+/// publishes Failed instead of a dangling Ready).
 async fn finish_warm(mut permit: AnnWarmPermit, outcome: AnnWarmOutcome) {
-    let next = match outcome {
-        AnnWarmOutcome::Ready => match permit
-            .ann
-            .indexes
-            .read()
-            .await
-            .get(&permit.key)
-            .map(|bridge| bridge.generation)
-            .filter(|generation| *generation >= permit.generation)
-        {
-            Some(generation) => AnnWarmState::Ready { generation },
-            None => AnnWarmState::Failed {
+    match outcome {
+        AnnWarmOutcome::Ready => {
+            let ann = permit.ann.clone();
+            let idxs = ann.indexes.read().await;
+            let next = match idxs
+                .get(&permit.key)
+                .map(|bridge| bridge.generation)
+                .filter(|generation| *generation >= permit.generation)
+            {
+                Some(generation) => AnnWarmState::Ready { generation },
+                None => AnnWarmState::Failed {
+                    generation: permit.generation,
+                    error: AnnWarmFailure::Operational,
+                },
+            };
+            #[cfg(test)]
+            run_finish_warm_ready_test_hook(&ann, &permit.key).await;
+            finish_warm_state(&mut permit, next);
+            drop(idxs);
+        }
+        AnnWarmOutcome::Empty => {
+            let next = AnnWarmState::Failed {
+                generation: permit.generation,
+                error: AnnWarmFailure::EmptyCorpus,
+            };
+            finish_warm_state(&mut permit, next);
+        }
+        AnnWarmOutcome::Failed => {
+            let next = AnnWarmState::Failed {
                 generation: permit.generation,
                 error: AnnWarmFailure::Operational,
-            },
-        },
-        AnnWarmOutcome::Empty => AnnWarmState::Failed {
-            generation: permit.generation,
-            error: AnnWarmFailure::EmptyCorpus,
-        },
-        AnnWarmOutcome::Failed => AnnWarmState::Failed {
-            generation: permit.generation,
-            error: AnnWarmFailure::Operational,
-        },
+            };
+            finish_warm_state(&mut permit, next);
+        }
+    }
+}
+
+/// Test-only seam (issue #2340): if a hook is installed on `ann`, spawn the
+/// eviction helper against `key` and hand its `JoinHandle` back to the test,
+/// all while the caller (`finish_warm`) still holds its `indexes` read
+/// guard. Lets a test drive the exact interleaving the fix closes: the
+/// spawned eviction task cannot acquire the `indexes` write lock until
+/// `finish_warm` finishes publishing and drops its guard.
+#[cfg(test)]
+async fn run_finish_warm_ready_test_hook(ann: &SharedAnn, key: &AnnKey) {
+    let hook = ann
+        .test_finish_warm_ready_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(hook) = hook else {
+        return;
     };
-    finish_warm_state(&mut permit, next);
+    let ann = ann.clone();
+    let key = key.clone();
+    let incumbent_digest = hook.incumbent_digest;
+    let generation = hook.generation;
+    let handle = tokio::spawn(async move {
+        evict_bridge_and_ready_state(&ann, &key, incumbent_digest, generation).await;
+    });
+    let _ = hook.handle_tx.send(handle);
+    tokio::task::yield_now().await;
 }
 
 impl Drop for AnnWarmPermit {
@@ -2677,6 +2740,12 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
     }
 }
 
+/// Whether `start_rotation_watcher` has claimed its one-shot guard for `ann`.
+#[cfg(test)]
+pub(crate) fn rotation_watch_started_for_test(ann: &SharedAnn) -> bool {
+    ann.rotation_watch_started.load(Ordering::Acquire)
+}
+
 /// Start one pack-lifetime watcher that releases mmap generations after peer
 /// checkpoints rotate their files. The task retains only a weak ANN reference
 /// between ticks and also exits immediately on daemon shutdown.
@@ -2746,6 +2815,47 @@ async fn refresh_rotated_segments_in_root(ann_root: &std::path::Path, ann: &Shar
             }
         }
     }
+}
+
+/// Evict `key`'s bridge if it is still the one identified by
+/// `incumbent_digest`, and clear a `Ready` warm state at the same
+/// `generation`, under one `indexes` write-lock critical section.
+///
+/// Keeping both mutations inside one critical section closes the split-lock
+/// race with `finish_warm`'s Ready publish (issue #2340): `finish_warm`
+/// decides Ready and publishes it to `warm_states` while still holding the
+/// `indexes` read guard it used for the decision, so whichever side's
+/// critical section runs second observes the other's completed effect —
+/// never a half-applied state where `warm_states` says `Ready` and no
+/// bridge is installed. Keying the state cleanup on the evicted bridge's own
+/// generation (not "any Ready") leaves an unrelated build's state alone.
+async fn evict_bridge_and_ready_state(
+    ann: &SharedAnn,
+    key: &AnnKey,
+    incumbent_digest: [u8; 32],
+    generation: u64,
+) -> bool {
+    let mut indexes = ann.indexes.write().await;
+    if !indexes
+        .get(key)
+        .is_some_and(|bridge| bridge.commit_digest == Some(incumbent_digest))
+    {
+        return false;
+    }
+    indexes.remove(key);
+    // Only a Ready state at the evicted bridge's own generation describes it.
+    // A Warming state belongs to an in-flight warm whose permit still owns
+    // the single-flight slot; removing it would let a second warm start
+    // alongside the first, and a Ready state at a different generation
+    // belongs to a later build this eviction has nothing to say about.
+    let mut states = warm_states_guard(&ann.warm_states);
+    if matches!(
+        states.get(key),
+        Some(AnnWarmState::Ready { generation: state_generation }) if *state_generation == generation
+    ) {
+        states.remove(key);
+    }
+    true
 }
 
 /// Adopt one changed publication under the same lock order as checkpoint
@@ -2825,28 +2935,7 @@ async fn refresh_rotated_segment(
             }
         }
         Err(error) => {
-            let removed = {
-                let mut indexes = ann.indexes.write().await;
-                if indexes
-                    .get(key)
-                    .is_some_and(|bridge| bridge.commit_digest == Some(incumbent_digest))
-                {
-                    indexes.remove(key);
-                    true
-                } else {
-                    false
-                }
-            };
-            if removed {
-                // Only a Ready state describes the evicted bridge. A Warming
-                // state belongs to an in-flight warm whose permit still owns
-                // the single-flight slot; removing it would let a second warm
-                // start alongside the first.
-                let mut states = warm_states_guard(&ann.warm_states);
-                if matches!(states.get(key), Some(AnnWarmState::Ready { .. })) {
-                    states.remove(key);
-                }
-            }
+            evict_bridge_and_ready_state(ann, key, incumbent_digest, generation).await;
             tracing::warn!(
                 error = %error,
                 namespace = %key.namespace,
@@ -4426,6 +4515,97 @@ mod tests {
             warm_states_guard(&ann.warm_states).get(&key).is_none(),
             "the Ready state described the evicted bridge and must go with it"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_rotation_does_not_clear_a_newer_builds_ready_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let (rt, ann, key) = install_generation_then_publish_invalid_rotation(&temp).await;
+
+        // A later build's permit already published Ready for this key at a
+        // newer generation than the one this eviction is evicting; sharing
+        // the key must not make the cleanup sweep it up too.
+        warm_states_guard(&ann.warm_states)
+            .insert(key.clone(), AnnWarmState::Ready { generation: 8 });
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        assert!(
+            ann.indexes.read().await.get(&key).is_none(),
+            "an invalid rotated generation must still evict the incumbent"
+        );
+        assert!(
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Ready { generation: 8 })
+            ),
+            "eviction must not clear a later build's Ready state sharing the key"
+        );
+    }
+
+    /// Regression for issue #2340: `finish_warm`'s Ready decision (read
+    /// `indexes`, check the bridge's generation) and its publication into
+    /// `warm_states` used to be two separate critical sections, so a
+    /// rotation eviction could run its own two-step remove-then-cleanup in
+    /// between, observe the state still `Warming`, and skip the cleanup —
+    /// leaving `warm_states` say `Ready` for a key `indexes` no longer has a
+    /// bridge for. Reverting the `finish_warm` fix (so the `indexes` read
+    /// guard drops before the `run_finish_warm_ready_test_hook` call instead
+    /// of after) reproduces exactly that: the hook's eviction task, spawned
+    /// with the guard already free, races to completion before the
+    /// publish, and the assertion below fails.
+    #[tokio::test]
+    async fn finish_warm_ready_publish_is_atomic_with_concurrent_eviction() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_rt, ann, key) = install_generation_then_publish_invalid_rotation(&temp).await;
+
+        let incumbent_digest = ann
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .and_then(|bridge| bridge.commit_digest)
+            .expect("incumbent bridge installed with a commit identity");
+
+        let permit = begin_warm(&ann, key.clone()).expect("a fresh key grants a warm permit");
+
+        let (handle_tx, mut handle_rx) = tokio::sync::mpsc::unbounded_channel();
+        *ann.test_finish_warm_ready_hook.lock().unwrap() =
+            Some(Arc::new(FinishWarmReadyTestHook {
+                incumbent_digest,
+                generation: 7,
+                handle_tx,
+            }));
+
+        // Drives finish_warm's Ready publish. Its test hook spawns
+        // `evict_bridge_and_ready_state` — the same critical section the
+        // rotation watcher's `Err` arm uses — against the identical
+        // incumbent bridge while finish_warm still holds the `indexes` read
+        // guard it used for the Ready decision.
+        finish_warm(permit, AnnWarmOutcome::Ready).await;
+
+        let evict_handle = handle_rx
+            .recv()
+            .await
+            .expect("the ready hook spawns the eviction task");
+        evict_handle.await.expect("eviction task completes");
+
+        // Invariant: a Ready state for the key implies a bridge is
+        // installed for the key. The two sides of the race can settle
+        // either way — the eviction's write lock was blocked until
+        // finish_warm published and can then see and clear the Ready state
+        // it just orphaned — but never in the inconsistent middle: Ready
+        // with no bridge.
+        let is_ready = matches!(
+            warm_states_guard(&ann.warm_states).get(&key),
+            Some(AnnWarmState::Ready { .. })
+        );
+        if is_ready {
+            assert!(
+                ann.indexes.read().await.get(&key).is_some(),
+                "a Ready warm state must not describe a bridge the rotation watcher evicted"
+            );
+        }
     }
 
     #[test]

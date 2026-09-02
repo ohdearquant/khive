@@ -832,6 +832,12 @@ pub(crate) async fn warm_existing_memory_indexes(rt: &KhiveRuntime, ann: &Shared
     }
 }
 
+/// Whether `start_rotation_watcher` has claimed its one-shot guard for `ann`.
+#[cfg(test)]
+pub(crate) fn rotation_watch_started_for_test(ann: &SharedAnn) -> bool {
+    ann.rotation_watch_started.load(Ordering::Acquire)
+}
+
 /// Start one pack-lifetime watcher that releases mmap file generations after
 /// a peer checkpoint rotates them. The task holds only a weak ANN reference
 /// between ticks, so dropping the pack ends it even in a non-daemon stdio
@@ -3297,6 +3303,87 @@ mod tests {
              checkpoint of unknown namespace coverage; recall requires the conservative \
              empty set to keep over-fetching for eligible visible memories",
             bridge.namespace_set
+        );
+    }
+
+    /// Mirrors the knowledge-pack invalid-rotation tests (issue #2340): a
+    /// peer's rotated checkpoint that fails validation must evict the
+    /// predecessor here too, and a later warm must recover. Unlike the
+    /// knowledge pack, memory has no separate warm-lifecycle map to race —
+    /// `refresh_rotated_segment` and `ensure_ann_for_model` both take
+    /// `model_warm_lock` for the same key (:917-918 and :1064-1065) before
+    /// touching `indexes`, so the watcher and an in-flight rebuild are
+    /// already mutually exclusive; this test pins the recovery behavior that
+    /// serialization is relied on to make safe.
+    #[tokio::test]
+    async fn invalid_rotation_evicts_predecessor_and_next_warm_recovers() {
+        const MODEL: &str = "memory-invalid-rotation-recovery-test-model";
+        const DIMS: usize = 4;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        rt.create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "invalid rotation recovery note",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+        let ann = new_shared();
+        let key = AnnKey::new(MODEL);
+
+        let first = ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("initial full checkpoint");
+        assert!(
+            matches!(first, AnnEnsureStatus::Built { vectors: 1 }),
+            "sanity: the initial warm must build and persist the corpus, got {first:?}"
+        );
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "sanity: the initial build must be installed"
+        );
+
+        // A peer publishes a changed commit whose UUID sidecar is missing, so
+        // the rotated generation fails validation and the incumbent is evicted.
+        let dir = ann_segment_dir(&rt, MODEL).expect("file-backed segment directory");
+        let incumbent_seq = ann
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .and_then(|bridge| bridge.index.last_applied_seq())
+            .expect("initial build carries an applied watermark");
+        let mut rotated = tiny_bridge(Uuid::new_v4(), 1);
+        rotated.set_applied_seq(incumbent_seq);
+        rotated.save_atomic(&dir).expect("rotate checkpoint");
+        std::fs::remove_file(dir.join("external_ids.bin")).expect("remove sidecar");
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        assert!(
+            ann.indexes.read().await.get(&key).is_none(),
+            "an invalid rotated generation must evict the incumbent"
+        );
+
+        // The next warm must recover: `model_warm_lock` is the same lock the
+        // watcher just released, so no stale ownership blocks the rebuild.
+        let recovered = ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("recovery checkpoint after eviction");
+        assert!(
+            matches!(recovered, AnnEnsureStatus::Built { vectors: 1 }),
+            "the next warm must rebuild after the watcher's eviction, got {recovered:?}"
+        );
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "the recovery build must reinstall the index"
         );
     }
 
