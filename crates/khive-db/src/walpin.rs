@@ -393,6 +393,35 @@ mod unix_impl {
         REMOVE_IF_SAME_RACE_HOOK.with(|cell| cell.borrow_mut().take())
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Test-only seam for a `readdir()` read failure mid-walk: forcing a
+        /// real directory read to fail from a portable unit test isn't
+        /// practical, so this one-shot override makes `list_names`'s next
+        /// loop iteration observe a NULL entry with this errno already set,
+        /// exactly as a genuine failed `readdir()` would leave it — the
+        /// downstream `readdir_null_is_error` branch that decides Err vs.
+        /// end-of-directory runs unmodified against the forced state.
+        static LIST_NAMES_READDIR_FAULT: std::cell::Cell<Option<libc::c_int>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_list_names_readdir_fault(errno: libc::c_int) {
+        LIST_NAMES_READDIR_FAULT.with(|cell| cell.set(Some(errno)));
+    }
+
+    fn take_list_names_readdir_fault() -> Option<libc::c_int> {
+        #[cfg(test)]
+        {
+            LIST_NAMES_READDIR_FAULT.with(|cell| cell.take())
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn errno_location() -> *mut libc::c_int {
         // SAFETY: `__error` returns this thread's errno cell; obtaining the
@@ -463,10 +492,11 @@ mod unix_impl {
     pub(super) struct SidecarDirHandle(fs::File);
 
     /// One opened, validated regular entry plus the filesystem identity used
-    /// to make a later unlink race-safe.
+    /// to make a later unlink race-safe. Ownership is checked before this is
+    /// constructed (see `read_checked_entry`), so every `CheckedEntry` is
+    /// already known to belong to `current_uid()`.
     pub(super) struct CheckedEntry {
         pub(super) body: Vec<u8>,
-        pub(super) owner_uid: u32,
         pub(super) mtime: SystemTime,
         device: u64,
         inode: u64,
@@ -967,16 +997,20 @@ mod unix_impl {
             Ok(())
         }
 
-        /// Read `name`'s contents plus its owner uid and mtime. `Ok(None)`
-        /// for a missing entry (raced away between listing and reading).
-        /// Refuses symlinks, non-regular files, and oversized entries: the
+        /// Read `name`'s contents plus its mtime. `Ok(None)` for a missing
+        /// entry (raced away between listing and reading). Refuses symlinks,
+        /// non-owned files, non-regular files, and oversized entries: the
         /// open carries `O_NONBLOCK` so a FIFO planted at the entry's name
         /// can never block this call waiting for a peer, the opened fd is
-        /// `fstat`'d and must be a regular file before any byte is read,
-        /// and the read itself is bounded — a same-uid process must not be
-        /// able to stall or balloon checkpoint-time enumeration. Owner uid
-        /// and mtime come from the same `fstat`, so every trust decision is
-        /// made against the exact object that was read.
+        /// `fstat`'d and must be a regular file owned by `current_uid()`
+        /// before any byte is read, and the read itself is bounded — a
+        /// same-uid process must not be able to stall or balloon
+        /// checkpoint-time enumeration. Ownership is checked against the
+        /// same `fstat` that classifies the file, and BEFORE its contents
+        /// are read, via `io::ErrorKind::PermissionDenied` — never folded
+        /// into the generic untrusted-entry error, so a caller can route a
+        /// non-owned (or otherwise uninspectable) entry to a distinct
+        /// degraded-evidence outcome instead of silently skipping it.
         pub(super) fn read_checked_entry(&self, name: &str) -> io::Result<Option<CheckedEntry>> {
             use std::os::unix::fs::MetadataExt;
 
@@ -1009,6 +1043,12 @@ mod unix_impl {
                     "walpin sidecar entry {name:?} is not a regular file"
                 )));
             }
+            if meta.uid() != current_uid() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("walpin sidecar entry {name:?} is not owned by the current user"),
+                ));
+            }
             if meta.len() > MAX_SIDECAR_ENTRY_BYTES {
                 return Err(io_other(format!(
                     "walpin sidecar entry {name:?} exceeds {MAX_SIDECAR_ENTRY_BYTES} bytes"
@@ -1026,20 +1066,16 @@ mod unix_impl {
             let mtime = SystemTime::UNIX_EPOCH + Duration::new(meta.mtime().max(0) as u64, 0);
             Ok(Some(CheckedEntry {
                 body: buf,
-                owner_uid: meta.uid(),
                 mtime,
                 device: meta.dev(),
                 inode: meta.ino(),
             }))
         }
 
-        pub(super) fn read_checked(
-            &self,
-            name: &str,
-        ) -> io::Result<Option<(Vec<u8>, u32, SystemTime)>> {
+        pub(super) fn read_checked(&self, name: &str) -> io::Result<Option<(Vec<u8>, SystemTime)>> {
             Ok(self
                 .read_checked_entry(name)?
-                .map(|entry| (entry.body, entry.owner_uid, entry.mtime)))
+                .map(|entry| (entry.body, entry.mtime)))
         }
 
         /// Remove `name` only while it still denotes the exact regular file
@@ -1136,8 +1172,15 @@ mod unix_impl {
                 // here is what makes that observable as distinct from an
                 // error below.
                 clear_errno();
-                // SAFETY: `dirp` is a valid, open `DIR*` for this whole loop.
-                let entry = unsafe { libc::readdir(dirp) };
+                let entry = if let Some(errno) = take_list_names_readdir_fault() {
+                    // SAFETY: sets the same thread-local errno cell a
+                    // genuine failed `readdir()` would have set.
+                    unsafe { *errno_location() = errno };
+                    std::ptr::null_mut()
+                } else {
+                    // SAFETY: `dirp` is a valid, open `DIR*` for this whole loop.
+                    unsafe { libc::readdir(dirp) }
+                };
                 if entry.is_null() {
                     if readdir_null_is_error(current_errno()) {
                         let err = io::Error::last_os_error();
@@ -3204,6 +3247,31 @@ enum OrphanTempVerdict {
     Untrusted(&'static str),
 }
 
+// A live producer's `proc_pidinfo`/`/proc` lookup can fail for reasons that
+// have nothing to do with the temp's trustworthiness (a permission boundary
+// on a shared host, a `/proc` mount restriction) — forcing that outcome from
+// a portable test isn't practical, so this thread-local one-shot override is
+// the seam.
+#[cfg(all(unix, test))]
+thread_local! {
+    static STALE_ORPHAN_TEMP_START_TIME_OVERRIDE: std::cell::Cell<Option<Option<i64>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(unix, test))]
+fn set_stale_orphan_temp_start_time_override(value: Option<i64>) {
+    STALE_ORPHAN_TEMP_START_TIME_OVERRIDE.with(|cell| cell.set(Some(value)));
+}
+
+#[cfg(unix)]
+fn stale_orphan_temp_actual_start(pid: u32) -> Option<i64> {
+    #[cfg(test)]
+    if let Some(overridden) = STALE_ORPHAN_TEMP_START_TIME_OVERRIDE.with(|cell| cell.take()) {
+        return overridden;
+    }
+    process_start_time_secs(pid)
+}
+
 #[cfg(unix)]
 fn stale_orphan_temp(
     handle: &unix_impl::SidecarDirHandle,
@@ -3213,12 +3281,16 @@ fn stale_orphan_temp(
     now: i64,
     stale_after_secs: i64,
 ) -> io::Result<OrphanTempVerdict> {
-    let Some(entry) = handle.read_checked_entry(name)? else {
-        return Ok(OrphanTempVerdict::Skip);
+    let entry = match handle.read_checked_entry(name) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return Ok(OrphanTempVerdict::Skip),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return Ok(OrphanTempVerdict::Untrusted(
+                "refused: producer temp not owned by current user",
+            ));
+        }
+        Err(e) => return Err(e),
     };
-    if entry.owner_uid != unix_impl::current_uid() {
-        return Ok(OrphanTempVerdict::Skip);
-    }
     let modified_at = entry
         .mtime
         .duration_since(UNIX_EPOCH)
@@ -3250,8 +3322,10 @@ fn stale_orphan_temp(
     if !is_process_alive(pid) {
         return Ok(OrphanTempVerdict::Reap(entry));
     }
-    let Some(actual_start) = process_start_time_secs(pid) else {
-        return Ok(OrphanTempVerdict::Skip);
+    let Some(actual_start) = stale_orphan_temp_actual_start(pid) else {
+        return Ok(OrphanTempVerdict::Untrusted(
+            "refused: producer temp process start time unavailable",
+        ));
     };
     if epoch_abs_diff(actual_start, recorded_start) > START_TIME_EPSILON_SECS {
         return Ok(OrphanTempVerdict::Reap(entry));
@@ -3347,9 +3421,13 @@ fn enumerate_live_bounded(
         // content read, and contributes `Unknown` rather than being
         // silently dropped — the entry's health is unestablished, not
         // exonerating.
-        let (body, owner_uid, mtime) = match handle.read_checked(&name) {
+        let (body, mtime) = match handle.read_checked(&name) {
             Ok(Some(v)) => v,
             Ok(None) => continue, // raced away between listing and reading
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                unknown.push((pid, "refused: sidecar entry not owned by current user"));
+                continue;
+            }
             Err(_) => {
                 unknown.push((
                     pid,
@@ -3358,10 +3436,6 @@ fn enumerate_live_bounded(
                 continue;
             }
         };
-        if owner_uid != unix_impl::current_uid() {
-            unknown.push((pid, "refused: sidecar entry not owned by current user"));
-            continue;
-        }
         let mtime_secs = mtime
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -4121,6 +4195,49 @@ mod tests {
         assert!(
             stale_live.exists(),
             "a live producer's temp must never be reaped"
+        );
+    }
+
+    /// A live producer's identity check depends on reading its process start
+    /// time; when that read fails (a permission boundary, a `/proc`
+    /// restriction) the temp's trustworthiness is simply unestablished, not
+    /// exonerated. It must surface as `Unknown` degraded evidence — the same
+    /// contract already enforced for a non-owned producer temp — rather than
+    /// being silently skipped, which would let diagnostics report `Complete`
+    /// while untrusted residue sits in the sidecar directory.
+    #[cfg(unix)]
+    #[test]
+    fn housekeeping_reports_a_live_producer_temp_whose_start_time_is_unreadable_as_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+
+        let live_pid = std::process::id();
+        let stale_live = dir.join(format!(".{live_pid}.beacon.tmp"));
+        fs::write(&stale_live, serde_json::to_vec(&beacon(live_pid)).unwrap()).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&stale_live)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+
+        set_stale_orphan_temp_start_time_override(None);
+        let report = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            report.orphan_temps_reaped, 0,
+            "identity that could not be verified is never trustworthy reap evidence"
+        );
+        assert!(
+            stale_live.exists(),
+            "an uninspectable producer temp must be retained, not silently dropped"
+        );
+        let unknown: Vec<u32> = report.unknown_pids().collect();
+        assert!(
+            unknown.contains(&live_pid),
+            "a live producer temp whose start time cannot be read must be reported as \
+             Unknown, not silently skipped: {unknown:?}"
         );
     }
 
@@ -4894,6 +5011,30 @@ mod tests {
         );
     }
 
+    /// The predicate test above only proves `readdir_null_is_error` itself
+    /// distinguishes EOF from a real error; it never drives `list_names` or
+    /// its production caller, so a regression at the actual call site (e.g.
+    /// folding a read error into an ordinary `break`) would leave that test
+    /// green. Forcing a real `readdir()` to fail mid-walk isn't practical
+    /// from a portable unit test, so this drives the fault through the
+    /// test-only seam and asserts the error reaches `enumerate_live`,
+    /// exactly as a genuine directory-read error must — never silently
+    /// reported as a complete-but-truncated listing.
+    #[test]
+    #[cfg(unix)]
+    fn readdir_failure_mid_walk_propagates_from_list_names_to_enumerate_live() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+
+        unix_impl::set_list_names_readdir_fault(libc::EIO);
+        let err = enumerate_live(&dir, Duration::from_secs(5)).expect_err(
+            "a readdir failure mid-walk must propagate as an error, never be folded into a \
+             truncated-but-otherwise-complete listing",
+        );
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    }
+
     /// `remove_if_same`'s device/inode recheck and its `unlinkat` are two
     /// separate syscalls; nothing closes the gap between them. This test
     /// drives that exact gap via the test-only hook (forcing a real second
@@ -4905,6 +5046,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn remove_if_same_a_replacement_landing_in_the_recheck_to_unlink_window_is_still_removed() {
+        use std::os::unix::fs::MetadataExt;
+
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("khive.db.walpin");
         ensure_sidecar_dir(&dir).unwrap();
@@ -4916,12 +5059,27 @@ mod tests {
             .read_checked_entry(name)
             .unwrap()
             .expect("the stale file must be readable and checked");
+        let expected_inode = fs::metadata(dir.join(name)).unwrap().ino();
 
         let replacement_path = dir.join(name);
+        let replacement_tmp_path = dir.join(".999999999.beacon.tmp.replacement");
         let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hook_ran_writer = std::sync::Arc::clone(&hook_ran);
+        let replacement_inode = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let replacement_inode_writer = std::sync::Arc::clone(&replacement_inode);
         unix_impl::set_remove_if_same_race_hook(move || {
-            fs::write(&replacement_path, b"a producer's brand-new in-flight write").unwrap();
+            // A genuine replacement swaps in a NEW inode via write-then-
+            // rename: `fs::write`-ing the existing name in place would only
+            // truncate the SAME inode the recheck already verified, proving
+            // nothing about the recheck-to-unlink race this test targets.
+            fs::write(
+                &replacement_tmp_path,
+                b"a producer's brand-new in-flight write",
+            )
+            .unwrap();
+            let new_inode = fs::metadata(&replacement_tmp_path).unwrap().ino();
+            fs::rename(&replacement_tmp_path, &replacement_path).unwrap();
+            replacement_inode_writer.store(new_inode, std::sync::atomic::Ordering::SeqCst);
             hook_ran_writer.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
@@ -4933,6 +5091,13 @@ mod tests {
             hook_ran.load(std::sync::atomic::Ordering::SeqCst),
             "the race hook must actually run inside remove_if_same for this test to prove \
              anything about the recheck-to-unlink window"
+        );
+        assert_ne!(
+            replacement_inode.load(std::sync::atomic::Ordering::SeqCst),
+            expected_inode,
+            "the hook must swap in a genuinely different inode, not rewrite the checked \
+             one in place, or this test cannot distinguish the race from an ordinary \
+             same-inode removal"
         );
         assert!(
             removed,

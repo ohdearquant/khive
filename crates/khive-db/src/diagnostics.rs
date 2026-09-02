@@ -1199,12 +1199,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
     )
     .await?;
     crate::ensure_request_read_active("db_diagnostics")?;
-    // See `collect_inner`'s matching comment: the WAL file and sidecar live
-    // beside `canonical_path()`, not the raw configured `path`.
-    let canonical = pool
-        .canonical_path()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| path.clone());
+    let canonical = operational_db_path(&pool, &path);
     let (wal_file, wal_pin) = inspect_file_state_interruptibly(canonical, sweep_interval).await?;
     crate::ensure_request_read_active("db_diagnostics")?;
 
@@ -1222,6 +1217,23 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
         wal_pin,
     })
+}
+
+/// The path every operational probe (WAL file, sidecar directory, OS holder
+/// census) resolves against for `pool`'s database. The checkpoint sidecar
+/// writers and `ConnectionPool` itself key the WAL and sidecar directory off
+/// `canonical_path()`, not the raw `configured` path — a symlinked or
+/// otherwise aliased configured path would otherwise send every probe below
+/// looking beside the alias while the evidence sits beside the canonical
+/// file. `configured` remains the presentation value the sync and async
+/// collectors put in `db_path`, since that is what the caller configured.
+/// Both `collect_inner` and `collect_with_runtime_audit_metrics_interruptibly`
+/// resolve through this one function so their aliasing behavior cannot drift
+/// apart.
+fn operational_db_path(pool: &ConnectionPool, configured: &Path) -> PathBuf {
+    pool.canonical_path()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| configured.to_path_buf())
 }
 
 fn collect_inner(
@@ -1264,18 +1276,12 @@ fn collect_inner(
     };
 
     let inspection = inspect_pool(pool);
-    // The checkpoint sidecar writers and `ConnectionPool` itself key the WAL
-    // and sidecar directory off `canonical_path()`, not the raw configured
-    // path — a symlinked or otherwise aliased `path` would make every
-    // operational probe below look beside the alias while the evidence sits
-    // beside the canonical file. `path` remains the presentation value in
-    // `db_path` since that is what the caller configured.
-    let canonical = pool.canonical_path().unwrap_or(&path);
+    let canonical = operational_db_path(pool, &path);
 
     DbDiagnostics {
         build,
         db_path: Some(path.display().to_string()),
-        wal_file: Some(wal_file_state(canonical)),
+        wal_file: Some(wal_file_state(&canonical)),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
         checkpoint_probe_error: inspection.checkpoint_probe_error,
@@ -1284,7 +1290,7 @@ fn collect_inner(
         size_composition_error: inspection.size_composition_error,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
-        wal_pin: wal_pin_attribution(canonical, sweep_interval),
+        wal_pin: wal_pin_attribution(&canonical, sweep_interval),
     }
 }
 
@@ -2475,6 +2481,99 @@ mod tests {
         // path, actually ran, completed untruncated, and found this
         // process's own beacon rather than missing it beside the wrong
         // (aliased) directory.
+        assert_eq!(
+            report.wal_pin.sidecar_listing_truncated,
+            Some(false),
+            "the sidecar enumeration must run to completion: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            report.wal_pin.registered_silent_pids.contains(&pid),
+            "the beacon written beside the canonical path must be found: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            report.wal_pin.census_holder_pids.contains(&pid),
+            "the OS census must find this process holding its own database open: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            !report
+                .wal_pin
+                .census_pids_without_attribution
+                .contains(&pid),
+            "this process's own holder entry must be attributed by its own sidecar evidence, \
+             not left unexplained: {:?}",
+            report.wal_pin
+        );
+    }
+
+    /// The async collector (`collect_with_audit_append_failures_interruptibly`)
+    /// resolves its operational path independently of the sync collector
+    /// (`collect`) — see `operational_db_path`. A regression that reintroduced
+    /// the raw configured path on only the async side would leave the sync
+    /// alias test above green while the async path silently missed its own
+    /// sidecar evidence; this exercises the same aliasing scenario through
+    /// the async entry point.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(khive_walpin_sidecar_env)]
+    async fn diagnostics_finds_sidecar_evidence_through_an_aliased_database_path_async() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).expect("mkdir real dir");
+        let real_path = real_dir.join("diag.db");
+        std::fs::write(&real_path, b"").expect("create real file");
+        let alias_path = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&real_path, &alias_path).expect("symlink alias");
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(alias_path.clone()),
+            ..PoolConfig::default()
+        })
+        .expect("pool open through symlinked path");
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .expect("seed a write so the WAL file exists");
+        }
+
+        let canonical = pool
+            .canonical_path()
+            .expect("file-backed pool")
+            .to_path_buf();
+        assert_ne!(
+            canonical, alias_path,
+            "the alias must actually differ from the canonical path for this test to mean \
+             anything"
+        );
+
+        let pid = std::process::id();
+        let sidecar_dir = crate::walpin::sidecar_dir_for(&canonical);
+        let beacon = crate::walpin::WalpinBeacon {
+            pid,
+            process_role: "session".to_string(),
+            started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
+            sweep_interval_ms: 5_000,
+        };
+        crate::walpin::write_beacon(&sidecar_dir, &beacon).expect("seed this process's beacon");
+
+        let pool = Arc::new(pool);
+        let report = collect_with_audit_append_failures_interruptibly(
+            Arc::clone(&pool),
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+            0,
+        )
+        .await
+        .expect("diagnostics succeed");
+
+        // Same rationale as the sync test: the wider OS holder census can be
+        // legitimately incomplete in a sandboxed environment, but the sidecar
+        // enumeration itself — keyed off the canonical path — must run to
+        // completion and find this process's own beacon.
         assert_eq!(
             report.wal_pin.sidecar_listing_truncated,
             Some(false),
