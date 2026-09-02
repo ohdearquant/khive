@@ -4627,6 +4627,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial(config_ledger)]
     async fn canonical_dispatch_preserves_an_earlier_outer_deadline() {
         let server = slow_sql_read_test_server();
         let outer = Duration::from_millis(50);
@@ -5725,6 +5726,7 @@ mod tests {
     /// token's namespace identical, so the signal lands on the active slot
     /// instead of the cold-namespace queue.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn brain_dispatch_hook_updates_state_visible_through_same_instance() {
         let config = RuntimeConfig {
             db_path: None,
@@ -5782,6 +5784,7 @@ mod tests {
     /// fail without it (occupancy false; forged value survives) and pass
     /// with it restored.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn single_runtime_boot_installs_note_write_validator() {
         let config = RuntimeConfig {
             db_path: None,

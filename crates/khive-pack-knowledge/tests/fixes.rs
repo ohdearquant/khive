@@ -3191,6 +3191,7 @@ async fn whitespace_padded_exclude_status_normalizes_to_draft() {
 // When compose runs in explicit domain_ids mode (is_auto=false), draft member atoms
 // must NOT be filtered — the caller opted in by supplying the domain directly.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn explicit_domain_ids_compose_includes_draft_member_atoms() {
     let f = pack(rt());
 
@@ -3286,6 +3287,7 @@ fn pack_with_events(rt: KhiveRuntime) -> Fixture {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn stats_total_events_counts_knowledge_verbs() {
     let f = pack_with_events(rt());
 

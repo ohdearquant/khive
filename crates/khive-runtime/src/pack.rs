@@ -6269,56 +6269,305 @@ pub(crate) mod tests {
         }
     }
 
-    /// An event-backed registry can drain the process-wide config ledger at
-    /// dispatch, so every such test fixture must join the ledger's serial
-    /// group even when its own assertion is about another audit field.
-    #[test]
-    fn event_store_test_fixtures_are_config_ledger_serialized() {
-        const SELF_SRC: &str = include_str!("pack.rs");
-        let lines: Vec<&str> = SELF_SRC.lines().collect();
-        let test_starts: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| {
-                let trimmed = line.trim();
-                trimmed == "#[test]" || trimmed.starts_with("#[tokio::test")
-            })
-            .map(|(index, _)| index)
-            .collect();
-        let event_store_fixture = ["with_event_", "store("].concat();
-        let mut offenders = Vec::new();
+    /// Recursively collect every `.rs` file under `dir` into `out`.
+    fn collect_rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_files(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
 
-        for (index, start) in test_starts.iter().copied().enumerate() {
-            let end = test_starts.get(index + 1).copied().unwrap_or(lines.len());
-            let span = &lines[start..end];
-            if !span.iter().any(|line| line.contains(&event_store_fixture)) {
+    /// Every `crates/<crate>/src/**/*.rs` and `crates/<crate>/tests/**/*.rs`
+    /// file in the workspace, read to a `String` alongside its path.
+    ///
+    /// This is the compiled-test population an event-backed registry
+    /// constructor can actually be reached from: unit tests live under
+    /// `src/`, integration tests live under `tests/`. Anything outside those
+    /// two directories per crate (benches, examples) never runs as `cargo
+    /// test` and is out of scope for this census.
+    fn workspace_rust_sources() -> Vec<(std::path::PathBuf, String)> {
+        let crates_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("khive-runtime's Cargo.toml lives directly under crates/")
+            .to_path_buf();
+        let mut files = Vec::new();
+        let Ok(crate_dirs) = std::fs::read_dir(&crates_root) else {
+            return Vec::new();
+        };
+        for crate_dir in crate_dirs.filter_map(Result::ok) {
+            let crate_dir = crate_dir.path();
+            if !crate_dir.is_dir() {
                 continue;
             }
+            for sub in ["src", "tests"] {
+                let sub_dir = crate_dir.join(sub);
+                if sub_dir.is_dir() {
+                    collect_rust_files(&sub_dir, &mut files);
+                }
+            }
+        }
+        files
+            .into_iter()
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((path, text))
+            })
+            .collect()
+    }
 
-            let signature_offset = span
+    /// The name of the function whose signature starts at `sig_line`
+    /// (already stripped of leading whitespace), if any.
+    fn fn_name_from_signature(sig_line: &str) -> Option<&str> {
+        let mut rest = sig_line;
+        for prefix in ["pub(crate) ", "pub(super) ", "pub "] {
+            if let Some(stripped) = rest.strip_prefix(prefix) {
+                rest = stripped;
+            }
+        }
+        let rest = rest
+            .strip_prefix("async fn ")
+            .or_else(|| rest.strip_prefix("fn "))?;
+        Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest))
+    }
+
+    /// `true` if `line`, once whitespace is trimmed, is a top-level `fn`
+    /// signature start (covering the `pub`/`pub(crate)`/`pub(super)` and
+    /// `async` modifiers actually used across this workspace).
+    fn is_fn_signature_line(trimmed: &str) -> bool {
+        fn_name_from_signature(trimmed).is_some()
+    }
+
+    /// Blank out the contents of every `"..."` string literal in `text`
+    /// (escapes included), line by line, so a seam name mentioned in an
+    /// error message or `.expect(...)` string — e.g. `pack.rs`'s own
+    /// `"...do not call with_event_store() for this backend."` — can never
+    /// read as a call. This only needs to handle ordinary quoted strings:
+    /// nothing in this workspace's actual seam-adjacent code uses raw
+    /// strings or multi-line string literals for text that could collide
+    /// with a seam or helper name.
+    fn strip_string_literals(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        // Persists across lines on purpose: this workspace's longer error
+        // and `.expect(...)` messages routinely use backslash-newline
+        // string continuations (see `pack.rs`'s own
+        // `IncompatibleEventStore` message), so a literal spanning several
+        // source lines must stay "in string" across all of them.
+        let mut in_string = false;
+        for line in text.lines() {
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                if in_string {
+                    if c == '\\' {
+                        out.push(' ');
+                        if chars.next().is_some() {
+                            out.push(' ');
+                        }
+                        continue;
+                    }
+                    if c == '"' {
+                        in_string = false;
+                        out.push('"');
+                    } else {
+                        out.push(' ');
+                    }
+                } else {
+                    if c == '"' {
+                        in_string = true;
+                    }
+                    out.push(c);
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// `true` if `text` contains a call to `name` — `name` immediately
+    /// followed by `(` (optional whitespace between), with a non-identifier
+    /// character (or start of text) before it, not immediately preceded by
+    /// `fn ` (which would make this the definition, not a call), and not
+    /// inside a string literal (which would make this prose, not a call).
+    ///
+    /// The identifier-boundary check is load-bearing: a naive
+    /// `text.contains(format!("{name}("))` matches `fixture(` inside
+    /// `daemon_script_fixture(`, which is a different, unrelated function —
+    /// this is the difference between a real population scan and one that
+    /// explodes into every helper in the workspace that happens to share a
+    /// suffix.
+    fn calls_name(text: &str, name: &str) -> bool {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let text = strip_string_literals(text);
+        let bytes = text.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(name) {
+            let idx = search_from + rel;
+            let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+            let after = idx + name.len();
+            let mut j = after;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            let after_ok = j < bytes.len() && bytes[j] == b'(';
+            let is_definition = text[..idx].ends_with("fn ");
+            if before_ok && after_ok && !is_definition {
+                return true;
+            }
+            search_from = idx + 1;
+        }
+        false
+    }
+
+    /// `(name, body)` for every function defined in `text`, where `body`
+    /// spans from the function's signature line to the line before the
+    /// *next* function signature (or EOF). This is deliberately not a
+    /// brace-depth parse: a workspace-wide brace/indentation matcher is
+    /// exactly the kind of thing that goes quietly wrong on one odd file and
+    /// silently over- or under-scans everything after it. Bounding by "next
+    /// signature" instead means the worst case is a body that runs a little
+    /// long into trailing non-fn items, never a runaway scan.
+    fn fn_bodies(text: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let starts: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| is_fn_signature_line(line.trim_start()))
+            .map(|(index, _)| index)
+            .collect();
+        starts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &start)| {
+                let end = starts.get(index + 1).copied().unwrap_or(lines.len());
+                let name = fn_name_from_signature(lines[start].trim_start())?;
+                Some((name.to_string(), lines[start..end].join("\n")))
+            })
+            .collect()
+    }
+
+    /// `seed`, plus the name of every function *defined in this same file*
+    /// whose body directly calls one of the `seed` names — i.e. a local
+    /// test-fixture helper (`pack_with_events()`, `fixture()`, ...) that
+    /// itself constructs an event-backed registry.
+    ///
+    /// Two deliberate boundaries keep this from over-matching:
+    ///
+    /// - **Per file, not per workspace.** A private helper named
+    ///   `fixture()` in one crate's test binary has nothing to do with an
+    ///   unrelated `fixture()` in another crate's — they're different
+    ///   functions in different compiled binaries. Resolving per file
+    ///   matches that visibility boundary instead of conflating same-named
+    ///   helpers across the whole tree.
+    /// - **One wrapper layer, not a transitive closure.** Chasing "a
+    ///   function whose body calls a function whose body calls a function
+    ///   whose body calls `with_event_store`" against plain name strings
+    ///   (no real symbol resolution) is exactly how a generic name like
+    ///   `new` or `build` — reused by dozens of unrelated types in the same
+    ///   file — turns into a global false-positive match on every
+    ///   constructor call in the file. A helper name is only promoted when
+    ///   it is unambiguous (defined exactly once in the file) and calls a
+    ///   `seed` name directly.
+    fn file_seam_names(text: &str, seed: &[&str]) -> Vec<String> {
+        let bodies = fn_bodies(text);
+        let mut name_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (name, _) in &bodies {
+            *name_counts.entry(name.as_str()).or_insert(0) += 1;
+        }
+
+        let mut known: Vec<String> = seed.iter().map(|s| s.to_string()).collect();
+        for (name, body) in &bodies {
+            if known.iter().any(|k| k == name) {
+                continue;
+            }
+            if name_counts.get(name.as_str()).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            if seed.iter().any(|seam| calls_name(body, seam)) {
+                known.push(name.clone());
+            }
+        }
+        known
+    }
+
+    /// An event-backed registry can drain the process-wide config ledger at
+    /// dispatch, so every compiled test that reaches an event-backed
+    /// registry constructor — directly, or through a test-fixture helper
+    /// defined in the same file that wraps one — must join the ledger's
+    /// serial group even when its own assertion is about another audit
+    /// field.
+    #[test]
+    fn event_store_test_fixtures_are_config_ledger_serialized() {
+        let sources = workspace_rust_sources();
+        assert!(
+            !sources.is_empty(),
+            "the workspace source scan found no .rs files under crates/*/src or \
+             crates/*/tests; the census's own file walk is broken, not the population \
+             it walks"
+        );
+
+        let mut candidate_count = 0usize;
+        let mut offenders = Vec::new();
+
+        for (path, text) in &sources {
+            let seam_names = file_seam_names(text, &["with_event_store"]);
+            let lines: Vec<&str> = text.lines().collect();
+            let test_starts: Vec<usize> = lines
                 .iter()
-                .position(|line| {
-                    let trimmed = line.trim_start();
-                    trimmed.starts_with("fn ") || trimmed.starts_with("async fn ")
+                .enumerate()
+                .filter(|(_, line)| {
+                    let trimmed = line.trim();
+                    trimmed == "#[test]" || trimmed.starts_with("#[tokio::test")
                 })
-                .expect("test span has a function signature");
-            let has_group = span[..signature_offset]
-                .iter()
-                .any(|line| line.trim() == "#[serial(config_ledger)]");
-            if !has_group {
-                let signature = span[signature_offset].trim_start();
-                let name = signature
-                    .strip_prefix("async ")
-                    .unwrap_or(signature)
-                    .strip_prefix("fn ")
-                    .unwrap_or(signature)
-                    .split('(')
-                    .next()
-                    .unwrap_or("<unknown>");
-                offenders.push(name.to_string());
+                .map(|(index, _)| index)
+                .collect();
+
+            for (index, start) in test_starts.iter().copied().enumerate() {
+                let end = test_starts.get(index + 1).copied().unwrap_or(lines.len());
+                let span = &lines[start..end];
+                let span_text = span.join("\n");
+                let matched = seam_names.iter().find(|seam| calls_name(&span_text, seam));
+                let Some(matched) = matched else {
+                    continue;
+                };
+                candidate_count += 1;
+
+                let has_group = span.iter().any(|line| {
+                    let trimmed = line.trim();
+                    trimmed == "#[serial(config_ledger)]"
+                        || trimmed == "#[serial_test::serial(config_ledger)]"
+                });
+                if !has_group {
+                    let signature_offset = span
+                        .iter()
+                        .position(|line| is_fn_signature_line(line.trim_start()))
+                        .expect("test span has a function signature");
+                    let name = fn_name_from_signature(span[signature_offset].trim_start())
+                        .unwrap_or("<unknown>");
+                    offenders.push(format!(
+                        "{}:{name} (reaches config-ledger seam via `{matched}`)",
+                        path.display()
+                    ));
+                }
             }
         }
 
+        assert!(
+            candidate_count > 0,
+            "census found zero event-store-backed test candidates across the whole \
+             workspace scan ({} source files) — the scan is broken, not the \
+             population it should have found (khive-runtime's own config-ledger \
+             tests alone are known callers)",
+            sources.len()
+        );
         assert!(
             offenders.is_empty(),
             "event-store-backed pack tests must use #[serial(config_ledger)]; \
@@ -6531,6 +6780,13 @@ pub(crate) mod tests {
             }
         }
 
+        // Entry reset, not exit: a `config_ledger`-grouped test that panics
+        // after queueing a row (elsewhere in this group) would otherwise
+        // leave it for whichever test the serial lock hands off to next;
+        // this test's exact `events.len() == 1` assertion below has no
+        // tolerance for an inherited row.
+        let _ = crate::config_ledger::drain_config_locked();
+
         let invoked = Arc::new(AtomicUsize::new(0));
         let invoked_by_operation = Arc::clone(&invoked);
         let store = Arc::new(MemoryEventStore::default());
@@ -6592,6 +6848,10 @@ pub(crate) mod tests {
                 Ok(GateDecision::deny("intercepted policy denied"))
             }
         }
+
+        // Entry reset, not exit — see the sibling test above for why an
+        // exact `events.len() == 1` assertion needs a clean ledger.
+        let _ = crate::config_ledger::drain_config_locked();
 
         let invoked = Arc::new(AtomicUsize::new(0));
         let invoked_by_operation = Arc::clone(&invoked);

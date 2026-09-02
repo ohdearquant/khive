@@ -306,6 +306,7 @@ impl EmbedderProvider for FailOnceEmbedderProvider {
 /// genre: incoming `annotates` from the document yields exactly the
 /// touching commits, and the squash-merge commit's PR edge resolves.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_links_commits_to_document_and_pr_by_provenance_query() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -451,6 +452,7 @@ async fn ingest_links_commits_to_document_and_pr_by_provenance_query() {
 /// annotations make module churn and repeated cross-project co-change
 /// computable from graph reads without reopening git history.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_records_changed_paths_and_links_code_modules() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -621,6 +623,7 @@ async fn ingest_records_changed_paths_and_links_code_modules() {
 /// repository snapshot, but it must not become an arbitrary tie-breaker when
 /// two live module rows still claim that identity.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_skips_ambiguous_snapshot_path_bindings() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -729,6 +732,7 @@ async fn ingest_skips_ambiguous_snapshot_path_bindings() {
 /// equal ADR-085's filesystem-derived `source_path`.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_preserves_unicode_and_delimiter_bearing_changed_paths() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -795,6 +799,7 @@ async fn ingest_preserves_unicode_and_delimiter_bearing_changed_paths() {
 /// canonical changed-path set. This records the change introduced to the
 /// destination branch without producing one path set per parent.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_records_first_parent_paths_for_merge_commits() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -853,6 +858,7 @@ async fn ingest_records_first_parent_paths_for_merge_commits() {
 /// for an empty commit"). Exercise the `--allow-empty` path end to end so
 /// the contract cannot silently rot.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_records_empty_changed_paths_for_empty_commits() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -904,6 +910,7 @@ async fn ingest_records_empty_changed_paths_for_empty_commits() {
 /// old path appears in `--name-only` output would depend on the rename
 /// detection settings of whatever git build runs the ingest.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_records_both_sides_of_a_rename() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -961,6 +968,7 @@ async fn ingest_records_both_sides_of_a_rename() {
 /// `changed_paths` — asserted explicitly below, because commit notes are
 /// immutable and the pollution persists until re-ingest.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_stalls_cursor_for_commit_missing_touched_paths() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1121,6 +1129,7 @@ exec "$REAL_GIT" "$@"
 /// `changed_paths_filtered_noncanonical` count carries the evidence.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_omits_changed_paths_when_all_paths_filtered() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1195,6 +1204,7 @@ async fn ingest_omits_changed_paths_when_all_paths_filtered() {
 /// the dropped paths, and warn once per run.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_filters_noncanonical_changed_paths_but_keeps_commit() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1293,6 +1303,7 @@ async fn ingest_filters_noncanonical_changed_paths_but_keeps_commit() {
 /// counted, not laundered into a canonical-looking masked path.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_filters_noncanonical_path_even_when_masking_hides_the_defect() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1353,6 +1364,7 @@ async fn ingest_filters_noncanonical_path_even_when_masking_hides_the_defect() {
 /// successfully, and re-encounters C — total stored rows must stay exactly
 /// one per sha.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_repeat_pass_after_stall_creates_no_duplicates() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1438,6 +1450,7 @@ async fn ingest_repeat_pass_after_stall_creates_no_duplicates() {
 /// Coordinator addendum requirement: a commit message containing a
 /// credential-shaped token must be masked before it is stored.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_secrets_in_commit_message() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1484,6 +1497,7 @@ async fn ingest_masks_secrets_in_commit_message() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_secret_shaped_changed_paths() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1529,6 +1543,7 @@ async fn ingest_masks_secret_shaped_changed_paths() {
 /// span masked — the containing PR note (and its surrounding prose) must be
 /// retained, not dropped.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_pr_body_hash_near_token_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1617,6 +1632,7 @@ async fn ingest_masks_pr_body_hash_near_token_without_dropping_note() {
 /// rather than causing the whole PR note to be rejected by the runtime's
 /// recursive `properties` secret scan.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_pr_title_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1709,6 +1725,7 @@ async fn ingest_masks_credential_shaped_pr_title_without_dropping_note() {
 /// must be masked in place rather than causing the whole issue note to be
 /// rejected by the runtime's recursive `properties` secret scan.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_issue_title_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1798,6 +1815,7 @@ async fn ingest_masks_credential_shaped_issue_title_without_dropping_note() {
 /// "arm" a UUID in the other -- covers the exact cross-field shape reported
 /// live against `git.digest`.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_does_not_block_issue_with_credential_word_in_title_and_uuid_in_body() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1876,6 +1894,7 @@ async fn ingest_does_not_block_issue_with_credential_word_in_title_and_uuid_in_b
 /// than the whole note being dropped with "reword the source" advice that
 /// makes no sense for content the ingester does not own.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_word_and_uuid_co_occurring_in_issue_body() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -1954,6 +1973,7 @@ async fn ingest_masks_credential_word_and_uuid_co_occurring_in_issue_body() {
 /// `ingest_issues` unchanged -- guards against a future over-aggressive
 /// masking regression that the detector-positive test above cannot catch.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_leaves_clean_issue_title_unmasked() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2025,6 +2045,7 @@ async fn ingest_leaves_clean_issue_title_unmasked() {
 /// label name previously tripped the gate on `create()` even after the
 /// title was masked, silently dropping the whole issue note.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_issue_label_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2109,6 +2130,7 @@ async fn ingest_masks_credential_shaped_issue_label_without_dropping_note() {
 /// login previously tripped the recursive secret gate on `properties` and
 /// silently dropped the issue note.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_issue_author_login_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2197,6 +2219,7 @@ async fn ingest_masks_credential_shaped_issue_author_login_without_dropping_note
 /// (becomes `null`) rather than persisted raw, and the issue itself must
 /// still be ingested.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_rejects_credential_shaped_issue_created_at_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2272,6 +2295,7 @@ async fn ingest_rejects_credential_shaped_issue_created_at_without_dropping_note
 /// Sibling of the `createdAt` regression above, for `closedAt` (ingest.rs
 /// line ~1550).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2351,6 +2375,7 @@ async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note(
 /// value; it must advance only from a sibling record's validated,
 /// canonicalized timestamp.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_rejects_credential_shaped_issue_updated_at_and_cursor_never_persists_raw_value() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2435,6 +2460,7 @@ async fn ingest_rejects_credential_shaped_issue_updated_at_and_cursor_never_pers
 /// note. A malformed value is dropped before sorting, while a clean sibling
 /// supplies the only durable/resumable cursor value.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_rejects_credential_shaped_pr_updated_at_and_cursor_never_persists_raw_value() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2529,6 +2555,7 @@ async fn ingest_rejects_credential_shaped_pr_updated_at_and_cursor_never_persist
 /// Multiple credential spans across both the title and the body of the same
 /// PR must all be masked, and exactly one PR note must be written.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_multiple_credential_spans_in_pr_title_and_body() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2623,6 +2650,7 @@ async fn ingest_masks_multiple_credential_spans_in_pr_title_and_body() {
 /// detector-positive tests above cannot catch, since they never exercise
 /// clean input.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_leaves_clean_pr_title_and_null_body_unmasked() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2741,6 +2769,7 @@ async fn ingest_leaves_clean_pr_title_and_null_body_unmasked() {
 /// a trailing marker placed after the token only survives in the stored
 /// name if masking ran first.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_pr_title_before_truncating_name_to_max_chars() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2847,6 +2876,7 @@ async fn ingest_masks_pr_title_before_truncating_name_to_max_chars() {
 /// post-ingest reference-extraction sweep (which runs over the
 /// already-masked stored text) must still resolve the reference.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_pr_body_credential_without_breaking_fixes_reference() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -2955,6 +2985,7 @@ async fn ingest_masks_pr_body_credential_without_breaking_fixes_reference() {
 // ── KindHook validation unit tests ──────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn commit_hook_rejects_bad_sha() {
     let (_rt, _token, registry) = fixture().await;
     let err = registry
@@ -2976,6 +3007,7 @@ async fn commit_hook_rejects_bad_sha() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn issue_hook_rejects_ungoverned_state_reason() {
     let (_rt, _token, registry) = fixture().await;
     let project_id = create(&registry, json!({"kind": "project", "name": "hook-repo"})).await;
@@ -3002,6 +3034,7 @@ async fn issue_hook_rejects_ungoverned_state_reason() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn issue_hook_requires_exact_project_id_and_canonicalizes_complete_spelling() {
     let (rt, token, registry) = fixture().await;
     let project_id = create(
@@ -3082,6 +3115,7 @@ async fn issue_hook_requires_exact_project_id_and_canonicalizes_complete_spellin
 /// warn-and-skipped (fail-closed, matching ADR-088 §3) rather than silently
 /// coerced or dropped-but-created.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn issue_ingest_never_echoes_credential_shaped_state_reason() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -3160,6 +3194,7 @@ async fn issue_ingest_never_echoes_credential_shaped_state_reason() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn issue_hook_requires_properties_project_id() {
     let (_rt, _token, registry) = fixture().await;
     let err = registry
@@ -3177,6 +3212,7 @@ async fn issue_hook_requires_properties_project_id() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn commit_hook_requires_properties_sha() {
     let (_rt, _token, registry) = fixture().await;
     let err = registry
@@ -3190,6 +3226,7 @@ async fn commit_hook_requires_properties_sha() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn commit_hook_rejects_invalid_changed_path_shapes() {
     let (_rt, _token, registry) = fixture().await;
     for changed_paths in [
@@ -3232,6 +3269,7 @@ async fn commit_hook_rejects_invalid_changed_path_shapes() {
 /// the hook must accept it (a missing or null `changed_paths` is likewise
 /// optional for manually created commit notes).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn commit_hook_accepts_empty_changed_paths() {
     let (_rt, _token, registry) = fixture().await;
     registry
@@ -3271,6 +3309,7 @@ async fn commit_hook_accepts_empty_changed_paths() {
 /// array of `/`-separated repo-relative paths is accepted (e.g. `src/lib.rs`
 /// survives the tightened path-shape validation unchanged).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn commit_hook_accepts_canonical_changed_paths() {
     let (_rt, _token, registry) = fixture().await;
     registry
@@ -3318,6 +3357,7 @@ async fn commit_hook_accepts_canonical_changed_paths() {
 /// and the commit ingester's squash-merge-suffix PR fallback must resolve
 /// within the ingesting project only, never across projects.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn issue_and_pr_idempotency_is_scoped_per_project() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -3456,6 +3496,7 @@ async fn issue_and_pr_idempotency_is_scoped_per_project() {
 /// issue between two valid ones aborts only its own record (one warning,
 /// both neighbors still land) rather than the whole ingest pass.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn gh_boundary_contract_and_partial_ingest_failure() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -3687,6 +3728,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
 /// continuation fetch (not a false `WindowComplete`) -- pagination remains
 /// resumable.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -3835,6 +3877,7 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
 /// it or deriving the next inclusive `updated:>=...` floor. This is the PR
 /// counterpart of `issue_full_page_never_leaks_raw_updated_at_into_paging_floor`.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn pr_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -4020,6 +4063,7 @@ async fn read_git_cursor(rt: &KhiveRuntime, project_id: Uuid, kind: &str) -> Opt
 /// `stateReason` is corrected upstream) retries and lands it without
 /// duplicating #5 or #10.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -4151,6 +4195,7 @@ async fn issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order
 /// test-only embedder ([`FailOnceEmbeddingService`]) that fails exactly once
 /// for a PR body containing [`CURSOR_FAIL_SENTINEL`].
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -4300,6 +4345,7 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
 /// `B..HEAD` range resolves and is empty) but is no longer an ancestor of
 /// HEAD, exactly the lagging-source shape.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn empty_walk_with_non_ancestor_cursor_refuses_completion() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -4400,6 +4446,7 @@ async fn empty_walk_with_non_ancestor_cursor_refuses_completion() {
 /// #20's `stateReason` is corrected) must retry and land #20 without
 /// duplicating #5.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn issue_ingest_retries_tie_at_cursor_timestamp() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -4520,6 +4567,7 @@ async fn issue_ingest_retries_tie_at_cursor_timestamp() {
 /// for why the pre-#763 leaked-credential-in-title mechanism no longer
 /// forces a create failure) since `pull_request` has no `stateReason` field.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn pr_ingest_retries_tie_at_cursor_timestamp() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -4638,6 +4686,7 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
 /// `precedes` edge from parent to child, and both commit and issue notes get
 /// the amendment's readable `name`.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_auto_creates_project_and_enriches_references() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -4821,6 +4870,7 @@ async fn digest_verb_auto_creates_project_and_enriches_references() {
 /// boundary: under the fixture's `AllowAllGate`, ADR-007 makes `get(id=...)`
 /// namespace-agnostic.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_receipt_discovery_uses_explicit_namespace_but_get_is_namespace_agnostic() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -5000,6 +5050,7 @@ async fn digest_receipt_discovery_uses_explicit_namespace_but_get_is_namespace_a
 /// page remains recoverable even if a newer receipt lands between queries,
 /// because the later row is outside the frozen `until` boundary.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_receipt_recovery_pages_past_one_thousand_in_a_frozen_window() {
     let (rt, _token, registry) = fixture().await;
     let namespace = "receipt-pagination";
@@ -5120,6 +5171,7 @@ async fn digest_receipt_recovery_pages_past_one_thousand_in_a_frozen_window() {
 /// mechanically detectable and identify the refused write without echoing
 /// the rejected content.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_counts_and_describes_partial_secret_gate_refusals() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -5233,6 +5285,7 @@ async fn digest_verb_counts_and_describes_partial_secret_gate_refusals() {
 /// looping `git.digest` calls until `done` eventually ingests every commit
 /// with no duplicates.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_max_items_is_bounded_and_resumable() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -5285,6 +5338,7 @@ async fn digest_verb_max_items_is_bounded_and_resumable() {
 /// `history_exhausted: true` — "nothing walked past this point" is now
 /// distinguishable from silence (issue #1617).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_sources_completed_and_history_exhausted_on_full_walk() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -5355,6 +5409,7 @@ async fn digest_verb_sources_completed_and_history_exhausted_on_full_walk() {
 /// `history_exhausted: false`, while `done: false` keeps its existing
 /// resume-loop meaning (issue #1617).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_sources_stopped_early_on_budget_exhaustion() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -5416,6 +5471,7 @@ async fn digest_verb_sources_stopped_early_on_budget_exhaustion() {
 /// (see `pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing`
 /// for why a leaked-credential fixture no longer forces a create failure).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_sources_gate_refusal_skips_record_and_walk_continues() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, _token, registry) = fixture().await;
@@ -5554,6 +5610,7 @@ fn issue_fixture(number: u64, title: &str, updated_at: &str) -> Value {
 /// true — the PR/issue half of the tri-state that previously only had
 /// commit-side coverage (issue #1617).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_pr_issue_sources_completed_on_happy_path() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -5625,6 +5682,7 @@ async fn digest_verb_pr_issue_sources_completed_on_happy_path() {
 
 /// With no source requested, exhaustion is vacuously true.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_history_exhausted_is_true_when_include_is_empty() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -5658,6 +5716,7 @@ async fn digest_history_exhausted_is_true_when_include_is_empty() {
 /// lands the first PR, stops the PR walk on its second record, and skips
 /// issues and commits outright.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_pr_issue_sources_stopped_early_on_budget_stop() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -5764,6 +5823,7 @@ async fn digest_verb_pr_issue_sources_stopped_early_on_budget_stop() {
 /// floor legitimately stalls (`StopFloorStalled`) — the `completed` state
 /// is covered by the happy-path and budget-stop tests instead.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_pr_source_stopped_early_on_full_page_then_refetch_failure_stays_skipped() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -5873,6 +5933,7 @@ esac
 /// to `stopped_early` with the failure in the reason, and neither `done`
 /// nor `history_exhausted` may claim the source is finished.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_walked_then_cursor_write_fails_never_reports_skipped() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -5974,6 +6035,7 @@ async fn ingest_walked_then_cursor_write_fails_never_reports_skipped() {
 /// it. Without the guard, this fixture's persisted cursor would be #10's
 /// 2026-01-03, past refused #20's 2026-01-01.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn pr_cursor_does_not_advance_past_refused_record_on_later_existing() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -6083,6 +6145,7 @@ async fn pr_cursor_does_not_advance_past_refused_record_on_later_existing() {
 /// ungoverned-`stateReason` rejection, and the pre-landed record is an
 /// issue with the newest timestamp.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn issue_cursor_does_not_advance_past_refused_record_on_later_existing() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -6181,6 +6244,7 @@ async fn issue_cursor_does_not_advance_past_refused_record_on_later_existing() {
 /// A database error during the first commit lookup is reported after the
 /// commit walk has started, not as a pre-walk hard failure.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_commit_lookup_failure_is_reported_in_band_after_walk_start() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -6290,6 +6354,7 @@ async fn ingest_commit_lookup_failure_is_reported_in_band_after_walk_start() {
 /// `stopped_early`, warn, force `done = false` — instead of aborting the
 /// whole ingest with an Err.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_commit_walked_then_cursor_write_fails_stays_in_band() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -6372,6 +6437,7 @@ async fn ingest_commit_walked_then_cursor_write_fails_stays_in_band() {
 /// `skip_serializing_if` or repr change cannot silently drop the
 /// distinction between "not requested" and "requested but state lost".
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_report_serializes_omitted_sources_as_null() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -6419,6 +6485,7 @@ async fn digest_report_serializes_omitted_sources_as_null() {
 /// A local cursor read failure happens before either remote listing. It keeps
 /// the source-level failure distinct from a remote listing skip.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_local_cursor_read_failure_is_not_remote_listing_skip() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -6489,6 +6556,7 @@ async fn digest_verb_local_cursor_read_failure_is_not_remote_listing_skip() {
 /// repo-incompatible) `gh` reports `gh_available:false`, skips requested
 /// remote sources, never starts a walker, and does not echo probe stderr.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_installed_but_unusable_gh_is_reported_false_without_leaking_stderr() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -6577,6 +6645,7 @@ esac
 /// commands. The capability probe must instead derive `origin` and pass that
 /// repository as argv, then pin the same value on every list call.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_multi_remote_configured_default_cannot_redirect_github_ingest() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -6688,6 +6757,7 @@ esac
 /// walked, which is exactly what `skipped` means (issue #1617).
 /// Commits are unaffected (ADR-088 §5 graceful absence).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_pr_issue_sources_skipped_on_gh_list_failure() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -6794,6 +6864,7 @@ esac
 /// ADR-088 Amendment 1 security posture) rather than panicking or silently
 /// no-op'ing.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_rejects_ssh_source() {
     let (_rt, _token, registry) = fixture().await;
     let err = registry
@@ -6811,6 +6882,7 @@ async fn digest_verb_rejects_ssh_source() {
 /// through `as_u64`'s failure into the 500 default. `0` clamps to 1 too;
 /// values above 2000 clamp to 2000; a non-integer value is a hard error.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_max_items_negative_and_zero_clamp_to_one() {
     let _guard = ENV_MUTEX.lock().await;
 
@@ -6855,6 +6927,7 @@ async fn digest_verb_max_items_negative_and_zero_clamp_to_one() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_max_items_above_cap_clamps_to_two_thousand() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -6889,6 +6962,7 @@ async fn digest_verb_max_items_above_cap_clamps_to_two_thousand() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_max_items_at_boundary_values() {
     let _guard = ENV_MUTEX.lock().await;
     for (requested, expected_ingested) in [(1i64, 1u64), (2000i64, 1u64)] {
@@ -6915,6 +6989,7 @@ async fn digest_verb_max_items_at_boundary_values() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn digest_verb_rejects_non_integer_max_items() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -6997,6 +7072,7 @@ impl EmbedderProvider for CapturingEmbedProvider {
 /// complete note (full content stored/FTS-indexed), must send only a capped,
 /// UTF-8-safe head prefix to the embedder, and must report the truncation.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_truncates_over_cap_commit_embedding_and_reports_it() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -7219,6 +7295,7 @@ impl EmbedderProvider for FailingEmbedProvider {
 /// `commit_embeddings_truncated` moves for that commit, since both only ever
 /// advance on the successful-create arm (a prior fix).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_over_cap_commit_with_failing_embedder_creates_nothing_and_warns() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -7313,6 +7390,7 @@ async fn ingest_over_cap_commit_with_failing_embedder_creates_nothing_and_warns(
 /// this replaces the default `LatticeEmbedderProvider` khive-runtime
 /// auto-registers for a configured model.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_over_cap_commit_embedding_is_semantically_retrievable() {
     const MODEL: EmbeddingModel = EmbeddingModel::BgeSmallEnV15;
     let dims = MODEL.dimensions();
@@ -7450,6 +7528,7 @@ async fn ingest_over_cap_commit_embedding_is_semantically_retrievable() {
 /// [`ingest_does_not_truncate_exact_cap_commit_embedding`] for the
 /// exact-cap-boundary sibling of this test.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_does_not_truncate_under_cap_commit_embedding() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -7503,6 +7582,7 @@ async fn ingest_does_not_truncate_under_cap_commit_embedding() {
 /// exact-cap unit test only proves the pure helper's behavior, not this
 /// full `run_ingest` pipeline's counter and embedder-input wiring.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_does_not_truncate_exact_cap_commit_embedding() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -7563,6 +7643,7 @@ async fn ingest_does_not_truncate_exact_cap_commit_embedding() {
 /// truncation — the counter reflects the capped candidate input regardless
 /// of whether any embedder is configured to consume it.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_reports_truncation_even_with_no_embedder_configured() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -7608,6 +7689,7 @@ async fn ingest_reports_truncation_even_with_no_embedder_configured() {
 /// capped embedding head), so a beyond-cap reference must be exactly as
 /// resolvable as one in the head.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_resolves_over_cap_commit_reference_beyond_the_embedding_cap() {
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
@@ -7695,6 +7777,7 @@ async fn ingest_resolves_over_cap_commit_reference_beyond_the_embedding_cap() {
 /// `create` handler once `GitPack` is loaded, and its alias normalises to
 /// the canonical name.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn git_pack_adr_entity_type_validates_through_create() {
     let (_rt, _token, registry) = fixture().await;
 
@@ -7734,6 +7817,7 @@ async fn git_pack_adr_entity_type_validates_through_create() {
 /// Without the git pack loaded, `adr` is not a registered Document subtype —
 /// proving the acceptance above is genuine pack composition, not a builtin.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn adr_entity_type_rejected_without_git_pack_loaded() {
     let rt = rt();
     let mut builder = VerbRegistryBuilder::new();
@@ -7775,6 +7859,7 @@ async fn adr_entity_type_rejected_without_git_pack_loaded() {
 /// actually distinguishes "composed from pack `ENTITY_TYPES`" from
 /// "builtin-only" from "absent".
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
     let (rt, token, _registry) = fixture().await;
 
@@ -7849,6 +7934,7 @@ async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
 /// subject line tripped the runtime's `secret_gate::check(name)` call and
 /// silently dropped the whole commit, despite `content` being safe.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_commit_subject_in_name_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -7907,6 +7993,7 @@ async fn ingest_masks_credential_shaped_commit_subject_in_name_without_dropping_
 /// credential-shaped `git config user.name` silently dropped the commit via
 /// the runtime's recursive `properties` secret scan.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_commit_author_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -7968,6 +8055,7 @@ async fn ingest_masks_credential_shaped_commit_author_without_dropping_note() {
 /// credential-shaped `git config user.email` silently dropped the commit via
 /// the runtime's recursive `properties` secret scan.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_commit_author_email_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -8032,6 +8120,7 @@ async fn ingest_masks_credential_shaped_commit_author_email_without_dropping_not
 /// subject must survive byte-for-byte unchanged — the fix above must not
 /// become an over-aggressive masking regression.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_leaves_clean_commit_author_and_subject_unmasked() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -8099,6 +8188,7 @@ async fn ingest_leaves_clean_commit_author_and_subject_unmasked() {
 /// `properties` secret scan (the sibling of the already-fixed issue
 /// `author_login` bug).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_pr_author_login_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -8181,6 +8271,7 @@ async fn ingest_masks_credential_shaped_pr_author_login_without_dropping_note() 
 /// The PR `base_ref` field entered gated `properties` raw — a
 /// credential-shaped base branch name silently dropped the PR.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_pr_base_ref_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -8264,6 +8355,7 @@ async fn ingest_masks_credential_shaped_pr_base_ref_without_dropping_note() {
 /// credential-shaped head branch name (realistic for a fork PR, where the
 /// contributor fully controls the branch name) silently dropped the PR.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_pr_head_ref_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
@@ -8346,6 +8438,7 @@ async fn ingest_masks_credential_shaped_pr_head_ref_without_dropping_note() {
 /// Regression guard: clean (non-credential-shaped) PR author, base ref, and
 /// head ref must survive byte-for-byte unchanged.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn ingest_leaves_clean_pr_author_and_refs_unmasked() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;

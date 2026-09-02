@@ -374,6 +374,7 @@ fn add_commit(repo: &Path, rel: &str, contents: &str, message: &str) {
 /// commit phase then succeeds, and the caller never sees the corrupt-cache
 /// error.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn corrupt_promisor_cache_self_heals_via_refetch_on_first_call() {
     let _env = env_guard().await;
     let bin_dir = tempfile::tempdir().expect("bin dir");
@@ -436,6 +437,7 @@ async fn corrupt_promisor_cache_self_heals_via_refetch_on_first_call() {
 /// warning names the strategy that actually succeeded (reclone), not the
 /// one that was tried first.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn refetch_failure_falls_through_to_one_reclone_and_still_self_heals() {
     let _env = env_guard().await;
     let bin_dir = tempfile::tempdir().expect("bin dir");
@@ -507,6 +509,7 @@ async fn refetch_failure_falls_through_to_one_reclone_and_still_self_heals() {
 /// original classified error surfaces to the caller, and no success warning
 /// is ever emitted for a call that did not actually self-heal.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn persistent_corruption_is_bounded_and_never_reports_false_success() {
     let _env = env_guard().await;
     let bin_dir = tempfile::tempdir().expect("bin dir");
@@ -571,6 +574,7 @@ async fn persistent_corruption_is_bounded_and_never_reports_false_success() {
 /// disposable cache is remote-URL-mode only) -- a local path is the
 /// caller's own working copy, never a candidate for eviction/reclone.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn local_source_never_repairs_even_when_recovery_would_succeed() {
     let _env = env_guard().await;
     let bin_dir = tempfile::tempdir().expect("bin dir");
@@ -603,6 +607,7 @@ async fn local_source_never_repairs_even_when_recovery_would_succeed() {
 /// this direct unit guards the helper itself so a future refactor of it
 /// can't silently break the assertions that depend on it.
 #[test]
+#[serial_test::serial(config_ledger)]
 fn head_sha_reads_the_real_current_commit() {
     let _env = env_guard_sync();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -625,6 +630,7 @@ fn head_sha_reads_the_real_current_commit() {
 /// `Fixes #1` body still resolves to a `closes` edge onto the issue -- none
 /// of which the commits-only internal-surface tests above can observe.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
     use async_trait::async_trait;
     use khive_runtime::{arm_vector_fail_after, EmbedderProvider};
@@ -916,6 +922,7 @@ async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
 /// exercise directly. Sentinel operator data inside the lookalike directory
 /// must survive completely untouched, and no ownership marker is written.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn public_verb_refuses_a_markerless_lookalike_at_the_cache_key_path() {
     let _env = env_guard().await;
     let scratch = tempfile::tempdir().expect("scratch root");
@@ -972,6 +979,7 @@ async fn public_verb_refuses_a_markerless_lookalike_at_the_cache_key_path() {
 /// following the symlink into a fetch or eviction.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn public_verb_refuses_a_symlink_at_the_cache_key_path() {
     let _env = env_guard().await;
     let scratch = tempfile::tempdir().expect("scratch root");

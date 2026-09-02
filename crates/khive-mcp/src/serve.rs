@@ -5838,6 +5838,7 @@ id = "lambda:project-actor"
     /// survives) and pass with them restored.
     #[tokio::test]
     #[serial]
+    #[serial(config_ledger)]
     async fn multi_backend_boot_installs_note_write_validator_on_every_runtime() {
         use crate::tools::request::RequestParams;
 
@@ -7968,6 +7969,7 @@ region = "us-east-1"
 
     #[tokio::test]
     #[serial]
+    #[serial(config_ledger)]
     async fn multi_backend_read_only_construction_and_pack_schema_paths_acquire_no_writer() {
         use khive_runtime::PackConfig;
 
@@ -8080,6 +8082,7 @@ region = "us-east-1"
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     #[tokio::test]
     #[serial]
+    #[serial(config_ledger)]
     async fn mixed_topology_channel_admission_follows_the_runtime_that_backs_each_loop() {
         use clap::Parser;
         use khive_runtime::PackConfig;
@@ -10660,6 +10663,7 @@ backend = "kg-backend"
 
         #[tokio::test]
         #[serial]
+        #[serial(config_ledger)]
         async fn kg_secondary_runtime_owns_external_id_claim_and_delivery_mark() {
             let dir = tempfile::tempdir().unwrap();
             let main_path = dir.path().join("main.db");
@@ -10798,6 +10802,7 @@ backend = "kg-backend"
         /// control: same base config, embedders retained.
         #[tokio::test]
         #[serial]
+        #[serial(config_ledger)]
         async fn pack_no_embed_strips_embedders_from_that_runtime_only() {
             let dir = tempfile::tempdir().unwrap();
             let khive_cfg = KhiveConfig {
@@ -10906,6 +10911,7 @@ backend = "kg-backend"
         /// which is exactly why the loop must not use it.
         #[tokio::test]
         #[serial]
+        #[serial(config_ledger)]
         async fn comm_secondary_runtime_owns_outbox_scan_claim_and_delivery_mark() {
             let dir = tempfile::tempdir().unwrap();
             let main_path = dir.path().join("main.db");
@@ -11509,6 +11515,7 @@ backend = "kg-backend"
         /// makes this assertion fail: it is an order check, not a mere
         /// presence/count check.
         #[tokio::test(start_paused = true)]
+        #[serial(config_ledger)]
         async fn channel_lifecycle_events_are_sequenced_across_a_failure_then_recovery() {
             let mut ch_registry = ChannelRegistry::new();
             ch_registry.register(Arc::new(FlakyOnceChannel {

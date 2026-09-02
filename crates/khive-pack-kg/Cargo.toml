@@ -31,6 +31,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 serde_json = { workspace = true }
+serial_test = { workspace = true }
 khive-runtime = { path = "../khive-runtime", features = ["fault-injection", "test-internals"] }
 khive-pack-formal = { version = "0.8.0", path = "../khive-pack-formal" }
 # Path-only: cyclic dev-dep pair with khive-pack-gtd; cargo strips it at publish.

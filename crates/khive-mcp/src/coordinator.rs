@@ -818,6 +818,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn coordinator_and_registry_routes_submit_equivalent_link_and_search_gate_requests() {
         let direct_gate = Arc::new(CapturingGate::default());
         let coordinator_gate = Arc::new(CapturingGate::default());
@@ -898,6 +899,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn coordinator_route_gates_and_audits_before_search_filter_validation() {
         let gate = Arc::new(CapturingGate::denying());
         let (registry, runtime) = make_registry_with_gate(Arc::clone(&gate) as GateRef);
