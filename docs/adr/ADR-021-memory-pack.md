@@ -7,6 +7,8 @@
 [ADR-007](ADR-007-namespace.md) Rev 6 carve-out: episodic memory writes stamp the caller's actor
 id by default, semantic memory writes stamp the shared pool, and an explicit `namespace=`
 overrides both.
+**Amended**: 2026-08-30, schema V23 makes the `memory` candidate filter an
+indexed FTS classifier rather than a post-MATCH row filter (#1907).
 
 ## Context
 
@@ -148,7 +150,10 @@ distinguish it from generic note search:
    pushed into FTS5 and vector-search retrieval (not as a post-filter). In a mixed
    `kg,gtd,memory` namespace with thousands of non-memory notes, this prevents
    high-ranking non-memory notes from filling the candidate pool before any memory note
-   is considered. If the underlying `search_notes` operation applies kind only as a
+   is considered. The SQLite backend stores granular note kind in the indexed
+   `record_kind` FTS column and intersects `record_kind : "memory"` with the lexical
+   query inside MATCH; an exact row predicate remains the equality backstop for the
+   trigram tokenizer. If the underlying `search_notes` operation applies kind only as a
    post-filter, the handler implements bounded over-fetch (ceiling `limit * 20` raw
    candidates) until `limit` memory hits are collected.
 2. **Decay-weighted scoring.** Each candidate's `salience` is decayed by age:
