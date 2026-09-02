@@ -524,6 +524,7 @@ async fn text_busy_standalone_writer_emits_ndjson_row() {
     let doc = TextDocument {
         subject_id: Uuid::new_v4(),
         kind: SubstrateKind::Entity,
+        record_kind: None,
         title: Some("t".to_string()),
         body: "body".to_string(),
         tags: vec![],
