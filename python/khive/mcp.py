@@ -17,11 +17,31 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from typing import Any
 
 from .errors import AuthError, KhiveError
+
+_TRANSPORT_LOGGER = "mcp.client.streamable_http"
+
+
+class _AcceptedTerminationFilter(logging.Filter):
+    """Silence the SDK's warning for a session DELETE the server accepted.
+
+    On session close the streamable-HTTP client sends `DELETE {base}/mcp`
+    and logs `Session termination failed: <status>` for anything but 200 or
+    204. khive-cloud acknowledges the DELETE with 202 Accepted, which is
+    success, so that record is dropped; any non-2xx status still logs.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if not message.startswith("Session termination failed: "):
+            return True
+        status = message.rsplit(" ", 1)[-1]
+        return not (status.isdigit() and 200 <= int(status) < 300)
 
 
 def _root_cause(exc: BaseException) -> BaseException:
@@ -76,39 +96,47 @@ async def mcp_session(base_url: str, api_key: str) -> AsyncIterator[Any]:
 
     url = base_url.rstrip("/") + "/mcp"
     headers = {"Authorization": f"ApiKey {api_key}"}
+    transport_log = logging.getLogger(_TRANSPORT_LOGGER)
+    termination_filter = _AcceptedTerminationFilter()
+    transport_log.addFilter(termination_filter)
     stack = AsyncExitStack()
     try:
-        http_client = await stack.enter_async_context(httpx.AsyncClient(headers=headers))
-        transport = streamable_http_client(url, http_client=http_client)
-        read, write, _get_session_id = await stack.enter_async_context(transport)
-        session = await stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
-    except (Exception, asyncio.CancelledError) as exc:
-        # A bad key (or any other setup-time transport failure) often does
-        # not surface here: `session.initialize()` awaits a response that
-        # never arrives, and only gets a `CancelledError` when the
-        # streamable-HTTP transport's task group is torn down — the real
-        # cause (e.g. an `httpx.HTTPStatusError`) is only raised by that
-        # teardown. Close the stack now so that exception, if there is one,
-        # is the one translated; it is strictly more informative than a
-        # bare `CancelledError`.
-        close_exc: BaseException | None = None
         try:
+            http_client = await stack.enter_async_context(httpx.AsyncClient(headers=headers))
+            transport = streamable_http_client(url, http_client=http_client)
+            read, write, _get_session_id = await stack.enter_async_context(transport)
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+        except (Exception, asyncio.CancelledError) as exc:
+            # A bad key (or any other setup-time transport failure) often does
+            # not surface here: `session.initialize()` awaits a response that
+            # never arrives, and only gets a `CancelledError` when the
+            # streamable-HTTP transport's task group is torn down — the real
+            # cause (e.g. an `httpx.HTTPStatusError`) is only raised by that
+            # teardown. Close the stack now so that exception, if there is one,
+            # is the one translated; it is strictly more informative than a
+            # bare `CancelledError`.
+            close_exc: BaseException | None = None
+            try:
+                await stack.aclose()
+            except Exception as inner:
+                close_exc = inner
+            real_exc = close_exc or exc
+            if isinstance(real_exc, KhiveError):
+                raise real_exc
+            raise _as_khive_error(real_exc, url) from real_exc
+        try:
+            yield session
+        except BaseException:
+            with suppress(Exception):
+                await stack.aclose()
+            raise
+        else:
             await stack.aclose()
-        except Exception as inner:
-            close_exc = inner
-        real_exc = close_exc or exc
-        if isinstance(real_exc, KhiveError):
-            raise real_exc
-        raise _as_khive_error(real_exc, url) from real_exc
-    try:
-        yield session
-    except BaseException:
-        with suppress(Exception):
-            await stack.aclose()
-        raise
-    else:
-        await stack.aclose()
+    finally:
+        # The DELETE that the SDK logs about is sent by `stack.aclose()`,
+        # so the filter stays until every close path above has run.
+        transport_log.removeFilter(termination_filter)
 
 
 async def alist_tool_names(base_url: str, api_key: str) -> list[str]:

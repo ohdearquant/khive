@@ -42,3 +42,8 @@ def test_live_search_entity():
 def test_live_mcp_tools_list():
     names = mcp_list_tools(os.environ["KHIVE_CLOUD_URL"], os.environ["KHIVE_CLOUD_API_KEY"])
     assert "request" in names
+
+
+def test_live_raw_accepts_dsl_text():
+    results = _live_db().raw("whoami()")
+    assert len(results) == 1 and results[0].ok

@@ -104,10 +104,13 @@ def _cloud_config_id(base_url: str) -> str:
 
 
 def _render_ops_field(ops_field: str) -> str:
-    """Decode the client's internal `[{"tool","args"}]` JSON string and
-    render it as DSL text — `frame["ops"]` always arrives in that JSON form
-    (`Session`/`ops.encode` build it for both transports), and the cloud
-    parser only accepts DSL text (see the module docstring)."""
+    """Turn `frame["ops"]` into the DSL text the cloud parser accepts.
+
+    `frame["ops"]` is always a JSON document (`Session`/`ops.encode` build
+    it for both transports): the client's internal `[{"tool","args"}]`
+    array, which is rendered; or, when a caller handed `raw()` DSL text
+    instead of op dicts, a JSON string (or a list mixing DSL strings and op
+    dicts), whose DSL text passes through untouched."""
     if not ops_field:
         return ""
     try:
@@ -116,6 +119,8 @@ def _render_ops_field(ops_field: str) -> str:
         raise TransportError(f"malformed ops payload: {exc}") from exc
     if not parsed:
         return ""
+    if isinstance(parsed, dict):
+        parsed = [parsed]
     return render_dsl(parsed)
 
 

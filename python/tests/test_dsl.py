@@ -91,3 +91,31 @@ def test_old_daemon_shaped_string_refused_by_fake(rest_server, api_key):
     )
     assert response.status_code == 400
     assert response.json() == {"error": "unknown verb: Missing 'verb' field in JSON"}
+
+
+def test_dsl_text_passes_through_untouched():
+    assert render_dsl("whoami()") == "whoami()"
+    chain = "[whoami() | stats()]"
+    assert render_dsl(chain) == chain
+    assert render_dsl(" [whoami(),  stats()] ") == " [whoami(),  stats()] "
+
+
+def test_dsl_string_elements_render_verbatim_beside_dicts():
+    assert render_dsl(["whoami()", op("stats")]) == "[whoami(), stats()]"
+    assert render_dsl(['search(query="x")']) == 'search(query="x")'
+    assert parse_dsl(render_dsl(["whoami()", op("search", query="x")])) == [
+        ("whoami", {}),
+        ("search", {"query": "x"}),
+    ]
+
+
+def test_entry_without_tool_name_raises_transport_error():
+    with pytest.raises(TransportError, match="no 'tool' name"):
+        render_dsl([{"args": {}}])
+    with pytest.raises(TransportError, match="no 'tool' name"):
+        render_dsl([{"tool": "", "args": {}}])
+
+
+def test_non_op_entry_raises_transport_error():
+    with pytest.raises(TransportError, match="cannot render int"):
+        render_dsl([3])

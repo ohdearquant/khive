@@ -54,6 +54,27 @@ def test_raw_returns_per_op_entries(db: Khive):
     assert http_op_error_code(results[1].error) == "verb_not_found"
 
 
+def test_raw_accepts_dsl_text(db: Khive):
+    results = db.raw("whoami()")
+    assert [(r.ok, r.tool) for r in results] == [(True, "whoami")]
+    assert results[0].result == {"namespace": "local"}
+
+
+def test_raw_accepts_dsl_batch_text(db: Khive):
+    results = db.raw("[whoami(), stats()]")
+    assert [(r.ok, r.tool) for r in results] == [(True, "whoami"), (True, "stats")]
+
+
+def test_raw_accepts_dsl_chain_text(db: Khive):
+    results = db.raw("[whoami() | stats()]")
+    assert [(r.ok, r.tool) for r in results] == [(True, "whoami"), (True, "stats")]
+
+
+def test_raw_accepts_dsl_text_beside_op_dicts(db: Khive):
+    results = db.raw(["whoami()", op("nope")])
+    assert [(r.ok, r.tool) for r in results] == [(True, "whoami"), (False, "nope")]
+
+
 def test_batch_raises_batch_error_on_embedded_failure(db: Khive):
     with pytest.raises(BatchError) as excinfo:
         db.batch([op("stats"), op("nope")])
