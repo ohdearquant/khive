@@ -663,7 +663,7 @@ fn statement_is_cancellable_read(stmt: &rusqlite::Statement<'_>, sql: &str) -> b
 /// an optional single positional argument (`PRAGMA name` or `PRAGMA
 /// name(arg)`) — none of these has a set/assignment form in SQLite, so an
 /// argument is always a read-side filter, never a mutation.
-const READER_STRUCTURAL_PRAGMAS: [&str; 7] = [
+const READER_STRUCTURAL_PRAGMAS: [&str; 8] = [
     "table_info",
     "table_xinfo",
     "table_list",
@@ -671,6 +671,7 @@ const READER_STRUCTURAL_PRAGMAS: [&str; 7] = [
     "index_info",
     "index_xinfo",
     "foreign_key_list",
+    "integrity_check",
 ];
 
 /// Introspection `PRAGMA`s admitted through the pooled reader capability only
@@ -805,7 +806,16 @@ fn admit_reader_capability_sql(
     transaction_control: Option<CachedReadTransactionControl>,
     operation: &'static str,
 ) -> khive_storage::types::StorageResult<()> {
-    if transaction_control.is_some() {
+    // Only the admitted single-level deferred-read span (`BEGIN`/`BEGIN
+    // DEFERRED` and its `COMMIT`/`END`/`ROLLBACK` counterpart) bypasses the
+    // read-shape check below; `Unsupported` forms (`BEGIN IMMEDIATE`,
+    // `SAVEPOINT`, `ROLLBACK TO ...`) fall through and are refused there like
+    // any other non-admitted statement head.
+    if matches!(
+        transaction_control,
+        Some(CachedReadTransactionControl::BeginDeferred)
+            | Some(CachedReadTransactionControl::Finish(_))
+    ) {
         return Ok(());
     }
     reader_capability_admits(&statement.sql).map_err(|message| StorageError::InvalidInput {
@@ -2331,7 +2341,8 @@ impl khive_storage::SqlReader for PoolBackedReader {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
-        admit_reader_capability_sql(&statement, None, "pool_reader.query_row")?;
+        let transaction_control = cached_read_transaction_control(&statement.sql);
+        admit_reader_capability_sql(&statement, transaction_control, "pool_reader.query_row")?;
         let pool = Arc::clone(&self.pool);
         run_pool_reader_query(pool, "pool_reader.query_row", move |scope, conn| {
             execute_query_row_interruptibly(
@@ -2350,7 +2361,8 @@ impl khive_storage::SqlReader for PoolBackedReader {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        admit_reader_capability_sql(&statement, None, "pool_reader.query_all")?;
+        let transaction_control = cached_read_transaction_control(&statement.sql);
+        admit_reader_capability_sql(&statement, transaction_control, "pool_reader.query_all")?;
         let pool = Arc::clone(&self.pool);
         run_pool_reader_query(pool, "pool_reader.query_all", move |scope, conn| {
             execute_query_interruptibly(
@@ -2370,7 +2382,8 @@ impl khive_storage::SqlReader for PoolBackedReader {
         statement: SqlStatement,
         page: PageRequest,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        admit_reader_capability_sql(&statement, None, "pool_reader.query_page")?;
+        let transaction_control = cached_read_transaction_control(&statement.sql);
+        admit_reader_capability_sql(&statement, transaction_control, "pool_reader.query_page")?;
         let pool = Arc::clone(&self.pool);
         run_pool_reader_query(pool, "pool_reader.query_page", move |scope, conn| {
             execute_query_page_interruptibly(
@@ -3333,6 +3346,92 @@ mod tests {
             assert!(
                 result.is_ok(),
                 "reader capability must still admit {control:?}: {result:?}"
+            );
+        }
+    }
+
+    /// Regression for the in-memory reader path: `PoolBackedReader` (the
+    /// `SqlBridge::reader` implementation used whenever `is_file_backed` is
+    /// `false`) computed its admission classification differently from
+    /// `SqliteReader`, always passing `None` for the cached transaction-control
+    /// read instead of classifying the statement. That made the deferred-read
+    /// snapshot pair (`BEGIN DEFERRED` ... `COMMIT`) a multi-call reader
+    /// already relies on to hold one consistent view across several pooled
+    /// checkouts — see `khive-pack-memory`'s fresh-tail leg — indistinguishable
+    /// from an unrecognized statement head and refused outright. Mutating
+    /// statements must still be refused through this path exactly as they are
+    /// through the file-backed one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_backed_reader_admits_deferred_read_transaction_control() {
+        let config = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE pool_backed_reader_probe(value INTEGER NOT NULL); \
+                 INSERT INTO pool_backed_reader_probe VALUES (1);",
+            )
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+        let mut reader = bridge.reader().await.unwrap();
+
+        reader
+            .query_all(SqlStatement {
+                sql: "BEGIN DEFERRED".into(),
+                params: vec![],
+                label: Some("pool-backed-reader-snapshot-begin".into()),
+            })
+            .await
+            .expect("BEGIN DEFERRED must be admitted through the pool-backed reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT value FROM pool_backed_reader_probe".into(),
+                params: vec![],
+                label: Some("pool-backed-reader-snapshot-read".into()),
+            })
+            .await
+            .expect("a read inside the admitted snapshot must succeed");
+        assert_eq!(rows.len(), 1);
+        reader
+            .query_all(SqlStatement {
+                sql: "COMMIT".into(),
+                params: vec![],
+                label: Some("pool-backed-reader-snapshot-commit".into()),
+            })
+            .await
+            .expect("COMMIT must be admitted through the pool-backed reader");
+
+        let integrity = reader
+            .query_scalar(SqlStatement {
+                sql: "PRAGMA integrity_check".into(),
+                params: vec![],
+                label: Some("pool-backed-reader-integrity-check".into()),
+            })
+            .await
+            .expect("PRAGMA integrity_check must be admitted through the pool-backed reader");
+        assert!(matches!(integrity, Some(SqlValue::Text(ref s)) if s.eq_ignore_ascii_case("ok")));
+
+        for probe in [
+            "ATTACH DATABASE ':memory:' AS x",
+            "PRAGMA writable_schema=ON",
+            "CREATE TEMP TABLE t(x)",
+            "SAVEPOINT nested_snapshot",
+        ] {
+            let mut reader = bridge.reader().await.unwrap();
+            let result = reader
+                .query_all(SqlStatement {
+                    sql: probe.into(),
+                    params: vec![],
+                    label: Some("pool-backed-reader-admission-probe".into()),
+                })
+                .await;
+            assert!(
+                result.is_err(),
+                "pool-backed reader capability must refuse {probe:?}; got {result:?}"
             );
         }
     }
