@@ -1000,7 +1000,9 @@ mod unix_impl {
                     "refusing to remove replaced walpin sidecar entry {name:?}"
                 )));
             }
-            let current_device = u64::try_from(current.st_dev).unwrap_or(u64::MAX);
+            // st_dev is u64 on Linux and i32 on macOS; widening first keeps the
+            // conversion real on both targets.
+            let current_device = u64::try_from(i128::from(current.st_dev)).unwrap_or(u64::MAX);
             let current_inode = current.st_ino;
             if current_device != expected.device || current_inode != expected.inode {
                 return Ok(false);
