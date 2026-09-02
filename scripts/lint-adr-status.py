@@ -81,6 +81,13 @@ INLINE_STATUS = re.compile(r"^\s*(?:-\s*)?\*{0,2}\s*status\s*\*{0,2}\s*:", re.IG
 # declarations, and taking only the first would silently prefer one of them —
 # the exact defect this lint exists to reject when the copies sit on two lines.
 INLINE_STATUS_ANYWHERE = re.compile(r"\*{0,2}\bstatus\s*\*{0,2}\s*:", re.IGNORECASE)
+# A backtick-delimited inline code span. CommonMark opens and closes a span on
+# a run of the SAME length, so a shorter or longer backtick run inside does
+# not close it early — the backreference enforces that.
+INLINE_CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)*?\1")
+# The destination portion of a Markdown link, `](...)`. A status-shaped
+# substring inside a URL (a path segment, a query string) is not a label.
+LINK_DESTINATION = re.compile(r"\]\([^)]*\)")
 # `## Status`, any heading level, nothing else on the line
 HEADING_STATUS = re.compile(r"^#{1,6}\s+status\s*$", re.IGNORECASE)
 # Any other `## ` heading closes the document header.
@@ -97,6 +104,17 @@ SECTION_HEADING = re.compile(r"^#{2,6}\s+\S")
 # indented one — end a block early, turning fenced display text back into
 # visible text, which reads a fenced-only status as a real declaration.
 FENCE_OPEN = re.compile(r"^ {0,3}(?P<chars>`{3,}|~{3,})(?P<info>.*)$")
+# A line indented 4+ spaces or led by a tab is CommonMark indented code, the
+# same display-text treatment as a fence. The simplified rule implemented
+# here: such a line counts as code only when the line immediately before it
+# is blank, or it is the first line of the file. CommonMark's real rule is
+# narrower — indented code cannot interrupt an actively continuing paragraph
+# even across a non-blank predecessor that is itself a heading or a fence —
+# but this checker does not distinguish predecessor kinds, so it always
+# requires a blank line. That is the conservative direction: a missed
+# indented-code line still reads as an ordinary line and gets matched
+# normally, it is never mistaken for a hidden declaration.
+INDENTED_CODE = re.compile(r"^(?: {4,}|\t)\S")
 # The cap exists so a special file or an oversized substitute cannot make CI
 # read without bound; a plausible ADR is orders of magnitude smaller.
 MAX_ADR_BYTES = 1 << 20
@@ -119,17 +137,17 @@ def header_declarations(lines: list[str]) -> list[Declaration]:
     is what lets the caller reject a second declaration instead of silently
     preferring one of them.
     """
-    visible, fence_marker = visible_view(lines)
+    visible, hidden = visible_view(lines)
     found: list[Declaration] = []
     for i, line in enumerate(visible):
-        if fence_marker[i] or line is None:
+        if hidden[i] or line is None:
             continue
         if SECTION_HEADING.match(line) and not HEADING_STATUS.match(line):
             break
         if HEADING_STATUS.match(line):
             for j in range(i + 1, len(lines)):
-                if fence_marker[j]:
-                    break  # a fenced value is display text, not a declaration
+                if hidden[j]:
+                    break  # a hidden (fenced/indented) value is display text
                 v = visible[j]
                 if v is not None and v.strip():
                     found.append(Declaration(j + 1, v.strip(), "heading"))
@@ -139,10 +157,14 @@ def header_declarations(lines: list[str]) -> list[Declaration]:
             # Every label on the line is a declaration. Taking only the first
             # would let `**Status**: accepted **Status**: proposed` pass as a
             # single valid declaration whose rider swallows the second one.
-            labels = list(INLINE_STATUS_ANYWHERE.finditer(line))
+            # Inline code spans and link destinations are stripped first: a
+            # status-shaped substring inside either is display text or a URL
+            # fragment, not a rider declaration.
+            scan_line = strip_inline_noise(line)
+            labels = list(INLINE_STATUS_ANYWHERE.finditer(scan_line))
             for k, m in enumerate(labels):
-                end = labels[k + 1].start() if k + 1 < len(labels) else len(line)
-                value = line[m.end() : end].strip()
+                end = labels[k + 1].start() if k + 1 < len(labels) else len(scan_line)
+                value = scan_line[m.end() : end].strip()
                 found.append(Declaration(i + 1, value, "inline"))
     return found
 
@@ -174,30 +196,49 @@ def strip_comments(line: str, in_comment: bool) -> tuple[str, bool]:
             in_comment = True
 
 
+def strip_inline_noise(line: str) -> str:
+    """`line` with inline code spans and link destinations removed.
+
+    Used only for counting "Status:" labels on an already-matched header
+    line: a label inside a backtick-delimited code span or a Markdown link
+    destination (`](...)`) is display text or a URL fragment, not a second
+    declaration.
+    """
+    line = INLINE_CODE_SPAN.sub("", line)
+    return LINK_DESTINATION.sub("", line)
+
+
 def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
-    """Per-line declaration-relevant text: fences and comments removed.
+    """Per-line declaration-relevant text: fences, indented code, and comments removed.
 
     `visible[i]` is the line with comment spans stripped, or None inside a
-    fenced block; `fence_marker[i]` marks the fence delimiters themselves.
-    A block closes only on its opener's own character, at least as many of
-    them, and nothing but whitespace after (CommonMark); other fence-shaped
-    lines inside the block are content. Fence openers inside a comment do not
-    open a fence, and comment openers inside a fence do not open a comment —
-    each construct is display text within the other.
+    fenced or indented-code block; `hidden[i]` marks every line that carries
+    no declaration-relevant text at all — fence delimiters and indented-code
+    lines alike. A fenced block closes only on its opener's own character, at
+    least as many of them, and nothing but whitespace after (CommonMark);
+    other fence-shaped lines inside the block are content. Fence openers
+    inside a comment do not open a fence, and comment openers inside a fence
+    do not open a comment — each construct is display text within the other.
+    An indented-code line (see `INDENTED_CODE`) is recognised the same way,
+    only outside a fence and outside a comment; `prev_blank` tracks whether
+    the immediately preceding line was blank, which is what the simplified
+    indented-code rule keys on.
     """
     visible: list[str | None] = []
-    fence_marker: list[bool] = []
+    hidden: list[bool] = []
     fence_close: re.Pattern[str] | None = None
     in_comment = False
+    prev_blank = True
     for line in lines:
         if fence_close is not None:
             if fence_close.match(line):
                 fence_close = None
                 visible.append(None)
-                fence_marker.append(True)
+                hidden.append(True)
             else:
                 visible.append(None)
-                fence_marker.append(False)
+                hidden.append(False)
+            prev_blank = line.strip() == ""
             continue
         if not in_comment:
             opener = FENCE_OPEN.match(line)
@@ -209,12 +250,19 @@ def visible_view(lines: list[str]) -> tuple[list[str | None], list[bool]]:
                     rf"^ {{0,3}}{re.escape(chars[0])}{{{len(chars)},}}[ \t]*$"
                 )
                 visible.append(None)
-                fence_marker.append(True)
+                hidden.append(True)
+                prev_blank = False
+                continue
+            if prev_blank and INDENTED_CODE.match(line):
+                visible.append(None)
+                hidden.append(True)
+                prev_blank = line.strip() == ""
                 continue
         text, in_comment = strip_comments(line, in_comment)
         visible.append(text)
-        fence_marker.append(False)
-    return visible, fence_marker
+        hidden.append(False)
+        prev_blank = line.strip() == ""
+    return visible, hidden
 
 
 def status_word(value: str) -> str | None:
@@ -235,6 +283,24 @@ def status_word(value: str) -> str | None:
         if rest and (rest[0].isalnum() or rest[0] == "_"):
             continue
         return word
+    return None
+
+
+def symlinked_base_component(base_dir: Path) -> Path | None:
+    """`base_dir` or its parent, whichever is a symlink — None if neither is.
+
+    `read_adr_contained`'s containment check compares `os.path.realpath` of
+    both the candidate file's parent and `base_dir`; if `base_dir` itself, or
+    its parent (the repository's `docs`), is a symlink, both operands resolve
+    through the same link and the comparison agrees even though the tree
+    `check_tree` enumerates lives elsewhere. Only these two components are
+    checked — walking further up the path would trip on symlinks the
+    surrounding filesystem carries for unrelated reasons (a machine's
+    temp-directory root, for one).
+    """
+    for candidate in (base_dir, base_dir.parent):
+        if candidate.is_symlink():
+            return candidate
     return None
 
 
@@ -312,6 +378,16 @@ def check_file(path: Path, base_dir: Path | None = None) -> list[str]:
 
 
 def check_tree(adr_dir: Path) -> int:
+    symlinked = symlinked_base_component(adr_dir)
+    if symlinked is not None:
+        print(
+            f"lint-adr-status: refusing to lint {adr_dir} — {symlinked} is a "
+            f"symlink. A symlinked ADR directory can make the containment "
+            f"check match a tree outside the intended one.",
+            file=sys.stderr,
+        )
+        return 1
+
     paths = sorted(adr_dir.glob(ADR_GLOB))
     if not paths:
         print(
@@ -443,6 +519,18 @@ MUST_FAIL = {
         "\n"
         "## Context\n"
     ),
+    # The only status-shaped text is 4-space-indented, which CommonMark
+    # renders as an indented code block — display text, not a declaration,
+    # exactly like the fenced case above. A checker blind to indented code
+    # accepts this as declaring "accepted" when the header in fact declares
+    # nothing.
+    "ADR-930-indented-status-only.md": (
+        "# ADR-930: Something\n"
+        "\n"
+        "    Status: accepted\n"
+        "\n"
+        "## Context\n"
+    ),
 }
 
 MUST_PASS = {
@@ -558,6 +646,37 @@ MUST_PASS = {
         "\n"
         "## Context\n"
     ),
+    # A real header declaration beside an indented-code example of the same
+    # label. The indented line must not count as a second declaration, and
+    # must not displace the real one — the indented-code counterpart of
+    # ADR-915's fenced-example case.
+    "ADR-931-status-plus-indented-example.md": (
+        "# ADR-931: Something\n"
+        "\n"
+        "**Status**: Accepted\n"
+        "\n"
+        "    Status: accepted   <- indented example, not a declaration\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A second "Status:" label inside a backtick-delimited inline code span
+    # is display text, not a rider declaration.
+    "ADR-932-inline-code-span-status.md": (
+        "# ADR-932: Something\n"
+        "\n"
+        "**Status**: Accepted (see `Status: Proposed`)\n"
+        "\n"
+        "## Context\n"
+    ),
+    # A "status:" substring inside a Markdown link's destination is a URL
+    # fragment, not a rider declaration.
+    "ADR-933-link-destination-status.md": (
+        "# ADR-933: Something\n"
+        "\n"
+        "**Status**: Accepted (see [details](https://example.com/status:notes))\n"
+        "\n"
+        "## Context\n"
+    ),
 }
 
 
@@ -620,6 +739,32 @@ def self_test() -> int:
             problems += 1
         link.unlink()
 
+        # Symlinked base-directory arm: `docs/adr` itself being a symlink must
+        # be refused before anything is read, because `check_tree`'s glob
+        # would otherwise enumerate the link's target and the containment
+        # check in `read_adr_contained` would agree with it (both operands
+        # resolve through the same `realpath`). Built as a fully separate
+        # scratch tree so it does not disturb `adr_dir`, which every other
+        # arm above and below still uses.
+        sym_root = Path(tmp) / "symlink-base-arm"
+        real_target = sym_root / "real-adr-storage"
+        real_target.mkdir(parents=True)
+        (real_target / "ADR-940-valid.md").write_text(
+            "# ADR-940\n\n**Status**: accepted\n\n## Context\n", encoding="utf-8"
+        )
+        sym_docs = sym_root / "docs"
+        sym_docs.mkdir()
+        symlinked_adr_dir = sym_docs / "adr"
+        symlinked_adr_dir.symlink_to(real_target)
+        print("lint-adr-status self-test: the next line is the expected "
+              "symlinked-base-directory refusal.", file=sys.stderr)
+        if check_tree(symlinked_adr_dir) == 0:
+            print(
+                "SELF-TEST: a symlinked ADR base directory was linted instead of refused.",
+                file=sys.stderr,
+            )
+            problems += 1
+
         # FIFO arm: os.open on a FIFO with no writer BLOCKS unless the open is
         # non-blocking, and a blocked open never reaches the S_ISREG rejection
         # — CI hangs instead of failing. The alarm turns a regression back
@@ -668,7 +813,7 @@ def self_test() -> int:
             )
             problems += 1
 
-    total = len(MUST_FAIL) + len(MUST_PASS) + 5
+    total = len(MUST_FAIL) + len(MUST_PASS) + 6
     print(f"lint-adr-status self-test: {total - problems}/{total} cases correct.")
     return 1 if problems else 0
 
