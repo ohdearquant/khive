@@ -42,9 +42,9 @@ fn file_backed_registry(
     // note-store cost with no deferred audit row riding along — silently
     // contradicting the "includes the deferred audit-batch row" claim this
     // file's comments make about what the delta contains.
-    let token = rt.authorize(Namespace::local()).expect("local token");
-    let event_store = rt.events(&token).expect("event store");
-    builder.with_event_store(event_store);
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("configure trusted runtime audit store");
     let registry = builder.build().expect("registry builds");
     (registry, rt)
 }
