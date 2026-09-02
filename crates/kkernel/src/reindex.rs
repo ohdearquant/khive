@@ -2414,6 +2414,7 @@ path = "{}"
         let before = fts
             .count(TextFilter {
                 kinds: vec![SubstrateKind::Note],
+                record_kinds: vec![],
                 namespaces: vec!["local".to_string()],
                 ids: vec![],
             })
@@ -2429,6 +2430,7 @@ path = "{}"
         let after = fts
             .count(TextFilter {
                 kinds: vec![SubstrateKind::Note],
+                record_kinds: vec![],
                 namespaces: vec!["local".to_string()],
                 ids: vec![],
             })
@@ -2588,6 +2590,7 @@ path = "{}"
         let count = fts
             .count(TextFilter {
                 kinds: vec![SubstrateKind::Note],
+                record_kinds: vec![],
                 namespaces: vec!["local".to_string()],
                 ids: vec![],
             })
@@ -2638,6 +2641,7 @@ path = "{}"
         let count = fts
             .count(TextFilter {
                 kinds: vec![SubstrateKind::Note],
+                record_kinds: vec![],
                 namespaces: vec!["local".to_string()],
                 ids: vec![],
             })
@@ -2680,6 +2684,7 @@ path = "{}"
         let count = fts
             .count(TextFilter {
                 kinds: vec![SubstrateKind::Note],
+                record_kinds: vec![],
                 namespaces: vec!["local".to_string()],
                 ids: vec![],
             })
@@ -2743,6 +2748,7 @@ path = "{}"
         let before = fts
             .count(TextFilter {
                 kinds: vec![SubstrateKind::Entity],
+                record_kinds: vec![],
                 namespaces: vec!["local".to_string()],
                 ids: vec![],
             })
@@ -2758,6 +2764,7 @@ path = "{}"
         let after = fts
             .count(TextFilter {
                 kinds: vec![SubstrateKind::Entity],
+                record_kinds: vec![],
                 namespaces: vec!["local".to_string()],
                 ids: vec![],
             })
@@ -2860,6 +2867,7 @@ path = "{}"
         let count = fts
             .count(TextFilter {
                 kinds: vec![SubstrateKind::Entity],
+                record_kinds: vec![],
                 namespaces: vec!["local".to_string()],
                 ids: vec![],
             })
@@ -2902,6 +2910,7 @@ path = "{}"
         let count = fts
             .count(TextFilter {
                 kinds: vec![SubstrateKind::Entity],
+                record_kinds: vec![],
                 namespaces: vec!["local".to_string()],
                 ids: vec![],
             })

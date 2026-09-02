@@ -22,6 +22,11 @@ decisions and rationale.
   callers must not infer full success solely from the absence of an RPC-level error.
 - Per-op failures do not abort siblings in Parallel mode; they do abort remaining
   ops in Chain mode (reported as `{"ok": false, "aborted": true}`).
+- `comm.read` and `comm.mark_read` are state-mutating acknowledgements, not
+  dependencies on sibling delivery operations. In Parallel mode they may commit
+  even when a sibling `comm.send` or `comm.reply` fails. Callers that need the
+  acknowledgement conditioned on delivery must use a Chain, or use `comm.reply`
+  for the common deliver-first/read-mark-second flow.
 - Invalid DSL (parse/lex failure) is preflighted before warm-daemon forwarding
   and returns an RPC-level `invalid_params` error; its error data carries
   `reason: "parse-error"` on both local and daemon-available paths. Per-verb

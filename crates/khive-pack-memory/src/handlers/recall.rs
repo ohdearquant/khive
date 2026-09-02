@@ -6776,9 +6776,27 @@ mod tests {
     }
 
     const STRATEGY_PROBE_QUERY: &str = "widening strategy probe query";
+    const STRATEGY_PROBE_TARGET: &str = "widening strategy probe query sentinel";
+    const STRATEGY_PROBE_INITIAL_CANDIDATE_LIMIT: u32 = 4;
+    const STRATEGY_PROBE_MAX_RECALL_CANDIDATES: usize = 8;
+    const STRATEGY_PROBE_KEYWORD_FILLERS: usize = 5;
+    const STRATEGY_PROBE_VECTOR_DECOYS: usize = 2;
 
-    /// Query and vector decoys share one direction; everything else is
-    /// orthogonal, so decoys are top vector hits while never matching FTS.
+    fn strategy_probe_recall_config() -> Value {
+        json!({
+            "candidate_limit": STRATEGY_PROBE_INITIAL_CANDIDATE_LIMIT,
+            "scoring": {
+                "max_recall_candidates": STRATEGY_PROBE_MAX_RECALL_CANDIDATES,
+            },
+            // One re-gather round is the behavior this fixture exercises.
+            "ann_overfetch_max_rounds": 2,
+        })
+    }
+
+    /// Query and vector decoys share one direction. The keyword target has a
+    /// distinct, lower vector score that remains above `min_raw_relevance`,
+    /// while fillers are orthogonal. This keeps the decoys first without
+    /// letting zero-score vector tie ordering intermittently filter the target.
     struct StrategyProbeVecService;
 
     #[async_trait]
@@ -6793,6 +6811,10 @@ mod tests {
                 .map(|t| {
                     if t == STRATEGY_PROBE_QUERY || t.starts_with("vector decoy") {
                         vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                    } else if t == STRATEGY_PROBE_TARGET {
+                        // cosine(query, target) ~= 0.316: below the decoys,
+                        // above the default raw-vector floor of 0.10.
+                        vec![1.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
                     } else {
                         vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
                     }
@@ -6842,11 +6864,13 @@ mod tests {
         let ns = Namespace::parse("local").expect("local namespace");
         let token = rt.authorize(ns).expect("authorize local");
 
-        // 160 out-of-window keyword fillers that out-rank the target on FTS,
-        // so the target sits outside the 150-candidate first fetch and inside
-        // the widened 200 (default candidate_limit 150, max 200).
+        // One more out-of-window keyword filler than the request-local initial
+        // cap. All fillers out-rank the target on FTS, so the target sits
+        // outside the 4-candidate first fetch and inside the explicitly capped
+        // widened fetch of 8. Keeping both bounds request-local avoids coupling
+        // this fixture to production defaults or a 150-row rank boundary.
         let mut filler_ids = Vec::new();
-        for i in 0..160 {
+        for i in 0..STRATEGY_PROBE_KEYWORD_FILLERS {
             let filler = rt
                 .create_note(
                     &token,
@@ -6870,7 +6894,7 @@ mod tests {
                 &token,
                 "memory",
                 None,
-                "widening strategy probe query sentinel",
+                STRATEGY_PROBE_TARGET,
                 Some(0.7),
                 None,
                 vec![],
@@ -6881,9 +6905,17 @@ mod tests {
         // as the query), never FTS hits (no query terms). Enough of them to
         // satisfy `limit` on their own if the count wrongly includes them.
         let mut decoy_ids = Vec::new();
-        for name in ["vector decoy alpha", "vector decoy beta"] {
+        for i in 0..STRATEGY_PROBE_VECTOR_DECOYS {
             let decoy = rt
-                .create_note(&token, "memory", None, name, Some(0.7), None, vec![])
+                .create_note(
+                    &token,
+                    "memory",
+                    None,
+                    &format!("vector decoy {i}"),
+                    Some(0.7),
+                    None,
+                    vec![],
+                )
                 .await
                 .expect("create decoy");
             decoy_ids.push(decoy.id);
@@ -6934,13 +6966,15 @@ mod tests {
                 "memory.recall",
                 json!({
                     "query": STRATEGY_PROBE_QUERY,
-                    "limit": 2,
+                    "limit": STRATEGY_PROBE_VECTOR_DECOYS,
                     "fusion_strategy": "vector_only",
+                    "config": strategy_probe_recall_config(),
                 }),
             )
             .await
             .expect("vector_only probe recall");
         let vector_probe_ids = recall_ids(&vector_probe);
+        assert_eq!(vector_probe_ids.len(), STRATEGY_PROBE_VECTOR_DECOYS);
         for decoy in &decoy_ids {
             assert!(
                 vector_probe_ids.contains(&decoy.to_string()),
@@ -6957,6 +6991,7 @@ mod tests {
                     "query": STRATEGY_PROBE_QUERY,
                     "limit": 2,
                     "fusion_strategy": "keyword_only",
+                    "config": strategy_probe_recall_config(),
                 }),
             )
             .await
@@ -6977,6 +7012,7 @@ mod tests {
                     "query": STRATEGY_PROBE_QUERY,
                     "limit": 2,
                     "fusion_strategy": "keyword_only",
+                    "config": strategy_probe_recall_config(),
                     "created_after": chrono::DateTime::from_timestamp_micros(t_in)
                         .expect("valid micros")
                         .to_rfc3339(),

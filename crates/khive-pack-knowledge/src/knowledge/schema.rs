@@ -1,6 +1,6 @@
 //! Param/option types for the knowledge pack verbs.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -93,12 +93,29 @@ pub(crate) struct AtomInput {
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub properties: Option<Value>,
-    #[serde(default)]
-    pub finalized: Option<bool>,
-    #[serde(default)]
-    pub source_uri: Option<String>,
-    #[serde(default)]
-    pub source_type: Option<String>,
+    /// Patch semantics: omitted preserves an existing flag, `null` resets it
+    /// to false, and a boolean sets it explicitly.
+    #[serde(default, deserialize_with = "tri_state")]
+    pub finalized: Option<Option<bool>>,
+    /// Patch semantics: omitted preserves an existing URI, `null` clears it,
+    /// and a string replaces it.
+    #[serde(default, deserialize_with = "tri_state")]
+    pub source_uri: Option<Option<String>>,
+    /// Patch semantics: omitted preserves an existing type, `null` clears it,
+    /// and a string replaces it.
+    #[serde(default, deserialize_with = "tri_state")]
+    pub source_type: Option<Option<String>>,
+}
+
+/// Preserve the distinction Serde's ordinary `Option<T>` collapses: an absent
+/// key uses the field default (`None`), while a present null/value becomes
+/// `Some(None)` / `Some(Some(value))`.
+fn tri_state<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Deserialize)]

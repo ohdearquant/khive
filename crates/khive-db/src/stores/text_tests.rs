@@ -44,6 +44,7 @@ fn setup_trigram_store(table_key: &str) -> Fts5TextSearch {
              namespace UNINDEXED, \
              metadata UNINDEXED, \
              updated_at UNINDEXED, \
+             record_kind, \
              tokenize = 'trigram'\
              )",
             table_name
@@ -58,6 +59,7 @@ fn make_document(subject_id: Uuid, title: &str, body: &str) -> TextDocument {
     TextDocument {
         subject_id,
         kind: SubstrateKind::Note,
+        record_kind: None,
         title: if title.is_empty() {
             None
         } else {
@@ -68,6 +70,18 @@ fn make_document(subject_id: Uuid, title: &str, body: &str) -> TextDocument {
         namespace: "test_ns".to_string(),
         metadata: None,
         updated_at: Utc::now(),
+    }
+}
+
+fn make_record_kind_document(
+    subject_id: Uuid,
+    record_kind: &str,
+    title: &str,
+    body: &str,
+) -> TextDocument {
+    TextDocument {
+        record_kind: Some(record_kind.to_string()),
+        ..make_document(subject_id, title, body)
     }
 }
 
@@ -86,6 +100,7 @@ async fn test_upsert_and_search() {
     let doc = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Entity,
+        record_kind: None,
         title: Some("Rust Programming".to_string()),
         body: "Rust is a systems programming language focused on safety and performance."
             .to_string(),
@@ -217,6 +232,7 @@ async fn test_count_with_filter() {
         let doc = TextDocument {
             subject_id: Uuid::new_v4(),
             kind,
+            record_kind: None,
             title: Some(format!("Doc {}", i)),
             body: format!("Content for document number {}", i),
             tags: vec![],
@@ -265,6 +281,7 @@ async fn test_get_document_roundtrip() {
     let original = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Note,
+        record_kind: Some("memory".to_string()),
         title: Some("Important Memo".to_string()),
         body: "This memo contains critical information.".to_string(),
         tags: vec!["important".to_string(), "memo".to_string()],
@@ -278,6 +295,7 @@ async fn test_get_document_roundtrip() {
     let retrieved = store.get_document("work", id).await.unwrap().unwrap();
     assert_eq!(retrieved.subject_id, id);
     assert_eq!(retrieved.kind, SubstrateKind::Note);
+    assert_eq!(retrieved.record_kind.as_deref(), Some("memory"));
     assert_eq!(retrieved.title, Some("Important Memo".to_string()));
     assert_eq!(retrieved.body, "This memo contains critical information.");
     assert_eq!(retrieved.tags, vec!["important", "memo"]);
@@ -315,6 +333,7 @@ async fn test_batch_upsert() {
         .map(|i| TextDocument {
             subject_id: Uuid::new_v4(),
             kind: SubstrateKind::Entity,
+            record_kind: None,
             title: Some(format!("Item {}", i)),
             body: format!("This is the body content for item number {}", i),
             tags: vec![format!("tag_{}", i % 5)],
@@ -381,6 +400,7 @@ async fn test_search_with_kind_filter() {
         .upsert_document(TextDocument {
             subject_id: id_entity,
             kind: SubstrateKind::Entity,
+            record_kind: None,
             title: Some("Rust Guide".to_string()),
             body: "A comprehensive guide to Rust programming.".to_string(),
             tags: vec![],
@@ -395,6 +415,7 @@ async fn test_search_with_kind_filter() {
         .upsert_document(TextDocument {
             subject_id: id_note,
             kind: SubstrateKind::Note,
+            record_kind: None,
             title: Some("Rust Notes".to_string()),
             body: "Quick notes about Rust concepts.".to_string(),
             tags: vec![],
@@ -422,6 +443,154 @@ async fn test_search_with_kind_filter() {
 
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].subject_id, id_entity);
+}
+
+#[tokio::test]
+async fn record_kind_filter_preserves_results_and_scopes_every_gather_mode() {
+    let store = setup_trigram_store("record_kind_gather_modes");
+    let memory_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    for id in memory_ids {
+        store
+            .upsert_document(make_record_kind_document(
+                id,
+                "memory",
+                "recall fixture",
+                "zircon recall evidence",
+            ))
+            .await
+            .unwrap();
+    }
+
+    let request = |record_kinds: Vec<String>| TextSearchRequest {
+        query: "zircon".to_string(),
+        mode: TextQueryMode::Plain,
+        filter: Some(TextFilter {
+            namespaces: vec!["test_ns".to_string()],
+            record_kinds,
+            ..TextFilter::default()
+        }),
+        top_k: 10,
+        snippet_chars: 0,
+    };
+    let before_noise = store.search(request(Vec::new())).await.unwrap();
+    assert_eq!(before_noise.len(), memory_ids.len());
+    let mut classifier_only_query = request(Vec::new());
+    classifier_only_query.query = "memory".to_string();
+    assert!(
+        store
+            .search(classifier_only_query)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an unscoped lexical query must not match indexed classifier text"
+    );
+
+    for i in 0..100 {
+        store
+            .upsert_document(make_record_kind_document(
+                Uuid::new_v4(),
+                "message",
+                &format!("unrelated {i}"),
+                "zircon recall evidence",
+            ))
+            .await
+            .unwrap();
+    }
+
+    let ranked = store
+        .search(request(vec!["memory".to_string()]))
+        .await
+        .unwrap();
+    assert_eq!(
+        ranked.iter().map(|hit| hit.subject_id).collect::<Vec<_>>(),
+        before_noise
+            .iter()
+            .map(|hit| hit.subject_id)
+            .collect::<Vec<_>>(),
+        "indexed corpus scoping must preserve the memory-only result set and order"
+    );
+
+    for options in [
+        TextSearchOptions {
+            gather_mode: khive_storage::types::TextGatherMode::Unranked,
+            gather_limit: None,
+        },
+        TextSearchOptions {
+            gather_mode: khive_storage::types::TextGatherMode::RankWithinCap,
+            gather_limit: Some(20),
+        },
+    ] {
+        let hits = store
+            .search_with_options(request(vec!["memory".to_string()]), options)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), memory_ids.len());
+        assert!(
+            hits.iter().all(|hit| memory_ids.contains(&hit.subject_id)),
+            "every gather mode must honor the indexed record-kind corpus"
+        );
+    }
+}
+
+#[tokio::test]
+async fn record_kind_filter_scopes_count_term_stats_and_short_kind_fallback() {
+    let store = setup_trigram_store("record_kind_counts");
+    for (record_kind, body) in [
+        ("memory", "common rare recall"),
+        ("memory", "common recall"),
+        ("message", "common rare message"),
+        ("message", "common rare message"),
+        ("ai", "common rare short classifier"),
+    ] {
+        store
+            .upsert_document(make_record_kind_document(
+                Uuid::new_v4(),
+                record_kind,
+                "fixture",
+                body,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let memory_filter = TextFilter {
+        namespaces: vec!["test_ns".to_string()],
+        record_kinds: vec!["memory".to_string()],
+        ..TextFilter::default()
+    };
+    assert_eq!(store.count(memory_filter.clone()).await.unwrap(), 2);
+    let stats = store
+        .term_stats(TextTermStatsRequest {
+            terms: vec!["common".to_string(), "rare".to_string()],
+            filter: Some(memory_filter),
+        })
+        .await
+        .unwrap();
+    let common = stats.iter().find(|stat| stat.term == "common").unwrap();
+    let rare = stats.iter().find(|stat| stat.term == "rare").unwrap();
+    assert_eq!(common.document_count, 2);
+    assert_eq!(common.document_frequency, 2);
+    assert_eq!(rare.document_frequency, 1);
+
+    let short_kind_hits = store
+        .search(TextSearchRequest {
+            query: "common".to_string(),
+            mode: TextQueryMode::Plain,
+            filter: Some(TextFilter {
+                namespaces: vec!["test_ns".to_string()],
+                record_kinds: vec!["ai".to_string()],
+                ..TextFilter::default()
+            }),
+            top_k: 10,
+            snippet_chars: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        short_kind_hits.len(),
+        1,
+        "a classifier too short for trigram postings must retain exact-filter correctness"
+    );
 }
 
 #[tokio::test]
@@ -1570,6 +1739,7 @@ async fn test_rename_namespace() {
     let doc = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Note,
+        record_kind: None,
         title: Some("Rename test".to_string()),
         body: "keyword_unique_xyz".to_string(),
         tags: vec![],
@@ -1626,6 +1796,7 @@ async fn test_metadata_none_roundtrip() {
     let doc = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Note,
+        record_kind: None,
         namespace: "test_ns".to_string(),
         title: None,
         body: "no metadata".to_string(),
@@ -1646,6 +1817,7 @@ async fn test_rename_namespace_noop() {
     let doc = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Note,
+        record_kind: None,
         title: None,
         body: "noop_test_content".to_string(),
         tags: vec![],
@@ -2774,4 +2946,120 @@ fn general_write_routes_through_writer_task_when_store_built_outside_runtime() {
             .expect("write task must not panic")
             .expect("upsert_document must succeed once unblocked");
     });
+}
+
+/// #1907: memory recall's lexical work must scale with the memory corpus, not
+/// with unrelated notes that happen to match the same common query term.
+#[test]
+fn memory_kind_match_work_is_bounded_by_memory_corpus() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rusqlite::functions::FunctionFlags;
+
+    fn measure(noise_rows: usize) -> (usize, usize, String) {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE fts_notes USING fts5(\
+             subject_id UNINDEXED, \
+             kind UNINDEXED, \
+             title, \
+             body, \
+             tags UNINDEXED, \
+             namespace UNINDEXED, \
+             metadata UNINDEXED, \
+             updated_at UNINDEXED, \
+             record_kind, \
+             tokenize = 'trigram'\
+             )",
+        )
+        .expect("production-shaped trigram table");
+
+        conn.execute_batch("BEGIN").expect("begin seed");
+        {
+            let mut insert = conn
+                .prepare(
+                    "INSERT INTO fts_notes \
+                    (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+                     VALUES (?1, 'note', '', 'common recall token', '[]', 'local', NULL, 0, ?2)",
+                )
+                .expect("prepare seed insert");
+            for i in 0..noise_rows {
+                insert
+                    .execute(rusqlite::params![format!("noise-{i}"), "message"])
+                    .expect("insert non-memory note");
+            }
+            for i in 0..50 {
+                insert
+                    .execute(rusqlite::params![format!("memory-{i}"), "memory"])
+                    .expect("insert memory note");
+            }
+        }
+        conn.execute_batch("COMMIT").expect("commit seed");
+
+        let visits = std::sync::Arc::new(AtomicUsize::new(0));
+        let visits_for_fn = std::sync::Arc::clone(&visits);
+        conn.create_scalar_function(
+            "visit_memory_kind",
+            1,
+            FunctionFlags::SQLITE_UTF8,
+            move |ctx| {
+                visits_for_fn.fetch_add(1, Ordering::Relaxed);
+                Ok(i64::from(ctx.get::<String>(0)? == "memory"))
+            },
+        )
+        .expect("register visit counter");
+
+        let filter = TextFilter {
+            record_kinds: vec!["memory".to_string()],
+            ..TextFilter::default()
+        };
+        let match_expr = build_filtered_match_expr("common", TextQueryMode::Plain, Some(&filter))
+            .expect("filtered MATCH expression");
+        assert!(
+            match_expr.contains("record_kind : \"memory\""),
+            "granular kind must be part of MATCH, got {match_expr:?}"
+        );
+        let sql = format!(
+            "SELECT subject_id FROM fts_notes \
+             WHERE fts_notes MATCH ?1 \
+             AND rank MATCH '{LEXICAL_BM25_RANK}' \
+             AND visit_memory_kind(record_kind) = 1 \
+             ORDER BY rank LIMIT 20"
+        );
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare explain")
+            .query_map([&match_expr], |row| row.get::<_, String>(3))
+            .expect("query explain")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect explain")
+            .join("\n");
+        let hits = conn
+            .prepare(&sql)
+            .expect("prepare measured query")
+            .query_map([&match_expr], |row| row.get::<_, String>(0))
+            .expect("run measured query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect measured hits");
+
+        (hits.len(), visits.load(Ordering::Relaxed), plan)
+    }
+
+    let (small_hits, small_visits, small_plan) = measure(200);
+    let (large_hits, large_visits, large_plan) = measure(2_000);
+    assert_eq!(small_hits, 20);
+    assert_eq!(large_hits, 20);
+    assert_eq!(
+        small_visits, 20,
+        "only the requested memory top-K is visited"
+    );
+    assert_eq!(large_visits, 20, "unrelated notes must add no visits");
+    assert!(small_plan.contains("VIRTUAL TABLE"), "{small_plan}");
+    assert!(large_plan.contains("VIRTUAL TABLE"), "{large_plan}");
+    assert!(
+        large_visits < small_visits.saturating_mul(3),
+        "memory query scanned the unrelated note corpus: {small_visits} candidate visits \
+         with 200 noise rows versus {large_visits} with 2,000 noise rows\n\
+         small plan:\n{small_plan}\nlarge plan:\n{large_plan}"
+    );
 }
