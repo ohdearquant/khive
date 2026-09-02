@@ -516,7 +516,28 @@ async fn dispatch_unbind_removes_binding() {
         )
         .await
         .unwrap();
+    assert_eq!(result["removed"], json!(1u64));
     assert_eq!(result["unbound"], json!(1u64));
+}
+
+#[tokio::test]
+async fn dispatch_unbind_reports_zero_when_selector_matches_nothing() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let result = pack
+        .dispatch(
+            "brain.unbind",
+            json!({"profile_id": "well-formed-but-unbound"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["removed"], json!(0u64));
+    assert_eq!(result["unbound"], json!(0u64));
 }
 
 // ── UE5-H1: brain.profiles lifecycle filter public API ───────────────────

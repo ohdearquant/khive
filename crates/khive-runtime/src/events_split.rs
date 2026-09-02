@@ -64,14 +64,16 @@ use crate::daemon::{read_frame, write_frame};
 /// The server rejects frames whose version it does not speak, so a skewed
 /// client gets a typed refusal instead of a deserialization panic.
 ///
-/// Version 2 is the first version any release ships: version 1 carried a
+/// Version 2 was the first version any release shipped: version 1 carried a
 /// `side_effects_unknown` error field that was replaced by the
 /// `writer_task_state` carrier before this module reached any released ref,
 /// so v1 speakers existed only on unreleased development heads. The bump
 /// exists so that even such a process gets the version refusal above rather
 /// than having its retryable writer states silently mapped to terminal
-/// `InvalidInput`.
-pub const EVENTS_PROTOCOL_VERSION: u32 = 2;
+/// `InvalidInput`. Version 3 replaces that state-only carrier with a failure
+/// disposition so a proven rollback can cross the socket without falsely
+/// claiming the remote writer task terminated.
+pub const EVENTS_PROTOCOL_VERSION: u32 = 3;
 
 /// Default bound on the fire-and-forget append queue, in batches. The loss
 /// window on overflow is this depth times the batch size in flight; the value
@@ -470,30 +472,28 @@ pub enum EventsResponse {
     },
     /// Typed refusal. `retryable` distinguishes transient daemon-side
     /// conditions from contract errors (bad frame, version skew).
-    /// `writer_task_state` is the single carrier of the ADR-133 dispositions
-    /// the retryable bit cannot express: the daemon-side writer terminated
-    /// in a state the audit-batch retry classifier keys on per-variant —
-    /// `NotStarted` and `TransactionRolledBack` are safe replays,
-    /// `SideEffectsUnknown` gates double-send decisions. Flattening any of
-    /// them into a generic refusal turns a mandated retry into a terminal
-    /// failure on the client side. `None` means the error is not a
-    /// writer-task termination at all (parse errors, version refusals,
-    /// non-writer storage errors). No second spelling exists: within one
-    /// protocol version every storage-class Error frame carries this field,
-    /// and cross-version frames never reach this mapping because
-    /// `dispatch_events_request` refuses a mismatched version outright —
-    /// a refusal that happens BEFORE any write executes, so no retryable
-    /// writer state can exist to lose. That guarantee is why
-    /// [`EVENTS_PROTOCOL_VERSION`] must be bumped with any change to this
-    /// field's shape: two shapes sharing one version would make this exact
-    /// sentence false (v2 exists because v1 briefly had a second spelling
-    /// on unreleased development heads).
+    /// `writer_task_failure` carries both request finality and whether the
+    /// remote writer seam terminated. The retryable bit cannot express that
+    /// distinction: an ordinary operation or COMMIT error may be transient or
+    /// permanent while its transaction is independently proven rolled back.
+    /// `None` means the error is not from a writer request. Cross-version
+    /// frames never reach this mapping because `dispatch_events_request`
+    /// refuses a mismatched version before any write executes.
     Error {
         message: String,
         retryable: bool,
         #[serde(default)]
-        writer_task_state: Option<WireWriterTaskState>,
+        writer_task_failure: Option<WireWriterTaskFailure>,
     },
+}
+
+/// Whether a writer-state error belongs to one failed request on a still-live
+/// seam or to a permanently retired writer task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireWriterTaskFailure {
+    RequestFailed { request_state: WireWriterTaskState },
+    TaskTerminated { request_state: WireWriterTaskState },
 }
 
 /// Wire mirror of [`khive_storage::WriterTaskRequestState`]. A separate type
@@ -1063,7 +1063,7 @@ async fn serve_events_conn(
             Err(error) => EventsResponse::Error {
                 message: format!("events daemon could not parse request frame: {error}"),
                 retryable: false,
-                writer_task_state: None,
+                writer_task_failure: None,
             },
         };
         let bytes = match serde_json::to_vec(&response) {
@@ -1100,7 +1100,7 @@ async fn dispatch_events_request(
                 request.protocol_version()
             ),
             retryable: false,
-            writer_task_state: None,
+            writer_task_failure: None,
         };
     }
     // The wire namespace is an unrestricted client-supplied String until this
@@ -1112,7 +1112,7 @@ async fn dispatch_events_request(
         return EventsResponse::Error {
             message: format!("events request namespace rejected: {error}"),
             retryable: false,
-            writer_task_state: None,
+            writer_task_failure: None,
         };
     }
     let store = match namespace_store(backend, stores, request.namespace()) {
@@ -1121,7 +1121,7 @@ async fn dispatch_events_request(
             return EventsResponse::Error {
                 message: format!("events store unavailable: {error}"),
                 retryable: true,
-                writer_task_state: None,
+                writer_task_failure: None,
             };
         }
     };
@@ -1149,7 +1149,7 @@ async fn dispatch_events_request(
                         page.limit, MAX_QUERY_EVENTS_PAGE_ROWS
                     ),
                     retryable: false,
-                    writer_task_state: None,
+                    writer_task_failure: None,
                 };
             }
             match store.query_events(filter, page).await {
@@ -1166,25 +1166,32 @@ async fn dispatch_events_request(
 
 #[cfg(unix)]
 fn storage_error_response(error: &StorageError) -> EventsResponse {
-    // Writer-task terminations carry their request state verbatim: the
-    // ADR-133 retry classifier decides per-variant (`NotStarted` and
-    // `TransactionRolledBack` are mandated retries), so the state must
-    // survive the socket even though `is_retryable()` reports the family
-    // non-transient.
-    let writer_task_state = match error {
-        StorageError::WriterTaskTerminated { request_state } => {
-            Some(WireWriterTaskState::from(*request_state))
-        }
-        _ => None,
+    let (message, writer_task_failure) = match error {
+        StorageError::WriterTaskRequestFailed {
+            request_state,
+            source,
+        } => (
+            source.to_string(),
+            Some(WireWriterTaskFailure::RequestFailed {
+                request_state: (*request_state).into(),
+            }),
+        ),
+        StorageError::WriterTaskTerminated { request_state } => (
+            error.to_string(),
+            Some(WireWriterTaskFailure::TaskTerminated {
+                request_state: (*request_state).into(),
+            }),
+        ),
+        _ => (error.to_string(), None),
     };
     EventsResponse::Error {
-        message: error.to_string(),
+        message,
         // Defer to the storage layer's own transience classifier rather than
         // re-enumerating variants here: a hand-rolled subset silently turns
         // transient writer contention (`WriterTaskBusy`, `Transaction`) into
         // a terminal error on the client side of the socket.
         retryable: error.is_retryable(),
-        writer_task_state,
+        writer_task_failure,
     }
 }
 
@@ -1599,23 +1606,33 @@ impl ForwardingEventStore {
             EventsResponse::Error {
                 message,
                 retryable,
-                writer_task_state,
+                writer_task_failure,
             } => {
-                if let Some(state) = writer_task_state {
-                    // Reconstruct the exact writer-task variant: the ADR-133
-                    // retry classifier decides per-state (`NotStarted` and
-                    // `TransactionRolledBack` are mandated retries,
-                    // `SideEffectsUnknown` gates double-send decisions), so
-                    // flattening any of them into a generic refusal breaks
-                    // the retry contract on the client side of the socket.
-                    // The field is the single carrier: cross-version frames
-                    // never reach this mapping (the daemon refuses a
-                    // mismatched protocol version before dispatch, and the
-                    // refusal precedes any write, so a version-skewed peer
-                    // has no writer state to lose — the guarantee that
-                    // obligates a version bump on any field-shape change).
-                    StorageError::WriterTaskTerminated {
-                        request_state: state.into(),
+                if let Some(failure) = writer_task_failure {
+                    match failure {
+                        WireWriterTaskFailure::RequestFailed { request_state } => {
+                            let source = if retryable {
+                                StorageError::Pool {
+                                    operation: op.into(),
+                                    message,
+                                }
+                            } else {
+                                StorageError::InvalidInput {
+                                    capability: khive_storage::StorageCapability::Events,
+                                    operation: op.into(),
+                                    message,
+                                }
+                            };
+                            StorageError::WriterTaskRequestFailed {
+                                request_state: request_state.into(),
+                                source: Box::new(source),
+                            }
+                        }
+                        WireWriterTaskFailure::TaskTerminated { request_state } => {
+                            StorageError::WriterTaskTerminated {
+                                request_state: request_state.into(),
+                            }
+                        }
                     }
                 } else if retryable {
                     StorageError::Pool {
@@ -2261,14 +2278,14 @@ mod tests {
             EventsResponse::Error {
                 message,
                 retryable,
-                writer_task_state,
+                writer_task_failure,
             } => {
                 assert!(
                     message.contains(&MAX_QUERY_EVENTS_PAGE_ROWS.to_string()),
                     "refusal must name the cap: {message}"
                 );
                 assert!(!retryable, "an over-cap page is not transient");
-                assert!(writer_task_state.is_none());
+                assert!(writer_task_failure.is_none());
             }
             other => panic!("over-cap query must be refused, got {other:?}"),
         }
@@ -2284,7 +2301,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn side_effects_unknown_state_crosses_the_wire_as_writer_task_state() {
+    fn side_effects_unknown_state_crosses_the_wire_as_terminal_failure() {
         let response = storage_error_response(&StorageError::WriterTaskTerminated {
             request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
         });
@@ -2292,7 +2309,9 @@ mod tests {
             matches!(
                 response,
                 EventsResponse::Error {
-                    writer_task_state: Some(WireWriterTaskState::SideEffectsUnknown),
+                    writer_task_failure: Some(WireWriterTaskFailure::TaskTerminated {
+                        request_state: WireWriterTaskState::SideEffectsUnknown,
+                    }),
                     ..
                 }
             ),
@@ -2303,15 +2322,36 @@ mod tests {
         assert!(matches!(
             busy,
             EventsResponse::Error {
-                writer_task_state: None,
+                writer_task_failure: None,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proven_rollback_crosses_the_wire_without_claiming_task_termination() {
+        let response = storage_error_response(&StorageError::WriterTaskRequestFailed {
+            request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+            source: Box::new(StorageError::Pool {
+                operation: "writer_task_commit".into(),
+                message: "commit refused".into(),
+            }),
+        });
+        assert!(matches!(
+            response,
+            EventsResponse::Error {
+                writer_task_failure: Some(WireWriterTaskFailure::RequestFailed {
+                    request_state: WireWriterTaskState::TransactionRolledBack,
+                }),
                 ..
             }
         ));
     }
 
     #[test]
-    fn error_frames_without_writer_state_still_parse() {
-        // `writer_task_state` is `#[serde(default)]`: an Error frame for a
+    fn error_frames_without_writer_failure_still_parse() {
+        // `writer_task_failure` is `#[serde(default)]`: an Error frame for a
         // non-writer failure (parse error, version refusal) omits it and the
         // client must read `None`, not fail the parse.
         let bytes = br#"{"kind":"error","message":"boom","retryable":true}"#;
@@ -2320,7 +2360,7 @@ mod tests {
             parsed,
             EventsResponse::Error {
                 retryable: true,
-                writer_task_state: None,
+                writer_task_failure: None,
                 ..
             }
         ));
@@ -2449,7 +2489,7 @@ mod tests {
     #[tokio::test]
     async fn stateless_non_retryable_error_maps_terminal_not_writer_terminated() {
         // The terminal arm of the client mapping, pinned deliberately: an
-        // Error frame with `retryable: false` and NO `writer_task_state` is
+        // Error frame with `retryable: false` and NO `writer_task_failure` is
         // a non-writer failure (parse error, version refusal) and must map
         // to terminal `InvalidInput` — never to `WriterTaskTerminated`
         // (there is no state to reconstruct) and never to the retryable
@@ -2466,7 +2506,7 @@ mod tests {
         // Control: the same non-retryable frame WITH a writer state must
         // take the reconstruction arm instead — proving the terminal arm
         // above is selected by the field's absence, not by `retryable`.
-        let with_state = br#"{"kind":"error","message":"died","retryable":false,"writer_task_state":"side_effects_unknown"}"#;
+        let with_state = br#"{"kind":"error","message":"died","retryable":false,"writer_task_failure":{"kind":"task_terminated","request_state":"side_effects_unknown"}}"#;
         let parsed: EventsResponse =
             serde_json::from_slice(with_state).expect("stateful frame parses");
         assert!(matches!(
@@ -2513,10 +2553,41 @@ mod tests {
         assert!(matches!(
             busy,
             EventsResponse::Error {
-                writer_task_state: None,
+                writer_task_failure: None,
                 ..
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proven_rollback_round_trips_as_non_terminal_request_failure() {
+        use khive_storage::WriterTaskRequestState as S;
+
+        let dir = tempfile::tempdir().unwrap();
+        let client =
+            EventsSplitClient::new(dir.path().join("never-bound.sock")).expect("client builds");
+        let store = ForwardingEventStore::new("test", client);
+        let response = storage_error_response(&StorageError::WriterTaskRequestFailed {
+            request_state: S::TransactionRolledBack,
+            source: Box::new(StorageError::Pool {
+                operation: "writer_task_commit".into(),
+                message: "commit refused".into(),
+            }),
+        });
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let parsed: EventsResponse = serde_json::from_slice(&bytes).unwrap();
+        let err = store.unexpected("append_events_idempotent", parsed);
+        assert!(
+            matches!(
+                err,
+                StorageError::WriterTaskRequestFailed {
+                    request_state: S::TransactionRolledBack,
+                    ..
+                }
+            ),
+            "proven rollback must not reconstruct as a terminal writer: {err:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -2638,7 +2709,7 @@ mod tests {
                 &response,
                 EventsResponse::Error {
                     retryable: false,
-                    writer_task_state: None,
+                    writer_task_failure: None,
                     ..
                 }
             ),

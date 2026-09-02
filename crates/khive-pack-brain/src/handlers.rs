@@ -2497,7 +2497,12 @@ impl BrainPack {
                 });
 
                 let removed = before - state.bindings.len();
-                Ok(json!({ "unbound": removed }))
+                // `removed` is the canonical mutation count. Keep `unbound`
+                // as a compatibility alias for existing callers and smoke
+                // tests. In particular, both fields remain present at zero so
+                // a successful no-op cannot be mistaken for a confirmed
+                // removal.
+                Ok(json!({ "removed": removed, "unbound": removed }))
             },
         )
         .await
