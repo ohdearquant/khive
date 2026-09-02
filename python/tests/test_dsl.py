@@ -7,12 +7,11 @@ from __future__ import annotations
 import json
 
 import pytest
+from _dsl_fake import DslParseError, PrevRef, parse_dsl
 
 from khive.dsl import render_dsl
 from khive.errors import TransportError
 from khive.ops import op
-
-from _dsl_fake import DslParseError, PrevRef, parse_dsl
 
 
 def test_bare_string():
@@ -221,9 +220,7 @@ def test_prev_shaped_literal_round_trips_top_level(prev_like):
 )
 def test_prev_shaped_literal_round_trips_nested(prev_like):
     """The same escape applies at any depth of an array or object argument."""
-    rendered = render_dsl(
-        [op("verb", tags=[prev_like], properties={"note": prev_like})]
-    )
+    rendered = render_dsl([op("verb", tags=[prev_like], properties={"note": prev_like})])
     [(verb, parsed_args)] = parse_dsl(rendered)
     assert verb == "verb"
     assert parsed_args == {"tags": [prev_like], "properties": {"note": prev_like}}
@@ -242,6 +239,6 @@ def test_intentional_prev_reference_in_a_chain_still_parses_as_a_reference():
 
 def test_prev_reference_outside_a_chain_is_rejected():
     with pytest.raises(DslParseError):
-        parse_dsl('update(id=$prev.id)')
+        parse_dsl("update(id=$prev.id)")
     with pytest.raises(DslParseError):
-        parse_dsl('[update(id=$prev.id), other()]')
+        parse_dsl("[update(id=$prev.id), other()]")

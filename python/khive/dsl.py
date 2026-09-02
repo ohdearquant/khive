@@ -41,7 +41,7 @@ def _needs_prev_escape(value: str) -> bool:
     """Whether `value` is shaped like a `$prev` chain reference and must be
     escaped to survive as a literal (see `parser_impl.rs::string_as_prev_ref`
     — matched here on the same three prefixes, at any nesting depth)."""
-    return value == "$prev" or value.startswith("$prev.") or value.startswith("$prev[")
+    return value == "$prev" or value.startswith(("$prev.", "$prev["))
 
 
 def _render_string(value: str, arg_name: str) -> str:

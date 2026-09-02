@@ -68,7 +68,7 @@ def test_prev_reference_resolved_inside_a_chain():
 
 def test_prev_reference_rejected_outside_a_chain():
     with pytest.raises(DslParseError):
-        parse_dsl('update(id=$prev.id)')
+        parse_dsl("update(id=$prev.id)")
 
 
 def test_prev_literal_escape_decodes_back_to_the_original_text():

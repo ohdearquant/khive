@@ -145,7 +145,7 @@ def _string_as_prev_ref(s: str, *, in_chain: bool) -> Any:
     stripped. Anything else is an ordinary string."""
     if s.startswith("\\"):
         rest = s[1:]
-        if rest == "$prev" or rest.startswith("$prev.") or rest.startswith("$prev["):
+        if rest == "$prev" or rest.startswith(("$prev.", "$prev[")):
             return rest
     if s == "$prev":
         if not in_chain:
@@ -179,7 +179,7 @@ def _parse_bare_prev_ref(text: str, in_chain: bool) -> PrevRef:
     `$` sigil directly, as opposed to a quoted string that merely looks like
     one (`_string_as_prev_ref`'s job). `text` is the whole isolated value
     token, so a full parse must consume it exactly."""
-    if not (text == "$prev" or text.startswith("$prev.") or text.startswith("$prev[")):
+    if not (text == "$prev" or text.startswith(("$prev.", "$prev["))):
         raise DslParseError(f"expected '$prev', found {text!r}")
     pos = len("$prev")
     n = len(text)

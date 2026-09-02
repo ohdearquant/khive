@@ -68,8 +68,9 @@ def test_mcp_session_allow_insecure_bypasses_url_guard(monkeypatch):
     async def _inner():
         # The URL guard is bypassed; the fake client has no real transport
         # underneath, so `streamable_http_client`/`session.initialize()` fail
-        # downstream — that failure proves the guard did not block it.
-        with pytest.raises(Exception):
+        # downstream and surface as the translated client error — that
+        # failure proves the guard did not block it.
+        with pytest.raises(KhiveError):
             async with mcp_session("http://example.test", "key", allow_insecure=True):
                 pass
 

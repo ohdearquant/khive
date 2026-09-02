@@ -36,7 +36,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from _dsl_fake import DslParseError, parse_dsl_with_mode
 
 API_KEY = "test-key-123"

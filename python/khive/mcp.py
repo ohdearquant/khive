@@ -221,6 +221,4 @@ def mcp_list_tools(base_url: str, api_key: str, *, allow_insecure: bool = False)
 
 def mcp_request(base_url: str, api_key: str, ops: str, *, allow_insecure: bool = False) -> Any:
     """Sync convenience over `acall_request` (`asyncio.run` under the hood)."""
-    return _run_sync(
-        lambda: acall_request(base_url, api_key, ops, allow_insecure=allow_insecure)
-    )
+    return _run_sync(lambda: acall_request(base_url, api_key, ops, allow_insecure=allow_insecure))
