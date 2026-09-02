@@ -69,7 +69,15 @@ mod tests {
 
     #[test]
     fn lattice_provenance_version_matches_all_exact_workspace_pins() {
-        let manifest: toml::Value = include_str!("../../Cargo.toml")
+        let workspace_manifest_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.toml");
+        let Ok(manifest_source) = std::fs::read_to_string(workspace_manifest_path) else {
+            println!(
+                "workspace Cargo.toml not found at {workspace_manifest_path} \
+                 (published crate archive does not carry it); skipping the pin check"
+            );
+            return;
+        };
+        let manifest: toml::Value = manifest_source
             .parse()
             .expect("workspace Cargo.toml must parse");
         let dependencies = manifest["workspace"]["dependencies"]
