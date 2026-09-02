@@ -63,8 +63,11 @@ not merely a content hash.
 
 When a peer identity differs, the watcher takes the model single-flight lock and
 `<segment-dir>/.bridge-checkpoint.lock`, then rechecks, validates, and mmaps the complete segment and
-UUID sidecar. It preserves the incumbent's in-process generation, durable epoch baseline, namespace
-coverage, and non-regressing write-log watermark before swapping the bridge. The swap drops the
+UUID sidecar. It preserves the incumbent's in-process generation, durable epoch baseline, and
+non-regressing write-log watermark before swapping the bridge, but not its namespace coverage: a
+peer's checkpoint can cover namespaces this process never observed, so the rotated bridge starts
+from the conservative empty set and recall keeps over-fetching until a full scan repopulates it.
+The swap drops the
 predecessor `VamanaIndex`, releasing its now-unlinked `vectors.bin` and `codes.bin` mappings without
 waiting for another recall or for process exit. A changed publication that cannot validate is
 evicted rather than retained: the next request enters the ordinary Cold/rebuild path, while the

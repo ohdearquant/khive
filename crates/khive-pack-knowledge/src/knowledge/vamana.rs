@@ -2838,7 +2838,14 @@ async fn refresh_rotated_segment(
                 }
             };
             if removed {
-                warm_states_guard(&ann.warm_states).remove(key);
+                // Only a Ready state describes the evicted bridge. A Warming
+                // state belongs to an in-flight warm whose permit still owns
+                // the single-flight slot; removing it would let a second warm
+                // start alongside the first.
+                let mut states = warm_states_guard(&ann.warm_states);
+                if matches!(states.get(key), Some(AnnWarmState::Ready { .. })) {
+                    states.remove(key);
+                }
             }
             tracing::warn!(
                 error = %error,
@@ -4342,6 +4349,83 @@ mod tests {
             "the rotated UUID sidecar must be the served mapping"
         );
         assert_eq!(bridge.generation, 7, "local generation fence is preserved");
+    }
+
+    async fn install_generation_then_publish_invalid_rotation(
+        temp: &TempDir,
+    ) -> (KhiveRuntime, SharedAnn, AnnKey) {
+        let rt = file_rt_with_embedder(temp.path().join("rotation.db"));
+        let ann = new_shared();
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let segment_dir =
+            ann_segment_dir(&rt, "local", WARM_TEST_MODEL).expect("file-backed segment directory");
+
+        let (first, _) = build_test_bridge(4, 2);
+        first
+            .save_atomic(&segment_dir)
+            .expect("persist first generation");
+        let loaded = AnnBridge::load(&segment_dir)
+            .expect("load first mmap generation")
+            .with_generation(7);
+        assert!(install_replacing(&ann, &key, loaded).await);
+
+        // A peer publishes a changed commit whose UUID sidecar is missing, so
+        // the rotated generation fails validation and the incumbent is evicted.
+        let (second, _) = build_test_bridge(4, 2);
+        second.save_atomic(&segment_dir).expect("rotate checkpoint");
+        std::fs::remove_file(segment_dir.join("external_ids.bin")).expect("remove sidecar");
+
+        (rt, ann, key)
+    }
+
+    #[tokio::test]
+    async fn invalid_rotation_keeps_in_flight_warming_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let (rt, ann, key) = install_generation_then_publish_invalid_rotation(&temp).await;
+
+        // A concurrent request owns the single-flight slot for this key.
+        warm_states_guard(&ann.warm_states).insert(
+            key.clone(),
+            AnnWarmState::Warming {
+                attempt_id: 41,
+                generation: 7,
+                started_at: std::time::Instant::now(),
+            },
+        );
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        assert!(
+            ann.indexes.read().await.get(&key).is_none(),
+            "an invalid rotated generation must evict the incumbent"
+        );
+        assert!(
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Warming { attempt_id: 41, .. })
+            ),
+            "eviction must not clear a warm state owned by an in-flight permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_rotation_clears_ready_state_of_evicted_bridge() {
+        let temp = TempDir::new().expect("tempdir");
+        let (rt, ann, key) = install_generation_then_publish_invalid_rotation(&temp).await;
+
+        warm_states_guard(&ann.warm_states)
+            .insert(key.clone(), AnnWarmState::Ready { generation: 7 });
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        assert!(
+            ann.indexes.read().await.get(&key).is_none(),
+            "an invalid rotated generation must evict the incumbent"
+        );
+        assert!(
+            warm_states_guard(&ann.warm_states).get(&key).is_none(),
+            "the Ready state described the evicted bridge and must go with it"
+        );
     }
 
     #[test]
