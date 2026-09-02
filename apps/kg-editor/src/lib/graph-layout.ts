@@ -217,6 +217,38 @@ export function settleGraphLayout<T extends GraphLayoutNode>(
     if (!movedAny) break;
   }
 
+  // The pass budget above is sized to the node count, so a dense graph at
+  // the schema-maximum can run out of separation passes with a handful of
+  // points still exactly coincident: a diagonal push at a stage corner can
+  // be entirely absorbed by the boundary clamp on both axes, since any
+  // offset that moves a point further into the corner clamps straight back
+  // to it, and no amount of extra passes resolves that on its own. Walk the
+  // settled points once and nudge any coordinate that repeats an earlier
+  // one along the same golden-angle spiral used for the initial placement
+  // (so nudges from different points don't line up) until it lands on a
+  // free spot.
+  const occupiedCoordinates = new Set<string>();
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    let key = `${rounded(point.x)},${rounded(point.y)}`;
+    let attempt = 0;
+    while (occupiedCoordinates.has(key) && attempt < 64) {
+      attempt += 1;
+      const angle = index * goldenAngle * 7 + attempt * goldenAngle;
+      const radius = 0.25 * attempt;
+      point.x = Math.min(
+        100 - HORIZONTAL_PADDING,
+        Math.max(HORIZONTAL_PADDING, point.x + Math.cos(angle) * radius),
+      );
+      point.y = Math.min(
+        100 - VERTICAL_PADDING,
+        Math.max(VERTICAL_PADDING, point.y + Math.sin(angle) * radius),
+      );
+      key = `${rounded(point.x)},${rounded(point.y)}`;
+    }
+    occupiedCoordinates.add(key);
+  }
+
   return points.map(({ node, x, y }) => ({
     ...node,
     x: rounded(x),

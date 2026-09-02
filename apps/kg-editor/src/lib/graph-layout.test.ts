@@ -90,4 +90,18 @@ describe("settleGraphLayout", () => {
 
     expect(distanceEvaluations).toBeLessThanOrEqual(400_000);
   }, 15_000);
+
+  it("never settles two nodes onto the same point at the schema maximum", () => {
+    const settled = settleGraphLayout(
+      Array.from({ length: 200 }, (_, index) => ({ id: `node-${index}` })),
+      [],
+    );
+
+    const occupied = new Set<string>();
+    for (const { x, y } of settled) {
+      const key = `${x},${y}`;
+      expect(occupied.has(key)).toBe(false);
+      occupied.add(key);
+    }
+  });
 });
