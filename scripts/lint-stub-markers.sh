@@ -775,7 +775,20 @@ LSTREEFAILFIXTURE
     # a cargo phase reopens that mutable-checkout bypass and fails here.
     ci_sh="$SCRIPT_DIR/ci.sh"
     if [ -f "$ci_sh" ]; then
-        first_phase="$(awk '/^run_all\(\)/{f=1} f&&/for phase in/{g=1;next} g&&/do$/{exit} g{gsub(/[^a-z-]/,"");if($0!="")print}' "$ci_sh" | head -1)"
+        # run_all keeps its order either inline (`for phase in \` ... `do`) or in a
+        # quoted run_all_phases list; both shapes are read here.
+        first_phase="$(awk '
+            /^run_all\(\)/ { f = 1 }
+            f && !g && (/for phase in/ || /run_all_phases="/) {
+                g = 1
+                sub(/^.*(for phase in|run_all_phases=")/, "")
+                gsub(/[^a-z-]/, "")
+                if ($0 != "") print
+                next
+            }
+            g && (/do$/ || /"$/) { exit }
+            g { gsub(/[^a-z-]/, ""); if ($0 != "") print }
+        ' "$ci_sh" | head -1)"
         if [ "$first_phase" != "no-stubs-scan" ]; then
             echo "self-test FAILED: ci.sh run_all must run 'no-stubs-scan' first (before any cargo phase); found '$first_phase'. Moving the placeholder scan after a cargo phase reopens the mutable-checkout bypass (#560)."
             status=1
