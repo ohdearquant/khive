@@ -146,7 +146,9 @@ With a token present, the UI sends it as the bearer credential on snapshot reque
 only a 404 from the protected route falls back to the curated static bundle. Without a
 token the UI does not request the protected route for an entry that has a curated asset;
 it loads that asset directly, so the token never ships in the client build. Entries that
-exist only in the configured catalog still probe the route so an honest miss is reported.
+exist only in the configured catalog are known to the browser only after a successful
+catalog discovery, which itself carries the token, or when supplied explicitly; those still
+probe the route so an honest miss is reported.
 An absent or mismatched token is indistinguishable from an unconfigured catalog: both
 routes fail closed to the same sanitized 404. Without `KHIVE_SHOWCASE_ACCESS_TOKEN` set,
 no request can be authorized, regardless of what credentials it presents.

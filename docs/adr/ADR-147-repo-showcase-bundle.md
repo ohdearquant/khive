@@ -439,8 +439,11 @@ in the session:
   that asset directly and makes no snapshot request; the reported source is the curated
   static fallback, exactly as it would have been after the `404`;
 - an entry that exists only in the configured catalog, with no curated asset, still probes
-  the route regardless of the token, so an unauthenticated session receives an honest
-  repository miss rather than a silent empty state.
+  the route regardless of the token. The browser knows such an entry only after a
+  successful catalog discovery, which itself carries the token, or when the entry is
+  supplied explicitly; so a session without a token reaches this arm only for an
+  explicitly supplied entry, and then receives an honest repository miss rather than a
+  silent empty state.
 
 The fallback boundary is unchanged: server errors, malformed or oversized reports, missing
 or mismatched provenance headers, repository-identity mismatches, and an elapsed request
