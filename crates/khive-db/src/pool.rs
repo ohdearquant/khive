@@ -2219,26 +2219,63 @@ fn current_journal_mode(conn: &Connection) -> Result<String, SqliteError> {
 }
 
 fn reset_reader_connection(conn: &Connection) -> bool {
-    if conn.is_autocommit() {
-        return true;
+    if !conn.is_autocommit() {
+        match conn.execute_batch("ROLLBACK") {
+            Ok(()) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _)) => {
+                if matches!(
+                    err.code,
+                    rusqlite::ErrorCode::CannotOpen
+                        | rusqlite::ErrorCode::DatabaseCorrupt
+                        | rusqlite::ErrorCode::NotADatabase
+                        | rusqlite::ErrorCode::DiskFull
+                ) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+        if !conn.is_autocommit() {
+            return false;
+        }
     }
 
-    match conn.execute_batch("ROLLBACK") {
-        Ok(()) => conn.is_autocommit(),
-        Err(rusqlite::Error::SqliteFailure(err, _)) => {
-            if matches!(
-                err.code,
-                rusqlite::ErrorCode::CannotOpen
-                    | rusqlite::ErrorCode::DatabaseCorrupt
-                    | rusqlite::ErrorCode::NotADatabase
-                    | rusqlite::ErrorCode::DiskFull
-            ) {
-                return false;
-            }
-            conn.is_autocommit()
-        }
-        Err(_) => false,
+    reader_connection_state_is_pristine(conn)
+}
+
+/// A pooled reader must never carry connection-local state across logical
+/// checkouts. Raw-SQL reads run arbitrary caller SQL against the shared
+/// pooled connection (`sql_bridge`'s `run_pool_reader_query`), so a
+/// `CREATE TEMP TABLE` or `ATTACH DATABASE` from one checkout would
+/// otherwise stay visible to whichever later caller draws the same
+/// connection back out of the pool. Dropping those objects individually is
+/// order-sensitive (triggers and indexes depend on their tables), so their
+/// presence is instead treated as reuse-disqualifying: the caller closes
+/// the connection and opens a fresh replacement. Ordinary reads create
+/// neither a temp object nor an attachment, so this never touches the hot
+/// path.
+fn reader_connection_state_is_pristine(conn: &Connection) -> bool {
+    let has_temp_objects: bool = match conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master)",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if has_temp_objects {
+        return false;
     }
+
+    let attached_databases: i64 = match conn.query_row(
+        "SELECT COUNT(*) FROM pragma_database_list WHERE name NOT IN ('main', 'temp')",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    attached_databases == 0
 }
 
 fn reader_connection_is_healthy(conn: &Connection) -> bool {
@@ -2794,6 +2831,88 @@ mod tests {
         assert_eq!(
             count, 1,
             "rollback-journal read-only connections must retain live change detection"
+        );
+    }
+
+    /// Raw-SQL reads run arbitrary caller SQL against a pooled reader
+    /// connection. A `CREATE TEMP TABLE` or `ATTACH DATABASE` issued by one
+    /// checkout must never remain visible to a later, unrelated checkout
+    /// that happens to draw the same pooled connection back out — that
+    /// would leak state across logical readers, and across whatever
+    /// separate checkouts (requests, checkouts of the same store) reuse the
+    /// pool. `max_readers: 1` forces the second checkout to reuse the exact
+    /// connection the first one returned.
+    #[test]
+    fn pooled_reader_return_clears_temp_schema_and_attached_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pooled-reader-reset.db");
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.execute_batch("CREATE TABLE main_row(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+
+        let secret_path = dir.path().join("secret.db");
+        {
+            let secret = Connection::open(&secret_path).unwrap();
+            secret
+                .execute_batch(
+                    "CREATE TABLE secret_row(id INTEGER PRIMARY KEY, body TEXT NOT NULL);\
+                     INSERT INTO secret_row(body) VALUES ('leaked-across-checkouts');",
+                )
+                .unwrap();
+        }
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        {
+            let reader = pool.reader().unwrap();
+            reader
+                .execute_batch("CREATE TEMP TABLE leaked_temp(id INTEGER PRIMARY KEY);")
+                .unwrap();
+            reader
+                .execute_batch(&format!(
+                    "ATTACH DATABASE '{}' AS secret;",
+                    secret_path.display()
+                ))
+                .unwrap();
+            let leaked_count: i64 = reader
+                .query_row("SELECT COUNT(*) FROM secret.secret_row", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(leaked_count, 1);
+        }
+
+        let reader = pool.reader().unwrap();
+        let temp_table_survived: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'leaked_temp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            temp_table_survived, 0,
+            "a TEMP table from an earlier checkout must not survive pooled reader reuse"
+        );
+
+        let attachment_survived: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'secret'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attachment_survived, 0,
+            "an ATTACHed database from an earlier checkout must not survive pooled reader reuse"
         );
     }
 
