@@ -156,12 +156,11 @@ impl GitPack {
         let (repo_path, expected_github_repo) = match &source {
             DigestSource::Local(p) => (p.clone(), None),
             DigestSource::Remote { canonical, gh_slug } => {
-                let cloned = cache::ensure_clone(canonical).map_err(|e| {
-                    RuntimeError::InvalidInput(format!(
-                        "remote clone/fetch of {:?} failed: {e}",
-                        redact_repo_url(canonical)
-                    ))
-                })?;
+                let cloned =
+                    cache::ensure_clone(canonical).map_err(|e| RuntimeError::RemoteFetchError {
+                        remote: redact_repo_url(canonical),
+                        message: e.to_string(),
+                    })?;
                 (
                     cloned,
                     gh_slug
@@ -2108,6 +2107,45 @@ mod tests {
                 "arbitrary malformed value must not become identity evidence: {malformed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn remote_setup_failure_is_typed_without_reclassifying_bad_input() {
+        let _guard = crate::cache::ENV_MUTEX.lock().await;
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+        let (_rt, _token, registry) = fixture().await;
+
+        let remote_result = registry
+            .dispatch(
+                "git.digest",
+                json!({
+                    "source": "https://user:tok3n@127.0.0.1:1/org/repo?token=SECRET"
+                }),
+            )
+            .await;
+        let malformed_result = registry
+            .dispatch("git.digest", json!({"source": "relative/repo"}))
+            .await;
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+
+        let remote_error = remote_result.expect_err("closed-port clone must fail");
+        let rendered = remote_error.to_string();
+        match remote_error {
+            RuntimeError::RemoteFetchError { remote, message } => {
+                assert_eq!(remote, "https://127.0.0.1:1/org/repo");
+                assert!(message.contains("git clone"), "{message}");
+            }
+            other => panic!("remote clone failure must stay typed, got {other:?}"),
+        }
+        assert!(
+            !rendered.contains("tok3n") && !rendered.contains("SECRET"),
+            "remote fetch error must redact credentials and query tokens: {rendered}"
+        );
+        assert!(
+            matches!(malformed_result, Err(RuntimeError::InvalidInput(ref message)) if message.contains("absolute")),
+            "malformed caller source must stay InvalidInput, got {malformed_result:?}"
+        );
     }
 
     #[test]
