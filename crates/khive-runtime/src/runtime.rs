@@ -705,11 +705,24 @@ impl KhiveRuntime {
     /// legacy `events` table (schedule provenance, kg projection guards,
     /// GraphQuery's substrate union) correct by construction. Reads merge
     /// both stores. Unconfigured runtimes (tests, in-memory) keep the legacy
-    /// main-store behavior.
+    /// main-store behavior. Every returned store is decorated at this typed
+    /// accessor boundary so append callers cannot override the namespace or
+    /// actor resolved into the sealed authorization token.
     pub fn events(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn EventStore>> {
-        let legacy = self
-            .backend
-            .events_for_namespace(token.namespace().as_str())?;
+        Ok(crate::event_store_guard::AttributedEventStore::wrap(
+            self.raw_events_for_namespace(token.namespace().as_str())?,
+            token,
+        ))
+    }
+
+    /// Build the undecorated event store used only by the registry's trusted
+    /// audit composer, which stamps from each resolved `GateRequest` before
+    /// enqueueing. Pack/runtime call sites must use [`Self::events`] instead.
+    pub(crate) fn raw_events_for_namespace(
+        &self,
+        namespace: &str,
+    ) -> RuntimeResult<Arc<dyn EventStore>> {
+        let legacy = self.backend.events_for_namespace(namespace)?;
         match &self.config.events_split {
             None => Ok(legacy),
             Some(split) => {
@@ -729,7 +742,7 @@ impl KhiveRuntime {
                         return Ok(legacy);
                     }
                     let lane = crate::events_split::direct_backend_read_only_for(&split.db_path)?
-                        .events_for_namespace(token.namespace().as_str())?;
+                        .events_for_namespace(namespace)?;
                     return Ok(Arc::new(crate::events_split::SplitEventStore::new(
                         legacy, lane,
                     )));
@@ -739,8 +752,7 @@ impl KhiveRuntime {
                     Some(socket) => {
                         let client = crate::events_split::client_for(socket)?;
                         Arc::new(crate::events_split::ForwardingEventStore::new(
-                            token.namespace().as_str(),
-                            client,
+                            namespace, client,
                         ))
                     }
                     #[cfg(not(unix))]
@@ -752,7 +764,7 @@ impl KhiveRuntime {
                         ));
                     }
                     None => crate::events_split::direct_backend_for(&split.db_path)?
-                        .events_for_namespace(token.namespace().as_str())?,
+                        .events_for_namespace(namespace)?,
                 };
                 Ok(Arc::new(crate::events_split::SplitEventStore::new(
                     legacy, lane,
@@ -1115,15 +1127,15 @@ impl KhiveRuntime {
                 }
                 // The primary check authorizes writes to `primary` only. Each
                 // extra namespace grants read visibility, so each one takes
-                // its own gate check before it may enter the minted set — a
-                // token must never carry visibility the gate was not asked
-                // about. Any deny or gate error refuses the whole mint,
-                // naming the offending namespace (fail-closed).
+                // its own Read-classified gate check before it may enter the
+                // minted set — a token must never carry visibility the gate
+                // was not asked about. Any deny or gate error refuses the
+                // whole mint, naming the offending namespace (fail-closed).
                 for extra in &extra_visible {
                     let extra_req = GateRequest::new(
                         actor.clone(),
                         extra.clone(),
-                        "authorize",
+                        "authorize.visible",
                         serde_json::Value::Null,
                     );
                     match self.config.gate.check(&extra_req) {
@@ -2332,8 +2344,64 @@ mod tests {
         );
     }
 
+    /// Grants Write on the primary namespace and Read, but not Write, on the
+    /// extra namespace. The pseudo-verb split is what lets a right-aware gate
+    /// express ADR-129's asymmetric authority contract.
+    #[derive(Debug)]
+    struct ReadOnlyExtraGate {
+        primary: &'static str,
+        extra: &'static str,
+    }
+
+    impl khive_gate::Gate for ReadOnlyExtraGate {
+        fn check(
+            &self,
+            req: &khive_gate::GateRequest,
+        ) -> Result<khive_gate::GateDecision, khive_gate::GateError> {
+            let allowed = match req.verb.as_str() {
+                "authorize" => req.namespace.as_str() == self.primary,
+                "authorize.visible" => req.namespace.as_str() == self.extra,
+                _ => false,
+            };
+            if allowed {
+                Ok(khive_gate::GateDecision::allow())
+            } else {
+                Ok(khive_gate::GateDecision::Deny {
+                    reason: format!(
+                        "{} denied for namespace {:?}",
+                        req.verb,
+                        req.namespace.as_str()
+                    ),
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn authorize_with_visibility_allows_read_only_extra_namespace() {
+        let primary = Namespace::parse("lambda:caller").expect("primary");
+        let extra = Namespace::parse("lambda:read-only").expect("extra");
+        let config = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            gate: Arc::new(ReadOnlyExtraGate {
+                primary: "lambda:caller",
+                extra: "lambda:read-only",
+            }),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let rt = KhiveRuntime::new(config).expect("memory runtime");
+
+        let token = rt
+            .authorize_with_visibility(primary, vec![extra.clone()])
+            .expect("Write on primary and Read on extra must mint");
+        assert!(token.visible_namespaces().contains(&extra));
+    }
+
     /// Denies exactly one namespace; every other request is allowed. Lets the
-    /// tests below prove a refusal comes from the per-extra visibility check
+    /// test below prove a refusal comes from the per-extra visibility check
     /// rather than from the primary authorization.
     #[derive(Debug)]
     struct DenyNamespaceGate {
@@ -2356,7 +2424,7 @@ mod tests {
     }
 
     #[test]
-    fn authorize_with_visibility_gate_checks_every_extra_namespace() {
+    fn authorize_with_visibility_denies_missing_extra_read() {
         let config = RuntimeConfig {
             db_path: None,
             packs: vec!["kg".to_string()],
@@ -2710,6 +2778,88 @@ mod tests {
         assert!(rt.graph(&tok).is_ok());
         assert!(rt.notes(&tok).is_ok());
         assert!(rt.events(&tok).is_ok());
+    }
+
+    fn attributed_event_runtime() -> (KhiveRuntime, NamespaceToken) {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            actor_id: Some("lambda:enrolled".to_string()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("memory runtime");
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("configured actor is allowed by the default gate");
+        (runtime, token)
+    }
+
+    fn forged_event(verb: &str) -> Event {
+        Event::new(
+            "caller-selected-namespace",
+            verb,
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "caller-selected-actor",
+        )
+    }
+
+    fn assert_token_attribution(event: &Event) {
+        assert_eq!(event.namespace, "local");
+        assert_eq!(event.actor, "actor:lambda:enrolled");
+    }
+
+    #[tokio::test]
+    async fn token_scoped_event_store_stamps_resolved_attribution_on_single_append() {
+        let (runtime, token) = attributed_event_runtime();
+        let store = runtime.events(&token).expect("event store");
+        let event = forged_event("single");
+        let id = event.id;
+
+        store.append_event(event).await.expect("append");
+
+        let stored = store
+            .get_event(id)
+            .await
+            .expect("read")
+            .expect("the token-stamped event remains visible to the token");
+        assert_token_attribution(&stored);
+        assert_eq!(stored.verb, "single", "non-attribution fields survive");
+    }
+
+    #[tokio::test]
+    async fn token_scoped_event_store_stamps_resolved_attribution_on_batch_paths() {
+        let (runtime, token) = attributed_event_runtime();
+        let store = runtime.events(&token).expect("event store");
+        let ordinary = forged_event("batch");
+        let ordinary_id = ordinary.id;
+
+        store
+            .append_events(vec![ordinary])
+            .await
+            .expect("ordinary batch append");
+        let stored = store
+            .get_event(ordinary_id)
+            .await
+            .expect("read")
+            .expect("ordinary batch event remains visible to the token");
+        assert_token_attribution(&stored);
+
+        let idempotent = forged_event("idempotent_batch");
+        let idempotent_id = idempotent.id;
+        let outcome = store
+            .append_events_idempotent(vec![idempotent])
+            .await
+            .expect("idempotent batch append");
+        assert_eq!(
+            outcome.rows,
+            vec![khive_storage::event::EventAppendDisposition::Inserted]
+        );
+        let stored = store
+            .get_event(idempotent_id)
+            .await
+            .expect("read")
+            .expect("idempotent batch event remains visible to the token");
+        assert_token_attribution(&stored);
     }
 
     #[test]

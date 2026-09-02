@@ -2878,10 +2878,8 @@ async fn build_registry_for_multi_backend_inner(
 
     if default_runtime.is_read_only() {
         builder.with_read_only_audit_store();
-    } else if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
-        if let Ok(event_store) = default_runtime.events(&tok) {
-            builder.with_event_store(event_store);
-        }
+    } else if let Err(error) = builder.with_runtime_event_store(&default_runtime) {
+        tracing::warn!(%error, "registry audit event store is unavailable");
     }
 
     khive_runtime::PackRegistry::register_packs_with_runtimes(
