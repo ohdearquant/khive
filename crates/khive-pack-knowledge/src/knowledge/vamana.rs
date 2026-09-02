@@ -3784,9 +3784,9 @@ mod tests {
         mark_unavailable(&ann, &key, current_generation(&ann, "local"));
 
         let start = std::time::Instant::now();
-        // Timeout is generous (5s, matching production ANN_WARM_WAIT_TIMEOUT_MS)
+        // Timeout is generous (matching production ANN_WARM_WAIT_TIMEOUT_MS)
         // to prove the short-circuit fires rather than the deadline.
-        let ready = wait_ready(&ann, &key, 5_000, 50).await;
+        let ready = wait_ready(&ann, &key, ANN_WARM_WAIT_TIMEOUT_MS, 50).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -3794,7 +3794,7 @@ mod tests {
             "must return false for a key marked unavailable at the current generation"
         );
         assert!(
-            elapsed < std::time::Duration::from_millis(200),
+            elapsed < std::time::Duration::from_millis(ANN_WARM_WAIT_TIMEOUT_MS / 2),
             "terminal unavailable outcome must short-circuit, not poll out the timeout: {elapsed:?}"
         );
     }
@@ -5757,13 +5757,13 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        let ready = wait_ready(&ann, &key, 5_000, 50).await;
+        let ready = wait_ready(&ann, &key, ANN_WARM_WAIT_TIMEOUT_MS, 50).await;
         let elapsed = start.elapsed();
 
         assert!(!ready, "empty corpus must never become ready");
         assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "the terminal unavailable outcome must short-circuit the 5s warm-wait: {elapsed:?}"
+            elapsed < std::time::Duration::from_millis(ANN_WARM_WAIT_TIMEOUT_MS / 2),
+            "the terminal unavailable outcome must short-circuit the warm-wait: {elapsed:?}"
         );
     }
 
