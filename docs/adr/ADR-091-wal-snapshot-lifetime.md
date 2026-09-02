@@ -1513,20 +1513,36 @@ housekeeping would reap. `db_diagnostics` reconciles that result with the indepe
 holder census: `complete` requires a complete census, an untruncated sidecar walk, no unknown
 sidecar classifications, and sidecar evidence for every confirmed holder. Each missing condition
 is an explicit degradation reason. The diagnostic request therefore measures cleanup candidates
-but never becomes the actor that consumes its own forensic evidence.
+but never becomes the actor that consumes its own forensic evidence. Amendment 6's disable rule
+applies here too: an operator who has explicitly disabled the sidecar gets a degraded result
+naming that as the reason, never a silent `inspect_live` call against a facility they turned off.
+Every operational path this pass touches — the sidecar directory and the WAL file it reasons
+about — is derived from the pool's canonical path, not its raw configured one, matching the
+checkpoint sidecar writers; a symlinked or otherwise aliased configured path must not send this
+reconciliation looking beside the alias while the evidence sits beside the canonical file.
 
 **Producer-temp residue.** The atomic writers' exact `.<pid>.json.tmp` and
 `.<pid>.beacon.tmp` names are now recognized in a separate bounded listing lane instead of being
 indistinguishable from arbitrary hidden files. Ordinary housekeeping and checkpoint attribution
-may remove a candidate only after it is older than the staleness window and its producer is
-positively dead or its parsed PID/start identity proves PID reuse. Fresh temps, live matching
-producers, malformed identity, uninspectable processes, non-owned entries, symlinks, and all
-unrecognized dot-names are retained. The candidate is opened with the existing non-following,
-regular-file, ownership, and size checks; immediately before unlink, its device/inode identity is
-rechecked against the classified object so a producer replacement is not intentionally removed on
-a stale verdict. The ordinary and producer-temp result sets each cap at 512 entries and the raw
-directory scan retains its existing bounded multiplier. Thus a crash population drains over
-bounded ticks without letting one cleanup pass scale with historical residue.
+may remove a candidate only after it is older than the staleness window, its body parses as its
+recorded kind, its recorded PID matches its filename, and its producer is positively dead or its
+parsed start-time identity proves PID reuse. A malformed body or a filename/body PID mismatch is
+retained and reported as unknown evidence regardless of whether the named PID is alive or dead —
+identity is validated before liveness is ever consulted, so a crash-truncated write or an
+already-recycled PID slot cannot be reaped on liveness alone. Fresh temps, live matching
+producers, uninspectable processes, non-owned entries, symlinks, and all unrecognized dot-names
+are likewise retained. The candidate is opened with the existing non-following, regular-file,
+ownership, and size checks; immediately before unlink, its device/inode identity is rechecked
+against the classified object, closing the wide races (stale content lingering, a symlink swapped
+in). POSIX has no delete-if-still-this-inode primitive for a plain unlink, so the recheck and the
+unlink remain two separate syscalls: a producer that replaces the same name in the instant between
+them can still have its new write removed. A producer that loses this narrow race observes its own
+rename fail because the temp it just wrote is already gone — every writer here already treats a
+missing temp as a transient failure to retry on the next tick, never as data loss, so this is the
+outcome such a producer must tolerate, not a race this recheck actually closes. The ordinary and
+producer-temp result sets each cap at 512 entries and the raw directory scan retains its existing
+bounded multiplier. Thus a crash population drains over bounded ticks without letting one cleanup
+pass scale with historical residue.
 
 **Database byte composition.** The same operator report now runs SQLite's read-only aggregate
 `dbstat` view on its guarded standalone connection. It returns per-object page/byte totals and

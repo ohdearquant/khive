@@ -372,6 +372,66 @@ mod unix_impl {
         unsafe { libc::geteuid() }
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Test-only seam for `remove_if_same`'s documented residual race:
+        /// POSIX gives no way to force a second process to replace a file at
+        /// the exact instant between the device/inode recheck and the
+        /// unlink, so a test runs arbitrary code from here instead,
+        /// synchronously, on the thread already inside `remove_if_same`.
+        static REMOVE_IF_SAME_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_remove_if_same_race_hook(hook: impl FnOnce() + 'static) {
+        REMOVE_IF_SAME_RACE_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    #[cfg(test)]
+    fn take_remove_if_same_race_hook() -> Option<Box<dyn FnOnce()>> {
+        REMOVE_IF_SAME_RACE_HOOK.with(|cell| cell.borrow_mut().take())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: `__error` returns this thread's errno cell; obtaining the
+        // pointer has no preconditions beyond running on a thread.
+        unsafe { libc::__error() }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: see the macOS arm above; `__errno_location` is the
+        // Linux/glibc equivalent thread-local errno accessor.
+        unsafe { libc::__errno_location() }
+    }
+
+    /// Zero `errno` on the current thread. `readdir` never clears `errno`
+    /// itself on success, so this must run immediately before each call for
+    /// the NULL-return ambiguity below to be resolvable afterward.
+    fn clear_errno() {
+        // SAFETY: `errno_location` returns a valid, live thread-local
+        // `c_int` cell for the duration of this call.
+        unsafe { *errno_location() = 0 };
+    }
+
+    fn current_errno() -> libc::c_int {
+        // SAFETY: see `clear_errno`.
+        unsafe { *errno_location() }
+    }
+
+    /// Whether a NULL `readdir` return denotes a genuine read error rather
+    /// than end-of-directory: POSIX overloads NULL for both and the only
+    /// distinguishing signal is `errno`, which stays `0` at end-of-directory
+    /// because the loop clears it immediately before every call. Split out
+    /// so a test can drive both branches directly — forcing a real `readdir`
+    /// to fail mid-walk from a portable unit test isn't practical, so this
+    /// pure predicate is the seam.
+    pub(super) fn readdir_null_is_error(errno: libc::c_int) -> bool {
+        errno != 0
+    }
+
     fn path_cstring(path: &Path) -> io::Result<CString> {
         CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io_other(format!("path {path:?} contains an interior NUL byte")))
@@ -984,8 +1044,22 @@ mod unix_impl {
 
         /// Remove `name` only while it still denotes the exact regular file
         /// opened and classified by `read_checked_entry`. A producer that
-        /// races the scan by replacing its temp therefore wins: the new
-        /// inode is retained instead of being unlinked under a stale verdict.
+        /// replaces its temp before this recheck runs therefore wins: the
+        /// new inode is retained instead of being unlinked under a stale
+        /// verdict.
+        ///
+        /// This closes the wide races (stale content lingering, a symlink
+        /// swapped in) but not every one: POSIX has no delete-if-still-
+        /// this-inode primitive for a plain file, so the recheck above and
+        /// the `unlinkat` below are two separate syscalls, and a replacement
+        /// landing in the instant between them is still a plain name lookup
+        /// that `unlinkat` will happily remove. A producer that loses this
+        /// narrow race observes its own `rename` fail because the temp it
+        /// just wrote is already gone; every writer here already treats a
+        /// missing temp as a transient failure to retry on the next tick
+        /// (see `write_heartbeat`'s and `write_beacon`'s callers), never as
+        /// data loss, so this is the outcome such a producer must tolerate,
+        /// not a race this function actually closes.
         pub(super) fn remove_if_same(
             &self,
             name: &str,
@@ -1007,6 +1081,10 @@ mod unix_impl {
             if current_device != expected.device || current_inode != expected.inode {
                 return Ok(false);
             }
+            #[cfg(test)]
+            if let Some(hook) = take_remove_if_same_race_hook() {
+                hook();
+            }
             self.unlink_tolerant(name)?;
             Ok(true)
         }
@@ -1024,7 +1102,11 @@ mod unix_impl {
         /// `.<pid>.(json|beacon).tmp` forms are retained in their own bounded
         /// lane so housekeeping can reap proven crash residue without letting
         /// junk consume the ordinary record budget. Every entry still counts
-        /// toward the raw `RAW_SCAN_FACTOR * max` scan bound.
+        /// toward the raw `RAW_SCAN_FACTOR * max` scan bound. A `readdir`
+        /// read error mid-walk is distinguished from ordinary end-of-
+        /// directory via `errno` (cleared before every call) and returned as
+        /// `Err`, never folded into a `truncated: false` listing that would
+        /// let a caller believe it saw every entry when it did not.
         pub(super) fn list_names(
             &self,
             max: usize,
@@ -1050,9 +1132,21 @@ mod unix_impl {
             let mut producer_temps = Vec::new();
             let mut truncated = false;
             loop {
+                // `readdir` leaves `errno` untouched on EOF; clearing it
+                // here is what makes that observable as distinct from an
+                // error below.
+                clear_errno();
                 // SAFETY: `dirp` is a valid, open `DIR*` for this whole loop.
                 let entry = unsafe { libc::readdir(dirp) };
                 if entry.is_null() {
+                    if readdir_null_is_error(current_errno()) {
+                        let err = io::Error::last_os_error();
+                        // SAFETY: `dirp` is still open and owned by this
+                        // call; this is the one closedir on the error path,
+                        // matching the one closedir on the `Ok` path below.
+                        unsafe { libc::closedir(dirp) };
+                        return Err(err);
+                    }
                     break;
                 }
                 if raw_scanned == raw_scan_limit {
@@ -3091,6 +3185,25 @@ impl EnumerationPurpose {
     }
 }
 
+/// The outcome of examining one producer-temp candidate against its recorded
+/// identity. Liveness alone never licenses a reap: a malformed or mismatched
+/// dead-PID temp is exactly the evidence a later TRUNCATE-no-progress
+/// attribution pass needs, so it must survive cleanup as `Untrusted`, never
+/// fall through to `Reap`.
+#[cfg(unix)]
+enum OrphanTempVerdict {
+    /// Not old enough yet, not owned by us, or a live producer still holding
+    /// a matching identity — no report, ordinary in-flight state.
+    Skip,
+    /// Confirmed dead-PID or PID-reused evidence, identity verified against
+    /// the filename.
+    Reap(unix_impl::CheckedEntry),
+    /// Old enough to act on, but the body does not parse for its recorded
+    /// kind or its recorded identity does not match the filename — retained
+    /// and reported regardless of whether the named PID is alive or dead.
+    Untrusted(&'static str),
+}
+
 #[cfg(unix)]
 fn stale_orphan_temp(
     handle: &unix_impl::SidecarDirHandle,
@@ -3099,12 +3212,12 @@ fn stale_orphan_temp(
     kind: ProducerTempKind,
     now: i64,
     stale_after_secs: i64,
-) -> io::Result<Option<unix_impl::CheckedEntry>> {
+) -> io::Result<OrphanTempVerdict> {
     let Some(entry) = handle.read_checked_entry(name)? else {
-        return Ok(None);
+        return Ok(OrphanTempVerdict::Skip);
     };
     if entry.owner_uid != unix_impl::current_uid() {
-        return Ok(None);
+        return Ok(OrphanTempVerdict::Skip);
     }
     let modified_at = entry
         .mtime
@@ -3112,15 +3225,9 @@ fn stale_orphan_temp(
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
     if now.saturating_sub(modified_at) <= stale_after_secs {
-        return Ok(None);
+        return Ok(OrphanTempVerdict::Skip);
     }
 
-    if !is_process_alive(pid) {
-        return Ok(Some(entry));
-    }
-    let Some(actual_start) = process_start_time_secs(pid) else {
-        return Ok(None);
-    };
     let recorded_identity = match kind {
         ProducerTempKind::Heartbeat => serde_json::from_slice::<WalpinHeartbeat>(&entry.body)
             .ok()
@@ -3130,15 +3237,26 @@ fn stale_orphan_temp(
             .map(|record| (record.pid, record.started_at)),
     };
     let Some((recorded_pid, recorded_start)) = recorded_identity else {
-        return Ok(None);
+        return Ok(OrphanTempVerdict::Untrusted(
+            "refused: producer temp body does not parse as its recorded kind",
+        ));
     };
     if recorded_pid != pid {
-        return Ok(None);
+        return Ok(OrphanTempVerdict::Untrusted(
+            "refused: producer temp identity does not match its filename",
+        ));
     }
+
+    if !is_process_alive(pid) {
+        return Ok(OrphanTempVerdict::Reap(entry));
+    }
+    let Some(actual_start) = process_start_time_secs(pid) else {
+        return Ok(OrphanTempVerdict::Skip);
+    };
     if epoch_abs_diff(actual_start, recorded_start) > START_TIME_EPSILON_SECS {
-        return Ok(Some(entry));
+        return Ok(OrphanTempVerdict::Reap(entry));
     }
-    Ok(None)
+    Ok(OrphanTempVerdict::Skip)
 }
 
 #[cfg(unix)]
@@ -3190,7 +3308,7 @@ fn enumerate_live_bounded(
             continue;
         };
         match stale_orphan_temp(&handle, &name, pid, kind, now, fallback_window_secs) {
-            Ok(Some(entry)) => {
+            Ok(OrphanTempVerdict::Reap(entry)) => {
                 cleanup_would_reap = cleanup_would_reap.saturating_add(1);
                 if purpose.removes_orphan_temps() {
                     match handle.remove_if_same(&name, &entry) {
@@ -3204,7 +3322,8 @@ fn enumerate_live_bounded(
                     }
                 }
             }
-            Ok(None) => {}
+            Ok(OrphanTempVerdict::Skip) => {}
+            Ok(OrphanTempVerdict::Untrusted(reason)) => unknown.push((pid, reason)),
             Err(_) => unknown.push((
                 pid,
                 "refused: untrusted producer temp (symlink, non-regular, or oversized)",
@@ -4007,6 +4126,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn housekeeping_retains_and_reports_malformed_or_mismatched_dead_producer_temps() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+
+        let malformed_pid = 2_000_000_010;
+        let malformed = dir.join(format!(".{malformed_pid}.beacon.tmp"));
+        fs::write(&malformed, b"not valid json").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&malformed)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+
+        let mismatched_pid = 2_000_000_020;
+        let mismatched = dir.join(format!(".{mismatched_pid}.beacon.tmp"));
+        fs::write(
+            &mismatched,
+            serde_json::to_vec(&beacon(mismatched_pid + 1)).unwrap(),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&mismatched)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+
+        let report = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            report.orphan_temps_reaped, 0,
+            "neither a malformed nor a mismatched dead-PID temp is trustworthy reap evidence"
+        );
+        assert!(
+            malformed.exists(),
+            "a malformed dead-PID temp must survive cleanup as unknown evidence"
+        );
+        assert!(
+            mismatched.exists(),
+            "a dead-PID temp whose recorded identity does not match its filename must survive \
+             cleanup as unknown evidence"
+        );
+        let unknown: Vec<u32> = report.unknown_pids().collect();
+        assert!(
+            unknown.contains(&malformed_pid),
+            "malformed evidence must be reported, not silently dropped: {unknown:?}"
+        );
+        assert!(
+            unknown.contains(&mismatched_pid),
+            "mismatched evidence must be reported, not silently dropped: {unknown:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn housekeeping_refuses_a_symlinked_producer_temp_without_touching_its_target() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("khive.db.walpin");
@@ -4702,6 +4878,71 @@ mod tests {
         assert!(
             report.unknown_pids().any(|p| p == 999_999_942),
             "an oversized entry must classify its PID as unknown: {report:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn readdir_null_is_error_distinguishes_eof_from_a_real_read_error() {
+        assert!(
+            !unix_impl::readdir_null_is_error(0),
+            "errno == 0 after a NULL readdir means ordinary end-of-directory"
+        );
+        assert!(
+            unix_impl::readdir_null_is_error(libc::EIO),
+            "a nonzero errno after a NULL readdir means the walk failed mid-stream"
+        );
+    }
+
+    /// `remove_if_same`'s device/inode recheck and its `unlinkat` are two
+    /// separate syscalls; nothing closes the gap between them. This test
+    /// drives that exact gap via the test-only hook (forcing a real second
+    /// process to land in a few-instruction window isn't something a
+    /// portable unit test can do) and asserts the DOCUMENTED outcome: the
+    /// replacement that lands there is removed too, because `unlinkat`
+    /// operates on whatever now sits at the name, not on the inode that was
+    /// checked.
+    #[test]
+    #[cfg(unix)]
+    fn remove_if_same_a_replacement_landing_in_the_recheck_to_unlink_window_is_still_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+        let handle = unix_impl::SidecarDirHandle::open_or_create(&dir).unwrap();
+
+        let name = ".999999999.beacon.tmp";
+        fs::write(dir.join(name), b"stale evidence").unwrap();
+        let expected = handle
+            .read_checked_entry(name)
+            .unwrap()
+            .expect("the stale file must be readable and checked");
+
+        let replacement_path = dir.join(name);
+        let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_ran_writer = std::sync::Arc::clone(&hook_ran);
+        unix_impl::set_remove_if_same_race_hook(move || {
+            fs::write(&replacement_path, b"a producer's brand-new in-flight write").unwrap();
+            hook_ran_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let removed = handle
+            .remove_if_same(name, &expected)
+            .expect("remove_if_same must not error when a replacement lands mid-call");
+
+        assert!(
+            hook_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the race hook must actually run inside remove_if_same for this test to prove \
+             anything about the recheck-to-unlink window"
+        );
+        assert!(
+            removed,
+            "remove_if_same reports success because the name-based unlink always succeeds, \
+             even though what it removed is no longer the inode it verified"
+        );
+        assert!(
+            !dir.join(name).exists(),
+            "a replacement landing in the recheck-to-unlink window is removed too — the \
+             documented residual race, not one this function actually closes"
         );
     }
 

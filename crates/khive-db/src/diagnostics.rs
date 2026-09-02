@@ -599,6 +599,10 @@ fn wal_pin_attribution_from_evidence(
 ///
 /// Unix-only: the OS census requires it. Everywhere else this degrades to
 /// `available: false` with a reason rather than failing the whole report.
+/// An operator who has explicitly disabled the sidecar (`KHIVE_WALPIN_SIDECAR`)
+/// also disables this request's sidecar collection, per ADR-091 Amendment 6 —
+/// the census still runs, but there is no sidecar evidence to reconcile it
+/// against.
 #[cfg(unix)]
 pub fn wal_pin_attribution(db_path: &Path, sweep_interval: Duration) -> WalPinAttribution {
     use crate::walpin;
@@ -607,6 +611,9 @@ pub fn wal_pin_attribution(db_path: &Path, sweep_interval: Duration) -> WalPinAt
         Ok(c) => c,
         Err(e) => return WalPinAttribution::unavailable(format!("census_holders failed: {e}")),
     };
+    if !walpin::sidecar_enabled(true) {
+        return wal_pin_attribution_without_sidecar(census, SIDECAR_DISABLED_REASON.to_string());
+    }
     match walpin::inspect_live(&walpin::sidecar_dir_for(db_path), sweep_interval) {
         Ok(sidecar) => wal_pin_attribution_from_evidence(census, sidecar),
         Err(error) => wal_pin_attribution_without_sidecar(
@@ -615,6 +622,12 @@ pub fn wal_pin_attribution(db_path: &Path, sweep_interval: Duration) -> WalPinAt
         ),
     }
 }
+
+/// Shared with the async collection path in `inspect_file_state_interruptibly`.
+#[cfg(unix)]
+const SIDECAR_DISABLED_REASON: &str =
+    "walpin sidecar is explicitly disabled (KHIVE_WALPIN_SIDECAR); attribution has no sidecar \
+     evidence to reconcile against the OS holder census";
 
 #[cfg(not(unix))]
 pub fn wal_pin_attribution(_db_path: &Path, _sweep_interval: Duration) -> WalPinAttribution {
@@ -1064,11 +1077,16 @@ pub struct DbDiagnostics {
 
 /// Assemble the report for `pool`'s database.
 ///
-/// The probe target is the pool's own configured path — one source of truth,
-/// so the report can never describe a file the pool is not bound to. An
-/// in-memory pool has no path: the counters are still real (they are
-/// process-global), but every file-backed section degrades to an explicit
-/// "unavailable" with a reason rather than being silently omitted.
+/// `db_path` in the returned report is the pool's own configured path, so
+/// the report can never claim to describe a file the pool is not bound to.
+/// Every operational probe — the WAL file, the sidecar, the OS holder census
+/// — instead targets `pool.canonical_path()`, the same value `ConnectionPool`
+/// and the checkpoint sidecar writers key off of; a symlinked or otherwise
+/// aliased configured path would otherwise send those probes looking beside
+/// the alias while the evidence sits beside the canonical file. An in-memory
+/// pool has no path: the counters are still real (they are process-global),
+/// but every file-backed section degrades to an explicit "unavailable" with
+/// a reason rather than being silently omitted.
 ///
 /// The PASSIVE probe goes through the infrastructure-only untracked
 /// standalone open, WITHOUT `SQLITE_OPEN_CREATE`, so a diagnostic request
@@ -1181,8 +1199,13 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
     )
     .await?;
     crate::ensure_request_read_active("db_diagnostics")?;
-    let (wal_file, wal_pin) =
-        inspect_file_state_interruptibly(path.clone(), sweep_interval).await?;
+    // See `collect_inner`'s matching comment: the WAL file and sidecar live
+    // beside `canonical_path()`, not the raw configured `path`.
+    let canonical = pool
+        .canonical_path()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| path.clone());
+    let (wal_file, wal_pin) = inspect_file_state_interruptibly(canonical, sweep_interval).await?;
     crate::ensure_request_read_active("db_diagnostics")?;
 
     Ok(DbDiagnostics {
@@ -1241,11 +1264,18 @@ fn collect_inner(
     };
 
     let inspection = inspect_pool(pool);
+    // The checkpoint sidecar writers and `ConnectionPool` itself key the WAL
+    // and sidecar directory off `canonical_path()`, not the raw configured
+    // path — a symlinked or otherwise aliased `path` would make every
+    // operational probe below look beside the alias while the evidence sits
+    // beside the canonical file. `path` remains the presentation value in
+    // `db_path` since that is what the caller configured.
+    let canonical = pool.canonical_path().unwrap_or(&path);
 
     DbDiagnostics {
         build,
         db_path: Some(path.display().to_string()),
-        wal_file: Some(wal_file_state(&path)),
+        wal_file: Some(wal_file_state(canonical)),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
         checkpoint_probe_error: inspection.checkpoint_probe_error,
@@ -1254,7 +1284,7 @@ fn collect_inner(
         size_composition_error: inspection.size_composition_error,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
-        wal_pin: wal_pin_attribution(&path, sweep_interval),
+        wal_pin: wal_pin_attribution(canonical, sweep_interval),
     }
 }
 
@@ -1395,22 +1425,26 @@ async fn inspect_file_state_interruptibly(
                         "WAL sidecar inspection cancelled",
                     ));
                 }
-                let sidecar = crate::walpin::inspect_live(
-                    &crate::walpin::sidecar_dir_for(&path),
-                    sweep_interval,
-                );
-                if worker_stopped.load(Ordering::SeqCst) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "WAL sidecar inspection cancelled",
-                    ));
-                }
-                match sidecar {
-                    Ok(sidecar) => wal_pin_attribution_from_evidence(census, sidecar),
-                    Err(error) => wal_pin_attribution_without_sidecar(
-                        census,
-                        format!("read-only sidecar enumeration failed: {error}"),
-                    ),
+                if !crate::walpin::sidecar_enabled(true) {
+                    wal_pin_attribution_without_sidecar(census, SIDECAR_DISABLED_REASON.to_string())
+                } else {
+                    let sidecar = crate::walpin::inspect_live(
+                        &crate::walpin::sidecar_dir_for(&path),
+                        sweep_interval,
+                    );
+                    if worker_stopped.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "WAL sidecar inspection cancelled",
+                        ));
+                    }
+                    match sidecar {
+                        Ok(sidecar) => wal_pin_attribution_from_evidence(census, sidecar),
+                        Err(error) => wal_pin_attribution_without_sidecar(
+                            census,
+                            format!("read-only sidecar enumeration failed: {error}"),
+                        ),
+                    }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Err(error),
@@ -2349,6 +2383,7 @@ mod tests {
     /// read-only sidecar pass itself completed successfully.
     #[cfg(unix)]
     #[test]
+    #[serial(khive_walpin_sidecar_env)]
     fn wal_pin_attribution_degrades_when_a_holder_has_no_sidecar_registration() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (pool, path) = seeded_pool(&dir);
@@ -2373,5 +2408,127 @@ mod tests {
             pin.census,
             WalPinCensus::Complete { .. } | WalPinCensus::Incomplete { .. }
         ));
+    }
+
+    /// `sidecar_dir_for` is a purely lexical derivation from whatever path it
+    /// is handed (`pool.rs`'s `sidecar_dir_for_alias_convergence` proves
+    /// this at the primitive level). Diagnostics must feed it
+    /// `pool.canonical_path()` — the same value the checkpoint sidecar
+    /// writers use — never the pool's raw configured path, or a symlinked
+    /// database misses its own sidecar evidence entirely.
+    #[cfg(unix)]
+    #[test]
+    #[serial(khive_walpin_sidecar_env)]
+    fn diagnostics_finds_sidecar_evidence_through_an_aliased_database_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).expect("mkdir real dir");
+        let real_path = real_dir.join("diag.db");
+        std::fs::write(&real_path, b"").expect("create real file");
+        let alias_path = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&real_path, &alias_path).expect("symlink alias");
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(alias_path.clone()),
+            ..PoolConfig::default()
+        })
+        .expect("pool open through symlinked path");
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .expect("seed a write so the WAL file exists");
+        }
+
+        let canonical = pool
+            .canonical_path()
+            .expect("file-backed pool")
+            .to_path_buf();
+        assert_ne!(
+            canonical, alias_path,
+            "the alias must actually differ from the canonical path for this test to mean \
+             anything"
+        );
+
+        let pid = std::process::id();
+        let sidecar_dir = crate::walpin::sidecar_dir_for(&canonical);
+        let beacon = crate::walpin::WalpinBeacon {
+            pid,
+            process_role: "session".to_string(),
+            started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
+            sweep_interval_ms: 5_000,
+        };
+        crate::walpin::write_beacon(&sidecar_dir, &beacon).expect("seed this process's beacon");
+
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+
+        // The wider OS holder census can be legitimately incomplete in a
+        // sandboxed test environment (other, unrelated processes this test
+        // has no permission to inspect) — that variability is orthogonal to
+        // what this test checks. What must hold regardless is that the
+        // sidecar enumeration itself, which is keyed off the canonical
+        // path, actually ran, completed untruncated, and found this
+        // process's own beacon rather than missing it beside the wrong
+        // (aliased) directory.
+        assert_eq!(
+            report.wal_pin.sidecar_listing_truncated,
+            Some(false),
+            "the sidecar enumeration must run to completion: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            report.wal_pin.registered_silent_pids.contains(&pid),
+            "the beacon written beside the canonical path must be found: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            report.wal_pin.census_holder_pids.contains(&pid),
+            "the OS census must find this process holding its own database open: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            !report
+                .wal_pin
+                .census_pids_without_attribution
+                .contains(&pid),
+            "this process's own holder entry must be attributed by its own sidecar evidence, \
+             not left unexplained: {:?}",
+            report.wal_pin
+        );
+    }
+
+    /// ADR-091 Amendment 6: an operator who explicitly disables the sidecar
+    /// also disables its collection. Diagnostics must honor that rather than
+    /// running `inspect_live` regardless of the operator's setting.
+    #[cfg(unix)]
+    #[test]
+    #[serial(khive_walpin_sidecar_env)]
+    fn wal_pin_attribution_reports_disabled_when_the_sidecar_is_explicitly_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pool, path) = seeded_pool(&dir);
+        let _ = &pool;
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "0");
+
+        let pin = wal_pin_attribution(&path, Duration::from_secs(30));
+
+        assert!(
+            !pin.available,
+            "an explicitly disabled sidecar can never produce a reconciled answer"
+        );
+        assert!(
+            pin.unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("disabled")),
+            "the reason must name the disabled sidecar, not a generic enumeration failure: \
+             {pin:?}"
+        );
+        assert!(pin.sidecar_entries.is_empty());
+        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
     }
 }
