@@ -106,8 +106,17 @@ fi
 echo ""
 echo "--- CLI alias ---"
 # The skip requires the published alias to carry the exact khive dependency,
-# so a rerun repairs a missing alias and refuses a mismatched one.
-PUBLISHED_ALIAS_KHIVE=$(npm view "@khive-ai/cli@${VERSION}" dependencies.khive 2>/dev/null || true)
+# so a rerun repairs a missing alias and refuses a mismatched one. Only a
+# confirmed missing package or version counts as absent; any other lookup
+# failure stops the script rather than publishing blind.
+if ALIAS_LOOKUP=$(npm view "@khive-ai/cli@${VERSION}" dependencies.khive 2>&1); then
+    PUBLISHED_ALIAS_KHIVE="$ALIAS_LOOKUP"
+elif [[ "$ALIAS_LOOKUP" == *E404* ]]; then
+    PUBLISHED_ALIAS_KHIVE=""
+else
+    echo "ERROR: could not look up @khive-ai/cli@${VERSION} on npm: ${ALIAS_LOOKUP}" >&2
+    exit 1
+fi
 if [[ "$PUBLISHED_ALIAS_KHIVE" == "$VERSION" ]]; then
     echo "  @khive-ai/cli@${VERSION} already on npm with khive ${VERSION} — skipping"
 elif [[ -n "$PUBLISHED_ALIAS_KHIVE" ]]; then

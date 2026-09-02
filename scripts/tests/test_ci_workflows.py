@@ -101,7 +101,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             npm_stub = pathlib.Path(temp_dir) / "npm"
             npm_stub.write_text(
                 "#!/bin/sh\n"
-                "if [ \"${1:-}\" = view ]; then exit 1; fi\n"
+                "if [ \"${1:-}\" = view ]; then echo 'npm ERR! code E404' >&2; exit 1; fi\n"
                 "echo \"unexpected npm command: $*\" >&2\n"
                 "exit 97\n"
             )
@@ -153,6 +153,36 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         version = json.loads((REPO_ROOT / "npm" / "package.json").read_text())["version"]
         self.assertEqual(completed.returncode, 1, completed.stdout)
         self.assertIn(f"depends on khive 0.0.1, expected {version}", completed.stderr)
+        self.assertNotIn("would publish @khive-ai/cli", completed.stdout)
+
+    def test_local_publish_stops_when_the_alias_lookup_fails_for_another_reason(self):
+        publish_script = REPO_ROOT / "scripts" / "npm-publish.sh"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            npm_stub = pathlib.Path(temp_dir) / "npm"
+            npm_stub.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = view ]; then\n"
+                "  case \"${2:-}\" in @khive-ai/cli@*) echo 'npm ERR! code ECONNREFUSED' >&2; exit 1;; esac\n"
+                "  echo 'npm ERR! code E404' >&2; exit 1\n"
+                "fi\n"
+                "echo \"unexpected npm command: $*\" >&2\n"
+                "exit 97\n"
+            )
+            npm_stub.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{temp_dir}:{env['PATH']}"
+            completed = subprocess.run(
+                ["bash", str(publish_script), "--dry-run"],
+                cwd=REPO_ROOT,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        self.assertIn("could not look up @khive-ai/cli@", completed.stderr)
+        self.assertIn("ECONNREFUSED", completed.stderr)
         self.assertNotIn("would publish @khive-ai/cli", completed.stdout)
 
 
