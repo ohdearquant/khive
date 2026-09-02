@@ -4549,11 +4549,11 @@ mod tests {
     /// rotation eviction could run its own two-step remove-then-cleanup in
     /// between, observe the state still `Warming`, and skip the cleanup —
     /// leaving `warm_states` say `Ready` for a key `indexes` no longer has a
-    /// bridge for. Reverting the `finish_warm` fix (so the `indexes` read
-    /// guard drops before the `run_finish_warm_ready_test_hook` call instead
-    /// of after) reproduces exactly that: the hook's eviction task, spawned
-    /// with the guard already free, races to completion before the
-    /// publish, and the assertion below fails.
+    /// bridge for. The invariant under test: `finish_warm` holds the
+    /// `indexes` read guard from its Ready decision through the publication
+    /// into `warm_states`, so an eviction spawned in between (here through
+    /// `run_finish_warm_ready_test_hook`) cannot complete before the publish
+    /// and the two maps never disagree.
     #[tokio::test]
     async fn finish_warm_ready_publish_is_atomic_with_concurrent_eviction() {
         let temp = TempDir::new().expect("tempdir");

@@ -3311,8 +3311,8 @@ mod tests {
     /// predecessor here too, and a later warm must recover. Unlike the
     /// knowledge pack, memory has no separate warm-lifecycle map to race —
     /// `refresh_rotated_segment` and `ensure_ann_for_model` both take
-    /// `model_warm_lock` for the same key (:917-918 and :1064-1065) before
-    /// touching `indexes`, so the watcher and an in-flight rebuild are
+    /// `model_warm_lock` for the same key before touching `indexes`, so the
+    /// watcher and an in-flight rebuild are
     /// already mutually exclusive; this test pins the recovery behavior that
     /// serialization is relied on to make safe.
     #[tokio::test]
