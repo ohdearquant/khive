@@ -40,8 +40,10 @@ with hardened, allowlisted argv construction. A remote `git.digest` source whose
 clone or fetch setup fails returns a typed `RemoteFetchError` naming the redacted remote
 to in-process callers; the MCP `request` envelope renders it as a plain error message
 rather than structured fields (ADR-088 Amendment 1, Remote-URL mode, point 5). A
-clone/fetch failure hit later while repairing an already-cached clone, or a source that
-parses as neither a local path nor a remote URL, is `InvalidInput` instead.
+clone/fetch failure hit later while repairing an already-cached clone surfaces as
+`InvalidInput` only when the bounded refetch-then-reclone repair ultimately fails (a
+successful reclone lets the digest complete); a source that parses as neither a local
+path nor a remote URL is `InvalidInput` as well.
 
 `workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
 
