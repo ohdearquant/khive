@@ -36,6 +36,10 @@ use crate::operations::{
     Resolved,
 };
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+use crate::secret_gate_finalizer::boundary::{
+    finalize_secret_gate_candidate, secret_gate_atomic_statements, SecretGateCandidateFields,
+    SecretGateTargetKind,
+};
 
 use khive_db::stores::attachment::delete_record_attachments_statement;
 use khive_db::stores::entity::{
@@ -490,16 +494,6 @@ pub async fn prepare_add_entity(
     let properties = optional_properties(args, "properties")?;
     let tags = optional_tags(args)?.unwrap_or_default();
 
-    crate::secret_gate::check(name)?;
-    if let Some(ref d) = description {
-        crate::secret_gate::check(d)?;
-    }
-    if let Some(ref p) = properties {
-        crate::secret_gate::check_json(p)?;
-    }
-    crate::secret_gate::check_tags(&tags)?;
-    crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-
     let ns = token.namespace().as_str();
     let mut entity = khive_storage::Entity::new(ns, kind, name);
     if let Some(d) = description {
@@ -512,16 +506,44 @@ pub async fn prepare_add_entity(
         entity = entity.with_tags(tags);
     }
 
-    let statements = vec![
-        PlanStatement {
+    // secret-gate-finalizer-entry: entity.bulk proposal.materialize
+    let finalization = finalize_secret_gate_candidate(
+        ns,
+        &token.actor().id,
+        entity.id,
+        SecretGateTargetKind::Entity,
+        "entity.bulk",
+        &SecretGateCandidateFields {
+            name_description: std::iter::once(entity.name.clone())
+                .chain(entity.description.iter().cloned())
+                .collect(),
+            json_properties: entity.properties.clone(),
+            tags: entity.tags.clone(),
+            ..SecretGateCandidateFields::default()
+        },
+        entity.properties.take(),
+    )?;
+    entity.properties = finalization.properties;
+
+    let mut statements = if let Some(event) = &finalization.success_event {
+        secret_gate_atomic_statements(entity_upsert_statement(&entity), event)?
+            .into_iter()
+            .enumerate()
+            .map(|(index, statement)| PlanStatement {
+                statement,
+                guard: (index == 0).then(|| AffectedRowGuard::exactly(1)),
+            })
+            .collect()
+    } else {
+        vec![PlanStatement {
             statement: entity_upsert_statement(&entity),
             guard: Some(AffectedRowGuard::exactly(1)),
-        },
-        PlanStatement {
-            statement: insert_document_statement("fts_entities", &entity_fts_document(&entity)),
-            guard: None,
-        },
-    ];
+        }]
+    };
+    statements.push(PlanStatement {
+        statement: insert_document_statement("fts_entities", &entity_fts_document(&entity)),
+        guard: None,
+    });
 
     Ok(AtomicOpPlan::AddEntity(AddEntityPlan {
         entity_id: entity.id,
@@ -555,15 +577,6 @@ pub async fn prepare_add_note(
     // (threaded in by the apply worker), not the proposer's.
     let properties = runtime.derive_note_write_properties(kind, token, properties)?;
 
-    crate::secret_gate::check(content)?;
-    if let Some(ref n) = name {
-        crate::secret_gate::check(n)?;
-    }
-    if let Some(ref p) = properties {
-        crate::secret_gate::check_json(p)?;
-    }
-    crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-
     let ns = token.namespace().as_str();
     let mut note = khive_storage::note::Note::new(ns, kind, content);
     if let Some(n) = name {
@@ -573,16 +586,46 @@ pub async fn prepare_add_note(
         note = note.with_properties(p);
     }
 
-    let statements = vec![
-        PlanStatement {
+    // secret-gate-finalizer-entry: note.create proposal.materialize
+    let finalization = finalize_secret_gate_candidate(
+        ns,
+        &token.actor().id,
+        note.id,
+        SecretGateTargetKind::Note,
+        "note.create",
+        &SecretGateCandidateFields {
+            record_content: vec![note.content.clone()],
+            name_description: note.name.iter().cloned().collect(),
+            json_properties: note.properties.clone(),
+            ..SecretGateCandidateFields::default()
+        },
+        note.properties.take(),
+    )?;
+    note.properties = finalization.properties;
+
+    let mut statements = if let Some(event) = &finalization.success_event {
+        let mut raw = secret_gate_atomic_statements(note_upsert_statement(&note), event)?;
+        raw.insert(
+            1,
+            khive_db::stores::note::note_assign_seq_statement(note.id),
+        );
+        raw.into_iter()
+            .enumerate()
+            .map(|(index, statement)| PlanStatement {
+                statement,
+                guard: (index == 0).then(|| AffectedRowGuard::exactly(1)),
+            })
+            .collect()
+    } else {
+        vec![PlanStatement {
             statement: note_upsert_statement(&note),
             guard: Some(AffectedRowGuard::exactly(1)),
-        },
-        PlanStatement {
-            statement: insert_document_statement("fts_notes", &note_fts_document(&note)),
-            guard: None,
-        },
-    ];
+        }]
+    };
+    statements.push(PlanStatement {
+        statement: insert_document_statement("fts_notes", &note_fts_document(&note)),
+        guard: None,
+    });
 
     Ok(AtomicOpPlan::AddNote(AddNotePlan {
         note_id: note.id,
@@ -745,7 +788,7 @@ async fn prepare_note_update_plan_from_snapshot(
     let expected_updated_at = note.updated_at;
     let expected_deleted_at = note.deleted_at;
 
-    let (note, text_changed) = runtime
+    let (note, text_changed, finalizer_event) = runtime
         .prepare_update_note_from_snapshot(
             token,
             note,
@@ -758,16 +801,22 @@ async fn prepare_note_update_plan_from_snapshot(
     } else {
         PostCommitEffect::None
     };
+    let record_statement =
+        note_replace_if_unchanged_statement(&note, expected_updated_at, expected_deleted_at);
+    let statements = match finalizer_event.as_ref() {
+        Some(event) => crate::secret_gate_atomic_statements(record_statement, event)?,
+        None => vec![record_statement],
+    }
+    .into_iter()
+    .enumerate()
+    .map(|(index, statement)| PlanStatement {
+        statement,
+        guard: (index == 0).then(|| AffectedRowGuard::exactly(1)),
+    })
+    .collect();
     Ok(AtomicOpPlan::Update(UpdatePlan {
         target_id: id,
-        statements: vec![PlanStatement {
-            statement: note_replace_if_unchanged_statement(
-                &note,
-                expected_updated_at,
-                expected_deleted_at,
-            ),
-            guard: Some(AffectedRowGuard::exactly(1)),
-        }],
+        statements,
         post_commit,
         edge_natural_key: None,
     }))
@@ -912,16 +961,27 @@ pub async fn prepare_update_entity_plan(
     id: Uuid,
     patch: crate::curation::EntityPatch,
 ) -> RuntimeResult<AtomicOpPlan> {
-    let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
-        runtime.prepare_update_entity(token, id, patch).await?;
-    let mut statements = vec![PlanStatement {
-        statement: entity_replace_if_unchanged_statement(
-            &entity,
-            expected_updated_at,
-            expected_deleted_at,
-        ),
-        guard: Some(AffectedRowGuard::exactly(1)),
-    }];
+    let (
+        entity,
+        reindex_required,
+        changed_fields,
+        expected_updated_at,
+        expected_deleted_at,
+        finalizer_event,
+    ) = runtime.prepare_update_entity(token, id, patch).await?;
+    let record_statement =
+        entity_replace_if_unchanged_statement(&entity, expected_updated_at, expected_deleted_at);
+    let mut statements: Vec<PlanStatement> = match finalizer_event.as_ref() {
+        Some(event) => crate::secret_gate_atomic_statements(record_statement, event)?,
+        None => vec![record_statement],
+    }
+    .into_iter()
+    .enumerate()
+    .map(|(index, statement)| PlanStatement {
+        statement,
+        guard: (index == 0).then(|| AffectedRowGuard::exactly(1)),
+    })
+    .collect();
     statements.extend(event_append_statements(
         token,
         &entity.namespace,

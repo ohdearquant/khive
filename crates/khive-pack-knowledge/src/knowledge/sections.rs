@@ -948,6 +948,7 @@ impl KnowledgeHandlers {
                     "finalized": true,
                 }]
             });
+            // secret-gate-finalizer-entry: knowledge.atom knowledge.sections.delegate
             KnowledgeHandlers::upsert_import_atoms(runtime, token, upsert_params).await?;
             imported_atoms += 1;
 

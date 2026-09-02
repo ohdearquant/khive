@@ -71,6 +71,8 @@ pub(crate) struct Domain {
     pub tags: String,
     /// JSON array of member atom slugs
     pub members: String,
+    /// Runtime posture projected from the same-UUID FTS mirror atom.
+    pub properties: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     // REASON: deleted_at is stored in SQL and read when reconstructing full domain history;

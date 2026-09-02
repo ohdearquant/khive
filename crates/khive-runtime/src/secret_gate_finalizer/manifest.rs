@@ -47,6 +47,16 @@ impl RuntimeFieldScope {
             RuntimeFieldScope::CodeSource => b"code-source",
         }
     }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            RuntimeFieldScope::RecordContent => "record-content",
+            RuntimeFieldScope::NameDescription => "name-description",
+            RuntimeFieldScope::JsonProperties => "json-properties",
+            RuntimeFieldScope::Tags => "tags",
+            RuntimeFieldScope::CodeSource => "code-source",
+        }
+    }
 }
 
 // ─── Digest ──────────────────────────────────────────────────────────────────
@@ -387,7 +397,7 @@ impl ManifestManager {
 
 // ─── Test-only, non-deployable lookup fixture ───────────────────────────────
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-internals"))]
 pub(crate) mod fixture {
     use super::*;
 
@@ -429,6 +439,18 @@ pub(crate) mod fixture {
                 field_scope: RuntimeFieldScope::RecordContent,
                 exact_value: assembled,
                 overridden_detector: "aws-access-key-id",
+            }
+        }
+
+        pub(crate) fn for_exact_value(
+            field_scope: RuntimeFieldScope,
+            exact_value: impl Into<String>,
+        ) -> Self {
+            Self {
+                test_fixture_schema: TEST_FIXTURE_SCHEMA_MARKER,
+                field_scope,
+                exact_value: exact_value.into(),
+                overridden_detector: "test-only-reviewed-false-positive",
             }
         }
 

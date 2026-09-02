@@ -891,6 +891,51 @@ acceptance section and is pinned by runtime-owned configuration. Every construct
 fail-closed. Adding age, revision ordering, revocation, or manifest-id freshness requires a later
 amendment with an explicit source of truth and acceptance fixture.
 
+### 6. Amendment 2: write-inventory, knowledge, and stamp-echo completion
+
+Issues #2057, #2058, and #2065 complete the first follow-on increment without changing the host
+trust model or activating a deployable non-empty manifest. The runtime-owned declaration now has
+eight finalizer families: entity create/update/bulk, note create/update/atomic-message, knowledge
+atom, and knowledge domain. A source-marker census ties every non-delegating property-bearing
+origin to one of those families: ordinary runtime writes, curation (including raw-SQL merge),
+atomic prepare and proposal materialization, portability restore, direct code ingest, and knowledge
+CRUD/section import. A new origin must either carry a declared marker and call the shared boundary
+or be added to a separately accepted excluded-surface obligation; silently bypassing both is a test
+failure.
+
+Merge finalization uses the final folded record, not either input row. The absorbed row's reserved
+stamp is removed before folding because a stamp is bound to its current UUID and cannot be
+transplanted. A real merge prefinalizes one immutable candidate, then recomputes the fold inside the
+writer transaction and refuses on any difference. The survivor row, runtime stamp, absorbed-row
+tombstone, and fresh target-bound success audit therefore commit or roll back together. Dry-run
+merges remain read-only and consume no manifest entry.
+
+Knowledge atoms persist the reserved property in their canonical `properties` column. Domains do
+not have a properties column, so a domain exemption persists the same property in a same-UUID,
+namespace-scoped mirror row in `knowledge_atoms`; canonical domain get/list/search responses project
+that mirror property back as the domain's `properties`. The mirror and domain mutation are one
+atomic batch. Their success events use the domain or atom UUID as both target and aggregate ID,
+carry `knowledge_domain` or `knowledge_atom` as the aggregate kind, and contain only the digest,
+scope, manifest identity, detector name, entry point, outcome, and target kind—never submitted
+content. Admission-failure injection proves that neither the primary row nor its stamp/mirror can
+survive a failed success audit.
+
+A caller may echo a stamp only on the record from which it was read. Before a property patch is
+folded, the runtime compares the submitted top-level value byte-for-byte with the persisted target
+value. An exact echo is normalized out of the caller patch; target-bound audit linkage then proves
+which exact scoped digest the runtime issued it for. The stamp is preserved only while that digest
+still occurs unchanged in the final candidate. A differing value, a supplied key on an unstamped
+target, an explicit removal, a stamp without target-bound audit linkage, or a stamp copied to a
+different target fails closed. If the linked bytes change to safe content, the old stamp is dropped
+and the complete candidate is scanned as a fresh write. A pre-reservation caller-written reserved
+key has no linkage and remains an operator-repair case rather than an accepted echo.
+
+The explicit #2059 git-redaction, #2060 session-redaction, and #2061 MCP-redaction obligations stay
+excluded and keep their existing blocking or masking behavior. Edge metadata, proposal-only
+metadata, merge reasons, and embedding-content overrides remain non-admission values because they
+are not final stored entity, note, atom, or domain properties. The production manifest remains
+empty until a separately accepted operator-controlled loading and adjudication workflow exists.
+
 ### Alternatives retained as rejected
 
 - Treating the crate-private harness as evidence for non-empty deployment is rejected because it

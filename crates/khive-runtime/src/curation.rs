@@ -14,16 +14,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use khive_db::stores::entity::entity_replace_if_unchanged_statement;
+use khive_db::stores::note::note_replace_if_unchanged_statement;
 use khive_db::SqliteError;
 use khive_storage::note::Note;
-use khive_storage::types::{EdgeFilter, TextDocument};
+use khive_storage::types::{EdgeFilter, SqlStatement, SqlValue, TextDocument};
 use khive_storage::{EdgeRelation, Entity, SubstrateKind};
 use khive_types::{Details, EdgeEndpointRule, EventKind, KhiveError};
 use rusqlite::OptionalExtension;
 
+use crate::atomic_plan::{AffectedRowGuard, PlanStatement, PostCommitEffect, UpdatePlan};
+use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{base_entity_rule_allows, canonical_edge_endpoints, endpoint_matches};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+use crate::{
+    finalize_secret_gate_candidate, finalize_secret_gate_update_candidate,
+    secret_gate_atomic_statements, SecretGateCandidateFields, SecretGateTargetKind,
+};
 
 /// Test-only pause point at the read/write boundary of a guarded
 /// read-modify-write, so a race between two concurrent callers of the same
@@ -557,6 +565,9 @@ enum EntityMergeRefusal {
         from_kind: String,
     },
     SafetyFloor(EntityMergeGuard),
+    SecretGateCandidateChanged {
+        into_id: Uuid,
+    },
 }
 
 impl EntityMergeRefusal {
@@ -572,6 +583,7 @@ impl EntityMergeRefusal {
                  from={from_id} ({from_kind}); merge requires both entities to share the same kind"
             )),
             Self::SafetyFloor(guard) => entity_merge_guard_error(guard),
+            Self::SecretGateCandidateChanged { into_id } => stale_entity_snapshot_error(into_id),
         }
     }
 }
@@ -624,6 +636,23 @@ fn map_merge_entity_storage_error(error: khive_storage::StorageError) -> Runtime
         },
         error => RuntimeError::Storage(error),
     }
+}
+
+/// Preserve the merge transaction's historical ownership error while the
+/// secret-gate finalizer pre-reads the candidate outside that transaction.
+///
+/// This check must run before finalization: a cross-namespace merge is not an
+/// eligible write and therefore must not consume a one-shot exemption. The
+/// wording intentionally matches `read_merge_entity`, which remains the
+/// transactional revalidation authority.
+fn ensure_entity_merge_namespace(entity: &Entity, namespace: &str) -> RuntimeResult<()> {
+    if entity.namespace == namespace {
+        return Ok(());
+    }
+    Err(RuntimeError::Sqlite(SqliteError::InvalidData(format!(
+        "entity {} belongs to namespace '{}', not '{}'",
+        entity.id, entity.namespace, namespace
+    ))))
 }
 
 // REASON: EdgeRow fields are populated via rusqlite row mapping. The struct is fully
@@ -870,21 +899,15 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         id: Uuid,
-        patch: EntityPatch,
-    ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
-        crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
-        if let Some(ref name) = patch.name {
-            crate::secret_gate::check(name)?;
-        }
-        if let Some(Some(ref desc)) = patch.description {
-            crate::secret_gate::check(desc)?;
-        }
-        if let Some(ref props) = patch.properties {
-            crate::secret_gate::check_json(props)?;
-        }
-        if let Some(ref tags) = patch.tags {
-            crate::secret_gate::check_tags(tags)?;
-        }
+        mut patch: EntityPatch,
+    ) -> RuntimeResult<(
+        Entity,
+        bool,
+        Vec<&'static str>,
+        i64,
+        Option<i64>,
+        Option<khive_storage::event::Event>,
+    )> {
         let store = self.entities(token)?;
         let mut entity = store
             .get_entity(id)
@@ -892,6 +915,11 @@ impl KhiveRuntime {
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
         let expected_updated_at = entity.updated_at;
         let expected_deleted_at = entity.deleted_at;
+        crate::secret_gate::normalize_secret_gate_property_echo(
+            &mut patch.properties,
+            entity.properties.as_ref(),
+            crate::secret_gate::PropertyWriteShape::Patch,
+        )?;
         #[cfg(test)]
         race_seam::pause_after_read().await;
 
@@ -939,6 +967,49 @@ impl KhiveRuntime {
             changed_fields.push("entity_type");
         }
 
+        let fields = SecretGateCandidateFields {
+            name_description: entity
+                .description
+                .iter()
+                .cloned()
+                .chain(std::iter::once(entity.name.clone()))
+                .collect(),
+            json_properties: entity.properties.clone(),
+            tags: entity.tags.clone(),
+            ..Default::default()
+        };
+        let has_stamp = entity
+            .properties
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|map| map.get(crate::secret_gate::RESERVED_SECRET_GATE_KEY))
+            .is_some();
+        // secret-gate-finalizer-entry: entity.update curation
+        let finalization = if has_stamp {
+            finalize_secret_gate_update_candidate(
+                self,
+                token.namespace().as_str(),
+                &token.actor().id,
+                entity.id,
+                SecretGateTargetKind::Entity,
+                "entity.update",
+                &fields,
+                entity.properties.take(),
+            )
+            .await?
+        } else {
+            finalize_secret_gate_candidate(
+                token.namespace().as_str(),
+                &token.actor().id,
+                entity.id,
+                SecretGateTargetKind::Entity,
+                "entity.update",
+                &fields,
+                entity.properties.take(),
+            )?
+        };
+        entity.properties = finalization.properties;
+
         // `updated_at` is also the optimistic-concurrency revision for
         // full-entity replacement. Make it strictly advance even when two
         // operations land inside one clock microsecond. Saturation is not a
@@ -958,6 +1029,7 @@ impl KhiveRuntime {
             changed_fields,
             expected_updated_at,
             expected_deleted_at,
+            finalization.success_event,
         ))
     }
 
@@ -979,15 +1051,70 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
-        let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
-            self.prepare_update_entity(token, id, patch).await?;
+        let (
+            entity,
+            reindex_required,
+            changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+            finalizer_event,
+        ) = self.prepare_update_entity(token, id, patch).await?;
 
-        let store = self.entities(token)?;
-        let persisted = store
-            .replace_entity_if_unchanged(entity.clone(), expected_updated_at, expected_deleted_at)
-            .await?;
-        if !persisted {
-            return Err(stale_entity_snapshot_error(id));
+        if let Some(event) = finalizer_event.as_ref() {
+            let statements = secret_gate_atomic_statements(
+                entity_replace_if_unchanged_statement(
+                    &entity,
+                    expected_updated_at,
+                    expected_deleted_at,
+                ),
+                event,
+            )?
+            .into_iter()
+            .enumerate()
+            .map(|(index, statement)| PlanStatement {
+                statement,
+                guard: (index == 0).then(|| AffectedRowGuard::exactly(1)),
+            })
+            .collect();
+            let plan = AtomicOpPlan::Update(UpdatePlan {
+                target_id: id,
+                statements,
+                post_commit: PostCommitEffect::None,
+                edge_natural_key: None,
+            });
+            match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
+                Ok(AtomicRunOutcome::Committed { .. }) => {}
+                Ok(AtomicRunOutcome::RolledBack {
+                    failure: AtomicOpFailure::GuardFailed { .. },
+                    ..
+                }) => return Err(stale_entity_snapshot_error(id)),
+                Ok(AtomicRunOutcome::RolledBack {
+                    failure: AtomicOpFailure::SqlError { message, .. },
+                    ..
+                }) => {
+                    return Err(RuntimeError::Internal(format!(
+                        "secret-gate entity finalization rolled back: {message}"
+                    )))
+                }
+                Err(error) => {
+                    return Err(RuntimeError::Internal(format!(
+                        "secret-gate entity finalization failed: {}",
+                        error.0
+                    )))
+                }
+            }
+        } else {
+            let store = self.entities(token)?;
+            let persisted = store
+                .replace_entity_if_unchanged(
+                    entity.clone(),
+                    expected_updated_at,
+                    expected_deleted_at,
+                )
+                .await?;
+            if !persisted {
+                return Err(stale_entity_snapshot_error(id));
+            }
         }
 
         let embedding_report = if reindex_required {
@@ -1151,7 +1278,7 @@ impl KhiveRuntime {
         let pack_rules = self.pack_edge_rules();
 
         // Ensure all required tables exist (idempotent DDL) before the transaction.
-        let _ = self.entities(token)?;
+        let entity_store = self.entities(token)?;
         let _ = self.graph(token)?;
         let _ = self.text(token)?;
         // vectors_for_model (not the default-model-only self.vectors()) so
@@ -1159,6 +1286,95 @@ impl KhiveRuntime {
         for model_name in embedding_plan.model_names() {
             let _ = self.vectors_for_model(token, model_name)?;
         }
+
+        // A dry-run remains a mutation-free preview and therefore neither
+        // consumes a manifest match nor synthesizes a posture stamp. A real
+        // merge finalizes one immutable pre-read candidate; the SQL transaction
+        // below recomputes and compares that candidate before writing.
+        // secret-gate-finalizer-entry: entity.update merge
+        let secret_gate_plan = if dry_run {
+            None
+        } else {
+            let into_entity = entity_store
+                .get_entity(into_id)
+                .await?
+                .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
+            ensure_entity_merge_namespace(&into_entity, &ns)?;
+            let from_entity = entity_store
+                .get_entity(from_id)
+                .await?
+                .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
+            ensure_entity_merge_namespace(&from_entity, &ns)?;
+            match validation {
+                EntityMergeValidation::LegacyKind if into_entity.kind != from_entity.kind => {
+                    return Err(EntityMergeRefusal::LegacyKind {
+                        into_id,
+                        into_kind: into_entity.kind,
+                        from_id,
+                        from_kind: from_entity.kind,
+                    }
+                    .into_runtime_error());
+                }
+                EntityMergeValidation::SafetyFloor => {
+                    validate_entity_merge_floor(&into_entity, &from_entity)
+                        .map_err(entity_merge_guard_error)?;
+                }
+                EntityMergeValidation::LegacyKind | EntityMergeValidation::Forced => {}
+            }
+            let expected =
+                entity_merge_candidate(&into_entity, &from_entity, strategy, content_strategy);
+            let fields = SecretGateCandidateFields {
+                name_description: expected
+                    .description
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(expected.name.clone()))
+                    .collect(),
+                json_properties: expected.properties.clone(),
+                tags: expected.tags.clone(),
+                ..Default::default()
+            };
+            let has_stamp = expected
+                .properties
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|map| map.get(crate::secret_gate::RESERVED_SECRET_GATE_KEY))
+                .is_some();
+            let finalization = if has_stamp {
+                finalize_secret_gate_update_candidate(
+                    self,
+                    &ns,
+                    &token.actor().id,
+                    into_id,
+                    SecretGateTargetKind::Entity,
+                    "merge",
+                    &fields,
+                    expected.properties.clone(),
+                )
+                .await?
+            } else {
+                finalize_secret_gate_candidate(
+                    &ns,
+                    &token.actor().id,
+                    into_id,
+                    SecretGateTargetKind::Entity,
+                    "merge",
+                    &fields,
+                    expected.properties.clone(),
+                )?
+            };
+            let success_event_statements = finalization
+                .success_event
+                .as_ref()
+                .map(crate::secret_gate_finalizer::boundary::secret_gate_success_event_statements)
+                .transpose()?
+                .unwrap_or_default();
+            Some(EntityMergeSecretGatePlan {
+                expected,
+                finalized_properties: finalization.properties,
+                success_event_statements,
+            })
+        };
 
         let pool = self.backend().pool_arc();
         // When the write queue is enabled, route this multi-statement merge through
@@ -1181,6 +1397,7 @@ impl KhiveRuntime {
                         dry_run,
                         pack_rules,
                         validation,
+                        secret_gate_plan,
                         MergeTxLimits::default(),
                     )
                     .map_err(|e| {
@@ -1210,6 +1427,7 @@ impl KhiveRuntime {
                         dry_run,
                         pack_rules,
                         validation,
+                        secret_gate_plan,
                         MergeTxLimits::default(),
                     )
                     .map_err(|error| match error {
@@ -1482,20 +1700,19 @@ impl KhiveRuntime {
     /// plan guarded by the snapshot's `updated_at`/`deleted_at` values.
     pub(crate) async fn prepare_update_note_from_snapshot(
         &self,
-        _token: &NamespaceToken,
+        token: &NamespaceToken,
         mut note: khive_storage::note::Note,
-        patch: NotePatch,
-    ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
-        crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
-        if let Some(ref content) = patch.content {
-            crate::secret_gate::check(content)?;
-        }
-        if let Some(Some(ref name)) = patch.name {
-            crate::secret_gate::check(name)?;
-        }
-        if let Some(ref props) = patch.properties {
-            crate::secret_gate::check_json(props)?;
-        }
+        mut patch: NotePatch,
+    ) -> RuntimeResult<(
+        khive_storage::note::Note,
+        bool,
+        Option<khive_storage::event::Event>,
+    )> {
+        crate::secret_gate::normalize_secret_gate_property_echo(
+            &mut patch.properties,
+            note.properties.as_ref(),
+            crate::secret_gate::PropertyWriteShape::Patch,
+        )?;
 
         reject_pack_managed_schedule_mutation(&note, "update")?;
 
@@ -1607,6 +1824,44 @@ impl KhiveRuntime {
             note.status = status;
         }
 
+        let fields = SecretGateCandidateFields {
+            record_content: vec![note.content.clone()],
+            name_description: note.name.iter().cloned().collect(),
+            json_properties: note.properties.clone(),
+            ..Default::default()
+        };
+        let has_stamp = note
+            .properties
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|map| map.get(crate::secret_gate::RESERVED_SECRET_GATE_KEY))
+            .is_some();
+        // secret-gate-finalizer-entry: note.update curation
+        let finalization = if has_stamp {
+            finalize_secret_gate_update_candidate(
+                self,
+                token.namespace().as_str(),
+                &token.actor().id,
+                note.id,
+                SecretGateTargetKind::Note,
+                "note.update",
+                &fields,
+                note.properties.take(),
+            )
+            .await?
+        } else {
+            finalize_secret_gate_candidate(
+                token.namespace().as_str(),
+                &token.actor().id,
+                note.id,
+                SecretGateTargetKind::Note,
+                "note.update",
+                &fields,
+                note.properties.take(),
+            )?
+        };
+        note.properties = finalization.properties;
+
         // `updated_at` is also the optimistic-concurrency revision for
         // full-note replacement. Make it strictly advance even when two
         // operations land inside one clock microsecond. Saturation is not a
@@ -1621,7 +1876,7 @@ impl KhiveRuntime {
         note.updated_at = chrono::Utc::now()
             .timestamp_micros()
             .max(minimum_updated_at);
-        Ok((note, text_changed))
+        Ok((note, text_changed, finalization.success_event))
     }
 
     /// Patch-style note update.
@@ -1682,15 +1937,60 @@ impl KhiveRuntime {
         if current != snapshot {
             return Err(stale_note_snapshot_error(id));
         }
-        let (note, text_changed) = self
+        let (note, text_changed, finalizer_event) = self
             .prepare_update_note_from_snapshot(token, snapshot, patch)
             .await?;
 
-        let persisted = store
-            .replace_note_if_unchanged(note.clone(), expected_updated_at, expected_deleted_at)
-            .await?;
-        if !persisted {
-            return Err(stale_note_snapshot_error(id));
+        if let Some(event) = finalizer_event.as_ref() {
+            let statements = secret_gate_atomic_statements(
+                note_replace_if_unchanged_statement(
+                    &note,
+                    expected_updated_at,
+                    expected_deleted_at,
+                ),
+                event,
+            )?
+            .into_iter()
+            .enumerate()
+            .map(|(index, statement)| PlanStatement {
+                statement,
+                guard: (index == 0).then(|| AffectedRowGuard::exactly(1)),
+            })
+            .collect();
+            let plan = AtomicOpPlan::Update(UpdatePlan {
+                target_id: id,
+                statements,
+                post_commit: PostCommitEffect::None,
+                edge_natural_key: None,
+            });
+            match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
+                Ok(AtomicRunOutcome::Committed { .. }) => {}
+                Ok(AtomicRunOutcome::RolledBack {
+                    failure: AtomicOpFailure::GuardFailed { .. },
+                    ..
+                }) => return Err(stale_note_snapshot_error(id)),
+                Ok(AtomicRunOutcome::RolledBack {
+                    failure: AtomicOpFailure::SqlError { message, .. },
+                    ..
+                }) => {
+                    return Err(RuntimeError::Internal(format!(
+                        "secret-gate note finalization rolled back: {message}"
+                    )))
+                }
+                Err(error) => {
+                    return Err(RuntimeError::Internal(format!(
+                        "secret-gate note finalization failed: {}",
+                        error.0
+                    )))
+                }
+            }
+        } else {
+            let persisted = store
+                .replace_note_if_unchanged(note.clone(), expected_updated_at, expected_deleted_at)
+                .await?;
+            if !persisted {
+                return Err(stale_note_snapshot_error(id));
+            }
         }
 
         let embedding_report = if text_changed {
@@ -2030,6 +2330,22 @@ impl KhiveRuntime {
 
         reject_pack_managed_schedule_mutation(&into_note, "merge")?;
         reject_pack_managed_schedule_mutation(&from_note, "merge")?;
+        if into_note.kind != from_note.kind {
+            return Err(RuntimeError::InvalidInput(format!(
+                "cannot merge notes of different kinds: {} vs {}",
+                into_note.kind, from_note.kind
+            )));
+        }
+        if into_note.kind == "message"
+            && (message_is_quarantined(&into_note) || message_is_quarantined(&from_note))
+        {
+            return Err(RuntimeError::InvalidInput(
+                "cannot merge a quarantined message: quarantine disposition is transport-owned \
+                 and must be released by the channel-ingest path before the content can be folded \
+                 into another record"
+                    .into(),
+            ));
+        }
 
         let _ = self.graph(token)?;
         let _ = self.text_for_notes(token)?;
@@ -2042,6 +2358,70 @@ impl KhiveRuntime {
         // handle. Both notes share a kind (checked inside), so the into-note's
         // kind decides for the merge.
         let preserve_owner_established = self.is_pack_owned_note_kind(&into_note.kind);
+
+        // secret-gate-finalizer-entry: note.update merge
+        let secret_gate_plan = if dry_run {
+            None
+        } else {
+            let merge_now = chrono::Utc::now().timestamp_micros();
+            let expected = note_merge_candidate(
+                &into_note,
+                &from_note,
+                from_id,
+                strategy,
+                content_strategy,
+                preserve_owner_established,
+                merge_now,
+            )
+            .map_err(RuntimeError::from)?;
+            let fields = SecretGateCandidateFields {
+                record_content: vec![expected.content.clone()],
+                name_description: expected.name.iter().cloned().collect(),
+                json_properties: expected.properties.clone(),
+                ..Default::default()
+            };
+            let has_stamp = expected
+                .properties
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|map| map.get(crate::secret_gate::RESERVED_SECRET_GATE_KEY))
+                .is_some();
+            let finalization = if has_stamp {
+                finalize_secret_gate_update_candidate(
+                    self,
+                    &ns,
+                    &token.actor().id,
+                    into_id,
+                    SecretGateTargetKind::Note,
+                    "merge",
+                    &fields,
+                    expected.properties.clone(),
+                )
+                .await?
+            } else {
+                finalize_secret_gate_candidate(
+                    &ns,
+                    &token.actor().id,
+                    into_id,
+                    SecretGateTargetKind::Note,
+                    "merge",
+                    &fields,
+                    expected.properties.clone(),
+                )?
+            };
+            let success_event_statements = finalization
+                .success_event
+                .as_ref()
+                .map(crate::secret_gate_finalizer::boundary::secret_gate_success_event_statements)
+                .transpose()?
+                .unwrap_or_default();
+            Some(NoteMergeSecretGatePlan {
+                expected,
+                finalized_properties: finalization.properties,
+                success_event_statements,
+                merge_now,
+            })
+        };
 
         let pool = self.backend().pool_arc();
         let writer_task = pool.writer_task_handle().ok().flatten();
@@ -2061,6 +2441,7 @@ impl KhiveRuntime {
                         dry_run,
                         pack_rules,
                         preserve_owner_established,
+                        secret_gate_plan,
                         MergeTxLimits::default(),
                     )
                     .map_err(|e| {
@@ -2089,6 +2470,7 @@ impl KhiveRuntime {
                         dry_run,
                         pack_rules,
                         preserve_owner_established,
+                        secret_gate_plan,
                         MergeTxLimits::default(),
                     )
                 })
@@ -2425,6 +2807,111 @@ fn read_merge_entity(
     })
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct EntityMergeCandidate {
+    name: String,
+    description: Option<String>,
+    properties: Option<Value>,
+    tags: Vec<String>,
+    properties_merged: usize,
+    tags_unioned: usize,
+    content_appended: bool,
+}
+
+#[derive(Clone)]
+struct EntityMergeSecretGatePlan {
+    expected: EntityMergeCandidate,
+    finalized_properties: Option<Value>,
+    success_event_statements: Vec<SqlStatement>,
+}
+
+/// Compute the exact property-bearing entity row the merge intends to keep.
+///
+/// A runtime-issued stamp belongs to its current target, so the absorbed
+/// entity's stamp is never one of the properties eligible for folding into a
+/// different UUID. If absorbed secret-bearing bytes survive the merge, the
+/// finalizer still sees those bytes and requires a fresh target-bound match.
+fn entity_merge_candidate(
+    into: &Entity,
+    from: &Entity,
+    strategy: EntityDedupMergePolicy,
+    content_strategy: ContentMergeStrategy,
+) -> EntityMergeCandidate {
+    let from_properties = without_absorbed_secret_gate_stamp(&from.properties);
+    let (properties, properties_merged) =
+        merge_properties(&into.properties, &from_properties, strategy);
+    let name = merge_string_field(&into.name, &from.name, strategy);
+    let (description, content_appended) = match content_strategy {
+        ContentMergeStrategy::Append => {
+            let into_description = into.description.as_deref().unwrap_or("");
+            let from_description = from.description.as_deref().unwrap_or("");
+            if from_description.is_empty() {
+                (into.description.clone(), false)
+            } else if into_description.is_empty() {
+                (from.description.clone(), true)
+            } else {
+                (
+                    Some(format!("{into_description}\n\n---\n\n{from_description}")),
+                    true,
+                )
+            }
+        }
+        ContentMergeStrategy::PreferInto => (into.description.clone(), false),
+        ContentMergeStrategy::PreferFrom => (from.description.clone(), false),
+    };
+    let (tags, tags_unioned) = union_tags(&into.tags, &from.tags);
+    EntityMergeCandidate {
+        name,
+        description,
+        properties,
+        tags,
+        properties_merged,
+        tags_unioned,
+        content_appended,
+    }
+}
+
+fn without_absorbed_secret_gate_stamp(properties: &Option<Value>) -> Option<Value> {
+    let mut properties = properties.clone();
+    if let Some(map) = properties.as_mut().and_then(Value::as_object_mut) {
+        map.remove(crate::secret_gate::RESERVED_SECRET_GATE_KEY);
+    }
+    properties
+}
+
+fn execute_secret_gate_success_statements(
+    conn: &rusqlite::Connection,
+    statements: &[SqlStatement],
+) -> Result<(), SqliteError> {
+    for statement in statements {
+        let mut prepared = conn.prepare(&statement.sql)?;
+        for (offset, parameter) in statement.params.iter().enumerate() {
+            let index = offset + 1;
+            match parameter {
+                SqlValue::Null => prepared.raw_bind_parameter(index, rusqlite::types::Null)?,
+                SqlValue::Bool(value) => prepared.raw_bind_parameter(index, i64::from(*value))?,
+                SqlValue::Integer(value) => prepared.raw_bind_parameter(index, *value)?,
+                SqlValue::Float(value) => prepared.raw_bind_parameter(index, *value)?,
+                SqlValue::Text(value) => prepared.raw_bind_parameter(index, value.as_str())?,
+                SqlValue::Blob(value) => prepared.raw_bind_parameter(index, value.as_slice())?,
+                SqlValue::Json(value) => {
+                    let serialized = serde_json::to_string(value)
+                        .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
+                    prepared.raw_bind_parameter(index, serialized.as_str())?;
+                }
+                SqlValue::Uuid(value) => {
+                    prepared.raw_bind_parameter(index, value.to_string().as_str())?
+                }
+                SqlValue::Timestamp(value) => {
+                    prepared.raw_bind_parameter(index, value.timestamp_micros())?
+                }
+            }
+        }
+        prepared.raw_execute()?;
+    }
+    Ok(())
+}
+
 /// All merge SQL on one connection inside an already-open `BEGIN IMMEDIATE` transaction.
 ///
 /// Reads both entities, rewires/drops incident edges, merges entity fields, updates FTS,
@@ -2448,6 +2935,7 @@ fn merge_entity_sql(
     dry_run: bool,
     pack_rules: Vec<EdgeEndpointRule>,
     validation: EntityMergeValidation,
+    secret_gate_plan: Option<EntityMergeSecretGatePlan>,
     limits: MergeTxLimits,
 ) -> Result<(MergeSummary, Entity), MergeEntitySqlError> {
     let mut budget = MergeTxBudget::new(limits);
@@ -2573,35 +3061,24 @@ fn merge_entity_sql(
         .collect();
 
     // --- Merge entity fields ---
-    let (merged_props, properties_merged) =
-        merge_properties(&into_entity.properties, &from_entity.properties, strategy);
-    let merged_name = merge_string_field(&into_entity.name, &from_entity.name, strategy);
-    let (merged_description, content_appended) = match content_strategy {
-        ContentMergeStrategy::Append => {
-            let into_desc = into_entity.description.as_deref().unwrap_or("");
-            let from_desc = from_entity.description.as_deref().unwrap_or("");
-            if from_desc.is_empty() {
-                (into_entity.description.clone(), false)
-            } else if into_desc.is_empty() {
-                (from_entity.description.clone(), true)
-            } else {
-                (Some(format!("{}\n\n---\n\n{}", into_desc, from_desc)), true)
-            }
+    let mut candidate =
+        entity_merge_candidate(&into_entity, &from_entity, strategy, content_strategy);
+    if let Some(plan) = secret_gate_plan.as_ref() {
+        if candidate != plan.expected {
+            return Err(MergeEntitySqlError::Refusal(
+                EntityMergeRefusal::SecretGateCandidateChanged { into_id },
+            ));
         }
-        // Description selection follows `content_strategy` directly — it is a
-        // deliberate, independently-settable choice, not derived from the
-        // entity-field `strategy` (properties/name/tags merge policy).
-        ContentMergeStrategy::PreferInto => (into_entity.description.clone(), false),
-        ContentMergeStrategy::PreferFrom => (from_entity.description.clone(), false),
-    };
-    let (merged_tags, tags_unioned) = union_tags(&into_entity.tags, &from_entity.tags);
+        candidate.properties = plan.finalized_properties.clone();
+    }
 
     let now = chrono::Utc::now().timestamp_micros();
     let into_str = into_id.to_string();
-    let props_str = merged_props
+    let props_str = candidate
+        .properties
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
-    let tags_json = serde_json::to_string(&merged_tags).unwrap_or_else(|_| "[]".to_string());
+    let tags_json = serde_json::to_string(&candidate.tags).unwrap_or_else(|_| "[]".to_string());
 
     // Writes are gated on `!dry_run` below, but the loop itself always runs so a
     // dry-run response reports a predictive `edges_rewired` count instead of zero.
@@ -2806,8 +3283,8 @@ fn merge_entity_sql(
                  updated_at = ?5, merged_into = NULL, merge_event_id = NULL \
              WHERE namespace = ?6 AND id = ?7",
             rusqlite::params![
-                &merged_name,
-                &merged_description,
+                &candidate.name,
+                &candidate.description,
                 &props_str,
                 &tags_json,
                 now,
@@ -2819,9 +3296,11 @@ fn merge_entity_sql(
         // Body formula mirrors entity_fts_document (the canonical constructor):
         // this path is sync/spawn_blocking so it can't call it directly, but
         // must stay field-identical.
-        let fts_body = match &merged_description {
-            Some(d) if !d.is_empty() => format!("{} {}", merged_name, d),
-            _ => merged_name.clone(),
+        let fts_body = match &candidate.description {
+            Some(description) if !description.is_empty() => {
+                format!("{} {description}", candidate.name)
+            }
+            _ => candidate.name.clone(),
         };
         let kind_str = SubstrateKind::Entity.to_string();
 
@@ -2842,7 +3321,7 @@ fn merge_entity_sql(
             rusqlite::params![
                 &into_str,
                 &kind_str,
-                &merged_name,
+                &candidate.name,
                 &fts_body,
                 &tags_json,
                 &namespace,
@@ -2880,17 +3359,24 @@ fn merge_entity_sql(
                 &from_str,
             ],
         )?;
+
+        if let Some(plan) = secret_gate_plan.as_ref() {
+            execute_secret_gate_success_statements(conn, &plan.success_event_statements)?;
+        }
     }
 
+    let properties_merged = candidate.properties_merged;
+    let tags_unioned = candidate.tags_unioned;
+    let content_appended = candidate.content_appended;
     let updated_entity = Entity {
         id: into_id,
         namespace,
         kind: into_entity.kind,
         entity_type: into_entity.entity_type,
-        name: merged_name,
-        description: merged_description,
-        properties: merged_props,
-        tags: merged_tags,
+        name: candidate.name,
+        description: candidate.description,
+        properties: candidate.properties,
+        tags: candidate.tags,
         created_at: into_entity.created_at,
         updated_at: now,
         deleted_at: into_entity.deleted_at,
@@ -3030,6 +3516,86 @@ fn append_merge_history(props: Option<Value>, entry: Value) -> Result<Option<Val
     Ok(Some(Value::Object(obj)))
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct NoteMergeCandidate {
+    name: Option<String>,
+    content: String,
+    properties: Option<Value>,
+    salience: Option<f64>,
+    expires_at: Option<i64>,
+    properties_merged: usize,
+    content_appended: bool,
+}
+
+#[derive(Clone)]
+struct NoteMergeSecretGatePlan {
+    expected: NoteMergeCandidate,
+    finalized_properties: Option<Value>,
+    success_event_statements: Vec<SqlStatement>,
+    merge_now: i64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn note_merge_candidate(
+    into: &khive_storage::note::Note,
+    from: &khive_storage::note::Note,
+    from_id: Uuid,
+    strategy: EntityDedupMergePolicy,
+    content_strategy: ContentMergeStrategy,
+    preserve_owner_established: bool,
+    now: i64,
+) -> Result<NoteMergeCandidate, SqliteError> {
+    let (content, content_appended) = match content_strategy {
+        ContentMergeStrategy::Append => {
+            if from.content.is_empty() {
+                (into.content.clone(), false)
+            } else {
+                (format!("{}\n\n---\n\n{}", into.content, from.content), true)
+            }
+        }
+        ContentMergeStrategy::PreferInto => (into.content.clone(), false),
+        ContentMergeStrategy::PreferFrom => (from.content.clone(), false),
+    };
+    let name = match strategy {
+        EntityDedupMergePolicy::PreferFrom => from.name.clone().or(into.name.clone()),
+        _ => into.name.clone().or(from.name.clone()),
+    };
+
+    let from_properties = without_absorbed_secret_gate_stamp(&from.properties);
+    let (mut properties, _) = merge_properties(&into.properties, &from_properties, strategy);
+    if preserve_owner_established {
+        preserve_owner_established_properties(&into.properties, &mut properties);
+    }
+    if into.kind == "message" {
+        preserve_message_transport_properties(&into.properties, &mut properties);
+    }
+    let properties_merged =
+        count_new_property_keys(into.properties.as_ref(), properties.as_ref(), strategy);
+    let merge_history_entry = serde_json::json!({
+        "merged_from": from_id.to_string(),
+        "merged_at": now,
+        "strategy": format!("{:?}", strategy),
+        "content_strategy": format!("{:?}", content_strategy),
+    });
+    let properties = append_merge_history(properties, merge_history_entry)?;
+    let salience = max_option_f64(into.salience, from.salience);
+    let expires_at = match (into.expires_at, from.expires_at) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+
+    Ok(NoteMergeCandidate {
+        name,
+        content,
+        properties,
+        salience,
+        expires_at,
+        properties_merged,
+        content_appended,
+    })
+}
+
 /// All note merge SQL on one connection inside a `BEGIN IMMEDIATE` transaction.
 ///
 /// Reads both notes (must have same `kind`), rewires/drops incident edges, merges content
@@ -3052,6 +3618,7 @@ fn merge_note_sql(
     dry_run: bool,
     pack_rules: Vec<EdgeEndpointRule>,
     preserve_owner_established: bool,
+    secret_gate_plan: Option<NoteMergeSecretGatePlan>,
     limits: MergeTxLimits,
 ) -> Result<(MergeSummary, khive_storage::note::Note), SqliteError> {
     let mut budget = MergeTxBudget::new(limits);
@@ -3097,7 +3664,10 @@ fn merge_note_sql(
         ));
     }
 
-    let now = chrono::Utc::now().timestamp_micros();
+    let now = secret_gate_plan
+        .as_ref()
+        .map(|plan| plan.merge_now)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_micros());
     let into_str = into_id.to_string();
     let from_str = from_id.to_string();
 
@@ -3169,73 +3739,27 @@ fn merge_note_sql(
         .map(|edge| (edge.id, edge.clone()))
         .collect();
 
-    // Merge note fields.
-    let (merged_content, content_appended) = match content_strategy {
-        ContentMergeStrategy::Append => {
-            if from_note.content.is_empty() {
-                (into_note.content.clone(), false)
-            } else {
-                (
-                    format!("{}\n\n---\n\n{}", into_note.content, from_note.content),
-                    true,
-                )
-            }
-        }
-        ContentMergeStrategy::PreferInto => (into_note.content.clone(), false),
-        ContentMergeStrategy::PreferFrom => (from_note.content.clone(), false),
-    };
-
-    let merged_name = match strategy {
-        EntityDedupMergePolicy::PreferFrom => from_note.name.clone().or(into_note.name.clone()),
-        _ => into_note.name.clone().or(from_note.name.clone()),
-    };
-
-    let (mut merged_props, _) =
-        merge_properties(&into_note.properties, &from_note.properties, strategy);
-
-    // A merge folds two records together; it does not transfer attribution.
-    // On a pack-owned note kind the into-note's owned identity properties are
-    // restored after the fold, under every strategy including `PreferFrom`, so
-    // the surviving row still says who wrote it.
-    if preserve_owner_established {
-        preserve_owner_established_properties(&into_note.properties, &mut merged_props);
-    }
-    if into_note.kind == "message" {
-        preserve_message_transport_properties(&into_note.properties, &mut merged_props);
-    }
-
-    // Recomputed from the final retained properties rather than carried
-    // forward from the fold's own count. The fold's count and post-
-    // restoration reality diverge whenever an owner-established key holds a
-    // nested object: `union` recurses into it and counts the absorbed
-    // note's leaf as merged, but restoration then reverts the whole key,
-    // and the fold's flat "keys contributed" number cannot express a
-    // partial reversal of a nested contribution. Diffing the final object
-    // against the into-note's pre-merge properties sidesteps that fold/
-    // restoration coupling entirely.
-    let properties_merged = count_new_property_keys(
-        into_note.properties.as_ref(),
-        merged_props.as_ref(),
+    // Merge note fields and verify that the transaction-start rows still
+    // produce the exact candidate finalized by the async boundary.
+    let mut candidate = note_merge_candidate(
+        &into_note,
+        &from_note,
+        from_id,
         strategy,
-    );
-
-    let merge_history_entry = serde_json::json!({
-        "merged_from": from_id.to_string(),
-        "merged_at": now,
-        "strategy": format!("{:?}", strategy),
-        "content_strategy": format!("{:?}", content_strategy),
-    });
-    let merged_props = append_merge_history(merged_props, merge_history_entry)?;
-
-    let merged_salience = max_option_f64(into_note.salience, from_note.salience);
-    let merged_expires_at = match (into_note.expires_at, from_note.expires_at) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-
-    let props_str = merged_props
+        content_strategy,
+        preserve_owner_established,
+        now,
+    )?;
+    if let Some(plan) = secret_gate_plan.as_ref() {
+        if candidate != plan.expected {
+            return Err(SqliteError::InvalidData(format!(
+                "note {into_id} changed concurrently after secret-gate finalization; retry with fresh state"
+            )));
+        }
+        candidate.properties = plan.finalized_properties.clone();
+    }
+    let props_str = candidate
+        .properties
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
 
@@ -3417,11 +3941,11 @@ fn merge_note_sql(
                 &namespace,
                 &into_note.kind,
                 &into_note.status,
-                &merged_name,
-                &merged_content,
-                merged_salience,
+                &candidate.name,
+                &candidate.content,
+                candidate.salience,
                 into_note.decay_factor,
-                merged_expires_at,
+                candidate.expires_at,
                 &props_str,
                 into_note.created_at,
                 now,
@@ -3440,10 +3964,10 @@ fn merge_note_sql(
         // is an empty string (not SQL NULL) for nameless notes, so get_document
         // round-trips None <-> "" correctly.
         let fts_merged = {
-            let mut merged_note = Note::new(&namespace, &*into_note.kind, &*merged_content);
+            let mut merged_note = Note::new(&namespace, &*into_note.kind, &candidate.content);
             merged_note.id = into_id;
-            merged_note.name = merged_name.clone();
-            merged_note.properties = merged_props.clone();
+            merged_note.name = candidate.name.clone();
+            merged_note.properties = candidate.properties.clone();
             merged_note.updated_at = now;
             note_fts_scalars(&merged_note)
         };
@@ -3487,19 +4011,26 @@ fn merge_note_sql(
              WHERE namespace = ?2 AND id = ?3 AND deleted_at IS NULL",
             rusqlite::params![now, &namespace, &from_str],
         )?;
+
+        if let Some(plan) = secret_gate_plan.as_ref() {
+            execute_secret_gate_success_statements(conn, &plan.success_event_statements)?;
+        }
     }
+
+    let properties_merged = candidate.properties_merged;
+    let content_appended = candidate.content_appended;
 
     let updated_note = khive_storage::note::Note {
         id: into_id,
         namespace: namespace.clone(),
         kind: into_note.kind.clone(),
         status: into_note.status.clone(),
-        name: merged_name,
-        content: merged_content,
-        salience: merged_salience,
+        name: candidate.name,
+        content: candidate.content,
+        salience: candidate.salience,
         decay_factor: into_note.decay_factor,
-        expires_at: merged_expires_at,
-        properties: merged_props,
+        expires_at: candidate.expires_at,
+        properties: candidate.properties,
         created_at: into_note.created_at,
         updated_at: now,
         deleted_at: into_note.deleted_at,
@@ -4525,6 +5056,7 @@ mod tests {
             changed_fields,
             _expected_updated_at,
             _expected_deleted_at,
+            _finalizer_event,
         ) = rt
             .prepare_update_entity(
                 &tok,
@@ -4662,9 +5194,9 @@ mod tests {
             })
         };
 
-        let (entity_a, _, _, expected_updated_at_a, expected_deleted_at_a) =
+        let (entity_a, _, _, expected_updated_at_a, expected_deleted_at_a, _) =
             reader_a.await.unwrap().expect("reader A prepares");
-        let (entity_b, _, _, expected_updated_at_b, expected_deleted_at_b) =
+        let (entity_b, _, _, expected_updated_at_b, expected_deleted_at_b, _) =
             reader_b.await.unwrap().expect("reader B prepares");
         assert_eq!(
             expected_updated_at_a, expected_updated_at_b,
@@ -4835,7 +5367,7 @@ mod tests {
             .expect("seed entity");
         let id = entity.id;
 
-        let (mut replacement, _, _, expected_updated_at, expected_deleted_at) = rt
+        let (mut replacement, _, _, expected_updated_at, expected_deleted_at, _) = rt
             .prepare_update_entity(
                 &tok,
                 id,
@@ -4932,7 +5464,7 @@ mod tests {
         let id = entity.id;
 
         // Snapshot BEFORE the delete: this is the stale writer's view.
-        let (replacement, _, _, expected_updated_at, expected_deleted_at) = rt
+        let (replacement, _, _, expected_updated_at, expected_deleted_at, _) = rt
             .prepare_update_entity(
                 &tok,
                 id,
@@ -9890,6 +10422,7 @@ mod tests {
                     false,
                     pack_rules,
                     EntityMergeValidation::LegacyKind,
+                    None,
                     limits,
                 )
                 .map_err(|error| match error {
@@ -9928,6 +10461,7 @@ mod tests {
                     true,
                     pack_rules,
                     EntityMergeValidation::LegacyKind,
+                    None,
                     MergeTxLimits {
                         max_rows: usize::MAX,
                         max_bytes: usize::MAX,
@@ -10062,6 +10596,7 @@ mod tests {
                     false,
                     pack_rules,
                     false,
+                    None,
                     limits,
                 )
             })
@@ -10652,5 +11187,379 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(unchanged.properties, Some(serde_json::json!({"k": "v"})));
+    }
+
+    #[tokio::test]
+    async fn update_entity_normalizes_real_persisted_stamp_echo() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let reviewed_name = ["AKIA", "CURATIONFIXTURE", "000000"].concat();
+        let _arm = crate::arm_secret_gate_test_exemption(
+            tok.namespace().as_str(),
+            crate::SecretGateFieldScope::NameDescription,
+            &reviewed_name,
+        );
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                &reviewed_name,
+                None,
+                Some(serde_json::json!({"original": true})),
+                vec![],
+            )
+            .await
+            .expect("fixture-backed entity is persisted with a real stamp");
+        let mut echoed = entity
+            .properties
+            .clone()
+            .expect("stamped properties")
+            .as_object()
+            .expect("object properties")
+            .clone();
+        echoed.insert("unrelated".into(), serde_json::json!("changed"));
+
+        let updated = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    properties: Some(Value::Object(echoed)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("byte-identical target stamp echo is stripped before merge");
+        assert_eq!(
+            updated
+                .properties
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|map| map.get("khive:secret_gate")),
+            Some(&Value::String("exempted:content-sha256-manifest-v1".into()))
+        );
+        assert_eq!(updated.properties.as_ref().unwrap()["unrelated"], "changed");
+
+        let mut differing = updated.properties.clone().unwrap();
+        differing["khive:secret_gate"] = Value::String("exempted:different".into());
+        let differing_error = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    properties: Some(differing),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a differing stamp value is never an echo");
+        assert!(differing_error.to_string().contains("byte-identical"));
+
+        let unstamped = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "unstamped-transplant-target",
+                None,
+                Some(serde_json::json!({"ordinary": true})),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let transplant_error = rt
+            .update_entity(
+                &tok,
+                unstamped.id,
+                EntityPatch {
+                    properties: updated.properties.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a real stamp cannot be transplanted to another target");
+        assert!(transplant_error.to_string().contains("byte-identical"));
+
+        let removal_error = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    properties: Some(Value::Null),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a replacement-shaped removal must fail");
+        assert!(removal_error.to_string().contains("remove"));
+
+        let stripped = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    name: Some("safe replacement name".into()),
+                    properties: updated.properties.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("changing the exempted bytes re-evaluates and drops the old stamp");
+        assert!(
+            stripped
+                .properties
+                .as_ref()
+                .and_then(Value::as_object)
+                .is_some_and(|map| !map.contains_key("khive:secret_gate")),
+            "a stamp must not launder changed exempted bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_note_normalizes_real_persisted_stamp_echo() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let reviewed_content = ["AKIA", "NOTEECHOFIXTURE", "000000"].concat();
+        let _arm = crate::arm_secret_gate_test_exemption(
+            tok.namespace().as_str(),
+            crate::SecretGateFieldScope::RecordContent,
+            &reviewed_content,
+        );
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                &reviewed_content,
+                None,
+                Some(serde_json::json!({"original": true})),
+                vec![],
+            )
+            .await
+            .expect("fixture-backed note is persisted with a real stamp");
+        let mut echoed = note.properties.clone().unwrap();
+        echoed["unrelated"] = Value::Bool(true);
+
+        let updated = rt
+            .update_note(
+                &tok,
+                note.id,
+                NotePatch::new(None, None, None, None, Some(echoed)),
+            )
+            .await
+            .expect("exact note stamp echo succeeds");
+        assert_eq!(
+            updated.properties.as_ref().unwrap()["khive:secret_gate"],
+            Value::String("exempted:content-sha256-manifest-v1".into())
+        );
+
+        let changed = rt
+            .update_note(
+                &tok,
+                note.id,
+                NotePatch::new(
+                    None,
+                    Some("safe replacement content".into()),
+                    None,
+                    None,
+                    updated.properties.clone(),
+                ),
+            )
+            .await
+            .expect("changed note content is rescanned without carrying the old stamp");
+        assert!(changed
+            .properties
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(|map| !map.contains_key("khive:secret_gate")));
+    }
+
+    #[tokio::test]
+    async fn merge_entity_refinalizes_absorbed_secret_for_the_survivor() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "safe merge survivor",
+                None,
+                Some(serde_json::json!({"into": true})),
+                vec![],
+            )
+            .await
+            .expect("create survivor");
+        let reviewed_name = ["AKIA", "MERGEENTITYFIX", "0000"].concat();
+        let _source_arm = crate::arm_secret_gate_test_exemption(
+            tok.namespace().as_str(),
+            crate::SecretGateFieldScope::NameDescription,
+            &reviewed_name,
+        );
+        let from = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                &reviewed_name,
+                None,
+                Some(serde_json::json!({"from": true})),
+                vec![],
+            )
+            .await
+            .expect("create independently finalized absorbed entity");
+
+        let _merge_arm = crate::arm_secret_gate_test_exemption(
+            tok.namespace().as_str(),
+            crate::SecretGateFieldScope::NameDescription,
+            &reviewed_name,
+        );
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferFrom,
+            ContentMergeStrategy::PreferInto,
+            false,
+        )
+        .await
+        .expect("merge consumes a fresh match for the surviving UUID");
+
+        let survivor = rt.get_entity(&tok, into.id).await.expect("read survivor");
+        assert_eq!(survivor.name, reviewed_name);
+        assert_eq!(
+            survivor.properties.as_ref().unwrap()["khive:secret_gate"],
+            "exempted:content-sha256-manifest-v1"
+        );
+
+        let mut reader = rt.sql().reader().await.expect("audit reader");
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT payload, aggregate_kind, target_id FROM events \
+                      WHERE namespace=?1 AND verb='secret_gate.finalize' AND target_id=?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(tok.namespace().as_str().to_owned()),
+                    SqlValue::Text(into.id.to_string()),
+                ],
+                label: Some("test.secret_gate.entity_merge_audit".into()),
+            })
+            .await
+            .expect("query merge finalizer audit")
+            .expect("target-bound merge audit");
+        assert!(matches!(
+            row.get("aggregate_kind"),
+            Some(SqlValue::Text(value)) if value == "entity"
+        ));
+        assert!(matches!(
+            row.get("target_id"),
+            Some(SqlValue::Text(value)) if value == &into.id.to_string()
+        ));
+        let payload = match row.get("payload") {
+            Some(SqlValue::Text(value)) => value,
+            other => panic!("missing payload: {other:?}"),
+        };
+        assert!(
+            !payload.contains(&reviewed_name),
+            "target-bound audit must not disclose absorbed secret bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_note_success_audit_failure_rolls_back_record_and_stamp() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "safe merge survivor",
+                None,
+                Some(serde_json::json!({"into": true})),
+                vec![],
+            )
+            .await
+            .expect("create survivor");
+        let reviewed_content = ["AKIA", "MERGENOTEFIXTURE", "00"].concat();
+        let _source_arm = crate::arm_secret_gate_test_exemption(
+            tok.namespace().as_str(),
+            crate::SecretGateFieldScope::RecordContent,
+            &reviewed_content,
+        );
+        let from = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                &reviewed_content,
+                None,
+                Some(serde_json::json!({"from": true})),
+                vec![],
+            )
+            .await
+            .expect("create independently finalized absorbed note");
+        let survivor_before = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(into.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let _merge_arm = crate::arm_secret_gate_test_exemption(
+            tok.namespace().as_str(),
+            crate::SecretGateFieldScope::RecordContent,
+            &reviewed_content,
+        );
+        let _failure_arm = crate::arm_secret_gate_test_audit_failure(tok.namespace().as_str());
+        rt.merge_note(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferFrom,
+            ContentMergeStrategy::PreferFrom,
+            false,
+        )
+        .await
+        .expect_err("success-audit failure must abort the merge transaction");
+
+        let survivor_after = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(into.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            survivor_after, survivor_before,
+            "survivor write rolled back"
+        );
+        assert!(
+            rt.notes(&tok)
+                .unwrap()
+                .get_note(from.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "absorbed note tombstone rolled back"
+        );
+
+        let mut reader = rt.sql().reader().await.expect("audit count reader");
+        let count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM events WHERE namespace=?1 \
+                      AND verb='secret_gate.finalize' AND target_id=?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(tok.namespace().as_str().to_owned()),
+                    SqlValue::Text(into.id.to_string()),
+                ],
+                label: Some("test.secret_gate.note_merge_rollback_audit".into()),
+            })
+            .await
+            .expect("count target audit events");
+        assert!(matches!(count, Some(SqlValue::Integer(0))));
     }
 }

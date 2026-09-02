@@ -146,6 +146,100 @@ pub fn check_tags(tags: &[String]) -> RuntimeResult<()> {
 /// subject to [`check_json`], never a posture mutation.
 pub const RESERVED_SECRET_GATE_KEY: &str = "khive:secret_gate";
 
+/// The only value the runtime may persist under [`RESERVED_SECRET_GATE_KEY`].
+///
+/// Keeping the spelling next to the reservation primitive makes echo
+/// normalization compare the actual posture value rather than treating any
+/// pre-reservation caller-written value as a runtime stamp.
+pub const SECRET_GATE_EXEMPTION_STAMP: &str = "exempted:content-sha256-manifest-v1";
+
+/// How a properties-bearing write composes its supplied document with the
+/// persisted document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyWriteShape {
+    /// Object keys are merged; an omitted key leaves the persisted key alone.
+    Patch,
+    /// The supplied document replaces the complete persisted document.
+    Replace,
+}
+
+/// Strip the sole caller-tolerated appearance of the runtime posture key.
+///
+/// A byte-identical echo of the canonical value currently persisted on the
+/// target is removed from `incoming` before any diff, merge, or secret scan.
+/// The caller never supplies the stored value: the write finalizer decides
+/// whether to carry the target-bound stamp after normalization. Every other
+/// occurrence is rejected, including an echo on an unstamped target, a
+/// differing/null value, and a full replacement that omits a persisted stamp.
+///
+/// Returns `true` only when an exact echo was stripped. `persisted` must be
+/// the properties read from the target being updated; passing another
+/// record's properties is a contract violation at the call site.
+pub fn normalize_secret_gate_property_echo(
+    incoming: &mut Option<serde_json::Value>,
+    persisted: Option<&serde_json::Value>,
+    shape: PropertyWriteShape,
+) -> RuntimeResult<bool> {
+    let persisted_value = persisted
+        .and_then(serde_json::Value::as_object)
+        .and_then(|map| map.get(RESERVED_SECRET_GATE_KEY));
+    let persisted_runtime_stamp = persisted_value
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.as_bytes() == SECRET_GATE_EXEMPTION_STAMP.as_bytes());
+
+    // A pre-reservation/caller-written value is never promoted to a trusted
+    // runtime stamp merely because it happens to sit under the reserved key.
+    if persisted_value.is_some() && !persisted_runtime_stamp {
+        return Err(RuntimeError::InvalidInput(format!(
+            "persisted property key `{RESERVED_SECRET_GATE_KEY}` is not a runtime-issued stamp; \
+             remove it through operator repair before updating this record"
+        )));
+    }
+
+    let Some(incoming_value) = incoming.as_mut() else {
+        // An omitted properties field means no properties mutation, even for
+        // handlers whose *present* value has replacement semantics.
+        return Ok(false);
+    };
+    let Some(incoming_map) = incoming_value.as_object_mut() else {
+        if persisted_runtime_stamp {
+            return Err(reserved_property_error(
+                "a non-object properties value would remove the persisted runtime stamp",
+            ));
+        }
+        return Ok(false);
+    };
+
+    if let Some(supplied) = incoming_map.get(RESERVED_SECRET_GATE_KEY) {
+        let exact_echo = persisted_runtime_stamp
+            && supplied
+                .as_str()
+                .is_some_and(|value| value.as_bytes() == SECRET_GATE_EXEMPTION_STAMP.as_bytes());
+        if !exact_echo {
+            return Err(reserved_property_error(
+                "the supplied value is not a byte-identical stamp on this target",
+            ));
+        }
+        incoming_map.remove(RESERVED_SECRET_GATE_KEY);
+        return Ok(true);
+    }
+
+    if persisted_runtime_stamp && shape == PropertyWriteShape::Replace {
+        return Err(reserved_property_error(
+            "a full properties replacement cannot remove the persisted runtime stamp",
+        ));
+    }
+
+    Ok(false)
+}
+
+fn reserved_property_error(reason: &str) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "property key `{RESERVED_SECRET_GATE_KEY}` is runtime-owned and cannot be created, \
+         replaced, merged, or removed by callers: {reason}"
+    ))
+}
+
 /// Reject a caller-supplied top-level `khive:secret_gate` property key.
 ///
 /// Call this before any diff, merge, or storage preparation touches
@@ -162,10 +256,9 @@ pub fn reject_reserved_secret_gate_property(
 ) -> RuntimeResult<()> {
     if let Some(serde_json::Value::Object(map)) = properties {
         if map.contains_key(RESERVED_SECRET_GATE_KEY) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "property key `{RESERVED_SECRET_GATE_KEY}` is runtime-owned and cannot be \
-                 created, replaced, merged, or removed by callers"
-            )));
+            return Err(reserved_property_error(
+                "no persisted target stamp was supplied for echo normalization",
+            ));
         }
     }
     Ok(())
@@ -275,7 +368,7 @@ fn keep_leftmost<'a>(
 }
 
 /// Return the first `SecretMatch` found in `text`, or `None`.
-fn scan(text: &str) -> Option<SecretMatch> {
+pub(crate) fn scan(text: &str) -> Option<SecretMatch> {
     scan_match(text).map(|(slice, detector)| build_match(detector, slice))
 }
 
@@ -2962,6 +3055,64 @@ mod tests {
             "khive:secret_gate": "exempted:content-sha256-manifest-v1",
         });
         assert!(reject_reserved_secret_gate_property(Some(&props)).is_err());
+    }
+
+    #[test]
+    fn exact_persisted_stamp_echo_is_stripped_before_patch_merge() {
+        let persisted =
+            serde_json::json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"});
+        let mut incoming = Some(serde_json::json!({
+            "khive:secret_gate": "exempted:content-sha256-manifest-v1",
+            "unrelated": "changed"
+        }));
+
+        let normalized = normalize_secret_gate_property_echo(
+            &mut incoming,
+            Some(&persisted),
+            PropertyWriteShape::Patch,
+        )
+        .expect("byte-identical persisted stamp echo is a no-op");
+
+        assert!(normalized);
+        assert_eq!(incoming, Some(serde_json::json!({"unrelated": "changed"})));
+    }
+
+    #[test]
+    fn stamp_echo_normalization_rejects_forgery_difference_and_removal() {
+        let persisted =
+            serde_json::json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"});
+
+        let mut unstamped_target = Some(persisted.clone());
+        assert!(normalize_secret_gate_property_echo(
+            &mut unstamped_target,
+            None,
+            PropertyWriteShape::Patch,
+        )
+        .is_err());
+
+        let mut different = Some(serde_json::json!({"khive:secret_gate": "forged"}));
+        assert!(normalize_secret_gate_property_echo(
+            &mut different,
+            Some(&persisted),
+            PropertyWriteShape::Patch,
+        )
+        .is_err());
+
+        let mut explicit_null = Some(serde_json::json!({"khive:secret_gate": null}));
+        assert!(normalize_secret_gate_property_echo(
+            &mut explicit_null,
+            Some(&persisted),
+            PropertyWriteShape::Patch,
+        )
+        .is_err());
+
+        let mut full_replacement_without_stamp = Some(serde_json::json!({"other": true}));
+        assert!(normalize_secret_gate_property_echo(
+            &mut full_replacement_without_stamp,
+            Some(&persisted),
+            PropertyWriteShape::Replace,
+        )
+        .is_err());
     }
 
     #[test]

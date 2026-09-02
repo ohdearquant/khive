@@ -124,6 +124,8 @@ mod tests {
         match decl {
             DeclSubstrate::Entity => Substrate::Entity,
             DeclSubstrate::Note => Substrate::Note,
+            DeclSubstrate::KnowledgeAtom => Substrate::KnowledgeAtom,
+            DeclSubstrate::KnowledgeDomain => Substrate::KnowledgeDomain,
         }
     }
 

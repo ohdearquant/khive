@@ -147,6 +147,16 @@ pub use runtime::{
     NoteMutationHookFn, NoteWriteValidatorFn, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
+#[cfg(any(test, feature = "test-internals"))]
+pub use secret_gate_finalizer::boundary::{
+    arm_secret_gate_test_audit_failure, arm_secret_gate_test_exemption, SecretGateAuditFailureArm,
+    SecretGateTestArm,
+};
+pub use secret_gate_finalizer::boundary::{
+    finalize_secret_gate_candidate, finalize_secret_gate_update_candidate,
+    secret_gate_atomic_statements, SecretGateCandidateFields, SecretGateFieldScope,
+    SecretGateFinalization, SecretGateTargetKind,
+};
 pub use validation::{
     GraphPatch, GraphSnapshot, RuleFn, RuleId, Severity, ValidationContext, ValidationReport,
     ValidationRule, Violation,

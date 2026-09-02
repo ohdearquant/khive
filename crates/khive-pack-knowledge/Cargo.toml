@@ -36,6 +36,7 @@ toml = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+khive-runtime = { version = "0.8.0", path = "../khive-runtime", features = ["test-internals"] }
 khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
 # Test-only: builds the two-backend (secondary + core main) runtime for the
 # ADR-073 concept-tier routing regression tests.

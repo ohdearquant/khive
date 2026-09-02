@@ -20,7 +20,11 @@ use serde::Serialize;
 use khive_db::StorageBackend;
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_pack_code::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions};
-use khive_runtime::{entity_fts_document, note_fts_document, secret_gate, KhiveRuntime, Namespace};
+use khive_runtime::{
+    entity_fts_document, finalize_secret_gate_candidate, note_fts_document, secret_gate,
+    secret_gate_atomic_statements, KhiveRuntime, Namespace, SecretGateCandidateFields,
+    SecretGateTargetKind,
+};
 use khive_storage::{SqlStatement, SqlValue, SubstrateKind};
 
 /// Upper bound on how long the real ingest path waits for the pool's writer
@@ -198,10 +202,78 @@ where
     // identity that makes re-ingest idempotent) has no dispatch-level
     // equivalent today — so the gate has to run here instead of being
     // inherited for free from the shared create handler.
-    preflight_secret_gate(&batch)?;
-
     if args.dry_run {
+        // A dry run has no atomic record+stamp+audit commit in which an
+        // exemption could be consumed, so it deliberately exercises the
+        // legacy fail-closed scanner only.
+        preflight_secret_gate(&batch)?;
         return dry_run_report(cfg.db_path.as_deref(), &batch).await;
+    }
+
+    // Edge metadata is outside ADR-115's admission surface and remains on
+    // the legacy fail-closed scanner.
+    preflight_edge_secret_gate(&batch)?;
+
+    // Finalize every entity/note before runtime construction. This preserves
+    // the command's zero-filesystem-effect refusal contract while also
+    // ensuring a late candidate failure cannot leave an earlier batch member
+    // persisted. Runtime-issued events are committed only for rows that pass
+    // the idempotency probe below.
+    let namespace = cfg.default_namespace.as_str().to_owned();
+    let actor = cfg
+        .actor_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("local")
+        .to_owned();
+    let mut finalized_entities = Vec::with_capacity(batch.entities.len());
+    for entity in &batch.entities {
+        let mut entity = entity.clone();
+        // secret-gate-finalizer-entry: entity.create code.ingest
+        let finalization = finalize_secret_gate_candidate(
+            &namespace,
+            &actor,
+            entity.id,
+            SecretGateTargetKind::Entity,
+            "entity.create",
+            &SecretGateCandidateFields {
+                name_description: entity
+                    .description
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(entity.name.clone()))
+                    .collect(),
+                json_properties: entity.properties.clone(),
+                tags: entity.tags.clone(),
+                ..SecretGateCandidateFields::default()
+            },
+            entity.properties.take(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        entity.properties = finalization.properties;
+        finalized_entities.push((entity, finalization.success_event));
+    }
+    let mut finalized_notes = Vec::with_capacity(batch.notes.len());
+    for note in &batch.notes {
+        let mut note = note.clone();
+        // secret-gate-finalizer-entry: note.create code.ingest
+        let finalization = finalize_secret_gate_candidate(
+            &namespace,
+            &actor,
+            note.id,
+            SecretGateTargetKind::Note,
+            "note.create",
+            &SecretGateCandidateFields {
+                record_content: vec![note.content.clone()],
+                name_description: note.name.iter().cloned().collect(),
+                json_properties: note.properties.clone(),
+                ..SecretGateCandidateFields::default()
+            },
+            note.properties.take(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        note.properties = finalization.properties;
+        finalized_notes.push((note, finalization.success_event));
     }
 
     let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -230,7 +302,8 @@ where
         let entities = runtime
             .entities(&token)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        for entity in &batch.entities {
+        let mut prepared_entities = Vec::with_capacity(finalized_entities.len());
+        for (entity, event) in finalized_entities {
             let existing = entities
                 .get_entity_including_deleted(entity.id)
                 .await
@@ -240,10 +313,42 @@ where
                 continue;
             }
             report.entities_created += 1;
-            entities
-                .upsert_entity(entity.clone())
+            prepared_entities.push((entity, event));
+        }
+
+        let notes = runtime.notes(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut prepared_notes = Vec::with_capacity(finalized_notes.len());
+        for (note, event) in finalized_notes {
+            let existing = notes
+                .get_note_including_deleted(note.id)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if existing.is_some() {
+                report.notes_skipped_existing += 1;
+                continue;
+            }
+            report.notes_created += 1;
+            prepared_notes.push((note, event));
+        }
+
+        // Every entity/note candidate has now reached the same finalizer
+        // before the first record write. A late secret failure therefore
+        // cannot leave an earlier batch member persisted.
+        for (entity, event) in &prepared_entities {
+            if let Some(event) = event.as_ref() {
+                let statements = secret_gate_atomic_statements(
+                    khive_db::stores::entity::entity_upsert_statement(entity),
+                    event,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let mut writer = runtime.sql().writer().await?;
+                writer.execute_batch(statements).await?;
+            } else {
+                entities
+                    .upsert_entity(entity.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
 
             let doc = entity_fts_document(entity);
             let embed_body = doc.body.clone();
@@ -302,21 +407,25 @@ where
             }
         }
 
-        let notes = runtime.notes(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
-        for note in &batch.notes {
-            let existing = notes
-                .get_note_including_deleted(note.id)
-                .await
+        for (note, event) in &prepared_notes {
+            if let Some(event) = event.as_ref() {
+                let mut statements = secret_gate_atomic_statements(
+                    khive_db::stores::note::note_upsert_statement(note),
+                    event,
+                )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if existing.is_some() {
-                report.notes_skipped_existing += 1;
-                continue;
+                statements.insert(
+                    1,
+                    khive_db::stores::note::note_assign_seq_statement(note.id),
+                );
+                let mut writer = runtime.sql().writer().await?;
+                writer.execute_batch(statements).await?;
+            } else {
+                notes
+                    .upsert_note(note.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
-            report.notes_created += 1;
-            notes
-                .upsert_note(note.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             if let Ok(fts) = runtime.text_for_notes(&token) {
                 if let Err(e) = fts.upsert_document(note_fts_document(note)).await {
@@ -505,6 +614,19 @@ fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
             secret_gate::check_json(properties).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(())
+}
+
+/// Fail-closed preflight for the property-bearing substrate that remains
+/// deliberately outside the shared entity/note/knowledge admission surface.
+fn preflight_edge_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
+    for edge in &batch.edges {
+        if let Some(properties) = &edge.metadata {
+            secret_gate::check_json(properties).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        secret_gate::reject_reserved_secret_gate_property(edge.metadata.as_ref())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     Ok(())

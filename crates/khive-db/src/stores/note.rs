@@ -133,6 +133,19 @@ pub fn note_upsert_statement(note: &Note) -> SqlStatement {
     }
 }
 
+/// Idempotently assign the durable, non-reusing sequence for `note_id`.
+///
+/// Raw atomic callers that compose [`note_upsert_statement`] with additional
+/// statements (for example a runtime-owned finalizer audit) must keep this in
+/// the same batch as the note row, matching [`SqlNoteStore::upsert_note`].
+pub fn note_assign_seq_statement(note_id: uuid::Uuid) -> SqlStatement {
+    SqlStatement {
+        sql: "INSERT OR IGNORE INTO notes_seq (note_id) VALUES (?1)".to_string(),
+        params: vec![SqlValue::Text(note_id.to_string())],
+        label: Some("note-assign-seq".to_string()),
+    }
+}
+
 /// Full-note compare-and-swap update used after caller-side normalization was
 /// derived from a read snapshot. Unlike [`note_upsert_statement`], this never
 /// inserts and cannot overwrite a row whose revision or deletion marker moved

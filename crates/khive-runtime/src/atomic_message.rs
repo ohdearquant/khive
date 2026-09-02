@@ -52,6 +52,10 @@ use crate::config::NamespaceToken;
 use crate::curation::note_fts_document;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::KhiveRuntime;
+use crate::secret_gate_finalizer::boundary::{
+    finalize_secret_gate_candidate, secret_gate_atomic_statements, SecretGateCandidateFields,
+    SecretGateTargetKind,
+};
 
 /// One note to write as part of an atomic set. Mirrors the subset of
 /// `create_note_inner`'s parameters `comm.send`/`comm.reply` actually use —
@@ -268,6 +272,7 @@ pub async fn create_notes_atomic_with_report(
     // ---- 1. Validate + build Note objects (all pre-write checks, same as
     // create_note_inner, before any embedding or DML is attempted). ----
     let mut notes: Vec<Note> = Vec::with_capacity(specs.len());
+    let mut secret_gate_events = Vec::with_capacity(specs.len());
     for spec in &specs {
         runtime.validate_note_kind(spec.kind)?;
         // Same owned-identity derivation every other note-write site runs
@@ -277,15 +282,6 @@ pub async fn create_notes_atomic_with_report(
         // never reaches storage verbatim on this writer either.
         let properties =
             runtime.derive_note_write_properties(spec.kind, spec.token, spec.properties.clone())?;
-        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        crate::secret_gate::check(spec.content)?;
-        if let Some(n) = spec.name {
-            crate::secret_gate::check(n)?;
-        }
-        if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
-        }
-
         let ns = spec.token.namespace().as_str();
         let mut note = Note::new(ns, spec.kind, spec.content);
         if let Some(id) = spec.id {
@@ -297,6 +293,23 @@ pub async fn create_notes_atomic_with_report(
         if let Some(p) = properties {
             note = note.with_properties(p);
         }
+        // secret-gate-finalizer-entry: note.atomic_message
+        let finalization = finalize_secret_gate_candidate(
+            ns,
+            &spec.token.actor().id,
+            note.id,
+            SecretGateTargetKind::Note,
+            "note.atomic_message",
+            &SecretGateCandidateFields {
+                record_content: vec![note.content.clone()],
+                name_description: note.name.iter().cloned().collect(),
+                json_properties: note.properties.clone(),
+                ..SecretGateCandidateFields::default()
+            },
+            note.properties.take(),
+        )?;
+        note.properties = finalization.properties;
+        secret_gate_events.push(finalization.success_event);
         notes.push(note);
     }
 
@@ -423,10 +436,26 @@ pub async fn create_notes_atomic_with_report(
     let mut plans: Vec<AtomicOpPlan> = Vec::with_capacity(notes.len());
     for (note_idx, note) in notes.iter().enumerate() {
         let outcomes_for_note = &embedding_outcomes[note_content_groups[note_idx]];
-        let mut statements = vec![PlanStatement {
-            statement: khive_db::stores::note::note_upsert_statement(note),
-            guard: Some(AffectedRowGuard::exactly(1)),
-        }];
+        let record_statement = khive_db::stores::note::note_upsert_statement(note);
+        let mut statements = if let Some(event) = &secret_gate_events[note_idx] {
+            let mut raw = secret_gate_atomic_statements(record_statement, event)?;
+            raw.insert(
+                1,
+                khive_db::stores::note::note_assign_seq_statement(note.id),
+            );
+            raw.into_iter()
+                .enumerate()
+                .map(|(index, statement)| PlanStatement {
+                    statement,
+                    guard: (index == 0).then(|| AffectedRowGuard::exactly(1)),
+                })
+                .collect()
+        } else {
+            vec![PlanStatement {
+                statement: record_statement,
+                guard: Some(AffectedRowGuard::exactly(1)),
+            }]
+        };
 
         if let Some(fault) = maybe_inject_fts_failure(&note.namespace, "fault-injected-fts") {
             statements.push(fault);

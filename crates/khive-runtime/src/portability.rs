@@ -14,6 +14,12 @@ use khive_storage::{EdgeRelation, EntityFilter};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+use crate::secret_gate::{normalize_secret_gate_property_echo, PropertyWriteShape};
+use crate::secret_gate_finalizer::boundary::{
+    finalize_secret_gate_candidate, finalize_secret_gate_update_candidate,
+    secret_gate_atomic_statements, SecretGateCandidateFields, SecretGateTargetKind,
+};
+use khive_db::stores::entity::entity_upsert_statement;
 
 // ── Archive types ─────────────────────────────────────────────────────────────
 
@@ -247,11 +253,6 @@ impl KhiveRuntime {
         // write time because they depend on mutable target state.
         for (index, entity) in archive.entities.iter().enumerate() {
             self.validate_entity_kind(&entity.kind)?;
-            // Archive content is caller-controlled input: the runtime-owned
-            // `khive:secret_gate` property key is reservation-only on import,
-            // exactly as on every other properties-bearing write path
-            // (ADR-115 Amendment 1 §3). Import never consumes exemptions.
-            crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
             if entity.name.trim().is_empty() {
                 return Err(RuntimeError::InvalidInput(format!(
                     "archive entity {index} ({}) name must be non-blank",
@@ -275,16 +276,39 @@ impl KhiveRuntime {
         let mut entities_imported = 0usize;
         let mut embedding_truncation = crate::retrieval::EmbeddingTruncationReport::default();
         for ee in &archive.entities {
+            let persisted = store.get_entity_including_deleted(ee.id).await?;
+            let mut properties = ee.properties.clone();
+            let echoed = normalize_secret_gate_property_echo(
+                &mut properties,
+                persisted
+                    .as_ref()
+                    .and_then(|entity| entity.properties.as_ref()),
+                PropertyWriteShape::Replace,
+            )?;
+            if echoed {
+                let stamp = persisted
+                    .as_ref()
+                    .and_then(|entity| entity.properties.as_ref())
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|map| map.get(crate::secret_gate::RESERVED_SECRET_GATE_KEY))
+                    .cloned()
+                    .expect("an accepted echo has a persisted runtime stamp");
+                properties
+                    .as_mut()
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("an accepted echo is object-shaped")
+                    .insert(crate::secret_gate::RESERVED_SECRET_GATE_KEY.into(), stamp);
+            }
             let created_micros = ee.created_at.timestamp_micros();
             let updated_micros = ee.updated_at.timestamp_micros();
-            let entity = khive_storage::entity::Entity {
+            let mut entity = khive_storage::entity::Entity {
                 id: ee.id,
                 namespace: ns.clone(),
                 kind: ee.kind.clone(),
                 entity_type: ee.entity_type.clone(),
                 name: ee.name.clone(),
                 description: ee.description.clone(),
-                properties: ee.properties.clone(),
+                properties,
                 tags: ee.tags.clone(),
                 created_at: created_micros,
                 updated_at: updated_micros,
@@ -293,7 +317,55 @@ impl KhiveRuntime {
                 merge_event_id: None,
                 content_ref: None,
             };
-            store.upsert_entity(entity.clone()).await?;
+            let fields = SecretGateCandidateFields {
+                name_description: entity
+                    .description
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(entity.name.clone()))
+                    .collect(),
+                json_properties: entity.properties.clone(),
+                tags: entity.tags.clone(),
+                ..SecretGateCandidateFields::default()
+            };
+            let has_stamp = entity
+                .properties
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|map| map.contains_key(crate::secret_gate::RESERVED_SECRET_GATE_KEY));
+            // secret-gate-finalizer-entry: entity.create portability.restore
+            let finalization = if has_stamp {
+                finalize_secret_gate_update_candidate(
+                    self,
+                    &ns,
+                    &token.actor().id,
+                    entity.id,
+                    SecretGateTargetKind::Entity,
+                    "entity.update",
+                    &fields,
+                    entity.properties.take(),
+                )
+                .await?
+            } else {
+                finalize_secret_gate_candidate(
+                    &ns,
+                    &token.actor().id,
+                    entity.id,
+                    SecretGateTargetKind::Entity,
+                    "entity.create",
+                    &fields,
+                    entity.properties.take(),
+                )?
+            };
+            entity.properties = finalization.properties;
+            if let Some(event) = finalization.success_event.as_ref() {
+                let statements =
+                    secret_gate_atomic_statements(entity_upsert_statement(&entity), event)?;
+                let mut writer = self.sql().writer().await?;
+                writer.execute_batch(statements).await?;
+            } else {
+                store.upsert_entity(entity.clone()).await?;
+            }
             // Reindex so imported entities are searchable via hybrid_search immediately.
             embedding_truncation.merge(self.reindex_entity(token, &entity).await?);
             entities_imported += 1;
