@@ -211,6 +211,7 @@ async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServe
 /// append beside each canonical result. The same backend still rejects writes.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advisory() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -279,6 +280,7 @@ async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advis
 
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn chmod_read_only_snapshot_default_list_keeps_items_envelope_and_sibling_audit_advisory() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -3592,6 +3594,7 @@ async fn subhandler_verbs_are_blocked_at_mcp_boundary() -> anyhow::Result<()> {
 /// when the gate lived in the shared dispatch — every handler had to be
 /// promoted to `Verb` to stay reachable, which is exactly what we are undoing.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
     use khive_mcp::tools::request::RequestParams;
 
@@ -5385,6 +5388,7 @@ async fn brain_feedback_default_agent_response_preserves_full_target_id() -> any
 /// behavior: create → output parses clean; update → output parses clean;
 /// content round-trips byte-identical.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Result<()> {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6015,6 +6019,7 @@ fn compute_config_id_normalizes_absent_and_present_but_empty_git_write_to_same_f
 /// assertion (b) fails (the entity namespace would be `"local"`) and the scoped
 /// list in (c) would be empty.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     use khive_mcp::tools::request::RequestParams;
     use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
@@ -6150,6 +6155,7 @@ fn make_format_server() -> KhiveMcpServer {
 /// ADR-078 §8.2: error envelopes are never passed through auto/table renderers.
 /// ADR-078 §8.4: ok results are rendered per-op.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn format_auto_mixed_ok_error_batch_error_stays_compact() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6210,6 +6216,7 @@ async fn format_auto_mixed_ok_error_batch_error_stays_compact() {
 /// Pins ADR-078 §8.4: a single `format` applies uniformly; `format_per_op`
 /// overrides per position.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn format_per_op_override_selects_format_per_position() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6278,6 +6285,7 @@ async fn format_per_op_override_selects_format_per_position() {
 /// effective presentation, so `full_id`/`namespace`/duplicate-props could
 /// be stripped even when that specific op was verbose.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6397,6 +6405,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
 /// AlwaysVerbose policy into the format-seam presentation. This is the *implicit
 /// policy* sibling of `presentation_per_op_verbose_preserves_*` (explicit override).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override() {
     use khive_mcp::tools::request::RequestParams;
 

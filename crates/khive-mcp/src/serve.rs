@@ -9959,6 +9959,7 @@ backend = "schedule-backend"
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn client_role_never_starts_the_schedule_component() {
         use clap::Parser;
         let args = Args::parse_from(["mcp"]);
@@ -11201,6 +11202,7 @@ backend = "kg-backend"
         }
 
         #[test]
+        #[serial_test::serial(config_ledger)]
         fn email_plan_gates_poll_and_outbox_on_daemon_role_and_backing_runtime_modes() {
             use clap::Parser;
 
@@ -11296,6 +11298,7 @@ backend = "kg-backend"
         use super::*;
 
         #[test]
+        #[serial_test::serial(config_ledger)]
         fn telegram_plan_gates_poll_and_outbox_on_backing_runtime_modes() {
             use clap::Parser;
 

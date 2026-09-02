@@ -6440,13 +6440,13 @@ pub(crate) mod tests {
     }
 
     /// `(name, body)` for every function defined in `text`, where `body`
-    /// spans from the function's signature line to the line before the
-    /// *next* function signature (or EOF). This is deliberately not a
-    /// brace-depth parse: a workspace-wide brace/indentation matcher is
-    /// exactly the kind of thing that goes quietly wrong on one odd file and
-    /// silently over- or under-scans everything after it. Bounding by "next
-    /// signature" instead means the worst case is a body that runs a little
-    /// long into trailing non-fn items, never a runaway scan.
+    /// spans from the function's signature line to the matching close of
+    /// its opening brace, found by [`brace_bounded_fn_end`]. The line
+    /// before the *next* function signature (or EOF) is passed to
+    /// `brace_bounded_fn_end` only as its own fallback bound — used when
+    /// brace counting never returns to depth zero, e.g. a signature shape
+    /// this scan doesn't recognize, or an actual brace imbalance — never as
+    /// this function's primary way of finding where a body ends.
     fn fn_bodies(text: &str) -> Vec<(String, String)> {
         let lines: Vec<&str> = text.lines().collect();
         let starts: Vec<usize> = lines
@@ -6560,6 +6560,80 @@ pub(crate) mod tests {
                 }
                 if known.iter().any(|seam| calls_name(body, seam)) {
                     known.push(name.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        known
+    }
+
+    /// [`file_seam_names`]'s closure, widened to resolve an ordinary
+    /// function-call chain that crosses source files within one crate —
+    /// e.g. a coordinator method defined in one file calling a config
+    /// reader defined in another — while still rejecting a name this scan
+    /// cannot safely resolve.
+    ///
+    /// `bodies_by_file` is one [`fn_bodies`] list per file; each entry
+    /// keeps the same per-file uniqueness gate `file_seam_names` applies
+    /// (a name only counts as *that file's* definition when it is the only
+    /// one *in that file's own text*), but growth is shared across every
+    /// file, so a name promoted from one file's chain is immediately
+    /// available to every other file's bodies on the next pass.
+    ///
+    /// A name defined identically in more than one file of the crate (the
+    /// same function name reused by two unrelated types — this workspace
+    /// has a real instance: a coordinator's own search method and an
+    /// unrelated service wrapper by the same name, in different files) is
+    /// promoted only when *every* one of its per-file-unique definitions
+    /// independently reaches the known set. Requiring the concatenated
+    /// text's exact-one-definition count instead would block such a name
+    /// forever — even though each definition, read in its own file, is
+    /// unambiguous — so this loosens the count check exactly as far as
+    /// keeping every resolution provably seam-reaching allows, and no
+    /// further: a name with even one non-reaching definition among its
+    /// per-file-unique occurrences is never promoted, which is what keeps
+    /// a generic name like `new` from becoming a crate-wide false match
+    /// the moment any single type's constructor happens to reach a seam.
+    fn crate_seam_names(bodies_by_file: &[Vec<(String, String)>], seed: &[&str]) -> Vec<String> {
+        let per_file_unique: Vec<Vec<(&str, &str)>> = bodies_by_file
+            .iter()
+            .map(|bodies| {
+                let mut counts: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for (name, _) in bodies {
+                    *counts.entry(name.as_str()).or_insert(0) += 1;
+                }
+                bodies
+                    .iter()
+                    .filter(|(name, _)| counts.get(name.as_str()).copied() == Some(1))
+                    .map(|(name, body)| (name.as_str(), body.as_str()))
+                    .collect()
+            })
+            .collect();
+
+        let mut occurrences: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for unique_in_file in &per_file_unique {
+            for (name, body) in unique_in_file {
+                occurrences.entry(name).or_default().push(body);
+            }
+        }
+
+        let mut known: Vec<String> = seed.iter().map(|s| s.to_string()).collect();
+        loop {
+            let mut grew = false;
+            for (name, bodies) in &occurrences {
+                if known.iter().any(|k| k == name) {
+                    continue;
+                }
+                if bodies
+                    .iter()
+                    .all(|body| known.iter().any(|seam| calls_name(body, seam)))
+                {
+                    known.push((*name).to_string());
                     grew = true;
                 }
             }
@@ -6780,6 +6854,8 @@ pub(crate) mod tests {
         // counts as "the crate's own handler".
         let mut crate_src_blobs: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut crate_src_bodies: std::collections::HashMap<String, Vec<Vec<(String, String)>>> =
+            std::collections::HashMap::new();
         for (path, text) in &sources {
             if !path.components().any(|c| c.as_os_str() == "src") {
                 continue;
@@ -6787,14 +6863,20 @@ pub(crate) mod tests {
             let Some(key) = crate_key(path) else {
                 continue;
             };
-            let blob = crate_src_blobs.entry(key).or_default();
+            let blob = crate_src_blobs.entry(key.clone()).or_default();
             blob.push_str(text);
             blob.push('\n');
+            crate_src_bodies
+                .entry(key)
+                .or_default()
+                .push(fn_bodies(text));
         }
         let mut crate_ledger_verbs: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for (crate_name, blob) in &crate_src_blobs {
-            let producers = file_seam_names(blob, &base_seed);
+            let empty = Vec::new();
+            let bodies_by_file = crate_src_bodies.get(crate_name).unwrap_or(&empty);
+            let producers = crate_seam_names(bodies_by_file, &base_seed);
             let verbs: Vec<String> = dispatch_verb_handlers(blob)
                 .into_iter()
                 .filter(|(_, handler)| producers.iter().any(|p| p == handler))
@@ -6803,12 +6885,61 @@ pub(crate) mod tests {
             crate_ledger_verbs.insert(crate_name.clone(), verbs);
         }
 
+        // Every source file in the crate (`src/` and `tests/` alike) —
+        // resolves an ordinary same-crate function-call chain that crosses
+        // files (a coordinator method in `dispatch.rs` calling a config
+        // reader that lands in `dispatch.rs` too, reached from a test in
+        // `tests.rs`) for the direct-call match below. Kept separate from
+        // `crate_src_bodies` above: that population stays `src/`-only so a
+        // `tests/`-only helper can never be misread as a pack's own
+        // dispatch handler.
+        //
+        // A pack's own verb-dispatch table (`dispatch_verb_handlers`'s own
+        // target shape — one function whose body is a `"verb" => ...
+        // handle_x(...)` match with many arms) is excluded from this
+        // population: "body contains a call to a known name" is sound only
+        // for a body that always makes that call, and a dispatch table's
+        // body contains a call to nearly every handler in the pack while
+        // any one invocation only ever takes one arm. Leaving it in would
+        // promote the dispatch function itself the moment *any* single
+        // verb's handler reaches a seam, which reads as "every verb reaches
+        // the ledger" — the false-positive an ordinary wrapper closure
+        // cannot produce, verb-routing is already resolved precisely by the
+        // separate `crate_ledger_verbs`/`calls_dispatch_with_verb` path
+        // above, keyed by which verb string was actually invoked.
+        let mut crate_all_bodies: std::collections::HashMap<String, Vec<Vec<(String, String)>>> =
+            std::collections::HashMap::new();
+        for (path, text) in &sources {
+            let Some(key) = crate_key(path) else {
+                continue;
+            };
+            let bodies: Vec<(String, String)> = fn_bodies(text)
+                .into_iter()
+                .filter(|(_, body)| dispatch_verb_handlers(body).len() <= 1)
+                .collect();
+            crate_all_bodies.entry(key).or_default().push(bodies);
+        }
+        let mut crate_direct_seams: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (crate_name, bodies_by_file) in &crate_all_bodies {
+            crate_direct_seams.insert(
+                crate_name.clone(),
+                crate_seam_names(bodies_by_file, &base_seed),
+            );
+        }
+
         let mut candidate_count = 0usize;
         let mut offenders = Vec::new();
 
         for (path, text) in &sources {
             let seam_names = file_seam_names(text, &base_seed);
-            let crate_verbs = crate_key(path).and_then(|key| crate_ledger_verbs.get(&key));
+            let crate_key_for_path = crate_key(path);
+            let crate_verbs = crate_key_for_path
+                .as_deref()
+                .and_then(|key| crate_ledger_verbs.get(key));
+            let crate_seams = crate_key_for_path
+                .as_deref()
+                .and_then(|key| crate_direct_seams.get(key));
             let lines: Vec<&str> = text.lines().collect();
             let test_starts: Vec<usize> = lines
                 .iter()
@@ -6825,7 +6956,10 @@ pub(crate) mod tests {
                 let end = test_body_end(&lines, start, hard_limit);
                 let span = &lines[start..end];
                 let span_text = span.join("\n");
-                let matched_direct = seam_names.iter().find(|seam| calls_name(&span_text, seam));
+                let matched_direct = seam_names
+                    .iter()
+                    .chain(crate_seams.into_iter().flatten())
+                    .find(|seam| calls_name(&span_text, seam));
                 let matched: Option<String> = matched_direct.cloned().or_else(|| {
                     crate_verbs.and_then(|verbs| {
                         verbs

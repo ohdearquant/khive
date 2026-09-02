@@ -4755,6 +4755,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn direct_recall_rejects_namespace_token_mismatch() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let pack = MemoryPack::new(rt.clone());
