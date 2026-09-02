@@ -300,6 +300,7 @@ mod tests {
             .upsert_document(TextDocument {
                 subject_id: id1,
                 kind: SubstrateKind::Entity,
+                record_kind: None,
                 namespace: "test".to_string(),
                 title: Some("Rust Programming".to_string()),
                 body: "Rust is a systems programming language.".to_string(),
@@ -314,6 +315,7 @@ mod tests {
             .upsert_document(TextDocument {
                 subject_id: id2,
                 kind: SubstrateKind::Entity,
+                record_kind: None,
                 namespace: "test".to_string(),
                 title: Some("Python Guide".to_string()),
                 body: "Python is a high-level programming language.".to_string(),
@@ -345,6 +347,7 @@ mod tests {
                 .upsert_document(TextDocument {
                     subject_id: Uuid::new_v4(),
                     kind: SubstrateKind::Note,
+                    record_kind: None,
                     namespace: "test".to_string(),
                     title: Some(format!("Doc {}", i)),
                     body: format!("Programming topic number {}.", i),
@@ -382,6 +385,7 @@ mod tests {
             .upsert_document(TextDocument {
                 subject_id: Uuid::new_v4(),
                 kind: SubstrateKind::Entity,
+                record_kind: None,
                 namespace: "test".to_string(),
                 title: Some("Alpha".to_string()),
                 body: "Alpha article content.".to_string(),
@@ -518,6 +522,7 @@ mod tests {
             .upsert_document(TextDocument {
                 subject_id: id,
                 kind: SubstrateKind::Note,
+                record_kind: None,
                 namespace: "test".to_string(),
                 title: Some("Test".to_string()),
                 body: "Test document for fusion.".to_string(),
