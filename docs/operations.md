@@ -451,7 +451,7 @@ read paths query. Engine resolution is the same one `kkernel mcp` uses (§1). Fu
 
 | Flag                              | Default                                     | Effect                                                                                  |
 | --------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `--db` / `KHIVE_DB`               | `~/.khive/khive.db`                         | Target database; with `[[backends]]`, required and must match one declared SQLite path   |
+| `--db` / `KHIVE_DB`               | `~/.khive/khive.db`                         | Target database; with `[[backends]]`, required and must match one declared SQLite path  |
 | `--config` / `KHIVE_CONFIG`       | home-fallback search                        | TOML config path                                                                        |
 | `--namespace` / `KHIVE_NAMESPACE` | `"local"` (or `[actor] id` if not explicit) | Namespace to reindex                                                                    |
 | `--model <name>`                  | unset → every registered model              | Restrict the graph (entity/note) pass to one embedding model                            |
