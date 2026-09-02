@@ -783,6 +783,7 @@ jobs:
           echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
       - name: Report unavailable coverage measurement
         if: steps.compute_coverage.outcome != 'success'
+        continue-on-error: true
         run: |
           echo "::warning title=Coverage measurement unavailable::cargo llvm-cov did not produce a result; the coverage ratchet will be skipped."
           {

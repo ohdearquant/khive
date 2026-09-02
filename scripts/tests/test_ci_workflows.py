@@ -74,6 +74,7 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
 
     def test_ratchet_requires_available_measurement_and_gate_tracks_both_jobs(self):
         workflow = workflow_text("ci.yml")
+        measurement = indented_block(workflow, "coverage-measurement", 2)
         ratchet = indented_block(workflow, "coverage-ratchet", 2)
         gate = indented_block(workflow, "ci-gate", 2)
 
@@ -85,6 +86,24 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
         self.assertIn("Check coverage does not regress", ratchet)
         self.assertIn("- coverage-measurement", gate)
         self.assertIn("- coverage-ratchet", gate)
+
+        self.assertIn(
+            "current: ${{ steps.compute_coverage.outputs.current }}", measurement
+        )
+        self.assertIn(
+            "CURRENT_COVERAGE: ${{ needs.coverage-measurement.outputs.current }}",
+            ratchet,
+        )
+
+    def test_measurement_reporting_step_is_best_effort(self):
+        workflow = workflow_text("ci.yml")
+        measurement = indented_block(workflow, "coverage-measurement", 2)
+        report_step = measurement.split(
+            "- name: Report unavailable coverage measurement", 1
+        )[1]
+
+        self.assertIn("continue-on-error: true", report_step)
+        self.assertIn("Coverage measurement unavailable", report_step)
 
 
 class AutoMergeGuardWorkflowTests(unittest.TestCase):
