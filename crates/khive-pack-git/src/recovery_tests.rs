@@ -189,7 +189,9 @@ async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(rt.clone()));
     builder.register(GitPack::new(rt.clone()));
-    builder.with_event_store(rt.events(&token).expect("event store"));
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("configure trusted runtime audit store");
     let registry = builder.build().expect("registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
     registry.apply_schema_plans(rt.backend());

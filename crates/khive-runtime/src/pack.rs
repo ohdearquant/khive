@@ -688,6 +688,22 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// Configure the registry's trusted audit sink from a runtime.
+    ///
+    /// Registry audit constructors stamp namespace and actor directly from
+    /// each resolved [`GateRequest`], including per-request daemon identity
+    /// overrides. This deliberately uses the runtime's undecorated sink: the
+    /// public token-scoped [`KhiveRuntime::events`] decorator would otherwise
+    /// replace every per-request stamp with the single actor that happened to
+    /// construct the registry.
+    pub fn with_runtime_event_store(
+        &mut self,
+        runtime: &KhiveRuntime,
+    ) -> Result<&mut Self, RuntimeError> {
+        let store = runtime.raw_events_for_namespace(self.default_namespace.as_str())?;
+        Ok(self.with_event_store(store))
+    }
+
     /// Override the ADR-133 audit-batch seam's tunables, applied when
     /// `build()` lazily constructs the batch from `event_store`.
     /// `None` (the default) uses `AuditBatchConfig::default()`. Exposed for
@@ -3020,6 +3036,52 @@ impl VerbRegistry {
         khive_types::VerbPresentationPolicy::Standard
     }
 
+    /// Resolve the declared [`VerbCategory`] for a verb name.
+    ///
+    /// Walks all registered handlers (including subhandlers) for the first
+    /// matching name and returns its speech-act category. Returns `None` for
+    /// an unregistered verb name, so a caller deciding transport-level
+    /// behavior (e.g. whether a post-dispatch condition is safe to retry)
+    /// can fail closed on an unknown verb instead of guessing a category.
+    pub fn verb_category(&self, verb: &str) -> Option<VerbCategory> {
+        self.packs
+            .iter()
+            .find_map(|pack| pack.handlers().iter().find(|h| h.name == verb))
+            .map(|handler| handler.category)
+    }
+
+    /// Verbs classified [`VerbCategory::Assertive`] that nonetheless schedule
+    /// a persisted write on every successful dispatch, so a caller re-issuing
+    /// a call in this list after a lost response duplicates that write:
+    ///
+    /// - `memory.recall` schedules `brain.record_serve`, which inserts a
+    ///   serve-ledger row keyed in part on a `served_at` timestamp captured
+    ///   fresh at dispatch time — a second dispatch inserts a second row
+    ///   rather than colliding with the first.
+    /// - `search` (the `kg` pack's bare verb) appends a `search_executed`
+    ///   event with a freshly generated id and no natural key at all.
+    ///
+    /// The speech-act category alone cannot rule this out — it describes
+    /// what the verb tells the *caller*, not what it schedules against
+    /// storage. Adding a verb here (or removing one because its side effect
+    /// was made idempotent) is a correctness decision requiring the same
+    /// scrutiny as the categorization itself.
+    const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] = &["memory.recall", "search"];
+
+    /// Whether a response lost to the daemon frame budget may be truthfully
+    /// advertised as safe to re-issue: the verb is [`VerbCategory::Assertive`]
+    /// (no institutional commitment was made) and is not on
+    /// `Self::SIDE_EFFECTING_ASSERTIVE_VERBS` (no persisted write to
+    /// duplicate on a second dispatch). An unregistered verb name resolves to
+    /// `None` from [`Self::verb_category`] and fails closed here.
+    ///
+    /// Used only by the MCP daemon's frame-budget omission decision; never
+    /// for permission checking or return-shape selection.
+    pub fn is_retry_safe_after_frame_omission(&self, verb: &str) -> bool {
+        matches!(self.verb_category(verb), Some(VerbCategory::Assertive))
+            && !Self::SIDE_EFFECTING_ASSERTIVE_VERBS.contains(&verb)
+    }
+
     /// Returns `true` if the named verb exists and is tagged
     /// `Visibility::Subhandler` (internal / operator-only).
     ///
@@ -4081,6 +4143,59 @@ pub(crate) mod tests {
                 "admission-degrade-safe verb {verb:?} is declared in \
                  khive-pack-kg/src/handler_defs.rs but is not VerbCategory::Assertive; \
                  admission degradation must not silently apply to a write-capable verb"
+            );
+        }
+    }
+
+    /// Re-derives each [`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`] entry's
+    /// classification from its owning pack's live source, the same
+    /// fail-closed pattern as `admission_degrade_safe_verbs_are_registered_assertive`
+    /// above: a category-only census would stay green even if a verb here
+    /// were quietly dropped to a different category, leaving
+    /// `is_retry_safe_after_frame_omission`'s exclusion pointed at a name
+    /// the category check would already exclude on its own — silently
+    /// removing test coverage for the exclusion list without anyone
+    /// noticing.
+    #[test]
+    fn side_effecting_assertive_verbs_are_registered_assertive() {
+        let sources: &[(&str, &str)] = &[
+            ("search", "/../khive-pack-kg/src/handler_defs.rs"),
+            ("memory.recall", "/../khive-pack-memory/src/pack.rs"),
+        ];
+        assert_eq!(
+            sources.len(),
+            VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS.len(),
+            "every entry in SIDE_EFFECTING_ASSERTIVE_VERBS needs a source-file mapping in \
+             this census, or a newly added verb would go unchecked"
+        );
+        for (verb, rel_path) in sources {
+            assert!(
+                VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS.contains(verb),
+                "census source table lists {verb:?}, which is missing from \
+                 SIDE_EFFECTING_ASSERTIVE_VERBS; keep the table and the list in sync"
+            );
+            let path = format!("{}{rel_path}", env!("CARGO_MANIFEST_DIR"));
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+            let needle = format!("\n        name: \"{verb}\",");
+            let name_pos = source.find(&needle).unwrap_or_else(|| {
+                panic!(
+                    "side-effecting-assertive verb {verb:?} has no top-level `HandlerDef` \
+                     in {path}; update SIDE_EFFECTING_ASSERTIVE_VERBS's source table or \
+                     this census"
+                )
+            });
+            let block_end = source[name_pos..]
+                .find("HandlerDef {")
+                .map(|offset| name_pos + offset)
+                .unwrap_or(source.len());
+            let block = &source[name_pos..block_end];
+            assert!(
+                block.contains("VerbCategory::Assertive"),
+                "side-effecting-assertive verb {verb:?} is declared in {path} but is not \
+                 VerbCategory::Assertive; is_retry_safe_after_frame_omission's exclusion \
+                 list only needs to cover verbs the category check would otherwise wave \
+                 through"
             );
         }
     }

@@ -158,6 +158,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         khive_runtime::daemon::acquire_recovery_lock()
     };
     let (server, schedule_rt) = build_server(&args).await?;
+    tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
 
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, &args);
@@ -537,15 +538,15 @@ fn ingest_namespace_from_env() -> String {
 
 /// Resolve the default inbound actor for fresh (uncorrelated) email messages.
 ///
-/// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"lambda:leo"` when the
+/// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"local"` when the
 /// variable is unset or blank. Called once at server startup alongside
-/// `ingest_namespace_from_env`.
+/// `ingest_namespace_from_env`, and defaults to the same neutral value.
 #[cfg(feature = "channel-email")]
 fn default_inbound_actor_from_env() -> String {
     std::env::var("KHIVE_EMAIL_DEFAULT_ACTOR")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "lambda:leo".to_string())
+        .unwrap_or_else(|| "local".to_string())
 }
 
 /// Parse the outbox allowlist from `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS`.
@@ -2004,6 +2005,7 @@ pub async fn serve_server(
              in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
         );
     }
+    tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, args);
     #[cfg(feature = "channel-telegram")]
@@ -2878,10 +2880,8 @@ async fn build_registry_for_multi_backend_inner(
 
     if default_runtime.is_read_only() {
         builder.with_read_only_audit_store();
-    } else if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
-        if let Ok(event_store) = default_runtime.events(&tok) {
-            builder.with_event_store(event_store);
-        }
+    } else if let Err(error) = builder.with_runtime_event_store(&default_runtime) {
+        tracing::warn!(%error, "registry audit event store is unavailable");
     }
 
     khive_runtime::PackRegistry::register_packs_with_runtimes(
@@ -3861,6 +3861,20 @@ pub fn resolved_database_disclosure(
     }
 }
 
+/// One-line, stdout-safe disclosure of the actor selected by the resolved
+/// CLI/project/environment precedence chain.
+pub fn resolved_actor_disclosure(actor_id: Option<&str>) -> String {
+    let actor = khive_runtime::resolve_actor(actor_id);
+    if khive_runtime::actor_is_unattributed(&actor) {
+        format!(
+            "actor: {:?} (resolved; unattributed local fallback)",
+            actor.id
+        )
+    } else {
+        format!("actor: {:?} (resolved; attributed)", actor.id)
+    }
+}
+
 /// Inputs for [`resolve_runtime_config`] — the subset of serve-time arguments
 /// that determine the resolved [`RuntimeConfig`]. Callers other than
 /// `kkernel mcp` (e.g. `kkernel reindex`) supply these directly so they resolve
@@ -4332,6 +4346,21 @@ mod tests {
         assert!(
             line.contains(":memory:") && line.contains("ephemeral"),
             "in-memory disclosure must say the target is ephemeral; got: {line}"
+        );
+    }
+
+    #[test]
+    fn resolved_actor_disclosure_names_attributed_actor() {
+        let line = resolved_actor_disclosure(Some("lambda:worker"));
+        assert_eq!(line, "actor: \"lambda:worker\" (resolved; attributed)");
+    }
+
+    #[test]
+    fn resolved_actor_disclosure_marks_local_unattributed() {
+        let line = resolved_actor_disclosure(None);
+        assert_eq!(
+            line,
+            "actor: \"local\" (resolved; unattributed local fallback)"
         );
     }
 
@@ -9037,6 +9066,43 @@ region = "us-east-1"
         outcome.expect("test body panicked");
     }
 
+    // --- default_inbound_actor_from_env ---
+
+    #[cfg(feature = "channel-email")]
+    mod default_inbound_actor_tests {
+        use super::*;
+
+        #[test]
+        #[serial]
+        fn default_inbound_actor_defaults_to_local() {
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            assert_eq!(
+                default_inbound_actor_from_env(),
+                "local",
+                "an unset actor must resolve to the neutral namespace, not to any particular \
+                 deployment's identity"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn default_inbound_actor_reads_env_var() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "lambda:mybot");
+            let actor = default_inbound_actor_from_env();
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            assert_eq!(actor, "lambda:mybot");
+        }
+
+        #[test]
+        #[serial]
+        fn default_inbound_actor_ignores_blank_env_var() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "  ");
+            let actor = default_inbound_actor_from_env();
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            assert_eq!(actor, "local", "blank env var must fall back to default");
+        }
+    }
+
     // --- ingest_namespace_from_env (Fix 4: namespace env var) ---
 
     #[cfg(feature = "channel-email")]
@@ -10463,7 +10529,7 @@ backend = "kg-backend"
                 "content": "hello",
                 "channel_kind": "email",
                 "external_id": "test-msg-1",
-                "default_inbound_actor": "lambda:leo",
+                "default_inbound_actor": "lambda:mybot",
             });
             registry
                 .dispatch("comm.ingest", ingest_params)

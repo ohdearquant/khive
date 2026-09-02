@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod error;
+mod event_store_guard;
 pub mod events_split;
 pub mod fusion;
 pub mod graph_traversal;
@@ -80,13 +81,16 @@ pub use daemon::{
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
     config_from_env, BackendConfig, BackendKind, BlobConfig, ConfigError, EngineConfig,
-    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, StorageSectionConfig,
+    GateSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig,
+    StorageSectionConfig,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, ChannelIngestFailureClass, GuardedWriteFailure,
-    RuntimeError, RuntimeResult, WriterPoolCheckoutTimeoutContext, WRITER_ADMISSION_SCOPE,
-    WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
+    RuntimeError, RuntimeResult, WriterPoolCheckoutTimeoutContext, WriterTaskFailureContext,
+    WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
+    WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
+pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use khive_db::{
@@ -94,8 +98,8 @@ pub use khive_db::{
     CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
-    ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
-    GateRef, GateRequest, Obligation,
+    ActorRef, AllowAllGate, AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext,
+    GateDecision, GateError, GateRef, GateRequest, Obligation,
 };
 pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};

@@ -996,7 +996,11 @@ impl KhiveRuntime {
             crate::retrieval::EmbeddingTruncationReport::default()
         };
 
-        let event_store = self.events(token)?;
+        let event_token =
+            token.with_namespace(crate::Namespace::parse(&entity.namespace).map_err(|error| {
+                RuntimeError::Internal(format!("entity namespace invalid: {error}"))
+            })?);
+        let event_store = self.events(&event_token)?;
         let event = khive_storage::event::Event::new(
             entity.namespace.clone(),
             "update",
@@ -1251,7 +1255,11 @@ impl KhiveRuntime {
 
         // Dry-run is a read-only preview: it must not append a merge event.
         if !dry_run {
-            let event_store = self.events(token)?;
+            let event_token =
+                token.with_namespace(crate::Namespace::parse(&updated_entity.namespace).map_err(
+                    |error| RuntimeError::Internal(format!("entity namespace invalid: {error}")),
+                )?);
+            let event_store = self.events(&event_token)?;
             // Mirror the wire-level strategy spelling from MergeParams so consumers
             // can round-trip the policy string back into a request.
             let policy_str = match strategy {
@@ -2116,7 +2124,11 @@ impl KhiveRuntime {
 
         // Dry-run is a read-only preview: it must not append a merge event.
         if !dry_run {
-            let event_store = self.events(token)?;
+            let event_token =
+                token.with_namespace(crate::Namespace::parse(&updated_note.namespace).map_err(
+                    |error| RuntimeError::Internal(format!("note namespace invalid: {error}")),
+                )?);
+            let event_store = self.events(&event_token)?;
             // Mirror the wire-level strategy spelling from MergeParams so consumers
             // can round-trip the policy string back into a request.
             let policy_str = match strategy {
@@ -2219,6 +2231,7 @@ pub fn entity_fts_document(entity: &Entity) -> TextDocument {
     TextDocument {
         subject_id: entity.id,
         kind: SubstrateKind::Entity,
+        record_kind: Some(entity.kind.clone()),
         title: Some(entity.name.clone()),
         body: entity_embedding_text(entity),
         tags: entity.tags.clone(),
@@ -2250,6 +2263,7 @@ pub fn note_fts_document(note: &Note) -> TextDocument {
     TextDocument {
         subject_id: note.id,
         kind: SubstrateKind::Note,
+        record_kind: Some(note.kind.clone()),
         title: note.name.clone(),
         body,
         tags: vec![],
@@ -2265,6 +2279,8 @@ pub fn note_fts_document(note: &Note) -> TextDocument {
 /// exactly what [`Fts5TextSearch::upsert_document`] would write, preventing
 /// null/empty-string divergence on the `title` column for nameless notes.
 pub(crate) struct NoteFtsScalars {
+    /// Granular note kind used by the indexed corpus classifier.
+    pub record_kind: String,
     /// Empty string when `note.name` is `None` — matches the `unwrap_or("")` in
     /// `Fts5TextSearch::upsert_document`.
     pub title: String,
@@ -2284,6 +2300,7 @@ pub(crate) struct NoteFtsScalars {
 pub(crate) fn note_fts_scalars(note: &Note) -> NoteFtsScalars {
     let doc = note_fts_document(note);
     NoteFtsScalars {
+        record_kind: doc.record_kind.unwrap_or_default(),
         title: doc.title.unwrap_or_default(),
         body: doc.body,
         tags: "[]".to_string(),
@@ -2818,8 +2835,8 @@ fn merge_entity_sql(
         conn.execute(
             &format!(
                 "INSERT INTO {} \
-                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 fts_table
             ),
             rusqlite::params![
@@ -2831,6 +2848,7 @@ fn merge_entity_sql(
                 &namespace,
                 &props_str,
                 now,
+                &into_entity.kind,
             ],
         )?;
 
@@ -3432,8 +3450,8 @@ fn merge_note_sql(
         conn.execute(
             &format!(
                 "INSERT INTO {} \
-                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 fts_table
             ),
             rusqlite::params![
@@ -3445,6 +3463,7 @@ fn merge_note_sql(
                 &namespace,
                 &fts_merged.metadata,
                 fts_merged.updated_at_micros,
+                &fts_merged.record_kind,
             ],
         )?;
 

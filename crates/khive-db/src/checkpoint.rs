@@ -4458,9 +4458,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("high_water_test.db");
 
-        // busy_timeout = 2000ms: a TRUNCATE regression blocks ~2s (clearly caught by
-        // the <500ms assertion below), but PASSIVE returns well within 500ms even on
-        // a heavily loaded CI runner. 4x margin on both sides vs. the old 200ms/50ms.
+        // busy_timeout = 2000ms: a TRUNCATE regression blocks ~2s, while the
+        // assertion below uses the midpoint of that gap instead of a noise-floor
+        // threshold. The checkpoint config carries the same 2000ms default.
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path.clone()),
@@ -4486,6 +4486,7 @@ mod tests {
         // not cause TRUNCATE to wait — the transaction is required for isomorphism.
         let reader = pool.reader().expect("reader");
         reader
+            .conn()
             .execute_batch("BEGIN DEFERRED; SELECT * FROM t;")
             .expect("begin read tx");
 
@@ -4500,30 +4501,34 @@ mod tests {
                 .unwrap();
         }
 
+        let checkpoint_config = CheckpointConfig::default();
         let conn = checkpoint_conn(&pool);
         let start = std::time::Instant::now();
         checkpoint_once(
             &pool,
             &conn,
-            &CheckpointConfig::default(),
+            &checkpoint_config,
             &mut TruncateState::default(),
         )
         .expect("checkpoint_once must succeed against a healthy dedicated connection");
         let elapsed = start.elapsed();
 
         // Commit and release the read snapshot only after checkpoint_once returns.
-        reader.execute_batch("COMMIT;").ok();
+        reader.conn().execute_batch("COMMIT;").ok();
         drop(reader);
 
-        // PASSIVE returns in <1ms even with an open reader snapshot.
-        // A TRUNCATE regression would block ~busy_timeout (2000ms) and fail here.
-        // 500ms threshold is generous for CI jitter while staying well below 2000ms.
+        // PASSIVE returns without waiting for the reader snapshot. A TRUNCATE
+        // regression would block for the configured busy timeout (2000ms), so
+        // use the midpoint of that gap rather than a noise-floor threshold.
+        let max_elapsed = checkpoint_config.truncate_busy_timeout / 2;
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "checkpoint_once with active reader snapshot took {:?}; \
-             expected <500ms (PASSIVE must not block on readers; \
-             a TRUNCATE regression would block ~2000ms)",
-            elapsed
+            elapsed < max_elapsed,
+            "checkpoint_once with active reader snapshot took {:?}; expected <{:?} \
+             (PASSIVE must not block on readers; a TRUNCATE regression would block \
+             for the configured {:?})",
+            elapsed,
+            max_elapsed,
+            checkpoint_config.truncate_busy_timeout
         );
     }
 
@@ -5592,6 +5597,7 @@ mod tests {
         // reader call site (e.g. `graph_traverse_read`) is expected to carry.
         let reader = pool.reader().expect("reader");
         reader
+            .conn()
             .execute_batch("BEGIN DEFERRED; SELECT * FROM t;")
             .expect("begin read tx");
         let _tx_handle =
@@ -5658,7 +5664,7 @@ mod tests {
             "expected a Stale emission naming the pinning reader, got: {emissions:?}"
         );
 
-        reader.execute_batch("COMMIT;").ok();
+        reader.conn().execute_batch("COMMIT;").ok();
         drop(reader);
         drop(_tx_handle);
     }

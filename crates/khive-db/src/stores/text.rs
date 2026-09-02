@@ -50,8 +50,8 @@ pub fn insert_document_statement(table: &str, document: &TextDocument) -> SqlSta
     SqlStatement {
         sql: format!(
             "INSERT INTO {table} \
-             (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+             (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
         ),
         params: vec![
             SqlValue::Text(document.subject_id.to_string()),
@@ -65,6 +65,10 @@ pub fn insert_document_statement(table: &str, document: &TextDocument) -> SqlSta
                 None => SqlValue::Null,
             },
             SqlValue::Integer(dt_to_micros(&document.updated_at)),
+            match &document.record_kind {
+                Some(kind) => SqlValue::Text(kind.clone()),
+                None => SqlValue::Null,
+            },
         ],
         label: Some(format!("fts-insert-{table}")),
     }
@@ -88,7 +92,8 @@ pub(crate) fn ensure_fts5_schema(
          tags UNINDEXED, \
          namespace UNINDEXED, \
          metadata UNINDEXED, \
-         updated_at UNINDEXED\
+         updated_at UNINDEXED, \
+         record_kind\
          )",
         table_name
     );
@@ -112,8 +117,9 @@ fn count_fts_pass(context: Option<&UsageContext>) {
 /// A TextSearch backed by SQLite FTS5 virtual tables.
 ///
 /// Each instance manages one table: `fts_{table_key}`. Documents are stored
-/// with their metadata in UNINDEXED columns; only `title` and `body` are
-/// full-text indexed.
+/// with their metadata in UNINDEXED columns. `title`, `body`, and the optional
+/// granular `record_kind` classifier are indexed; corpus filters use the
+/// classifier inside MATCH and retain exact row predicates.
 pub struct Fts5TextSearch {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
@@ -257,36 +263,13 @@ impl Fts5TextSearch {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Text,
-                op,
-                move |scope| {
-                    scope.ensure_active()?;
-                    let conn = pool
-                        .open_standalone_reader()
-                        .map_err(|error| map_sqlite_err(error, op))?;
-                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        } else {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Text,
-                op,
-                move |scope| {
-                    let mut guard = pool.resolve_reader_checkout(
-                        StorageCapability::Text,
-                        op,
-                        pool.reader_until(|| scope.should_stop()),
-                    )?;
-                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        }
+        super::run_pooled_store_read(
+            Arc::clone(&self.pool),
+            StorageCapability::Text,
+            op,
+            move |conn| f(conn).map_err(|error| map_err(error, op)),
+        )
+        .await
     }
 }
 
@@ -594,6 +577,56 @@ fn build_match_expr(query: &str, mode: TextQueryMode) -> Option<String> {
     }
 }
 
+fn quote_fts5_phrase(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Build an indexed classifier predicate for FTS5's MATCH expression.
+///
+/// The production tokenizer is trigram, so values shorter than three
+/// characters have no postings. In that uncommon case the caller keeps only
+/// the exact row predicate from `build_filter_clause`; correctness is
+/// preserved while the indexed optimization deliberately declines.
+fn record_kind_match_expr(filter: Option<&TextFilter>) -> Option<String> {
+    let record_kinds = &filter?.record_kinds;
+    if record_kinds.is_empty() || record_kinds.iter().any(|kind| kind.chars().count() < 3) {
+        return None;
+    }
+
+    let clauses: Vec<String> = record_kinds
+        .iter()
+        .map(|kind| format!("record_kind : {}", quote_fts5_phrase(kind)))
+        .collect();
+    if clauses.len() == 1 {
+        clauses.into_iter().next()
+    } else {
+        Some(format!("({})", clauses.join(" OR ")))
+    }
+}
+
+fn build_filtered_match_expr(
+    query: &str,
+    mode: TextQueryMode,
+    filter: Option<&TextFilter>,
+) -> Option<String> {
+    // Keep lexical terms confined to the two historically indexed text
+    // columns. Once record_kind became indexed, an unqualified query would
+    // otherwise make `memory` match every memory row solely via its classifier.
+    let query = format!("{{title body}} : ({})", build_match_expr(query, mode)?);
+    match record_kind_match_expr(filter) {
+        Some(classifier) => Some(format!("{classifier} AND ({query})")),
+        None => Some(query),
+    }
+}
+
+/// Custom FTS5 rank configuration that keeps the classifier out of lexical
+/// relevance while retaining the optimized hidden-`rank` ORDER BY path.
+///
+/// `record_kind` participates in MATCH for candidate pruning, but its weight is
+/// zero so the classifier cannot become a relevance signal. Subject metadata
+/// columns were already UNINDEXED; title/body retain their default unit weight.
+const LEXICAL_BM25_RANK: &str = "bm25(0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)";
+
 /// Build a WHERE clause fragment and params for a `TextFilter`.
 ///
 /// Returns `(clause, params)` where clause is empty if no filters are active.
@@ -640,6 +673,26 @@ fn build_filter_clause(
         conditions.push(format!("{}.kind IN ({})", table, placeholders.join(", ")));
         for kind in &filter.kinds {
             params.push(Box::new(kind.to_string()));
+        }
+    }
+
+    if !filter.record_kinds.is_empty() {
+        let placeholders: Vec<String> = filter
+            .record_kinds
+            .iter()
+            .map(|_| {
+                let p = format!("?{}", idx);
+                idx += 1;
+                p
+            })
+            .collect();
+        conditions.push(format!(
+            "{}.record_kind IN ({})",
+            table,
+            placeholders.join(", ")
+        ));
+        for kind in &filter.record_kinds {
+            params.push(Box::new(kind.clone()));
         }
     }
 
@@ -712,8 +765,8 @@ fn batch_upsert_documents_dml(
     );
     let ins_sql = format!(
         "INSERT INTO {} \
-         (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         table
     );
 
@@ -742,6 +795,7 @@ fn batch_upsert_documents_dml(
                     namespace,
                     &metadata_json,
                     dt_to_micros(&doc.updated_at),
+                    &doc.record_kind,
                 ],
             )?;
             Ok::<(), rusqlite::Error>(())
@@ -885,7 +939,7 @@ impl TextSearch for Fts5TextSearch {
 
         self.with_reader("fts_get", move |conn| {
             let sql = format!(
-                "SELECT subject_id, kind, title, body, tags, namespace, metadata, updated_at \
+                "SELECT subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind \
                  FROM {} WHERE namespace = ?1 AND subject_id = ?2",
                 table
             );
@@ -902,6 +956,7 @@ impl TextSearch for Fts5TextSearch {
                     let ns: String = row.get(5)?;
                     let metadata_json: Option<String> = row.get(6)?;
                     let updated_at_micros: i64 = row.get(7)?;
+                    let record_kind: Option<String> = row.get(8)?;
 
                     let sid = Uuid::parse_str(&id_str).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -922,6 +977,7 @@ impl TextSearch for Fts5TextSearch {
                     Ok(Some(TextDocument {
                         subject_id: sid,
                         kind,
+                        record_kind,
                         title: if title.is_empty() { None } else { Some(title) },
                         body,
                         tags: tags_from_json(&tags_json),
@@ -942,7 +998,11 @@ impl TextSearch for Fts5TextSearch {
 
         let result = self
             .with_reader("fts_search", move |conn| {
-                let match_expr = match build_match_expr(&request.query, request.mode) {
+                let match_expr = match build_filtered_match_expr(
+                    &request.query,
+                    request.mode,
+                    request.filter.as_ref(),
+                ) {
                     Some(expr) => expr,
                     None => return Ok(Vec::new()),
                 };
@@ -968,7 +1028,8 @@ impl TextSearch for Fts5TextSearch {
 
                 let sql = format!(
                     "SELECT subject_id, rank, title, {snippet_expr} \
-                     FROM {table} WHERE {table} MATCH ?1{filter_clause} \
+                     FROM {table} WHERE {table} MATCH ?1 \
+                     AND rank MATCH '{LEXICAL_BM25_RANK}'{filter_clause} \
                      ORDER BY rank LIMIT ?2",
                 );
 
@@ -1042,21 +1103,29 @@ impl TextSearch for Fts5TextSearch {
         let table = self.table_name.clone();
 
         self.with_reader("fts_count", move |conn| {
-            let (filter_clause, filter_params) = build_filter_clause(&filter, &table, 1);
+            let indexed_classifier = record_kind_match_expr(Some(&filter));
+            let filter_start = if indexed_classifier.is_some() { 2 } else { 1 };
+            let (filter_clause, filter_params) = build_filter_clause(&filter, &table, filter_start);
 
-            let sql = if filter_clause.is_empty() {
-                format!("SELECT COUNT(*) FROM {}", table)
+            let sql = if indexed_classifier.is_some() {
+                format!("SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1{filter_clause}")
+            } else if filter_clause.is_empty() {
+                format!("SELECT COUNT(*) FROM {table}")
             } else {
                 let where_part = filter_clause.trim_start_matches(" AND ");
-                format!("SELECT COUNT(*) FROM {} WHERE {}", table, where_part)
+                format!("SELECT COUNT(*) FROM {table} WHERE {where_part}")
             };
 
             let mut stmt = conn.prepare(&sql)?;
 
+            if let Some(classifier) = indexed_classifier {
+                stmt.raw_bind_parameter(1, classifier)?;
+            }
+
             for (i, param) in filter_params.iter().enumerate() {
                 param
                     .to_sql()
-                    .map(|val| stmt.raw_bind_parameter(1 + i, val))
+                    .map(|val| stmt.raw_bind_parameter(filter_start + i, val))
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
             }
 
@@ -1114,26 +1183,35 @@ impl TextSearch for Fts5TextSearch {
 
         self.with_reader("fts_term_stats", move |conn| {
             let filter = request.filter.as_ref();
+            let indexed_classifier = record_kind_match_expr(filter);
 
-            // Document count uses params starting at ?1 (no MATCH expression).
+            let count_filter_start = if indexed_classifier.is_some() { 2 } else { 1 };
             let (count_filter_clause, count_filter_params) = if let Some(f) = filter {
-                build_filter_clause(f, &table, 1)
+                build_filter_clause(f, &table, count_filter_start)
             } else {
                 (String::new(), Vec::new())
             };
 
             let document_count: u64 = {
-                let count_sql = if count_filter_clause.is_empty() {
+                let count_sql = if indexed_classifier.is_some() {
+                    format!(
+                        "SELECT COUNT(*) FROM {table} \
+                         WHERE {table} MATCH ?1{count_filter_clause}"
+                    )
+                } else if count_filter_clause.is_empty() {
                     format!("SELECT COUNT(*) FROM {table}")
                 } else {
                     let where_part = count_filter_clause.trim_start_matches(" AND ");
                     format!("SELECT COUNT(*) FROM {table} WHERE {where_part}")
                 };
                 let mut stmt = conn.prepare(&count_sql)?;
+                if let Some(ref classifier) = indexed_classifier {
+                    stmt.raw_bind_parameter(1, classifier)?;
+                }
                 for (i, param) in count_filter_params.iter().enumerate() {
                     param
                         .to_sql()
-                        .map(|val| stmt.raw_bind_parameter(1 + i, val))
+                        .map(|val| stmt.raw_bind_parameter(count_filter_start + i, val))
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
                 }
                 let mut rows = stmt.raw_query();
@@ -1168,11 +1246,16 @@ impl TextSearch for Fts5TextSearch {
                     (String::new(), Vec::new())
                 };
 
+                let text_term = format!("{{title body}} : ({sanitized})");
+                let term_match = match &indexed_classifier {
+                    Some(classifier) => format!("{classifier} AND ({text_term})"),
+                    None => text_term,
+                };
                 let count_sql = format!(
                     "SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1{term_filter_clause}"
                 );
                 let mut stmt = conn.prepare(&count_sql)?;
-                stmt.raw_bind_parameter(1, &sanitized)?;
+                stmt.raw_bind_parameter(1, &term_match)?;
                 for (i, param) in term_filter_params.iter().enumerate() {
                     param
                         .to_sql()
@@ -1244,7 +1327,11 @@ impl Fts5TextSearch {
         let usage = khive_storage::usage::current();
 
         self.with_reader("fts_search_unranked", move |conn| {
-            let match_expr = match build_match_expr(&request.query, request.mode) {
+            let match_expr = match build_filtered_match_expr(
+                &request.query,
+                request.mode,
+                request.filter.as_ref(),
+            ) {
                 Some(expr) => expr,
                 None => return Ok(Vec::new()),
             };
@@ -1315,7 +1402,11 @@ impl Fts5TextSearch {
         let usage = khive_storage::usage::current();
 
         self.with_reader("fts_search_rank_within_cap", move |conn| {
-            let match_expr = match build_match_expr(&request.query, request.mode) {
+            let match_expr = match build_filtered_match_expr(
+                &request.query,
+                request.mode,
+                request.filter.as_ref(),
+            ) {
                 Some(expr) => expr,
                 None => return Ok(Vec::new()),
             };
@@ -1370,8 +1461,10 @@ impl Fts5TextSearch {
 
             let rank_sql = format!(
                 "SELECT subject_id, rank, title, {snippet_expr} \
-                 FROM {table} WHERE {table} MATCH ?1 AND subject_id IN ({in_clause}) \
-                 ORDER BY rank LIMIT ?2"
+                 FROM {table} WHERE {table} MATCH ?1 \
+                 AND rank MATCH '{LEXICAL_BM25_RANK}' \
+                 AND subject_id IN ({in_clause}) \
+                 ORDER BY rank LIMIT ?2",
             );
 
             let mut stmt2 = conn.prepare(&rank_sql)?;
@@ -1509,6 +1602,7 @@ struct FtsRenameRow {
     tags: String,
     metadata: Option<String>,
     updated_at: i64,
+    record_kind: Option<String>,
 }
 
 /// Move every FTS5 document row from `old_ns` to `new_ns` in `table`.
@@ -1525,7 +1619,7 @@ fn rename_namespace_dml(
     new_ns: &str,
 ) -> Result<u64, rusqlite::Error> {
     let sel_sql = format!(
-        "SELECT subject_id, kind, title, body, tags, metadata, updated_at \
+        "SELECT subject_id, kind, title, body, tags, metadata, updated_at, record_kind \
          FROM {} WHERE namespace = ?1",
         table
     );
@@ -1540,6 +1634,7 @@ fn rename_namespace_dml(
                 tags: row.get(4)?,
                 metadata: row.get(5)?,
                 updated_at: row.get(6)?,
+                record_kind: row.get(7)?,
             })
         })?;
         iter.collect::<Result<Vec<_>, _>>()?
@@ -1554,8 +1649,8 @@ fn rename_namespace_dml(
 
     let ins_sql = format!(
         "INSERT INTO {} \
-         (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         table
     );
     for row in &rows {
@@ -1570,6 +1665,7 @@ fn rename_namespace_dml(
                 new_ns,
                 row.metadata,
                 row.updated_at,
+                row.record_kind,
             ],
         )?;
     }

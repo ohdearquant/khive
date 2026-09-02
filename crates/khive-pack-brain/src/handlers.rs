@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{
-    micros_to_iso, DispatchHook, EventView, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
-    VerbRegistry,
+    micros_to_iso, DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace,
+    NamespaceToken, RuntimeError, VerbRegistry,
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
@@ -1929,12 +1929,14 @@ impl BrainPack {
                 .as_ref()
                 .map(|(scorer, ledger)| (scorer.as_str(), ledger.as_str()));
             let namespace = token.namespace().as_str().to_string();
+            let attribution = EventAttribution::from_token(token);
             // Forced-zero unattributed events do not touch the mass table, so
             // this sentinel is an atomic-unit routing key only and can never be
             // mistaken for a registered serving profile.
             let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
                 sql.as_ref(),
                 &namespace,
+                attribution,
                 "__unattributed__",
                 &target_id,
                 gate_mode,
@@ -2495,7 +2497,12 @@ impl BrainPack {
                 });
 
                 let removed = before - state.bindings.len();
-                Ok(json!({ "unbound": removed }))
+                // `removed` is the canonical mutation count. Keep `unbound`
+                // as a compatibility alias for existing callers and smoke
+                // tests. In particular, both fields remain present at zero so
+                // a successful no-op cannot be mistaken for a confirmed
+                // removal.
+                Ok(json!({ "removed": removed, "unbound": removed }))
             },
         )
         .await
