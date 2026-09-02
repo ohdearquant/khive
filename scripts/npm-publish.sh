@@ -105,8 +105,14 @@ fi
 
 echo ""
 echo "--- CLI alias ---"
-if npm view "@khive-ai/cli@${VERSION}" version 2>/dev/null | grep -q "${VERSION}"; then
-    echo "  @khive-ai/cli@${VERSION} already on npm — skipping"
+# The skip requires the published alias to carry the exact khive dependency,
+# so a rerun repairs a missing alias and refuses a mismatched one.
+PUBLISHED_ALIAS_KHIVE=$(npm view "@khive-ai/cli@${VERSION}" dependencies.khive 2>/dev/null || true)
+if [[ "$PUBLISHED_ALIAS_KHIVE" == "$VERSION" ]]; then
+    echo "  @khive-ai/cli@${VERSION} already on npm with khive ${VERSION} — skipping"
+elif [[ -n "$PUBLISHED_ALIAS_KHIVE" ]]; then
+    echo "ERROR: @khive-ai/cli@${VERSION} on npm depends on khive ${PUBLISHED_ALIAS_KHIVE}, expected ${VERSION}" >&2
+    exit 1
 else
     if $DRY_RUN; then
         echo "  [dry-run] would publish @khive-ai/cli@${VERSION}"
