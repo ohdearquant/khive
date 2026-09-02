@@ -2836,9 +2836,9 @@ async fn evict_bridge_and_ready_state(
     generation: u64,
 ) -> bool {
     let mut indexes = ann.indexes.write().await;
-    if !indexes
+    if indexes
         .get(key)
-        .is_some_and(|bridge| bridge.commit_digest == Some(incumbent_digest))
+        .is_none_or(|bridge| bridge.commit_digest != Some(incumbent_digest))
     {
         return false;
     }
