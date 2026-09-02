@@ -188,6 +188,8 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-169](ADR-169-timezone-correct-timestamps.md)                       | Timezone-Correct Timestamps: Date-Only Values and a Configured Display Timezone                            |
 | [ADR-170](ADR-170-events-daemon-split.md)                               | Dedicated events daemon — the audit lane leaves the domain store                                           |
 | [ADR-171](ADR-171-brain-daemon-split.md)                                | Brain daemon — profile state leaves the domain process                                                     |
+| [ADR-172](ADR-172-server-owned-config-thin-clients.md)                  | Server-owned storage config — client processes stop carrying engines                                       |
+| [ADR-173](ADR-173-weighted-incidence-topology.md)                       | Weighted incidence as the graph's storage primitive                                                        |
 
 <!-- END GENERATED ADR CATALOG -->
 
