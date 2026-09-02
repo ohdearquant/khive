@@ -12,7 +12,8 @@ whole `ops` value or one element beside `{"tool", "args"}` dicts.
 Value grammar, as the cloud parser implements it: a double-quoted string
 (decoded escapes are `\\"` `\\'` `\\n` `\\t` `\\r` `\\\\`; any other backslash
 sequence is kept literally, so non-ASCII text must be emitted raw — never as
-`\\uXXXX`), an integer, a float, `true`/`false`/`null`, an array of values in
+`\\uXXXX`), an integer, a finite float (`NaN`/`Infinity` have no
+representation in the grammar), `true`/`false`/`null`, an array of values in
 this same grammar, or an object handed to a JSON parser verbatim. A control
 character other than newline, tab, or carriage return cannot be carried in a
 DSL string.
@@ -21,6 +22,7 @@ DSL string.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from .errors import TransportError
@@ -52,12 +54,20 @@ def _render_value(value: Any, arg_name: str) -> str:
         return "true" if value else "false"
     if value is None:
         return "null"
+    if isinstance(value, float) and not math.isfinite(value):
+        raise TransportError(
+            f"argument {arg_name!r}: non-finite float {value!r} has no representation in "
+            "the request DSL"
+        )
     if isinstance(value, (int, float)):
         return json.dumps(value)
     if isinstance(value, list):
         return "[" + ", ".join(_render_value(v, arg_name) for v in value) + "]"
     if isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        except ValueError as exc:
+            raise TransportError(f"argument {arg_name!r}: {exc}") from exc
     raise TransportError(
         f"argument {arg_name!r}: cannot render {type(value).__name__} in the request DSL"
     )

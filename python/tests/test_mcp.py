@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 import pytest
 
 pytest.importorskip("mcp")
 
-from khive import AuthError
+import khive.mcp as mcp_module
+from khive import AuthError, KhiveError
 from khive.mcp import (
     _TRANSPORT_LOGGER,
     _AcceptedTerminationFilter,
@@ -55,6 +57,43 @@ def test_body_exception_inside_mcp_session_propagates_unchanged(mcp_server, api_
 
     with pytest.raises(_Boom):
         asyncio.run(_inner())
+
+
+def test_cancelled_error_inside_mcp_session_propagates_unchanged(mcp_server, api_key):
+    async def _inner():
+        async with mcp_session(mcp_server.url, api_key):
+            raise asyncio.CancelledError("caller cancellation")
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(_inner())
+
+
+def test_alist_tool_names_translates_call_time_failure(monkeypatch):
+    class _FailingSession:
+        async def list_tools(self):
+            raise RuntimeError("network blip")
+
+    @asynccontextmanager
+    async def _fake_session(base_url, api_key):
+        yield _FailingSession()
+
+    monkeypatch.setattr(mcp_module, "mcp_session", _fake_session)
+    with pytest.raises(KhiveError):
+        asyncio.run(mcp_module.alist_tool_names("http://example.test", "key"))
+
+
+def test_acall_request_translates_call_time_failure(monkeypatch):
+    class _FailingSession:
+        async def call_tool(self, name, args):
+            raise RuntimeError("network blip")
+
+    @asynccontextmanager
+    async def _fake_session(base_url, api_key):
+        yield _FailingSession()
+
+    monkeypatch.setattr(mcp_module, "mcp_session", _fake_session)
+    with pytest.raises(KhiveError):
+        asyncio.run(mcp_module.acall_request("http://example.test", "key", "stats()"))
 
 
 def test_as_khive_error_preserves_403_status():

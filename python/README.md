@@ -58,7 +58,14 @@ socket daemon returns) and `GET /health`; a non-2xx response raises
 `AuthError` (401/403), `RateLimited` (429), `BadRequest` (4xx), or
 `ServerError` (5xx) — all subclasses of `HttpError`. An `AsyncHttpTransport`
 twin is available for asyncio callers (used directly; `Session` itself stays
-sync).
+sync). Client-side identity (`namespace`, `actor_id`, `visible_namespaces`)
+is not sent over this transport — khive-cloud resolves the principal from
+the API key alone.
+
+A plain `http://` base URL is refused unless its host is loopback
+(`127.0.0.1`, `::1`, `localhost`); pass `allow_insecure=True` to
+`khive.cloud(...)` or `HttpTransport(...)` to talk to a non-loopback host
+over `http://` anyway.
 
 MCP access — the same deployment's `request` tool over streamable HTTP — is
 in `khive.mcp`:
@@ -96,7 +103,7 @@ uv pip install -e '.[dev]'
 pytest tests/
 ```
 
-The cloud/MCP/CLI tests run against offline fake servers and need the
+The cloud/MCP tests run against offline fake servers and need the
 `cloud` extra (`uv pip install -e '.[dev,cloud]'`); without it they skip
 cleanly rather than failing. `tests/test_cloud_live.py` is the exception —
 it talks to a real khive-cloud deployment and is skipped unless

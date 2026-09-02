@@ -191,3 +191,57 @@ def test_json_2xx_body_that_is_a_list_raises_transport_error():
         handle = Khive(transport=HttpTransport(url, "key"))
         with pytest.raises(TransportError):
             handle.stats()
+
+
+def test_non_dict_result_entry_raises_transport_error():
+    body = json.dumps({"results": [42]}).encode()
+    with _malformed_server(body) as url:
+        handle = Khive(transport=HttpTransport(url, "key"))
+        with pytest.raises(TransportError):
+            handle.stats()
+
+
+def test_result_entry_missing_required_fields_raises_transport_error():
+    body = json.dumps({"results": [{"result": {"x": 1}}]}).encode()
+    with _malformed_server(body) as url:
+        handle = Khive(transport=HttpTransport(url, "key"))
+        with pytest.raises(TransportError):
+            handle.stats()
+
+
+def test_send_dsl_round_trips(rest_server, api_key):
+    transport = HttpTransport(rest_server.url, api_key)
+    envelope = transport.send_dsl("stats()", timeout=5.0)
+    assert envelope["ok"] is True
+    assert envelope["result"]["results"][0]["result"] == {
+        "entities": 1,
+        "edges": 0,
+        "notes": 0,
+    }
+
+
+def test_send_dsl_with_delimiters_sent_verbatim(rest_server, api_key):
+    transport = HttpTransport(rest_server.url, api_key)
+    dsl = 'search(query="a, b (c) [d]")'
+    envelope = transport.send_dsl(dsl, timeout=5.0)
+    assert envelope["result"]["results"][0] == {
+        "ok": True,
+        "tool": "search",
+        "result": {"items": []},
+    }
+
+
+def test_non_loopback_http_base_url_refused():
+    with pytest.raises(ValueError, match="http.*example.test"):
+        HttpTransport("http://example.test", "key")
+
+
+def test_loopback_http_base_url_admitted(rest_server, api_key):
+    handle = Khive(transport=HttpTransport(rest_server.url, api_key))
+    assert handle.stats() == {"entities": 1, "edges": 0, "notes": 0}
+
+
+def test_allow_insecure_admits_non_loopback_http_base_url():
+    # No connection is made; this only proves construction is not refused.
+    transport = HttpTransport("http://example.test", "key", allow_insecure=True)
+    assert transport._base_url == "http://example.test"

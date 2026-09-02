@@ -31,6 +31,9 @@ import struct
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Self
+from urllib.parse import urlsplit
+
+from pydantic import ValidationError
 
 from .dsl import render_dsl
 from .errors import (
@@ -41,6 +44,7 @@ from .errors import (
     TransportError,
     raise_for_status,
 )
+from .models import OpResult
 
 PROTOCOL_VERSION = 4
 MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -99,6 +103,30 @@ class SocketTransport(Transport):
         return bytes(buf)
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _check_base_url_security(base_url: str, allow_insecure: bool) -> None:
+    """Refuse a plain `http://` base URL that is not loopback.
+
+    An API key sent in an `Authorization` header over plain HTTP to a
+    non-loopback host is a credential leak to every hop in between. Loopback
+    (a local dev server, or the offline fakes this package's own tests run
+    against) is exempt; anything else needs `https://` or an explicit
+    `allow_insecure=True`.
+    """
+    parsed = urlsplit(base_url)
+    if parsed.scheme != "http" or allow_insecure:
+        return
+    host = (parsed.hostname or "").lower()
+    if host in _LOOPBACK_HOSTS:
+        return
+    raise ValueError(
+        f"refusing a {parsed.scheme}:// base URL with non-loopback host {host!r}; "
+        "pass allow_insecure=True to allow this"
+    )
+
+
 def _cloud_config_id(base_url: str) -> str:
     return "http:" + base_url.rstrip("/")
 
@@ -140,6 +168,25 @@ def _parse_envelope(response: Any) -> dict[str, Any]:
     return payload
 
 
+def _validate_envelope_results(envelope: dict[str, Any], url: str) -> dict[str, Any]:
+    """Reject an envelope whose result entries do not match `OpResult`.
+
+    Runs after `_stringify_op_errors`, so a per-op error is already the
+    plain string `OpResult.error` expects, not khive-cloud's
+    `{"code","message"}` object — a top-level-only check would otherwise let
+    e.g. `{"results": [42]}` or an entry missing `ok`/`tool` reach the caller
+    as a successful response.
+    """
+    for index, entry in enumerate(envelope["results"]):
+        try:
+            OpResult.model_validate(entry)
+        except ValidationError as exc:
+            raise TransportError(
+                f"response from {url} has a malformed result at index {index}: {exc}"
+            ) from exc
+    return envelope
+
+
 def _stringify_op_errors(envelope: Any) -> Any:
     """Flatten khive-cloud's `{"code","message"}` per-op error objects to a
     string, in place, so each entry still validates against
@@ -175,11 +222,30 @@ class HttpTransport(Transport):
 
     The API key is sent only as the `Authorization` header — never logged,
     never in `repr`, never folded into an error message.
+
+    `frame`'s identity fields (`Session._base_frame`'s `namespace`,
+    `actor_id`, `visible_namespaces`) are never put on the wire: khive-cloud
+    resolves the principal from the API key alone, so those fields only
+    matter to `SocketTransport`'s local daemon.
+
+    By default a plain `http://` base URL is refused unless its host is
+    loopback (`127.0.0.1`, `::1`, `localhost`) — an API key sent over plain
+    HTTP to anything else leaks to every hop in between. Pass
+    `allow_insecure=True` to talk to a non-loopback host over `http://`
+    anyway.
     """
 
-    def __init__(self, base_url: str, api_key: str, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        timeout: float = 30.0,
+        allow_insecure: bool = False,
+    ) -> None:
         import httpx
 
+        _check_base_url_security(base_url, allow_insecure)
         self._base_url = base_url.rstrip("/")
         self._client = httpx.Client(
             base_url=self._base_url,
@@ -221,7 +287,9 @@ class HttpTransport(Transport):
         except httpx.HTTPError as exc:
             raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
         raise_for_status(response.status_code, response.text, str(response.url))
-        return {"ok": True, "result": _stringify_op_errors(_parse_envelope(response))}
+        envelope = _stringify_op_errors(_parse_envelope(response))
+        _validate_envelope_results(envelope, str(response.url))
+        return {"ok": True, "result": envelope}
 
     def close(self) -> None:
         self._client.close()
@@ -239,11 +307,28 @@ class AsyncHttpTransport:
     Not a `Transport` subclass — `Transport.round_trip` is synchronous and
     `Session` drives it synchronously, so this is used directly by callers
     who are already inside an event loop rather than through `Session`.
+
+    `frame`'s identity fields (`Session._base_frame`'s `namespace`,
+    `actor_id`, `visible_namespaces`) are never put on the wire: khive-cloud
+    resolves the principal from the API key alone, so those fields only
+    matter to `SocketTransport`'s local daemon.
+
+    By default a plain `http://` base URL is refused unless its host is
+    loopback (`127.0.0.1`, `::1`, `localhost`); pass `allow_insecure=True`
+    to talk to a non-loopback host over `http://` anyway.
     """
 
-    def __init__(self, base_url: str, api_key: str, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        timeout: float = 30.0,
+        allow_insecure: bool = False,
+    ) -> None:
         import httpx
 
+        _check_base_url_security(base_url, allow_insecure)
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
@@ -274,7 +359,9 @@ class AsyncHttpTransport:
         except httpx.HTTPError as exc:
             raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
         raise_for_status(response.status_code, response.text, str(response.url))
-        return {"ok": True, "result": _stringify_op_errors(_parse_envelope(response))}
+        envelope = _stringify_op_errors(_parse_envelope(response))
+        _validate_envelope_results(envelope, str(response.url))
+        return {"ok": True, "result": envelope}
 
     async def aclose(self) -> None:
         await self._client.aclose()

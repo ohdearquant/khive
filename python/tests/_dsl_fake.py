@@ -13,10 +13,15 @@ import re
 from typing import Any
 
 _OP_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*)\((.*)\)$", re.DOTALL)
+_FINITE_NUMBER_RE = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$")
 
 
 class DslParseError(ValueError):
     pass
+
+
+def _reject_non_finite_constant(name: str) -> float:
+    raise DslParseError(f"non-finite constant {name!r} has no representation in the request DSL")
 
 
 def _split_top_level(text: str, seps: str) -> list[str]:
@@ -85,6 +90,8 @@ def _parse_string(text: str) -> str:
             out.append(ch)
             i += 1
             continue
+        if ord(ch) < 0x20:
+            raise DslParseError(f"raw control character in string literal: {ch!r}")
         out.append(ch)
         i += 1
     return "".join(out)
@@ -111,17 +118,16 @@ def _parse_value(text: str) -> Any:
         return [_parse_value(p) for p in _split_top_level(inner, ",")]
     if text[0] == "{":
         try:
-            return json.loads(text)
+            return json.loads(text, parse_constant=_reject_non_finite_constant)
         except ValueError as exc:
             raise DslParseError(f"malformed object literal: {text!r}") from exc
     try:
         return int(text)
     except ValueError:
         pass
-    try:
+    if _FINITE_NUMBER_RE.match(text):
         return float(text)
-    except ValueError:
-        raise DslParseError(f"unparseable value: {text!r}") from None
+    raise DslParseError(f"unparseable value: {text!r}")
 
 
 def _parse_op(text: str) -> tuple[str, dict[str, Any]]:

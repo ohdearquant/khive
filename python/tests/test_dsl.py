@@ -119,3 +119,55 @@ def test_entry_without_tool_name_raises_transport_error():
 def test_non_op_entry_raises_transport_error():
     with pytest.raises(TransportError, match="cannot render int"):
         render_dsl([3])
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_float_scalar_raises_transport_error(bad):
+    with pytest.raises(TransportError):
+        render_dsl([op("update", weight=bad)])
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_float_in_array_raises_transport_error(bad):
+    with pytest.raises(TransportError):
+        render_dsl([op("update", weights=[1.0, bad])])
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_float_in_object_raises_transport_error(bad):
+    with pytest.raises(TransportError):
+        render_dsl([op("update", properties={"w": bad})])
+
+
+def test_finite_float_round_trip():
+    args = {"weight": -2.5e-3}
+    rendered = render_dsl([op("verb", **args)])
+    assert rendered == "verb(weight=-0.0025)"
+    [(verb, parsed_args)] = parse_dsl(rendered)
+    assert verb == "verb"
+    assert parsed_args == args
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"kind": None},
+        {"hard": False},
+        {"tags": []},
+        {"properties": {}},
+        {"weight": -0.5},
+        {"weight": 1.5e10},
+        {"weight": -2.5e-3},
+        {"note": "literal \\q unknown escape"},
+        {"query": "$prev"},
+        {"query": "$prev.id"},
+    ],
+)
+def test_round_trip_additional_value_shapes(args):
+    # Built as a raw op dict, not `op(**args)`: `op()` prunes `None` values
+    # before `render_dsl` ever sees them, so `{"kind": None}` could not
+    # reach the renderer's `null` arm through the normal call path.
+    rendered = render_dsl([{"tool": "verb", "args": args}])
+    [(verb, parsed_args)] = parse_dsl(rendered)
+    assert verb == "verb"
+    assert parsed_args == args

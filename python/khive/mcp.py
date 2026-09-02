@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from .errors import AuthError, KhiveError
@@ -119,17 +119,37 @@ async def mcp_session(base_url: str, api_key: str) -> AsyncIterator[Any]:
             close_exc: BaseException | None = None
             try:
                 await stack.aclose()
-            except Exception as inner:
+            except BaseException as inner:
                 close_exc = inner
-            real_exc = close_exc or exc
+            if isinstance(exc, asyncio.CancelledError) and close_exc is not None:
+                # The bare-cancellation case above: `exc` itself carries no
+                # information, so the teardown failure IS the real cause.
+                real_exc = close_exc
+            else:
+                # `exc` is already a typed setup failure (or a cancellation
+                # that resolved on its own) — an unrelated cleanup failure
+                # must not bury it, only annotate it.
+                real_exc = exc
+                if close_exc is not None and hasattr(real_exc, "add_note"):
+                    real_exc.add_note(f"cleanup after setup failure also raised: {close_exc!r}")
             if isinstance(real_exc, KhiveError):
                 raise real_exc
             raise _as_khive_error(real_exc, url) from real_exc
         try:
             yield session
-        except BaseException:
-            with suppress(Exception):
+        except BaseException as body_exc:
+            try:
                 await stack.aclose()
+            except BaseException as close_exc:
+                if close_exc is body_exc:
+                    raise
+                # Swallow a cleanup failure distinct from the exception being
+                # unwound — `contextlib.suppress(Exception)` cannot do this
+                # because cleanup can raise `asyncio.CancelledError` or a
+                # `BaseExceptionGroup`, neither of which is an `Exception`,
+                # and either would otherwise replace `body_exc` silently.
+                if hasattr(body_exc, "add_note"):
+                    body_exc.add_note(f"cleanup after body exception also raised: {close_exc!r}")
             raise
         else:
             await stack.aclose()
@@ -141,15 +161,23 @@ async def mcp_session(base_url: str, api_key: str) -> AsyncIterator[Any]:
 
 async def alist_tool_names(base_url: str, api_key: str) -> list[str]:
     """`tools/list`, returning just the tool names."""
+    url = base_url.rstrip("/") + "/mcp"
     async with mcp_session(base_url, api_key) as session:
-        result = await session.list_tools()
+        try:
+            result = await session.list_tools()
+        except Exception as exc:
+            raise _as_khive_error(exc, url) from exc
         return [tool.name for tool in result.tools]
 
 
 async def acall_request(base_url: str, api_key: str, ops: str) -> Any:
     """Call the `request` tool with the given ops DSL and parse its JSON reply."""
+    url = base_url.rstrip("/") + "/mcp"
     async with mcp_session(base_url, api_key) as session:
-        result = await session.call_tool("request", {"ops": ops})
+        try:
+            result = await session.call_tool("request", {"ops": ops})
+        except Exception as exc:
+            raise _as_khive_error(exc, url) from exc
         if result.isError:
             text = result.content[0].text if result.content else "unknown MCP error"
             raise KhiveError(text)

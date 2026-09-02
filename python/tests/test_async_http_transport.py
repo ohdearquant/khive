@@ -10,10 +10,13 @@ its coroutine with a bare `asyncio.run` (same pattern as `test_mcp.py`).
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 httpx = pytest.importorskip("httpx")
+
+from test_http_transport import _malformed_server
 
 from khive import AsyncHttpTransport, AuthError, RateLimited, ServerError, TransportError
 from khive.ops import encode, op
@@ -121,3 +124,98 @@ def test_aclose_closes_the_underlying_client(rest_server, api_key):
         assert transport._client.is_closed
 
     _run(_inner())
+
+
+def test_op_error_entry_flattened(rest_server, api_key):
+    async def _inner():
+        transport = AsyncHttpTransport(rest_server.url, api_key)
+        try:
+            response = await transport.round_trip({"ops": encode([op("nope")])}, timeout=5.0)
+            entry = response["result"]["results"][0]
+            assert entry["ok"] is False
+            assert "verb_not_found" in entry["error"]
+        finally:
+            await transport.aclose()
+
+    _run(_inner())
+
+
+def test_non_dict_result_entry_raises_transport_error():
+    async def _inner():
+        body = json.dumps({"results": [42]}).encode()
+        with _malformed_server(body) as url:
+            transport = AsyncHttpTransport(url, "key")
+            try:
+                with pytest.raises(TransportError):
+                    await transport.round_trip({"ops": encode([op("stats")])}, timeout=5.0)
+            finally:
+                await transport.aclose()
+
+    _run(_inner())
+
+
+def test_non_json_2xx_body_raises_transport_error():
+    async def _inner():
+        with _malformed_server(b"not json at all") as url:
+            transport = AsyncHttpTransport(url, "key")
+            try:
+                with pytest.raises(TransportError):
+                    await transport.round_trip({"ops": encode([op("stats")])}, timeout=5.0)
+            finally:
+                await transport.aclose()
+
+    _run(_inner())
+
+
+def test_json_2xx_body_missing_results_raises_transport_error():
+    async def _inner():
+        body = json.dumps({"ok": True}).encode()
+        with _malformed_server(body) as url:
+            transport = AsyncHttpTransport(url, "key")
+            try:
+                with pytest.raises(TransportError):
+                    await transport.round_trip({"ops": encode([op("stats")])}, timeout=5.0)
+            finally:
+                await transport.aclose()
+
+    _run(_inner())
+
+
+def test_json_2xx_body_that_is_a_list_raises_transport_error():
+    async def _inner():
+        body = json.dumps(["not", "an", "envelope"]).encode()
+        with _malformed_server(body) as url:
+            transport = AsyncHttpTransport(url, "key")
+            try:
+                with pytest.raises(TransportError):
+                    await transport.round_trip({"ops": encode([op("stats")])}, timeout=5.0)
+            finally:
+                await transport.aclose()
+
+    _run(_inner())
+
+
+def test_non_loopback_http_base_url_refused():
+    with pytest.raises(ValueError, match="http.*example.test"):
+        AsyncHttpTransport("http://example.test", "key")
+
+
+def test_loopback_http_base_url_admitted(rest_server, api_key):
+    async def _inner():
+        transport = AsyncHttpTransport(rest_server.url, api_key)
+        try:
+            response = await transport.round_trip({"ops": encode([op("stats")])}, timeout=5.0)
+            assert response["result"]["results"][0]["result"] == {
+                "entities": 1,
+                "edges": 0,
+                "notes": 0,
+            }
+        finally:
+            await transport.aclose()
+
+    _run(_inner())
+
+
+def test_allow_insecure_admits_non_loopback_http_base_url():
+    transport = AsyncHttpTransport("http://example.test", "key", allow_insecure=True)
+    assert transport._base_url == "http://example.test"
