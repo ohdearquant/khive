@@ -659,6 +659,162 @@ fn statement_is_cancellable_read(stmt: &rusqlite::Statement<'_>, sql: &str) -> b
     stmt.readonly() && transaction_control_head(sql).is_none()
 }
 
+/// Introspection `PRAGMA`s admitted through the pooled reader capability with
+/// an optional single positional argument (`PRAGMA name` or `PRAGMA
+/// name(arg)`) — none of these has a set/assignment form in SQLite, so an
+/// argument is always a read-side filter, never a mutation.
+const READER_STRUCTURAL_PRAGMAS: [&str; 7] = [
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+];
+
+/// Introspection `PRAGMA`s admitted through the pooled reader capability only
+/// in their bare, argument-less read form. Every one of these also has a
+/// `PRAGMA name = value` or `PRAGMA name(value)` assignment form in SQLite —
+/// an assigning form changes connection-local state that a pristine-state
+/// scan run only on dirty checkouts must never let back into the pool
+/// unnoticed (`reader_connection_state_is_pristine`,
+/// `reader_connection_settings_match_baseline`).
+const READER_SETTING_PRAGMAS: [&str; 10] = [
+    "database_list",
+    "collation_list",
+    "function_list",
+    "compile_options",
+    "page_count",
+    "freelist_count",
+    "user_version",
+    "schema_version",
+    "journal_mode",
+    "page_size",
+];
+
+/// Reject any raw SQL that is not one of a small allow-listed set of
+/// read-only statement shapes before it ever reaches a pooled reader
+/// connection.
+///
+/// `stmt.readonly()` (SQLite's own classifier, used by
+/// [`statement_is_cancellable_read`] to decide interrupt eligibility) is not
+/// a sufficient admission predicate on its own: by SQLite's own definition it
+/// also returns `true` for `ATTACH`/`DETACH`, `CREATE TEMP TABLE`, and
+/// configuration `PRAGMA`s like `writable_schema`, `busy_timeout`, or
+/// `cache_size` — none of which write the main database file, but all of
+/// which leave connection-local state that persists across pooled checkouts.
+/// Classification here instead runs on the statement head, admitting only
+/// `SELECT`, `WITH ... SELECT`, `VALUES`, `EXPLAIN [QUERY PLAN] <admitted>`,
+/// and the fixed `PRAGMA` allow-lists above.
+fn reader_capability_admits(sql: &str) -> Result<(), String> {
+    let rest = skip_sqlite_empty_prefix(sql.as_bytes());
+    let Some((head, tail)) = next_sqlite_token(rest) else {
+        // No head token (empty/comment-only statement): let SQLite's own
+        // prepare step surface that error rather than duplicating it here.
+        return Ok(());
+    };
+    if head.eq_ignore_ascii_case(b"SELECT")
+        || head.eq_ignore_ascii_case(b"VALUES")
+        || head.eq_ignore_ascii_case(b"WITH")
+    {
+        return Ok(());
+    }
+    if head.eq_ignore_ascii_case(b"EXPLAIN") {
+        let mut rest = skip_sqlite_empty_prefix(tail);
+        if let Some((query, next)) = next_sqlite_token(rest) {
+            if query.eq_ignore_ascii_case(b"QUERY") {
+                let after_query = skip_sqlite_empty_prefix(next);
+                match next_sqlite_token(after_query) {
+                    Some((plan, next2)) if plan.eq_ignore_ascii_case(b"PLAN") => {
+                        rest = skip_sqlite_empty_prefix(next2);
+                    }
+                    _ => {
+                        return Err(
+                            "EXPLAIN QUERY must be followed by PLAN through the reader capability"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+        return reader_capability_admits(&String::from_utf8_lossy(rest));
+    }
+    if head.eq_ignore_ascii_case(b"PRAGMA") {
+        return reader_capability_admits_pragma(tail);
+    }
+    Err(format!(
+        "statement head {:?} is not admitted through the reader capability; only \
+         SELECT/WITH/VALUES/EXPLAIN and an allow-listed set of read-only PRAGMA forms \
+         may run against a pooled reader connection",
+        String::from_utf8_lossy(head)
+    ))
+}
+
+fn reader_capability_admits_pragma(tail: &[u8]) -> Result<(), String> {
+    let rest = skip_sqlite_empty_prefix(tail);
+    let Some((mut name, mut after_name)) = next_sqlite_token(rest) else {
+        return Err("PRAGMA with no name is not admitted through the reader capability".into());
+    };
+    // `schema.pragma_name` — the schema qualifier changes which attached
+    // database the pragma targets, not which pragma runs.
+    if after_name.first() == Some(&b'.') {
+        let (qualified_name, qualified_after) =
+            next_sqlite_token(&after_name[1..]).ok_or_else(|| {
+                "PRAGMA schema-qualifier with no pragma name is not admitted through the \
+                 reader capability"
+                    .to_string()
+            })?;
+        name = qualified_name;
+        after_name = qualified_after;
+    }
+    let after = skip_sqlite_empty_prefix(after_name);
+    let is_structural = READER_STRUCTURAL_PRAGMAS
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed.as_bytes()));
+    let is_setting = READER_SETTING_PRAGMAS
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed.as_bytes()));
+    if !is_structural && !is_setting {
+        return Err(format!(
+            "PRAGMA {:?} is not admitted through the reader capability",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    if after.first() == Some(&b'=') {
+        return Err(format!(
+            "PRAGMA {:?} may not be assigned through the reader capability",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    if after.first() == Some(&b'(') && !is_structural {
+        return Err(format!(
+            "PRAGMA {:?} may not carry an argument through the reader capability",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a statement bound for the reader capability that is neither
+/// admitted transaction control (handled by the caller's cached
+/// read-transaction state machine) nor an admitted read shape
+/// ([`reader_capability_admits`]).
+fn admit_reader_capability_sql(
+    statement: &SqlStatement,
+    transaction_control: Option<CachedReadTransactionControl>,
+    operation: &'static str,
+) -> khive_storage::types::StorageResult<()> {
+    if transaction_control.is_some() {
+        return Ok(());
+    }
+    reader_capability_admits(&statement.sql).map_err(|message| StorageError::InvalidInput {
+        capability: StorageCapability::Sql,
+        operation: operation.into(),
+        message,
+    })
+}
+
 fn execute_query_interruptibly(
     scope: &crate::read_cancellation::InterruptibleReadScope,
     conn: &rusqlite::Connection,
@@ -1422,6 +1578,7 @@ impl khive_storage::SqlReader for SqliteReader {
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
         let transaction_control = cached_read_transaction_control(&statement.sql);
+        admit_reader_capability_sql(&statement, transaction_control, "query_row")?;
         if !self
             .use_explicit_transaction_handle(transaction_control, "query_row")
             .await?
@@ -1471,6 +1628,7 @@ impl khive_storage::SqlReader for SqliteReader {
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
         let transaction_control = cached_read_transaction_control(&statement.sql);
+        admit_reader_capability_sql(&statement, transaction_control, "query_all")?;
         if !self
             .use_explicit_transaction_handle(transaction_control, "query_all")
             .await?
@@ -1514,6 +1672,7 @@ impl khive_storage::SqlReader for SqliteReader {
         page: PageRequest,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
         let transaction_control = cached_read_transaction_control(&statement.sql);
+        admit_reader_capability_sql(&statement, transaction_control, "query_page")?;
         if !self
             .use_explicit_transaction_handle(transaction_control, "query_page")
             .await?
@@ -2120,6 +2279,11 @@ where
                 operation,
                 pool.reader_until(|| scope.should_stop()),
             )?;
+            // Every caller of `run_pool_reader_query` runs a `SqlStatement`
+            // (raw SQL) rather than a typed store's fixed query, so the
+            // checkout pays the pristine-state scan on return regardless of
+            // which `SqlReader` wrapper (reader or writer capability) drew it.
+            guard.mark_dirty();
             scope.with_pooled_reader(&mut guard, |conn| query(scope, conn))
         },
     )
@@ -2167,6 +2331,7 @@ impl khive_storage::SqlReader for PoolBackedReader {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
+        admit_reader_capability_sql(&statement, None, "pool_reader.query_row")?;
         let pool = Arc::clone(&self.pool);
         run_pool_reader_query(pool, "pool_reader.query_row", move |scope, conn| {
             execute_query_row_interruptibly(
@@ -2185,6 +2350,7 @@ impl khive_storage::SqlReader for PoolBackedReader {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        admit_reader_capability_sql(&statement, None, "pool_reader.query_all")?;
         let pool = Arc::clone(&self.pool);
         run_pool_reader_query(pool, "pool_reader.query_all", move |scope, conn| {
             execute_query_interruptibly(
@@ -2204,6 +2370,7 @@ impl khive_storage::SqlReader for PoolBackedReader {
         statement: SqlStatement,
         page: PageRequest,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        admit_reader_capability_sql(&statement, None, "pool_reader.query_page")?;
         let pool = Arc::clone(&self.pool);
         run_pool_reader_query(pool, "pool_reader.query_page", move |scope, conn| {
             execute_query_page_interruptibly(
@@ -3045,6 +3212,10 @@ mod tests {
         // Production-shaped file-backed raw-SQL reads must use the same pool
         // admission as typed stores. Before ADR-165 Slice 2, `reader()` opened
         // a standalone connection and this held pooled reader was invisible.
+        // A plain SELECT (not a DML/RETURNING statement) is used here: the
+        // reader capability's admission gate now refuses non-read statement
+        // shapes before checkout is even attempted, so a DML probe would
+        // never reach the cancellation-race path this test exercises.
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
         let mut waiting_reader = bridge.reader().await.unwrap();
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -3053,8 +3224,7 @@ mod tests {
             async move {
                 waiting_reader
                     .query_row(SqlStatement {
-                        sql: "UPDATE checkout_cancel_probe SET value = value + 1 RETURNING value"
-                            .into(),
+                        sql: "SELECT value FROM checkout_cancel_probe".into(),
                         params: vec![],
                         label: Some("must-not-run-after-cancelled-checkout".into()),
                     })
@@ -3085,13 +3255,86 @@ mod tests {
             .unwrap();
         assert_eq!(
             value, 0,
-            "a DML statement started after its pre-admission checkout was cancelled"
+            "the probe row must be untouched: nothing else in this test writes to it"
         );
         assert_eq!(
             pool.available_readers(),
             1,
             "reader checkout leaked a permit"
         );
+    }
+
+    /// Reproduction probe for the reader-capability admission gap: `sqlite3_stmt_readonly`
+    /// (the only check the pre-fix bridge applied to raw SQL reaching the
+    /// pooled reader) returns `true` for `ATTACH`, configuration `PRAGMA`s,
+    /// and `CREATE TEMP TABLE` — none of which write the main database file,
+    /// but all of which leave connection-local state that `reset_reader_connection`
+    /// did not catch. Each probe below is submitted through the reader
+    /// capability exactly as an untrusted caller would reach it
+    /// (`SqlBridge::reader` -> `SqlReader::query_all`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_reader_capability_admission_of_state_mutating_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_reader_admission_probe.db")),
+            max_readers: 2,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch("CREATE TABLE reader_admission_probe(value INTEGER NOT NULL);")
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let probes: [&str; 5] = [
+            "ATTACH DATABASE ':memory:' AS x",
+            "PRAGMA writable_schema=ON",
+            "PRAGMA busy_timeout=1",
+            "PRAGMA cache_size(-64)",
+            "CREATE TEMP TABLE t(x)",
+        ];
+        let mut admitted = Vec::new();
+        for probe in probes {
+            let mut reader = bridge.reader().await.unwrap();
+            let result = reader
+                .query_all(SqlStatement {
+                    sql: probe.into(),
+                    params: vec![],
+                    label: Some("reader-admission-probe".into()),
+                })
+                .await;
+            admitted.push((probe, result.is_ok()));
+        }
+        eprintln!("reader capability admission per probe: {admitted:#?}");
+        for (probe, was_admitted) in &admitted {
+            assert!(
+                !was_admitted,
+                "reader capability must refuse {probe:?}; the pre-fix bridge wrongly admitted it"
+            );
+        }
+
+        // Control: an ordinary SELECT and an allow-listed introspection
+        // PRAGMA must still be admitted through the same reader capability.
+        let controls: [&str; 2] = [
+            "SELECT value FROM reader_admission_probe",
+            "PRAGMA table_info(reader_admission_probe)",
+        ];
+        for control in controls {
+            let mut reader = bridge.reader().await.unwrap();
+            let result = reader
+                .query_all(SqlStatement {
+                    sql: control.into(),
+                    params: vec![],
+                    label: Some("reader-admission-control".into()),
+                })
+                .await;
+            assert!(
+                result.is_ok(),
+                "reader capability must still admit {control:?}: {result:?}"
+            );
+        }
     }
 
     /// A pooled-reader checkout that exhausts `checkout_timeout` WITHOUT any

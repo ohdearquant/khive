@@ -798,6 +798,10 @@ exhausted `KHIVE_CHECKOUT_TIMEOUT_SECS` before work began, not cooperative reque
 `active_pooled_reader_checkouts`, `peak_active_pooled_reader_checkouts`,
 `completed_pooled_reader_checkouts`, and `max_completed_reader_hold_micros` expose concurrency
 and lifecycle evidence; completed hold includes connection reset/replacement before reuse.
+`reader_replacement_open_failures` counts a disqualified pooled-reader return whose replacement
+connection then also failed to open, permanently shrinking the physical pool by one slot below
+`max_readers`; non-zero here means the pool has fewer physical reader connections than
+configured, and each occurrence is also logged at `warn`.
 
 The timeout setting applies to each admission attempt. A verb that issues several sequential
 reads can spend more than one configured timeout in total wall time, but each attempt is bounded

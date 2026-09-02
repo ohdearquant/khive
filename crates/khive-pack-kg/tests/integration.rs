@@ -14593,6 +14593,7 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
         "peak_active_pooled_reader_checkouts",
         "completed_pooled_reader_checkouts",
         "max_completed_reader_hold_micros",
+        "reader_replacement_open_failures",
     ] {
         let value = reader_contention.get(field).unwrap_or_else(|| {
             panic!("reader_contention.{field} must be present in the wire payload")
