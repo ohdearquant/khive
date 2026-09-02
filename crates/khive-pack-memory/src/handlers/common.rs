@@ -896,6 +896,7 @@ impl MemoryPack {
                     filter: Some(TextFilter {
                         namespaces: namespaces.to_vec(),
                         kinds: vec![SubstrateKind::Note],
+                        record_kinds: vec!["memory".to_string()],
                         ..TextFilter::default()
                     }),
                     top_k: candidate_limit,
