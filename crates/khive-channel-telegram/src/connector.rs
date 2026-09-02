@@ -50,15 +50,23 @@ struct TelegramApiResponse<T> {
     description: Option<String>,
 }
 
+/// Classify a failed Bot API call by HTTP status, falling back to the
+/// response body's `error_code` when it parses. `response` is `None` when
+/// the body was empty, non-JSON, or otherwise failed to deserialize (a 4xx
+/// status with an HTML error page from an intermediate proxy, for example);
+/// the HTTP status alone is still authoritative for the transient/permanent
+/// split in that case, so a client error never falls back to the transient
+/// default just because its body could not be parsed as Bot API JSON.
 fn telegram_api_error<T>(
     method: &str,
     status: reqwest::StatusCode,
-    response: &TelegramApiResponse<T>,
+    response: Option<&TelegramApiResponse<T>>,
 ) -> ChannelError {
-    let code = response.error_code.unwrap_or(status.as_u16());
+    let error_code = response.and_then(|r| r.error_code);
+    let description = response.and_then(|r| r.description.as_deref());
+    let code = error_code.unwrap_or(status.as_u16());
     let message = format!(
-        "{method} failed: status={status}, error_code={:?}, description={:?}",
-        response.error_code, response.description
+        "{method} failed: status={status}, error_code={error_code:?}, description={description:?}"
     );
     if code == 408 || code == 429 || code >= 500 {
         ChannelError::Transport(message)
@@ -163,15 +171,26 @@ impl TelegramConnector for LiveTelegramConnector {
             })?;
 
         let status = resp.status();
-        let parsed: TelegramApiResponse<serde_json::Value> = resp.json().await.map_err(|e| {
+        let body = resp.text().await.map_err(|e| {
             ChannelError::Transport(format!(
-                "sendMessage: malformed response: {}",
+                "sendMessage: failed to read response body: {}",
                 e.without_url()
             ))
         })?;
 
-        if !status.is_success() || !parsed.ok {
-            return Err(telegram_api_error("sendMessage", status, &parsed));
+        if !status.is_success() {
+            let parsed: Option<TelegramApiResponse<serde_json::Value>> =
+                serde_json::from_str(&body).ok();
+            return Err(telegram_api_error("sendMessage", status, parsed.as_ref()));
+        }
+
+        let parsed: TelegramApiResponse<serde_json::Value> =
+            serde_json::from_str(&body).map_err(|e| {
+                ChannelError::Transport(format!("sendMessage: malformed response: {e}"))
+            })?;
+
+        if !parsed.ok {
+            return Err(telegram_api_error("sendMessage", status, Some(&parsed)));
         }
         Ok(())
     }
@@ -193,15 +212,24 @@ impl TelegramConnector for LiveTelegramConnector {
             })?;
 
         let status = resp.status();
-        let parsed: TelegramApiResponse<Vec<TelegramUpdate>> = resp.json().await.map_err(|e| {
+        let body = resp.text().await.map_err(|e| {
             ChannelError::Transport(format!(
-                "getUpdates: malformed response: {}",
+                "getUpdates: failed to read response body: {}",
                 e.without_url()
             ))
         })?;
 
-        if !status.is_success() || !parsed.ok {
-            return Err(telegram_api_error("getUpdates", status, &parsed));
+        if !status.is_success() {
+            let parsed: Option<TelegramApiResponse<serde_json::Value>> =
+                serde_json::from_str(&body).ok();
+            return Err(telegram_api_error("getUpdates", status, parsed.as_ref()));
+        }
+
+        let parsed: TelegramApiResponse<Vec<TelegramUpdate>> = serde_json::from_str(&body)
+            .map_err(|e| ChannelError::Transport(format!("getUpdates: malformed response: {e}")))?;
+
+        if !parsed.ok {
+            return Err(telegram_api_error("getUpdates", status, Some(&parsed)));
         }
         Ok(parsed.result.unwrap_or_default())
     }
@@ -327,6 +355,26 @@ mod tests {
     async fn send_message_classifies_api_client_error_as_permanent() {
         let base_url =
             spawn_one_shot_server(r#"{"ok":false,"error_code":400,"description":"Bad Request"}"#);
+        let connector = LiveTelegramConnector::with_base_url("token".to_string(), base_url);
+
+        let error = connector.send_message(555, "hi").await.unwrap_err();
+        assert!(matches!(error, ChannelError::PermanentTransport(_)));
+        assert_eq!(
+            error.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Permanent
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_classifies_client_error_with_unparseable_body_as_permanent() {
+        // A 400 with a body that is not the Bot API's JSON shape (an intermediate
+        // proxy's HTML error page, or an empty body) must still classify as
+        // permanent from the HTTP status alone -- requiring the body to parse
+        // before the status is consulted would silently retry a rejection.
+        let base_url = spawn_one_shot_server_with_status(
+            "400 Bad Request",
+            "<html><body>400 Bad Request</body></html>",
+        );
         let connector = LiveTelegramConnector::with_base_url("token".to_string(), base_url);
 
         let error = connector.send_message(555, "hi").await.unwrap_err();

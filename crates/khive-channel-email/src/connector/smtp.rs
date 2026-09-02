@@ -137,6 +137,21 @@ fn classify_smtp_send_error(is_permanent: bool, message: String) -> ChannelError
     }
 }
 
+/// Classify a failure from the connect/AUTH preamble (ADR-122 §4's
+/// "connection, AUTH" stage grouping), distinct from [`classify_smtp_send_error`]
+/// which classifies the post-auth per-message MAIL/RCPT/DATA stage. A
+/// permanent (5xx) rejection here applies to the whole account, not one
+/// recipient, so it is surfaced as `Auth` rather than a per-message
+/// permanent failure: the caller must stop the outbound component for
+/// operator action instead of terminally failing the note being sent.
+fn classify_smtp_connection_error(is_permanent: bool, message: String) -> ChannelError {
+    if is_permanent {
+        ChannelError::Auth(message)
+    } else {
+        ChannelError::Transport(message)
+    }
+}
+
 /// Build the outbound RFC 822 message, applying thread-correlation, Message-ID, and
 /// reply-threading headers.
 ///
@@ -247,6 +262,20 @@ impl SmtpConnector for LettreSmtp {
                     .build()
             }
         };
+
+        // Explicitly separate the connect/AUTH preamble from the per-message
+        // MAIL/RCPT/DATA exchange (ADR-122 §4): `test_connection` runs only
+        // the former (connect, EHLO, AUTH if configured, NOOP), so a
+        // definitive rejection here is an account-wide auth problem, not a
+        // rejection of this particular recipient. The transport pools the
+        // connection it just opened, so a successful test reuses it for the
+        // send below instead of paying for a second handshake.
+        transport.test_connection().await.map_err(|error| {
+            classify_smtp_connection_error(
+                error.is_permanent(),
+                format!("SMTP connection/authentication failed: {error}"),
+            )
+        })?;
 
         transport.send(msg).await.map_err(|error| {
             classify_smtp_send_error(error.is_permanent(), format!("SMTP send failed: {error}"))
@@ -406,6 +435,30 @@ mod tests {
         assert_eq!(
             permanent.delivery_failure_class(),
             khive_channel::DeliveryFailureClass::Permanent
+        );
+    }
+
+    #[test]
+    fn smtp_connection_preamble_permanent_rejection_is_auth_not_permanent_transport() {
+        // A definitive rejection during connect/AUTH applies to the whole
+        // account, not the one message being sent -- it must not be routed
+        // through the same per-message permanent-failure path a rejected
+        // recipient uses (classify_smtp_send_error), or the outbox loop
+        // would terminally fail one note instead of stopping the component.
+        let transient = classify_smtp_connection_error(false, "421 too busy".to_string());
+        assert!(matches!(transient, ChannelError::Transport(_)));
+        assert_eq!(
+            transient.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Transient
+        );
+
+        let permanent =
+            classify_smtp_connection_error(true, "535 5.7.8 authentication failed".to_string());
+        assert!(matches!(permanent, ChannelError::Auth(_)));
+        assert_ne!(
+            std::mem::discriminant(&permanent),
+            std::mem::discriminant(&ChannelError::PermanentTransport(String::new())),
+            "a permanent AUTH rejection must not be classified as a per-message permanent failure"
         );
     }
 

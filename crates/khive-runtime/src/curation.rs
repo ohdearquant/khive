@@ -1924,6 +1924,22 @@ impl KhiveRuntime {
         Ok(snapshot)
     }
 
+    /// True once a `delivery` outcome has been terminally recorded
+    /// (`"delivered"` or `"failed"`). Shared by every delivery-outcome
+    /// marker: concurrent outbox workers (two daemon processes overlapping
+    /// during a restart, per ADR-122 §4/Consequences) can both load the same
+    /// pending note before either writes, so a marker must re-check the
+    /// freshly loaded snapshot rather than trust the compare-and-swap alone
+    /// -- the CAS only rejects a write against a snapshot that has since
+    /// changed, not a write that starts from an up-to-date terminal snapshot
+    /// and would otherwise happily overwrite it with a different outcome.
+    fn outbound_delivery_is_terminal(props: Option<&serde_json::Map<String, Value>>) -> bool {
+        props
+            .and_then(|properties| properties.get("delivery"))
+            .and_then(Value::as_str)
+            .is_some_and(|state| state == "delivered" || state == "failed")
+    }
+
     /// Record a transient transport failure while leaving the message
     /// pending. The retry deadline is derived from the incremented persisted
     /// attempt count, using `base_delay * 2^(attempt - 1)` capped at
@@ -1950,11 +1966,7 @@ impl KhiveRuntime {
 
         let snapshot = self.outbound_message(token, id).await?;
         let props = snapshot.properties.as_ref().and_then(Value::as_object);
-        let terminal = props
-            .and_then(|properties| properties.get("delivery"))
-            .and_then(Value::as_str)
-            .is_some_and(|state| state == "delivered" || state == "failed");
-        if terminal {
+        if Self::outbound_delivery_is_terminal(props) {
             return Err(RuntimeError::InvalidInput(format!(
                 "outbound message {id} already has a terminal delivery outcome"
             )));
@@ -2020,6 +2032,13 @@ impl KhiveRuntime {
             "transport_message_id": &transport_message_id,
         }))?;
         let snapshot = self.outbound_message(token, id).await?;
+        if Self::outbound_delivery_is_terminal(
+            snapshot.properties.as_ref().and_then(Value::as_object),
+        ) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "outbound message {id} already has a terminal delivery outcome"
+            )));
+        }
         let mut props = snapshot
             .properties
             .as_ref()
@@ -2058,6 +2077,13 @@ impl KhiveRuntime {
             "last_error": &last_error,
         }))?;
         let snapshot = self.outbound_message(token, id).await?;
+        if Self::outbound_delivery_is_terminal(
+            snapshot.properties.as_ref().and_then(Value::as_object),
+        ) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "outbound message {id} already has a terminal delivery outcome"
+            )));
+        }
         let mut props = snapshot
             .properties
             .as_ref()
@@ -4292,6 +4318,86 @@ mod tests {
                 "{label}: expected InvalidInput, got {err:?}"
             );
         }
+    }
+
+    /// Regression: two concurrent outbox workers (two overlapping daemon
+    /// processes during a restart, per ADR-122 §4/Consequences) can both
+    /// load the same pending note before either writes. Without a terminal
+    /// re-check, a worker that lost the race to record a failure still
+    /// re-fetches a fresh snapshot right before writing -- which already
+    /// carries the winner's "delivered" outcome -- and the compare-and-swap
+    /// alone does not stop it from blindly overwriting that success with
+    /// "failed" (or vice versa).
+    #[tokio::test]
+    async fn outbound_delivery_marker_refuses_to_overwrite_existing_terminal_outcome() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let delivered_first = outbound_message_note();
+        let delivered_first_id = delivered_first.id;
+        let failed_first = outbound_message_note();
+        let failed_first_id = failed_first.id;
+        for note in [delivered_first, failed_first] {
+            store.upsert_note(note).await.expect("seed note");
+        }
+
+        rt.mark_outbound_message_delivered(
+            &tok,
+            delivered_first_id,
+            "2026-08-28T00:00:00Z".to_string(),
+            None,
+        )
+        .await
+        .expect("first delivery marker wins the race");
+
+        let err = rt
+            .mark_outbound_message_failed(
+                &tok,
+                delivered_first_id,
+                "2026-08-28T00:00:01Z".to_string(),
+                "duplicate send rejected".to_string(),
+            )
+            .await
+            .expect_err("a losing failure marker must not clobber the recorded success");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+
+        let note = store
+            .get_note(delivered_first_id)
+            .await
+            .expect("get note")
+            .expect("note exists");
+        let props = note
+            .properties
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            props.get("delivery").and_then(|v| v.as_str()),
+            Some("delivered"),
+            "recorded success must survive the losing worker's overwrite attempt"
+        );
+
+        rt.mark_outbound_message_failed(
+            &tok,
+            failed_first_id,
+            "2026-08-28T00:00:00Z".to_string(),
+            "recipient rejected".to_string(),
+        )
+        .await
+        .expect("first failure marker wins the race");
+
+        let err = rt
+            .mark_outbound_message_delivered(
+                &tok,
+                failed_first_id,
+                "2026-08-28T00:00:01Z".to_string(),
+                None,
+            )
+            .await
+            .expect_err("a late success marker must not clobber a recorded failure");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)));
     }
 
     #[tokio::test]

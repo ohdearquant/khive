@@ -1461,7 +1461,7 @@ async fn channel_outbox_loop(
 
     loop {
         tokio::time::sleep(OUTBOUND_RETRY_BASE).await;
-        channel_outbox_once(
+        let stop = channel_outbox_once(
             email_channel.as_ref(),
             &runtime,
             &namespace,
@@ -1470,12 +1470,22 @@ async fn channel_outbox_loop(
             &allowlist,
         )
         .await;
+        if stop {
+            tracing::error!(
+                "email outbound delivery stopped: SMTP authentication was rejected; \
+                 restart the component after fixing credentials"
+            );
+            return;
+        }
     }
 }
 
 /// Execute one email outbox scan. Kept separate from the five-second loop so
 /// routing and owner-claim behavior can be verified without sleeping or
-/// opening a network transport.
+/// opening a network transport. Returns `true` when the caller must stop the
+/// component (ADR-122 §4: a definitive SMTP AUTH rejection applies to the
+/// whole account, not the one message being sent, so it is never recorded as
+/// a per-note failure).
 #[cfg(feature = "channel-email")]
 #[allow(clippy::too_many_arguments)]
 async fn channel_outbox_once(
@@ -1485,7 +1495,7 @@ async fn channel_outbox_once(
     mailbox: &str,
     domain: &str,
     allowlist: &[String],
-) {
+) -> bool {
     use chrono::Utc;
     use khive_channel::ChannelEnvelope;
 
@@ -1500,7 +1510,7 @@ async fn channel_outbox_once(
         Ok(token) => token,
         Err(error) => {
             tracing::warn!(error = %error, "outbox loop: namespace authorization failed");
-            return;
+            return false;
         }
     };
     let notes = match runtime
@@ -1510,7 +1520,7 @@ async fn channel_outbox_once(
         Ok(notes) => notes,
         Err(error) => {
             tracing::warn!(error = %error, "outbox loop: outbox scan failed");
-            return;
+            return false;
         }
     };
     let notes: Vec<serde_json::Value> = notes
@@ -1670,6 +1680,22 @@ async fn channel_outbox_once(
                     ),
                 }
             }
+            Err(khive_channel::ChannelError::Auth(auth_error)) => {
+                // ADR-122 §4: a definitive AUTH rejection is an account-wide
+                // condition, not a fact about this recipient. Recording it as
+                // a per-note permanent failure (via record_outbound_send_failure)
+                // would terminally fail every note queued during the outage;
+                // instead leave this note pending and stop the component so
+                // an operator notices and fixes credentials before delivery
+                // resumes.
+                tracing::error!(
+                    note_id = %note_id,
+                    recipient = %recipient,
+                    error = %auth_error,
+                    "outbox loop: SMTP authentication rejected; stopping outbound delivery"
+                );
+                return true;
+            }
             Err(error) => {
                 let mark_result = match uuid::Uuid::parse_str(&note_id) {
                     Ok(uuid) => record_outbound_send_failure(runtime, &token, uuid, &error)
@@ -1698,6 +1724,7 @@ async fn channel_outbox_once(
             }
         }
     }
+    false
 }
 
 /// Apply the same independent daemon/runtime admission as the email adapter:
@@ -10731,6 +10758,7 @@ backend = "kg-backend"
             Success,
             Transient,
             Permanent,
+            Auth,
         }
 
         struct ScriptedChannel {
@@ -10763,6 +10791,9 @@ backend = "kg-backend"
                     SendOutcome::Permanent => Err(ChannelError::PermanentTransport(
                         "recipient rejected".to_string(),
                     )),
+                    SendOutcome::Auth => {
+                        Err(ChannelError::Auth("authentication failed".to_string()))
+                    }
                 }
             }
 
@@ -10852,6 +10883,54 @@ backend = "kg-backend"
             assert_eq!(properties["delivery_attempts"].as_u64(), Some(1));
             assert!(properties["next_attempt_at"].as_str().is_some());
             assert!(properties.get("delivery").is_none());
+        }
+
+        /// Regression (khive #2333 review #3): a definitive SMTP AUTH
+        /// rejection is an account-wide condition, not a fact about the
+        /// message being sent. `channel_outbox_once` must not route it
+        /// through the per-note failure path -- doing so would terminally
+        /// fail every note queued during an auth outage -- and must instead
+        /// leave the note untouched and signal the caller to stop the
+        /// component.
+        #[tokio::test]
+        async fn email_auth_failure_stops_component_without_touching_the_note() {
+            let (runtime, token, namespace) = runtime();
+            let id = seed_outbound(
+                &runtime,
+                &token,
+                "email:recipient@example.com",
+                serde_json::json!({}),
+            )
+            .await;
+            let channel = ScriptedChannel::new(SendOutcome::Auth);
+
+            let stop = channel_outbox_once(
+                &channel,
+                &runtime,
+                &namespace,
+                "sender@example.com",
+                "example.com",
+                &["recipient@example.com".to_string()],
+            )
+            .await;
+
+            assert!(stop, "an AUTH rejection must signal the loop to stop");
+            let note = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap();
+            let properties = note.properties.unwrap_or_default();
+            assert!(
+                properties.get("delivery").is_none(),
+                "an account-wide auth rejection must not terminally fail the note"
+            );
+            assert!(
+                properties.get("delivery_attempts").is_none(),
+                "an account-wide auth rejection must not consume a per-note retry attempt"
+            );
         }
 
         #[tokio::test]
