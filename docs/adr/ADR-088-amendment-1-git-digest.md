@@ -175,14 +175,23 @@ frozen `until`; temporary absence is not evidence that the pass failed or commit
 4. Cleanup on eviction uses directory removal of the scratch path only (never touches
    user-owned paths).
 
-5. Failure contract (2026-09-02). A remote source whose clone or fetch setup fails
-   returns the typed `RemoteFetchError { remote, message }` rather than a generic error:
-   `remote` is the canonical URL with any embedded credentials and query string redacted,
-   and `message` is the underlying git failure. A source that cannot be parsed as a local
-   path or a remote URL stays `InvalidInput`, and storage failures keep their existing
-   error types, so callers can tell a network or authentication failure apart from a
-   malformed request without inspecting message text. The rendered error never contains
-   the credential or query material stripped from `remote`.
+5. Failure contract (2026-09-02). When the initial clone or fetch that establishes a
+   cache entry (step 1) fails, it returns the typed `RemoteFetchError { remote, message }`
+   in-process rather than a generic error: `remote` is the canonical URL with any embedded
+   credentials and query string redacted, and `message` is the cache/setup error text: a
+   synthesized exit-status summary for a failed git invocation, or the I/O, size-cap, or
+   unsafe-replace guard message for a non-git cache failure; none of these retain git's
+   own stderr. This typed variant reaches in-process `VerbRegistry::dispatch` callers; the
+   MCP `request` envelope has no dedicated wire encoding for it and falls back to
+   rendering the plain error message, so an MCP caller still has to read that text to tell
+   it apart from `InvalidInput`. Because `remote` is redacted before the error is built,
+   the rendered message, in-process or on the wire, never contains the credential or
+   query material stripped from it. A clone/fetch failure hit later, while repairing a
+   missing object during commit walking against an already-cached clone (a bounded
+   refetch-then-reclone attempt), is not raised as `RemoteFetchError`; it is wrapped as a
+   plain error and reaches the caller as `InvalidInput` instead. A source that cannot be
+   parsed as a local path or a remote URL also stays `InvalidInput`, and storage failures
+   keep their existing error types.
 
 ### Accepted cache crash-residue rider (2026-08-09)
 
