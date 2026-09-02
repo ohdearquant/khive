@@ -1,11 +1,26 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
+
+## Amendment (2026-08-29): tri-state atom upsert patches
+
+On an existing atom, `knowledge.upsert_atoms` treats `source_uri`, `source_type`, and `finalized`
+as patch fields with three wire states. An omitted key preserves the stored value. JSON `null`
+clears a source field, while a non-blank string replaces it. A boolean sets `finalized`
+explicitly. Because the `finalized` column is non-nullable, `finalized: null` resets it to the
+schema default (`false`), the same persisted flag as explicit `false`.
+
+The atom lifecycle `status` remains independent from the legacy finalization flag. Setting
+`finalized: true` promotes `draft` to `reviewed`; `false` or `null` does not demote `reviewed`,
+`deprecated`, or any future non-draft lifecycle state. On insert, omitted or null source fields
+store SQL NULL, and omitted or null `finalized` creates a non-finalized `draft` atom. Blank source
+strings retain their prior compatibility behavior: they store NULL on insert and leave an
+existing source unchanged on update.
 
 ## Amendment (2026-08-06): identifier parity for `knowledge.get`
 
@@ -184,13 +199,13 @@ does **not** introduce new note kinds, entity kinds, or edge relations:
 #### `knowledge.upsert_atoms` — bulk atom insert/update
 
 ```
-upsert_atoms(atoms: [{slug, name, content, tags?, properties?, finalized?}, ...], chunk_size?) → {upserted: N}
+upsert_atoms(atoms: [{slug, name, content, tags?, properties?, source_uri?, source_type?, finalized?}, ...], chunk_size?) → {upserted: N}
 ```
 
 Inserts or updates atoms by `(namespace, slug)` key. On conflict, updates name,
-content, tags, properties, finalized, and `updated_at`. Empty `atoms`
-array is rejected. Tags are stored as a JSON array string; properties as a JSON
-object string.
+content, tags, properties, source attribution, finalized, and `updated_at` according to the
+tri-state amendment above. Empty `atoms` array is rejected. Tags are stored as a JSON array
+string; properties as a JSON object string.
 
 #### `knowledge.upsert_domains` — bulk domain insert/update
 

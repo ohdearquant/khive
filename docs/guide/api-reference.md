@@ -1308,6 +1308,10 @@ Remove rows from the profile resolution table. At least one filter is required.
 request(ops="brain.unbind(actor=\"role:implementer\")")
 ```
 
+The result includes `removed`, the number of matching bindings deleted. A successful
+request that matched nothing returns `removed: 0`. The legacy `unbound` field carries
+the same count for compatibility.
+
 ### `brain.bindings` — Assertive
 
 List rows in the profile resolution table, optionally filtered.

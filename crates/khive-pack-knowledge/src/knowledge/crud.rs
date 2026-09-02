@@ -281,10 +281,10 @@ impl KnowledgeHandlers {
             khive_runtime::secret_gate::reject_reserved_secret_gate_property(
                 atom_in.properties.as_ref(),
             )?;
-            if let Some(ref uri) = atom_in.source_uri {
+            if let Some(Some(uri)) = &atom_in.source_uri {
                 khive_runtime::secret_gate::check(uri)?;
             }
-            if let Some(ref st) = atom_in.source_type {
+            if let Some(Some(st)) = &atom_in.source_type {
                 khive_runtime::secret_gate::check(st)?;
             }
         }
@@ -366,13 +366,23 @@ impl KnowledgeHandlers {
             let source_uri = atom_in
                 .source_uri
                 .as_ref()
+                .and_then(Option::as_ref)
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty());
+            // Blank strings keep their established update behavior (preserve),
+            // while JSON null is now an explicit clear.
+            let source_uri_present =
+                matches!(&atom_in.source_uri, Some(None)) || source_uri.is_some();
             let source_type = atom_in
                 .source_type
                 .as_ref()
+                .and_then(Option::as_ref)
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty());
+            let source_type_present =
+                matches!(&atom_in.source_type, Some(None)) || source_type.is_some();
+            let finalized_present = atom_in.finalized.is_some();
+            let finalized = atom_in.finalized.flatten().unwrap_or(false);
 
             if insert {
                 statements.push(SqlStatement {
@@ -389,8 +399,8 @@ impl KnowledgeHandlers {
                             source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
                             // status mirrors the lifecycle backfill (finalized => reviewed) so a
                             // freshly-finalized atom is never left at the 'draft' default.
-                            SqlValue::Text(if atom_in.finalized.unwrap_or(false) { "reviewed" } else { "draft" }.to_string()),
-                            SqlValue::Integer(atom_in.finalized.unwrap_or(false) as i64),
+                            SqlValue::Text(if finalized { "reviewed" } else { "draft" }.to_string()),
+                            SqlValue::Integer(finalized as i64),
                             SqlValue::Integer(now),
                             SqlValue::Integer(now),
                         ],
@@ -399,25 +409,22 @@ impl KnowledgeHandlers {
                 created += 1;
             } else {
                 statements.push(SqlStatement {
-                    // Promote draft -> reviewed when this upsert finalizes the atom.
-                    // Never demote an already reviewed row, and leave status
-                    // untouched when not finalizing. finalized=COALESCE(?7, finalized)
-                    // preserves the existing flag when the caller omits it; SQLite's
-                    // `NULL = 1` evaluates to NULL (falsy), so an omitted field also
-                    // leaves the status CASE on its ELSE branch. source_uri/source_type
-                    // use the same COALESCE shape so an omitted field preserves the
-                    // existing attribution instead of clobbering it with NULL.
-                    sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=COALESCE(?5, source_uri), source_type=COALESCE(?6, source_type), finalized=COALESCE(?7, finalized), status = CASE WHEN ?7 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?8 WHERE id=?9 AND namespace=?10".into(),
+                    // Presence/value pairs distinguish omission from explicit JSON
+                    // null. Finalized is non-nullable, so its null value is bound as
+                    // false. Only true promotes draft -> reviewed; clearing the flag
+                    // does not demote an independent lifecycle status.
+                    sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=CASE WHEN ?5 = 1 THEN ?6 ELSE source_uri END, source_type=CASE WHEN ?7 = 1 THEN ?8 ELSE source_type END, finalized=CASE WHEN ?9 = 1 THEN ?10 ELSE finalized END, status=CASE WHEN ?9 = 1 AND ?10 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?11 WHERE id=?12 AND namespace=?13".into(),
                     params: vec![
                         SqlValue::Text(atom_in.name.clone()),
                         SqlValue::Text(content),
                         SqlValue::Text(tags_json),
                         props_json.map_or(SqlValue::Null, SqlValue::Text),
+                        SqlValue::Integer(source_uri_present as i64),
                         source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                        SqlValue::Integer(source_type_present as i64),
                         source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                        atom_in
-                            .finalized
-                            .map_or(SqlValue::Null, |f| SqlValue::Integer(f as i64)),
+                        SqlValue::Integer(finalized_present as i64),
+                        SqlValue::Integer(finalized as i64),
                         SqlValue::Integer(now),
                         SqlValue::Text(id),
                         SqlValue::Text(ns.clone()),
