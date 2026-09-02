@@ -632,7 +632,7 @@ relation validation, and index-maintenance behavior. The persistence failure mod
 caller whose patch was derived from a stale full-row snapshot: the caller receives a distinct
 optimistic-concurrency conflict instead of silently overwriting the newer row.
 
-For the six production-graph sites in scope, a full-row replacement carries the revision read
+For the eight production-graph sites in scope, a full-row replacement carries the revision read
 before patch application into the shared guarded store operation. The operation succeeds only if
 the row still has that revision and deletion state and the replacement revision strictly advances
 it. A conflict performs no curation update; the caller must fetch current state and explicitly

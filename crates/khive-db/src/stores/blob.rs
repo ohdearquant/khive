@@ -5054,8 +5054,15 @@ mod tests {
         .await
         .expect_err("the probe must refuse when an id it would delete already names a row");
         assert!(
-            matches!(error, StorageError::Unsupported { .. }),
-            "expected StorageError::Unsupported, got {error:?}"
+            matches!(
+                &error,
+                StorageError::WriterTaskRequestFailed {
+                    request_state:
+                        khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                    source,
+                } if matches!(source.as_ref(), StorageError::Unsupported { .. })
+            ),
+            "expected a proven-rollback wrapper retaining StorageError::Unsupported, got {error:?}"
         );
 
         let reader = backend.pool().reader().unwrap();

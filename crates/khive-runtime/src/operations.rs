@@ -13483,6 +13483,7 @@ mod tests {
             .count(TextFilter {
                 ids: vec![],
                 kinds: vec![],
+                record_kinds: vec![],
                 namespaces: vec![ns.clone()],
             })
             .await
@@ -13596,6 +13597,7 @@ mod tests {
             .count(TextFilter {
                 ids: vec![],
                 kinds: vec![],
+                record_kinds: vec![],
                 namespaces: vec![ns.clone()],
             })
             .await

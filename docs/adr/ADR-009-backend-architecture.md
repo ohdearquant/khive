@@ -415,4 +415,4 @@ read-to-replacement race without changing the ordinary upsert contract.
 
 No open design question remains within this storage amendment: the conflict is a typed storage
 outcome, ordinary upserts retain live-row replacement semantics while tombstone restoration is
-explicit, and the six-site boundary above is explicit.
+explicit, and the eight-site boundary above is explicit.
