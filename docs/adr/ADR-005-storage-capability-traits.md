@@ -716,3 +716,32 @@ cooperative phase. Cancellation is never converted into a degraded diagnostic
 or partial-success search. Coordinator fan-out stamps each child completion and
 accepts it only when the stamp is at or before the shared absolute deadline;
 the interrupt grace is cleanup time, not extra result time.
+
+## Amendment: bounded, classifiable batch refusals (2026-08-30)
+
+Issue #2079 extends `BatchWriteSummary` without removing or renaming its
+legacy `attempted`, `affected`, `failed`, and `first_error` fields. A backend
+that makes best-effort per-item decisions now records a bounded `errors`
+sample. Each entry carries the zero-based input index, the input's stable
+store identity when one exists, a stable error class, explicit retryability,
+and a bounded diagnostic message. `error_counts` covers the complete failed
+set by `(class, retryability)`, including details omitted after the sample
+fills. `errors_truncated` and `errors_omitted` make that loss explicit.
+
+The detail sample is capped at 128 entries and each sampled message at 512
+Unicode scalar values. `first_error` deliberately retains its original value
+and size semantics for compatibility. New fields use serde defaults and are
+omitted when empty, so legacy JSON deserializes and successful summaries keep
+their previous wire shape. Alternate trait implementations may continue to
+construct summaries with `Default`; they should use
+`BatchWriteSummary::record_failure` when making per-item refusal decisions.
+
+The SQLite entity, note, text, sparse, and vector best-effort loops populate
+the new evidence. Validation and serialization refusals are permanent;
+SQLite busy/locked results are transient; an interrupted SQLite operation is
+transient; constraint failures are permanent; and unclassified driver errors
+remain explicitly unknown. The guarded all-or-nothing graph batch reports the
+bad edge as permanent invalid input and the otherwise-valid collateral items
+as `batch_aborted` with unknown per-item retryability. Ordinary all-or-nothing
+methods continue to return `Err(StorageError)` on a failed write rather than
+fabricating partial-success details.

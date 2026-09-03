@@ -5808,8 +5808,7 @@ mod tests {
             Ok(khive_storage::BatchWriteSummary {
                 attempted: count,
                 affected: count,
-                failed: 0,
-                first_error: String::new(),
+                ..khive_storage::BatchWriteSummary::default()
             })
         }
 

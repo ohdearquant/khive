@@ -431,11 +431,12 @@ fn batch_upsert_entities(
     entities: &[Entity],
     attempted: u64,
 ) -> Result<BatchWriteSummary, rusqlite::Error> {
-    let mut affected = 0u64;
-    let mut failed = 0u64;
-    let mut first_error = String::new();
+    let mut summary = BatchWriteSummary {
+        attempted,
+        ..BatchWriteSummary::default()
+    };
 
-    for entity in entities {
+    for (index, entity) in entities.iter().enumerate() {
         let id_str = entity.id.to_string();
         let properties_str = entity
             .properties
@@ -466,22 +467,15 @@ fn batch_upsert_entities(
                 merge_event_id_str,
             ],
         ) {
-            Ok(_) => affected += 1,
+            Ok(_) => summary.affected = summary.affected.saturating_add(1),
             Err(e) => {
-                if first_error.is_empty() {
-                    first_error = e.to_string();
-                }
-                failed += 1;
+                let (class, retryability) = super::classify_batch_sqlite_error(&e);
+                summary.record_failure(index, Some(id_str), class, retryability, e.to_string());
             }
         }
     }
 
-    Ok(BatchWriteSummary {
-        attempted,
-        affected,
-        failed,
-        first_error,
-    })
+    Ok(summary)
 }
 
 fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {
