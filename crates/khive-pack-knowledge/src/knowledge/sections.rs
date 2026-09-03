@@ -239,7 +239,7 @@ fn collect_md_files(root: &Path) -> Result<ImportDiscovery, RuntimeError> {
     collect_md_files_with_limits(root, IMPORT_TRAVERSAL_LIMITS)
 }
 
-fn to_slug(stem: &str) -> String {
+pub(super) fn to_slug(stem: &str) -> String {
     stem.to_ascii_lowercase()
         .chars()
         .map(|c| {

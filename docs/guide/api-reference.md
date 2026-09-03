@@ -1870,6 +1870,8 @@ The response is `{results, total, candidate_provenance, ...}`. A genuine FTS mis
 not scan or rank the newest corpus rows. `candidate_provenance.lexical` reports one of:
 
 - `matched`: eligible lexical candidates were found.
+- `exact_name`: no query term was scoreable (every token below the minimum length), and an
+  indexed exact-slug probe found the atom where FTS could not.
 - `no_match`: FTS found no lexical match.
 - `filtered`: FTS matched, but kind/status eligibility removed every lexical candidate.
 - `partial_timeout`: part of a lexical/decomposed candidate stage completed before the
