@@ -26,6 +26,8 @@ import {
 } from "@/icons";
 import {
   type CSSProperties,
+  type Dispatch,
+  type SetStateAction,
   useEffect,
   useId,
   useMemo,
@@ -83,7 +85,7 @@ type ViewProps = Readonly<{
   moduleById: ModuleMap;
   selectedModuleId: string | null;
   structureGraphSelection: StructureGraphSelection;
-  onStructureGraphSelection: (selection: StructureGraphSelection) => void;
+  onStructureGraphSelection: Dispatch<SetStateAction<StructureGraphSelection>>;
   onInspectModule: (moduleId: string) => void;
   onExploreStructure: () => void;
 }>;
@@ -685,7 +687,11 @@ function StructureGraph({
   const compactGraphLabels =
     displayedModules.length > DENSE_GRAPH_LABEL_THRESHOLD;
   const selectGraphNode = (nodeId: string) => {
-    onStructureGraphSelection({ subtreeId, selectedId: nodeId });
+    onStructureGraphSelection((current) =>
+      current.subtreeId === subtreeId && current.selectedId === nodeId
+        ? current
+        : { subtreeId, selectedId: nodeId }
+    );
   };
   const inspectCouplingEndpoint = (moduleId: string) => {
     selectGraphNode(moduleId);
@@ -702,10 +708,12 @@ function StructureGraph({
               aria-label={`${labels.node_types.package} · ${capability.views.structure_graph.label}`}
               value={subtreeId}
               onChange={(event) => {
-                onStructureGraphSelection({
-                  subtreeId: event.target.value,
-                  selectedId: event.target.value,
-                });
+                const nextId = event.target.value;
+                onStructureGraphSelection((current) =>
+                  current.subtreeId === nextId && current.selectedId === nextId
+                    ? current
+                    : { subtreeId: nextId, selectedId: nextId }
+                );
                 setFocusedPairKey(null);
               }}
             >
@@ -3072,10 +3080,17 @@ export function RepoShowcase({
   const moduleInspectorRef = useRef<HTMLElement>(null);
   const dashboardRef = useRef<HTMLDivElement>(null);
   const copyLinkRef = useRef<HTMLButtonElement>(null);
+  // Tracks the location this effect last finished applying, so a rerun
+  // triggered only by dependency identity churn (a fresh module list from
+  // the same navigation) can be told apart from an actual location change.
+  const appliedLocationHrefRef = useRef<string | null>(null);
 
   useEffect(() => {
     function restoreLocation(announce = false) {
-      const parsed = parseRepositoryLocation(new URL(window.location.href));
+      const requestHref = window.location.href;
+      const isLocationChange = announce ||
+        appliedLocationHrefRef.current !== requestHref;
+      const parsed = parseRepositoryLocation(new URL(requestHref));
       const requestedPath = parsed.location.modulePath;
       const requestedModuleId = parsed.location.moduleId;
       const messages = parsed.issues.map((issue) => issue.message);
@@ -3151,7 +3166,14 @@ export function RepoShowcase({
             bundle.graph.packages.items.some((item) =>
               item.id === current.selectedId
             ) || moduleById.has(current.selectedId));
-        if (!restoredModule && !announce && currentSelectionIsValid) {
+        if (!isLocationChange) {
+          // A rerun triggered only by dependency identity churn (e.g. a
+          // fresh module-list reference for the same bundle) is not a
+          // navigation: keep the user's current graph selection, repairing
+          // it only if it no longer resolves against this bundle.
+          return currentSelectionIsValid ? current : nextGraphSelection;
+        }
+        if (!restoredModule && currentSelectionIsValid) {
           return current;
         }
         if (
@@ -3206,6 +3228,7 @@ export function RepoShowcase({
           `${canonical.pathname}${canonical.search}${canonical.hash}`,
         );
       }
+      appliedLocationHrefRef.current = canonical.href;
     }
 
     const handlePopState = () => restoreLocation(true);
@@ -3262,19 +3285,27 @@ export function RepoShowcase({
       "",
       `${next.pathname}${next.search}${next.hash}`,
     );
+    // An in-app navigation sets its own state explicitly; a later rerun of
+    // the location-sync effect must treat this location as already applied.
+    appliedLocationHrefRef.current = window.location.href;
   }
 
-  function selectModule(moduleId: string, alignStructureGraph = true) {
+  function selectModule(
+    moduleId: string,
+    { alignStructureGraph = true }: { alignStructureGraph?: boolean } = {},
+  ) {
     const selected = moduleById.get(moduleId);
     if (!selected) return;
     pushLocation(moduleId, activeView);
     setNavigationStatus("");
     setSelectedModuleId(moduleId);
     if (alignStructureGraph) {
-      setStructureGraphSelection({
-        subtreeId: selected.package_id,
-        selectedId: selected.id,
-      });
+      setStructureGraphSelection((current) =>
+        current.subtreeId === selected.package_id &&
+          current.selectedId === selected.id
+          ? current
+          : { subtreeId: selected.package_id, selectedId: selected.id }
+      );
     }
     setUnresolvedModule(null);
     setLocationNotice(null);
@@ -3383,7 +3414,7 @@ export function RepoShowcase({
 
   function inspectModuleFromGraph(moduleId: string) {
     if (!moduleById.has(moduleId)) return;
-    selectModule(moduleId, false);
+    selectModule(moduleId, { alignStructureGraph: false });
     focusAndScrollInspector();
   }
   return (

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
@@ -21,8 +21,21 @@ function exactish(value: string): RegExp {
 }
 
 describe("repository showcase", () => {
+  let scrollIntoViewDescriptor: PropertyDescriptor | undefined;
+
   beforeEach(() => {
     window.history.replaceState(null, "", "/");
+    scrollIntoViewDescriptor = undefined;
+  });
+
+  afterEach(() => {
+    if (scrollIntoViewDescriptor) {
+      Object.defineProperty(
+        HTMLElement.prototype,
+        "scrollIntoView",
+        scrollIntoViewDescriptor,
+      );
+    }
   });
 
   it("restores and traverses a shareable module and analysis location", async () => {
@@ -496,6 +509,10 @@ describe("repository showcase", () => {
     const bundle = golden();
     const user = userEvent.setup();
     const scrollIntoView = vi.fn();
+    scrollIntoViewDescriptor = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      "scrollIntoView",
+    );
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
       configurable: true,
       value: scrollIntoView,
