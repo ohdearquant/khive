@@ -94,7 +94,8 @@ pub struct MirrorStats {
     /// under overlapping-root dispatch could ever have parsed the same
     /// bytes into rows. Distinct from an ordinary empty advance (blank or
     /// unparseable lines), whose bytes a different source candidate might
-    /// still have claimed.
+    /// still have claimed. The dispatch loop treats the advance as
+    /// uncontested only when the same pass also `scanned` no ordinary line.
     pub skipped_oversized_bytes: bool,
 }
 

@@ -1218,14 +1218,20 @@ async fn finalize_dispatch_stats(
     // known-oversized line). An erroring candidate might have parsed an
     // ordinary empty-advance span had it succeeded, so that case holds the
     // cursor at the old offset and re-reads the bytes (bounded and
-    // idempotent) on a later pass. A skipped-oversized-line advance carries
-    // no such ambiguity — the line was too large for ANY parser before one
-    // ever ran — so it commits even when a sibling candidate errored on the
-    // same span (ADR-080). On commit failure the in-memory offset is
+    // idempotent) on a later pass. A pass that skipped only oversized bytes
+    // carries no such ambiguity — the line was too large for ANY parser
+    // before one ever ran — so it commits even when a sibling candidate
+    // errored on the same span (ADR-080). On commit failure the in-memory offset is
     // likewise NOT applied.
     let stats = match stats {
         Some(stats) if !ended_by_inserting && stats.inserted == 0 && stats.new_offset > offset => {
-            if had_errors && !stats.skipped_oversized_bytes {
+            // The exemption is exact only when the pass consumed nothing but
+            // the oversized bytes (and blank lines): a bounded chunk keeps
+            // reading ordinary lines after a terminated oversized line, and
+            // those lines an erroring sibling might have parsed, so a mixed
+            // pass (`scanned > 0`) keeps the veto.
+            let uncontested_skip = stats.skipped_oversized_bytes && stats.scanned == 0;
+            if had_errors && !uncontested_skip {
                 tracing::debug!(
                     path = %path.display(),
                     new_offset = stats.new_offset,
@@ -3003,6 +3009,46 @@ mod cursor_retry_tests {
             Some(4096),
             "the cursor for the oversized file must have durably advanced, so the \
              next pass starts past the discarded prefix instead of re-reading it"
+        );
+    }
+
+    /// A pass that skipped an oversized line but also scanned an ordinary line
+    /// is not source-independent: the ordinary line is exactly what the
+    /// erroring sibling might have parsed, so the veto still holds and the
+    /// bounded span is re-read on a later pass.
+    #[tokio::test]
+    async fn mixed_oversized_skip_and_scanned_line_keeps_the_error_veto() {
+        let (rt, _dir) = runtime_without_schema();
+        apply_session_schema(&rt).await;
+        let path = PathBuf::from("/projects/mixed.jsonl");
+        let start_offset = 0u64;
+
+        let mut dispatch = CandidateDispatch::default();
+        assert!(!dispatch.record(
+            Ok(MirrorStats {
+                inserted: 0,
+                scanned: 1,
+                new_offset: 4200,
+                skipped_oversized_bytes: true,
+            }),
+            start_offset,
+        ));
+        assert!(!dispatch.record(Err(RuntimeError::Internal("boom".into())), start_offset,));
+
+        let CandidateDispatch { stats, errors } = dispatch;
+        let (stats, had_errors) =
+            finalize_dispatch_stats(&rt, &path, start_offset, false, stats, !errors.is_empty())
+                .await;
+
+        assert!(
+            stats.is_none(),
+            "an advance that also scanned an ordinary line stays vetoed while a sibling errored"
+        );
+        assert!(had_errors);
+        assert_eq!(
+            cursor_row_offset(&rt, &path).await,
+            None,
+            "no cursor row may be written for a contested span"
         );
     }
 
