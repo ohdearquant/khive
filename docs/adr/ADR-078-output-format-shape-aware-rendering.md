@@ -238,18 +238,25 @@ transform, not a serialization. `format=json` (the default, on every surface) an
 contract is shape-stable. A deployment that wants these reductions on every call opts in with
 `default_output_format = "auto"`.
 
+**Superseded by Amendment 3 for `presentation=agent`:** `format=json` under Agent presentation
+now applies these same reductions; only `presentation=verbose` (any format) and Human `format=json`
+keep the unreduced canonical shape. See Amendment 3 for the current contract.
+
 **7.1. `full_id` suppression**
 
 In `format=auto` and `format=table`, the `full_id` field (the 36-character canonical UUID emitted
 alongside the 8-character `id` shortcode) is omitted from the output. `full_id` is retained in
-`format=json` and in `PresentationMode::Verbose`.
+`format=json` and in `PresentationMode::Verbose`. **Superseded by Amendment 3:** `format=json`
+under Agent presentation now omits `full_id` too; only `PresentationMode::Verbose` and Human
+`format=json` retain it unconditionally.
 
 **This partially supersedes the P-C1 code rule in `crates/khive-runtime/src/presentation.rs`**, which
 treated `full_id` as a stable chaining handle kept unconditionally in all modes. That rule was
 introduced as an implementation decision and is in tension with ADR-045 §3, which states that
 `full_id` is "NOT included by default" in Agent mode. ADR-078 resolves the discrepancy by making
 suppression explicit for `auto` and `table`, while preserving `full_id` in `format=json` and
-`Verbose` for any caller that requires the full UUID.
+`Verbose` for any caller that requires the full UUID. **Superseded by Amendment 3** for the
+`format=json` half of that last clause — see above.
 
 The suppression is safe because ADR-016 short-UUID-prefix resolution handles `$prev.id` chains
 using 8-char shortcodes without requiring the 36-char form. The `format=json` escape hatch remains
@@ -266,7 +273,9 @@ value are both identical to a top-level sibling field in the same record is drop
 retained.
 
 This is a pure view transform at the presentation layer. The canonical stored record is unchanged;
-`format=json` and `Verbose` mode reproduce the full `properties` object. On `gtd.tasks` output, the
+`format=json` and `Verbose` mode reproduce the full `properties` object. **Superseded by
+Amendment 3:** `format=json` under Agent presentation applies this dedup too; only
+`PresentationMode::Verbose` and Human `format=json` reproduce the full object. On `gtd.tasks` output, the
 deduplication removes the `assignee`, `priority`, and `status` echoes from `properties`, retaining
 `tags` and `transition_note`. On the measured sample this reduction accounts for 31–36% of total
 response bytes.
@@ -275,7 +284,9 @@ response bytes.
 
 In `format=auto` and `format=table`, the `namespace` field is omitted when its value is `"local"`
 (the default namespace, ADR-007). When `namespace` carries a non-default value, it is included.
-`format=json` always includes `namespace`.
+`format=json` always includes `namespace`. **Superseded by Amendment 3:** `format=json` under
+Agent presentation elides `namespace="local"` too; only `PresentationMode::Verbose` and Human
+`format=json` always include it.
 
 ### 8. Invariants
 
@@ -592,6 +603,19 @@ project selection fields, acknowledgements return acknowledgements); this amendm
 the view layer honest in the interim rather than lossy.
 
 ## Amendment 3 (2026-08-29): Agent JSON redundancy reduction
+
+**Current contract.** Two axes govern reduction: presentation mode and format.
+`PresentationMode::Verbose` is lossless in every format — JSON, `auto`, and `table` alike — and
+is the sole escape hatch a caller can rely on unconditionally. Under `PresentationMode::Agent`
+or `PresentationMode::Human`, `format=auto` and `format=table` have applied the §7 reductions
+since this ADR's original text; this amendment extends that to `format=json` **for Agent
+presentation only** — Human `format=json` stays unreduced. So: Agent JSON now reduces, Human
+JSON does not, Verbose never does, regardless of format. What a reduced payload removes (§7.1–§7.3):
+the `full_id` field, the `namespace` field when it equals `"local"`, and any `properties` child
+entry that exactly duplicates a top-level sibling. What it keeps: the `id` shortcode, every other
+top-level field, non-`"local"` `namespace` values, and any `properties` entry with no top-level
+duplicate — i.e. the reduction only drops values a caller could already reconstruct from the rest
+of the same record.
 
 The default MCP combination, `presentation=agent, format=json`, previously kept
 top-level fields duplicated verbatim inside each record's `properties` object. This
