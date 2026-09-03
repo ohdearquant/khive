@@ -3392,6 +3392,7 @@ fn pack_with_events(rt: KhiveRuntime) -> Fixture {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn stats_total_events_counts_knowledge_verbs() {
     let f = pack_with_events(rt());
 

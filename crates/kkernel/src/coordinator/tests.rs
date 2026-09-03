@@ -339,6 +339,7 @@ async fn locator_cache_returns_none_for_unknown_uuid() {
 // ---- D4: fan_out_search tests (entity substrate) ----
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_single_backend_returns_hits() {
     let coord = SubstrateCoordinator::single(memory_runtime());
     let ns = Namespace::local();
@@ -371,6 +372,7 @@ async fn fan_out_search_single_backend_returns_hits() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_single_backend_applies_source_filter_before_limit() {
     let coord = SubstrateCoordinator::single(memory_runtime());
     let ns = Namespace::local();
@@ -436,6 +438,7 @@ async fn fan_out_search_single_backend_applies_source_filter_before_limit() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_two_backends_merged() {
     let mut registry = BackendRegistry::new();
     let rt_main = memory_runtime();
@@ -494,6 +497,7 @@ async fn fan_out_search_two_backends_merged() {
 /// must cap the final entity result set at `limit` — the per-backend
 /// truncation alone would allow up to (#backends × limit) merged hits.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_caps_merged_entity_hits_at_limit() {
     let mut registry = BackendRegistry::new();
     let rt_main = memory_runtime();
@@ -543,6 +547,7 @@ async fn fan_out_search_caps_merged_entity_hits_at_limit() {
 /// Same merged-cap guarantee for note fan-out: two backends each holding more
 /// notes than `limit` must not yield more than `limit` merged note hits.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_caps_merged_note_hits_at_limit() {
     let mut registry = BackendRegistry::new();
     let rt_main = memory_runtime();
@@ -603,6 +608,7 @@ async fn fan_out_search_caps_merged_note_hits_at_limit() {
 /// RED before the fix: the fan-out await loop had no timeout, so a single
 /// hung backend's `tokio::spawn`'d task blocked the whole fan-out forever.
 #[tokio::test(start_paused = true)]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
     let mut registry = BackendRegistry::new();
     let rt_main = memory_runtime();
@@ -669,6 +675,7 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
 /// the five-second budget for each handle (N hung backends must still cost one
 /// timeout window, not N windows).
 #[tokio::test(start_paused = true)]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_multiple_hung_backends_share_one_absolute_deadline() {
     let mut registry = BackendRegistry::new();
     for backend in ["hung-a", "hung-b", "hung-c"] {
@@ -704,6 +711,7 @@ async fn fan_out_search_multiple_hung_backends_share_one_absolute_deadline() {
 /// must not relabel that late result as healthy merely because it is polled
 /// after the grace window.
 #[tokio::test(start_paused = true)]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() {
     let mut registry = BackendRegistry::new();
     registry.register(BackendId::new("a-hung"), memory_runtime());
@@ -750,6 +758,7 @@ async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() 
 /// merely asserting the wrong thing (see the mutation-control note in the
 /// implementation report for how this was verified as load-bearing).
 #[tokio::test(start_paused = true)]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate() {
     let mut registry = BackendRegistry::new();
     let rt_hung = memory_runtime();
@@ -792,6 +801,7 @@ async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate()
 /// credential-shaped name must be masked at the coordinator WARN site itself,
 /// before the later MCP envelope sanitizer ever receives the result.
 #[tokio::test(start_paused = true)]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_timeout_masks_backend_credentials_in_coordinator_warning() {
     let secret = format!("archive auth token sk_live_{}", "z".repeat(32));
     let mut registry = BackendRegistry::new();
@@ -846,6 +856,7 @@ fn coordinator_warning_cause_masker_is_bounded_and_fail_closed() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_masks_real_authorization_cause_in_coordinator_warning() {
     let secret = format!("authorization token sk_live_{} denied", "r".repeat(32));
     let mut registry = BackendRegistry::new();
@@ -891,6 +902,7 @@ async fn fan_out_search_masks_real_authorization_cause_in_coordinator_warning() 
 /// Same as the entity-substrate test above, for the `search_notes` await at
 /// the other single-backend early-return call site.
 #[tokio::test(start_paused = true)]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_single_backend_hung_backend_times_out_note_substrate() {
     let mut registry = BackendRegistry::new();
     let rt_hung = memory_runtime();
@@ -940,6 +952,7 @@ async fn fan_out_search_single_backend_hung_backend_times_out_note_substrate() {
 /// RED before the fix: `fan_out_search`'s single-backend branch authorized
 /// against `namespace` alone, discarding `extra_visible` entirely.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_with_visibility_single_backend_finds_extra_namespace_row() {
     let coord = SubstrateCoordinator::single(memory_runtime());
     let runtime = coord.primary_runtime().unwrap();
@@ -998,6 +1011,7 @@ async fn fan_out_search_with_visibility_single_backend_finds_extra_namespace_row
 /// RED before the fix: the spawned branch authorized each backend token
 /// against `namespace` alone, discarding `extra_visible` entirely.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_with_visibility_multi_backend_finds_extra_namespace_row() {
     let mut registry = BackendRegistry::new();
     let rt_main = memory_runtime();
@@ -1053,6 +1067,7 @@ async fn fan_out_search_with_visibility_multi_backend_finds_extra_namespace_row(
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_applies_source_filter_before_rrf_and_limit() {
     let mut registry = BackendRegistry::new();
     registry.register(BackendId::new("alpha"), memory_runtime());
@@ -1173,6 +1188,7 @@ async fn fan_out_search_applies_source_filter_before_rrf_and_limit() {
 /// re-deriving the old (buggy) per-backend-truncated result from the same
 /// override lists and asserting it differs from the actual (fixed) result.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_rrf_merge_uses_full_candidate_window_not_per_backend_limit() {
     let mut registry = BackendRegistry::new();
     let rt_a = memory_runtime();
@@ -1259,6 +1275,7 @@ async fn fan_out_search_rrf_merge_uses_full_candidate_window_not_per_backend_lim
 /// (`[Z, V]`) — `Y` never reaches the merge, and the old result is `[X, Z]`
 /// instead of `[Y, X]`.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_rrf_merge_uses_full_candidate_window_not_per_backend_limit_notes() {
     let mut registry = BackendRegistry::new();
     let rt_a = memory_runtime();
@@ -1400,6 +1417,7 @@ fn cross_backend_entity_merge_preserves_retrieval_leg_membership() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_empty_registry_returns_empty() {
     let coord = SubstrateCoordinator::new(BackendRegistry::new());
     let ns = Namespace::local();
@@ -1420,6 +1438,7 @@ async fn fan_out_search_empty_registry_returns_empty() {
 /// results from the working backend, and the failing backend's
 /// `BackendSearchResult.error` must be populated (not `None`).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_partial_failure_preserves_working_backend_hits() {
     let rt_main = memory_runtime();
     let rt_lore = memory_runtime();
@@ -1496,6 +1515,7 @@ async fn fan_out_partial_failure_preserves_working_backend_hits() {
 /// A backend task panic is a partial failure, not an omitted contribution.
 /// The backend id and join error must remain visible beside healthy hits.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
     let rt_main = memory_runtime();
     let rt_lore = memory_runtime();
@@ -1674,6 +1694,7 @@ async fn invalidate_clears_locate_cache() {
 /// exactly as before. No coordinator interception changes the outcome for
 /// single-backend deployments.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn t1_single_backend_zero_change_invariant() {
     let rt = memory_runtime();
     let coord = SubstrateCoordinator::single(Arc::clone(&rt));
@@ -2154,6 +2175,7 @@ async fn t2d_rego_gate_evaluator_failure_omits_canary_from_wire_and_logs() {
 
 /// T3: Fan-out entity search over two backends merges results from both.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn t3_fan_out_search_merged_from_two_backends() {
     let rt_a = memory_runtime();
     let rt_b = memory_runtime();
@@ -2290,6 +2312,7 @@ async fn t5_record_created_prewarns_locator() {
 
 /// Fan-out note search over two backends merges note hits.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_note_search_two_backends() {
     let rt_a = memory_runtime();
     let rt_b = memory_runtime();
@@ -2353,6 +2376,7 @@ async fn fan_out_note_search_two_backends() {
 /// sanitize_fts5_query strips hyphens by removal rather than replacement, so
 /// all tokens here are plain lowercase ASCII with no punctuation.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_props_filter_drops_non_matching() {
     let rt_main = memory_runtime();
     let rt_lore = memory_runtime();
@@ -2423,6 +2447,7 @@ async fn fan_out_search_props_filter_drops_non_matching() {
 /// Query token "truncsemtest" appears in both descriptions; sanitize_fts5_query
 /// passes it unchanged (no hyphens or special characters).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_props_filter_before_truncation_semantics() {
     let rt = memory_runtime();
     let ns = Namespace::local();
@@ -2486,6 +2511,7 @@ async fn fan_out_search_props_filter_before_truncation_semantics() {
 /// Query token "tagsfiltertest" is embedded in both descriptions so FTS returns
 /// both candidates before the tag predicate is applied inside hybrid_search.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_tags_filter_drops_non_matching() {
     let rt_main = memory_runtime();
     let rt_lore = memory_runtime();
@@ -2548,6 +2574,7 @@ async fn fan_out_search_tags_filter_drops_non_matching() {
 /// The validated entity request must preserve every supported entity filter
 /// through multi-backend fan-out. Each decoy violates exactly one filter.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_preserves_full_entity_filter_contract() {
     let rt_main = memory_runtime();
     let rt_lore = memory_runtime();
@@ -2650,6 +2677,7 @@ async fn fan_out_search_preserves_full_entity_filter_contract() {
 /// Note fan-out preserves granular/legacy kind reconciliation, supersession,
 /// properties, and tags as one canonical request across every backend.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_preserves_full_note_filter_contract() {
     let rt_main = memory_runtime();
     let rt_lore = memory_runtime();
@@ -3191,6 +3219,7 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
 /// backend row for both substrates and asserts every hydrated map is
 /// populated from the actual stored record.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
     use khive_mcp::coordinator::CoordinatorService;
 
