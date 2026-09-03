@@ -10,8 +10,13 @@ into, or assume the existence of any particular transport — a transport
 that wants to send DSL text over the wire calls `render_dsl` explicitly.
 
 This module's own emitted subset of the value grammar: a double-quoted
-string using only the escapes `\\"` `\\n` `\\t` `\\r` `\\\\` (this renderer
-never emits `\\uXXXX`; non-ASCII text is emitted raw), an integer within
+string using only the escapes `\\"` `\\n` `\\t` `\\r` `\\\\` (at the scalar
+string path — a bare string argument or one nested in an array — this
+renderer never emits `\\uXXXX`; non-ASCII text is emitted raw). A string
+nested inside an object argument instead goes through `json.dumps`, which
+emits the standard JSON `\\uXXXX` escape for a raw control byte other than
+newline, tab, or carriage return (non-ASCII text still stays raw there,
+since `ensure_ascii=False`). An integer within
 `[-2**63, 2**64 - 1]` (see `_MIN_SIGNED_64`/`_MAX_UNSIGNED_64` below — an
 integer outside that range has no exact representation in the parser's
 decoded value and is refused rather than silently reinterpreted), a finite
@@ -294,7 +299,9 @@ def _render_op(entry: dict[str, Any]) -> str:
 
 def _render_entry(entry: Any) -> str:
     if isinstance(entry, str):
-        # Already one op in DSL text; used verbatim.
+        # Already one op in DSL text; used verbatim, subject to the same
+        # empty/whitespace-only and byte-cap checks as a whole-string `ops`.
+        _check_raw_text(entry)
         return entry
     if isinstance(entry, dict):
         return _render_op(entry)

@@ -361,7 +361,15 @@ def _parse_op(text: str, in_chain: bool = False) -> tuple[str, dict[str, Any]]:
     text = text.strip()
     tool, pos = _parse_tool_name(text, 0)
     pos = _skip_ws(text, pos)
-    if pos >= len(text) or text[pos] != "(" or text[-1] != ")":
+    if pos >= len(text) or text[pos] != "(":
+        raise DslParseError(f"not a call: {text!r}")
+    if text[-1] != ")":
+        # Mirrors `parser_impl.rs`'s object-value EOF-while-expecting-a-key
+        # arm (P113): the input ends immediately after an open `{`, with no
+        # key or `}` yet — the same shape whether or not the outer call is
+        # also left unclosed.
+        if text[-1] == "{":
+            raise DslParseError(f"unexpected end of input while expecting an object key: {text!r}")
         raise DslParseError(f"not a call: {text!r}")
     argtext = text[pos + 1 : -1].strip()
     args: dict[str, Any] = {}

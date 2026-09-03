@@ -1219,9 +1219,11 @@ def _check_p108():
     platform usize is still grammar-accepted syntax passed through
     unchanged — it only fails later, at runtime resolution in
     `path.rs::apply_path_segment`. This offline fake has no mirror of that
-    runtime resolution step (it only mirrors the parser grammar), so whether
-    an oversized index actually misses at resolution is not assertable here
-    and is left unverified.
+    runtime resolution step (it only mirrors the parser grammar), so only
+    parser acceptance is asserted here; the runtime miss on an oversized
+    index is instead pinned by
+    `path::tests::oversized_bracket_index_is_malformed_and_always_misses` in
+    `crates/khive-request/src/parser/path.rs`.
     """
     text = "first() | second(x=$prev[12])"
     rendered = render_dsl(text)
@@ -1290,8 +1292,12 @@ _add("P112", "refuses", _check_p112)
 # -- P113: an object literal reaching EOF while a key is expected is refused,
 #          distinct from the empty-object accept at P76 ---------------------
 def _check_p113():
+    # `v(a={)` reaches the "quoted string key" arm instead (the next byte
+    # after `{` is the real character `)`, not end-of-input) — the request
+    # must end right after the `{` to reach the EOF-while-expecting-a-key
+    # arm this rule describes.
     with pytest.raises(DslParseError):
-        parse_dsl("v(a={)")
+        parse_dsl("v(a={")
 
 
 _add("P113", "fake", _check_p113)
@@ -1328,8 +1334,11 @@ def _check_p117():
     `apply_path_segment` (no Python port exists), so only the
     renderer/parser-observable half of the obligation is assertable here:
     dot-separated field text and bracket index text both pass through the
-    renderer and the fake's grammar-level parse unchanged. Whether a given
-    reference actually resolves at runtime is left unverified.
+    renderer and the fake's grammar-level parse unchanged. The Field/
+    Malformed resolution split itself is instead pinned by
+    `path::tests::dotted_field_segments_resolve_by_key_or_miss` and
+    `path::tests::oversized_bracket_index_is_malformed_and_always_misses` in
+    `crates/khive-request/src/parser/path.rs`.
     """
     text = 'first() | second(x="$prev.a.b")'
     rendered = render_dsl(text)

@@ -101,6 +101,20 @@ def test_dsl_string_elements_render_verbatim_beside_dicts():
     ]
 
 
+def test_empty_string_element_in_list_raises_transport_error():
+    with pytest.raises(TransportError, match="empty"):
+        render_dsl([""])
+    with pytest.raises(TransportError, match="empty"):
+        render_dsl(["", op("stats")])
+
+
+def test_whitespace_only_string_element_in_list_raises_transport_error():
+    with pytest.raises(TransportError, match="empty"):
+        render_dsl(["  \t\n  "])
+    with pytest.raises(TransportError, match="empty"):
+        render_dsl(["  \t\n  ", "whoami()"])
+
+
 def test_mixed_dsl_string_and_op_dict_pack_verb_accepted():
     rendered = render_dsl(["whoami()", op("blob.put", bytes="x")])
     assert rendered == '[whoami(), blob.put(bytes="x")]'
