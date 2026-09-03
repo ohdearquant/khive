@@ -80,6 +80,16 @@ let report = reindex_knowledge(&runtime, &token, opts, None, None).await?;
 
 All 19 verbs are `Visibility::Verb` (exposed on the agent-facing MCP surface).
 
+For a cheap, stable inventory walk, call
+`knowledge.list(fields=["id","slug"], after="", limit=500)` and round-trip each
+non-null `next_after`. The projection is pushed into SQL, so atom `content` is
+not hydrated. Cursor pages use `created_at ASC, id ASC`; legacy offset pages
+retain `created_at DESC, id DESC`. The cursor is a live traversal: inserts
+behind an issued boundary wait for a fresh walk, while inserts ahead may extend
+the current walk without shifting or duplicating pre-existing rows. Stop when
+`next_after` is null; cursor pages carry no `total`, because counting the
+namespace is a full scan per page.
+
 ## Where this sits
 
 `khive-pack-knowledge` sits in the pack tier, above `khive-runtime` /
