@@ -168,13 +168,14 @@ impl CoordinatorService for SubstrateCoordinatorService {
                     .inner
                     .registry()
                     .get(&r.backend_id)
-                    .is_some_and(|entry| entry.runtime.config().embedding_model.is_some());
+                    .is_some_and(|entry| entry.runtime.vector_arm_selected());
                 CoordBackendResult {
                     backend_id: r.backend_id,
                     entity_hits: r.hits,
                     note_hits: r.note_hits,
                     vector_selected,
                     error: r.error,
+                    vector_error: r.vector_error,
                 }
             })
             .collect();

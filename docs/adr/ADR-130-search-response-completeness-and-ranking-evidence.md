@@ -818,6 +818,37 @@ Verification MUST cover an exact-name text hit, a 60-plus-character
 keyword-dense text zero-hit, vector-only and `both` candidate counting,
 complete-empty, partial-with-hit, degraded-empty, and frame-budget preservation.
 
+## Amendment 4 (2026-09-03): arm status is per-arm, not per-backend
+
+Amendment 3's status definitions read as backend-granular — `ran` as "every
+backend on which [the arm] was selected completed that search", `error` as "a
+backend on which the arm was selected failed" — and cannot unambiguously
+express the coordinated multi-backend case where one backend's text leg
+completes while that same backend's vector leg fails. This amendment restates
+both statuses at arm granularity, superseding Amendment 3's wording (not its
+intent) for `ran` and `error`:
+
+- `ran` means the arm completed on every backend on which it was selected.
+- `error` means the arm itself failed on at least one backend on which it was
+  selected, whether or not that backend's other arm completed. A backend
+  whose text leg completed and whose vector leg alone failed makes `vector`
+  read `error` while `text` reads `ran`, on the same response.
+
+`skipped` is unchanged from Amendment 3. The backend-level completeness
+fields — `missing_backends` and `backend_errors` — are also unchanged: they
+still report whole-backend failures only. A backend whose only failure was
+one arm does not appear in either field, and the response's top-level
+`status` stays `"complete"`.
+
+Separately, the sentence in Amendment 3 stating "Both fields [`arm_participation`
+and `backend_errors`] MUST survive presentation and frame-budget omission at
+their normal envelope location" is corrected: frame-budget omission relocates
+both fields from their normal top-level location to `error.search` on the
+omitted envelope (the operation's `ok` flips to `false` once its result is
+discarded, so the two fields move under the synthesized `error` object rather
+than staying beside a `result` that no longer exists). They still survive
+omission; they do not survive at the *same* location.
+
 ## References
 
 - the two follow-up items this record's fixes were split from

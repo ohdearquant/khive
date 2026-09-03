@@ -179,7 +179,7 @@ impl SearchDegradation {
         let vector_selected = result
             .per_backend
             .iter()
-            .any(|backend| backend.vector_selected)
+            .any(|backend| backend.vector_selected || backend.vector_error.is_some())
             || result.entity_hits.iter().any(|hit| {
                 matches!(
                     hit.source,
@@ -192,14 +192,20 @@ impl SearchDegradation {
                     khive_runtime::SearchSource::Vector | khive_runtime::SearchSource::Both
                 )
             });
+        // A whole-backend `error` means that backend's dispatch task failed
+        // before either arm could be attributed (auth, timeout, join failure,
+        // or a failed text leg — the text leg fails loud inside
+        // `hybrid_search_outcome`, so a text-arm failure always surfaces
+        // here). `vector_error` is populated only when the text leg
+        // completed and the vector leg alone failed, so it never doubles as
+        // a text-arm signal.
         let text_failed = result
             .per_backend
             .iter()
             .any(|backend| backend.error.is_some());
-        let vector_failed = result
-            .per_backend
-            .iter()
-            .any(|backend| backend.vector_selected && backend.error.is_some());
+        let vector_failed = result.per_backend.iter().any(|backend| {
+            backend.vector_error.is_some() || (backend.vector_selected && backend.error.is_some())
+        });
         let mut arm_participation = SearchArmParticipation {
             text: SearchArmEvidence {
                 status: if text_failed {
@@ -315,10 +321,13 @@ fn search_arm_candidate_counts(result: &Value) -> (usize, usize) {
         .into_iter()
         .flatten()
         .fold((0, 0), |(text, vector), hit| {
-            match hit.get("source").and_then(Value::as_str) {
-                Some("text") => (text + 1, vector),
-                Some("vector") => (text, vector + 1),
-                Some("both") => (text + 1, vector + 1),
+            let source = hit.get("source").and_then(Value::as_str);
+            match source {
+                Some(s) if s == khive_runtime::SearchSource::Text.as_str() => (text + 1, vector),
+                Some(s) if s == khive_runtime::SearchSource::Vector.as_str() => (text, vector + 1),
+                Some(s) if s == khive_runtime::SearchSource::Both.as_str() => {
+                    (text + 1, vector + 1)
+                }
                 _ => (text, vector),
             }
         })
@@ -1949,7 +1958,7 @@ impl KhiveMcpServer {
                 let vector_selected = self
                     .runtime
                     .as_ref()
-                    .is_some_and(|runtime| runtime.config().embedding_model.is_some());
+                    .is_some_and(|runtime| runtime.vector_arm_selected());
                 let success =
                     op_success_from_registry_result(&tool, is_help, result, vector_selected);
                 chain_ok_envelope_or_depth_error(tool, success)
@@ -2063,7 +2072,7 @@ impl KhiveMcpServer {
                 let vector_selected = self
                     .runtime
                     .as_ref()
-                    .is_some_and(|runtime| runtime.config().embedding_model.is_some());
+                    .is_some_and(|runtime| runtime.vector_arm_selected());
                 // ADR-096 Fork 1: a per-request identity overrides the default
                 // namespace for both the coordinator intercept and the registry
                 // dispatch below, so the two can't drift out of sync per op.
@@ -5954,6 +5963,7 @@ mod tests {
                         "backend failure {index}: {}",
                         "\0\"\\".repeat(MAX_BACKEND_ERROR_MESSAGE_CHARS)
                     )),
+                    vector_error: None,
                 })
                 .collect();
             if reverse {
@@ -6018,6 +6028,44 @@ mod tests {
         );
     }
 
+    /// A populated `vector_error` is itself proof the vector arm was
+    /// selected and failed. `vector_selected` on the backend can be a
+    /// registry miss (stale/absent metadata) — it must never hide a
+    /// recorded vector-arm failure.
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn vector_error_reports_arm_failure_even_when_vector_selected_is_false() {
+        let result = CoordSearchResult {
+            entity_hits: Vec::new(),
+            note_hits: Vec::new(),
+            per_backend: vec![crate::coordinator::BackendSearchResult {
+                backend_id: khive_runtime::BackendId::parse("main").expect("valid backend id"),
+                entity_hits: Vec::new(),
+                note_hits: Vec::new(),
+                vector_selected: false,
+                error: None,
+                vector_error: Some("injected vector-arm failure".to_string()),
+            }],
+            partial: false,
+            entity_kinds: std::collections::HashMap::new(),
+            note_kinds: std::collections::HashMap::new(),
+            entity_created_at: std::collections::HashMap::new(),
+            note_created_at: std::collections::HashMap::new(),
+            note_names: std::collections::HashMap::new(),
+        };
+
+        let degradation = SearchDegradation::from_result(&result, &json!([]));
+        let arm_participation = degradation
+            .arm_participation
+            .expect("arm participation must be computed");
+        assert_eq!(
+            arm_participation.vector.status,
+            SearchArmStatus::Error,
+            "a recorded vector_error must report the vector arm as failed \
+             regardless of the backend's vector_selected flag"
+        );
+    }
+
     #[test]
     #[serial_test::serial(config_ledger)]
     fn backend_id_credentials_are_absent_from_wire_and_warning() {
@@ -6032,6 +6080,7 @@ mod tests {
                 note_hits: Vec::new(),
                 vector_selected: true,
                 error: Some("storage unavailable".to_string()),
+                vector_error: None,
             }],
             partial: true,
             entity_kinds: std::collections::HashMap::new(),
