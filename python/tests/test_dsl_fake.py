@@ -153,3 +153,29 @@ def test_trailing_comma_in_argument_list_rejected():
 def test_duplicate_argument_name_rejected():
     with pytest.raises(DslParseError):
         parse_dsl("verb(x=1,x=2)")
+
+
+@pytest.mark.parametrize(
+    ("text", "variant"),
+    [
+        ("", "Empty"),
+        ("[v() | w()]", "MixedSeparators"),
+        ("[v(), ]", "TrailingComma"),
+        ("v(a=1, a=2)", "DuplicateArg"),
+        ("v(a={, b=1)", "UnexpectedChar"),
+        ("v(a={", "UnexpectedEof"),
+        ("v(a=1", "UnclosedCall"),
+    ],
+)
+def test_variant_names_the_mirrored_error_class(text, variant):
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl(text)
+    assert exc_info.value.variant == variant
+
+
+def test_an_unclassified_rejection_carries_no_variant():
+    # A quoted key that runs off the end is rejected, but at an arm the fake
+    # does not mirror, so it claims no class (see the module docstring).
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl('v(a={"k"')
+    assert exc_info.value.variant is None

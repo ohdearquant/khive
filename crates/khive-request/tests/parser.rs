@@ -676,6 +676,57 @@ fn unclosed_paren_rejected() {
 }
 
 #[test]
+fn object_key_position_distinguishes_end_of_input_from_a_present_byte() {
+    // Only true end-of-input right after `{` reaches the object-key `None` arm.
+    let err = parse_request("v(a={").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DslError::UnexpectedEof {
+                expected: "object key"
+            }
+        ),
+        "{err:?}"
+    );
+    // Any present byte, `)` or `,` alike, takes the `Some(c)` arm instead.
+    for input in ["v(a={)", "v(a={, b=1)"] {
+        let err = parse_request(input).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DslError::UnexpectedChar {
+                    expected: "quoted string key",
+                    ..
+                }
+            ),
+            "{input}: {err:?}"
+        );
+    }
+    // The empty object closes only when `}` is the very next byte.
+    let parsed = ops("v(a={})");
+    assert_eq!(val(&parsed[0].args["a"]), &json!({}));
+}
+
+#[test]
+fn a_closing_brace_inside_an_open_local_bracket_is_rejected_at_once() {
+    // `[` is still open when `}` arrives, so the value scan rejects immediately.
+    let err = parse_request("v(a=1[})").unwrap_err();
+    assert!(
+        matches!(err, DslError::UnclosedBracket { kind: '{' }),
+        "{err:?}"
+    );
+    // With no local container open, `}` ends the value and the arg list rejects it.
+    let err = parse_request("v(a=1})").unwrap_err();
+    assert!(
+        matches!(err, DslError::UnexpectedChar { found: '}', .. }),
+        "{err:?}"
+    );
+    // Inside a quoted span the `}` is string content; the malformed scalar fails as a value.
+    let err = parse_request(r#"v(a=1["x}"])"#).unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }), "{err:?}");
+}
+
+#[test]
 fn unclosed_call_reports_its_opening_byte_after_long_input() {
     let padding = "x".repeat(1_024);
     let src = format!(r#"comm.send(to="x", content="{padding}""#);

@@ -4,6 +4,15 @@ Used only to make the offline fake REST/MCP servers in `conftest.py` enforce
 the real wire contract (`ops` is one request DSL string, not the client's
 internal JSON ops-array form) instead of silently accepting whatever the
 renderer under test happens to send.
+
+Scope of the mirror: the fake pins whether an input is accepted or rejected
+and, where `docs/DSL_WIRE_CONTRACT.md` names one for the shape under test,
+the error variant class the real parser reports (`DslParseError.variant`,
+spelled as the `DslError` variant name in `crates/khive-request`). Error
+message text is a diagnostic for the test reader and pins nothing; the real
+parser's reason strings are not part of the wire contract. A raise without a
+`variant` is a rejection the fake does not classify, which is deliberate:
+mirroring every positional arm of the real parser is not this file's job.
 """
 
 from __future__ import annotations
@@ -28,7 +37,12 @@ _MAX_UNSIGNED_64 = 2**64 - 1
 
 
 class DslParseError(ValueError):
-    pass
+    """A rejection by the fake. `variant`, when set, names the `DslError`
+    variant the real parser reports for the same input."""
+
+    def __init__(self, message: str, variant: str | None = None) -> None:
+        super().__init__(message)
+        self.variant = variant
 
 
 class PrevRef:
@@ -47,7 +61,10 @@ class PrevRef:
 
 
 def _reject_non_finite_constant(name: str) -> float:
-    raise DslParseError(f"non-finite constant {name!r} has no representation in the request DSL")
+    raise DslParseError(
+        f"non-finite constant {name!r} has no representation in the request DSL",
+        variant="InvalidValue",
+    )
 
 
 def _skip_ws(text: str, pos: int) -> int:
@@ -109,18 +126,22 @@ def _parse_tool_name(text: str, pos: int) -> tuple[str, int]:
     pos = _skip_ws(text, pos)
     m = _IDENT_RE.match(text, pos)
     if not m:
-        raise DslParseError(f"invalid identifier at {pos}: {text!r}")
+        raise DslParseError(f"invalid identifier at {pos}: {text!r}", variant="InvalidIdentifier")
     tool = m.group(0)
     pos = m.end()
     if pos < len(text) and text[pos] == ".":
         pos += 1
         m2 = _IDENT_RE.match(text, pos)
         if not m2:
-            raise DslParseError(f"invalid identifier at {pos}: {text!r}")
+            raise DslParseError(
+                f"invalid identifier at {pos}: {text!r}", variant="InvalidIdentifier"
+            )
         tool = f"{tool}.{m2.group(0)}"
         pos = m2.end()
         if pos < len(text) and text[pos] == ".":
-            raise DslParseError(f"unsupported verb nesting: {tool}{text[pos:]!r}")
+            raise DslParseError(
+                f"unsupported verb nesting: {tool}{text[pos:]!r}", variant="UnsupportedVerbNesting"
+            )
     return tool, pos
 
 
@@ -168,13 +189,17 @@ def _string_as_prev_ref(s: str, *, in_chain: bool) -> Any:
             return rest
     if s == "$prev":
         if not in_chain:
-            raise DslParseError("$prev reference used outside a chain")
+            raise DslParseError(
+                "$prev reference used outside a chain", variant="PrevRefOutsideChain"
+            )
         return PrevRef("")
     if s.startswith("$prev."):
         rest = s[len("$prev.") :]
         if rest and _quoted_prev_path_is_valid(rest):
             if not in_chain:
-                raise DslParseError("$prev reference used outside a chain")
+                raise DslParseError(
+                    "$prev reference used outside a chain", variant="PrevRefOutsideChain"
+                )
             return PrevRef(rest)
         return s
     if s.startswith("$prev["):
@@ -186,20 +211,27 @@ def _string_as_prev_ref(s: str, *, in_chain: bool) -> Any:
                 tail = after[close + 1 :]
                 if _quoted_prev_path_is_valid(tail):
                     if not in_chain:
-                        raise DslParseError("$prev reference used outside a chain")
+                        raise DslParseError(
+                            "$prev reference used outside a chain", variant="PrevRefOutsideChain"
+                        )
                     return PrevRef(f"[{index_str}]{tail}")
         return s
     return s
 
 
-def _parse_bare_prev_ref(text: str, in_chain: bool) -> PrevRef:
+def _parse_bare_prev_ref(
+    text: str, in_chain: bool, *, followed_by_close_paren: bool = False
+) -> PrevRef:
     """Parses the primary (unquoted) `$prev` reference syntax — mirrors
     `parser_impl.rs::parse_prev_ref`, triggered when a value starts with the
     `$` sigil directly, as opposed to a quoted string that merely looks like
     one (`_string_as_prev_ref`'s job). `text` is the whole isolated value
-    token, so a full parse must consume it exactly."""
+    token, so a full parse must consume it exactly. `followed_by_close_paren`
+    says the call's own `)` came right after `text` in the real source (see
+    `_parse_value`), which decides whether an index left open at the end of
+    `text` met that `)` or true end-of-input."""
     if not (text == "$prev" or text.startswith(("$prev.", "$prev["))):
-        raise DslParseError(f"expected '$prev', found {text!r}")
+        raise DslParseError(f"expected '$prev', found {text!r}", variant="InvalidValue")
     pos = len("$prev")
     n = len(text)
     path = ""
@@ -209,7 +241,9 @@ def _parse_bare_prev_ref(text: str, in_chain: bool) -> PrevRef:
             pos += 1
             m = _IDENT_RE.match(text, pos)
             if not m:
-                raise DslParseError(f"expected identifier after '.' in {text!r}")
+                raise DslParseError(
+                    f"expected identifier after '.' in {text!r}", variant="InvalidIdentifier"
+                )
             if path:
                 path += "."
             path += m.group(0)
@@ -219,21 +253,51 @@ def _parse_bare_prev_ref(text: str, in_chain: bool) -> PrevRef:
             idx_start = pos
             while pos < n and _is_ascii_digit(text[pos]):
                 pos += 1
-            if pos == idx_start or pos >= n or text[pos] != "]":
-                raise DslParseError(f"malformed index in $prev path: {text!r}")
+            if pos == idx_start:
+                raise DslParseError(
+                    f"malformed index in $prev path: {text!r}", variant="InvalidValue"
+                )
+            if pos >= n:
+                raise DslParseError(
+                    f"malformed index in $prev path: {text!r}",
+                    variant="UnexpectedChar" if followed_by_close_paren else "UnexpectedEof",
+                )
+            if text[pos] != "]":
+                raise DslParseError(
+                    f"malformed index in $prev path: {text!r}", variant="UnexpectedChar"
+                )
             index_str = text[idx_start:pos]
             pos += 1
             if path:
                 path += "."
             path += f"[{index_str}]"
         else:
-            raise DslParseError(f"unexpected {c!r} in $prev path: {text!r}")
+            raise DslParseError(
+                f"unexpected {c!r} in $prev path: {text!r}", variant="UnexpectedChar"
+            )
     if not in_chain:
-        raise DslParseError("$prev reference used outside a chain")
+        raise DslParseError("$prev reference used outside a chain", variant="PrevRefOutsideChain")
     return PrevRef(path)
 
 
 _RAW_CONTROL_ESCAPE = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _string_end(text: str, start: int) -> int | None:
+    """Mirrors `parser/scan.rs::scan_string_end`: `start` sits on the opening
+    quote; returns the index just past the closing quote, skipping backslash
+    pairs, or None when the span never closes."""
+    i = start + 1
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        i += 1
+        if ch == '"':
+            return i
+    return None
 
 
 def _parse_string(text: str) -> str:
@@ -243,27 +307,28 @@ def _parse_string(text: str) -> str:
     `json.loads` (this also makes `\\uXXXX` decode, unlike a hand-rolled
     escape table). Any other raw control byte is left as-is, which
     `json.loads` rejects exactly as strict JSON does. JSON does not define
-    `\\'`, so that sequence is rejected too, not decoded to `'`."""
-    if len(text) < 2 or text[-1] != '"':
-        raise DslParseError(f"unterminated string: {text!r}")
-    body = text[1:-1]
-    normalized: list[str] = ['"']
+    `\\'`, so that sequence is rejected too, not decoded to `'`. A span that
+    never closes is the scanner's `UnclosedString`; one that closes with
+    bytes left over fails the strict decode like any malformed literal."""
+    end = _string_end(text, 0) if text[:1] == '"' else None
+    if end is None:
+        raise DslParseError(f"unterminated string: {text!r}", variant="UnclosedString")
+    normalized: list[str] = []
     i = 0
-    n = len(body)
+    n = len(text)
     while i < n:
-        ch = body[i]
+        ch = text[i]
         if ch == "\\" and i + 1 < n:
             normalized.append(ch)
-            normalized.append(body[i + 1])
+            normalized.append(text[i + 1])
             i += 2
             continue
         normalized.append(_RAW_CONTROL_ESCAPE.get(ch, ch))
         i += 1
-    normalized.append('"')
     try:
         return json.loads("".join(normalized))
     except ValueError as exc:
-        raise DslParseError(f"malformed string literal: {text!r}") from exc
+        raise DslParseError(f"malformed string literal: {text!r}", variant="InvalidValue") from exc
 
 
 def _coerce_out_of_range_int(value: Any) -> Any:
@@ -299,13 +364,22 @@ def _parse_object(text: str, in_chain: bool, depth: int = 0) -> dict[str, Any]:
     for entry in _split_top_level(inner, ","):
         entry = entry.strip()
         if not entry:
-            raise DslParseError(f"malformed object literal: {text!r}")
+            raise DslParseError(f"malformed object literal: {text!r}", variant="UnexpectedChar")
         parts = _split_top_level(entry, ":")
         if len(parts) != 2:
-            raise DslParseError(f"malformed object entry: {entry!r}")
+            raise DslParseError(f"malformed object entry: {entry!r}", variant="UnexpectedChar")
         key_text = parts[0].strip()
         if not key_text.startswith('"'):
-            raise DslParseError(f"object key must be a quoted string: {key_text!r}")
+            raise DslParseError(
+                f"object key must be a quoted string: {key_text!r}", variant="UnexpectedChar"
+            )
+        key_end = _string_end(key_text, 0)
+        if key_end is not None and key_end < len(key_text):
+            # The key decoded; the real parser then asks for `:` and meets
+            # the leftover byte instead.
+            raise DslParseError(
+                f"unexpected text after object key: {key_text!r}", variant="UnexpectedChar"
+            )
         key = _parse_string(key_text)
         obj[key] = _parse_value(parts[1].strip(), in_chain, depth)
     return obj
@@ -331,24 +405,17 @@ def _parse_value(
     parse_object_arg_body`'s `Some(c)` vs `None` arms (about 271-282) make."""
     text = text.strip()
     if not text:
-        raise DslParseError("empty value")
+        raise DslParseError("empty value", variant="InvalidValue")
     if text[0] == "$":
-        return _parse_bare_prev_ref(text, in_chain)
-    if text[0] == '"':
-        return _string_as_prev_ref(_parse_string(text), in_chain=in_chain)
-    if text == "true":
-        return True
-    if text == "false":
-        return False
-    if text == "null":
-        return None
+        return _parse_bare_prev_ref(text, in_chain, followed_by_close_paren=followed_by_close_paren)
     if text[0] == "[":
         if text[-1] != "]":
             raise DslParseError(f"unterminated array: {text!r}")
         child_depth = depth + 1
         if child_depth > NESTING_DEPTH_LIMIT:
             raise DslParseError(
-                f"container nesting depth {child_depth} exceeds max {NESTING_DEPTH_LIMIT}"
+                f"container nesting depth {child_depth} exceeds max {NESTING_DEPTH_LIMIT}",
+                variant="NestingTooDeep",
             )
         inner = text[1:-1].strip()
         if not inner:
@@ -358,78 +425,126 @@ def _parse_value(
         child_depth = depth + 1
         if child_depth > NESTING_DEPTH_LIMIT:
             raise DslParseError(
-                f"container nesting depth {child_depth} exceeds max {NESTING_DEPTH_LIMIT}"
+                f"container nesting depth {child_depth} exceeds max {NESTING_DEPTH_LIMIT}",
+                variant="NestingTooDeep",
             )
         if text[-1] != "}":
             # Mirrors `parser_impl.rs::parse_object_arg_body`'s key-position
-            # match (P113): reaching true end-of-input right after `{`, with
-            # no key or `}` yet, is the `None` arm and gets its own reason —
-            # distinct from any other unterminated shape, which this fake
-            # still reports as a generic unterminated object. When this same
-            # empty-after-`{` slice was in fact followed by the call's own
-            # `)` in the real source (`followed_by_close_paren`), the real
-            # parser never reaches end-of-input at all — it peeks that `)`
-            # and takes the `Some(c)` arm instead, so this reports the
-            # quoted-key reason, not the end-of-input one.
-            if not text[1:].strip():
+            # match (P113): the byte after `{` decides the class. True
+            # end-of-input is the `None` arm; any present byte that is not a
+            # `"` — the call's own `)` when `followed_by_close_paren`, or a
+            # `,` kept inside this slice by `_split_top_level` — is the
+            # `Some(c)` arm. A quoted key that then runs off the end is left
+            # unclassified: the real parser fails somewhere after the key,
+            # at an arm this fake does not mirror.
+            after_brace = text[1:].lstrip()
+            if not after_brace:
                 if followed_by_close_paren:
                     raise DslParseError(
-                        f"unexpected ')' while expecting a quoted string key: {text!r}"
+                        f"unexpected ')' while expecting a quoted string key: {text!r}",
+                        variant="UnexpectedChar",
                     )
                 raise DslParseError(
-                    f"unexpected end of input while expecting an object key: {text!r}"
+                    f"unexpected end of input while expecting an object key: {text!r}",
+                    variant="UnexpectedEof",
+                )
+            if after_brace[0] != '"':
+                raise DslParseError(
+                    f"unexpected {after_brace[0]!r} while expecting a quoted string key: {text!r}",
+                    variant="UnexpectedChar",
                 )
             raise DslParseError(f"unterminated object: {text!r}")
         return _parse_object(text, in_chain, child_depth)
+    # A scalar: the real parser first scans to the value's boundary
+    # (`parser_impl.rs::scan_value_end`), decodes that slice, and only then
+    # lets the enclosing grammar see what follows — so a leftover byte is
+    # rejected as unexpected only once the slice before it decoded.
+    boundary = _scan_value_end(text)
+    if boundary < len(text):
+        _parse_scalar(text[:boundary].strip(), in_chain)
+        raise DslParseError(
+            f"unexpected {text[boundary]!r} after a value: {text!r}", variant="UnexpectedChar"
+        )
+    return _parse_scalar(text, in_chain)
+
+
+def _parse_scalar(text: str, in_chain: bool) -> Any:
+    """Decodes one already-bounded scalar slice the way `parse_value` hands
+    it to `decode_quoted_json_string` or `serde_json`."""
+    if not text:
+        raise DslParseError("empty value", variant="InvalidValue")
+    if text[0] == '"':
+        return _string_as_prev_ref(_parse_string(text), in_chain=in_chain)
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    if text == "null":
+        return None
     if _JSON_NUMBER_RE.match(text):
         parsed = json.loads(text, parse_constant=_reject_non_finite_constant)
         return _coerce_out_of_range_int(parsed)
-    _reject_unclosed_local_bracket(text)
-    raise DslParseError(f"unparseable value: {text!r}")
+    raise DslParseError(f"unparseable value: {text!r}", variant="InvalidValue")
 
 
-def _reject_unclosed_local_bracket(text: str) -> None:
-    """Mirrors `parser_impl.rs::scan_value_end`'s `'}'` arm (P116) over a raw
-    scalar slice that is not itself one of `_parse_value`'s recognized
-    container/scalar shapes: a `}` reached while a local `[` or `(` earlier
-    in the same slice is still open is rejected as `UnclosedBracket { kind:
-    '{' }`, the same outcome `v(a=1[})`'s "1[}" value slice reaches in the
-    real parser, distinct from the unparseable-scalar fallback this slice
-    would otherwise hit. `scan_value_end` dispatches a `'"'` byte to
-    `scan_string_end` (`parser/scan.rs` lines 10-23) before ever looking at
-    `[`/`(`/`}` depth, so a `}` inside a quoted span — e.g. the value slice
-    `1["x}"]` — is consumed as ordinary string content and never reaches the
-    `'}'` arm at all; this mirrors that same quote-skip (backslash-pair skip,
-    stop at the next unescaped `"`) before resuming the bracket/paren scan,
-    so this helper does not raise for that shape either."""
-    depth_brack = 0
+def _scan_value_end(text: str) -> int:
+    """Mirrors `parser_impl.rs::scan_value_end` over a raw scalar slice:
+    returns the index where the value ends — a `]`, `}`, `)` or `,` met with
+    no local container open, else the end of the slice. A `}` or `)` met
+    while a *different* local container is still open is `UnclosedBracket`
+    at once (P116, e.g. the `1[}` slice of `v(a=1[})`); a `[` or `{` still
+    open at the end of the slice is the same class. A `"` hands off to the
+    string scan first, so a bracket inside a quoted span is never counted
+    and a span that never closes is `UnclosedString`."""
     depth_paren = 0
+    depth_brack = 0
+    depth_brace = 0
     i = 0
     n = len(text)
     while i < n:
         ch = text[i]
         if ch == '"':
-            i += 1
-            while i < n:
-                c2 = text[i]
-                if c2 == "\\":
-                    i += 2
-                    continue
-                i += 1
-                if c2 == '"':
-                    break
+            end = _string_end(text, i)
+            if end is None:
+                raise DslParseError(f"unterminated string: {text!r}", variant="UnclosedString")
+            i = end
             continue
         if ch == "[":
             depth_brack += 1
+        elif ch == "]":
+            if depth_brack == 0:
+                return i
+            depth_brack -= 1
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            if depth_brace == 0:
+                if depth_paren == 0 and depth_brack == 0:
+                    return i
+                raise DslParseError(
+                    f"unclosed bracket: unmatched '{{' while scanning {text!r}",
+                    variant="UnclosedBracket",
+                )
+            depth_brace -= 1
         elif ch == "(":
             depth_paren += 1
-        elif ch == "]" and depth_brack > 0:
-            depth_brack -= 1
-        elif ch == ")" and depth_paren > 0:
+        elif ch == ")":
+            if depth_paren == 0 and depth_brack == 0 and depth_brace == 0:
+                return i
+            if depth_paren == 0:
+                raise DslParseError(
+                    f"unclosed bracket: unmatched '(' while scanning {text!r}",
+                    variant="UnclosedBracket",
+                )
             depth_paren -= 1
-        elif ch == "}" and (depth_brack > 0 or depth_paren > 0):
-            raise DslParseError(f"unclosed bracket: unmatched '{{' while scanning {text!r}")
+        elif ch == "," and depth_paren == 0 and depth_brack == 0 and depth_brace == 0:
+            return i
         i += 1
+    if depth_brack > 0 or depth_brace > 0:
+        raise DslParseError(
+            f"unclosed bracket: container left open in {text!r}", variant="UnclosedBracket"
+        )
+    return i
 
 
 def _parse_args(argtext: str, in_chain: bool, *, closed: bool = False) -> dict[str, Any]:
@@ -450,16 +565,30 @@ def _parse_args(argtext: str, in_chain: bool, *, closed: bool = False) -> dict[s
             # Mirrors `parser_impl.rs::parse_op`: after a `,` the loop
             # always expects another `name=value`, so a trailing comma
             # (or any empty piece) is rejected, not skipped.
-            raise DslParseError(f"malformed arg list: trailing or empty argument in {argtext!r}")
+            raise DslParseError(
+                f"malformed arg list: trailing or empty argument in {argtext!r}",
+                variant="InvalidIdentifier",
+            )
         if "=" not in piece:
-            raise DslParseError(f"malformed arg: {piece!r}")
+            # The real parser asks for `=` after the name: it meets the next
+            # `,` or the call's `)` unless this piece is the open tail.
+            raise DslParseError(
+                f"malformed arg: {piece!r}",
+                variant="UnexpectedChar" if closed or index < last_index else "UnexpectedEof",
+            )
         key, _, val = piece.partition("=")
         key = key.strip()
         if not _IDENT_RE.fullmatch(key):
-            raise DslParseError(f"invalid argument name: {key!r}")
+            # An identifier that starts well but carries junk fails at the
+            # `=` delimiter; one that never starts is an invalid identifier.
+            head = _IDENT_RE.match(key)
+            raise DslParseError(
+                f"invalid argument name: {key!r}",
+                variant="UnexpectedChar" if head else "InvalidIdentifier",
+            )
         if key in args:
             # Mirrors `parser_impl.rs::parse_op`'s `DuplicateArg`.
-            raise DslParseError(f"duplicate argument: {key!r}")
+            raise DslParseError(f"duplicate argument: {key!r}", variant="DuplicateArg")
         args[key] = _parse_value(
             val.strip(),
             in_chain,
@@ -481,7 +610,7 @@ def _parse_op(text: str, in_chain: bool = False) -> tuple[str, dict[str, Any]]:
         # with the reason `parser_impl.rs::parse_object_arg_body` gives,
         # rather than a generic "not a call" that never inspects the tail.
         _parse_args(text[pos + 1 :].strip(), in_chain)
-        raise DslParseError(f"not a call: {text!r}")
+        raise DslParseError(f"not a call: {text!r}", variant="UnclosedCall")
     args = _parse_args(text[pos + 1 : -1].strip(), in_chain, closed=True)
     return tool, args
 
@@ -497,10 +626,13 @@ def parse_dsl_with_mode(text: str) -> tuple[list[tuple[str, dict[str, Any]]], st
     known."""
     text = text.strip()
     if not text:
-        raise DslParseError("empty ops string")
+        raise DslParseError("empty ops string", variant="Empty")
     raw_len = len(text.encode("utf-8"))
     if raw_len > MAX_OPS_INPUT_LEN:
-        raise DslParseError(f"ops input is {raw_len} bytes; max is {MAX_OPS_INPUT_LEN} bytes")
+        raise DslParseError(
+            f"ops input is {raw_len} bytes; max is {MAX_OPS_INPUT_LEN} bytes",
+            variant="InputTooLarge",
+        )
     if text[0] == "[":
         if text[-1] != "]":
             raise DslParseError(f"unterminated batch: {text!r}")
@@ -508,15 +640,24 @@ def parse_dsl_with_mode(text: str) -> tuple[list[tuple[str, dict[str, Any]]], st
         if not inner:
             return [], "parallel"
         if len(_split_top_level(inner, "|")) > 1:
-            raise DslParseError("mixed separators: '|' is not allowed inside '[...]'")
+            raise DslParseError(
+                "mixed separators: '|' is not allowed inside '[...]'", variant="MixedSeparators"
+            )
         parts = _split_top_level(inner, ",")
+        if not parts[-1].strip():
+            # Mirrors `dispatch.rs::parse_fn_batch`: a `,` followed by `]`.
+            raise DslParseError(f"trailing comma in batch: {text!r}", variant="TrailingComma")
         if len(parts) > MAX_OPS:
-            raise DslParseError(f"batch has {len(parts)} ops; max is {MAX_OPS}")
+            raise DslParseError(
+                f"batch has {len(parts)} ops; max is {MAX_OPS}", variant="TooManyOps"
+            )
         return [_parse_op(p, in_chain=False) for p in parts], "parallel"
     chain_parts = _split_top_level(text, "|")
     if len(chain_parts) > 1:
         if len(chain_parts) > MAX_OPS:
-            raise DslParseError(f"chain has {len(chain_parts)} ops; max is {MAX_OPS}")
+            raise DslParseError(
+                f"chain has {len(chain_parts)} ops; max is {MAX_OPS}", variant="TooManyOps"
+            )
         return [_parse_op(p, in_chain=True) for p in chain_parts], "chain"
     return [_parse_op(text, in_chain=False)], "single"
 

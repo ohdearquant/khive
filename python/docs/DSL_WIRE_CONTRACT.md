@@ -4,6 +4,8 @@ The table below lists every accept/reject rule of the request parser under `crat
 
 **Citation:** that audit proves presence and count — the quoted text exists in the named file, at the declared occurrence count (1, unless the row marks `{shared=N}`). It does not prove the quote sits on the deciding branch: a citation whose text happens to recur unchanged elsewhere in the file would still pass with existence alone. Naming the actual decision a row claims — not just a line that contains matching text — is a reading obligation on the row's author, not something this audit enforces.
 
+**Reasons:** error reason strings — the `expected` text, byte positions, and message wording — are not part of the wire contract. A client may depend only on accept/reject and, where a row names it, on the error variant class; the offline fake in `python/tests/_dsl_fake.py` pins exactly that and nothing about wording.
+
 ## Rules
 
 | id | site (file, quoted line) | accepts / rejects | mode | renderer obligation |

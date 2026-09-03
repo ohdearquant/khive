@@ -288,8 +288,9 @@ def _check_p8():
     # renderer forwards it unchanged and only the daemon parser catches it.
     rendered = render_dsl(["update(id=$prev.id)"])
     assert rendered == "update(id=$prev.id)"
-    with pytest.raises(DslParseError):
+    with pytest.raises(DslParseError) as exc_info:
         parse_dsl(rendered)
+    assert exc_info.value.variant == "PrevRefOutsideChain"
 
 
 _add("P8", "fake", _check_p8)
@@ -583,8 +584,9 @@ def _check_p51():
     # PrevRefOutsideChain — the renderer forwards it unchanged.
     rendered = render_dsl(["update(id=$prev.id)", "other()"])
     assert rendered == "[update(id=$prev.id), other()]"
-    with pytest.raises(DslParseError):
+    with pytest.raises(DslParseError) as exc_info:
         parse_dsl(rendered)
+    assert exc_info.value.variant == "PrevRefOutsideChain"
 
 
 _add("P51", "fake", _check_p51)
@@ -1007,8 +1009,9 @@ def _check_p89():
     # unchanged.
     rendered = render_dsl("first() | second(x=$prev[])")
     assert rendered == "first() | second(x=$prev[])"
-    with pytest.raises(DslParseError):
+    with pytest.raises(DslParseError) as exc_info:
         parse_dsl(rendered)
+    assert exc_info.value.variant == "InvalidValue"
 
 
 _add("P89", "fake", _check_p89)
@@ -1018,8 +1021,9 @@ _add("P89", "fake", _check_p89)
 def _check_p90():
     # Same passthrough gap as P89, for a malformed index terminator.
     rendered = render_dsl("first() | second(x=$prev[0x])")
-    with pytest.raises(DslParseError):
+    with pytest.raises(DslParseError) as exc_info:
         parse_dsl(rendered)
+    assert exc_info.value.variant == "UnexpectedChar"
 
 
 _add("P90", "fake", _check_p90)
@@ -1303,25 +1307,20 @@ _add("P112", "refuses", _check_p112)
 # -- P113: an object literal reaching EOF while a key is expected is refused,
 #          distinct from the empty-object accept at P76 ---------------------
 def _check_p113():
-    # `v(a={)` reaches the "quoted string key" arm instead (the next byte
-    # after `{` is the real character `)`, not end-of-input) — the request
-    # must end right after the `{` to reach the EOF-while-expecting-a-key
-    # arm this rule describes. The fake reaches this through its normal
-    # argument/value parser (not a dedicated shortcut), so the reason it
-    # raises is the same "object key" wording the real parser's `None` arm
-    # names.
-    with pytest.raises(DslParseError, match="object key"):
+    # The request must end right after the `{` to reach the `None` arm this
+    # rule describes; the row names its variant, so the fake pins the class.
+    with pytest.raises(DslParseError) as exc_info:
         parse_dsl("v(a={")
-    # The near case: `v(a={)` looks the same at a glance, but the call
-    # actually closes. The real parser's object-key match peeks the very
-    # next byte after `{`, which here is the real character `)`, not
-    # end-of-input — so it takes the `Some(c)` quoted-string-key arm
-    # (`parser_impl.rs` about 271-276), never the `None` arm this rule
-    # describes. The fake must report the quoted-key reason for this shape,
-    # not the end-of-input one.
-    with pytest.raises(DslParseError, match="quoted string key") as exc_info:
-        parse_dsl("v(a={)")
-    assert "object key" not in str(exc_info.value)
+    assert exc_info.value.variant == "UnexpectedEof"
+    # The near cases: a present byte after `{` — the call's own `)`, or a
+    # `,` — takes the `Some(c)` arm the row sets this rule apart from, so
+    # neither may report the end-of-input class. The row does not name that
+    # arm's variant, so nothing more is pinned here; the real parser's own
+    # suite (`crates/khive-request/tests/parser.rs`) pins both shapes.
+    for near in ("v(a={)", "v(a={, b=1)"):
+        with pytest.raises(DslParseError) as exc_info:
+            parse_dsl(near)
+        assert exc_info.value.variant != "UnexpectedEof", near
 
 
 _add("P113", "fake", _check_p113)
@@ -1347,19 +1346,22 @@ def _check_p116():
     # ordinary value boundary and the arg-list loop rejects the leftover `}`)
     # — the `[` here is what keeps a local container open through the `}`,
     # reaching this rule's `UnclosedBracket` outcome.
-    with pytest.raises(DslParseError, match="unclosed bracket"):
+    with pytest.raises(DslParseError) as exc_info:
         parse_dsl("v(a=1[})")
+    assert exc_info.value.variant == "UnclosedBracket"
+    # The row also names the no-container case: the same `}` ends the value
+    # and the arg-list loop rejects it as an unexpected character.
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl("v(a=1})")
+    assert exc_info.value.variant == "UnexpectedChar"
     # `v(a=1["x}"])` looks similar at a glance, but the `}` sits inside a
-    # quoted span. `scan_value_end` dispatches `'"'` to `scan_string_end`
-    # (`parser/scan.rs` lines 10-23) before ever inspecting bracket depth, so
-    # the quoted `"x}"` is consumed whole and the `}` is never seen by the
-    # `'}'` arm this rule describes — the real parser closes the local `[`
-    # and then rejects the malformed scalar `1["x}"]` through the
-    # `InvalidValue` mapping instead (`parser_impl.rs` lines 411-429). The
-    # fake must not raise "unclosed bracket" for this shape.
+    # quoted span, which `scan_value_end` consumes whole before ever
+    # inspecting bracket depth — the `'}'` arm this rule describes is never
+    # reached, so the fake must not report its class for this shape. The
+    # row names no variant for it; the real parser's own suite pins one.
     with pytest.raises(DslParseError) as exc_info:
         parse_dsl('v(a=1["x}"])')
-    assert "unclosed bracket" not in str(exc_info.value)
+    assert exc_info.value.variant != "UnclosedBracket"
 
 
 _add("P116", "fake", _check_p116)
