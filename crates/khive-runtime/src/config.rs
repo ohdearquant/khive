@@ -740,6 +740,17 @@ pub fn runtime_config_from_khive_config(
         .filter(|s| !s.trim().is_empty())
         .or_else(|| base.actor_id.clone());
 
+    let gate = khive_cfg
+        .gate
+        .as_ref()
+        .map(|gate| {
+            Arc::new(khive_gate::CallerEnrollmentGate::new(
+                gate.granted_actors.clone(),
+                gate.grant_unattributed,
+            )) as GateRef
+        })
+        .unwrap_or_else(|| base.gate.clone());
+
     let git_write = khive_cfg.git_write.clone();
     let blob_hydration_bytes = khive_cfg
         .runtime
@@ -764,6 +775,7 @@ pub fn runtime_config_from_khive_config(
             visible_namespaces,
             allowed_outbound_namespaces,
             actor_id,
+            gate,
             git_write,
             blob_hydration_bytes,
             display_timezone,
@@ -801,6 +813,7 @@ pub fn runtime_config_from_khive_config(
         visible_namespaces,
         allowed_outbound_namespaces,
         actor_id,
+        gate,
         git_write,
         blob_hydration_bytes,
         display_timezone,
