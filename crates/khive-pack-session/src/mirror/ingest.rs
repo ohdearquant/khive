@@ -87,6 +87,15 @@ pub struct MirrorStats {
     /// Byte offset advanced to. Ordinary partial lines are excluded; a known
     /// oversized line may checkpoint a bounded discarded prefix mid-line.
     pub new_offset: u64,
+    /// True when this pass's advance discarded bytes from a line that
+    /// exceeded `max_line_bytes` (complete or still-unterminated). That
+    /// determination is made before any per-source parser ever sees the
+    /// line, so the resulting advance is source-independent — no candidate
+    /// under overlapping-root dispatch could ever have parsed the same
+    /// bytes into rows. Distinct from an ordinary empty advance (blank or
+    /// unparseable lines), whose bytes a different source candidate might
+    /// still have claimed.
+    pub skipped_oversized_bytes: bool,
 }
 
 /// Ceiling on bytes read per `mirror_file` call in production (8 MiB); bounds
@@ -166,7 +175,10 @@ pub async fn mirror_file(
 /// candidate that could parse them, and an interrupt between candidates
 /// cannot leave the cursor advanced past bytes no candidate inserted. The
 /// service additionally vetoes that commit when ANY candidate errors during
-/// the pass, even if another candidate returned an empty advance.
+/// the pass, even if another candidate returned an empty advance — except
+/// when the empty advance is [`MirrorStats::skipped_oversized_bytes`], which
+/// always commits: a known-oversized line was never attributable to a
+/// source in the first place, so a sibling's error cannot contest it.
 pub async fn mirror_file_deferred(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -208,6 +220,8 @@ struct MirrorChunk {
     events: Vec<parse::ParsedEvent>,
     scanned: u64,
     new_offset: u64,
+    /// See [`MirrorStats::skipped_oversized_bytes`].
+    skipped_oversized_bytes: bool,
 }
 
 /// Outcome of `read_line_bounded` for one line. See
@@ -309,6 +323,7 @@ fn read_bounded_chunk(
             events: Vec::new(),
             scanned: 0,
             new_offset: start_offset,
+            skipped_oversized_bytes: false,
         });
     }
 
@@ -331,6 +346,7 @@ fn read_bounded_chunk(
     let mut lines_consumed: u64 = 0;
     let mut new_offset = start_offset;
     let mut bytes_this_pass: usize = 0;
+    let mut skipped_oversized_bytes = false;
 
     loop {
         if lines_consumed > 0
@@ -353,6 +369,7 @@ fn read_bounded_chunk(
             LineRead::Partial => break, // leave partial trailing line for next pass
             LineRead::OversizedUnterminated { bytes } => {
                 new_offset += bytes as u64;
+                skipped_oversized_bytes = true;
                 tracing::warn!(
                     path = %path.display(),
                     offset = line_offset,
@@ -376,6 +393,7 @@ fn read_bounded_chunk(
                 bytes_this_pass += bytes;
                 lines_consumed += 1;
                 skipping_oversized_line = false;
+                skipped_oversized_bytes = true;
             }
             LineRead::Complete { bytes } => {
                 new_offset += bytes as u64;
@@ -409,6 +427,7 @@ fn read_bounded_chunk(
         events,
         scanned,
         new_offset,
+        skipped_oversized_bytes,
     })
 }
 
@@ -463,6 +482,7 @@ async fn mirror_file_inner(
             inserted: 0,
             scanned: 0,
             new_offset: chunk.new_offset,
+            skipped_oversized_bytes: false,
         });
     }
 
@@ -487,6 +507,7 @@ async fn mirror_file_inner(
             inserted: 0,
             scanned: chunk.scanned,
             new_offset: chunk.new_offset,
+            skipped_oversized_bytes: chunk.skipped_oversized_bytes,
         });
     }
 
@@ -646,6 +667,7 @@ async fn mirror_whole_file_export(
             inserted: 0,
             scanned: 0,
             new_offset: start_offset,
+            skipped_oversized_bytes: false,
         });
     }
 
@@ -662,6 +684,7 @@ async fn mirror_whole_file_export(
             inserted: 0,
             scanned: 0,
             new_offset: start_offset,
+            skipped_oversized_bytes: false,
         });
     }
 
@@ -1000,6 +1023,7 @@ async fn write_events_and_cursor_on_writer(
         inserted,
         scanned,
         new_offset,
+        skipped_oversized_bytes: false,
     })
 }
 
@@ -1620,14 +1644,23 @@ mod tests {
         let (rt, _dir) = setup().await;
 
         let max_line_bytes: usize = 256;
-        // One line, far larger than the cap, with no terminating '\n' at all.
-        let huge_unterminated = "z".repeat(max_line_bytes * 20);
+        // One line, far larger than the cap AND larger than the reader's
+        // internal buffer window, with no terminating '\n' at all. Staying
+        // within one buffer window would let the first bounded read drain
+        // the whole fixture in a single pass, landing exactly at EOF and
+        // never exercising a genuine mid-line resume on the next pass.
+        let huge_unterminated = "z".repeat(max_line_bytes + 4 * 8 * 1024);
 
         let mut file = NamedTempFile::new().expect("tmpfile");
         file.write_all(huge_unterminated.as_bytes())
             .expect("write unterminated line");
         let path = file.path().to_path_buf();
         let initial_file_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            huge_unterminated.len() > max_line_bytes + 3 * 8 * 1024,
+            "fixture must extend several reader windows beyond the line cap so the \
+             first bounded read stops mid-line rather than draining the whole file"
+        );
 
         let limits = MirrorLimits {
             max_bytes_per_pass: MIRROR_MAX_BYTES_PER_PASS,
@@ -1642,8 +1675,11 @@ mod tests {
                 .await
                 .expect("first pass over an unterminated oversized line");
         assert!(
-            stats1.new_offset > 0 && stats1.new_offset <= initial_file_len,
-            "the first bounded skip must make valid forward progress"
+            stats1.new_offset > 0 && stats1.new_offset < initial_file_len,
+            "the first bounded skip must land strictly inside the oversized line \
+             (not at EOF), so the next pass exercises a genuine mid-line resume \
+             through the persisted-cursor path rather than a fresh read starting \
+             after a coincidental full drain"
         );
         assert_eq!(stats1.scanned, 0);
         assert_eq!(stats1.inserted, 0);
@@ -1656,6 +1692,12 @@ mod tests {
             cursor_offset(&rt, &path.to_string_lossy()).await,
             Some(stats1.new_offset as i64),
             "mid-skip progress must survive a daemon restart"
+        );
+        assert_ne!(
+            huge_unterminated.as_bytes()[stats1.new_offset as usize - 1],
+            b'\n',
+            "the persisted cursor must sit strictly inside the oversized line, not \
+             just after a line terminator, to exercise the mid-line resume path"
         );
 
         // Drain every full bounded prefix, then a simulated daemon restart at
