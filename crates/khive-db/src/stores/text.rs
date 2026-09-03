@@ -915,6 +915,26 @@ fn build_filter_clause(
     }
 }
 
+/// Test-only seam for [`delete_document_dml`]'s unmanaged (no-writer-task)
+/// path: lets a test force the map-row delete to fail after the FTS-row
+/// delete has already run, so the enclosing `BEGIN IMMEDIATE` / `ROLLBACK`
+/// block's atomicity can be exercised without a real process crash
+/// mid-transaction. Compiles to nothing outside `#[cfg(test)]` — production
+/// code never reads this flag.
+///
+/// A process-wide `AtomicBool` rather than a thread-local: the unmanaged
+/// path runs the DML closure inside `tokio::task::spawn_blocking`
+/// (`with_writer_unmanaged`), on a worker thread distinct from the test's
+/// own thread, so a thread-local set by the test would never be observed by
+/// the closure. Callers must serialize against this flag (e.g.
+/// `#[serial_test::serial]`) since it is shared across concurrently running
+/// tests.
+#[cfg(test)]
+pub(crate) mod delete_dml_test_seam {
+    pub(crate) static FAIL_BEFORE_MAP_DELETE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+}
+
 /// DML-only single-document delete shared by both the legacy (flag-off) and
 /// WriterTask-routed (flag-on) `delete_document` paths.
 ///
@@ -928,13 +948,22 @@ fn delete_document_dml(
     table: &str,
     namespace: &str,
     subject_id: Uuid,
-) -> Result<bool, rusqlite::Error> {
+) -> Result<bool, SqliteError> {
     let [fts_statement, map_statement] = delete_document_statements(table, namespace, subject_id);
 
     let mut stmt = conn.prepare(&fts_statement.sql)?;
     bind_params(&mut stmt, &fts_statement.params)?;
     let deleted = stmt.raw_execute()? > 0;
     drop(stmt);
+
+    #[cfg(test)]
+    if delete_dml_test_seam::FAIL_BEFORE_MAP_DELETE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(SqliteError::InvalidData(
+            "delete_document_dml test seam: forced failure between the FTS-row \
+             delete and the map-row delete"
+                .to_string(),
+        ));
+    }
 
     let mut map_stmt = conn.prepare(&map_statement.sql)?;
     bind_params(&mut map_stmt, &map_statement.params)?;
@@ -1180,7 +1209,7 @@ impl TextSearch for Fts5TextSearch {
             return writer_task
                 .send_bounded(move |conn| {
                     delete_document_dml(conn, &table2, &namespace2, subject_id)
-                        .map_err(|e| map_err(e, "fts_delete"))
+                        .map_err(|e| map_sqlite_err(e, "fts_delete"))
                 })
                 .await;
         }
@@ -1200,7 +1229,10 @@ impl TextSearch for Fts5TextSearch {
                 }
                 Err(e) => {
                     let _ = conn.execute_batch("ROLLBACK");
-                    Err(e)
+                    Err(match e {
+                        SqliteError::Rusqlite(inner) => inner,
+                        other => rusqlite::Error::InvalidParameterName(other.to_string()),
+                    })
                 }
             }
         })

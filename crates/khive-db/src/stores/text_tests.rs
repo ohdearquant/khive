@@ -275,6 +275,133 @@ async fn stale_map_entry_never_returns_or_deletes_the_wrong_document() {
     );
 }
 
+/// Round 3 review: `delete_document_dml`'s unmanaged (no-writer-task) path
+/// wraps the FTS-row delete and the map-row delete in one explicit `BEGIN
+/// IMMEDIATE` / `COMMIT` / `ROLLBACK` block (`Fts5TextSearch::delete_document`'s
+/// fallback, used when `current_writer_task` returns `None`) so a failure
+/// between the two statements rolls both back together instead of leaving the
+/// FTS row deleted while its map row survives. Forces that failure via the
+/// `delete_dml_test_seam` flag and asserts on the raw rows that neither
+/// statement's effect was left half-committed, then clears the seam and
+/// confirms a real delete still removes both rows.
+///
+/// `#[serial_test::serial]`: the seam flag is a process-wide `AtomicBool`
+/// (see `delete_dml_test_seam`'s doc comment for why), so this test cannot
+/// run concurrently with anything else that calls `delete_document` on the
+/// unmanaged path.
+#[tokio::test]
+#[serial_test::serial(delete_dml_test_seam)]
+async fn unmanaged_delete_rolls_back_the_fts_row_when_the_map_delete_fails() {
+    let store = setup_memory_store("unmanaged_delete_rollback");
+    assert!(
+        store
+            .current_writer_task("precondition_check")
+            .unwrap()
+            .is_none(),
+        "this test exercises the no-writer-task fallback path; a writer-task \
+         handle here would route delete_document through the queue's own \
+         transaction instead of the explicit BEGIN IMMEDIATE block under test"
+    );
+
+    let ns = "test_ns";
+    let a = Uuid::new_v4();
+    store
+        .upsert_document(make_document(a, "Doc A", "first document"))
+        .await
+        .unwrap();
+
+    let table = store.table_name.clone();
+    let map_table = rowid_map_table(&table);
+
+    struct ResetSeamOnDrop;
+    impl Drop for ResetSeamOnDrop {
+        fn drop(&mut self) {
+            delete_dml_test_seam::FAIL_BEFORE_MAP_DELETE
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let reset_seam = ResetSeamOnDrop;
+    delete_dml_test_seam::FAIL_BEFORE_MAP_DELETE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let result = store.delete_document(ns, a).await;
+    assert!(
+        result.is_err(),
+        "the forced map-row-delete failure must surface as an error, got {result:?}"
+    );
+
+    {
+        let writer = store.pool.writer().unwrap();
+        let fts_count: i64 = writer
+            .conn()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE subject_id = ?1"),
+                rusqlite::params![a.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fts_count, 1,
+            "the FTS-row delete must roll back alongside the failed map-row delete"
+        );
+
+        let map_count: i64 = writer
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {map_table} WHERE namespace = ?1 AND subject_id = ?2"
+                ),
+                rusqlite::params![ns, a.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            map_count, 1,
+            "the map row must survive a rolled-back delete alongside its FTS row"
+        );
+    }
+
+    let fetched = store.get_document(ns, a).await.unwrap();
+    assert!(
+        fetched.is_some(),
+        "a rolled-back delete must leave the document fully readable, got {fetched:?}"
+    );
+
+    drop(reset_seam);
+
+    let deleted = store.delete_document(ns, a).await.unwrap();
+    assert!(
+        deleted,
+        "with the seam cleared, delete_document must succeed and remove both rows"
+    );
+
+    let writer = store.pool.writer().unwrap();
+    let fts_count: i64 = writer
+        .conn()
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE subject_id = ?1"),
+            rusqlite::params![a.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        fts_count, 0,
+        "the FTS row must be gone after the real delete"
+    );
+
+    let map_count: i64 = writer
+        .conn()
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {map_table} WHERE namespace = ?1 AND subject_id = ?2"),
+            rusqlite::params![ns, a.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        map_count, 0,
+        "the map row must be gone after the real delete"
+    );
+}
+
 #[tokio::test]
 async fn test_delete_document() {
     let store = setup_memory_store("delete");
