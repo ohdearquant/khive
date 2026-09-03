@@ -1892,13 +1892,34 @@ impl CheckpointConnection {
         }
         self.conn.as_ref()
     }
+}
 
-    /// Drop the current connection after a connection-level pragma failure so
-    /// the next tick's `ensure_open` reopens it fresh rather than repeatedly
-    /// retrying a connection already known to be broken.
-    fn drop_connection(&mut self) {
-        self.conn = None;
-    }
+/// Run one due FTS5 maintenance step off this task's Tokio worker thread.
+///
+/// A due step can issue up to `config.merge_pages` pages of synchronous
+/// SQLite incremental-merge I/O against a trigram index over a corpus of
+/// hundreds of thousands of rows — the same class of blocking work the
+/// WAL-pin beacon writes above already move off the worker via
+/// `tokio::task::spawn_blocking`. `conn` and `state` are moved into the
+/// blocking closure and handed back to the caller regardless of the step's
+/// outcome, so the checkpoint task can restore its dedicated connection and
+/// scheduler state on every path.
+async fn run_fts_maintenance_off_worker(
+    conn: rusqlite::Connection,
+    config: crate::fts_maintenance::FtsMaintenanceConfig,
+    mut state: crate::fts_maintenance::FtsMaintenanceState,
+    now: Instant,
+) -> (
+    rusqlite::Connection,
+    crate::fts_maintenance::FtsMaintenanceState,
+    Result<Option<crate::fts_maintenance::FtsMaintenanceStep>, String>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let result = crate::fts_maintenance::run_if_due(&conn, &config, &mut state, now);
+        (conn, state, result)
+    })
+    .await
+    .expect("FTS5 maintenance blocking task panicked")
 }
 
 /// Run the WAL checkpoint background task.
@@ -2058,12 +2079,20 @@ pub async fn run_checkpoint_task(
         #[cfg(unix)]
         let mut pending_sidecar_attribution = None;
 
-        let tick = match checkpoint_conn.ensure_open(&pool) {
-            None => {
-                note_checkpoint_skipped();
-                CheckpointTick::Skipped
-            }
-            Some(conn) => match checkpoint_once_core(&pool, conn, &config, &mut truncate_state) {
+        let tick = if checkpoint_conn.ensure_open(&pool).is_none() {
+            note_checkpoint_skipped();
+            CheckpointTick::Skipped
+        } else {
+            // `ensure_open` above just confirmed a connection is open. Take
+            // ownership of it so the FTS maintenance step below can move it
+            // onto a blocking thread; every path either restores it to
+            // `checkpoint_conn` or lets it drop, which is the moved-ownership
+            // equivalent of the former `drop_connection()` call.
+            let conn = checkpoint_conn
+                .conn
+                .take()
+                .expect("ensure_open just confirmed a connection is open");
+            match checkpoint_once_core(&pool, &conn, &config, &mut truncate_state) {
                 Ok(outcome) => {
                     #[cfg(unix)]
                     {
@@ -2071,12 +2100,18 @@ pub async fn run_checkpoint_task(
                     }
                     #[cfg(not(unix))]
                     let _ = outcome.sidecar_attribution;
-                    match crate::fts_maintenance::run_if_due(
+
+                    let (conn, state, fts_result) = run_fts_maintenance_off_worker(
                         conn,
-                        &fts_maintenance_config,
-                        &mut fts_maintenance_state,
+                        fts_maintenance_config.clone(),
+                        fts_maintenance_state,
                         Instant::now(),
-                    ) {
+                    )
+                    .await;
+                    fts_maintenance_state = state;
+                    checkpoint_conn.conn = Some(conn);
+
+                    match fts_result {
                         Ok(Some(step)) => match step.outcome {
                             crate::fts_maintenance::FtsMaintenanceOutcome::Worked => {
                                 tracing::info!(
@@ -2125,11 +2160,10 @@ pub async fn run_checkpoint_task(
                         "dedicated checkpoint connection failed a pragma; \
                          dropping it for a fresh reopen next tick"
                     );
-                    checkpoint_conn.drop_connection();
                     note_checkpoint_skipped();
                     CheckpointTick::Skipped
                 }
-            },
+            }
         };
 
         // A successful no-progress TRUNCATE returns a bounded attribution
@@ -4143,6 +4177,79 @@ mod tests {
             pressure_tick.contains("checkpoint_outcome_should_emit"),
             "extracted pressure tick helper must gate on the lifecycle emit decision"
         );
+    }
+
+    /// `run_fts_maintenance_off_worker` moves the same `run_if_due` call onto
+    /// a blocking thread; driven on a genuinely multi-threaded runtime
+    /// against a fragmented fixture, it must reach the same step outcome as
+    /// calling `run_if_due` directly on an identically-seeded fixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fts_maintenance_off_worker_matches_the_direct_call() {
+        fn fragmented_fixture() -> (tempfile::TempDir, rusqlite::Connection) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("fts-off-worker.db");
+            let conn = rusqlite::Connection::open(&path).expect("open sqlite");
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE fts_entities USING fts5(namespace UNINDEXED, subject_id UNINDEXED, title, body, tokenize='trigram');
+                 CREATE VIRTUAL TABLE fts_notes USING fts5(namespace UNINDEXED, subject_id UNINDEXED, title, body, tokenize='trigram');
+                 INSERT INTO fts_entities(fts_entities, rank) VALUES('automerge', 0);
+                 INSERT INTO fts_notes(fts_notes, rank) VALUES('automerge', 0);",
+            )
+            .expect("create FTS fixtures");
+            // Round-robin starts at table index 0 (`fts_entities`); fragment
+            // that one so the very first due call has real merge work to do.
+            for index in 0..80 {
+                let body = format!(
+                    "segment fixture {index} keeps enough repeated production recall text to span pages {}",
+                    "memory query corpus ".repeat(40)
+                );
+                conn.execute(
+                    "INSERT INTO fts_entities(namespace, subject_id, title, body) VALUES(?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "local",
+                        format!("id-{index}"),
+                        format!("title {index}"),
+                        body
+                    ],
+                )
+                .expect("one autocommit FTS write");
+            }
+            (dir, conn)
+        }
+
+        let config = crate::fts_maintenance::FtsMaintenanceConfig {
+            enabled: true,
+            interval: Duration::ZERO,
+            merge_pages: 8,
+            minimum_segments: 2,
+        };
+
+        let (_direct_dir, direct_conn) = fragmented_fixture();
+        let mut direct_state = crate::fts_maintenance::FtsMaintenanceState::new(Instant::now());
+        let direct_step = crate::fts_maintenance::run_if_due(
+            &direct_conn,
+            &config,
+            &mut direct_state,
+            Instant::now(),
+        )
+        .expect("direct maintenance step")
+        .expect("fragmented fixture has a due step");
+
+        let (_wrapped_dir, wrapped_conn) = fragmented_fixture();
+        let wrapped_state = crate::fts_maintenance::FtsMaintenanceState::new(Instant::now());
+        let (_conn, _state, wrapped_result) =
+            run_fts_maintenance_off_worker(wrapped_conn, config, wrapped_state, Instant::now())
+                .await;
+        let wrapped_step = wrapped_result
+            .expect("wrapped maintenance step")
+            .expect("fragmented fixture has a due step");
+
+        assert_eq!(
+            direct_step, wrapped_step,
+            "the spawn_blocking wrapper must produce the same step outcome as calling \
+             run_if_due directly"
+        );
+        assert_eq!(direct_step.table, "fts_entities");
     }
 
     // `checkpoint_once` -> `query_wal_pages` writes the process-wide

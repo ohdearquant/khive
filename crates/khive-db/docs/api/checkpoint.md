@@ -105,6 +105,15 @@ an otherwise successful checkpoint discard its connection. Tables below two
 segments are skipped. Secondary-backend checkpoint tasks never probe for or
 maintain the main substrate's FTS tables.
 
+The converse also holds for a step that does start: once the merge statement
+is executing, it holds SQLite's write lock like any other write, so a
+concurrent application writer may wait behind that one step for its
+execution time, bounded by the configured page budget. The step itself runs
+off the checkpoint task's Tokio worker thread (`tokio::task::spawn_blocking`),
+so a large merge cannot stall the async runtime while it runs — only the
+SQLite-level write lock is shared with application writers, not the async
+executor.
+
 Operator overrides are `KHIVE_FTS_MERGE_ENABLED`,
 `KHIVE_FTS_MERGE_INTERVAL_SECS`, `KHIVE_FTS_MERGE_PAGES`, and
 `KHIVE_FTS_MERGE_MIN_SEGMENTS`. Invalid values warn and retain conservative

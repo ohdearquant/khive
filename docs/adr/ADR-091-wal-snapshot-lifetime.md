@@ -1631,6 +1631,13 @@ mutex, and does not change the PASSIVE/TRUNCATE gates defined above. Busy,
 threshold, progress, no-op, requested-page, and error outcomes are
 process-lifetime counters. A maintenance failure is independent of a
 successful checkpoint observation and does not discard the connection.
+The converse is not free, however: once a step's merge statement is
+executing it holds SQLite's write lock like any other write, so an
+application writer may wait behind that one step for its execution time,
+bounded by the configured page budget. The step runs off the checkpoint
+task's Tokio worker thread (`tokio::task::spawn_blocking`), so it cannot
+stall the async runtime itself while it executes — only the SQLite-level
+write lock is shared with application writers.
 
 **Diagnostics.** FTS5 documents row id 10 in each `%_data` shadow table as the
 binary structure record. `db_diagnostics.fts_segments` decodes those two

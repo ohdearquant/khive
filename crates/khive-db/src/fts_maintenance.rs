@@ -226,6 +226,20 @@ fn read_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
     unreachable!("nine-byte SQLite varint returns inside the loop")
 }
 
+/// Four-byte marker SQLite writes immediately after the cookie for a V2
+/// ("`FTS5_STRUCTURE_V2`") structure record — the layout `contentless_delete=1`
+/// tables use. Verified against `fts5StructureWrite`/`fts5StructureDecode` in
+/// the vendored `libsqlite3-sys` `sqlite3.c` and against a real record read
+/// back from a `contentless_delete=1` table built with this tree's pinned
+/// SQLite: cookie(4) + \[V2 marker(4)\] + level_count + segment_count +
+/// write_counter, then per level merge_input_segments + level_segments, then
+/// per segment segment_id + first_leaf + last_leaf, and for V2 five further
+/// varints per segment (origin1, origin2, page-tombstone count,
+/// entry-tombstone count, entry count) that this diagnostic does not report.
+/// Those five fields are appended after each segment's leaf range, not as a
+/// separate counter after the write counter.
+const FTS5_STRUCTURE_V2_MARKER: [u8; 4] = [0xFF, 0x00, 0x00, 0x01];
+
 pub(crate) fn parse_structure_record(bytes: &[u8]) -> Result<FtsIndexStructure, String> {
     let cookie_bytes: [u8; 4] = bytes
         .get(..4)
@@ -234,6 +248,10 @@ pub(crate) fn parse_structure_record(bytes: &[u8]) -> Result<FtsIndexStructure, 
         .expect("slice length checked above");
     let cookie = u32::from_be_bytes(cookie_bytes);
     let mut cursor = 4;
+    let is_v2 = bytes.get(cursor..cursor + 4) == Some(&FTS5_STRUCTURE_V2_MARKER[..]);
+    if is_v2 {
+        cursor += 4;
+    }
     let level_count = read_varint(bytes, &mut cursor)?;
     let segment_count = read_varint(bytes, &mut cursor)?;
     let level_zero_segments_written = read_varint(bytes, &mut cursor)?;
@@ -246,13 +264,17 @@ pub(crate) fn parse_structure_record(bytes: &[u8]) -> Result<FtsIndexStructure, 
         ));
     }
 
+    // A V2 segment carries five extra varints (contentless-delete origin and
+    // tombstone bookkeeping) after its leaf range; a V1 segment carries none.
+    let bytes_per_segment: u64 = if is_v2 { 8 } else { 3 };
+
     let mut levels = Vec::with_capacity(level_capacity);
     let mut parsed_segments = 0_u64;
     for level in 0..level_count {
         let merge_input_segments = read_varint(bytes, &mut cursor)?;
         let level_segments = read_varint(bytes, &mut cursor)?;
         let remaining = bytes.len().saturating_sub(cursor);
-        if level_segments > (remaining / 3) as u64 {
+        if level_segments > remaining as u64 / bytes_per_segment {
             return Err(format!(
                 "FTS5 level {level} declares {level_segments} segments but its record is truncated"
             ));
@@ -265,6 +287,15 @@ pub(crate) fn parse_structure_record(bytes: &[u8]) -> Result<FtsIndexStructure, 
                 return Err(format!(
                     "FTS5 level {level} has invalid leaf range {first_leaf}..={last_leaf}"
                 ));
+            }
+            if is_v2 {
+                // origin1, origin2, page-tombstone count, entry-tombstone
+                // count, entry count — read (and bounds-checked) so the
+                // cursor lands correctly on the next segment/level; this
+                // diagnostic reports segment/level counts only.
+                for _ in 0..5 {
+                    read_varint(bytes, &mut cursor)?;
+                }
             }
         }
         parsed_segments = parsed_segments
@@ -306,9 +337,22 @@ fn has_active_merge(structure: &FtsIndexStructure) -> bool {
         .any(|level| level.merge_input_segments > 0)
 }
 
+/// Look up an `FTS_TABLES` entry by name instead of by array position, so a
+/// future reorder of `FTS_TABLES` cannot silently swap which structure record
+/// a diagnostic caller reads. The scheduler (`run_if_due`'s round-robin)
+/// stays position-based deliberately — it treats every entry uniformly and
+/// does not attach meaning to a specific index.
+fn fts_table(name: &str) -> FtsTable {
+    FTS_TABLES
+        .iter()
+        .find(|table| table.name == name)
+        .copied()
+        .unwrap_or_else(|| unreachable!("FTS_TABLES must define a {name} entry"))
+}
+
 pub(crate) fn inspect_fts_segments(conn: &Connection) -> Result<FtsSegmentDiagnostics, String> {
-    let entities = inspect_table(conn, FTS_TABLES[0])?;
-    let notes = inspect_table(conn, FTS_TABLES[1])?;
+    let entities = inspect_table(conn, fts_table("fts_entities"))?;
+    let notes = inspect_table(conn, fts_table("fts_notes"))?;
     let total_segments = entities.segment_count.saturating_add(notes.segment_count);
     Ok(FtsSegmentDiagnostics {
         entities,
@@ -538,6 +582,65 @@ mod tests {
         assert_eq!(parsed.levels[0].merge_input_segments, 3);
         assert_eq!(parsed.levels[0].segment_count, 70);
         assert_eq!(parsed.levels[1].segment_count, 60);
+    }
+
+    #[test]
+    fn parses_v2_contentless_delete_structure_record() {
+        // Captured verbatim from `%_data.id = 10` of a real
+        // `content='', contentless_delete=1` FTS5 table, built under this
+        // tree's pinned SQLite, after two single-page inserts:
+        // `sqlite3 v2.db "CREATE VIRTUAL TABLE t USING
+        // fts5(body, content='', contentless_delete=1, tokenize='trigram');
+        // INSERT ...; INSERT ...; SELECT hex(block) FROM t_data WHERE id=10"`
+        // -> 00000000FF000001010202000201010101010000010201010202000001
+        //
+        // cookie(4)=0, V2 marker(4)=FF 00 00 01, level_count=1,
+        // segment_count=2, write_counter=2; one level with
+        // merge_input_segments=0, level_segments=2; two segments, each
+        // segment_id/first_leaf/last_leaf followed by the five V2-only
+        // varints (origin1, origin2, page-tombstone count, entry-tombstone
+        // count, entry count) `fts5StructureWrite` appends for
+        // `contentless_delete=1` tables. There is no extra counter inserted
+        // after the write counter — verified against both the vendored
+        // `fts5StructureDecode`/`fts5StructureWrite` source and this real
+        // record's byte length (29 bytes: 8-byte header + 3-byte level
+        // header + 2 segments * 8 bytes).
+        let bytes = [
+            0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x01, 0x01, 0x02, 0x02, 0x00, 0x02, 0x01,
+            0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x01, 0x02, 0x01, 0x01, 0x02, 0x02, 0x00, 0x00,
+            0x01,
+        ];
+
+        let parsed = parse_structure_record(&bytes).expect("valid V2 structure record");
+
+        assert_eq!(parsed.cookie, 0);
+        assert_eq!(parsed.level_count, 1);
+        assert_eq!(parsed.segment_count, 2);
+        assert_eq!(parsed.level_zero_segments_written, 2);
+        assert_eq!(parsed.levels.len(), 1);
+        assert_eq!(parsed.levels[0].merge_input_segments, 0);
+        assert_eq!(parsed.levels[0].segment_count, 2);
+    }
+
+    #[test]
+    fn v1_structure_record_is_unaffected_by_v2_marker_detection() {
+        // A V1 record's byte 4 is the top byte of the level-count varint,
+        // never 0xFF for a small level count, so the V2 marker check must
+        // not misfire on ordinary records — regression guard for the
+        // marker-detection addition above.
+        let mut bytes = vec![0, 0, 0, 9];
+        push_varint(1, &mut bytes); // level_count
+        push_varint(1, &mut bytes); // segment_count
+        push_varint(5, &mut bytes); // write_counter
+        push_varint(0, &mut bytes); // level 0 merge_input_segments
+        push_varint(1, &mut bytes); // level 0 level_segments
+        push_varint(1, &mut bytes); // segment_id
+        push_varint(1, &mut bytes); // first_leaf
+        push_varint(1, &mut bytes); // last_leaf
+
+        let parsed = parse_structure_record(&bytes).expect("valid V1 structure record");
+        assert_eq!(parsed.cookie, 9);
+        assert_eq!(parsed.segment_count, 1);
     }
 
     #[test]

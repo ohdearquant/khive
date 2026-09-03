@@ -1404,6 +1404,18 @@ struct PoolInspection {
     fts_segments_error: Option<String>,
 }
 
+/// Split an FTS segment inspection result into the `(value, error)` pair
+/// shape every section of [`PoolInspection`]/[`DbDiagnostics`] uses, shared
+/// by the interruptible and plain inspection paths below.
+fn split_fts_segments_result(
+    result: Result<crate::FtsSegmentDiagnostics, String>,
+) -> (Option<crate::FtsSegmentDiagnostics>, Option<String>) {
+    match result {
+        Ok(segments) => (Some(segments), None),
+        Err(error) => (None, Some(error)),
+    }
+}
+
 fn inspect_pool_interruptibly(
     pool: &ConnectionPool,
     scope: &crate::read_cancellation::InterruptibleReadScope,
@@ -1467,10 +1479,7 @@ fn inspect_pool_interruptibly(
             Some(format!("graph-edge integrity query failed: {e}")),
         ),
     };
-    let (fts_segments, fts_segments_error) = match fts_segments {
-        Ok(segments) => (Some(segments), None),
-        Err(error) => (None, Some(error)),
-    };
+    let (fts_segments, fts_segments_error) = split_fts_segments_result(fts_segments);
 
     let (size_composition, size_composition_error) = match size_composition {
         Ok(composition) => (Some(composition), None),
@@ -1640,10 +1649,7 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
         ),
     };
     let (fts_segments, fts_segments_error) =
-        match crate::fts_maintenance::inspect_fts_segments(&conn) {
-            Ok(segments) => (Some(segments), None),
-            Err(error) => (None, Some(error)),
-        };
+        split_fts_segments_result(crate::fts_maintenance::inspect_fts_segments(&conn));
 
     PoolInspection {
         checkpoint_probe,
