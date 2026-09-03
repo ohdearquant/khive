@@ -84,5 +84,44 @@ class ResolveBinaryTests(unittest.TestCase):
         )
 
 
+class SmokeChildEnvTests(unittest.TestCase):
+    """tests/smoke_test.py builds every smoke child's environment through
+    smoke_child_env; no KHIVE_* setting of the parent may reach a child, or
+    the parent's config, namespace, actor or output format silently changes
+    what the smoke suite measures."""
+
+    def _smoke_child_env(self):
+        spec = importlib.util.spec_from_file_location(
+            "smoke_test_module", REPO_ROOT / "tests" / "smoke_test.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        # smoke_test.py imports its sibling helpers by bare name.
+        sys.path.insert(0, str(REPO_ROOT / "tests"))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.remove(str(REPO_ROOT / "tests"))
+        return module.smoke_child_env
+
+    def test_child_env_strips_every_khive_variable(self):
+        smoke_child_env = self._smoke_child_env()
+        source = {
+            "PATH": "/usr/bin",
+            "KHIVE_PACKS": "kg,gtd",
+            "KHIVE_CONFIG": "/somewhere/config.toml",
+            "KHIVE_OUTPUT_FORMAT": "table",
+            "KHIVE_NAMESPACE": "other",
+            "KHIVE_ACTOR": "someone",
+            "KHIVE_NO_DAEMON": "0",
+        }
+        env = smoke_child_env(source)
+        leaked = sorted(k for k in env if k.startswith("KHIVE_") and k != "KHIVE_NO_DAEMON")
+        self.assertEqual(leaked, [])
+        self.assertEqual(env["KHIVE_NO_DAEMON"], "1")
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertIn("HOME", env)
+        self.assertEqual(source["KHIVE_ACTOR"], "someone", "the source mapping is not mutated")
+
+
 if __name__ == "__main__":
     unittest.main()

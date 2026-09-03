@@ -50,8 +50,12 @@ _SMOKE_HOME = tempfile.TemporaryDirectory(prefix="khive-smoke-home-")
 
 
 def smoke_child_env(source=None) -> dict[str, str]:
-    env = dict(os.environ if source is None else source)
-    env.pop("KHIVE_PACKS", None)
+    """Environment for a smoke child: every KHIVE_* setting of the parent is
+    dropped (config, packs, namespace, actor, output format alike), so the
+    child resolves its own defaults; a test that needs a KHIVE_* value sets
+    it on the returned mapping."""
+    base = os.environ if source is None else source
+    env = {k: v for k, v in base.items() if not k.startswith("KHIVE_")}
     env["HOME"] = _SMOKE_HOME.name
     env["KHIVE_NO_DAEMON"] = "1"
     return env
