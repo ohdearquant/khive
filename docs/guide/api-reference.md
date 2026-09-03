@@ -1870,15 +1870,23 @@ The response is `{results, total, candidate_provenance, ...}`. A genuine FTS mis
 not scan or rank the newest corpus rows. `candidate_provenance.lexical` reports one of:
 
 - `matched`: eligible lexical candidates were found.
-- `no_match`: FTS found no lexical match.
-- `filtered`: FTS matched, but kind/status eligibility removed every lexical candidate.
+- `no_match`: FTS found no lexical match among the terms actually searched. This also covers
+  a truncation-caused miss (see `terms_truncated` below) — an untested term's eligibility is
+  unknown, so it is never reported as `filtered`.
+- `filtered`: FTS matched among the terms actually searched, but kind/status eligibility
+  removed every lexical candidate.
 - `partial_timeout`: part of a lexical/decomposed candidate stage completed before the
   request read deadline.
 - `timed_out`: the lexical candidate stage timed out without a completed candidate leg.
 
 `candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and
 no returned result has lexical evidence; it is otherwise `none`, including for an empty
-result. Each result includes `score_provenance`:
+result. `candidate_provenance.terms_truncated` is `true` when the query supplied more
+distinct scoreable terms than the per-request FTS fan-out bound; the lexical candidate set
+only reflects terms up to that bound. The bound is shared across every lexical fetch one
+request makes, including all three fetches `search`'s query-decomposition path can issue
+(the full query plus two sub-queries), so a decomposed request cannot triple the effective
+cap. Each result includes `score_provenance`:
 
 ```json
 {

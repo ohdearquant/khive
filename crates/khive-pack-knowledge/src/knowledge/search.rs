@@ -417,11 +417,13 @@ fn fts5_candidate_terms(raw_query: &str) -> Vec<String> {
     }
 }
 
-/// The OR-joined form of [`fts5_candidate_terms`], used only for the cheap
-/// unordered existence probe in `fetch_fts_candidates` (no `ORDER BY bm25`,
-/// `LIMIT 1`) — never as the ordered candidate query itself. See issue #1930:
-/// running that ordered query over the full OR-joined match set is what made
-/// `knowledge.suggest`/`knowledge.search` blow the read deadline at scale.
+/// The OR-joined form of [`fts5_candidate_terms`] over the full, untruncated
+/// term set. `fetch_fts_candidates`'s own raw-existence probe joins its
+/// (possibly budget-truncated) `terms` directly instead of calling this, so
+/// truncation and eligibility stay distinguishable outcomes; this remains as
+/// a test-only building block for exercising `fts5_candidate_terms`'s
+/// OR-joined shape in isolation.
+#[cfg(test)]
 fn fts5_candidate_expression(raw_query: &str) -> String {
     fts5_candidate_terms(raw_query).join(" OR ")
 }
@@ -450,15 +452,38 @@ fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
 /// never to the size of the full match set.
 const FTS_TERM_LIMIT: usize = 500;
 
+/// Bound on the number of distinct scoreable terms that issue their own
+/// `MATCH` query, shared across every lexical fetch a single `knowledge.search`
+/// (or `suggest`) call makes. Without this cap a caller-controlled query with
+/// many distinct terms turns one request into an unbounded number of index
+/// probes plus proportional retained-row memory (each bounded only by
+/// `FTS_TERM_LIMIT`), with the request read deadline as the only backstop.
+/// `search_decomposed` calls the lexical fetch up to three times (full query
+/// plus two sub-queries) for one request; the budget is a request-scoped
+/// [`std::sync::atomic::AtomicUsize`] threaded through [`SearchCtx`] so those calls draw
+/// from one shared allowance instead of each getting their own `32`. Terms
+/// beyond the remaining budget are dropped after dedup/expansion, in the same
+/// deterministic order `fts5_candidate_terms` produces, so a query at or
+/// under the cap sees byte-for-byte identical candidate generation and
+/// ranking to the uncapped behavior.
+const FTS_TERM_COUNT_LIMIT: usize = 32;
+
 /// Outcome of the bounded lexical candidate fetch.
 ///
 /// `state` distinguishes a real lexical miss from a match removed by public
 /// eligibility and from the fail-open timeout outcome. Any non-timeout
 /// storage error (including a genuine FTS5 syntax/parser error) still
-/// surfaces as an `Err`.
+/// surfaces as an `Err`. `terms_truncated` reports whether the query supplied
+/// more distinct scoreable terms than the remaining `FTS_TERM_COUNT_LIMIT`
+/// budget, so a caller can tell a bounded candidate generation stage from a
+/// full one. The raw-existence eligibility probe below scopes itself to the
+/// same truncated term set, so a truncation-caused miss is never reported as
+/// `Filtered` — `Filtered` means eligibility removed a match among the terms
+/// actually searched, not that an untested term might have matched.
 struct FtsFetchOutcome {
     atoms: Vec<Atom>,
     state: LexicalCandidateState,
+    terms_truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,6 +560,21 @@ async fn advance_fts_test_deadline_after_term(completed_terms: usize) {
     }
 }
 
+// Counts per-term `MATCH` statements actually issued by the loop below, so a
+// test can prove the fan-out is bounded by the shared term budget rather
+// than trusting the cap's arithmetic alone.
+#[cfg(test)]
+tokio::task_local! {
+    static FTS_TEST_TERM_QUERY_COUNT: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
+#[cfg(test)]
+fn count_fts_test_term_query() {
+    let _ = FTS_TEST_TERM_QUERY_COUNT.try_with(|counter| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 fn is_timeout(e: &khive_storage::StorageError) -> bool {
     matches!(e, khive_storage::StorageError::Timeout { .. })
 }
@@ -556,6 +596,7 @@ fn is_read_timeout(e: &RuntimeError) -> bool {
 /// term, unioned and deduplicated in application code. FTS remains only the
 /// candidate generator; TF-IDF in `search_core` remains the ranker, so the
 /// per-term merge order does not need to be a globally correct bm25 rank.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_fts_candidates(
     runtime: &KhiveRuntime,
     ns: &str,
@@ -564,7 +605,30 @@ async fn fetch_fts_candidates(
     statuses: &[String],
     exclude_statuses: &[&str],
     fetch_limit: usize,
+    term_budget: &std::sync::atomic::AtomicUsize,
 ) -> Result<FtsFetchOutcome, RuntimeError> {
+    // Consume from the request-scoped term budget before doing any I/O: a
+    // budget already exhausted by an earlier call in this request (e.g. the
+    // full query in `search_decomposed`) means this call contributes no
+    // lexical candidates at all, and there is no reason to open a reader.
+    let mut terms = fts5_candidate_terms(raw_query);
+    let full_term_count = terms.len();
+    let remaining_budget = term_budget.load(std::sync::atomic::Ordering::Relaxed);
+    let terms_truncated = full_term_count > remaining_budget;
+    terms.truncate(remaining_budget);
+    term_budget.store(
+        remaining_budget - terms.len(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    if terms.is_empty() {
+        return Ok(FtsFetchOutcome {
+            atoms: Vec::new(),
+            state: LexicalCandidateState::NoMatch,
+            terms_truncated: true,
+        });
+    }
+
     let sql = runtime.sql();
     let mut reader = match sql.reader().await {
         Ok(reader) => reader,
@@ -572,12 +636,12 @@ async fn fetch_fts_candidates(
             return Ok(FtsFetchOutcome {
                 atoms: Vec::new(),
                 state: LexicalCandidateState::TimedOut,
+                terms_truncated,
             });
         }
         Err(e) => return Err(sql_err("search fts reader", e)),
     };
 
-    let terms = fts5_candidate_terms(raw_query);
     let type_clause = type_eligibility_sql(type_filter, "a");
     let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 4);
     let per_term_limit = if terms.len() == 1 {
@@ -638,7 +702,10 @@ async fn fetch_fts_candidates(
 
         per_term_rows.push(rows.iter().filter_map(atom_from_row).collect());
         #[cfg(test)]
-        advance_fts_test_deadline_after_term(per_term_rows.len()).await;
+        {
+            count_fts_test_term_query();
+            advance_fts_test_deadline_after_term(per_term_rows.len()).await;
+        }
     }
 
     let max_term_rows = per_term_rows.iter().map(Vec::len).max().unwrap_or(0);
@@ -664,6 +731,7 @@ async fn fetch_fts_candidates(
         return Ok(FtsFetchOutcome {
             atoms: combined,
             state,
+            terms_truncated,
         });
     }
 
@@ -671,15 +739,22 @@ async fn fetch_fts_candidates(
         return Ok(FtsFetchOutcome {
             atoms: combined,
             state: LexicalCandidateState::Matched,
+            terms_truncated,
         });
     }
 
     // No term produced an eligible row. Distinguish a true lexical miss from
     // a lexical match whose rows were all ineligible. In either case an empty
-    // lexical result is correct; the distinction is response provenance.
-    // This probe has no ORDER BY and LIMIT 1, so it stays cheap even over the
-    // OR-joined expression.
-    let match_expr = fts5_candidate_expression(raw_query);
+    // lexical result is correct; the distinction is response provenance. This
+    // probe scopes itself to the same (possibly truncated) `terms` the loop
+    // above actually searched — never to the full untruncated query — so a
+    // truncation-caused miss is reported as `NoMatch` (paired with
+    // `terms_truncated: true`), never as `Filtered`: `Filtered` means
+    // eligibility removed a match among the terms actually searched, and an
+    // untested term's eligibility is simply unknown. This probe has no
+    // ORDER BY and LIMIT 1, so it stays cheap even over the OR-joined
+    // expression.
+    let match_expr = terms.join(" OR ");
     let raw_fts_match = match reader
         .query_row(SqlStatement {
             sql: "SELECT 1 AS present FROM fts_knowledge \
@@ -695,6 +770,7 @@ async fn fetch_fts_candidates(
             return Ok(FtsFetchOutcome {
                 atoms: Vec::new(),
                 state: LexicalCandidateState::TimedOut,
+                terms_truncated,
             });
         }
         Err(e) => return Err(sql_err("search fts eligibility probe", e)),
@@ -703,6 +779,7 @@ async fn fetch_fts_candidates(
         return Ok(FtsFetchOutcome {
             atoms: Vec::new(),
             state: LexicalCandidateState::Filtered,
+            terms_truncated,
         });
     }
 
@@ -712,6 +789,7 @@ async fn fetch_fts_candidates(
     Ok(FtsFetchOutcome {
         atoms: Vec::new(),
         state: LexicalCandidateState::NoMatch,
+        terms_truncated,
     })
 }
 
@@ -727,6 +805,15 @@ struct SearchCtx<'a> {
     fetch_limit: usize,
     statuses: &'a [String],
     exclude_statuses: &'a [&'a str],
+    /// Request-scoped remaining allowance for [`FTS_TERM_COUNT_LIMIT`],
+    /// shared by every lexical fetch this request makes. `search_decomposed`
+    /// calls `search_core` up to three times for one `knowledge.search`
+    /// request; sharing one counter across them bounds the whole request's
+    /// distinct-term fan-out instead of granting each call its own budget.
+    /// Atomic rather than `Cell` only because the handler future must stay
+    /// `Send` across its `.await` points; every access is sequential — this
+    /// pack never touches the counter from more than one task at a time.
+    term_budget: &'a std::sync::atomic::AtomicUsize,
 }
 
 // ─── core single-pass search ──────────────────────────────────────────────────
@@ -734,9 +821,12 @@ struct SearchCtx<'a> {
 /// `search_core`'s result plus the lexical/FTS candidate-stage outcome. A
 /// caller sees `hits` possibly empty/partial and an explicit timeout state
 /// instead of an `Err` for a genuine request read-deadline expiry.
+/// `terms_truncated` reports whether any lexical fetch in this call ran out
+/// of the shared per-request term budget.
 struct SearchCoreOutcome {
     hits: Vec<ScoredHit>,
     lexical_state: LexicalCandidateState,
+    terms_truncated: bool,
 }
 
 async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutcome, RuntimeError> {
@@ -752,6 +842,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
             lexical_state: LexicalCandidateState::NoMatch,
+            terms_truncated: false,
         });
     }
 
@@ -782,7 +873,11 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     // fall through to exact-name-bonus-only scoring rather than returning early.
     let terms_only_exact = terms.is_empty();
 
-    let FtsFetchOutcome { atoms, state } = fetch_fts_candidates(
+    let FtsFetchOutcome {
+        atoms,
+        state,
+        terms_truncated,
+    } = fetch_fts_candidates(
         runtime,
         ns,
         &raw_query,
@@ -790,12 +885,14 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
         ctx.statuses,
         ctx.exclude_statuses,
         CANDIDATE_POOL,
+        ctx.term_budget,
     )
     .await?;
     if atoms.is_empty() {
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
             lexical_state: state,
+            terms_truncated,
         });
     }
 
@@ -804,6 +901,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
             lexical_state: state,
+            terms_truncated,
         });
     }
 
@@ -856,6 +954,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
             })
             .collect(),
         lexical_state: state,
+        terms_truncated,
     })
 }
 
@@ -879,7 +978,11 @@ async fn search_decomposed(
     let SearchCoreOutcome {
         hits: full,
         lexical_state: full_state,
+        terms_truncated: full_truncated,
     } = search_core(ctx, query).await?;
+    // Same `term_budget` `Cell` as `ctx`: the three lexical fetches below draw
+    // from one shared per-request allowance rather than each getting their
+    // own `FTS_TERM_COUNT_LIMIT`.
     let sub_ctx1 = SearchCtx {
         runtime: ctx.runtime,
         ns: ctx.ns,
@@ -890,16 +993,20 @@ async fn search_decomposed(
         fetch_limit: sub_limit,
         statuses: ctx.statuses,
         exclude_statuses: ctx.exclude_statuses,
+        term_budget: ctx.term_budget,
     };
     let SearchCoreOutcome {
         hits: s1,
         lexical_state: s1_state,
+        terms_truncated: s1_truncated,
     } = search_core(&sub_ctx1, &sub_q1).await?;
     let SearchCoreOutcome {
         hits: s2,
         lexical_state: s2_state,
+        terms_truncated: s2_truncated,
     } = search_core(&sub_ctx1, &sub_q2).await?;
     let lexical_state = LexicalCandidateState::merge(&[full_state, s1_state, s2_state]);
+    let terms_truncated = full_truncated || s1_truncated || s2_truncated;
 
     let mut scores: HashMap<String, f32> = HashMap::new();
     let mut data: HashMap<String, ScoredHit> = HashMap::new();
@@ -951,6 +1058,7 @@ async fn search_decomposed(
     Ok(SearchCoreOutcome {
         hits: ranked,
         lexical_state,
+        terms_truncated,
     })
 }
 
@@ -2022,6 +2130,10 @@ impl KnowledgeHandlers {
         let allow_deprecated =
             deprecated_allowed_by_status_policy(&requested_statuses, &effective_exclude_statuses);
 
+        // One term budget for the whole request: `search_decomposed` below
+        // may call the lexical fetch up to three times, and they must share
+        // this allowance rather than each getting their own.
+        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
         let ctx = SearchCtx {
             runtime,
             ns: &ns,
@@ -2032,6 +2144,7 @@ impl KnowledgeHandlers {
             fetch_limit,
             statuses: &requested_statuses,
             exclude_statuses: &effective_exclude_statuses,
+            term_budget: &term_budget,
         };
 
         // Trigger background warm — never block search on the ANN rebuild.
@@ -2083,6 +2196,7 @@ impl KnowledgeHandlers {
         let SearchCoreOutcome {
             mut hits,
             lexical_state,
+            terms_truncated,
         } = if do_decompose && non_stop_count >= decompose_threshold {
             search_decomposed(&ctx, &raw_query, intersection_bonus).await?
         } else {
@@ -2174,6 +2288,7 @@ impl KnowledgeHandlers {
             "candidate_provenance": {
                 "lexical": lexical_state.as_str(),
                 "fallback": fallback,
+                "terms_truncated": terms_truncated,
             },
         });
         if ann_unavailable {
@@ -2222,6 +2337,7 @@ impl KnowledgeHandlers {
         // should not drive auto-compose or agent orientation.
         const SUGGEST_EXCLUDE: &[&str] = &["draft", "deprecated"];
 
+        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
         let ctx = SearchCtx {
             runtime,
             ns: &ns,
@@ -2232,6 +2348,7 @@ impl KnowledgeHandlers {
             fetch_limit: limit * 3,
             statuses: &[],
             exclude_statuses: SUGGEST_EXCLUDE,
+            term_budget: &term_budget,
         };
 
         // Fetch ANN candidates BEFORE the lexical stage — same rationale as
@@ -2288,6 +2405,7 @@ impl KnowledgeHandlers {
         let SearchCoreOutcome {
             mut hits,
             lexical_state,
+            terms_truncated: _,
         } = search_core(&ctx, &raw_query).await?;
         let lexical_timed_out = lexical_state.timed_out();
 
@@ -3035,6 +3153,7 @@ mod tests {
 
         let query = "term0 term1";
         let deadline = std::time::Duration::from_millis(650);
+        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
 
         let new_result = khive_storage::scope_request_read_deadline(
             deadline,
@@ -3043,7 +3162,16 @@ mod tests {
                     after_completed_terms: 1,
                     by: deadline,
                 },
-                fetch_fts_candidates(&runtime, "local", query, None, &[], &[], CANDIDATE_POOL),
+                fetch_fts_candidates(
+                    &runtime,
+                    "local",
+                    query,
+                    None,
+                    &[],
+                    &[],
+                    CANDIDATE_POOL,
+                    &term_budget,
+                ),
             ),
         )
         .await;
@@ -3170,10 +3298,19 @@ mod tests {
         }
 
         let fetch_limit = 5;
-        let outcome =
-            fetch_fts_candidates(&runtime, "local", "alpha beta", None, &[], &[], fetch_limit)
-                .await
-                .expect("fetch must not error");
+        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
+        let outcome = fetch_fts_candidates(
+            &runtime,
+            "local",
+            "alpha beta",
+            None,
+            &[],
+            &[],
+            fetch_limit,
+            &term_budget,
+        )
+        .await
+        .expect("fetch must not error");
         assert_eq!(outcome.state, LexicalCandidateState::Matched);
         assert_eq!(outcome.atoms.len(), fetch_limit);
 
@@ -3223,6 +3360,7 @@ mod tests {
                 .expect("seed unrelated atom");
         }
 
+        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
         let outcome = fetch_fts_candidates(
             &runtime,
             "local",
@@ -3231,6 +3369,7 @@ mod tests {
             &[],
             &[],
             CANDIDATE_POOL,
+            &term_budget,
         )
         .await
         .expect("lexical miss must not error");
@@ -3306,6 +3445,7 @@ mod tests {
                 .expect("seed filtered atom");
         }
 
+        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
         let outcome = fetch_fts_candidates(
             &runtime,
             "local",
@@ -3314,12 +3454,155 @@ mod tests {
             &[],
             &["draft", "deprecated"],
             CANDIDATE_POOL,
+            &term_budget,
         )
         .await
         .expect("filtered lexical match must not error");
 
         assert!(outcome.atoms.is_empty());
         assert_eq!(outcome.state, LexicalCandidateState::Filtered);
+    }
+
+    /// Issue: a caller can supply a query with an unbounded number of
+    /// distinct scoreable terms, turning one request into one `MATCH`
+    /// statement per term with no bound but the request read deadline. The
+    /// per-term loop must stop once the shared budget is exhausted
+    /// regardless of how many distinct terms the query carries, and report
+    /// the truncation.
+    #[tokio::test]
+    async fn distinct_term_fan_out_is_bounded_and_reports_truncation() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+
+        let over_cap_query: String = (0..(FTS_TERM_COUNT_LIMIT * 2))
+            .map(|i| format!("distinctterm{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let full_terms = fts5_candidate_terms(&over_cap_query);
+        assert!(
+            full_terms.len() > FTS_TERM_COUNT_LIMIT,
+            "test setup must exceed the cap: got {} terms",
+            full_terms.len()
+        );
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
+        let outcome = FTS_TEST_TERM_QUERY_COUNT
+            .scope(
+                counter.clone(),
+                fetch_fts_candidates(
+                    &runtime,
+                    "local",
+                    &over_cap_query,
+                    None,
+                    &[],
+                    &[],
+                    CANDIDATE_POOL,
+                    &term_budget,
+                ),
+            )
+            .await
+            .expect("bounded fan-out fetch must not error");
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            FTS_TERM_COUNT_LIMIT,
+            "a query with more distinct terms than the cap must issue exactly \
+             FTS_TERM_COUNT_LIMIT MATCH statements, never one per term"
+        );
+        assert!(
+            outcome.terms_truncated,
+            "the outcome must report that the term set was truncated"
+        );
+
+        // Control: a query at or under the cap sees byte-for-byte identical
+        // candidate generation — no truncation, one statement per term.
+        let under_cap_query = "alpha beta gamma";
+        let under_cap_terms = fts5_candidate_terms(under_cap_query);
+        assert!(under_cap_terms.len() <= FTS_TERM_COUNT_LIMIT);
+
+        let control_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
+        let control_outcome = FTS_TEST_TERM_QUERY_COUNT
+            .scope(
+                control_counter.clone(),
+                fetch_fts_candidates(
+                    &runtime,
+                    "local",
+                    under_cap_query,
+                    None,
+                    &[],
+                    &[],
+                    CANDIDATE_POOL,
+                    &control_budget,
+                ),
+            )
+            .await
+            .expect("under-cap fetch must not error");
+        assert_eq!(
+            control_counter.load(std::sync::atomic::Ordering::Relaxed),
+            under_cap_terms.len()
+        );
+        assert!(!control_outcome.terms_truncated);
+    }
+
+    /// The fan-out bound above is per-request, not per-call: `search_decomposed`
+    /// runs the lexical fetch up to three times (full query plus two
+    /// sub-queries) for one `knowledge.search` request. Each of the three
+    /// getting its own `FTS_TERM_COUNT_LIMIT` would let one decomposed
+    /// request issue up to 3x the intended number of `MATCH` statements —
+    /// exactly the fan-out this bound exists to prevent. All three calls here
+    /// share one `SearchCtx::term_budget`, so the full query (already over
+    /// the cap on its own) exhausts the budget and leaves nothing for either
+    /// sub-query.
+    #[tokio::test]
+    async fn term_budget_is_shared_across_decomposed_sub_queries() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+
+        let over_cap_query: String = (0..(FTS_TERM_COUNT_LIMIT + 18))
+            .map(|i| format!("distinctterm{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let statuses: Vec<String> = Vec::new();
+        let weights = Weights::default();
+        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
+        let ctx = SearchCtx {
+            runtime: &runtime,
+            ns: "local",
+            role: None,
+            type_filter: None,
+            min_score: 0.0,
+            w: &weights,
+            fetch_limit: CANDIDATE_POOL,
+            statuses: &statuses,
+            exclude_statuses: &[],
+            term_budget: &term_budget,
+        };
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outcome = FTS_TEST_TERM_QUERY_COUNT
+            .scope(
+                counter.clone(),
+                search_decomposed(&ctx, &over_cap_query, 0.25),
+            )
+            .await
+            .expect(
+                "a decomposed search must not error even when every leg's \
+                 term budget is exhausted",
+            );
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            FTS_TERM_COUNT_LIMIT,
+            "the full query and both sub-queries must draw from ONE shared \
+             per-request term budget: the full query alone exceeds the cap, \
+             so it must exhaust the budget and leave zero MATCH statements \
+             for either sub-query — never 3 independent budgets' worth"
+        );
+        assert!(
+            outcome.terms_truncated,
+            "the outcome must report the request-wide truncation"
+        );
     }
 
     #[tokio::test]
