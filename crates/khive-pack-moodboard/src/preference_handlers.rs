@@ -1682,9 +1682,9 @@ mod tests {
     use super::*;
     use crate::preference::{
         materialize_fann, pair_split, CalibrationProvenance, DataSplit, FannProvenance,
-        OptimizerProvenance, PairKey, SplitCounts, TestMetrics, TrainingProvenance,
-        FANN_CRATE_VERSION, FANN_FORMAT, FEATURE_SCHEMA_CANONICAL_JSON, MIN_CAL_DECISIVE_GROUPS,
-        MIN_CAL_TIE_GROUPS, MIN_TEST_DECISIVE_GROUPS, MIN_TRAIN_DECISIVE_GROUPS, MODEL_FAMILY,
+        OptimizerProvenance, PairKey, SplitCounts, TestMetrics, TrainingProvenance, FANN_FORMAT,
+        FEATURE_SCHEMA_CANONICAL_JSON, MIN_CAL_DECISIVE_GROUPS, MIN_CAL_TIE_GROUPS,
+        MIN_TEST_DECISIVE_GROUPS, MIN_TRAIN_DECISIVE_GROUPS, MODEL_FAMILY,
         OPTIMIZER_BACKTRACKING_IDENTITY, PAIR_SPLIT_REVISION, TIE_BAND_RULE_IDENTITY,
         TRAINING_REVISION,
     };
@@ -2361,7 +2361,7 @@ mod tests {
             },
             fann: FannProvenance {
                 crate_name: "lattice-fann".to_string(),
-                crate_version: FANN_CRATE_VERSION.to_string(),
+                crate_version: crate::LATTICE_VERSION.to_string(),
                 format: FANN_FORMAT.to_string(),
                 architecture: format!("{FEATURE_COUNT}->1 linear; zero intercept"),
                 network_content_ref: network_content_ref.to_string(),
