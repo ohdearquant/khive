@@ -1,11 +1,27 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30, 2026-09-03)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
+
+## Amendment (2026-09-03): exact-name/tag recovery for a genuine FTS miss
+
+Removing the recency fallback (below) made two scorable candidate classes unreachable, because
+`fts_knowledge` cannot surface them regardless of corpus content: a query shorter than the
+trigram tokenizer's minimum span (e.g. "RAG", "ML") never forms a trigram, so `exact_name_bonus`
+scoring — which only needs the raw query as a substring of the name — never got a candidate to
+score; and `tags` is not one of the FTS-indexed columns at all, so a query that only overlaps an
+atom's tags (`w_tags` scoring) never got one either.
+
+A genuine FTS miss now runs one further bounded, direct-predicate lookup — not a recency scan —
+before reporting empty: atoms whose `name` contains the raw query (case-insensitive) or whose
+`tags` JSON array contains a query token, capped at the same candidate-pool limit and still
+scoped by namespace/status/kind eligibility inside the SQL. `candidate_provenance.lexical` reports
+this outcome as `exact_match`, distinct from `matched` (a real FTS/bm25 hit) so a caller can still
+tell which lexical mechanism produced the candidates.
 
 ## Amendment (2026-08-30): honest lexical fallback and score provenance
 
@@ -18,8 +34,8 @@ an embedder and index can supply it.
 
 `knowledge.search` adds backward-compatible provenance fields:
 
-- Top-level `candidate_provenance.lexical` is `matched`, `no_match`, `filtered`, `partial_timeout`,
-  or `timed_out`.
+- Top-level `candidate_provenance.lexical` is `matched`, `exact_match`, `no_match`, `filtered`,
+  `partial_timeout`, or `timed_out` (`exact_match` added 2026-09-03, see amendment above).
 - Top-level `candidate_provenance.fallback` is `ann` only when the returned set has ANN
   evidence and no returned result has lexical evidence; otherwise it is `none`.
 - Each result adds `score_provenance` with a stable-order `sources` subset of `lexical` and

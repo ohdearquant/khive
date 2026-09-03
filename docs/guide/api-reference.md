@@ -1889,8 +1889,12 @@ score bands.
 The response is `{results, total, candidate_provenance, ...}`. A genuine FTS miss does
 not scan or rank the newest corpus rows. `candidate_provenance.lexical` reports one of:
 
-- `matched`: eligible lexical candidates were found.
-- `no_match`: FTS found no lexical match.
+- `matched`: eligible lexical candidates were found via FTS.
+- `exact_match`: FTS found no match, but a bounded direct-predicate lookup found candidates
+  by exact name substring or literal tag — the only way to reach a query too short for the
+  trigram index (e.g. "RAG", "ML") or a query that only overlaps an atom's tags (tags are not
+  FTS-indexed).
+- `no_match`: neither FTS nor the exact-match lookup found a lexical candidate.
 - `filtered`: FTS matched, but kind/status eligibility removed every lexical candidate.
 - `partial_timeout`: part of a lexical/decomposed candidate stage completed before the
   request read deadline.

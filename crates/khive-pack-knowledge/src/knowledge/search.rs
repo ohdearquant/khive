@@ -426,6 +426,36 @@ fn fts5_candidate_expression(raw_query: &str) -> String {
     fts5_candidate_terms(raw_query).join(" OR ")
 }
 
+/// De-duplicated, non-stop, length-eligible query tokens, expanded the same
+/// way `search_core` expands scoring terms. Used only by the exact-match
+/// recovery path's tag predicate below — `fts_knowledge` does not index
+/// `tags` at all (schema.sql), so a tag-only query can never surface through
+/// FTS regardless of term length.
+fn tag_match_terms(raw_query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut terms: Vec<String> = matching::tokenize_field(raw_query)
+        .into_iter()
+        .filter(|term| term.len() >= MIN_TERM_LEN && !is_stop(term))
+        .filter(|term| seen.insert(term.clone()))
+        .collect();
+    let _ = expand_terms(&mut terms);
+    terms
+}
+
+/// Escape SQLite `LIKE` wildcard characters (`%`, `_`) and the escape
+/// character itself (`\`) so a query token is matched literally under
+/// `LIKE ... ESCAPE '\'` rather than as a pattern.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// SQL eligibility predicate for the public atom/domain kind filter.
 ///
 /// Domain mirrors are atoms carrying the exact `type:domain` tag. Applying
@@ -464,6 +494,7 @@ struct FtsFetchOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LexicalCandidateState {
     Matched,
+    ExactMatch,
     NoMatch,
     Filtered,
     PartialTimeout,
@@ -474,6 +505,7 @@ impl LexicalCandidateState {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Matched => "matched",
+            Self::ExactMatch => "exact_match",
             Self::NoMatch => "no_match",
             Self::Filtered => "filtered",
             Self::PartialTimeout => "partial_timeout",
@@ -502,6 +534,9 @@ impl LexicalCandidateState {
         }
         if states.contains(&Self::Matched) {
             return Self::Matched;
+        }
+        if states.contains(&Self::ExactMatch) {
+            return Self::ExactMatch;
         }
         if states.contains(&Self::Filtered) {
             return Self::Filtered;
@@ -706,12 +741,81 @@ async fn fetch_fts_candidates(
         });
     }
 
-    // A genuine FTS miss is an empty lexical candidate set. Corpus recency is
-    // not query evidence; feeding newest rows into rank fusion creates an
-    // artificial lexical source and can make off-topic results look topical.
+    // A genuine FTS miss. Corpus recency is still not query evidence — that
+    // fallback stays removed — but two candidate classes the scorer still
+    // promises can never reach the trigram index at all, regardless of the
+    // query: `exact_name_bonus` scores a name that contains the raw query as
+    // a substring, and a query shorter than the trigram minimum span (e.g.
+    // "RAG", "ML") never matches any trigram; and `w_tags` scores atom tags,
+    // which `fts_knowledge` does not index. Recover both with a bounded
+    // direct-predicate lookup — not a recency scan — so only rows that
+    // actually overlap the query by name substring or literal tag come back.
+    let name_needle = raw_query.trim().to_lowercase();
+    let tag_terms = tag_match_terms(raw_query);
+    if name_needle.is_empty() && tag_terms.is_empty() {
+        return Ok(FtsFetchOutcome {
+            atoms: Vec::new(),
+            state: LexicalCandidateState::NoMatch,
+        });
+    }
+
+    let mut exact_params: Vec<SqlValue> = vec![SqlValue::Text(ns.to_owned())];
+    let mut predicates: Vec<String> = Vec::new();
+    let mut next_param = 2;
+    if !name_needle.is_empty() {
+        predicates.push(format!("a.name LIKE ?{next_param} ESCAPE '\\'"));
+        exact_params.push(SqlValue::Text(format!("%{}%", escape_like(&name_needle))));
+        next_param += 1;
+    }
+    for term in &tag_terms {
+        predicates.push(format!("a.tags LIKE ?{next_param} ESCAPE '\\'"));
+        exact_params.push(SqlValue::Text(format!("%\"{}\"%", escape_like(term))));
+        next_param += 1;
+    }
+
+    let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, next_param);
+    next_param += status_params.len();
+    exact_params.extend(status_params);
+    let limit_param = next_param;
+    exact_params.push(SqlValue::Integer(fetch_limit as i64));
+
+    let exact_sql = format!(
+        "SELECT a.* FROM knowledge_atoms AS a \
+         WHERE a.namespace = ?1 AND a.deleted_at IS NULL{status_clause}{type_clause} \
+           AND ({predicate_or}) \
+         ORDER BY a.slug LIMIT ?{limit_param}",
+        predicate_or = predicates.join(" OR ")
+    );
+
+    let exact_rows = match reader
+        .query_all(SqlStatement {
+            sql: exact_sql,
+            params: exact_params,
+            label: None,
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) if is_timeout(&e) => {
+            return Ok(FtsFetchOutcome {
+                atoms: Vec::new(),
+                state: LexicalCandidateState::TimedOut,
+            });
+        }
+        Err(e) => return Err(sql_err("search exact-match candidates", e)),
+    };
+
+    let exact_atoms: Vec<Atom> = exact_rows.iter().filter_map(atom_from_row).collect();
+    if exact_atoms.is_empty() {
+        return Ok(FtsFetchOutcome {
+            atoms: Vec::new(),
+            state: LexicalCandidateState::NoMatch,
+        });
+    }
+
     Ok(FtsFetchOutcome {
-        atoms: Vec::new(),
-        state: LexicalCandidateState::NoMatch,
+        atoms: exact_atoms,
+        state: LexicalCandidateState::ExactMatch,
     })
 }
 
@@ -3322,6 +3426,127 @@ mod tests {
         assert_eq!(outcome.state, LexicalCandidateState::Filtered);
     }
 
+    /// A query shorter than the trigram tokenizer's minimum span (schema.sql:
+    /// `tokenize='trigram case_sensitive 0'`) can never MATCH `fts_knowledge`,
+    /// regardless of corpus content — so an atom findable only by exact name
+    /// (e.g. "ML", "RAG") was unreachable once the recency fallback was
+    /// removed. Recovered via the bounded exact-name predicate.
+    #[tokio::test]
+    async fn exact_name_match_recovers_query_below_trigram_minimum() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '93000000-0000-0000-0000-000000000001', 'local', \
+                              'ml-abbrev', 'ML', 'filler content unrelated to the query', \
+                              '[]', NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, NULL \
+                          ), ( \
+                              '93000000-0000-0000-0000-000000000002', 'local', \
+                              'zzz-control', 'Zzz Control', \
+                              'this atom shares nothing with the query', \
+                              '[]', NULL, 1, 'reviewed', NULL, NULL, 2000, 2000, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed ML atom and unrelated control");
+        }
+
+        let outcome = fetch_fts_candidates(&runtime, "local", "ML", None, &[], &[], CANDIDATE_POOL)
+            .await
+            .expect("exact-name recovery must not error");
+
+        assert_eq!(outcome.state, LexicalCandidateState::ExactMatch);
+        let slugs: Vec<&str> = outcome.atoms.iter().map(|a| a.slug.as_str()).collect();
+        assert_eq!(
+            slugs, ["ml-abbrev"],
+            "only the exact-name match returns, never the unrelated control (no recency leakage): {slugs:?}"
+        );
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+        let out = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "ML", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("exact-name search must not error");
+        assert_eq!(out["candidate_provenance"]["lexical"], "exact_match");
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["results"][0]["slug"], "ml-abbrev");
+    }
+
+    /// `fts_knowledge` indexes only `slug`, `name`, `content` (schema.sql) —
+    /// `tags` is never part of the FTS index, so a query matching an atom
+    /// only through its tags was unreachable once the recency fallback was
+    /// removed. Recovered via the bounded exact-tag predicate.
+    #[tokio::test]
+    async fn tag_only_match_recovers_without_recency_fallback() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '93000000-0000-0000-0000-000000000003', 'local', \
+                              'tag-only-hit', 'Something Else Entirely', \
+                              'content with no lexical overlap either', \
+                              '[\"lora\"]', NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, NULL \
+                          ), ( \
+                              '93000000-0000-0000-0000-000000000004', 'local', \
+                              'zzz-control-2', 'Zzz Control Two', \
+                              'unrelated content and unrelated tags', \
+                              '[\"other\"]', NULL, 1, 'reviewed', NULL, NULL, 2000, 2000, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed tag-only atom and unrelated control");
+        }
+
+        let outcome =
+            fetch_fts_candidates(&runtime, "local", "lora", None, &[], &[], CANDIDATE_POOL)
+                .await
+                .expect("tag-only recovery must not error");
+
+        assert_eq!(outcome.state, LexicalCandidateState::ExactMatch);
+        let slugs: Vec<&str> = outcome.atoms.iter().map(|a| a.slug.as_str()).collect();
+        assert_eq!(
+            slugs, ["tag-only-hit"],
+            "only the tag match returns, never the unrelated control (no recency leakage): {slugs:?}"
+        );
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+        let out = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "lora", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("tag-only search must not error");
+        assert_eq!(out["candidate_provenance"]["lexical"], "exact_match");
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["results"][0]["slug"], "tag-only-hit");
+    }
+
     #[tokio::test]
     async fn missing_ann_hydration_is_dropped_and_reported() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -3912,16 +4137,20 @@ mod tests {
             texts: &[String],
             _model: lattice_embed::EmbeddingModel,
         ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
-            // Distinct, non-degenerate unit vectors per text position so
-            // cosine similarity is well-defined and never uniform, the same
-            // shape `ann_degrade_tests::FakeDimService` uses.
+            // One unit basis vector per text position (dominant coordinate
+            // `i % RERANK_TEST_DIM`, everything else zero) so distinct
+            // positions are genuinely distinct directions with a
+            // well-defined, non-uniform cosine similarity between them.
+            // The uniform-scaling `vec![v / norm; DIM]` shape this replaced
+            // collapsed to the same vector for every positive `v` — `norm`
+            // is `v * sqrt(DIM)`, so `v / norm` cancels `v` out entirely.
             Ok(texts
                 .iter()
                 .enumerate()
                 .map(|(i, _)| {
-                    let v = (i + 1) as f32;
-                    let norm = (RERANK_TEST_DIM as f32 * v * v).sqrt();
-                    vec![v / norm; RERANK_TEST_DIM]
+                    let mut v = vec![0.0f32; RERANK_TEST_DIM];
+                    v[i % RERANK_TEST_DIM] = 1.0;
+                    v
                 })
                 .collect())
         }
