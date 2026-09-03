@@ -1515,8 +1515,12 @@ request(ops="comm.unread()")
 Compatibility mark-read surface for one or more inbound messages. It does not retrieve message
 content; use `comm.inbox` or `comm.thread` for that. Outbound messages cannot be marked read. Mark writes
 are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
-remain fatal, but a post-read mark failure returns `read: false` with `mark_error`. Inspect each
-single or bulk result and re-issue failures later.
+remain fatal, but a post-read mark failure returns `status: "failed"`, `read: false`, and
+`mark_error`. A write whose execution seam terminated after being accepted (so it may already
+have applied) instead returns `status: "unknown"`, `read: null`, and `mark_error` — check the
+message's current state through `comm.inbox` before re-issuing; re-issuing is safe, since marking
+a message read is idempotent. Successful items carry `status: "success"`; inspect each result and
+re-issue failures (or unresolved unknowns) later.
 
 | Param | Type            | Required    | Notes                                                                   |
 | ----- | --------------- | ----------- | ----------------------------------------------------------------------- |
@@ -1529,8 +1533,9 @@ request(ops="comm.read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
 ```
 
 Exactly one of `id` or `ids` is required. The bulk response contains ordered
-`results` plus `requested_count`, `unique_count`, `marked_count`, and
-`failed_count`. Bulk updates are not atomic across messages: validation errors
+`results` plus `requested_count`, `unique_count`, `marked_count`, `unknown_count`, and
+`failed_count`, with aggregate `status=success|partial|failed|unknown`. Bulk updates are not atomic
+across messages: validation errors
 reject the call before any write, while later storage errors appear in each
 item's `read` and optional `mark_error`.
 
