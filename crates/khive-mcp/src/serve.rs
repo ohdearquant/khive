@@ -10885,7 +10885,7 @@ backend = "kg-backend"
             assert!(properties.get("delivery").is_none());
         }
 
-        /// Regression (khive #2333 review #3): a definitive SMTP AUTH
+        /// Regression: a definitive SMTP AUTH
         /// rejection is an account-wide condition, not a fact about the
         /// message being sent. `channel_outbox_once` must not route it
         /// through the per-note failure path -- doing so would terminally
