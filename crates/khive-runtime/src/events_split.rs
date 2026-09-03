@@ -1671,8 +1671,7 @@ impl EventStore for ForwardingEventStore {
         Ok(BatchWriteSummary {
             attempted,
             affected: attempted,
-            failed: 0,
-            first_error: String::new(),
+            ..BatchWriteSummary::default()
         })
     }
 

@@ -884,3 +884,13 @@ policy. `writer_task_begin_busy_absorbed` counts the subset of those refusals
 that was followed by another internal attempt; the refusals surfaced to the
 caller are the difference between the two. Both are published as concrete
 `u64` values under `db_diagnostics.writer_contention`.
+
+## Amendment 7 (2026-08-30): Preserve classifiable batch refusal evidence
+
+ADR-005's #2079 amendment adds bounded per-item `errors`, complete
+`error_counts`, and explicit truncation metadata to `BatchWriteSummary` while
+retaining its four legacy fields. The writer task's generic typed reply path
+continues to carry the summary value itself, so these fields cross queue-on
+and queue-off execution unchanged. No writer-task adapter may reconstruct a
+summary from aggregate counters or `first_error`, because doing so would erase
+the store's refusal classification and retryability decision.
