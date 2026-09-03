@@ -43,6 +43,71 @@ struct ScoredHit {
     is_domain: bool,
     status: Option<String>,
     score: f32,
+    provenance: ScoreProvenance,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScoreProvenance {
+    lexical: bool,
+    ann: bool,
+    embedding_rerank: bool,
+}
+
+impl ScoreProvenance {
+    const fn lexical() -> Self {
+        Self {
+            lexical: true,
+            ann: false,
+            embedding_rerank: false,
+        }
+    }
+
+    const fn ann() -> Self {
+        Self {
+            lexical: false,
+            ann: true,
+            embedding_rerank: false,
+        }
+    }
+
+    fn merge_sources(&mut self, other: Self) {
+        self.lexical |= other.lexical;
+        self.ann |= other.ann;
+        self.embedding_rerank |= other.embedding_rerank;
+    }
+
+    fn sources(self) -> Vec<&'static str> {
+        let mut sources = Vec::with_capacity(2);
+        if self.lexical {
+            sources.push("lexical");
+        }
+        if self.ann {
+            sources.push("ann");
+        }
+        sources
+    }
+
+    fn to_json(self) -> Value {
+        json!({
+            "sources": self.sources(),
+            "embedding_rerank": self.embedding_rerank,
+            "normalization": "s_over_s_plus_1",
+            "calibrated": false,
+        })
+    }
+}
+
+/// `ann` only when the returned set carries ANN evidence and no returned hit
+/// carries lexical evidence — i.e. the response is entirely ANN-sourced, not
+/// merely ANN-assisted.
+fn candidate_fallback(hits: &[ScoredHit]) -> &'static str {
+    let has_lexical = hits.iter().any(|hit| hit.provenance.lexical);
+    let has_ann = hits.iter().any(|hit| hit.provenance.ann);
+    if has_ann && !has_lexical {
+        "ann"
+    } else {
+        "none"
+    }
 }
 
 enum AnnAvailability {
@@ -188,7 +253,14 @@ fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[ScoredHit], min_scor
         .map(|hit| (hit.id.clone(), DeterministicScore::from_f32(hit.score)))
         .collect();
     for hit in ann_hits {
-        by_id.entry(hit.id.clone()).or_insert_with(|| hit.clone());
+        match by_id.entry(hit.id.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().provenance.merge_sources(hit.provenance);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(hit.clone());
+            }
+        }
     }
 
     let source_count = usize::from(!fts_source.is_empty()) + usize::from(!ann_source.is_empty());
@@ -255,7 +327,7 @@ fn deprecated_allowed_by_status_policy(statuses: &[String], exclude_statuses: &[
 
 /// Remove hits that do not match `type_filter` after hydration.
 ///
-/// Mirrors the FTS/SQL path in `fetch_fts_candidates` (the full-scan fallback):
+/// Mirrors the FTS/SQL path in `fetch_fts_candidates`:
 ///
 /// - `Some("domain")` keeps only domain hits (`hit.is_domain == true`).
 /// - `Some(other)` where other is non-empty keeps only non-domain hits.
@@ -357,7 +429,7 @@ fn fts5_candidate_expression(raw_query: &str) -> String {
 /// SQL eligibility predicate for the public atom/domain kind filter.
 ///
 /// Domain mirrors are atoms carrying the exact `type:domain` tag. Applying
-/// this predicate in the FTS/full-scan query is load-bearing: filtering after
+/// this predicate in the bounded FTS query is load-bearing: filtering after
 /// `LIMIT` lets the wrong kind consume every candidate slot.
 fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
     match type_filter {
@@ -380,13 +452,62 @@ const FTS_TERM_LIMIT: usize = 500;
 
 /// Outcome of the bounded lexical candidate fetch.
 ///
-/// `timed_out` is set only for [`khive_storage::StorageError::Timeout`] — the
-/// request-scoped read deadline elapsing mid-fetch. Any other storage error
-/// (including a genuine FTS5 syntax/parser error) still surfaces as an `Err`;
-/// fail-open applies to a timeout only.
+/// `state` distinguishes a real lexical miss from a match removed by public
+/// eligibility and from the fail-open timeout outcome. Any non-timeout
+/// storage error (including a genuine FTS5 syntax/parser error) still
+/// surfaces as an `Err`.
 struct FtsFetchOutcome {
     atoms: Vec<Atom>,
-    timed_out: bool,
+    state: LexicalCandidateState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LexicalCandidateState {
+    Matched,
+    NoMatch,
+    Filtered,
+    PartialTimeout,
+    TimedOut,
+}
+
+impl LexicalCandidateState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::NoMatch => "no_match",
+            Self::Filtered => "filtered",
+            Self::PartialTimeout => "partial_timeout",
+            Self::TimedOut => "timed_out",
+        }
+    }
+
+    const fn timed_out(self) -> bool {
+        matches!(self, Self::PartialTimeout | Self::TimedOut)
+    }
+
+    fn merge(states: &[Self]) -> Self {
+        if states.contains(&Self::PartialTimeout) {
+            return Self::PartialTimeout;
+        }
+
+        let timeout_count = states
+            .iter()
+            .filter(|state| **state == Self::TimedOut)
+            .count();
+        if timeout_count == states.len() {
+            return Self::TimedOut;
+        }
+        if timeout_count > 0 {
+            return Self::PartialTimeout;
+        }
+        if states.contains(&Self::Matched) {
+            return Self::Matched;
+        }
+        if states.contains(&Self::Filtered) {
+            return Self::Filtered;
+        }
+        Self::NoMatch
+    }
 }
 
 #[cfg(test)]
@@ -450,7 +571,7 @@ async fn fetch_fts_candidates(
         Err(e) if is_timeout(&e) => {
             return Ok(FtsFetchOutcome {
                 atoms: Vec::new(),
-                timed_out: true,
+                state: LexicalCandidateState::TimedOut,
             });
         }
         Err(e) => return Err(sql_err("search fts reader", e)),
@@ -535,25 +656,29 @@ async fn fetch_fts_candidates(
     }
 
     if term_query_timed_out {
+        let state = if combined.is_empty() {
+            LexicalCandidateState::TimedOut
+        } else {
+            LexicalCandidateState::PartialTimeout
+        };
         return Ok(FtsFetchOutcome {
             atoms: combined,
-            timed_out: true,
+            state,
         });
     }
 
     if !combined.is_empty() {
         return Ok(FtsFetchOutcome {
             atoms: combined,
-            timed_out: false,
+            state: LexicalCandidateState::Matched,
         });
     }
 
-    // No term produced an eligible row. Preserve the fallback's established
-    // meaning: it is for a lexical miss, not for a lexical match whose rows
-    // were all ineligible. In the latter case an empty result is correct; a
-    // full scan could otherwise admit unrelated zero-score rows when
-    // min_score is the default 0. This probe has no ORDER BY and LIMIT 1, so
-    // it stays cheap even over the OR-joined expression.
+    // No term produced an eligible row. Distinguish a true lexical miss from
+    // a lexical match whose rows were all ineligible. In either case an empty
+    // lexical result is correct; the distinction is response provenance.
+    // This probe has no ORDER BY and LIMIT 1, so it stays cheap even over the
+    // OR-joined expression.
     let match_expr = fts5_candidate_expression(raw_query);
     let raw_fts_match = match reader
         .query_row(SqlStatement {
@@ -569,7 +694,7 @@ async fn fetch_fts_candidates(
         Err(e) if is_timeout(&e) => {
             return Ok(FtsFetchOutcome {
                 atoms: Vec::new(),
-                timed_out: true,
+                state: LexicalCandidateState::TimedOut,
             });
         }
         Err(e) => return Err(sql_err("search fts eligibility probe", e)),
@@ -577,46 +702,16 @@ async fn fetch_fts_candidates(
     if raw_fts_match.is_some() {
         return Ok(FtsFetchOutcome {
             atoms: Vec::new(),
-            timed_out: false,
+            state: LexicalCandidateState::Filtered,
         });
     }
 
-    // FTS returned nothing — fall back to a bounded full scan. Eligibility
-    // remains inside SQL so the cap is filled from rows the caller can
-    // actually receive.
-    let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 3);
-    let sql_str = format!(
-        "SELECT a.* FROM knowledge_atoms AS a \
-         WHERE a.namespace = ?1 AND a.deleted_at IS NULL{status_clause}{type_clause} \
-         ORDER BY a.created_at DESC, a.slug LIMIT ?2"
-    );
-    let mut params = vec![
-        SqlValue::Text(ns.to_owned()),
-        SqlValue::Integer(fetch_limit as i64),
-    ];
-    params.extend(status_params);
-
-    let rows = match reader
-        .query_all(SqlStatement {
-            sql: sql_str,
-            params,
-            label: None,
-        })
-        .await
-    {
-        Ok(rows) => rows,
-        Err(e) if is_timeout(&e) => {
-            return Ok(FtsFetchOutcome {
-                atoms: Vec::new(),
-                timed_out: true,
-            });
-        }
-        Err(e) => return Err(sql_err("search full scan", e)),
-    };
-
+    // A genuine FTS miss is an empty lexical candidate set. Corpus recency is
+    // not query evidence; feeding newest rows into rank fusion creates an
+    // artificial lexical source and can make off-topic results look topical.
     Ok(FtsFetchOutcome {
-        atoms: rows.iter().filter_map(atom_from_row).collect(),
-        timed_out: false,
+        atoms: Vec::new(),
+        state: LexicalCandidateState::NoMatch,
     })
 }
 
@@ -636,13 +731,12 @@ struct SearchCtx<'a> {
 
 // ─── core single-pass search ──────────────────────────────────────────────────
 
-/// `search_core`'s result plus whether the lexical/FTS candidate fetch hit the
-/// request read deadline (issue #1930's fail-open signal). A caller sees
-/// `hits` possibly empty/partial and `lexical_timed_out = true` instead of an
-/// `Err` — never a verb-level error for a genuine timeout.
+/// `search_core`'s result plus the lexical/FTS candidate-stage outcome. A
+/// caller sees `hits` possibly empty/partial and an explicit timeout state
+/// instead of an `Err` for a genuine request read-deadline expiry.
 struct SearchCoreOutcome {
     hits: Vec<ScoredHit>,
-    lexical_timed_out: bool,
+    lexical_state: LexicalCandidateState,
 }
 
 async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutcome, RuntimeError> {
@@ -657,7 +751,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     if raw_query.is_empty() {
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
-            lexical_timed_out: false,
+            lexical_state: LexicalCandidateState::NoMatch,
         });
     }
 
@@ -688,7 +782,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     // fall through to exact-name-bonus-only scoring rather than returning early.
     let terms_only_exact = terms.is_empty();
 
-    let FtsFetchOutcome { atoms, timed_out } = fetch_fts_candidates(
+    let FtsFetchOutcome { atoms, state } = fetch_fts_candidates(
         runtime,
         ns,
         &raw_query,
@@ -701,7 +795,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     if atoms.is_empty() {
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
-            lexical_timed_out: timed_out,
+            lexical_state: state,
         });
     }
 
@@ -709,7 +803,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     if candidates.is_empty() {
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
-            lexical_timed_out: timed_out,
+            lexical_state: state,
         });
     }
 
@@ -758,9 +852,10 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
                 finalized: cand.finalized,
                 is_domain: cand.is_domain,
                 score,
+                provenance: ScoreProvenance::lexical(),
             })
             .collect(),
-        lexical_timed_out: timed_out,
+        lexical_state: state,
     })
 }
 
@@ -783,7 +878,7 @@ async fn search_decomposed(
 
     let SearchCoreOutcome {
         hits: full,
-        lexical_timed_out: full_timed_out,
+        lexical_state: full_state,
     } = search_core(ctx, query).await?;
     let sub_ctx1 = SearchCtx {
         runtime: ctx.runtime,
@@ -798,13 +893,13 @@ async fn search_decomposed(
     };
     let SearchCoreOutcome {
         hits: s1,
-        lexical_timed_out: s1_timed_out,
+        lexical_state: s1_state,
     } = search_core(&sub_ctx1, &sub_q1).await?;
     let SearchCoreOutcome {
         hits: s2,
-        lexical_timed_out: s2_timed_out,
+        lexical_state: s2_state,
     } = search_core(&sub_ctx1, &sub_q2).await?;
-    let lexical_timed_out = full_timed_out || s1_timed_out || s2_timed_out;
+    let lexical_state = LexicalCandidateState::merge(&[full_state, s1_state, s2_state]);
 
     let mut scores: HashMap<String, f32> = HashMap::new();
     let mut data: HashMap<String, ScoredHit> = HashMap::new();
@@ -855,7 +950,7 @@ async fn search_decomposed(
     ranked.truncate(ctx.fetch_limit);
     Ok(SearchCoreOutcome {
         hits: ranked,
-        lexical_timed_out,
+        lexical_state,
     })
 }
 
@@ -915,6 +1010,7 @@ async fn rerank_with_embeddings(
         for (hit, cos) in hits.iter_mut().zip(cosines.iter()) {
             let norm_tfidf = hit.score / max_tfidf;
             hit.score = alpha * norm_tfidf + (1.0 - alpha) * cos.max(0.0);
+            hit.provenance.embedding_rerank = true;
         }
         hits.sort_by(|a, b| {
             b.score
@@ -1227,6 +1323,7 @@ async fn search_eligible_ann_with_refill(
                 is_domain: false,
                 status: None,
                 score,
+                provenance: ScoreProvenance::ann(),
             })
             .collect();
 
@@ -1985,12 +2082,13 @@ impl KnowledgeHandlers {
 
         let SearchCoreOutcome {
             mut hits,
-            lexical_timed_out,
+            lexical_state,
         } = if do_decompose && non_stop_count >= decompose_threshold {
             search_decomposed(&ctx, &raw_query, intersection_bonus).await?
         } else {
             search_core(&ctx, &raw_query).await?
         };
+        let lexical_timed_out = lexical_state.timed_out();
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -2023,6 +2121,7 @@ impl KnowledgeHandlers {
         apply_status_multipliers(&mut hits, allow_deprecated);
         enforce_min_score_floor(&mut hits, min_score);
         hits.truncate(limit);
+        let fallback = candidate_fallback(&hits);
 
         let atom_ids: Vec<String> = hits
             .iter()
@@ -2063,12 +2162,20 @@ impl KnowledgeHandlers {
                     "finalized": h.finalized,
                     "kind": if h.is_domain { "domain" } else { "atom" },
                     "score": h.score,
+                    "score_provenance": h.provenance.to_json(),
                 })
             })
             .collect();
         let count = results.len();
 
-        let mut out = json!({ "results": results, "total": count });
+        let mut out = json!({
+            "results": results,
+            "total": count,
+            "candidate_provenance": {
+                "lexical": lexical_state.as_str(),
+                "fallback": fallback,
+            },
+        });
         if ann_unavailable {
             out["ann_unavailable"] = json!(true);
         }
@@ -2180,8 +2287,9 @@ impl KnowledgeHandlers {
 
         let SearchCoreOutcome {
             mut hits,
-            lexical_timed_out,
+            lexical_state,
         } = search_core(&ctx, &raw_query).await?;
+        let lexical_timed_out = lexical_state.timed_out();
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -2943,10 +3051,7 @@ mod tests {
             "the per-term fetch must return partial degradation when the controlled deadline \
              expires between term queries",
         );
-        assert!(
-            outcome.timed_out,
-            "the controlled deadline must be observed"
-        );
+        assert_eq!(outcome.state, LexicalCandidateState::PartialTimeout);
         assert!(
             !outcome.atoms.is_empty(),
             "candidates from the completed term must survive degradation"
@@ -3069,7 +3174,7 @@ mod tests {
             fetch_fts_candidates(&runtime, "local", "alpha beta", None, &[], &[], fetch_limit)
                 .await
                 .expect("fetch must not error");
-        assert!(!outcome.timed_out);
+        assert_eq!(outcome.state, LexicalCandidateState::Matched);
         assert_eq!(outcome.atoms.len(), fetch_limit);
 
         let beta_present = outcome
@@ -3089,6 +3194,134 @@ mod tests {
         );
     }
 
+    /// Issue #1982: a genuine FTS miss is not a request to browse the newest
+    /// corpus rows. The former bounded full-scan fallback returned this atom
+    /// despite there being no lexical overlap, and rank fusion could then
+    /// turn that arbitrary recency order into a topical-looking score.
+    #[tokio::test]
+    async fn true_lexical_miss_does_not_return_newest_rows() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '92000000-0000-0000-0000-000000000001', 'local', \
+                              'newest-unrelated', 'Newest Unrelated', \
+                              'content about retrieval systems and vector indexes', '[]', NULL, \
+                              1, 'reviewed', NULL, NULL, 999, 999, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed unrelated atom");
+        }
+
+        let outcome = fetch_fts_candidates(
+            &runtime,
+            "local",
+            "zzzxqvnonexistent",
+            None,
+            &[],
+            &[],
+            CANDIDATE_POOL,
+        )
+        .await
+        .expect("lexical miss must not error");
+
+        assert_eq!(outcome.state, LexicalCandidateState::NoMatch);
+        assert!(
+            outcome.atoms.is_empty(),
+            "a true lexical miss must stay empty, not return newest rows: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|atom| atom.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+        let off_topic = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "zzzxqvnonexistent", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("off-topic search must not error");
+        assert_eq!(off_topic["total"], 0);
+        assert_eq!(off_topic["candidate_provenance"]["lexical"], "no_match");
+        assert_eq!(off_topic["candidate_provenance"]["fallback"], "none");
+
+        let lexical = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "retrieval", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("lexical search must not error");
+        assert_eq!(lexical["candidate_provenance"]["lexical"], "matched");
+        assert_eq!(lexical["candidate_provenance"]["fallback"], "none");
+        let first = &lexical["results"][0];
+        assert_eq!(first["slug"], "newest-unrelated");
+        assert_eq!(first["score_provenance"]["sources"], json!(["lexical"]));
+        assert_eq!(first["score_provenance"]["embedding_rerank"], false);
+        assert_eq!(
+            first["score_provenance"]["normalization"],
+            "s_over_s_plus_1"
+        );
+        assert_eq!(first["score_provenance"]["calibrated"], false);
+    }
+
+    #[tokio::test]
+    async fn lexical_candidate_state_distinguishes_filtered_match() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '92000000-0000-0000-0000-000000000002', 'local', \
+                              'filtered-draft', 'Filtered Draft', \
+                              'uniquefilteredtoken content', '[]', NULL, 0, 'draft', \
+                              NULL, NULL, 1, 1, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed filtered atom");
+        }
+
+        let outcome = fetch_fts_candidates(
+            &runtime,
+            "local",
+            "uniquefilteredtoken",
+            None,
+            &[],
+            &["draft", "deprecated"],
+            CANDIDATE_POOL,
+        )
+        .await
+        .expect("filtered lexical match must not error");
+
+        assert!(outcome.atoms.is_empty());
+        assert_eq!(outcome.state, LexicalCandidateState::Filtered);
+    }
+
     #[tokio::test]
     async fn missing_ann_hydration_is_dropped_and_reported() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -3102,6 +3335,7 @@ mod tests {
             is_domain: false,
             status: None,
             score: 0.8,
+            provenance: ScoreProvenance::ann(),
         }];
 
         let failures = hydrate_empty_hits(&runtime, "local", &mut hits).await;
@@ -3179,6 +3413,7 @@ mod tests {
                 is_domain: false,
                 status: None,
                 score: 1.0,
+                provenance: ScoreProvenance::ann(),
             })
             .collect();
 
@@ -3314,6 +3549,7 @@ mod tests {
             is_domain: false,
             status: None,
             score: 1.0,
+            provenance: ScoreProvenance::ann(),
         })
         .collect();
 
@@ -3383,7 +3619,47 @@ mod tests {
             is_domain: false,
             status: status.map(str::to_string),
             score,
+            provenance: ScoreProvenance::lexical(),
         }
+    }
+
+    fn make_ann_hit(id: &str, status: Option<&str>, score: f32) -> ScoredHit {
+        let mut hit = make_hit(id, status, score);
+        hit.provenance = ScoreProvenance::ann();
+        hit
+    }
+
+    #[test]
+    fn rrf_fusion_preserves_per_hit_score_sources_and_ann_fallback() {
+        let mut hybrid = vec![make_hit("shared", Some("reviewed"), 0.8)];
+        let ann = vec![make_ann_hit("shared", Some("reviewed"), 0.9)];
+        fuse_ann_hits(&mut hybrid, &ann, 0.0);
+        assert_eq!(hybrid.len(), 1);
+        assert_eq!(hybrid[0].provenance.sources(), ["lexical", "ann"]);
+        assert_eq!(candidate_fallback(&hybrid), "none");
+
+        let mut ann_only = Vec::new();
+        fuse_ann_hits(
+            &mut ann_only,
+            &[make_ann_hit("semantic", Some("reviewed"), 0.9)],
+            0.0,
+        );
+        assert_eq!(ann_only.len(), 1);
+        assert_eq!(ann_only[0].provenance.sources(), ["ann"]);
+        assert_eq!(candidate_fallback(&ann_only), "ann");
+        assert_eq!(
+            ann_only[0].provenance.to_json(),
+            json!({
+                "sources": ["ann"],
+                "embedding_rerank": false,
+                "normalization": "s_over_s_plus_1",
+                "calibrated": false,
+            })
+        );
+
+        let lexical_only = vec![make_hit("lexical", Some("reviewed"), 0.7)];
+        assert_eq!(lexical_only[0].provenance.sources(), ["lexical"]);
+        assert_eq!(candidate_fallback(&lexical_only), "none");
     }
 
     #[test]
@@ -3619,6 +3895,133 @@ mod tests {
             healthy.and_then(|counts| counts.get(&atom_ids[0]).copied()),
             Some(0),
             "control: without a deadline the lookup returns real counts"
+        );
+    }
+
+    // ── deterministic embedder for the rerank-provenance test ────────────
+
+    const RERANK_TEST_MODEL_KEY: &str = "all-minilm-l6-v2";
+    const RERANK_TEST_DIM: usize = 384;
+
+    struct RerankTestEmbedService;
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for RerankTestEmbedService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            // Distinct, non-degenerate unit vectors per text position so
+            // cosine similarity is well-defined and never uniform, the same
+            // shape `ann_degrade_tests::FakeDimService` uses.
+            Ok(texts
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let v = (i + 1) as f32;
+                    let norm = (RERANK_TEST_DIM as f32 * v * v).sqrt();
+                    vec![v / norm; RERANK_TEST_DIM]
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "rerank-test-embed"
+        }
+    }
+
+    struct RerankTestEmbedProvider;
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for RerankTestEmbedProvider {
+        fn name(&self) -> &str {
+            RERANK_TEST_MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            RERANK_TEST_DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(std::sync::Arc::new(RerankTestEmbedService))
+        }
+    }
+
+    fn runtime_with_deterministic_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
+            db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime with embedder config");
+        rt.register_embedder(RerankTestEmbedProvider);
+        rt
+    }
+
+    /// Existing coverage only asserts `score_provenance.embedding_rerank ==
+    /// false` (no embedder configured); the mutation at
+    /// `rerank_with_embeddings` that sets it `true` on a successful rerank
+    /// had no test that would fail if it were deleted. This pins the `true`
+    /// case under a deterministic embedder.
+    #[tokio::test]
+    async fn embedding_rerank_provenance_is_true_when_rerank_runs() {
+        let runtime = runtime_with_deterministic_embedder();
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '94000000-0000-0000-0000-000000000001', 'local', \
+                              'rerank-target', 'Rerank Target', \
+                              'content that the lexical stage must match for the rerank pass', \
+                              '[]', NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed rerank target atom");
+        }
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+        let out = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "rerank target content", "rerank": true}),
+            &ann,
+        )
+        .await
+        .expect("rerank-enabled search must not error");
+
+        assert_eq!(out["total"], 1);
+        assert_eq!(
+            out["results"][0]["score_provenance"]["embedding_rerank"], true,
+            "a successful embedding rerank must record embedding_rerank: true; got {out:?}"
         );
     }
 }

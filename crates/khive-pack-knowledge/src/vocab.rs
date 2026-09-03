@@ -255,7 +255,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.search",
-        description: "TF-IDF ranked search over the atom teaching corpus ONLY — knowledge graph entities and notes are a disjoint corpus and are never returned here; use the kg pack's `search` verb for those. Embedding rerank applies by default when an embedder is configured. Draft and deprecated atoms are excluded by default; pass include_drafts=true to include drafts (deprecated remain excluded). Scores are squash-normalized to [0,1); absolute score is not a presence signal — use result rank for presence/coverage checks. Atom results include `body_lines`, the aggregate line count of their stored sections (str::lines() semantics: a terminal newline adds no line, blank interior lines count; 0 for a sectionless atom); domain results and deadline-degraded rows report null, the latter alongside a `degraded` flag.",
+        description: "TF-IDF ranked search over the atom teaching corpus ONLY — knowledge graph entities and notes are a disjoint corpus and are never returned here; use the kg pack's `search` verb for those. Embedding rerank applies by default when an embedder is configured. A genuine FTS miss returns no lexical candidates instead of scanning newest corpus rows; a healthy ANN leg may still return explicitly labeled ANN-only results. Draft and deprecated atoms are excluded by default; pass include_drafts=true to include drafts (deprecated remain excluded). The top-level `candidate_provenance` reports lexical state (`matched`, `no_match`, `filtered`, `partial_timeout`, or `timed_out`) and whether the returned set is an ANN fallback. Every result carries `score_provenance` with lexical/ANN sources, embedding-rerank use, `s_over_s_plus_1` normalization, and `calibrated:false`. Scores are request-relative and squash-normalized to [0,1); absolute score is not a presence signal — use result rank together with provenance for presence/coverage checks. Atom results include `body_lines`, the aggregate line count of their stored sections (str::lines() semantics: a terminal newline adds no line, blank interior lines count; 0 for a sectionless atom); domain results and deadline-degraded rows report null, the latter alongside a `degraded` flag.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -312,7 +312,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum score threshold (default 0.0). Scores are squash-normalized to [0,1); absolute score is not a presence signal — use result rank for presence/coverage checks.",
+                description: "Minimum final-score threshold (default 0.0). Scores are request-relative and squash-normalized to [0,1), not calibrated presence signals; use rank together with candidate_provenance and score_provenance.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
