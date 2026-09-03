@@ -1782,7 +1782,7 @@ Cursor traversal is live, not a snapshot. Inserts behind an issued boundary
 belong to a fresh walk; inserts ahead may extend the current walk. Existing
 rows are not shifted, skipped, or duplicated. Responses include machine-readable
 `order` and, in cursor mode, `next_after`. Stop when `next_after` is null;
-`total` is recomputed per request and is not a completion signal.
+cursor pages carry no `total` (counting is a full scan per page), offset pages do.
 
 ### `knowledge.delete_atoms` — Commissive
 

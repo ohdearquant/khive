@@ -123,8 +123,8 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                               issued boundary belong to a fresh walk; inserts ahead may extend the \
                               current walk. Reuse the same type/status/fields filters. Soft-deleting \
                               a boundary does not invalidate it; missing, wrong-type, or out-of-namespace \
-                              cursors fail. Stop when next_after is null; total is recomputed per \
-                              request and is not a cursor-completion signal. Mutually exclusive with offset.",
+                              cursors fail. Stop when next_after is null; cursor pages carry no total \
+                              (counting is a full scan per page). Mutually exclusive with offset.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

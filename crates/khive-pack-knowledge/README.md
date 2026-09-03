@@ -87,7 +87,8 @@ not hydrated. Cursor pages use `created_at ASC, id ASC`; legacy offset pages
 retain `created_at DESC, id DESC`. The cursor is a live traversal: inserts
 behind an issued boundary wait for a fresh walk, while inserts ahead may extend
 the current walk without shifting or duplicating pre-existing rows. Stop when
-`next_after` is null; the per-request `total` can change during the walk.
+`next_after` is null; cursor pages carry no `total`, because counting the
+namespace is a full scan per page.
 
 ## Where this sits
 

@@ -236,7 +236,7 @@ list(
   offset?: 0,
   after?: <full-uuid|"">,
   fields?: [<field>, ...]
-) → {results: [...], total: N, limit, offset?, order, next_after?}
+) → {results: [...], limit, order, total?, offset?, next_after?}
 ```
 
 Default type is `atom`. Limit is capped at 500. Legacy offset pages have a
@@ -251,8 +251,9 @@ boundary may extend the current walk. Existing rows are not shifted, skipped,
 or duplicated by those inserts. A cursor remains usable if its row is
 soft-deleted, but a missing, wrong-type, or out-of-namespace cursor fails.
 Callers must retain the same type and status filters for the whole walk.
-The walk is complete when `next_after` is null. `total` is recomputed for each
-request and can change during a live walk, so it is not a completion signal.
+The walk is complete when `next_after` is null. Cursor pages carry no `total`:
+counting the namespace is a full scan per page and cannot signal completion.
+Offset pages keep `total`.
 
 `fields` is a strict, non-empty response projection. Atom fields are `id`,
 `namespace`, `slug`, `name`, `content`, `tags`, `properties`, `status`,

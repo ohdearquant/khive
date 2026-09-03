@@ -1844,6 +1844,10 @@ async fn list_fields_projects_atom_and_domain_keys_only() {
         assert_eq!(response["order"], "created_at_asc_id_asc");
         assert!(response["next_after"].is_null());
         assert!(
+            response.get("total").is_none(),
+            "a cursor page never counts the namespace"
+        );
+        assert!(
             serde_json::to_vec(&response)
                 .expect("serialize response")
                 .len()
@@ -2017,6 +2021,7 @@ async fn list_cursor_walk_has_no_gaps_or_duplicates_during_concurrent_inserts() 
             .await
             .expect("next cursor page");
         assert_eq!(page["order"], "created_at_asc_id_asc");
+        assert!(page.get("total").is_none());
         for row in page["results"].as_array().expect("page results") {
             assert_eq!(row.as_object().expect("projected row").len(), 2);
             seen.push(row["id"].as_str().expect("id").to_string());

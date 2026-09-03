@@ -930,19 +930,6 @@ impl KnowledgeHandlers {
                     .await
                     .map_err(|e| sql_err("list domains", e))?;
 
-                let total_row = reader
-                    .query_scalar(SqlStatement {
-                        sql: "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL".into(),
-                        params: vec![SqlValue::Text(ns)],
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("list domains count", e))?;
-                let total = match total_row {
-                    Some(SqlValue::Integer(n)) => n,
-                    _ => 0,
-                };
-
                 let has_more = cursor_mode && rows.len() > limit_usize;
                 if has_more {
                     rows.truncate(limit_usize);
@@ -955,15 +942,28 @@ impl KnowledgeHandlers {
                     .filter_map(|row| project_list_row(row, kind, p.fields.as_deref()))
                     .collect();
 
+                // A cursor page carries no total: counting the namespace is a
+                // full scan per page, and next_after is the completion signal.
                 if cursor_mode {
                     Ok(json!({
                         "results": items,
-                        "total": total,
                         "limit": limit,
                         "order": LIST_CURSOR_ORDER,
                         "next_after": next_after,
                     }))
                 } else {
+                    let total_row = reader
+                        .query_scalar(SqlStatement {
+                            sql: "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL".into(),
+                            params: vec![SqlValue::Text(ns)],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| sql_err("list domains count", e))?;
+                    let total = match total_row {
+                        Some(SqlValue::Integer(n)) => n,
+                        _ => 0,
+                    };
                     Ok(json!({
                         "results": items,
                         "total": total,
@@ -1061,21 +1061,6 @@ impl KnowledgeHandlers {
                     .await
                     .map_err(|e| sql_err("list atoms", e))?;
 
-                let mut count_params = vec![SqlValue::Text(ns)];
-                count_params.extend(count_status_params);
-                let total_row = reader
-                    .query_scalar(SqlStatement {
-                        sql: count_sql,
-                        params: count_params,
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("list atoms count", e))?;
-                let total = match total_row {
-                    Some(SqlValue::Integer(n)) => n,
-                    _ => 0,
-                };
-
                 let has_more = cursor_mode && rows.len() > limit_usize;
                 if has_more {
                     rows.truncate(limit_usize);
@@ -1088,15 +1073,30 @@ impl KnowledgeHandlers {
                     .filter_map(|row| project_list_row(row, kind, p.fields.as_deref()))
                     .collect();
 
+                // A cursor page carries no total: counting the namespace is a
+                // full scan per page, and next_after is the completion signal.
                 if cursor_mode {
                     Ok(json!({
                         "results": items,
-                        "total": total,
                         "limit": limit,
                         "order": LIST_CURSOR_ORDER,
                         "next_after": next_after,
                     }))
                 } else {
+                    let mut count_params = vec![SqlValue::Text(ns)];
+                    count_params.extend(count_status_params);
+                    let total_row = reader
+                        .query_scalar(SqlStatement {
+                            sql: count_sql,
+                            params: count_params,
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| sql_err("list atoms count", e))?;
+                    let total = match total_row {
+                        Some(SqlValue::Integer(n)) => n,
+                        _ => 0,
+                    };
                     Ok(json!({
                         "results": items,
                         "total": total,
