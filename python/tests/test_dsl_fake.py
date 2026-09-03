@@ -2,7 +2,7 @@
 
 `_dsl_fake.parse_dsl` exists only so the offline test servers reject what the
 real cloud grammar rejects instead of silently accepting whatever a
-submitted renderer sends; these tests pin the arms most likely to drift back
+renderer under test sends; these tests pin the arms most likely to drift back
 to permissive.
 """
 
