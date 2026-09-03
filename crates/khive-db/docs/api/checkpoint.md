@@ -113,6 +113,10 @@ off the checkpoint task's Tokio worker thread (`tokio::task::spawn_blocking`),
 so a large merge cannot stall the async runtime while it runs — only the
 SQLite-level write lock is shared with application writers, not the async
 executor.
+The checkpoint task itself awaits that step before it can observe its next
+tick, so WAL ticks falling inside one step's execution are skipped rather than
+queued (the interval uses `MissedTickBehavior::Skip`); the page budget bounds
+that pause.
 
 Operator overrides are `KHIVE_FTS_MERGE_ENABLED`,
 `KHIVE_FTS_MERGE_INTERVAL_SECS`, `KHIVE_FTS_MERGE_PAGES`, and
