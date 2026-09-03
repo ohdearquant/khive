@@ -989,14 +989,25 @@ async fn mark_read_targets_best_effort(
         let original_properties = note.properties.clone();
         match mark_read_target(runtime, token, id, note).await {
             Ok(result) => results.push(result),
-            Err(error) => results.push(json!({
-                "id": short_id(id),
-                "full_id": id.as_hyphenated().to_string(),
-                "status": "failed",
-                "read": false,
-                "mark_error": error.to_string(),
-                "properties": original_properties,
-            })),
+            Err(error) => {
+                let (status, read) = match &error {
+                    RuntimeError::Storage(storage_error) => {
+                        match classify_mark_read_error(storage_error) {
+                            MarkReadFailure::Unknown => ("unknown", Value::Null),
+                            MarkReadFailure::Failed => ("failed", json!(false)),
+                        }
+                    }
+                    _ => ("failed", json!(false)),
+                };
+                results.push(json!({
+                    "id": short_id(id),
+                    "full_id": id.as_hyphenated().to_string(),
+                    "status": status,
+                    "read": read,
+                    "mark_error": error.to_string(),
+                    "properties": original_properties,
+                }));
+            }
         }
     }
     Ok(bulk_read_response(requested_count, results))
@@ -1049,12 +1060,18 @@ fn bulk_read_response(requested_count: usize, results: Vec<Value>) -> Value {
         .iter()
         .filter(|result| result["read"].as_bool() == Some(true))
         .count();
+    let unknown_count = results
+        .iter()
+        .filter(|result| result["status"].as_str() == Some("unknown"))
+        .count();
     let unique_count = results.len();
-    let failed_count = unique_count - marked_count;
-    let status = if failed_count == 0 {
+    let failed_count = unique_count - marked_count - unknown_count;
+    let status = if failed_count == 0 && unknown_count == 0 {
         "success"
-    } else if marked_count == 0 {
+    } else if marked_count == 0 && unknown_count == 0 {
         "failed"
+    } else if marked_count == 0 && failed_count == 0 {
+        "unknown"
     } else {
         "partial"
     };
@@ -1064,6 +1081,7 @@ fn bulk_read_response(requested_count: usize, results: Vec<Value>) -> Value {
         "requested_count": requested_count,
         "unique_count": unique_count,
         "marked_count": marked_count,
+        "unknown_count": unknown_count,
         "failed_count": failed_count,
     })
 }
@@ -1165,6 +1183,28 @@ fn read_recheck_filter(caller_actor: &str) -> NoteFilter {
             },
         ],
         ..Default::default()
+    }
+}
+
+/// Whether a mark-read write error means the patch definitely did not apply,
+/// or whether the writer seam terminated after accepting the request with no
+/// way to tell whether it landed.
+enum MarkReadFailure {
+    Failed,
+    Unknown,
+}
+
+/// Classify a mark-read storage error by its real variant, never by its
+/// display text. `SideEffectsUnknown` means the write was accepted before its
+/// execution seam terminated — the patch may already be committed, so it must
+/// not be reported as a definite failure. Same match shape as
+/// `message::attach_outbound_id_to_ambiguous_write`'s dual-write classifier.
+fn classify_mark_read_error(error: &khive_storage::StorageError) -> MarkReadFailure {
+    match error {
+        khive_storage::StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        } => MarkReadFailure::Unknown,
+        _ => MarkReadFailure::Failed,
     }
 }
 
@@ -1279,16 +1319,26 @@ fn read_response(
                 id = %full,
                 error = %e,
                 "comm mark-read: update failed under writer contention; \
-                 degrading to read:false (best-effort)"
+                 degrading (best-effort)"
             );
-            json!({
-                "id": short,
-                "full_id": full,
-                "status": "failed",
-                "read": false,
-                "mark_error": e.to_string(),
-                "properties": original_properties,
-            })
+            match classify_mark_read_error(&e) {
+                MarkReadFailure::Unknown => json!({
+                    "id": short,
+                    "full_id": full,
+                    "status": "unknown",
+                    "read": Value::Null,
+                    "mark_error": e.to_string(),
+                    "properties": original_properties,
+                }),
+                MarkReadFailure::Failed => json!({
+                    "id": short,
+                    "full_id": full,
+                    "status": "failed",
+                    "read": false,
+                    "mark_error": e.to_string(),
+                    "properties": original_properties,
+                }),
+            }
         }
     }
 }
@@ -4418,7 +4468,62 @@ mod tests {
     }
 
     #[test]
-    fn bulk_read_response_reports_success_partial_and_failed_statuses() {
+    fn read_response_side_effects_unknown_reports_unknown_not_failed() {
+        let original = json!({ "direction": "inbound", "read": false });
+        let patched = json!({ "direction": "inbound", "read": true });
+        let err = StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        };
+        let err_text = err.to_string();
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Err(err),
+            Some(original.clone()),
+            patched,
+        );
+        assert_eq!(resp["id"], json!("abc123"));
+        assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(
+            resp["status"],
+            json!("unknown"),
+            "a write whose seam terminated after acceptance may already have \
+             landed and must not be reported as a definite failure; got {resp}"
+        );
+        assert_eq!(
+            resp["read"],
+            Value::Null,
+            "an indeterminate outcome is neither true nor false; got {resp}"
+        );
+        assert_eq!(resp["mark_error"], json!(err_text));
+        assert_eq!(resp["properties"], original);
+    }
+
+    #[test]
+    fn read_response_writer_task_terminated_rolled_back_still_reports_failed() {
+        let original = json!({ "direction": "inbound", "read": false });
+        let patched = json!({ "direction": "inbound", "read": true });
+        let err = StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+        };
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Err(err),
+            Some(original),
+            patched,
+        );
+        assert_eq!(
+            resp["status"],
+            json!("failed"),
+            "a proven rollback is a definite failure, not an indeterminate \
+             outcome; got {resp}"
+        );
+        assert_eq!(resp["read"], json!(false));
+    }
+
+    #[test]
+    fn bulk_read_response_reports_success_partial_failed_and_unknown_statuses() {
         let response = |outcomes: &[bool]| {
             bulk_read_response(
                 outcomes.len(),
@@ -4432,6 +4537,31 @@ mod tests {
         assert_eq!(response(&[true, true])["status"], "success");
         assert_eq!(response(&[true, false])["status"], "partial");
         assert_eq!(response(&[false, false])["status"], "failed");
+
+        let mixed = bulk_read_response(
+            3,
+            vec![
+                json!({ "status": "success", "read": true }),
+                json!({ "status": "failed", "read": false }),
+                json!({ "status": "unknown", "read": Value::Null }),
+            ],
+        );
+        assert_eq!(mixed["status"], "partial");
+        assert_eq!(mixed["marked_count"], 1);
+        assert_eq!(mixed["failed_count"], 1);
+        assert_eq!(mixed["unknown_count"], 1);
+
+        let all_unknown = bulk_read_response(
+            2,
+            vec![
+                json!({ "status": "unknown", "read": Value::Null }),
+                json!({ "status": "unknown", "read": Value::Null }),
+            ],
+        );
+        assert_eq!(all_unknown["status"], "unknown");
+        assert_eq!(all_unknown["marked_count"], 0);
+        assert_eq!(all_unknown["failed_count"], 0);
+        assert_eq!(all_unknown["unknown_count"], 2);
     }
 
     // Regression for the bulk-read lost-update: prevalidation (`validate_read_target`)

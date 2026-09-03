@@ -161,9 +161,14 @@ message view. Stable property aliases such as `from_actor`, `to_actor`, and
 
 `comm.read(id=...)` keeps the single-message response. The additive
 `comm.read(ids=[...])` form validates 1-500 supplied IDs and returns per-item
-outcomes with marked/failed counts. Each result carries `status=success|failed`,
-and the bulk result carries `status=success|partial|failed`, so a degraded mark
-is explicit alongside `read`/`mark_error`. Bulk updates are not one
+outcomes with marked/failed/unknown counts. Each result carries
+`status=success|failed|unknown`, and the bulk result carries
+`status=success|partial|failed|unknown`, so a degraded mark is explicit
+alongside `read`/`mark_error`. `unknown` (`read: null`) means the write's
+execution seam terminated after the request was accepted, so the mark may
+already have landed; check the message's current state through `comm.inbox`
+before deciding whether to re-issue it — re-issuing is safe, since marking a
+message read is idempotent. Bulk updates are not one
 cross-message transaction. `comm.read` remains available
 for compatibility, but its name describes neither retrieval nor mutation
 clearly; retrieve message content through `comm.inbox` or `comm.thread`.

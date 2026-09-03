@@ -259,14 +259,16 @@ read/unread invariant and has no semantic meaning to the sender.
 Exactly one of `id` or `ids` is required. The single-ID form preserves its
 existing response. The bulk form accepts 1-500 IDs, resolves duplicates to one
 update, validates every target before the first mutation, and returns ordered
-per-target `results` with `requested_count`, `unique_count`, `marked_count`, and
-`failed_count`. Each result carries `status=success|failed`; the bulk response
-carries `status=success|partial|failed` from its aggregate counts.
+per-target `results` with `requested_count`, `unique_count`, `marked_count`,
+`unknown_count`, and `failed_count`. Each result carries
+`status=success|failed|unknown`; the bulk response carries
+`status=success|partial|failed|unknown` from its aggregate counts.
 Validation includes the same namespace, message-kind, direction, addressee, and
 legacy-message rules as the single-ID form. Updates are not a cross-message
 transaction: a validation failure rejects the call before any update, while an
-item-level storage failure returns `read=false` plus `mark_error` without rolling
-back an earlier successful item.
+item-level storage failure returns `read=false` (or `read=null` for an
+indeterminate outcome — see below) plus `mark_error` without rolling back an
+earlier successful item.
 
 Patches only the `read` key via `NoteStore::try_patch_note_property`, a
 storage-side `json_set`, not a caller-side merge-then-overwrite of the whole
@@ -292,7 +294,7 @@ sqlite writer pool can time out (`checkout_timeout`, 5s default), and the
 read itself has already succeeded by the time the patch runs, so a failed or
 no-op write no longer fails the whole call. This follows the same
 high-level best-effort principle as `handle_reply`'s fold-in mark, which has
-been best-effort since its introduction. Three outcomes:
+been best-effort since its introduction. Four outcomes:
 
 - `Ok(true)` — the row was live and updated: `status: "success"`, `read: true`,
   `properties` is the patched value (including the new `read: true`).
@@ -302,14 +304,28 @@ been best-effort since its introduction. Three outcomes:
   `mark_error: "no live row updated"`, `properties` is the note's ORIGINAL
   stored value (a stored SQL-NULL properties column round-trips as JSON `null`, never `{}`)
   — the response never claims a write that did not land.
-- `Err(e)` — the patch failed (writer timeout, pool exhaustion, etc.):
-  logged via `tracing::warn!` with the full error detail, then `read:
-  false`, `status: "failed"`, `mark_error` is the error's `Display` string,
-  `properties` is the original stored value (again `null` if that is what was stored).
+- `Err(e)` where `e` is `StorageError::WriterTaskTerminated { request_state:
+  SideEffectsUnknown }` — the write was accepted before its execution seam
+  terminated, so the patch may already be committed: `status: "unknown"`,
+  `read: null` (neither `true` nor `false` — a definite outcome is not yet
+  known), `mark_error` is the error's `Display` string, `properties` is the
+  original stored value. Re-check the message's current state through
+  `comm.inbox` before deciding whether to re-issue the mark; re-issuing is
+  safe because marking a message read is idempotent (the underlying
+  `json_set` on `$.read` always resolves to the same `true`, regardless of
+  the row's current value).
+- `Err(e)` for any other error (writer timeout, pool exhaustion, a proven
+  transaction rollback, etc.): logged via `tracing::warn!` with the full
+  error detail, then `read: false`, `status: "failed"`, `mark_error` is the
+  error's `Display` string, `properties` is the original stored value (again
+  `null` if that is what was stored). This is a definite failure, distinct
+  from the indeterminate case above — classification matches on the error's
+  real type, never its display text.
 
-`id`/`full_id` are returned in all three arms — only the mark degrades, not
+`id`/`full_id` are returned in all four arms — only the mark degrades, not
 the read. There is no retry loop; a caller polling unread counts simply
-sees the message still unread and can re-issue `comm.read` (self-healing).
+sees the message still unread (or in an indeterminate state) and can
+re-issue `comm.read` (self-healing).
 Every validation error that runs before the patch (not found, wrong kind,
 outbound, wrong addressee) is unaffected and stays a hard error.
 

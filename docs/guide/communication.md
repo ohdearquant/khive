@@ -141,12 +141,15 @@ request(ops="comm.read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
 
 `comm.mark_read` requires `ids` with 1-500 full UUIDs or 8-character hex prefixes. It validates
 every target before mutation, deduplicates resolved IDs, and returns ordered results plus
-`requested_count`, `unique_count`, `marked_count`, and `failed_count`. Each item carries
-`status=success|failed`; the aggregate carries `status=success|partial|failed`. The default
-`atomic=false` reuses the best-effort bulk behavior: later storage failures appear in each
-result's `read=false` and `mark_error` without rolling back an earlier success. With
-`atomic=true`, all unique marks are guarded and committed in one transaction; any failed
-recheck or storage statement rolls back the full set.
+`requested_count`, `unique_count`, `marked_count`, `unknown_count`, and `failed_count`. Each item
+carries `status=success|failed|unknown`; the aggregate carries
+`status=success|partial|failed|unknown`. The default `atomic=false` reuses the best-effort bulk
+behavior: later storage failures appear in each result's `read=false` and `mark_error` without
+rolling back an earlier success. A write whose execution seam terminated after being accepted (so
+it may already have applied) instead carries `status=unknown`, `read=null` — check the message's
+current state through `comm.inbox` before re-issuing that mark; re-issuing is safe, since marking
+a message read is idempotent. With `atomic=true`, all unique marks are guarded and committed in
+one transaction; any failed recheck or storage statement rolls back the full set.
 
 `comm.read` remains compatible with the 0.7.0 surface: exactly one of `id` or `ids` is required,
 and its bulk form remains best-effort. Prefer the named verb for new bulk callers.

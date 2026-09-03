@@ -220,7 +220,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.read",
-        description: "Compatibility mark-read verb for one or up to 500 inbound messages; it does not retrieve message content. Mark writes are best-effort: each result carries status=success|failed, and bulk responses carry status=success|partial|failed.",
+        description: "Compatibility mark-read verb for one or up to 500 inbound messages; it does not retrieve message content. Mark writes are best-effort: each result carries status=success|failed|unknown (unknown means the write's execution seam terminated after the request was accepted, so it may already have applied — re-check with comm.inbox before deciding whether to re-issue; re-issuing is safe, marking read is idempotent), and bulk responses carry status=success|partial|failed|unknown.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
