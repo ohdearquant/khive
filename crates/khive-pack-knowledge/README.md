@@ -58,7 +58,6 @@ let opts = KnowledgeReindexOptions {
     sections: true,
     drop_existing: false,
     rebuild_ann: true,
-    rebuild_fts: true,
     batch_size: None,
 };
 let report = reindex_knowledge(&runtime, &token, opts, None, None).await?;

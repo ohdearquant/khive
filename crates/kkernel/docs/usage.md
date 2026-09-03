@@ -328,15 +328,12 @@ The knowledge pass calls the `khive_pack_knowledge::reindex_knowledge` library
 entry directly (the full-corpus `knowledge.index` handler) and rebuilds the
 Vamana ANN snapshot — no verb-DSL shell required.
 
-**FTS rebuild is opt-in and namespace-aware.** `fts_knowledge` and
-`fts_sections` are global tables, not scoped to `--namespace`, so rebuilding
-them is wasted work (and unnecessary writer contention) on anything less than
-a full-corpus run. `--rebuild-fts` is therefore OFF by default and only
-defaults ON when the run is an unrestricted full-corpus rebuild: no explicit
-`--namespace`/`KHIVE_NAMESPACE`, and both atoms and sections are in scope
-(neither `--sections-only` nor `--no-sections` narrowed it). Passing
-`--rebuild-fts` explicitly always forces it on, for any scope. The report
-carries a `knowledge_fts_rebuild` object (index names, elapsed milliseconds,
+**FTS rebuild is opt-in.** `fts_knowledge` and `fts_sections` are global
+tables, not scoped to `--namespace`, so rebuilding them is whole-database
+work (and writer contention) whatever the run's scope. No run shape implies
+the rebuild: it is off unless `--rebuild-fts` is passed, and passing it
+rebuilds both indexes for any scope. The report carries a
+`knowledge_fts_rebuild` object (index names, elapsed milliseconds,
 integrity-check outcome) whenever the rebuild ran, and omits it otherwise.
 
 ```bash
