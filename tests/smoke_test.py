@@ -26,11 +26,9 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from documented_verb_counts import validate_documented_counts
+from kkernel_binary import resolve_binary_path
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
-)
+BINARY = resolve_binary_path()
 
 DEFAULT_PACKS = frozenset(
     {

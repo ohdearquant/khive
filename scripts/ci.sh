@@ -299,17 +299,30 @@ phase_no_default_features() {
     cargo check --workspace --no-default-features
 }
 
+# Single source of truth for where the built kkernel binary lives: KKERNEL_BINARY
+# if the caller set it explicitly, else CARGO_TARGET_DIR (absolute, or relative
+# to crates/) if set, else crates/target. phase_release exports the result, but
+# that export lives only in phase_release's own process — the GitHub workflow
+# runs release, contract-tests, smoke-tests, vector-smoke, and contract-suite as
+# separate `ci.sh <phase>` processes, so anything that needs the binary later
+# calls this function fresh rather than trusting an inherited export.
+kkernel_binary_path() {
+    if [ -n "${KKERNEL_BINARY:-}" ]; then
+        printf '%s\n' "$KKERNEL_BINARY"
+        return
+    fi
+    cargo_target_dir=${CARGO_TARGET_DIR:-"$SCRIPT_DIR/../crates/target"}
+    case "$cargo_target_dir" in
+        /*) ;;
+        *) cargo_target_dir="$SCRIPT_DIR/../crates/$cargo_target_dir" ;;
+    esac
+    printf '%s\n' "$cargo_target_dir/release/kkernel"
+}
+
 phase_release() {
     echo "=== Build (release) ==="
-    if [ -z "${KKERNEL_BINARY:-}" ]; then
-        cargo_target_dir=${CARGO_TARGET_DIR:-"$SCRIPT_DIR/../crates/target"}
-        case "$cargo_target_dir" in
-            /*) ;;
-            *) cargo_target_dir="$SCRIPT_DIR/../crates/$cargo_target_dir" ;;
-        esac
-        KKERNEL_BINARY="$cargo_target_dir/release/kkernel"
-        export KKERNEL_BINARY
-    fi
+    KKERNEL_BINARY="$(kkernel_binary_path)"
+    export KKERNEL_BINARY
     # pack-formal is an optional dependency, so a default build does not link it.
     # smoke_test.py's formal section spawns the binary with `--pack formal` to
     # cover the pack's additive EntityOfType endpoint rules, and an unlinked pack
@@ -371,6 +384,14 @@ phase_macos_pr_tests() {
 }
 
 run_phase() {
+    # Test-only hook: naming a phase in CI_SH_TEST_FAIL_PHASE forces that phase
+    # to fail without running its real body, so the run_all failure/skip
+    # reporting can be exercised without paying for a build. Unset in every
+    # real invocation; never read anywhere else.
+    if [ -n "${CI_SH_TEST_FAIL_PHASE:-}" ] && [ "$1" = "$CI_SH_TEST_FAIL_PHASE" ]; then
+        echo "CI_SH_TEST_FAIL_PHASE: forcing phase '$1' to fail (test mode)" >&2
+        return 1
+    fi
     case "$1" in
         no-stubs-scan) phase_no_stubs_scan ;;
         lockfile) phase_lockfile ;;
@@ -400,7 +421,7 @@ run_phase() {
     esac
 }
 
-run_all() {
+set_run_all_phases() {
     run_all_phases="\
         no-stubs-scan \
         lockfile \
@@ -419,6 +440,17 @@ run_all() {
         smoke-tests \
         vector-smoke \
         contract-suite"
+}
+
+print_phases() {
+    set_run_all_phases
+    for phase in $run_all_phases; do
+        echo "$phase"
+    done
+}
+
+run_all() {
+    set_run_all_phases
     current_phase=
     run_all_complete=0
 
@@ -457,14 +489,15 @@ run_all() {
 case "$#" in
     0) run_all ;;
     1)
-        if [ "$1" = "all" ]; then
-            run_all
-        else
-            run_phase "$1"
-        fi
+        case "$1" in
+            all) run_all ;;
+            --print-phases) print_phases ;;
+            --print-binary-path) kkernel_binary_path ;;
+            *) run_phase "$1" ;;
+        esac
         ;;
     *)
-        echo "Usage: $0 [phase|all]" >&2
+        echo "Usage: $0 [phase|all|--print-phases|--print-binary-path]" >&2
         exit 2
         ;;
 esac
