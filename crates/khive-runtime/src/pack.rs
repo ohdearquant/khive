@@ -1522,73 +1522,108 @@ impl VerbRegistry {
     /// dispatch's own audit row degrades.
     ///
     /// Every entry here MUST be declared `VerbCategory::Assertive` in its
-    /// pack's live vocabulary. The
+    /// named pack's live vocabulary. The
     /// `admission_degrade_safe_assertive_census_matches_live_pack_sources`
     /// test below scans every pack that currently declares public Assertive
     /// handlers and requires every such handler to be classified exactly
     /// once as safe or as a known incidental writer. A new Assertive verb
     /// therefore fails closed both at runtime and in the source census until
     /// it receives an explicit side-effect review.
-    const ADMISSION_DEGRADE_SAFE_VERBS: &'static [&'static str] = &[
+    ///
+    /// Entries are `(owning pack name, verb)` pairs, not bare verb names:
+    /// [`Self::admission_degrade_safe`] requires the handler actually
+    /// resolved for `verb` to belong to the exact pack named here. A verb
+    /// name alone is not a sound key — any pack registered through the same
+    /// [`PackRegistry`]/[`VerbRegistryBuilder`] path can declare a handler
+    /// under any name it likes, including one that collides with a name on
+    /// this list, and unique-verb-name validation only rejects that
+    /// collision when the real owning pack is *also* loaded. A deployment
+    /// that omits the real pack (or loads a third-party pack instead) would
+    /// let a same-named write-performing handler inherit degrade-safety it
+    /// never earned. Binding to the pack closes that gap.
+    const ADMISSION_DEGRADE_SAFE_VERBS: &'static [(&'static str, &'static str)] = &[
         // agent
-        "agent.observe",
+        ("agent", "agent.observe"),
         // blob
-        "blob.get",
-        "blob.stat",
+        ("blob", "blob.get"),
+        ("blob", "blob.stat"),
         // brain
-        "brain.event_counts",
-        "brain.profiles",
-        "brain.profile",
-        "brain.resolve",
-        "brain.bindings",
+        ("brain", "brain.event_counts"),
+        ("brain", "brain.profiles"),
+        ("brain", "brain.profile"),
+        ("brain", "brain.resolve"),
+        ("brain", "brain.bindings"),
         // comm
-        "comm.delivered",
-        "comm.inbox",
-        "comm.unread",
-        "comm.thread",
-        "comm.health",
-        "comm.probe",
+        ("comm", "comm.delivered"),
+        ("comm", "comm.inbox"),
+        ("comm", "comm.unread"),
+        ("comm", "comm.thread"),
+        ("comm", "comm.health"),
+        ("comm", "comm.probe"),
         // gtd
-        "gtd.next",
-        "gtd.tasks",
+        ("gtd", "gtd.next"),
+        ("gtd", "gtd.tasks"),
         // kg
-        "get",
-        "list",
-        "stats",
-        "search",
-        "neighbors",
-        "traverse",
-        "context",
-        "query",
-        "resolve",
-        "whoami",
-        "verbs",
+        ("kg", "get"),
+        ("kg", "list"),
+        ("kg", "stats"),
+        ("kg", "search"),
+        ("kg", "neighbors"),
+        ("kg", "traverse"),
+        ("kg", "context"),
+        ("kg", "query"),
+        ("kg", "resolve"),
+        ("kg", "whoami"),
+        ("kg", "verbs"),
         // knowledge (ANN-maintaining search/suggest/compose are excluded)
-        "knowledge.get",
-        "knowledge.list",
-        "knowledge.stats",
-        "knowledge.fold",
-        "knowledge.topic",
+        ("knowledge", "knowledge.get"),
+        ("knowledge", "knowledge.list"),
+        ("knowledge", "knowledge.stats"),
+        ("knowledge", "knowledge.fold"),
+        ("knowledge", "knowledge.topic"),
         // moodboard
-        "moodboard.model",
-        "moodboard.search",
-        "moodboard.preference",
+        ("moodboard", "moodboard.model"),
+        ("moodboard", "moodboard.search"),
+        ("moodboard", "moodboard.preference"),
         // schedule
-        "schedule.agenda",
+        ("schedule", "schedule.agenda"),
         // session
-        "session.list",
-        "session.resume",
-        "session.export",
+        ("session", "session.list"),
+        ("session", "session.resume"),
+        ("session", "session.export"),
     ];
+
+    /// Sorted copy of [`Self::ADMISSION_DEGRADE_SAFE_VERBS`], built once, so
+    /// [`Self::admission_degrade_safe`] can decide eligibility with a binary
+    /// search instead of a linear scan over every entry on every audited
+    /// dispatch. The source list above stays grouped by pack (with a `//
+    /// <pack>` comment per group) for human review; this is a derived,
+    /// lookup-shaped view of the same data, not a second source of truth.
+    fn admission_degrade_safe_sorted() -> &'static [(&'static str, &'static str)] {
+        static SORTED: std::sync::LazyLock<Vec<(&'static str, &'static str)>> =
+            std::sync::LazyLock::new(|| {
+                let mut pairs = VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS.to_vec();
+                pairs.sort_unstable();
+                pairs
+            });
+        &SORTED
+    }
 
     /// Whether `verb` is both declared [`VerbCategory::Assertive`] (the
     /// speech-act tag for handlers that "retrieve and present facts" rather
     /// than committing a domain change) AND explicitly opted in to
     /// admission-pressure audit degradation via
-    /// [`Self::ADMISSION_DEGRADE_SAFE_VERBS`]. Unknown or non-opted-in verbs
-    /// are conservatively `false` — fail-closed, so a new Assertive handler
+    /// [`Self::ADMISSION_DEGRADE_SAFE_VERBS`] under the exact pack that
+    /// registered it. Unknown, non-opted-in, or wrong-pack verbs are
+    /// conservatively `false` — fail-closed, so a new Assertive handler (or
+    /// one registered by a pack other than the one the allowlist names)
     /// hard-fails its audit obligation like any write until someone
     /// deliberately reviews it and adds it to the allowlist.
+    ///
+    /// Resolving the handler and its owning pack together (rather than
+    /// checking the verb name and category in isolation) is the point:
+    /// [`Self::ADMISSION_DEGRADE_SAFE_VERBS`]'s doc explains why a bare verb
+    /// name is not a sound key on its own.
     ///
     /// Used only to decide whether a dispatch's own audit-obligation row may
     /// degrade to best-effort on transient audit-lane admission pressure
@@ -1597,13 +1632,29 @@ impl VerbRegistry {
     /// momentarily saturated. Never used for permission checking, transport
     /// routing, or return-shape selection.
     fn admission_degrade_safe(&self, verb: &str) -> bool {
-        if !Self::ADMISSION_DEGRADE_SAFE_VERBS.contains(&verb) {
+        let Some((pack_name, handler)) = self.packs.iter().find_map(|pack| {
+            pack.handlers()
+                .iter()
+                .find(|h| h.name == verb)
+                .map(|handler| (pack.name(), handler))
+        }) else {
             return false;
-        }
-        self.packs
-            .iter()
-            .find_map(|pack| pack.handlers().iter().find(|h| h.name == verb))
-            .is_some_and(|handler| handler.category == VerbCategory::Assertive)
+        };
+        handler.category == VerbCategory::Assertive
+            && Self::admission_degrade_safe_sorted()
+                .binary_search_by(|&(p, v)| p.cmp(pack_name).then_with(|| v.cmp(verb)))
+                .is_ok()
+    }
+
+    /// White-box accessor for [`Self::admission_degrade_safe`], needed
+    /// because the admission-pressure regression tests in
+    /// `tests/read_verb_admission_exhaustion.rs` compile as a separate
+    /// external binary and cannot reach a crate-private method directly —
+    /// the same reason [`audit_admission_refused_obligation_count`] and
+    /// `AuditBatch::test_snapshot` are `pub` rather than `pub(crate)`.
+    #[cfg(any(test, feature = "test-internals"))]
+    pub fn admission_degrade_safe_probe(&self, verb: &str) -> bool {
+        self.admission_degrade_safe(verb)
     }
 
     /// Return the help schema envelope for a verb.
@@ -4129,10 +4180,24 @@ pub(crate) mod tests {
     /// source — the same fail-closed pattern as `adr133_writer_census.rs`'s
     /// `reclassify_from_live_source`.
     ///
+    /// Every occurrence of the literal `HandlerDef {` token in scanned source
+    /// is classified into exactly one of: a struct-literal field block, or a
+    /// function/closure signature merely naming the type
+    /// (`-> &'static HandlerDef {`) — a per-file count assertion fails
+    /// closed if any occurrence goes unclassified, so a handler declared in
+    /// an unanticipated shape (a prior version of this census silently
+    /// dropped the single-element `static X: [HandlerDef; 1] = [HandlerDef {`
+    /// shape used by `khive-pack-code` and `khive-pack-template`) cannot
+    /// drop out of the count without failing the test. This also verifies
+    /// that each [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`] entry's
+    /// claimed owning pack matches the pack whose source actually declares
+    /// that verb.
+    ///
     /// This test proves category membership (`VerbCategory::Assertive`),
-    /// non-membership in [`KNOWN_INCIDENTAL_WRITE_VERBS`], and exhaustive
-    /// classification of every currently public Assertive handler. It does NOT prove
-    /// general effect-purity: an Assertive handler may still emit its own
+    /// pack ownership, non-membership in [`KNOWN_INCIDENTAL_WRITE_VERBS`],
+    /// and exhaustive classification of every currently public Assertive
+    /// handler. It does NOT prove general effect-purity: an Assertive
+    /// handler may still emit its own
     /// observability/config events on an independent, best-effort background
     /// path (`search`'s `SearchExecuted` telemetry, `context`'s one-time
     /// `ConfigLocked` event) that this test does not inspect and that this
@@ -4205,33 +4270,97 @@ pub(crate) mod tests {
             "cross-pack Assertive census found no pack source files"
         );
 
-        let mut live_assertive = BTreeMap::<String, String>::new();
+        // verb name -> (owning pack, relative source path)
+        let mut live_assertive = BTreeMap::<String, (String, String)>::new();
         for path in handler_sources {
-            let relative_path = path
+            let relative = path
                 .strip_prefix(crates_dir)
-                .expect("pack source must be inside the workspace crates directory")
-                .display()
+                .expect("pack source must be inside the workspace crates directory");
+            let relative_path = relative.display().to_string();
+            let crate_dir_name = relative
+                .components()
+                .next()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let owning_pack = crate_dir_name
+                .strip_prefix("khive-pack-")
+                .unwrap_or_else(|| {
+                    panic!("{relative_path}: expected a khive-pack-<name> crate directory")
+                })
                 .to_string();
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
 
-            // Exactly four spaces identify array-level `HandlerDef` literals;
-            // their fields then have exactly eight. Nested `ParamDef` literals
-            // use deeper indentation and cannot be mistaken for handler names.
-            for block in source.split("\n    HandlerDef {").skip(1) {
+            // Every literal occurrence of `HandlerDef {` is either a
+            // struct-literal field block (parsed below) or a
+            // function/closure signature merely naming the type in
+            // return-tail position (`-> &'static HandlerDef {`, possibly
+            // qualified as `khive_types::HandlerDef {`) — a struct literal
+            // is never preceded on its own line by `->`. Both are explicitly
+            // classified; neither is silently skipped, and the per-file
+            // count assertion below fails closed if a future shape is
+            // neither.
+            let raw_token_count = source.matches("HandlerDef {").count();
+            let mut classified_count = 0usize;
+            let mut search_from = 0usize;
+            while let Some(rel_pos) = source[search_from..].find("HandlerDef {") {
+                let match_start = search_from + rel_pos;
+                let match_end = match_start + "HandlerDef {".len();
+                search_from = match_end;
+                classified_count += 1;
+
+                let line_start = source[..match_start]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                if source[line_start..match_start].contains("->") {
+                    continue;
+                }
+
+                let next_marker = source[match_end..].find("HandlerDef {");
+                let block_end = next_marker.map(|o| match_end + o).unwrap_or(source.len());
+                let block = &source[match_end..block_end];
+
+                // The field indentation is read from the block's own first
+                // line rather than hardcoded: array-element declarations
+                // (`&[HandlerDef {`) indent fields one level deeper than the
+                // single-element `static X: [HandlerDef; 1] = [HandlerDef {`
+                // shape, and a hardcoded depth would silently stop matching
+                // whichever shape it didn't anticipate — exactly how the
+                // narrower delimiter this replaced went unnoticed.
+                let first_field_line = block
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{relative_path}: HandlerDef {{ at byte {match_start} has no \
+                             field line before EOF or the next HandlerDef {{"
+                        )
+                    });
+                let indent_len = first_field_line.len() - first_field_line.trim_start().len();
+                let indent = &first_field_line[..indent_len];
+                let name_prefix = format!("{indent}name: \"");
+                let visibility_prefix = format!("{indent}visibility: ");
+                let category_prefix = format!("{indent}category: ");
+
                 let name = block.lines().find_map(|line| {
-                    line.strip_prefix("        name: \"")
+                    line.strip_prefix(name_prefix.as_str())
                         .and_then(|rest| rest.strip_suffix("\","))
                 });
                 let visibility = block
                     .lines()
-                    .find_map(|line| line.strip_prefix("        visibility: "));
+                    .find_map(|line| line.strip_prefix(visibility_prefix.as_str()));
                 let category = block
                     .lines()
-                    .find_map(|line| line.strip_prefix("        category: "));
+                    .find_map(|line| line.strip_prefix(category_prefix.as_str()));
                 let (Some(name), Some(visibility), Some(category)) = (name, visibility, category)
                 else {
-                    continue;
+                    panic!(
+                        "{relative_path}: HandlerDef {{ block starting with {first_field_line:?} \
+                         could not be parsed for name/visibility/category at indent \
+                         {indent_len}; extend this census's parser to handle the shape instead \
+                         of silently excluding it"
+                    );
                 };
                 if !visibility.contains("Visibility::Verb")
                     || !category.contains("VerbCategory::Assertive")
@@ -4239,32 +4368,60 @@ pub(crate) mod tests {
                     continue;
                 }
 
-                let prior = live_assertive.insert(name.to_string(), relative_path.clone());
+                let prior = live_assertive.insert(
+                    name.to_string(),
+                    (owning_pack.clone(), relative_path.clone()),
+                );
                 assert!(
                     prior.is_none(),
                     "public Assertive verb {name:?} is declared in both {prior:?} and \
-                     {relative_path}; the registry surface must remain collision-free"
+                     ({owning_pack:?}, {relative_path:?}); the registry surface must remain \
+                     collision-free"
                 );
             }
+            assert_eq!(
+                classified_count, raw_token_count,
+                "{relative_path}: found {raw_token_count} occurrences of the `HandlerDef {{` \
+                 token but only classified {classified_count} of them; the census scan must \
+                 account for every occurrence"
+            );
         }
 
-        let safe: BTreeSet<&str> = VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS
+        let safe: BTreeSet<(&str, &str)> = VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS
             .iter()
             .copied()
             .collect();
         assert_eq!(
             safe.len(),
             VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS.len(),
-            "ADMISSION_DEGRADE_SAFE_VERBS contains duplicate names"
+            "ADMISSION_DEGRADE_SAFE_VERBS contains duplicate (pack, verb) pairs"
         );
+        let safe_verbs: BTreeSet<&str> = safe.iter().map(|&(_, v)| v).collect();
+        assert_eq!(
+            safe_verbs.len(),
+            safe.len(),
+            "ADMISSION_DEGRADE_SAFE_VERBS names the same verb under two different packs; a verb \
+             belongs to exactly one pack"
+        );
+        for &(pack, verb) in &safe {
+            let live_owner = live_assertive
+                .get(verb)
+                .map(|(owning_pack, _)| owning_pack.as_str());
+            assert_eq!(
+                live_owner,
+                Some(pack),
+                "ADMISSION_DEGRADE_SAFE_VERBS claims {verb:?} is owned by pack {pack:?}, but its \
+                 live declaration says otherwise (found: {live_owner:?})"
+            );
+        }
         let incidental: BTreeSet<&str> = KNOWN_INCIDENTAL_WRITE_VERBS.iter().copied().collect();
         assert!(
-            safe.is_disjoint(&incidental),
+            safe_verbs.is_disjoint(&incidental),
             "a public Assertive verb cannot be both admission-degrade-safe and an incidental writer: {:?}",
-            safe.intersection(&incidental).collect::<Vec<_>>()
+            safe_verbs.intersection(&incidental).collect::<Vec<_>>()
         );
 
-        let classified: BTreeSet<&str> = safe.union(&incidental).copied().collect();
+        let classified: BTreeSet<&str> = safe_verbs.union(&incidental).copied().collect();
         let live: BTreeSet<&str> = live_assertive.keys().map(String::as_str).collect();
         assert_eq!(
             classified, live,

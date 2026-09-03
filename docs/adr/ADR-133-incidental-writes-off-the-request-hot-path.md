@@ -634,7 +634,10 @@ This amendment qualifies both sentences for one narrow, named case: the 39 revie
 rationale are in ADR-103 Amendment 3), and only when the row's own commit did not resolve before
 the dispatch returned because the audit lane's admission was transiently exhausted or the caller's
 bounded wait for it elapsed — `AuditTerminalReason::QueueAdmissionExhausted` or
-`AdmissionDeadlineExpired`, never a persistent commit failure. For that verb set and those two
+`AdmissionDeadlineExpired`, never a persistent commit failure. Membership in that verb set is
+itself bound to the exact pack that registered the handler, not the verb name alone (ADR-103
+Amendment 3) — a handler under a different pack never qualifies for this exception, no matter what
+it is named. For that verb set and those two
 terminal reasons, the dispatch reports its already-computed successful read result without waiting
 on its own audit/accounting row. The two reasons are not the same fact, though, and this amendment
 does not treat them as one:

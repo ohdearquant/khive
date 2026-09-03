@@ -940,6 +940,13 @@ The cross-pack source census classifies every current public Assertive handler e
 consumer/checkpoint maintenance) remain explicitly fail-closed. A new Assertive handler is not
 eligible until its side effects are reviewed and the closed census is updated.
 
+Eligibility is bound to the owning pack and verb together, not the verb name alone: each entry on
+the allowlist names a `(pack, verb)` pair, and a handler only degrades if the pack that actually
+registered it matches the pack named beside that verb. A verb name by itself is not a sound key —
+any pack loaded through the same registration path could otherwise declare a handler under a name
+that collides with an allowlisted one while performing a durable write of its own, and inherit
+degrade-safety it never earned.
+
 **Consequence, stated precisely:** `brain.event_counts`'s `total_cost_unit` and
 `cost_unit_by_verb` aggregation (Amendment 1) undercount those 39 verbs by the `cost_unit` of
 every row dropped this way — but the two terminal reasons above are not the same fact, and

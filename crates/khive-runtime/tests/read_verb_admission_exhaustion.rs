@@ -112,10 +112,15 @@ impl EventStore for MemoryEventStore {
 /// takes the admission-degrade path (khive#2228 M1): only a *successful*
 /// dispatch of an allowlisted read may degrade its audit obligation, never a
 /// `DispatchFailed` one.
+///
+/// `Pack::NAME` is `"kg"`, matching `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`'s
+/// `("kg", "get")` entry: admission-degrade eligibility is bound to the
+/// owning pack, not the verb name alone, so a stand-in pack under any other
+/// name would make `get` ineligible regardless of category.
 struct BetaPack;
 
 impl Pack for BetaPack {
-    const NAME: &'static str = "beta";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -156,10 +161,14 @@ impl PackRuntime for BetaPack {
 
 /// Minimal pack exercising one read (`list`, `Assertive`) and one write
 /// (`create`, `Commissive`) verb, neither doing any real domain work.
+///
+/// `Pack::NAME` is `"kg"`, matching `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`'s
+/// `("kg", "list")` entry — see `BetaPack`'s doc for why this must match
+/// exactly.
 struct AlphaPack;
 
 impl Pack for AlphaPack {
-    const NAME: &'static str = "alpha";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[
@@ -201,14 +210,29 @@ impl PackRuntime for AlphaPack {
         _registry: &khive_runtime::pack::VerbRegistry,
         _token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
+        Ok(serde_json::json!({ "pack": "kg", "verb": verb }))
     }
 }
 
-/// Cross-pack name probe for the khive#2217 effect census. The handlers are
-/// deliberately no-ops: this test exercises the registry's reviewed
-/// name/category classification under a forced audit refusal, not the real
-/// packs' domain behavior (which the source census audits separately).
+/// Rogue-pack probe: declares Assertive handlers under the verb names of
+/// several *other* real packs' allowlisted reads (`gtd.tasks`, `gtd.next`,
+/// `comm.inbox`) alongside the known-incidental-write names
+/// (`memory.recall`, `db_diagnostics`, `knowledge.*`), all under a pack name
+/// (`cross-pack-census-probe`) that matches none of
+/// `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`'s `(pack, verb)` entries.
+///
+/// This is exactly the shape of pack that admission-degrade eligibility must
+/// reject: a verb name alone is not a sound key, because any pack registered
+/// through the same `VerbRegistryBuilder` path can declare a handler under a
+/// name that collides with an allowlisted one while actually performing a
+/// durable write of its own. Binding eligibility to `(pack, verb)` — not
+/// `verb` alone — means every handler here must stay fail-closed regardless
+/// of verb name, proven by
+/// `cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlist`
+/// below. The handlers are deliberately no-ops: this test exercises the
+/// registry's reviewed name/category/pack classification under a forced
+/// audit refusal, not real domain behavior (which the source census in
+/// `khive-runtime/src/pack.rs`'s `mod tests` audits separately).
 struct CrossPackCensusProbe;
 
 impl Pack for CrossPackCensusProbe {
@@ -405,10 +429,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
         .dispatch("list", Value::Null)
         .await
         .expect("a read verb must not fail on audit-lane admission exhaustion");
-    assert_eq!(
-        result,
-        serde_json::json!({ "pack": "alpha", "verb": "list" })
-    );
+    assert_eq!(result, serde_json::json!({ "pack": "kg", "verb": "list" }));
     assert_eq!(
         audit_admission_refused_obligation_count(),
         before_refused + 1,
@@ -462,13 +483,22 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
     drop(filler);
 }
 
-/// khive#2217: the three read names observed live must all survive a forced
-/// `QueueAdmissionExhausted` outcome, while Assertive handlers whose nominal
-/// read path has an incidental durable/accounting effect stay fail-closed.
-/// The negative half prevents a category-only widening from passing.
+/// Admission-degrade eligibility is bound to `(pack, verb)`, not `verb`
+/// alone: every handler `CrossPackCensusProbe` declares is `Assertive` and
+/// several of its names (`gtd.tasks`, `gtd.next`, `comm.inbox`) are on
+/// `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`, but the pack that declares
+/// them here (`cross-pack-census-probe`) matches none of the allowlist's
+/// `(pack, verb)` pairs. Every handler must therefore stay fail-closed under
+/// a forced `QueueAdmissionExhausted` outcome — the previously-"safe" names
+/// included, since a bare name match without pack verification is exactly
+/// the gap this binding closes. Before the fix, the first three names in
+/// this test's loop degraded successfully (accepted as `true` by
+/// `admission_degrade_safe`), which is the failure mode the direct probe
+/// assertion below reproduces.
 #[serial]
 #[tokio::test]
-async fn reported_cross_pack_reads_degrade_while_incidental_assertives_stay_strict() {
+#[serial(config_ledger)]
+async fn cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlist() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
     builder.register(CrossPackCensusProbe);
@@ -481,6 +511,18 @@ async fn reported_cross_pack_reads_degrade_while_incidental_assertives_stay_stri
     let audit_batch = registry
         .audit_batch_handle()
         .expect("event store configured, so the batch seam is too");
+
+    // Direct white-box check, independent of the audit-pressure mechanics
+    // below: a handler named like an allowlisted verb but declared by the
+    // wrong pack must never read as admission-degrade-safe.
+    for verb in ["gtd.tasks", "gtd.next", "comm.inbox"] {
+        assert!(
+            !registry.admission_degrade_safe_probe(verb),
+            "{verb} is on ADMISSION_DEGRADE_SAFE_VERBS under a different pack; \
+             cross-pack-census-probe's handler of the same name must not inherit \
+             its degrade-safety"
+        );
+    }
 
     fault_injection::arm_supervisor_sleep_before_spawn();
     let occupant_batch = audit_batch.clone();
@@ -514,33 +556,10 @@ async fn reported_cross_pack_reads_degrade_while_incidental_assertives_stay_stri
 
     let before_refused = audit_admission_refused_obligation_count();
     let before_unresolved = audit_admission_unresolved_obligation_count();
-    for verb in ["gtd.tasks", "gtd.next", "comm.inbox"] {
-        let result = registry
-            .dispatch(verb, Value::Null)
-            .await
-            .unwrap_or_else(|error| {
-                panic!("{verb} must survive forced audit admission refusal: {error}")
-            });
-        assert_eq!(
-            result,
-            serde_json::json!({
-                "pack": "cross-pack-census-probe",
-                "verb": verb,
-            })
-        );
-    }
-    assert_eq!(
-        audit_admission_refused_obligation_count(),
-        before_refused + 3,
-        "each reported read's refused audit row must take the counted degradation path"
-    );
-    assert_eq!(
-        audit_admission_unresolved_obligation_count(),
-        before_unresolved,
-        "forced queue refusal must not move the deadline-expiry counter"
-    );
-
     for verb in [
+        "gtd.tasks",
+        "gtd.next",
+        "comm.inbox",
         "memory.recall",
         "db_diagnostics",
         "knowledge.search",
@@ -549,7 +568,8 @@ async fn reported_cross_pack_reads_degrade_while_incidental_assertives_stay_stri
     ] {
         let error = match registry.dispatch(verb, Value::Null).await {
             Ok(result) => panic!(
-                "{verb} must stay fail-closed under forced audit admission refusal; \
+                "{verb} must stay fail-closed under forced audit admission refusal — its \
+                 owning pack here does not match the allowlist's entry for this verb name; \
                  unexpected result: {result}"
             ),
             Err(error) => error,
@@ -563,8 +583,13 @@ async fn reported_cross_pack_reads_degrade_while_incidental_assertives_stay_stri
     }
     assert_eq!(
         audit_admission_refused_obligation_count(),
-        before_refused + 3,
-        "excluded Assertive handlers must not increment admission-degrade counters"
+        before_refused,
+        "a pack-identity mismatch must never take the counted admission-degrade path"
+    );
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved,
+        "forced queue refusal must not move the deadline-expiry counter"
     );
 
     drop(occupant);
@@ -636,10 +661,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
         .dispatch("list", Value::Null)
         .await
         .expect("a read verb must not fail when its own audit row's admission deadline elapses");
-    assert_eq!(
-        result,
-        serde_json::json!({ "pack": "alpha", "verb": "list" })
-    );
+    assert_eq!(result, serde_json::json!({ "pack": "kg", "verb": "list" }));
     assert_eq!(
         audit_admission_unresolved_obligation_count(),
         before_unresolved + 1,
