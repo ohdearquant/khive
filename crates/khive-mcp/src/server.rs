@@ -36,9 +36,9 @@ use khive_request::{
     ParsedRequest, PrevFailure, TypedJsonOp,
 };
 use khive_runtime::{
-    present, render_format, InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError,
-    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
-    VerbRegistry, VerbRegistryBuilder,
+    prepare_format_value, present, render_format, InterceptedDispatchResult, KhiveRuntime,
+    OutputFormat, PackLoadError, PackRegistry, PresentationMode, RuntimeConfig, RuntimeError,
+    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_types::RefusalReason;
 
@@ -3690,19 +3690,26 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
 /// - If `ok=false` (error entry): always compact JSON, never reformatted (§8.2).
 /// - If `ok=true`: resolve per-op format (per_op_formats[i] → batch_format) and
 ///   per-op presentation (presentation_per_op[i] → batch presentation, then the
-///   verb's AlwaysVerbose policy forces Verbose), apply `render_format` to the
-///   `result` payload with the effective presentation so that both
-///   `presentation_per_op=["verbose"]` and AlwaysVerbose verbs (including
-///   strict feedback, delivery-correlation acknowledgements, and durable receipt
-///   responses) correctly skip the redundancy-drop
-///   pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
+///   verb's AlwaysVerbose policy forces Verbose), apply the effective presentation
+///   to the `result` payload so that both `presentation_per_op=["verbose"]` and
+///   AlwaysVerbose verbs (including strict feedback, delivery-correlation
+///   acknowledgements, and durable receipt responses) correctly skip the
+///   redundancy-drop pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`). JSON
+///   output stays a JSON value — `prepare_format_value` applies the pre-pass
+///   in place — so a compounded response never round-trips `result` through a
+///   string; every other format calls `render_format` and stores the rendered
+///   string instead (ADR-078 Amendment 3).
 ///
 /// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
 /// Daemon-served responses are rendered before fitting. If the rendered envelope
 /// exceeds the frame allowance, entries fall back to compact JSON before payload
 /// details are omitted. Local dispatch has no daemon-frame allowance and returns
-/// the requested representation without fitting. Every daemon fit decision
-/// serializes the actual response-frame shape so JSON string escaping is included.
+/// the requested representation without fitting. Every daemon fit decision is
+/// computed from per-entry serialized lengths (`fit_rendered_batch_envelope`),
+/// not by re-serializing the response-frame shape on each candidate; the
+/// arithmetic accounts for JSON string escaping exactly (see
+/// `json_escaped_len`), so the fit decision matches what serializing the
+/// actual frame would have measured.
 fn render_result(
     value: serde_json::Value,
     batch_format: OutputFormat,
@@ -3777,7 +3784,7 @@ fn render_batch_entry(
         .and_then(|format| *format)
         .unwrap_or(batch_format);
     let is_ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    if !is_ok || per_op_format == OutputFormat::Json {
+    if !is_ok {
         return entry.clone();
     }
 
@@ -3794,47 +3801,69 @@ fn render_batch_entry(
         }
         _ => base_presentation,
     };
-    let Some(result) = entry.get("result") else {
+    if entry.get("result").is_none() {
         return entry.clone();
-    };
-    let mut rendered_entry = entry.clone();
-    if let Value::Object(ref mut fields) = rendered_entry {
-        fields.insert(
-            "result".to_string(),
-            Value::String(render_format(
-                result.clone(),
-                per_op_format,
-                effective_presentation,
-            )),
-        );
     }
+    let mut rendered_entry = entry.clone();
+    let Value::Object(ref mut fields) = rendered_entry else {
+        return rendered_entry;
+    };
+    // `result` was already duplicated by `entry.clone()` above; take it back
+    // out of the clone instead of cloning it a second time off `entry`. Both
+    // `prepare_format_value` and `render_format` take the value by ownership,
+    // so a no-op reduction (Verbose/Human JSON) no longer pays for a clone it
+    // throws away.
+    let Some(result) = fields.remove("result") else {
+        return rendered_entry;
+    };
+    let formatted = if per_op_format == OutputFormat::Json {
+        prepare_format_value(result, per_op_format, effective_presentation)
+    } else {
+        Value::String(render_format(result, per_op_format, effective_presentation))
+    };
+    fields.insert("result".to_string(), formatted);
     rendered_entry
 }
 
+/// Fit a rendered batch envelope inside the daemon frame budget.
+///
+/// The envelope's compact-JSON length is additive: for a fixed set of
+/// non-`results` keys, `serialize({..metadata, results: X})` only ever
+/// changes in the byte range spanned by `results`'s own array literal, so
+/// its length is exactly `envelope_metadata_escaped_len(metadata) +
+/// sum(entry_escaped_len) + separators` (`envelope_escaped_len` below), and
+/// the daemon-frame length is that same number plus the frame's own fixed
+/// overhead (`empty_rendered_daemon_frame_len`). That turns "does this
+/// candidate fit" from a full-batch clone-and-reserialize into arithmetic
+/// over lengths computed once per entry, so fitting no longer costs
+/// O(entries × batch bytes).
 fn fit_rendered_batch_envelope(
     map: &serde_json::Map<String, Value>,
     compact_results: &[Value],
-    mut out_results: Vec<Value>,
+    out_results: Vec<Value>,
     served_config_id: &str,
     registry: &VerbRegistry,
 ) -> serde_json::Map<String, Value> {
-    let mut out_map = map.clone();
-    out_map.insert(
-        "results".to_string(),
-        serde_json::Value::Array(out_results.clone()),
-    );
-    if response_value_fits_daemon_frame(
-        &serde_json::Value::Object(out_map.clone()),
-        served_config_id,
-    ) {
-        return out_map;
+    let frame_base = empty_rendered_daemon_frame_len(served_config_id);
+    let mut metadata = envelope_metadata(map);
+    let mut metadata_len = envelope_metadata_escaped_len(&metadata);
+    let mut out_results = out_results;
+    let mut entry_lens: Vec<usize> = out_results.iter().map(entry_escaped_len).collect();
+    let fits = |entry_lens: &[usize], metadata_len: usize| {
+        frame_base + envelope_escaped_len(entry_lens, metadata_len)
+            <= khive_runtime::daemon::MAX_FRAME_BYTES
+    };
+
+    if fits(&entry_lens, metadata_len) {
+        metadata.insert("results".to_string(), Value::Array(out_results));
+        return metadata;
     }
 
-    let rendered_frame_bytes = response_value_daemon_frame_len(
-        &serde_json::Value::Object(out_map.clone()),
-        served_config_id,
-    );
-    let mut compact_fallbacks: Vec<(usize, usize)> = compact_results
+    // Pass 1: canonical (compact) fallback wherever it actually saves bytes,
+    // largest saving first. Agent JSON reduction can make a canonical form
+    // LARGER than its rendered form (redundant fields already dropped), so a
+    // fallback there would move the envelope the wrong way and is skipped.
+    let mut compact_fallbacks: Vec<(usize, usize, usize)> = compact_results
         .iter()
         .zip(&out_results)
         .enumerate()
@@ -3842,25 +3871,26 @@ fn fit_rendered_batch_envelope(
             if compact == rendered {
                 return None;
             }
-            let mut candidate_results = out_results.clone();
-            candidate_results[index] = compact.clone();
-            let mut candidate_map = out_map.clone();
-            candidate_map.insert("results".to_string(), Value::Array(candidate_results));
-            let compact_frame_bytes =
-                response_value_daemon_frame_len(&Value::Object(candidate_map), served_config_id);
-            (compact_frame_bytes < rendered_frame_bytes)
-                .then_some((index, rendered_frame_bytes - compact_frame_bytes))
+            let compact_len = entry_escaped_len(compact);
+            // `then_some` evaluates its argument eagerly regardless of the
+            // guard, so an inline `rendered_len - compact_len` here would
+            // underflow-panic exactly when compact is larger (the case this
+            // guard exists to exclude) — `then` defers it to a closure.
+            (compact_len < entry_lens[index])
+                .then(|| (index, entry_lens[index] - compact_len, compact_len))
         })
         .collect();
-    compact_fallbacks.sort_unstable_by_key(|&(_, saved_bytes)| std::cmp::Reverse(saved_bytes));
-    for (index, _) in compact_fallbacks {
+    compact_fallbacks.sort_unstable_by_key(|&(_, saved_bytes, _)| std::cmp::Reverse(saved_bytes));
+    for (index, _, compact_len) in compact_fallbacks {
         out_results[index] = compact_results[index].clone();
-        out_map.insert("results".to_string(), Value::Array(out_results.clone()));
-        if response_value_fits_daemon_frame(&Value::Object(out_map.clone()), served_config_id) {
-            return out_map;
+        entry_lens[index] = compact_len;
+        if fits(&entry_lens, metadata_len) {
+            metadata.insert("results".to_string(), Value::Array(out_results));
+            return metadata;
         }
     }
 
+    // Pass 2: omission, largest current entry first.
     let mut by_size: Vec<(usize, usize)> = out_results
         .iter()
         .enumerate()
@@ -3868,20 +3898,79 @@ fn fit_rendered_batch_envelope(
         .collect();
     by_size.sort_unstable_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
     for (index, _) in by_size {
-        out_results[index] = frame_budget_omission(&compact_results[index], registry);
-        out_map.insert(
-            "results".to_string(),
-            serde_json::Value::Array(out_results.clone()),
-        );
-        refresh_frame_budget_outcome(&mut out_map);
-        if response_value_fits_daemon_frame(
-            &serde_json::Value::Object(out_map.clone()),
-            served_config_id,
-        ) {
+        let omitted = frame_budget_omission(&compact_results[index], registry);
+        entry_lens[index] = entry_escaped_len(&omitted);
+        out_results[index] = omitted;
+        refresh_frame_budget_outcome(&mut metadata, &out_results);
+        metadata_len = envelope_metadata_escaped_len(&metadata);
+        if fits(&entry_lens, metadata_len) {
             break;
         }
     }
-    out_map
+    metadata.insert("results".to_string(), Value::Array(out_results));
+    metadata
+}
+
+/// All envelope fields except `results`, copied without ever touching the
+/// (potentially large) `results` array — `map.clone()` would deep-clone it
+/// just to have `results` overwritten a moment later.
+fn envelope_metadata(map: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    map.iter()
+        .filter(|(key, _)| key.as_str() != "results")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// The escaped byte length of `{..metadata, "results": []}`. Since
+/// `metadata` excludes `results`, this costs nothing proportional to batch
+/// size — it changes only when `refresh_frame_budget_outcome` rewrites
+/// `summary`/`status`, both tiny fixed-shape objects.
+fn envelope_metadata_escaped_len(metadata: &serde_json::Map<String, Value>) -> usize {
+    let mut probe = metadata.clone();
+    probe.insert("results".to_string(), Value::Array(Vec::new()));
+    json_escaped_len(&serde_json::to_vec(&Value::Object(probe)).expect("value is serializable"))
+}
+
+/// The escaped byte length `entry` contributes once embedded in the
+/// envelope's `results` array (i.e. as it will be re-escaped a second time
+/// when the whole envelope is wrapped in a daemon response frame).
+fn entry_escaped_len(entry: &Value) -> usize {
+    json_escaped_len(&serde_json::to_vec(entry).expect("value is serializable"))
+}
+
+/// `envelope_metadata_escaped_len(metadata)` plus the array literal built
+/// from `entry_escaped_lens` — the incremental form of
+/// `envelope_metadata_escaped_len` with `results` populated instead of
+/// empty. `metadata_escaped_len` already counts the two bracket bytes of
+/// `results`'s empty `[]`, and those brackets stay in place either way, so
+/// only the entries and the commas between them are additional.
+fn envelope_escaped_len(entry_escaped_lens: &[usize], metadata_escaped_len: usize) -> usize {
+    let separators = entry_escaped_lens.len().saturating_sub(1);
+    metadata_escaped_len + entry_escaped_lens.iter().sum::<usize>() + separators
+}
+
+/// The number of bytes `bytes` would occupy once JSON-string-escaped
+/// (excluding the surrounding quotes), matching serde_json's default
+/// formatter (`ESCAPE` table in `serde_json::ser`) byte for byte. Escaping
+/// has no cross-byte state, so this is additive over concatenation — the
+/// property `fit_rendered_batch_envelope` relies on to compute the frame
+/// length from per-entry lengths instead of re-serializing the envelope.
+fn json_escaped_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .map(|&byte| match byte {
+            b'"' | b'\\' => 2,
+            0x08 | 0x09 | 0x0A | 0x0C | 0x0D => 2,
+            0x00..=0x1F => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// The daemon-frame byte length for an empty rendered payload — the fixed
+/// overhead every non-empty payload's escaped length is added on top of.
+fn empty_rendered_daemon_frame_len(served_config_id: &str) -> usize {
+    rendered_response_daemon_frame_len("", served_config_id)
 }
 
 fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
@@ -3995,10 +4084,7 @@ fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
 
 /// Rebuild aggregate outcome fields after the transport layer turns one or
 /// more oversized successes into explicit failures.
-fn refresh_frame_budget_outcome(map: &mut serde_json::Map<String, Value>) {
-    let Some(results) = map.get("results").and_then(Value::as_array) else {
-        return;
-    };
+fn refresh_frame_budget_outcome(map: &mut serde_json::Map<String, Value>, results: &[Value]) {
     let total = results.len();
     let succeeded = results
         .iter()
@@ -4032,15 +4118,6 @@ fn serialized_response_len(value: &Value) -> usize {
 
 fn serialize_response_value(value: &Value) -> String {
     serde_json::to_string(value).expect("serde_json::Value is always serializable")
-}
-
-fn response_value_fits_daemon_frame(value: &Value, served_config_id: &str) -> bool {
-    response_value_daemon_frame_len(value, served_config_id)
-        <= khive_runtime::daemon::MAX_FRAME_BYTES
-}
-
-fn response_value_daemon_frame_len(value: &Value, served_config_id: &str) -> usize {
-    rendered_response_daemon_frame_len(&serialize_response_value(value), served_config_id)
 }
 
 fn rendered_response_fits_daemon_frame(rendered: &str, served_config_id: &str) -> bool {
@@ -5990,7 +6067,184 @@ mod tests {
         assert!(fitted["results"][0]["error"]
             .as_str()
             .is_some_and(|error| error.contains("frame budget was exceeded")));
-        assert!(response_value_fits_daemon_frame(&fitted, "test-config"));
+        assert!(rendered_response_fits_daemon_frame(
+            &serialize_response_value(&fitted),
+            "test-config"
+        ));
+    }
+
+    /// `envelope_escaped_len` claims that a batch envelope's daemon-frame
+    /// length can be derived from `envelope_metadata_escaped_len` (the
+    /// envelope with `results: []`) plus each entry's own escaped length
+    /// plus separators, without ever re-serializing the populated envelope.
+    /// Check that claim by direct measurement across shapes that stress the
+    /// escaping (nested containers, quotes, backslashes, control characters).
+    #[test]
+    fn envelope_escaped_len_matches_direct_daemon_frame_serialization() {
+        let served_config_id = "escape-probe";
+        let shapes: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![json!({"ok": true, "tool": "t", "result": 1})],
+            (0..5)
+                .map(|i| json!({"ok": true, "tool": format!("t{i}"), "result": i}))
+                .collect(),
+            vec![
+                json!({
+                    "ok": true,
+                    "tool": "t",
+                    "result": {"nested": [1, 2, [3, 4], "a\"b\\c\nline\ttab\u{1}ctrl\u{7f}del"]},
+                }),
+                json!({
+                    "ok": false,
+                    "tool": "t2",
+                    "error": "quote \" backslash \\ newline \n unicode \u{1}",
+                }),
+            ],
+        ];
+
+        for results in shapes {
+            let entry_count = results.len();
+            let envelope = parallel_batch_envelope(results.clone());
+            let map = envelope.as_object().expect("batch envelope object");
+            let metadata = envelope_metadata(map);
+            let metadata_len = envelope_metadata_escaped_len(&metadata);
+            let entry_lens: Vec<usize> = results.iter().map(entry_escaped_len).collect();
+
+            let incremental = empty_rendered_daemon_frame_len(served_config_id)
+                + envelope_escaped_len(&entry_lens, metadata_len);
+            let direct = rendered_response_daemon_frame_len(
+                &serialize_response_value(&envelope),
+                served_config_id,
+            );
+            assert_eq!(
+                incremental, direct,
+                "shape with {entry_count} entries: incremental frame length must match \
+                 direct serialization"
+            );
+        }
+    }
+
+    /// Reproduces a defect found while writing this fixture: the pre-incremental
+    /// `fit_rendered_batch_envelope` computed `rendered_frame_bytes -
+    /// compact_frame_bytes` as a plain (eagerly evaluated) argument to
+    /// `bool::then_some`, so the subtraction ran unconditionally — including
+    /// when `compact_frame_bytes >= rendered_frame_bytes`, i.e. exactly the
+    /// case Agent JSON reduction introduces (canonical retains `full_id`/
+    /// `namespace` and so can be the larger side). That underflowed and
+    /// panicked in a debug/test build; in a release build (no overflow
+    /// checks) it wrapped to a huge value that would have sorted the
+    /// oversized canonical form to the FRONT of the fallback queue instead
+    /// of excluding it. This test fails loudly (panic) if that pattern comes
+    /// back, and separately asserts the entry is left untouched rather than
+    /// silently swapped.
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn fit_rendered_batch_envelope_never_falls_back_when_compact_is_larger() {
+        let registry = frame_budget_category_test_registry();
+        let rendered_kept = Value::String("kept-rendered".to_string());
+        let compact_larger =
+            Value::String("kept-rendered-with-extra-canonical-metadata-suffix".to_string());
+        let oversized = Value::String("Z".repeat(9_000_000));
+
+        let compact_results = vec![
+            json!({"ok": true, "tool": "small-a", "result": compact_larger}),
+            json!({"ok": true, "tool": "big-b", "result": oversized.clone()}),
+        ];
+        let out_results = vec![
+            json!({"ok": true, "tool": "small-a", "result": rendered_kept.clone()}),
+            json!({"ok": true, "tool": "big-b", "result": oversized}),
+        ];
+        let envelope = parallel_batch_envelope(compact_results.clone());
+        let map = envelope.as_object().expect("batch envelope object");
+
+        let fitted = fit_rendered_batch_envelope(
+            map,
+            &compact_results,
+            out_results,
+            "compact-larger-probe",
+            &registry,
+        );
+        let fitted = Value::Object(fitted);
+
+        assert_eq!(
+            fitted["results"][0]["result"], rendered_kept,
+            "entry whose canonical form is larger than its rendered form must never fall back"
+        );
+        assert_eq!(fitted["results"][1]["ok"], false);
+        assert_eq!(
+            fitted["results"][1]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+    }
+
+    /// Snapshot equivalence: this fixture avoids any canonical-larger-than-
+    /// rendered entry (see the dedicated test above for that case, which the
+    /// pre-incremental code could not even run without panicking) so it can
+    /// be run unmodified against the pre-incremental `fit_rendered_batch_envelope`
+    /// for a baseline. Captured before the incremental rewrite:
+    ///
+    /// ```text
+    /// PROBE index=0 tool=big-a ok=Some(false) result_len=None error_kind=Some("response_frame_budget_exceeded")
+    /// PROBE index=1 tool=mid-b ok=Some(true) result_len=Some(2900000) error_kind=None
+    /// PROBE index=2 tool=small-c ok=Some(true) result_len=Some(5) error_kind=None
+    /// PROBE summary={"aborted":0,"failed":1,"succeeded":2,"total":3}
+    /// PROBE status="partial"
+    /// PROBE total_serialized_len=2900530
+    /// ```
+    ///
+    /// i.e. the modest compact-fallback saving on `big-a` (150,000 bytes)
+    /// isn't enough alone, `mid-b`'s fallback is applied, and `big-a` is the
+    /// one omitted afterward (largest current entry) — never `mid-b` or
+    /// `small-c`.
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn fit_rendered_batch_envelope_matches_pre_incremental_behavior_for_fixed_fixture() {
+        let registry = frame_budget_category_test_registry();
+        let rendered0 = Value::String("A".repeat(6_000_000));
+        let compact0 = Value::String("A".repeat(5_900_000));
+        let rendered1 = Value::String("B".repeat(3_000_000));
+        let compact1 = Value::String("B".repeat(2_900_000));
+        let small = Value::String("small".to_string());
+
+        let compact_results = vec![
+            json!({"ok": true, "tool": "big-a", "result": compact0}),
+            json!({"ok": true, "tool": "mid-b", "result": compact1}),
+            json!({"ok": true, "tool": "small-c", "result": small.clone()}),
+        ];
+        let out_results = vec![
+            json!({"ok": true, "tool": "big-a", "result": rendered0}),
+            json!({"ok": true, "tool": "mid-b", "result": rendered1}),
+            json!({"ok": true, "tool": "small-c", "result": small}),
+        ];
+        let envelope = parallel_batch_envelope(compact_results.clone());
+        let map = envelope.as_object().expect("batch envelope object");
+
+        let fitted = fit_rendered_batch_envelope(
+            map,
+            &compact_results,
+            out_results,
+            "probe-config",
+            &registry,
+        );
+        let fitted = Value::Object(fitted);
+
+        assert_eq!(fitted["results"][0]["ok"], false);
+        assert_eq!(
+            fitted["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        assert_eq!(fitted["results"][1]["ok"], true);
+        assert_eq!(
+            fitted["results"][1]["result"].as_str().map(str::len),
+            Some(2_900_000)
+        );
+        assert_eq!(fitted["results"][2]["result"], json!("small"));
+        assert_eq!(
+            fitted["summary"],
+            json!({"total": 3, "succeeded": 2, "failed": 1, "aborted": 0})
+        );
+        assert_eq!(fitted["status"], "partial");
+        assert_eq!(serialized_response_len(&fitted), 2_900_530);
     }
 
     #[test]
