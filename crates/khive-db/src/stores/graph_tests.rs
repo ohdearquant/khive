@@ -3,8 +3,18 @@ use crate::pool::PoolConfig;
 use khive_storage::types::{
     Direction, TraversalExecutionBudget, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_ROOTS,
 };
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
+
+fn deny_count_function(ctx: AuthContext<'_>) -> Authorization {
+    match ctx.action {
+        AuthAction::Function { function_name } if function_name.eq_ignore_ascii_case("count") => {
+            Authorization::Deny
+        }
+        _ => Authorization::Allow,
+    }
+}
 
 /// Deterministic barrier at the exact insert-to-probe seam
 /// [`edge_insert_guarded`] calls into (via `#[cfg(test)] hook(...)`) after a
@@ -287,6 +297,95 @@ fn make_edge(source: Uuid, target: Uuid, relation: EdgeRelation, weight: f64) ->
 }
 
 #[tokio::test]
+async fn edge_pages_run_when_sqlite_count_is_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("graph-count-free-pages.db")),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+    }
+    // Pooled-reader mode lets the authorizer below observe the exact
+    // connection used by both the control count and the page queries.
+    let store = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "count-free-a");
+    for namespace in ["count-free-a", "count-free-b"] {
+        let mut edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+        edge.namespace = namespace.to_string();
+        store.upsert_edge(edge).await.unwrap();
+    }
+    assert_eq!(
+        store
+            .count_edges_in_namespaces(
+                &["count-free-a".to_string(), "count-free-b".to_string()],
+                EdgeFilter::default(),
+            )
+            .await
+            .unwrap(),
+        2,
+        "the explicit count API remains exact"
+    );
+
+    {
+        let reader = pool.reader().unwrap();
+        reader.conn().authorizer(Some(deny_count_function)).unwrap();
+    }
+
+    assert!(
+        store.count_edges(EdgeFilter::default()).await.is_err(),
+        "the exact-count control must be rejected by the authorizer"
+    );
+    let page = store
+        .query_edges(
+            EdgeFilter::default(),
+            vec![],
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("single-namespace page must not invoke SQLite count");
+    assert_eq!(page.total, None);
+    assert_eq!(page.items.len(), 1);
+
+    let namespaces = vec!["count-free-a".to_string(), "count-free-b".to_string()];
+    assert!(
+        store
+            .count_edges_in_namespaces(&namespaces, EdgeFilter::default())
+            .await
+            .is_err(),
+        "the multi-namespace exact-count control must be rejected by the authorizer"
+    );
+    let page = store
+        .query_edges_in_namespaces(
+            &namespaces,
+            EdgeFilter::default(),
+            vec![],
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("multi-namespace page must not invoke SQLite count");
+    assert_eq!(page.total, None);
+    assert_eq!(page.items.len(), 2);
+
+    let reader = pool.reader().unwrap();
+    reader
+        .conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+}
+
+#[tokio::test]
 async fn query_edges_in_namespaces_offset_paging_enumerates_exactly() {
     // #2088 regression: two namespaces, every edge sharing one created_at
     // (the worst tie population), paged by offset to exhaustion. The single
@@ -326,7 +425,7 @@ async fn query_edges_in_namespaces_offset_paging_enumerates_exactly() {
             )
             .await
             .unwrap();
-        assert_eq!(page.total, Some(40));
+        assert_eq!(page.total, None);
         if page.items.is_empty() {
             break;
         }
@@ -621,7 +720,7 @@ async fn query_edges_in_namespaces_offset_paging_exceeds_sqlite_variable_limit()
             )
             .await
             .unwrap();
-        assert_eq!(page.total, Some(12));
+        assert_eq!(page.total, None);
         if page.items.is_empty() {
             break;
         }

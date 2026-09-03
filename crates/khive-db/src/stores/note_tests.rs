@@ -1,6 +1,7 @@
 use super::*;
 use crate::pool::PoolConfig;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+use serial_test::serial;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn deny_commit(ctx: AuthContext<'_>) -> Authorization {
@@ -17,6 +18,15 @@ fn deny_rollback(ctx: AuthContext<'_>) -> Authorization {
         AuthAction::Transaction {
             operation: TransactionOperation::Rollback,
         } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }
+}
+
+fn deny_count_function(ctx: AuthContext<'_>) -> Authorization {
+    match ctx.action {
+        AuthAction::Function { function_name } if function_name.eq_ignore_ascii_case("count") => {
+            Authorization::Deny
+        }
         _ => Authorization::Allow,
     }
 }
@@ -586,6 +596,7 @@ async fn assert_page_count_and_items_share_snapshot(query: SnapshotPageQuery) {
 }
 
 #[tokio::test]
+#[serial]
 async fn note_page_count_and_items_share_one_snapshot_during_concurrent_insert() {
     for query in [SnapshotPageQuery::Basic, SnapshotPageQuery::Filtered] {
         assert_page_count_and_items_share_snapshot(query).await;
@@ -593,11 +604,262 @@ async fn note_page_count_and_items_share_one_snapshot_during_concurrent_insert()
 }
 
 #[tokio::test]
-async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update() {
+async fn filtered_count_free_page_runs_without_count_over_large_match_set() {
     use khive_storage::note::PropertyFilter as NotePropFilter;
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("note-filter-count-snapshot.db");
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("note-count-free-large-filter.db")),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+    // Use the pooled-reader mode so the authorizer installed below is the
+    // exact connection both control and count-free queries execute on.
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
+    let namespace = format!("count-free-large-{}", Uuid::new_v4().simple());
+    let notes = (0..2_000)
+        .map(|index| {
+            let mut note = make_note_with_props(
+                &namespace,
+                "message",
+                &format!("message-{index}"),
+                serde_json::json!({"direction": "inbound"}),
+            );
+            note.created_at = index;
+            note
+        })
+        .collect();
+    let summary = store.upsert_notes(notes).await.unwrap();
+    assert_eq!(summary.failed, 0, "large filtered seed failed: {summary:?}");
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![NotePropFilter {
+            json_path: "$.direction".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text("inbound".to_string()),
+        }],
+        ..NoteFilter::default()
+    };
+    {
+        let reader = pool.reader().unwrap();
+        reader.conn().authorizer(Some(deny_count_function)).unwrap();
+    }
+
+    let request = PageRequest {
+        offset: 0,
+        limit: 6,
+    };
+    let exact_control = store
+        .query_notes_filtered(&namespace, &filter, request.clone())
+        .await;
+    assert!(
+        exact_control.is_err(),
+        "control exact-count page must be rejected by the count authorizer"
+    );
+
+    let exact_unfiltered_control = store
+        .query_notes(&namespace, Some("message"), request.clone())
+        .await;
+    assert!(
+        exact_unfiltered_control.is_err(),
+        "control unfiltered exact-count page must be rejected by the count authorizer"
+    );
+
+    let page = store
+        .query_notes_filtered_count_free(&namespace, &filter, request.clone())
+        .await
+        .expect("count-free page must not invoke SQLite count");
+    assert_eq!(page.total, None);
+    assert_eq!(page.items.len(), 6, "caller receives its lookahead row");
+    assert_eq!(page.items[0].content, "message-1999");
+    assert_eq!(page.items[5].content, "message-1994");
+
+    let unfiltered_page = store
+        .query_notes_count_free(&namespace, Some("message"), request)
+        .await
+        .expect("unfiltered count-free page must not invoke SQLite count");
+    assert_eq!(unfiltered_page.total, None);
+    assert_eq!(unfiltered_page.items.len(), 6);
+    assert_eq!(unfiltered_page.items[0].content, "message-1999");
+    assert_eq!(unfiltered_page.items[5].content, "message-1994");
+
+    let reader = pool.reader().unwrap();
+    reader
+        .conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn filtered_count_free_page_keeps_one_statement_snapshot_and_total_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("note-count-free-snapshot.db")),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+    let store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
+    let namespace = format!("count-free-snapshot-{}", Uuid::new_v4().simple());
+    let mut initial = Vec::new();
+    for content in ["a", "b", "c"] {
+        let mut note = make_note_with_props(
+            &namespace,
+            "message",
+            content,
+            serde_json::json!({"page_case": true}),
+        );
+        note.created_at = 10;
+        initial.push(note);
+    }
+    let mut expected_ids: Vec<_> = initial.iter().map(|note| note.id).collect();
+    expected_ids.sort();
+    store.upsert_notes(initial).await.unwrap();
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![khive_storage::note::PropertyFilter {
+            json_path: "$.page_case".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Bool(true),
+        }],
+        ..NoteFilter::default()
+    };
+    let (reached_rx, proceed_tx) =
+        page_snapshot_seam::install("query_notes_filtered_count_free", namespace.clone());
+    let query_task = {
+        let store = Arc::clone(&store);
+        let namespace = namespace.clone();
+        let filter = filter.clone();
+        tokio::spawn(async move {
+            store
+                .query_notes_filtered_count_free(
+                    &namespace,
+                    &filter,
+                    PageRequest {
+                        offset: 0,
+                        limit: 3,
+                    },
+                )
+                .await
+        })
+    };
+
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .expect("waiting for the row-step seam must not panic")
+        .expect("count-free query must step its first row");
+
+    let mut concurrent = make_note_with_props(
+        &namespace,
+        "message",
+        "concurrent",
+        serde_json::json!({"page_case": true}),
+    );
+    concurrent.created_at = 11;
+    let concurrent_id = concurrent.id;
+    store
+        .upsert_note(concurrent)
+        .await
+        .expect("WAL writer must commit while the page statement is paused");
+    proceed_tx.send(()).unwrap();
+
+    let page = query_task.await.unwrap().unwrap();
+    page_snapshot_seam::uninstall();
+    assert_eq!(page.total, None);
+    assert_eq!(
+        page.items.iter().map(|note| note.id).collect::<Vec<_>>(),
+        expected_ids,
+        "the lookahead page must retain id-ascending tie order on its pinned snapshot"
+    );
+
+    let after = store
+        .query_notes_filtered_count_free(
+            &namespace,
+            &filter,
+            PageRequest {
+                offset: 0,
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.items[0].id, concurrent_id);
+    assert_eq!(
+        after.items[1..]
+            .iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SnapshotCountQuery {
+    Exact,
+    Bounded,
+}
+
+impl SnapshotCountQuery {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Exact => "count_notes_filtered_in_snapshot",
+            Self::Bounded => "count_notes_filtered_bounded_in_snapshot",
+        }
+    }
+}
+
+async fn run_snapshot_count_query(
+    store: &SqlNoteStore,
+    query: SnapshotCountQuery,
+    namespace: &str,
+    filters: &[NoteFilter],
+) -> Result<Vec<u64>, StorageError> {
+    match query {
+        SnapshotCountQuery::Exact => {
+            store
+                .count_notes_filtered_in_snapshot(namespace, filters)
+                .await
+        }
+        SnapshotCountQuery::Bounded => store
+            .count_notes_filtered_bounded_in_snapshot(namespace, filters, 10)
+            .await
+            .map(|counts| {
+                counts
+                    .into_iter()
+                    .map(|count| {
+                        assert!(!count.saturated, "one-row partition cannot hit cap");
+                        assert_eq!(count.cap, 10);
+                        count.count
+                    })
+                    .collect()
+            }),
+    }
+}
+
+async fn assert_filtered_count_partitions_share_snapshot(query: SnapshotCountQuery) {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(format!("note-filter-count-snapshot-{query:?}.db"));
     let pool = Arc::new(
         ConnectionPool::new(PoolConfig {
             path: Some(path),
@@ -658,16 +920,14 @@ async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update()
     ];
 
     let (reached_rx, proceed_tx) =
-        page_snapshot_seam::install("count_notes_filtered_in_snapshot", namespace.clone());
+        page_snapshot_seam::install(query.operation(), namespace.clone());
     let query_task = {
         let store = Arc::clone(&store);
         let namespace = namespace.clone();
         let filters = filters.clone();
-        tokio::spawn(async move {
-            store
-                .count_notes_filtered_in_snapshot(&namespace, &filters)
-                .await
-        })
+        tokio::spawn(
+            async move { run_snapshot_count_query(&store, query, &namespace, &filters).await },
+        )
     };
 
     tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
@@ -696,14 +956,69 @@ async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update()
 
     assert_eq!(counts, vec![1, 0], "both partitions must use one snapshot");
 
-    let after = store
-        .count_notes_filtered_in_snapshot(&namespace, &filters)
+    let after = run_snapshot_count_query(&store, query, &namespace, &filters)
         .await
         .unwrap();
     assert_eq!(
         after,
         vec![0, 1],
         "the committed update must appear afterward"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update() {
+    for query in [SnapshotCountQuery::Exact, SnapshotCountQuery::Bounded] {
+        assert_filtered_count_partitions_share_snapshot(query).await;
+    }
+}
+
+#[tokio::test]
+async fn bounded_filtered_count_is_exact_at_cap_and_saturates_above_it() {
+    use khive_storage::BoundedCount;
+
+    let store = setup_memory_store();
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        ..NoteFilter::default()
+    };
+    for index in 0..5 {
+        store
+            .upsert_note(make_note("default", "message", &format!("message-{index}")))
+            .await
+            .unwrap();
+    }
+
+    let exact = store
+        .count_notes_filtered_bounded_in_snapshot("default", std::slice::from_ref(&filter), 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        exact,
+        vec![BoundedCount {
+            count: 5,
+            cap: 5,
+            saturated: false,
+        }],
+        "a population equal to the cap is still exact"
+    );
+
+    store
+        .upsert_note(make_note("default", "message", "over-cap"))
+        .await
+        .unwrap();
+    let saturated = store
+        .count_notes_filtered_bounded_in_snapshot("default", &[filter], 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        saturated,
+        vec![BoundedCount {
+            count: 5,
+            cap: 5,
+            saturated: true,
+        }]
     );
 }
 
@@ -1961,11 +2276,19 @@ async fn page_offset_over_i64max_rejected() {
     );
 
     let filtered_result = store
-        .query_notes_filtered("ns1", &NoteFilter::default(), oversized)
+        .query_notes_filtered("ns1", &NoteFilter::default(), oversized.clone())
         .await;
     assert!(
         matches!(filtered_result, Err(StorageError::InvalidInput { .. })),
         "query_notes_filtered: expected InvalidInput, got {filtered_result:?}"
+    );
+
+    let count_free_result = store
+        .query_notes_filtered_count_free("ns1", &NoteFilter::default(), oversized)
+        .await;
+    assert!(
+        matches!(count_free_result, Err(StorageError::InvalidInput { .. })),
+        "query_notes_filtered_count_free: expected InvalidInput, got {count_free_result:?}"
     );
 }
 
@@ -2309,7 +2632,7 @@ fn transactional_write_refreshes_writer_task_after_construction_outside_runtime(
 // -- unread-probe partial index tests --
 
 /// The comm unread probe (badge count + inbox unread listing) must be served
-/// by `idx_notes_unread_probe_recipient`, so its work scales with the unread set, not
+/// by `idx_notes_unread_probe_recipient_direction`, so its work scales with the unread set, not
 /// total mailbox size. The assertions below are the actual discriminator: the
 /// generated WHERE SQL contains the literal form and `JsonTypeNeMissing` contributes
 /// no bind parameter. The plan before and after dropping the index is only an
@@ -2414,7 +2737,7 @@ async fn unread_probe_query_uses_partial_index() {
     };
     let indexed_plan = plan(&sql, &params);
     assert!(
-        indexed_plan.contains("idx_notes_unread_probe_recipient"),
+        indexed_plan.contains("idx_notes_unread_probe_recipient_direction"),
         "unread probe must be served by the partial index, got plan:\n{indexed_plan}"
     );
 
@@ -2427,11 +2750,11 @@ async fn unread_probe_query_uses_partial_index() {
     // a literal is provable at prepare time everywhere.)
     reader
         .conn()
-        .execute_batch("DROP INDEX idx_notes_unread_probe_recipient")
+        .execute_batch("DROP INDEX idx_notes_unread_probe_recipient_direction")
         .unwrap();
     let control_plan = plan(&sql, &params);
     assert!(
-        !control_plan.contains("idx_notes_unread_probe_recipient"),
+        !control_plan.contains("idx_notes_unread_probe_recipient_direction"),
         "control: dropped index must vanish from the plan, got:\n{control_plan}"
     );
 }
@@ -2512,14 +2835,14 @@ async fn unread_probe_legacy_partition_includes_null_and_uses_partial_index() {
         .collect();
     let plan = plan.join("\n");
     assert!(
-        plan.contains("idx_notes_unread_probe_recipient"),
+        plan.contains("idx_notes_unread_probe_recipient_direction"),
         "legacy recipient partition must use the partial index, got plan:\n{plan}"
     );
 }
 
 /// The unread probe's work must scale with the CALLER's unread set, not
 /// with other recipients' backlog: the recipient key column on
-/// `idx_notes_unread_probe_recipient` (the exact `ifnull(...)` expression
+/// `idx_notes_unread_probe_recipient_direction` (the exact `ifnull(...)` expression
 /// EqOrMissingIndexed generates) lets the planner exclude other actors' rows
 /// inside the index. Grow an irrelevant recipient's unread backlog 10x and
 /// assert the probe's VM step count stays flat — a recipient-blind scan
@@ -2631,6 +2954,632 @@ async fn unread_probe_work_is_bounded_by_callers_own_unread_rows() {
          {steps_small} VM steps at 200 irrelevant rows vs {steps_large} at 2000 \
          (a recipient-scoped probe stays flat; a blind scan grows ~10x)"
     );
+}
+
+/// khive#2318 follow-up: every `comm.send` durably writes an outbound copy
+/// addressed to the recipient (`to_actor` set the same as the inbound copy)
+/// whose `read` property is never subsequently set to `true` — the sender's
+/// own copy is never opened by the recipient. That outbound row sits in the
+/// same `(namespace, kind, to_actor)` partition of the unread-probe partial
+/// index as the recipient's genuinely unread inbound rows for the rest of
+/// its life. `direction='inbound'` is a residual predicate (a bound
+/// parameter, not a key column) on both the bounded-count SQL
+/// (`count_notes_filtered_bounded_in_snapshot`) and the ordered unread
+/// listing SQL, so growing a recipient's own OUTBOUND history — not another
+/// recipient's backlog, not the recipient's own unread inbound count — must
+/// not grow the work either statement does. This pins the fix
+/// (`idx_notes_unread_probe_recipient_direction`'s direction key column)
+/// against the regression it closes: the control section below reproduces
+/// the pre-fix shape and shows it fails the same assertion.
+#[tokio::test]
+async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+    use rusqlite::StatementStatus;
+
+    const CAP: i64 = 1_000;
+
+    fn count_filter() -> NoteFilter {
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters: vec![
+                NotePropFilter {
+                    json_path: "$.direction".to_string(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text("inbound".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.read".to_string(),
+                    op: FilterOp::JsonTypeNeMissing,
+                    value: SqlValue::Text("true".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.to_actor".to_string(),
+                    op: FilterOp::EqOrMissingIndexed,
+                    value: SqlValue::Text("actor:a".to_string()),
+                },
+            ],
+            order_by: None,
+            ..Default::default()
+        }
+    }
+
+    // Mirrors count_notes_filtered_bounded_in_snapshot's inner SQL exactly
+    // (note.rs ~1618-1627): the LIMIT bounds rows that MATCH the full WHERE
+    // clause, not index entries visited before direction rejects them.
+    fn count_sql_and_params(filter: &NoteFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        params.push(Box::new(CAP + 1));
+        let limit_idx = params.len();
+        (
+            format!("SELECT COUNT(*) FROM (SELECT 1 FROM notes{where_sql} LIMIT ?{limit_idx})"),
+            params,
+        )
+    }
+
+    // Mirrors the ordered unread-listing shape (query_notes_filtered_bounded /
+    // the comm.inbox unread listing, note.rs ~1748-1752).
+    fn list_sql_and_params(filter: &NoteFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        params.push(Box::new(CAP + 1));
+        let limit_idx = params.len();
+        (
+            format!(
+                "SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT ?{limit_idx}"
+            ),
+            params,
+        )
+    }
+
+    fn seed_inbound(conn: &rusqlite::Connection, n: usize) {
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', 'inbound', 'to_actor', 'actor:a'), \
+                         ?3, ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("mine {i}"),
+                    i as i64
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    // Same recipient key (`to_actor: actor:a`) as the inbound rows above,
+    // direction='outbound', `read` absent — exactly the shape
+    // dual_write_message leaves behind for every message ever sent TO
+    // actor:a (the sender's own copy of that delivery), stamped strictly
+    // newer so a created_at DESC scan meets it before the caller's own rows.
+    fn seed_outbound(conn: &rusqlite::Connection, n: usize) {
+        let base: i64 = conn
+            .query_row("SELECT ifnull(max(created_at), 0) FROM notes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..n {
+            let stamp = base + 1 + i as i64;
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', 'outbound', 'to_actor', 'actor:a'), \
+                         ?3, ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("sent-copy {i}"),
+                    stamp
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    fn measure(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> (i64, i32) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let value: i64 = stmt.query_row(refs.as_slice(), |row| row.get(0)).unwrap();
+        (value, stmt.get_status(StatementStatus::VmStep))
+    }
+
+    fn measure_list(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> (usize, i32) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows: Vec<String> = stmt
+            .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let steps = stmt.get_status(StatementStatus::VmStep);
+        (rows.len(), steps)
+    }
+
+    // -- Fixed: idx_notes_unread_probe_recipient_direction is live. --
+    let pool = setup_pool();
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_inbound(conn, 5);
+    }
+
+    let filter = count_filter();
+    let (count_sql, count_params) = count_sql_and_params(&filter);
+    let (list_sql, list_params) = list_sql_and_params(&filter);
+
+    {
+        let reader = pool.reader().unwrap();
+        let plan = |sql: &str, params: &[Box<dyn rusqlite::types::ToSql>]| -> String {
+            let mut stmt = reader
+                .conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let details: Vec<String> = stmt
+                .query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            details.join("\n")
+        };
+        let count_plan = plan(&count_sql, &count_params);
+        assert!(
+            count_plan.contains("idx_notes_unread_probe_recipient_direction"),
+            "bounded-count query must be served by the direction-aware index, got:\n{count_plan}"
+        );
+        let list_plan = plan(&list_sql, &list_params);
+        assert!(
+            list_plan.contains("idx_notes_unread_probe_recipient_direction"),
+            "unread listing query must be served by the direction-aware index, got:\n{list_plan}"
+        );
+    }
+
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_outbound(conn, 3_000);
+    }
+    let (count_val_small, count_steps_small) = {
+        let reader = pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    let (list_rows_small, list_steps_small) = {
+        let reader = pool.reader().unwrap();
+        measure_list(reader.conn(), &list_sql, &list_params)
+    };
+    assert_eq!(
+        count_val_small, 5,
+        "only the caller's unread inbound rows count"
+    );
+    assert_eq!(
+        list_rows_small, 5,
+        "only the caller's unread inbound rows list"
+    );
+
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_outbound(conn, 27_000); // cumulative outbound backlog: 30_000 (10x)
+    }
+    let (count_val_large, count_steps_large) = {
+        let reader = pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    let (list_rows_large, list_steps_large) = {
+        let reader = pool.reader().unwrap();
+        measure_list(reader.conn(), &list_sql, &list_params)
+    };
+    assert_eq!(
+        count_val_large, 5,
+        "only the caller's unread inbound rows count"
+    );
+    assert_eq!(
+        list_rows_large, 5,
+        "only the caller's unread inbound rows list"
+    );
+
+    assert!(
+        count_steps_large < count_steps_small.saturating_mul(3),
+        "bounded-count work scaled with the recipient's own outbound history: \
+         {count_steps_small} VM steps at 3,000 outbound rows vs {count_steps_large} at 30,000 \
+         (a direction-scoped probe stays flat; a direction-blind scan grows ~10x)"
+    );
+    assert!(
+        list_steps_large < list_steps_small.saturating_mul(3),
+        "unread listing work scaled with the recipient's own outbound history: \
+         {list_steps_small} VM steps at 3,000 outbound rows vs {list_steps_large} at 30,000 \
+         (a direction-scoped probe stays flat; a direction-blind scan grows ~10x)"
+    );
+
+    // -- Control: reproduce the pre-fix (direction-blind) index shape and
+    // show the same assertion fails, proving the bound above is real and not
+    // an artifact of small numbers or an unrelated planner choice. --
+    let control_pool = setup_pool();
+    {
+        let writer = control_pool.writer().unwrap();
+        let conn = writer.conn();
+        conn.execute_batch(
+            "DROP INDEX idx_notes_unread_probe_recipient_direction;
+             CREATE INDEX idx_notes_unread_probe_recipient_control
+                 ON notes(namespace, kind,
+                          ifnull(json_extract(properties, '$.to_actor'), ''),
+                          created_at DESC, id ASC)
+                 WHERE (json_type(properties, '$.read') IS NULL
+                        OR json_type(properties, '$.read') != 'true')
+                   AND deleted_at IS NULL;",
+        )
+        .unwrap();
+        seed_inbound(conn, 5);
+        seed_outbound(conn, 3_000);
+    }
+    let (control_count_small, control_count_steps_small) = {
+        let reader = control_pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    {
+        let writer = control_pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_outbound(conn, 27_000);
+    }
+    let (control_count_large, control_count_steps_large) = {
+        let reader = control_pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    assert_eq!(
+        control_count_small, 5,
+        "control: same correct value at 3,000 outbound"
+    );
+    assert_eq!(
+        control_count_large, 5,
+        "control: same correct value at 30,000 outbound"
+    );
+    assert!(
+        control_count_steps_large > control_count_steps_small.saturating_mul(3),
+        "control instrument did not reproduce the pre-fix growth: \
+         {control_count_steps_small} VM steps at 3,000 outbound rows vs \
+         {control_count_steps_large} at 30,000 under the direction-blind index shape \
+         (expected clear growth, proving the fixed measurement above is falsifiable)"
+    );
+}
+
+/// `comm.inbox(status="unread")` builds its `to_actor` predicate at
+/// khive-pack-comm/src/handlers.rs ~613-624: `direction` (`Eq`), `read`
+/// (`JsonTypeNeMissing`), then `to_actor`. Before this test's fix, that last
+/// filter used `FilterOp::EqOrMissing`, whose SQL
+/// (`(json_extract(...) = ? OR json_extract(...) IS NULL)`) is a different
+/// expression than any indexed key in the schema (the recipient-scoped
+/// partial index at `idx_notes_unread_probe_recipient_direction` is keyed on
+/// `ifnull(json_extract(...), '')`, not the raw extract), so the planner
+/// fell back to `idx_comm_message_direction` (namespace, kind, direction,
+/// read — no recipient key at all) and every caller's unread inbox listing
+/// scanned every unread inbound row IN THE NAMESPACE, not just their own.
+/// `idx_comm_message_direction` (khive-pack-comm/src/vocab.rs) is reproduced
+/// here verbatim since khive-db has no dependency on khive-pack-comm to
+/// import it from; it must be present for this test to reflect the real
+/// index landscape a comm-pack-loaded server actually has.
+///
+/// The control section pins the pre-fix `EqOrMissing` shape (still reachable
+/// as a `FilterOp` variant) against the exact regression this closes: it
+/// must NOT seek the recipient index and its scan work must grow with
+/// OTHER actors' unread backlog. The fixed section proves
+/// `FilterOp::EqOrLegacyIndexed` seeks the recipient-scoped partial index
+/// instead and stays flat.
+#[tokio::test]
+async fn inbox_unread_listing_uses_recipient_index_not_direction_blind_scan() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+    use rusqlite::StatementStatus;
+
+    fn listing_filter(to_actor_op: FilterOp) -> NoteFilter {
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters: vec![
+                NotePropFilter {
+                    json_path: "$.direction".to_string(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text("inbound".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.read".to_string(),
+                    op: FilterOp::JsonTypeNeMissing,
+                    value: SqlValue::Text("true".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.to_actor".to_string(),
+                    op: to_actor_op,
+                    value: SqlValue::Text("actor:a".to_string()),
+                },
+            ],
+            order_by: None,
+            ..Default::default()
+        }
+    }
+
+    fn listing_sql_and_params(
+        filter: &NoteFilter,
+    ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        params.push(Box::new(1001_i64));
+        let limit_idx = params.len();
+        (
+            format!(
+                "SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT ?{limit_idx}"
+            ),
+            params,
+        )
+    }
+
+    fn plan(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn measure_list(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> (usize, i32) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows: Vec<String> = stmt
+            .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let steps = stmt.get_status(StatementStatus::VmStep);
+        (rows.len(), steps)
+    }
+
+    fn seed(
+        conn: &rusqlite::Connection,
+        to_actor: &str,
+        direction: &str,
+        n: usize,
+        start_stamp: i64,
+    ) {
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', ?3, 'to_actor', ?4), ?5, ?5)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("{to_actor}-{direction}-{i}"),
+                    direction,
+                    to_actor,
+                    start_stamp + i as i64,
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    fn build_pool_with_comm_indexes() -> Arc<ConnectionPool> {
+        let pool = setup_pool();
+        let writer = pool.writer().unwrap();
+        // Reproduces khive-pack-comm/src/vocab.rs COMM_SCHEMA_PLAN_STMTS's
+        // idx_comm_message_direction verbatim: applied at comm-pack init in
+        // the real system, so this test reflects the actual index landscape
+        // a comm-pack-loaded server has (khive-db cannot depend on
+        // khive-pack-comm to import the constant directly).
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
+                    ON notes(namespace, kind, json_extract(properties, '$.direction'), \
+                    json_extract(properties, '$.read'), created_at DESC) \
+                    WHERE deleted_at IS NULL;",
+            )
+            .unwrap();
+        drop(writer);
+        pool
+    }
+
+    // -- Control: reproduce the pre-fix EqOrMissing shape. --
+    {
+        let pool = build_pool_with_comm_indexes();
+        {
+            let writer = pool.writer().unwrap();
+            seed(writer.conn(), "actor:a", "inbound", 5, 0);
+        }
+        let filter = listing_filter(FilterOp::EqOrMissing);
+        let (sql, params) = listing_sql_and_params(&filter);
+        {
+            let reader = pool.reader().unwrap();
+            let control_plan = plan(reader.conn(), &sql, &params);
+            assert!(
+                !control_plan.contains("idx_notes_unread_probe_recipient_direction"),
+                "control must reproduce the pre-fix shape (no recipient-index seek), got:\n{control_plan}"
+            );
+        }
+        let (_, steps_small) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        {
+            let writer = pool.writer().unwrap();
+            // Another actor's unread backlog: same direction/read shape, disjoint recipient.
+            seed(writer.conn(), "actor:other", "inbound", 3_000, 10_000);
+        }
+        let (rows_after, steps_large) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        assert_eq!(
+            rows_after, 5,
+            "control: still only the caller's own unread rows in the result set"
+        );
+        assert!(
+            steps_large > steps_small.saturating_mul(3),
+            "control instrument did not reproduce the pre-fix growth: \
+             {steps_small} VM steps before vs {steps_large} after seeding another actor's \
+             3,000-row unread backlog (a recipient-blind scan should grow sharply)"
+        );
+    }
+
+    // -- Fixed: EqOrLegacyIndexed seeks the recipient-scoped partial index. --
+    {
+        let pool = build_pool_with_comm_indexes();
+        {
+            let writer = pool.writer().unwrap();
+            seed(writer.conn(), "actor:a", "inbound", 5, 0);
+        }
+        let filter = listing_filter(FilterOp::EqOrLegacyIndexed);
+        let (sql, params) = listing_sql_and_params(&filter);
+        {
+            let reader = pool.reader().unwrap();
+            let fixed_plan = plan(reader.conn(), &sql, &params);
+            assert!(
+                fixed_plan.contains("idx_notes_unread_probe_recipient_direction"),
+                "fixed listing query must be served by the recipient-scoped partial index, got:\n{fixed_plan}"
+            );
+        }
+        let (_, steps_small) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        {
+            let writer = pool.writer().unwrap();
+            seed(writer.conn(), "actor:other", "inbound", 3_000, 10_000);
+        }
+        let (rows_after, steps_large) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        assert_eq!(
+            rows_after, 5,
+            "fixed: still only the caller's own unread rows in the result set"
+        );
+        assert!(
+            steps_large < steps_small.saturating_mul(3),
+            "fixed listing work scaled with another actor's unread backlog: \
+             {steps_small} VM steps before vs {steps_large} after seeding another actor's \
+             3,000-row unread backlog (a recipient-scoped seek should stay flat)"
+        );
+    }
+}
+
+/// `EqOrLegacyIndexed` must match exactly the same rows `EqOrMissing` does,
+/// for every value shape the comm write paths (`comm.send`, `comm.reply`,
+/// `comm.ingest`) can produce: an exact recipient match, a legacy row with
+/// `to_actor` entirely absent, and — the case a naive `ifnull(...) IN (?, '')`
+/// predicate would get wrong — a row where `to_actor` is a present-but-empty
+/// JSON string. None of the three comm write paths can produce that last
+/// shape today (`validate_actor_label` rejects an empty `to` at `send`;
+/// `ingest` rejects an empty `to` before it reaches `to_actor`; `reply`'s
+/// fallback chain bottoms out at a `to`/`from` property pair every write
+/// path always sets non-empty) — but the generic `kg.create` surface is not
+/// comm-validated and can place such a row directly, so this fixes the
+/// value's behavior by construction rather than by unreachability.
+#[tokio::test]
+async fn eq_or_legacy_indexed_matches_eq_or_missing_on_every_write_path_shape() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+    use khive_storage::types::{PageRequest, SqlValue};
+
+    let store = setup_memory_store();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "exact match",
+            serde_json::json!({"to_actor": "actor:a"}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "absent (legacy)",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "explicit null",
+            serde_json::json!({"to_actor": null}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "present empty string",
+            serde_json::json!({"to_actor": ""}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "different recipient",
+            serde_json::json!({"to_actor": "actor:b"}),
+        ))
+        .await
+        .unwrap();
+
+    for op in [FilterOp::EqOrMissing, FilterOp::EqOrLegacyIndexed] {
+        let filter = NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters: vec![PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: op.clone(),
+                value: SqlValue::Text("actor:a".to_string()),
+            }],
+            ..Default::default()
+        };
+        let page = store
+            .query_notes_filtered(
+                "default",
+                &filter,
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let mut contents: Vec<&str> = page.items.iter().map(|n| n.content.as_str()).collect();
+        contents.sort_unstable();
+        assert_eq!(
+            contents,
+            vec!["absent (legacy)", "exact match", "explicit null"],
+            "{op:?}: must match the exact recipient plus absent/null legacy rows, \
+             and exclude the present-empty-string and different-recipient rows"
+        );
+    }
 }
 
 /// The inlined json_type literal admits only SQLite's closed json_type
