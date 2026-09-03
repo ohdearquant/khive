@@ -137,7 +137,7 @@ impl NamedVectorIdentity {
 pub use crate::config::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
     parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
-    BackendId, NamespaceToken, RuntimeConfig,
+    BackendId, BackendIdError, NamespaceToken, RuntimeConfig,
 };
 
 // ---- KhiveRuntime ----
@@ -1996,7 +1996,7 @@ mod tests {
         let main_backend = Arc::new(StorageBackend::memory().expect("main backend"));
         let pack_backend = Arc::new(StorageBackend::memory().expect("pack backend"));
         let mut config = RuntimeConfig::no_embeddings();
-        config.backend_id = BackendId::new("assets");
+        config.backend_id = BackendId::parse("assets").expect("valid backend id");
         let runtime = KhiveRuntime::from_backend(pack_backend, config)
             .with_core_backend(Arc::clone(&main_backend));
         let (_root, hydrator) = test_blob_hydrator();
@@ -2753,7 +2753,7 @@ mod tests {
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
-            backend_id: BackendId::new("lore"),
+            backend_id: BackendId::parse("lore").expect("valid backend id"),
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
@@ -3321,7 +3321,7 @@ mod tests {
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
-            backend_id: BackendId::new("lore"),
+            backend_id: BackendId::parse("lore").expect("valid backend id"),
             brain_profile: None,
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
@@ -3541,7 +3541,7 @@ mod tests {
                 additional_embedding_models: vec![],
                 gate: Arc::new(AllowAllGate),
                 packs: vec!["kg".to_string()],
-                backend_id: BackendId::new("lore"),
+                backend_id: BackendId::parse("lore").expect("valid backend id"),
                 brain_profile: None,
                 visible_namespaces: vec![],
                 allowed_outbound_namespaces: vec![],

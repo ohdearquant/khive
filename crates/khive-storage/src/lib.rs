@@ -58,18 +58,18 @@ pub use types::StorageResult;
 pub use vectors::VectorStore;
 
 pub use types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
-    IndexRebuildScope, LinkId, MissingEndpoints, NeighborHit, NeighborQuery, OrphanSweepConfig,
-    OrphanSweepResult, Page, PageRequest, PathNode, PropertyFilter, PropertyOp, SeekCursor,
-    SeekPage, SortDirection, SortOrder, SparseRecord, SparseSearchHit, SparseSearchRequest,
-    SparseVector, SqlRow, SqlStatement, SqlValue, TextDocument, TextFilter, TextGatherMode,
-    TextIndexStats, TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest,
-    TextTermStats, TextTermStatsRequest, TimeRange, TraversalExecutionBudget, TraversalOptions,
-    TraversalRequest, VectorIndexKind, VectorMetadataFilter, VectorRecord, VectorSearchHit,
-    VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo, DEFAULT_TRAVERSAL_LIMIT,
-    MAX_SPARSE_SEARCH_TOP_K, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS,
-    MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
+    BatchWriteSummary, BoundedCount, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter,
+    EdgeSeekPage, EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal,
+    GuardedWriteOutcome, IndexRebuildScope, LinkId, MissingEndpoints, NeighborHit, NeighborQuery,
+    OrphanSweepConfig, OrphanSweepResult, Page, PageRequest, PathNode, PropertyFilter, PropertyOp,
+    SeekCursor, SeekPage, SortDirection, SortOrder, SparseRecord, SparseSearchHit,
+    SparseSearchRequest, SparseVector, SqlRow, SqlStatement, SqlValue, TextDocument, TextFilter,
+    TextGatherMode, TextIndexStats, TextQueryMode, TextSearchHit, TextSearchOptions,
+    TextSearchRequest, TextTermStats, TextTermStatsRequest, TimeRange, TraversalExecutionBudget,
+    TraversalOptions, TraversalRequest, VectorIndexKind, VectorMetadataFilter, VectorRecord,
+    VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
+    DEFAULT_TRAVERSAL_LIMIT, MAX_SPARSE_SEARCH_TOP_K, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT,
+    MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
 };
 
 pub use khive_types::{

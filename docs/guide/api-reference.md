@@ -1460,9 +1460,12 @@ request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 
 List and page through the caller's filtered inbound messages (default) or sent
 history (`box="sent"`).
-The response keeps the inbox envelope. `unread_count` is the exact mailbox-wide
-unread count for the caller — independent of the page window and of `status`
-and sender filters — and is zero for sent rows.
+The response keeps the inbox envelope and adds explicit bounded-count metadata.
+`unread_count` is the mailbox-wide unread count for the caller — independent of
+the page window and of `status` and sender filters — and is exact below
+`unread_count_cap` (1,000). When `unread_count_saturated` is `true`, the count
+equals the cap and means "at least this many"; `false` means it is exact. Sent
+rows report zero and `false`.
 With `wait_ms`, an initially empty fully filtered page waits for a newly
 committed matching message and otherwise returns at the deadline.
 
@@ -1511,6 +1514,9 @@ are errors. Omit it for the existing full-body response.
 
 Count-only view of the caller's unread inbound messages — the same filter as
 `comm.inbox(status="unread")`, without message payloads. Takes no parameters.
+Returns `{count, count_cap, count_saturated, actor}` with the same 1,000-row
+bound as the inbox metadata: `count_saturated=false` is exact, while `true`
+means `count == count_cap` is a lower bound.
 
 ```
 request(ops="comm.unread()")
@@ -1521,8 +1527,12 @@ request(ops="comm.unread()")
 Compatibility mark-read surface for one or more inbound messages. It does not retrieve message
 content; use `comm.inbox` or `comm.thread` for that. Outbound messages cannot be marked read. Mark writes
 are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
-remain fatal, but a post-read mark failure returns `read: false` with `mark_error`. Inspect each
-single or bulk result and re-issue failures later.
+remain fatal, but a post-read mark failure returns `status: "failed"`, `read: false`, and
+`mark_error`. A write whose execution seam terminated after being accepted (so it may already
+have applied) instead returns `status: "unknown"`, `read: null`, and `mark_error` — check the
+message's current state through `comm.inbox` before re-issuing; re-issuing is safe, since marking
+a message read is idempotent. Successful items carry `status: "success"`; inspect each result and
+re-issue failures (or unresolved unknowns) later.
 
 | Param | Type            | Required    | Notes                                                                   |
 | ----- | --------------- | ----------- | ----------------------------------------------------------------------- |
@@ -1535,8 +1545,9 @@ request(ops="comm.read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
 ```
 
 Exactly one of `id` or `ids` is required. The bulk response contains ordered
-`results` plus `requested_count`, `unique_count`, `marked_count`, and
-`failed_count`. Bulk updates are not atomic across messages: validation errors
+`results` plus `requested_count`, `unique_count`, `marked_count`, `unknown_count`, and
+`failed_count`, with aggregate `status=success|partial|failed|unknown`. Bulk updates are not atomic
+across messages: validation errors
 reject the call before any write, while later storage errors appear in each
 item's `read` and optional `mark_error`.
 
@@ -1798,11 +1809,17 @@ request(ops="knowledge.stats()")
 
 ### `knowledge.index` — Commissive
 
-Backfill embeddings + FTS for atoms/domains.
+Backfill atom embeddings.
 
 The response includes `truncation_by_model`, keyed by every model that completed embedding work.
-Each value contains `truncated` and `discarded_bytes` counters derived from the actual embedding
-outcomes; atom source content remains complete in SQL and FTS.
+Each truncation value contains `truncated` and `discarded_bytes` counters derived from the actual
+embedding outcomes; atom source content remains complete in SQL and FTS.
+
+This verb does not rebuild the FTS indexes. Rebuilding `fts_knowledge`/`fts_sections` is a
+whole-database operation independent of the caller's namespace, and the ordinary verb has no
+per-caller cost admission to bound it, so that rebuild is reachable only through the
+`kkernel reindex` operator CLI (`--rebuild-fts`), which reports the indexes rebuilt, elapsed
+time, and the rank-1 integrity-check outcome.
 
 | Param         | Type            | Required | Notes                                                   |
 | ------------- | --------------- | -------- | ------------------------------------------------------- |

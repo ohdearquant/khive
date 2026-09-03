@@ -186,7 +186,7 @@ async fn query_edges_in_namespaces_default_rejects_multi_namespace_by_name() {
         .await
         .unwrap();
     assert_eq!(empty.items.len(), 0);
-    assert_eq!(empty.total, Some(0));
+    assert_eq!(empty.total, None);
 
     // Single namespace: the default delegates to `query_edges` and succeeds.
     let single = store
