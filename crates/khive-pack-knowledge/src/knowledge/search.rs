@@ -421,6 +421,22 @@ where
         .await
 }
 
+/// Recorded in the true execution order of the four checkpoints below,
+/// independent of `tokio::sync::Notify`'s single-stored-permit semantics
+/// (a `notify_one()` fired before anyone awaits `notified()` is still
+/// delivered to the next waiter, so a signal alone cannot distinguish
+/// "happened concurrently" from "happened earlier and is only observed
+/// later"). Tests that need to prove genuine overlap — not just that both
+/// checkpoints were eventually reached — read this log's positions instead.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CandidateStageEvent {
+    AnnStarted,
+    LexicalStarted,
+    AnnFinished,
+    LexicalFinished,
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct CandidateStageTestControl {
@@ -430,6 +446,7 @@ pub(crate) struct CandidateStageTestControl {
     pub(crate) lexical_started: std::sync::Arc<tokio::sync::Notify>,
     pub(crate) lexical_release: std::sync::Arc<tokio::sync::Notify>,
     pub(crate) lexical_finished: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) events: std::sync::Arc<std::sync::Mutex<Vec<CandidateStageEvent>>>,
     block_ann: bool,
     block_lexical: bool,
 }
@@ -444,6 +461,7 @@ impl CandidateStageTestControl {
             lexical_started: std::sync::Arc::new(tokio::sync::Notify::new()),
             lexical_release: std::sync::Arc::new(tokio::sync::Notify::new()),
             lexical_finished: std::sync::Arc::new(tokio::sync::Notify::new()),
+            events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             block_ann,
             block_lexical,
         }
@@ -481,12 +499,22 @@ async fn candidate_stage_test_start(stage: CandidateStage) {
     };
     match stage {
         CandidateStage::Ann => {
+            control
+                .events
+                .lock()
+                .unwrap()
+                .push(CandidateStageEvent::AnnStarted);
             control.ann_started.notify_one();
             if control.block_ann {
                 control.ann_release.notified().await;
             }
         }
         CandidateStage::Lexical => {
+            control
+                .events
+                .lock()
+                .unwrap()
+                .push(CandidateStageEvent::LexicalStarted);
             control.lexical_started.notify_one();
             if control.block_lexical {
                 control.lexical_release.notified().await;
@@ -497,9 +525,15 @@ async fn candidate_stage_test_start(stage: CandidateStage) {
 
 #[cfg(test)]
 fn candidate_stage_test_finish(stage: CandidateStage) {
-    let _ = CANDIDATE_STAGE_TEST_CONTROL.try_with(|control| match stage {
-        CandidateStage::Ann => control.ann_finished.notify_one(),
-        CandidateStage::Lexical => control.lexical_finished.notify_one(),
+    let _ = CANDIDATE_STAGE_TEST_CONTROL.try_with(|control| {
+        control.events.lock().unwrap().push(match stage {
+            CandidateStage::Ann => CandidateStageEvent::AnnFinished,
+            CandidateStage::Lexical => CandidateStageEvent::LexicalFinished,
+        });
+        match stage {
+            CandidateStage::Ann => control.ann_finished.notify_one(),
+            CandidateStage::Lexical => control.lexical_finished.notify_one(),
+        }
     });
 }
 
@@ -516,17 +550,57 @@ async fn advance_fts_test_deadline_after_term(completed_terms: usize) {
     }
 }
 
-fn is_timeout(e: &khive_storage::StorageError) -> bool {
-    matches!(e, khive_storage::StorageError::Timeout { .. })
+/// ANN-refill counterpart of `FtsTestDeadlineAdvance`: advances paused Tokio
+/// time exactly between two ANN refill rounds (deterministic instead of a
+/// wall-clock race), so a test can prove a completed round's hits survive a
+/// deadline that expires before the next round is allowed to start.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct AnnTestDeadlineAdvance {
+    after_completed_rounds: usize,
+    by: std::time::Duration,
 }
 
-/// Same check, for the `RuntimeError` shape `?`-propagated storage timeouts
-/// arrive in at the handler layer.
-fn is_read_timeout(e: &RuntimeError) -> bool {
-    matches!(
-        e,
-        RuntimeError::Storage(khive_storage::StorageError::Timeout { .. })
-    )
+#[cfg(test)]
+tokio::task_local! {
+    static ANN_TEST_DEADLINE_ADVANCE: AnnTestDeadlineAdvance;
+}
+
+#[cfg(test)]
+pub(crate) async fn scope_ann_test_deadline_advance<F>(
+    after_completed_rounds: usize,
+    by: std::time::Duration,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    ANN_TEST_DEADLINE_ADVANCE
+        .scope(
+            AnnTestDeadlineAdvance {
+                after_completed_rounds,
+                by,
+            },
+            future,
+        )
+        .await
+}
+
+#[cfg(test)]
+async fn advance_ann_test_deadline_after_round(completed_rounds: usize) {
+    let advance_by = ANN_TEST_DEADLINE_ADVANCE
+        .try_with(|control| {
+            (completed_rounds == control.after_completed_rounds).then_some(control.by)
+        })
+        .ok()
+        .flatten();
+    if let Some(advance_by) = advance_by {
+        tokio::time::advance(advance_by).await;
+    }
+}
+
+fn is_timeout(e: &khive_storage::StorageError) -> bool {
+    matches!(e, khive_storage::StorageError::Timeout { .. })
 }
 
 /// Fetch a bounded lexical candidate pool.
@@ -1297,8 +1371,14 @@ fn attach_body_lines_timeout_degradation(out: &mut Value) {
 
 struct EligibleAnnSearchState {
     hits: Vec<ScoredHit>,
-    availability: AnnAvailability,
+    /// `None` only when the request read deadline expired before any ANN
+    /// round completed — no round means no observed availability.
+    availability: Option<AnnAvailability>,
     hydration_failures: usize,
+    /// Set when the request read deadline expired mid-refill. `hits` still
+    /// carries whatever the most recently completed round produced; the
+    /// caller must not discard them just because the deadline is spent.
+    timed_out: bool,
 }
 
 #[derive(Default)]
@@ -1329,13 +1409,28 @@ async fn search_eligible_ann_with_refill(
     query_embedding: &[f32],
     target_eligible: usize,
     initial_k: usize,
-) -> Result<EligibleAnnSearchState, RuntimeError> {
+) -> EligibleAnnSearchState {
     let runtime = ctx.runtime;
     let target_eligible = target_eligible.max(1);
     let mut request_k = initial_k.max(target_eligible).max(1);
 
+    // Carries the most recently completed round's eligible hits so a
+    // deadline expiry mid-refill can return them instead of discarding
+    // real, already-computed results (issue #2312).
+    let mut last_round = EligibleAnnSearchState {
+        hits: Vec::new(),
+        availability: None,
+        hydration_failures: 0,
+        timed_out: false,
+    };
+    #[cfg(test)]
+    let mut completed_rounds = 0usize;
+
     loop {
-        khive_storage::ensure_request_read_active("knowledge.search")?;
+        if khive_storage::ensure_request_read_active("knowledge.search").is_err() {
+            last_round.timed_out = true;
+            return last_round;
+        }
         let AnnSearchState {
             hits: raw_hits,
             availability,
@@ -1360,18 +1455,41 @@ async fn search_eligible_ann_with_refill(
             .collect();
 
         let hydration_failures = hydrate_empty_hits(runtime, ctx.ns, &mut hits).await;
-        khive_storage::ensure_request_read_active("knowledge.search")?;
+        #[cfg(test)]
+        {
+            completed_rounds += 1;
+            advance_ann_test_deadline_after_round(completed_rounds).await;
+        }
+        let deadline_expired =
+            khive_storage::ensure_request_read_active("knowledge.search").is_err();
         filter_hits_by_status(&mut hits, ctx.statuses, ctx.exclude_statuses);
         filter_hits_by_type(&mut hits, ctx.type_filter);
 
+        if deadline_expired {
+            return EligibleAnnSearchState {
+                hits,
+                availability: Some(availability),
+                hydration_failures,
+                timed_out: true,
+            };
+        }
+
         if hits.len() >= target_eligible || source_exhausted {
             hits.truncate(target_eligible);
-            return Ok(EligibleAnnSearchState {
+            return EligibleAnnSearchState {
                 hits,
-                availability,
+                availability: Some(availability),
                 hydration_failures,
-            });
+                timed_out: false,
+            };
         }
+
+        last_round = EligibleAnnSearchState {
+            hits,
+            availability: Some(availability),
+            hydration_failures,
+            timed_out: false,
+        };
 
         // The live vector-store count is not a sound upper bound for a serving
         // bridge: a fresh delete removes the canonical vector before its tail
@@ -1379,12 +1497,8 @@ async fn search_eligible_ann_with_refill(
         // source itself proves exhaustion.
         let next_k = request_k.saturating_mul(2);
         if next_k == request_k {
-            hits.truncate(target_eligible);
-            return Ok(EligibleAnnSearchState {
-                hits,
-                availability,
-                hydration_failures,
-            });
+            last_round.hits.truncate(target_eligible);
+            return last_round;
         }
         request_k = next_k;
     }
@@ -1411,7 +1525,12 @@ async fn search_ann_candidates(
         {
             Ok(Ok(query_emb)) => {
                 let key = vamana::AnnKey::new(ctx.ns, ctx.runtime.default_embedder_name());
-                match search_eligible_ann_with_refill(
+                let EligibleAnnSearchState {
+                    hits,
+                    availability,
+                    hydration_failures,
+                    timed_out,
+                } = search_eligible_ann_with_refill(
                     ctx,
                     token,
                     ann,
@@ -1420,24 +1539,13 @@ async fn search_ann_candidates(
                     target_eligible,
                     initial_k,
                 )
-                .await
-                {
-                    Ok(EligibleAnnSearchState {
-                        hits,
-                        availability,
-                        hydration_failures,
-                    }) => Ok(AnnCandidateOutcome {
-                        hits,
-                        availability: Some(availability),
-                        hydration_failures,
-                        timed_out: false,
-                    }),
-                    Err(e) if is_read_timeout(&e) => Ok(AnnCandidateOutcome {
-                        timed_out: true,
-                        ..Default::default()
-                    }),
-                    Err(e) => Err(e),
-                }
+                .await;
+                Ok(AnnCandidateOutcome {
+                    hits,
+                    availability,
+                    hydration_failures,
+                    timed_out,
+                })
             }
             Ok(Err(_)) => Ok(AnnCandidateOutcome::default()),
             Err(e) if is_timeout(&e) => Ok(AnnCandidateOutcome {

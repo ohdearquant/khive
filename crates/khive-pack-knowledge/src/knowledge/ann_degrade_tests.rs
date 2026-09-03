@@ -378,10 +378,23 @@ static TIMEOUT_OVERRIDE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 // ── Issue #1996: concurrent candidate scheduling ─────────────────────────────
 
 /// Block the ANN leg at its deterministic test checkpoint and prove the
-/// lexical leg reaches its own checkpoint before ANN is released. The same
-/// assertion exercises both handlers, so a future accidental return to serial
-/// scheduling in either call path fails without corpus-size or wall-clock
-/// timing assumptions.
+/// lexical leg reaches its own checkpoint while ANN is still blocked. The
+/// proof reads `CandidateStageTestControl::events`, an append-only log
+/// written in true execution order, rather than racing
+/// `tokio::sync::Notify::notified()` calls against each other: `notify_one()`
+/// stores a permit for a future waiter even when fired long before that
+/// waiter starts listening, so a signal-presence check alone cannot tell
+/// "happened concurrently" from "happened earlier and was only observed
+/// later" — a lexical-first sequential handler would still show the lexical
+/// leg's stale, already-fired signal as "present" once observed and read as
+/// overlap. Requiring `AnnStarted < LexicalStarted < AnnFinished` in the
+/// recorded order catches both wrong directions: `LexicalStarted` after
+/// `AnnFinished` means ANN actually ran to completion first (serial,
+/// ANN-first); `LexicalStarted` before `AnnStarted` means lexical ran to
+/// completion first (serial, lexical-first). The same assertion exercises
+/// both handlers, so a future accidental return to serial scheduling in
+/// either call path fails without corpus-size or wall-clock timing
+/// assumptions.
 #[tokio::test(start_paused = true)]
 async fn search_and_suggest_candidate_stages_overlap() {
     for suggest in [false, true] {
@@ -412,17 +425,15 @@ async fn search_and_suggest_candidate_stages_overlap() {
         };
         let observer = async move {
             observer_control.ann_started.notified().await;
-            let overlapped = tokio::time::timeout(
+            let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
                 observer_control.lexical_started.notified(),
             )
-            .await
-            .is_ok();
+            .await;
             observer_control.ann_release.notify_one();
-            overlapped
         };
 
-        let (result, overlapped) = search::scope_candidate_stage_test_control(control, async {
+        let (result, ()) = search::scope_candidate_stage_test_control(control.clone(), async {
             tokio::join!(call, observer)
         })
         .await;
@@ -433,9 +444,23 @@ async fn search_and_suggest_candidate_stages_overlap() {
                 if suggest { "suggest" } else { "search" }
             )
         });
+
+        let events = control.events.lock().unwrap().clone();
+        let position = |needle: search::CandidateStageEvent| {
+            events.iter().position(|e| *e == needle).unwrap_or_else(|| {
+                panic!(
+                    "{}: {needle:?} never recorded; events: {events:?}",
+                    if suggest { "suggest" } else { "search" }
+                )
+            })
+        };
+        let ann_started_at = position(search::CandidateStageEvent::AnnStarted);
+        let lexical_started_at = position(search::CandidateStageEvent::LexicalStarted);
+        let ann_finished_at = position(search::CandidateStageEvent::AnnFinished);
         assert!(
-            overlapped,
-            "{} lexical candidates must start while ANN is blocked",
+            ann_started_at < lexical_started_at && lexical_started_at < ann_finished_at,
+            "{}: lexical candidates must start after ANN starts and before ANN finishes \
+             (genuine overlap, not either leg running serially first); events: {events:?}",
             if suggest { "suggest" } else { "search" }
         );
     }
@@ -631,6 +656,91 @@ async fn late_ann_timeout_after_lexical_success_fails_open_in_suggest() {
     );
     assert_eq!(
         result["results"][0]["name"], "Late Ann Timeout Domain",
+        "result: {result}"
+    );
+}
+
+/// Both legs can time out on the same shared deadline: a slow FTS term query
+/// (blocked at its test checkpoint here) and an ANN refill that already
+/// completed one round but was mid-widen when the deadline expired.
+/// `search_eligible_ann_with_refill`'s round already produced real, hydrated,
+/// eligible hits before the expiry — those must survive into the fused
+/// response instead of being discarded just because the deadline is spent by
+/// the time the caller notices (issue #2312). `scope_ann_test_deadline_advance`
+/// expires the deadline deterministically right after ANN's first completed
+/// round (mirroring `scope_fts_test_deadline_advance`'s per-term boundary),
+/// so this never depends on wall-clock timing.
+#[tokio::test(start_paused = true)]
+async fn both_legs_timed_out_search_still_returns_partial_ann_hits() {
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "both-timeout-atom",
+                    "name": "Both Timeout Atom",
+                    "finalized": true,
+                    "content": "bothtimeoutsentinel transformer retrieval corpus benchmark search latency vector index nearest neighbor ranking fusion embedding cosine similarity attention encoder decoder positional normalization residual connection"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    // ANN unblocked (runs its first refill round for real); lexical blocked
+    // at its checkpoint until the coordinator below releases it, by which
+    // point ANN's own round-1 completion has already advanced the shared
+    // deadline past expiry.
+    let control = search::CandidateStageTestControl::new(false, true);
+    let coordinator_control = control.clone();
+    let deadline = std::time::Duration::from_millis(200);
+
+    let call = khive_storage::scope_request_read_deadline(
+        deadline,
+        search::scope_candidate_stage_test_control(
+            control,
+            search::scope_ann_test_deadline_advance(
+                1,
+                deadline * 2,
+                KnowledgeHandlers::search(
+                    &rt,
+                    &token,
+                    json!({ "query": "bothtimeoutsentinel" }),
+                    &ann,
+                ),
+            ),
+        ),
+    );
+    let coordinator = async move {
+        coordinator_control.ann_finished.notified().await;
+        coordinator_control.lexical_release.notify_one();
+    };
+
+    let (result, ()) = tokio::join!(call, coordinator);
+    let result = result.expect("a both-legs timeout must degrade instead of failing search");
+    assert_eq!(
+        result["degraded"]["ann_timeout"], true,
+        "the completed-then-expired ANN round must be reported: {result}"
+    );
+    assert_eq!(
+        result["degraded"]["lexical_timeout"], true,
+        "the blocked-then-expired lexical leg must be reported: {result}"
+    );
+    assert!(
+        result["total"].as_u64().unwrap_or_default() > 0,
+        "the ANN round completed before the deadline must survive even though \
+         both legs ultimately timed out: {result}"
+    );
+    assert_eq!(
+        result["results"][0]["name"], "Both Timeout Atom",
         "result: {result}"
     );
 }
@@ -1267,4 +1377,82 @@ async fn ann_candidate_query_embeds_under_query_role_not_generic_embed() {
             if suggest { "suggest" } else { "search" }
         );
     }
+}
+
+/// Third call site covered by the embed-intent regression (issue #2312): the
+/// section-scoring query embed inside `compose` (`search.rs`, the `q_emb`
+/// computation gated on `has_sections`) must also use the query role, not
+/// the generic embed. `knowledge.edit` embeds new section rows through the
+/// document/passage role, which — on `QueryRoleAwareService`, which has no
+/// override for it — falls back to the trait's default and reaches `embed`:
+/// the section carrying `docroletargetmarker` lands on axis 0, the section
+/// without it lands on axis 1. `embed_query` always returns axis 0
+/// regardless of text. Both sections belong to the same atom and share no
+/// lexical terms with the query, so BM25, atom-cosine, domain, and
+/// type-weight contribute identically to both — only section-cosine can
+/// decide the order. The correct call site therefore ranks the marked
+/// section first; the regression this guards against — calling the generic
+/// `embed` on the raw query — would rank the other section first instead.
+#[tokio::test]
+async fn compose_section_query_embeds_under_query_role_not_generic_embed() {
+    let rt = rt_with_query_role_aware_embedder();
+    let registry = build_registry(&rt);
+
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "compose-role-atom",
+                    "name": "Compose Role Atom",
+                    "content": "atom body content unrelated to either section marker or to the query terms used in this compose section-scoring role-verification regression test scenario"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+
+    registry
+        .dispatch(
+            "knowledge.edit",
+            json!({
+                "id": "compose-role-atom",
+                "sections": [
+                    {
+                        "section_type": "overview",
+                        "content": "docroletargetmarker demonstrates retrieval consistency between symbolic content descriptions used for embedding role verification in this compose regression scenario covering section scoring"
+                    },
+                    {
+                        "section_type": "references",
+                        "content": "unrelated placeholder narrative content used only as a distractor for the compose embedding role verification regression scenario covering section scoring behavior"
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("edit sections");
+
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let ann = vamana::new_shared();
+
+    let result = KnowledgeHandlers::compose(
+        &rt,
+        &token,
+        json!({
+            "query": "xylophonemarmot zetajumble quokkaverify",
+            "atom_ids": ["compose-role-atom"],
+            "explain": true,
+        }),
+        &ann,
+        std::collections::HashMap::new(),
+    )
+    .await
+    .expect("compose must not Err");
+
+    assert_eq!(
+        result["data"]["sections"][0]["heading"], "overview",
+        "the compose section query must embed under the query role, not the \
+         generic embed, or the references section wins the fused ranking \
+         instead; result: {result}"
+    );
 }
