@@ -3,6 +3,7 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
+use std::cell::Cell;
 use std::fs;
 use std::io::Read as _;
 use std::ops::{Deref, DerefMut};
@@ -491,6 +492,11 @@ pub struct ConnectionPool {
     /// acquisition boundaries means new verbs inherit instrumentation without
     /// per-verb classification (ADR-133 D8 / issue #1389).
     writer_acquisition_counters: Arc<WriterAcquisitionCounters>,
+    /// Pool-scoped reader route, saturation, and hold-lifecycle counters.
+    /// Instrumentation lives at the acquisition boundary so every typed
+    /// store and raw-SQL caller inherits it without per-verb bookkeeping
+    /// (ADR-165 Slice 2 / ADR-166 G2).
+    reader_acquisition_counters: ReaderAcquisitionCounters,
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
@@ -552,13 +558,33 @@ enum ReaderLease<'pool> {
 /// Returns the connection to the pool on drop.
 pub struct ReaderGuard<'pool> {
     lease: Option<ReaderLease<'pool>>,
+    /// One permit from the pool-wide reader budget, shared with the explicit
+    /// raw-SQL transaction exception. Returned only after the connection has
+    /// been reset/replaced and made reusable.
+    admission_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     pool: &'pool ConnectionPool,
     reusable: bool,
+    checked_out_at: Instant,
+    /// Set by [`Self::mark_dirty`] whenever this checkout ran a `SqlReader`
+    /// raw-SQL statement (`sql_bridge`'s `run_pool_reader_query`), never by a
+    /// typed store read. Gates whether `Drop` pays the TEMP-object,
+    /// attachment, and connection-setting pristine scan on return —
+    /// `reader_connection_state_is_pristine` and
+    /// `reader_connection_settings_match_baseline` never touch the hot path
+    /// of an ordinary typed checkout.
+    dirty: Cell<bool>,
 }
 
 impl<'pool> ReaderGuard<'pool> {
-    /// Access the connection.
-    pub fn conn(&self) -> &Connection {
+    /// Access the connection from within `khive-db`. Every internal caller
+    /// is either a typed store (proven read-only by construction) or a
+    /// raw-SQL route that already calls [`Self::mark_dirty`] itself, so this
+    /// stays crate-private: it is the untracked half of the pristine-return
+    /// contract, and a caller outside the crate has no way to pay into that
+    /// contract by calling `mark_dirty` (also crate-private). A raw
+    /// `&Connection` is never handed to a caller outside `khive-db` — use
+    /// [`Self::query_row`] instead, which admits only read-shaped SQL.
+    pub(crate) fn conn(&self) -> &Connection {
         match self
             .lease
             .as_ref()
@@ -569,19 +595,40 @@ impl<'pool> ReaderGuard<'pool> {
         }
     }
 
+    /// Run one read-only statement against this reader lease and map the
+    /// first resulting row, for callers outside `khive-db`.
+    ///
+    /// Unlike a raw `Connection`, this never hands out a capability that can
+    /// change connection-local or database state: `sql` is checked against
+    /// the same allow-listed read-shape classifier
+    /// (`SELECT`/`WITH ... SELECT`/`VALUES`/`EXPLAIN`/a fixed read-only
+    /// `PRAGMA` set) the pooled `SqlReader` surface admits raw SQL through,
+    /// and anything else — `BEGIN`, DML, DDL, a setting `PRAGMA`, `ATTACH`
+    /// — is refused before it ever reaches SQLite. An admitted statement
+    /// still marks the checkout dirty unconditionally, so `Drop` always pays
+    /// the pristine-state scan (or, in degraded shared-lease mode, the
+    /// settings/rollback verification) on return.
+    pub fn query_row<T, P, F>(&self, sql: &str, params: P, f: F) -> Result<T, SqliteError>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        crate::sql_bridge::reader_capability_admits(sql).map_err(SqliteError::InvalidData)?;
+        self.mark_dirty();
+        Ok(self.conn().query_row(sql, params, f)?)
+    }
+
     /// Fail closed when connection-global state could not be restored after
     /// a read. A pooled reader is closed and replaced on drop; a degraded
     /// shared-writer reader is quarantined for the lifetime of the pool.
     pub(crate) fn discard(&mut self) {
         self.reusable = false;
     }
-}
 
-impl<'pool> Deref for ReaderGuard<'pool> {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        self.conn()
+    /// Mark this checkout as having run a raw-SQL statement, so `Drop` pays
+    /// the pristine-state scan on return instead of skipping it.
+    pub(crate) fn mark_dirty(&self) {
+        self.dirty.set(true);
     }
 }
 
@@ -592,19 +639,333 @@ impl<'pool> Drop for ReaderGuard<'pool> {
         };
 
         match lease {
-            ReaderLease::Pooled(conn) if self.reusable => self.pool.return_reader(conn),
+            ReaderLease::Pooled(conn) if self.reusable => {
+                self.pool.return_reader(conn, self.dirty.get())
+            }
             ReaderLease::Pooled(conn) => {
                 close_connection_quietly(conn);
-                if let Ok(conn) = self.pool.open_reader_connection() {
-                    if let Err(conn) = self.pool.readers.push(conn) {
-                        close_connection_quietly(conn);
-                    }
-                }
+                self.pool.replace_discarded_reader_slot();
             }
             ReaderLease::Shared(guard) if !self.reusable => {
                 self.pool.retire_pooled_writer(&guard);
             }
-            ReaderLease::Shared(_guard) => {}
+            ReaderLease::Shared(guard) => {
+                // The shared lease IS the pool's writer connection (degraded
+                // `max_readers == 0` mode) — there is no separate reader
+                // connection to close and replace. A dirty return that
+                // cannot be verifiably restored poisons the whole pool via
+                // the same terminal-fault path a writer transaction fault
+                // uses, since reuse and replacement are equally unavailable
+                // here.
+                if self.dirty.get() && !restore_shared_reader_state(&guard, &self.pool.config) {
+                    self.pool.retire_pooled_writer(&guard);
+                }
+            }
+        }
+
+        // A checkout remains active until reset/replacement returned the
+        // connection to service (or the degraded writer guard was released),
+        // not merely until the caller's query closure returned.
+        drop(self.admission_slot.take());
+        self.pool
+            .reader_acquisition_counters
+            .record_checkout_completed(self.checked_out_at.elapsed());
+    }
+}
+
+/// Owned, `'static` counterpart to [`ReaderGuard`]'s degraded-mode
+/// (`max_readers == 0`) lease. `ReaderGuard` borrows `&'pool ConnectionPool`
+/// and therefore cannot be retained across the separate `.await` points
+/// between a caller's `SqlReader` trait-method calls — every ordinary call
+/// through it draws a fresh checkout and returns it before the next call
+/// begins. That is fine for an ordinary read, but wrong for the explicit
+/// multi-call deferred read transaction (ADR-005/ADR-091): a `BEGIN
+/// DEFERRED` checked out and returned this way releases the pool's one
+/// physical connection to any concurrent caller — including a writer —
+/// before its own matching `COMMIT`/`ROLLBACK` runs, and an abandoned span
+/// (an error or cancellation between the two) leaves that connection sitting
+/// in the pool inside an open transaction with nothing left holding it. This
+/// type owns an `Arc`-rooted mutex guard instead of borrowing one, so it can
+/// be held by the caller across those `.await` points and give the whole
+/// span real, exclusive ownership of the one connection.
+pub(crate) struct SharedReaderTransactionGuard {
+    conn: parking_lot::ArcMutexGuard<parking_lot::RawMutex, Connection>,
+    admission_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    pool: Arc<ConnectionPool>,
+    checked_out_at: Instant,
+    /// Set once a statement executed against this connection could not
+    /// prove its own cleanup ran (SQLite progress-handler removal failure).
+    /// `Drop` then treats the connection exactly like a rollback failure:
+    /// poison the pool rather than let possibly-corrupted connection state
+    /// return to service.
+    poison: Cell<bool>,
+}
+
+impl SharedReaderTransactionGuard {
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Force poisoning on drop regardless of the connection's own
+    /// autocommit/pristine state.
+    pub(crate) fn poison(&self) {
+        self.poison.set(true);
+    }
+}
+
+impl Drop for SharedReaderTransactionGuard {
+    fn drop(&mut self) {
+        // An abandoned span must never let this connection return to
+        // service while still inside an open transaction — the next reader
+        // or writer to draw the pool's one physical connection would
+        // silently inherit it. Roll back first; only a verified return to
+        // autocommit, followed by the same pristine-state scan an ordinary
+        // dirty degraded checkout pays, allows reuse.
+        let mut restored = !self.poison.get();
+        if restored && !self.conn.is_autocommit() {
+            restored = self.conn.execute_batch("ROLLBACK").is_ok() && self.conn.is_autocommit();
+        }
+        if restored {
+            restored = restore_shared_reader_state(&self.conn, &self.pool.config);
+        }
+        if !restored {
+            self.pool.retire_pooled_writer(&self.conn);
+        }
+        drop(self.admission_slot.take());
+        self.pool
+            .reader_acquisition_counters
+            .record_checkout_completed(self.checked_out_at.elapsed());
+    }
+}
+
+impl ConnectionPool {
+    /// Check out the degraded-mode (`max_readers == 0`) pool's single
+    /// physical connection as an owned [`SharedReaderTransactionGuard`]
+    /// instead of a borrowed [`ReaderGuard`]. Mirrors the admission and
+    /// mutex-acquisition loop in [`Self::reader_until`]'s degraded branch —
+    /// the only difference is the guard type returned, so a caller can
+    /// retain this one across several separate `.await` points.
+    ///
+    /// Exists only for the in-memory backend's explicit deferred-read-
+    /// transaction bypass (`sql_bridge::PoolBackedReader`); ordinary reads
+    /// use [`Self::reader_until`].
+    pub(crate) fn checkout_shared_reader_transaction(
+        self: &Arc<Self>,
+        should_stop: impl Fn() -> bool,
+    ) -> Result<Option<SharedReaderTransactionGuard>, SqliteError> {
+        debug_assert_eq!(
+            self.max_readers, 0,
+            "the owned shared-reader-transaction guard exists only for the degraded, \
+             single-connection backend"
+        );
+        self.ensure_pooled_writer_active()?;
+        let started = Instant::now();
+        let admission_slot = loop {
+            if should_stop() {
+                return Ok(None);
+            }
+            match Arc::clone(&self.sql_bridge_reader_slots).try_acquire_owned() {
+                Ok(slot) => break slot,
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(SqliteError::InvalidData(
+                        "reader admission semaphore is closed".to_string(),
+                    ));
+                }
+                Err(tokio::sync::TryAcquireError::NoPermits) => {}
+            }
+            if started.elapsed() >= self.config.checkout_timeout {
+                self.reader_acquisition_counters.record_checkout_timeout();
+                return Err(pool_exhausted_error(
+                    self.config.checkout_timeout,
+                    self.max_readers,
+                ));
+            }
+            thread::yield_now();
+        };
+
+        loop {
+            if should_stop() {
+                return Ok(None);
+            }
+            let remaining = self
+                .config
+                .checkout_timeout
+                .saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                self.reader_acquisition_counters.record_checkout_timeout();
+                return Err(pool_exhausted_error(
+                    self.config.checkout_timeout,
+                    self.max_readers,
+                ));
+            }
+            if let Some(conn) = self
+                .writer
+                .try_lock_arc_for(remaining.min(Duration::from_millis(2)))
+            {
+                self.ensure_pooled_writer_active()?;
+                self.reader_acquisition_counters.record_pooled_checkout();
+                return Ok(Some(SharedReaderTransactionGuard {
+                    conn,
+                    admission_slot: Some(admission_slot),
+                    pool: Arc::clone(self),
+                    checked_out_at: Instant::now(),
+                    poison: Cell::new(false),
+                }));
+            }
+        }
+    }
+}
+
+/// Why a caller is allowed to bypass the pooled reader queue.
+///
+/// This is deliberately a closed, crate-private list. Ordinary request reads
+/// have no variant: they must use [`ConnectionPool::reader`] and surface its
+/// bounded admission timeout without falling back to a fresh connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // The closed ADR list includes infrastructure paths not instantiated today.
+pub(crate) enum StandaloneReaderPurpose {
+    /// ADR-005/ADR-091's explicit, multi-call deferred raw-SQL transaction.
+    ExplicitSqlReadTransaction,
+    /// Boot-time schema/model-registry inspection before a runtime pool can
+    /// own the read. Kept separate from request traffic in diagnostics.
+    BootSchemaProbe,
+    /// An operator diagnostic that requires a physically independent
+    /// snapshot. Kept separate from request traffic in diagnostics.
+    DiagnosticsIndependentSnapshot,
+}
+
+impl StandaloneReaderPurpose {
+    fn is_infrastructure(self) -> bool {
+        matches!(
+            self,
+            Self::BootSchemaProbe | Self::DiagnosticsIndependentSnapshot
+        )
+    }
+}
+
+/// Process-local reader acquisition and hold lifecycle since one
+/// [`ConnectionPool`] was constructed.
+///
+/// Counters are monotonic and reset only when the pool is reconstructed.
+/// `active_pooled_checkouts` is the point-in-time number of live
+/// [`ReaderGuard`] values. Hold duration includes connection reset or
+/// replacement on return, because the slot is not reusable before then.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReaderAcquisitionSnapshot {
+    /// Configured process-local admission budget shared by pooled readers and
+    /// the explicit raw-SQL read-transaction exception.
+    pub reader_admission_capacity: usize,
+    /// Point-in-time permits not held by either pooled readers or explicit
+    /// raw-SQL read transactions.
+    pub available_reader_admission_slots: usize,
+    /// Successful request-path reader acquisitions (pooled plus the explicit
+    /// raw-SQL transaction exception; infrastructure opens excluded).
+    pub acquisitions: u64,
+    /// Successful bounded pooled-reader checkouts.
+    pub pooled_checkouts: u64,
+    /// Successful request-path standalone opens from the closed exception
+    /// list (currently explicit raw-SQL deferred transactions only).
+    pub standalone_opens: u64,
+    /// Successful boot/diagnostic standalone opens, attributed separately so
+    /// request traffic cannot be inferred from infrastructure activity.
+    pub infrastructure_standalone_opens: u64,
+    /// Reader-admission waits that exhausted `checkout_timeout` before any
+    /// query began. Covers pooled checkout and the closed raw-SQL exception;
+    /// cooperative request cancellation is intentionally excluded.
+    pub checkout_timeouts: u64,
+    /// Pooled checkouts live at the instant this snapshot was taken.
+    pub active_pooled_checkouts: u64,
+    /// High-water mark of concurrent pooled checkouts.
+    pub peak_active_pooled_checkouts: u64,
+    /// Pooled guards that completed their full return/reset lifecycle.
+    pub completed_pooled_checkouts: u64,
+    /// Longest completed checkout hold, including return/reset, in
+    /// microseconds. Diagnostic evidence only; never a test timing gate.
+    pub max_completed_hold_micros: u64,
+    /// A disqualified pooled-reader return (reset/pristine-check failure)
+    /// whose replacement connection then also failed to open, permanently
+    /// shrinking the physical pool by one slot below `max_readers`. Logged at
+    /// `warn` when it happens; this counter makes the shrink observable in a
+    /// snapshot too, since the pool itself never re-grows on its own.
+    pub reader_replacement_open_failures: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReaderAcquisitionCounters {
+    pooled_checkouts: AtomicU64,
+    standalone_opens: AtomicU64,
+    infrastructure_standalone_opens: AtomicU64,
+    checkout_timeouts: AtomicU64,
+    active_pooled_checkouts: AtomicU64,
+    peak_active_pooled_checkouts: AtomicU64,
+    completed_pooled_checkouts: AtomicU64,
+    max_completed_hold_micros: AtomicU64,
+    reader_replacement_open_failures: AtomicU64,
+}
+
+impl ReaderAcquisitionCounters {
+    fn record_pooled_checkout(&self) {
+        self.pooled_checkouts.fetch_add(1, Ordering::Relaxed);
+        let active = self
+            .active_pooled_checkouts
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.peak_active_pooled_checkouts
+            .fetch_max(active, Ordering::Relaxed);
+    }
+
+    fn record_checkout_timeout(&self) {
+        self.checkout_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_reader_replacement_open_failure(&self) {
+        self.reader_replacement_open_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_standalone_open(&self, purpose: StandaloneReaderPurpose) {
+        if purpose.is_infrastructure() {
+            self.infrastructure_standalone_opens
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.standalone_opens.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_checkout_completed(&self, hold: Duration) {
+        let previous = self.active_pooled_checkouts.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "reader active-checkout counter underflow");
+        self.completed_pooled_checkouts
+            .fetch_add(1, Ordering::Relaxed);
+        let micros = u64::try_from(hold.as_micros()).unwrap_or(u64::MAX);
+        self.max_completed_hold_micros
+            .fetch_max(micros, Ordering::Relaxed);
+    }
+
+    fn snapshot(
+        &self,
+        reader_admission_capacity: usize,
+        available_reader_admission_slots: usize,
+    ) -> ReaderAcquisitionSnapshot {
+        let pooled_checkouts = self.pooled_checkouts.load(Ordering::Relaxed);
+        let standalone_opens = self.standalone_opens.load(Ordering::Relaxed);
+        ReaderAcquisitionSnapshot {
+            reader_admission_capacity,
+            available_reader_admission_slots,
+            acquisitions: pooled_checkouts.saturating_add(standalone_opens),
+            pooled_checkouts,
+            standalone_opens,
+            infrastructure_standalone_opens: self
+                .infrastructure_standalone_opens
+                .load(Ordering::Relaxed),
+            checkout_timeouts: self.checkout_timeouts.load(Ordering::Relaxed),
+            active_pooled_checkouts: self.active_pooled_checkouts.load(Ordering::Relaxed),
+            peak_active_pooled_checkouts: self.peak_active_pooled_checkouts.load(Ordering::Relaxed),
+            completed_pooled_checkouts: self.completed_pooled_checkouts.load(Ordering::Relaxed),
+            max_completed_hold_micros: self.max_completed_hold_micros.load(Ordering::Relaxed),
+            reader_replacement_open_failures: self
+                .reader_replacement_open_failures
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -856,6 +1217,7 @@ impl ConnectionPool {
             checkpoint_ownership: CheckpointOwnershipGate::new(),
             pooled_writer_retired: AtomicBool::new(false),
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
+            reader_acquisition_counters: ReaderAcquisitionCounters::default(),
             readers,
             max_readers,
             config,
@@ -919,9 +1281,51 @@ impl ConnectionPool {
     where
         C: Fn() -> bool,
     {
+        let started = Instant::now();
+        let mut admission_attempt = 0u32;
+        let admission_slot = loop {
+            if should_stop() {
+                return Ok(None);
+            }
+            match Arc::clone(&self.sql_bridge_reader_slots).try_acquire_owned() {
+                Ok(slot) => break slot,
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(SqliteError::InvalidData(
+                        "reader admission semaphore is closed".to_string(),
+                    ));
+                }
+                Err(tokio::sync::TryAcquireError::NoPermits) => {}
+            }
+            if started.elapsed() >= self.config.checkout_timeout {
+                self.reader_acquisition_counters.record_checkout_timeout();
+                return Err(pool_exhausted_error(
+                    self.config.checkout_timeout,
+                    self.max_readers,
+                ));
+            }
+            match admission_attempt {
+                0..=7 => {
+                    let spins = 1usize << admission_attempt;
+                    for _ in 0..spins {
+                        std::hint::spin_loop();
+                    }
+                }
+                8..=15 => thread::yield_now(),
+                _ => {
+                    let remaining = self
+                        .config
+                        .checkout_timeout
+                        .saturating_sub(started.elapsed());
+                    let sleep =
+                        Duration::from_micros(50 * (1u64 << (admission_attempt - 16).min(6)));
+                    thread::sleep(sleep.min(remaining).min(Duration::from_millis(2)));
+                }
+            }
+            admission_attempt = admission_attempt.saturating_add(1);
+        };
+
         if self.max_readers == 0 {
             self.ensure_pooled_writer_active()?;
-            let started = Instant::now();
             loop {
                 if should_stop() {
                     return Ok(None);
@@ -931,6 +1335,7 @@ impl ConnectionPool {
                     .checkout_timeout
                     .saturating_sub(started.elapsed());
                 if remaining.is_zero() {
+                    self.reader_acquisition_counters.record_checkout_timeout();
                     return Err(pool_exhausted_error(
                         self.config.checkout_timeout,
                         self.max_readers,
@@ -941,16 +1346,19 @@ impl ConnectionPool {
                     .try_lock_for(remaining.min(Duration::from_millis(2)))
                 {
                     self.ensure_pooled_writer_active()?;
+                    self.reader_acquisition_counters.record_pooled_checkout();
                     return Ok(Some(ReaderGuard {
                         lease: Some(ReaderLease::Shared(guard)),
+                        admission_slot: Some(admission_slot),
                         pool: self,
                         reusable: true,
+                        checked_out_at: Instant::now(),
+                        dirty: Cell::new(false),
                     }));
                 }
             }
         }
 
-        let started = Instant::now();
         let mut attempt = 0u32;
 
         loop {
@@ -958,14 +1366,19 @@ impl ConnectionPool {
                 return Ok(None);
             }
             if let Some(conn) = self.readers.pop() {
+                self.reader_acquisition_counters.record_pooled_checkout();
                 return Ok(Some(ReaderGuard {
                     lease: Some(ReaderLease::Pooled(conn)),
+                    admission_slot: Some(admission_slot),
                     pool: self,
                     reusable: true,
+                    checked_out_at: Instant::now(),
+                    dirty: Cell::new(false),
                 }));
             }
 
             if started.elapsed() >= self.config.checkout_timeout {
+                self.reader_acquisition_counters.record_checkout_timeout();
                 return Err(pool_exhausted_error(
                     self.config.checkout_timeout,
                     self.max_readers,
@@ -1089,6 +1502,23 @@ impl ConnectionPool {
         self.writer_acquisition_counters.snapshot()
     }
 
+    /// Snapshot reader acquisition, saturation, and hold lifecycle outcomes
+    /// since this pool was constructed. Counters reset only with pool
+    /// reconstruction.
+    pub fn reader_acquisition_snapshot(&self) -> ReaderAcquisitionSnapshot {
+        self.reader_acquisition_counters.snapshot(
+            self.max_readers.max(1),
+            self.sql_bridge_reader_slots.available_permits(),
+        )
+    }
+
+    /// Record one pool-wide reader-admission wait that exhausted the configured
+    /// checkout timeout outside [`Self::reader_until`] (currently the explicit
+    /// raw-SQL read-transaction exception and reads on a standalone writer).
+    pub(crate) fn record_reader_admission_timeout(&self) {
+        self.reader_acquisition_counters.record_checkout_timeout();
+    }
+
     /// Clone the pool-scoped counter set for the lifetime-owned writer task.
     pub(crate) fn writer_acquisition_counters(&self) -> Arc<WriterAcquisitionCounters> {
         Arc::clone(&self.writer_acquisition_counters)
@@ -1163,7 +1593,8 @@ impl ConnectionPool {
         }
     }
 
-    /// Pool-wide permits for file-backed raw-SQL reader opens and active reads.
+    /// Pool-wide admission permits shared by pooled readers, the explicit
+    /// raw-SQL read-transaction exception, and reads on standalone writers.
     pub(crate) fn sql_bridge_reader_slots(&self) -> Arc<Semaphore> {
         Arc::clone(&self.sql_bridge_reader_slots)
     }
@@ -1553,11 +1984,18 @@ impl ConnectionPool {
             .await
     }
 
-    /// Open a standalone read-only connection to the same file-backed database.
+    /// Open a standalone read-only connection for one enumerated structural
+    /// exception to pooled-reader routing.
     ///
-    /// Companion to `open_standalone_writer` for stores that also need an
-    /// independent reader connection outside the pooled reader queue.
-    pub fn open_standalone_reader(&self) -> Result<Connection, SqliteError> {
+    /// There is intentionally no public/generic standalone-reader fallback.
+    /// Ordinary request reads use [`Self::reader`] and surface bounded pool
+    /// exhaustion. Adding a purpose variant or call site is therefore a
+    /// deliberate, scoped architecture change (ADR-165 Slice 2), not a
+    /// routine extension.
+    pub(crate) fn open_standalone_reader(
+        &self,
+        purpose: StandaloneReaderPurpose,
+    ) -> Result<Connection, SqliteError> {
         let path = self.read_connection_path()?;
 
         let conn = Connection::open_with_flags(
@@ -1568,27 +2006,54 @@ impl ConnectionPool {
         )?;
         configure_reader_connection(&conn, &self.config)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        self.reader_acquisition_counters
+            .record_standalone_open(purpose);
         Ok(conn)
     }
 
-    fn return_reader(&self, conn: Connection) {
+    fn return_reader(&self, conn: Connection, dirty: bool) {
         if self.max_readers == 0 {
             return;
         }
 
-        let conn = if reset_reader_connection(&conn) && reader_connection_is_healthy(&conn) {
-            Some(conn)
-        } else {
-            close_connection_quietly(conn);
-            self.open_reader_connection().ok()
-        };
+        if reset_reader_connection(&conn, dirty, &self.config)
+            && reader_connection_is_healthy(&conn)
+        {
+            self.enqueue_reader_slot(conn);
+            return;
+        }
 
-        if let Some(conn) = conn {
-            if let Err(conn) = self.readers.push(conn) {
-                eprintln!(
-                    "[sqlite-pool] reader pool queue full, discarding replacement connection"
+        close_connection_quietly(conn);
+        self.replace_discarded_reader_slot();
+    }
+
+    /// Push a connection back onto the physical reader queue, discarding it
+    /// (rather than growing the queue past its configured capacity) if the
+    /// queue is already full.
+    fn enqueue_reader_slot(&self, conn: Connection) {
+        if let Err(conn) = self.readers.push(conn) {
+            eprintln!("[sqlite-pool] reader pool queue full, discarding replacement connection");
+            close_connection_quietly(conn);
+        }
+    }
+
+    /// Open a fresh connection to refill one physical reader slot after its
+    /// previous occupant was closed and discarded — either disqualified on
+    /// an ordinary return ([`Self::return_reader`]) or abandoned by a
+    /// non-reusable checkout ([`ReaderGuard`]'s `Drop`). Both call sites
+    /// share this so a failed replacement is recorded and logged identically
+    /// either way, instead of one path silently shrinking the pool.
+    fn replace_discarded_reader_slot(&self) {
+        match self.open_reader_connection() {
+            Ok(conn) => self.enqueue_reader_slot(conn),
+            Err(error) => {
+                self.reader_acquisition_counters
+                    .record_reader_replacement_open_failure();
+                tracing::warn!(
+                    %error,
+                    "sqlite-pool: reader replacement connection failed to open; the physical \
+                     pool permanently shrinks by one slot below max_readers"
                 );
-                close_connection_quietly(conn);
             }
         }
     }
@@ -2001,27 +2466,208 @@ fn current_journal_mode(conn: &Connection) -> Result<String, SqliteError> {
         .map_err(Into::into)
 }
 
-fn reset_reader_connection(conn: &Connection) -> bool {
-    if conn.is_autocommit() {
+fn reset_reader_connection(conn: &Connection, dirty: bool, config: &PoolConfig) -> bool {
+    if !conn.is_autocommit() {
+        match conn.execute_batch("ROLLBACK") {
+            Ok(()) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _)) => {
+                if matches!(
+                    err.code,
+                    rusqlite::ErrorCode::CannotOpen
+                        | rusqlite::ErrorCode::DatabaseCorrupt
+                        | rusqlite::ErrorCode::NotADatabase
+                        | rusqlite::ErrorCode::DiskFull
+                ) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+        if !conn.is_autocommit() {
+            return false;
+        }
+    }
+
+    if !dirty {
         return true;
     }
 
-    match conn.execute_batch("ROLLBACK") {
-        Ok(()) => conn.is_autocommit(),
-        Err(rusqlite::Error::SqliteFailure(err, _)) => {
-            if matches!(
-                err.code,
-                rusqlite::ErrorCode::CannotOpen
-                    | rusqlite::ErrorCode::DatabaseCorrupt
-                    | rusqlite::ErrorCode::NotADatabase
-                    | rusqlite::ErrorCode::DiskFull
+    reader_connection_state_is_pristine(conn)
+        && reader_connection_settings_match_baseline(conn, config, 0)
+}
+
+/// A pooled reader must never carry connection-local state across logical
+/// checkouts. Raw-SQL reads run arbitrary caller SQL against the shared
+/// pooled connection (`sql_bridge`'s `run_pool_reader_query`), so a
+/// `CREATE TEMP TABLE` or `ATTACH DATABASE` from one checkout would
+/// otherwise stay visible to whichever later caller draws the same
+/// connection back out of the pool. Dropping those objects individually is
+/// order-sensitive (triggers and indexes depend on their tables), so their
+/// presence is instead treated as reuse-disqualifying: the caller closes
+/// the connection and opens a fresh replacement.
+///
+/// Called only when [`ReaderGuard::dirty`] is set (`reset_reader_connection`'s
+/// `dirty` gate) — a typed store read never runs raw caller SQL and returns
+/// without paying this scan; only a checkout that executed a `SqlReader`
+/// raw-SQL statement (`sql_bridge`'s `run_pool_reader_query`) does.
+fn reader_connection_state_is_pristine(conn: &Connection) -> bool {
+    let has_temp_objects: bool = match conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master)",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if has_temp_objects {
+        return false;
+    }
+
+    let attached_databases: i64 = match conn.query_row(
+        "SELECT COUNT(*) FROM pragma_database_list WHERE name NOT IN ('main', 'temp')",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    attached_databases == 0
+}
+
+/// The observable connection-local settings a reader capability could in
+/// principle influence, compared against this pool's configured baseline.
+/// Called only on a dirty return, alongside [`reader_connection_state_is_pristine`]
+/// — the reader-capability admission gate (`sql_bridge::reader_capability_admits`)
+/// refuses every raw-SQL form that could change these today, so this is
+/// defense in depth against a gap in that gate, not the primary boundary.
+///
+/// `expected_query_only` is the caller's expected baseline for `query_only`:
+/// pooled reader connections never set it explicitly (`configure_reader_connection`
+/// does not touch it) regardless of `config.read_only`, so pooled-reader callers
+/// pass `0`; the degraded shared-writer-as-reader lease (`max_readers == 0`)
+/// inherits whatever `configure_writer_connection` set, which does depend on
+/// `config.read_only`.
+fn reader_connection_settings_match_baseline(
+    conn: &Connection,
+    config: &PoolConfig,
+    expected_query_only: i64,
+) -> bool {
+    let expected_busy_timeout_ms =
+        i64::try_from(config.busy_timeout.as_millis()).unwrap_or(i64::MAX);
+    let expected_cache_size: i64 = CACHE_SIZE_KIB.parse().unwrap_or(-65536);
+    let checks: [(&str, i64); 8] = [
+        ("query_only", expected_query_only),
+        ("writable_schema", 0),
+        ("foreign_keys", 1),
+        ("busy_timeout", expected_busy_timeout_ms),
+        ("cache_size", expected_cache_size),
+        ("temp_store", 2),
+        ("read_uncommitted", 0),
+        ("defer_foreign_keys", 0),
+    ];
+    checks.iter().all(|(pragma, expected)| {
+        conn.pragma_query_value(None, pragma, |row| row.get::<_, i64>(0))
+            .map(|actual| actual == *expected)
+            .unwrap_or(false)
+    })
+}
+
+/// Best-effort recovery for a dirty shared reader-writer lease
+/// (`max_readers == 0` degraded mode): there is no separate connection to
+/// close and replace, so a disqualifying state is instead undone in place —
+/// DETACH every non-main/non-temp database, drop every TEMP object in
+/// dependency order (views and triggers before the indexes and tables they
+/// depend on), then reapply the pool's baseline connection settings. Returns
+/// `true` only if the connection verifiably passes the same pristine/settings
+/// checks afterward; the caller poisons the lease on `false`.
+fn restore_shared_reader_state(conn: &Connection, config: &PoolConfig) -> bool {
+    if !detach_non_main_databases(conn) {
+        return false;
+    }
+    if !drop_temp_objects(conn) {
+        return false;
+    }
+    let expected_query_only = i64::from(config.read_only);
+    if reset_observable_settings(conn, config, expected_query_only).is_err() {
+        return false;
+    }
+    reader_connection_state_is_pristine(conn)
+        && reader_connection_settings_match_baseline(conn, config, expected_query_only)
+}
+
+fn detach_non_main_databases(conn: &Connection) -> bool {
+    loop {
+        let name: Option<String> = match conn.query_row(
+            "SELECT name FROM pragma_database_list WHERE name NOT IN ('main', 'temp') LIMIT 1",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(name) => Some(name),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(_) => return false,
+        };
+        let Some(name) = name else {
+            return true;
+        };
+        let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+        if conn
+            .execute_batch(&format!("DETACH DATABASE {quoted}"))
+            .is_err()
+        {
+            return false;
+        }
+    }
+}
+
+fn drop_temp_objects(conn: &Connection) -> bool {
+    // Views and triggers depend on tables/indexes but are never depended on
+    // themselves; dropping them first means every later DROP TABLE/INDEX
+    // never fails on a dangling dependent.
+    for (kind, ddl_keyword) in [
+        ("view", "VIEW"),
+        ("trigger", "TRIGGER"),
+        ("index", "INDEX"),
+        ("table", "TABLE"),
+    ] {
+        loop {
+            let name: Option<String> = match conn.query_row(
+                "SELECT name FROM sqlite_temp_master WHERE type = ?1 LIMIT 1",
+                [kind],
+                |row| row.get(0),
             ) {
+                Ok(name) => Some(name),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(_) => return false,
+            };
+            let Some(name) = name else {
+                break;
+            };
+            let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+            if conn
+                .execute_batch(&format!("DROP {ddl_keyword} IF EXISTS temp.{quoted}"))
+                .is_err()
+            {
                 return false;
             }
-            conn.is_autocommit()
         }
-        Err(_) => false,
     }
+    true
+}
+
+fn reset_observable_settings(
+    conn: &Connection,
+    config: &PoolConfig,
+    expected_query_only: i64,
+) -> Result<(), rusqlite::Error> {
+    conn.pragma_update(None, "query_only", expected_query_only)?;
+    conn.pragma_update(None, "writable_schema", 0)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.busy_timeout(config.busy_timeout)?;
+    conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "read_uncommitted", 0)?;
+    conn.pragma_update(None, "defer_foreign_keys", 0)?;
+    Ok(())
 }
 
 fn reader_connection_is_healthy(conn: &Connection) -> bool {
@@ -2210,6 +2856,7 @@ mod tests {
         );
         let reader = pool.reader().expect("dedicated read-only reader checkout");
         let count: i64 = reader
+            .conn()
             .query_row("SELECT COUNT(*) FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
@@ -2360,12 +3007,15 @@ mod tests {
         .unwrap();
         let reader = pool.reader().unwrap();
         let body: String = reader
+            .conn()
             .query_row("SELECT body FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
         assert_eq!(body, "committed-only-in-wal");
         drop(reader);
 
-        let standalone = pool.open_standalone_reader().unwrap();
+        let standalone = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .unwrap();
         let count: i64 = standalone
             .query_row("SELECT COUNT(*) FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
@@ -2449,11 +3099,14 @@ mod tests {
         .unwrap();
         let reader = pool.reader().unwrap();
         let body: String = reader
+            .conn()
             .query_row("SELECT body FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
         assert_eq!(body, "visible-through-target-wal");
         drop(reader);
-        let standalone = pool.open_standalone_reader().unwrap();
+        let standalone = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .unwrap();
         let count: i64 = standalone
             .query_row("SELECT COUNT(*) FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
@@ -2515,11 +3168,14 @@ mod tests {
         .unwrap();
         let reader = pool.reader().unwrap();
         let body: String = reader
+            .conn()
             .query_row("SELECT body FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
         assert_eq!(body, "checkpointed");
         drop(reader);
-        let standalone = pool.open_standalone_reader().unwrap();
+        let standalone = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .unwrap();
         let count: i64 = standalone
             .query_row("SELECT COUNT(*) FROM snapshot_row", [], |row| row.get(0))
             .unwrap();
@@ -2556,6 +3212,7 @@ mod tests {
         {
             let reader = pool.reader().unwrap();
             let count: i64 = reader
+                .conn()
                 .query_row("SELECT COUNT(*) FROM live_row", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(count, 0);
@@ -2566,11 +3223,484 @@ mod tests {
             .unwrap();
         let reader = pool.reader().unwrap();
         let count: i64 = reader
+            .conn()
             .query_row("SELECT COUNT(*) FROM live_row", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
             count, 1,
             "rollback-journal read-only connections must retain live change detection"
+        );
+    }
+
+    /// Raw-SQL reads run arbitrary caller SQL against a pooled reader
+    /// connection. A `CREATE TEMP TABLE` or `ATTACH DATABASE` issued by one
+    /// checkout must never remain visible to a later, unrelated checkout
+    /// that happens to draw the same pooled connection back out — that
+    /// would leak state across logical readers, and across whatever
+    /// separate checkouts (requests, checkouts of the same store) reuse the
+    /// pool. `max_readers: 1` forces the second checkout to reuse the exact
+    /// connection the first one returned.
+    #[test]
+    fn pooled_reader_return_clears_temp_schema_and_attached_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pooled-reader-reset.db");
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.execute_batch("CREATE TABLE main_row(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+
+        let secret_path = dir.path().join("secret.db");
+        {
+            let secret = Connection::open(&secret_path).unwrap();
+            secret
+                .execute_batch(
+                    "CREATE TABLE secret_row(id INTEGER PRIMARY KEY, body TEXT NOT NULL);\
+                     INSERT INTO secret_row(body) VALUES ('leaked-across-checkouts');",
+                )
+                .unwrap();
+        }
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        {
+            let reader = pool.reader().unwrap();
+            reader
+                .conn()
+                .execute_batch("CREATE TEMP TABLE leaked_temp(id INTEGER PRIMARY KEY);")
+                .unwrap();
+            reader
+                .conn()
+                .execute_batch(&format!(
+                    "ATTACH DATABASE '{}' AS secret;",
+                    secret_path.display()
+                ))
+                .unwrap();
+            let leaked_count: i64 = reader
+                .conn()
+                .query_row("SELECT COUNT(*) FROM secret.secret_row", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(leaked_count, 1);
+            // The pristine-state scan on return only runs for a checkout
+            // marked dirty by the raw-SQL bridge (`sql_bridge::run_pool_reader_query`);
+            // this test drives the connection directly rather than through
+            // `SqlReader`, so it marks the checkout dirty itself to exercise
+            // the same scan a real raw-SQL reader checkout would trigger.
+            reader.mark_dirty();
+        }
+
+        let reader = pool.reader().unwrap();
+        let temp_table_survived: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'leaked_temp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            temp_table_survived, 0,
+            "a TEMP table from an earlier checkout must not survive pooled reader reuse"
+        );
+
+        let attachment_survived: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'secret'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attachment_survived, 0,
+            "an ATTACHed database from an earlier checkout must not survive pooled reader reuse"
+        );
+    }
+
+    /// `PRAGMA writable_schema = ON` lets a caller `DELETE` a TEMP object's
+    /// own `sqlite_temp_master` row while the object stays live in that
+    /// connection's in-memory schema — the catalog scan alone
+    /// (`reader_connection_state_is_pristine`) is blind to this. The
+    /// settings check (`reader_connection_settings_match_baseline`) must
+    /// still catch the connection as dirty via `writable_schema` itself and
+    /// disqualify it for reuse.
+    #[test]
+    fn writable_schema_evasion_of_the_temp_catalog_scan_still_disqualifies_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writable-schema-evasion.db");
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.execute_batch("CREATE TABLE main_row(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        {
+            let reader = pool.reader().unwrap();
+            reader
+                .conn()
+                .execute_batch("CREATE TEMP TABLE leaked_temp(id INTEGER PRIMARY KEY);")
+                .unwrap();
+            reader
+                .conn()
+                .execute_batch(
+                    "PRAGMA writable_schema = ON; \
+                     DELETE FROM sqlite_temp_master WHERE name = 'leaked_temp';",
+                )
+                .unwrap();
+            let visible: i64 = reader
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'leaked_temp'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                visible, 0,
+                "the evasion must actually hide the row from the catalog scan"
+            );
+            reader.mark_dirty();
+        }
+
+        let reader = pool.reader().unwrap();
+        // A reused (not replaced) connection would still see `leaked_temp`:
+        // SQLite's in-memory schema for a TEMP table survives a
+        // `sqlite_temp_master` row delete. A fresh replacement connection
+        // has no such table at all.
+        let leaked_still_queryable = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM leaked_temp", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .is_ok();
+        assert!(
+            !leaked_still_queryable,
+            "a writable_schema evasion of the catalog scan must still disqualify the \
+             connection via the settings check"
+        );
+    }
+
+    /// A checkout that never runs raw SQL through [`ReaderGuard::mark_dirty`]
+    /// (the shape of every typed store read) must return without the
+    /// catalog/settings scan running at all — not merely without being
+    /// disqualified by it. Proven here by leaving state behind on the
+    /// connection that the scan *would* catch if it ran, then checking that
+    /// state is still there on the very next checkout: a scan that ran would
+    /// have detected and cleared it.
+    #[test]
+    fn a_checkout_that_never_marks_dirty_skips_the_catalog_scan_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed-read-skips-scan.db");
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.execute_batch("CREATE TABLE main_row(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        {
+            let reader = pool.reader().unwrap();
+            // A typed store never calls `run_pool_reader_query`, so it never
+            // calls `mark_dirty` either — this checkout is returned clean.
+            reader
+                .conn()
+                .execute_batch("CREATE TEMP TABLE survivor(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+
+        let reader = pool.reader().unwrap();
+        let survived = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM survivor", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .is_ok();
+        assert!(
+            survived,
+            "a non-dirty checkout must return without running the catalog scan at all, \
+             so a TEMP table it left behind is still visible on the next checkout"
+        );
+    }
+
+    /// A `busy_timeout`/`cache_size` change made directly on a dirty
+    /// checkout's connection must not be observed by the next checkout —
+    /// these are exactly the two settings the reader-capability admission
+    /// gate (`sql_bridge::reader_capability_admits`) refuses to let a raw
+    /// PRAGMA touch; this test pins the independent settings-check safety
+    /// net for the case where something still changed them.
+    #[test]
+    fn busy_timeout_and_cache_size_changes_do_not_survive_a_dirty_pooled_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings-evasion.db");
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.execute_batch("CREATE TABLE main_row(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        let default_busy_timeout_ms = i64::try_from(pool.config().busy_timeout.as_millis())
+            .expect("configured busy_timeout fits i64 millis");
+
+        {
+            let reader = pool.reader().unwrap();
+            reader
+                .conn()
+                .pragma_update(None, "busy_timeout", 1i64)
+                .unwrap();
+            reader
+                .conn()
+                .pragma_update(None, "cache_size", -64i64)
+                .unwrap();
+            reader
+                .conn()
+                .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .unwrap();
+            reader.mark_dirty();
+        }
+
+        let reader = pool.reader().unwrap();
+        let busy_timeout: i64 = reader
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        let cache_size: i64 = reader
+            .conn()
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            busy_timeout, default_busy_timeout_ms,
+            "busy_timeout must be restored to the pool's configured baseline"
+        );
+        assert_eq!(
+            cache_size, -65536,
+            "cache_size must be restored to the pool's configured baseline"
+        );
+    }
+
+    /// `max_readers == 0` (degraded mode) has no separate reader connection
+    /// to close and replace — the shared writer-as-reader lease is the only
+    /// connection. A dirty return must still be cleaned (or the pool
+    /// poisoned) rather than handing the next checkout leaked TEMP/attached
+    /// state, exactly as the pooled path does.
+    #[test]
+    fn degraded_shared_reader_lease_clears_temp_schema_and_attached_databases_on_dirty_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("degraded-shared-reader-reset.db");
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.execute_batch("CREATE TABLE main_row(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+        let secret_path = dir.path().join("secret.db");
+        {
+            let secret = Connection::open(&secret_path).unwrap();
+            secret
+                .execute_batch(
+                    "CREATE TABLE secret_row(id INTEGER PRIMARY KEY, body TEXT NOT NULL);\
+                     INSERT INTO secret_row(body) VALUES ('leaked-across-checkouts');",
+                )
+                .unwrap();
+        }
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            max_readers: 0,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        {
+            let reader = pool.reader().unwrap();
+            reader
+                .conn()
+                .execute_batch("CREATE TEMP TABLE leaked_temp(id INTEGER PRIMARY KEY);")
+                .unwrap();
+            reader
+                .conn()
+                .execute_batch(&format!(
+                    "ATTACH DATABASE '{}' AS secret;",
+                    secret_path.display()
+                ))
+                .unwrap();
+            reader.mark_dirty();
+        }
+
+        let reader = pool.reader().unwrap();
+        let temp_table_survived: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'leaked_temp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            temp_table_survived, 0,
+            "a TEMP table must not survive a dirty degraded shared-reader-lease return"
+        );
+        let attachment_survived: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'secret'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attachment_survived, 0,
+            "an ATTACHed database must not survive a dirty degraded shared-reader-lease return"
+        );
+    }
+
+    /// `ReaderGuard::conn` is crate-private and no method on `ReaderGuard`
+    /// ever returns a raw `&Connection` to a caller outside `khive-db` — the
+    /// only public accessor, `query_row`, must refuse anything that is not
+    /// an admitted read shape before it reaches SQLite at all, not merely
+    /// mark the checkout dirty after the fact. Before that encapsulation, a
+    /// caller with a raw connection could open a transaction, run DML, or
+    /// flip connection-local state on a lease meant to be read-only; a
+    /// `BEGIN`, an `INSERT`, and a setting `PRAGMA` must each be refused
+    /// here, and the probe rows/state they would have written must not
+    /// exist afterward.
+    #[test]
+    fn query_row_refuses_write_and_transaction_control_statements() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch("CREATE TABLE query_row_admission_probe(id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let reader = pool.reader().unwrap();
+        for (label, sql) in [
+            ("BEGIN", "BEGIN"),
+            (
+                "INSERT",
+                "INSERT INTO query_row_admission_probe(id) VALUES (1)",
+            ),
+            (
+                "CREATE TEMP TABLE",
+                "CREATE TEMP TABLE query_row_admission_probe_temp(id INTEGER PRIMARY KEY)",
+            ),
+            ("setting PRAGMA", "PRAGMA journal_mode = OFF"),
+        ] {
+            let result = reader.query_row(sql, [], |row| row.get::<_, i64>(0));
+            assert!(
+                result.is_err(),
+                "query_row must refuse {label} ({sql:?}); got {result:?}"
+            );
+        }
+
+        let row_count: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM query_row_admission_probe",
+                [],
+                |row| row.get(0),
+            )
+            .expect("an admitted SELECT must still succeed");
+        assert_eq!(
+            row_count, 0,
+            "a refused INSERT must never have reached SQLite"
+        );
+        let temp_table_survived: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master \
+                 WHERE name = 'query_row_admission_probe_temp'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("an admitted SELECT must still succeed");
+        assert_eq!(
+            temp_table_survived, 0,
+            "a refused CREATE TEMP TABLE must never have reached SQLite"
+        );
+        let journal_mode: String = reader
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("the read-only journal_mode PRAGMA form must still be admitted");
+        assert_ne!(
+            journal_mode.to_ascii_lowercase(),
+            "off",
+            "a refused setting PRAGMA must never have reached SQLite"
+        );
+    }
+
+    /// A non-reusable checkout (marked via `discard()`, the cancellation
+    /// cleanup path in `read_cancellation.rs`) closes its connection and
+    /// tries to open a replacement to refill the physical pool slot. Before
+    /// this shared the same accounting `return_reader`'s disqualified-return
+    /// path uses, a failed replacement open here was silently swallowed: no
+    /// counter, no log, so `db_diagnostics` under-reported the lost
+    /// capacity.
+    #[test]
+    fn discarded_reader_replacement_open_failure_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("discard-replacement-failure.db");
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        let before = pool.reader_acquisition_snapshot();
+
+        let mut reader = pool.reader().unwrap();
+        reader.discard();
+        // The replacement open this triggers on drop must fail deterministically:
+        // remove the file a fresh SQLITE_OPEN_READ_ONLY open needs.
+        std::fs::remove_file(&path).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(sqlite_sidecar(&path, suffix));
+        }
+        drop(reader);
+
+        let after = pool.reader_acquisition_snapshot();
+        assert_eq!(
+            after.reader_replacement_open_failures - before.reader_replacement_open_failures,
+            1,
+            "a non-reusable checkout's failed replacement open must be recorded, not silently \
+             swallowed"
         );
     }
 
@@ -3446,6 +4576,79 @@ mod tests {
                 writer_task_side_effects_unknown: 0,
             },
             "the public standalone boundary must contribute to the aggregate exactly once"
+        );
+    }
+
+    #[test]
+    fn reader_snapshot_tracks_pool_saturation_hold_lifecycle_and_exception_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader_acquisition_counters.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            max_readers: 1,
+            checkout_timeout: Duration::from_millis(2),
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool");
+
+        assert_eq!(
+            pool.reader_acquisition_snapshot(),
+            ReaderAcquisitionSnapshot {
+                reader_admission_capacity: 1,
+                available_reader_admission_slots: 1,
+                ..ReaderAcquisitionSnapshot::default()
+            }
+        );
+
+        let held = pool.reader().expect("first pooled checkout succeeds");
+        assert_eq!(
+            pool.reader_acquisition_snapshot(),
+            ReaderAcquisitionSnapshot {
+                reader_admission_capacity: 1,
+                available_reader_admission_slots: 0,
+                acquisitions: 1,
+                pooled_checkouts: 1,
+                active_pooled_checkouts: 1,
+                peak_active_pooled_checkouts: 1,
+                ..ReaderAcquisitionSnapshot::default()
+            }
+        );
+
+        let timeout = match pool.reader() {
+            Ok(_) => panic!("the sole live checkout must exhaust bounded admission"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &timeout,
+                SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                    if code.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "reader saturation must keep the pool-exhausted classification: {timeout}"
+        );
+        drop(held);
+
+        let explicit = pool
+            .open_standalone_reader(StandaloneReaderPurpose::ExplicitSqlReadTransaction)
+            .expect("explicit read-transaction exception opens");
+        drop(explicit);
+        let infrastructure = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .expect("infrastructure exception opens");
+        drop(infrastructure);
+
+        let snapshot = pool.reader_acquisition_snapshot();
+        assert_eq!(snapshot.acquisitions, 2);
+        assert_eq!(snapshot.pooled_checkouts, 1);
+        assert_eq!(snapshot.standalone_opens, 1);
+        assert_eq!(snapshot.infrastructure_standalone_opens, 1);
+        assert_eq!(snapshot.checkout_timeouts, 1);
+        assert_eq!(snapshot.active_pooled_checkouts, 0);
+        assert_eq!(snapshot.peak_active_pooled_checkouts, 1);
+        assert_eq!(snapshot.completed_pooled_checkouts, 1);
+        assert!(
+            snapshot.max_completed_hold_micros > 0,
+            "the held checkout's completed lifecycle must expose nonzero hold evidence"
         );
     }
 

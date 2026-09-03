@@ -996,7 +996,11 @@ impl KhiveRuntime {
             crate::retrieval::EmbeddingTruncationReport::default()
         };
 
-        let event_store = self.events(token)?;
+        let event_token =
+            token.with_namespace(crate::Namespace::parse(&entity.namespace).map_err(|error| {
+                RuntimeError::Internal(format!("entity namespace invalid: {error}"))
+            })?);
+        let event_store = self.events(&event_token)?;
         let event = khive_storage::event::Event::new(
             entity.namespace.clone(),
             "update",
@@ -1251,7 +1255,11 @@ impl KhiveRuntime {
 
         // Dry-run is a read-only preview: it must not append a merge event.
         if !dry_run {
-            let event_store = self.events(token)?;
+            let event_token =
+                token.with_namespace(crate::Namespace::parse(&updated_entity.namespace).map_err(
+                    |error| RuntimeError::Internal(format!("entity namespace invalid: {error}")),
+                )?);
+            let event_store = self.events(&event_token)?;
             // Mirror the wire-level strategy spelling from MergeParams so consumers
             // can round-trip the policy string back into a request.
             let policy_str = match strategy {
@@ -2116,7 +2124,11 @@ impl KhiveRuntime {
 
         // Dry-run is a read-only preview: it must not append a merge event.
         if !dry_run {
-            let event_store = self.events(token)?;
+            let event_token =
+                token.with_namespace(crate::Namespace::parse(&updated_note.namespace).map_err(
+                    |error| RuntimeError::Internal(format!("note namespace invalid: {error}")),
+                )?);
+            let event_store = self.events(&event_token)?;
             // Mirror the wire-level strategy spelling from MergeParams so consumers
             // can round-trip the policy string back into a request.
             let policy_str = match strategy {
@@ -2812,11 +2824,18 @@ fn merge_entity_sql(
             _ => merged_name.clone(),
         };
         let kind_str = SubstrateKind::Entity.to_string();
+        let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
 
+        // `into`'s old FTS row (via the map, not a namespace/subject_id
+        // scan), then the new merged row, then the map upsert to the new
+        // rowid. No separate map-row delete first: `INSERT OR REPLACE`
+        // overwrites it in place (see `delete_document_statement`'s doc
+        // comment in khive-db).
         conn.execute(
             &format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                fts_table
+                "DELETE FROM {fts_table} WHERE rowid IN \
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
             ),
             rusqlite::params![&namespace, &into_str],
         )?;
@@ -2839,12 +2858,27 @@ fn merge_entity_sql(
                 &into_entity.kind,
             ],
         )?;
-
         conn.execute(
             &format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                fts_table
+                "INSERT OR REPLACE INTO {fts_map} (namespace, subject_id, rowid) \
+                 VALUES (?1, ?2, last_insert_rowid())"
             ),
+            rusqlite::params![&namespace, &into_str],
+        )?;
+
+        // `from`'s FTS row is gone for good (merged away, not reinserted) —
+        // its map row must be removed too, or it would keep pointing at a
+        // rowid the DELETE above already reclaimed.
+        conn.execute(
+            &format!(
+                "DELETE FROM {fts_table} WHERE rowid IN \
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
+            ),
+            rusqlite::params![&namespace, &from_str],
+        )?;
+        conn.execute(
+            &format!("DELETE FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2"),
             rusqlite::params![&namespace, &from_str],
         )?;
 
@@ -3416,10 +3450,16 @@ fn merge_note_sql(
                 into_note.deleted_at,
             ])?;
 
+        let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
+
+        // `into`'s old FTS row (via the map), then the new merged row, then
+        // the map upsert to the new rowid — see `merge_entity_sql`'s matching
+        // comment for why no separate map-row delete is needed here.
         conn.execute(
             &format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                fts_table
+                "DELETE FROM {fts_table} WHERE rowid IN \
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
             ),
             rusqlite::params![&namespace, &into_str],
         )?;
@@ -3454,12 +3494,25 @@ fn merge_note_sql(
                 &fts_merged.record_kind,
             ],
         )?;
-
         conn.execute(
             &format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                fts_table
+                "INSERT OR REPLACE INTO {fts_map} (namespace, subject_id, rowid) \
+                 VALUES (?1, ?2, last_insert_rowid())"
             ),
+            rusqlite::params![&namespace, &into_str],
+        )?;
+
+        // `from`'s FTS row is gone for good — remove its map row too.
+        conn.execute(
+            &format!(
+                "DELETE FROM {fts_table} WHERE rowid IN \
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
+            ),
+            rusqlite::params![&namespace, &from_str],
+        )?;
+        conn.execute(
+            &format!("DELETE FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2"),
             rusqlite::params![&namespace, &from_str],
         )?;
 
