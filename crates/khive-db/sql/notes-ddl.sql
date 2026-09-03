@@ -28,17 +28,22 @@ CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
 -- unread listing/count projection). Its WHERE clause is the exact predicate the
 -- JsonTypeNeMissing filter op generates (with the json_type value inlined
 -- as a literal -- a bound parameter cannot prove implication at plan time),
--- and its third key column is the exact `ifnull(...)` expression the
--- EqOrMissingIndexed filter op generates for the recipient, so the planner serves
--- unread scans from only the caller's own unread rows. Generic EqOrMissing
--- remains available for legacy recipient-less visibility: work is proportional
--- to the unread set,
--- never to other actors' backlog and never to total mailbox size. The
--- superseded recipient-blind shape is dropped by name (a no-op once gone).
+-- its third key column is the exact `ifnull(...)` expression the
+-- EqOrMissingIndexed filter op generates for the recipient, and its fourth key
+-- column is the message direction, so the planner serves unread scans from
+-- only the caller's own unread INBOUND rows. Generic EqOrMissing remains
+-- available for legacy recipient-less visibility: work is proportional to
+-- the unread inbound set, never to other actors' backlog, never to total
+-- mailbox size, and never to the recipient's own outbound send history
+-- (every comm.send leaves a durable outbound copy addressed to the recipient
+-- that is never marked read). The superseded recipient-blind and
+-- direction-blind shapes are dropped by name (a no-op once gone).
 DROP INDEX IF EXISTS idx_notes_unread_probe;
-CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient
+DROP INDEX IF EXISTS idx_notes_unread_probe_recipient;
+CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient_direction
     ON notes(namespace, kind,
              ifnull(json_extract(properties, '$.to_actor'), ''),
+             json_extract(properties, '$.direction'),
              created_at DESC, id ASC)
     WHERE (json_type(properties, '$.read') IS NULL
            OR json_type(properties, '$.read') != 'true')

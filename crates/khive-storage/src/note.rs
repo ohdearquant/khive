@@ -764,9 +764,19 @@ pub trait NoteStore: Send + Sync + 'static {
     ///
     /// A saturated entry reports `count == cap` and `saturated == true`; an
     /// unsaturated entry is exact. SQL implementations should count over a
-    /// limited `SELECT 1` subquery so work is proportional to `cap`, never the
-    /// complete matching population. Backends that cannot preserve the shared
-    /// snapshot or work bound must fail closed.
+    /// limited `SELECT 1` subquery so work is proportional to `cap` and the
+    /// caller's own matching population, never an unrelated backlog. That
+    /// bound holds only when every `property_filter` in the given
+    /// `NoteFilter` is servable as an index key column (equality on a bound
+    /// parameter or a plan-time-provable partial-index predicate) all the way
+    /// down to the filter that actually narrows the population — a residual
+    /// filter evaluated after the index seek (a bound parameter the index
+    /// cannot use to skip rows) degrades the bound to work proportional to
+    /// the rows *scanned* before `cap` matches are found, not the rows that
+    /// match. Callers building filters against this bound must ensure the
+    /// full predicate set is indexed, not just the predicate that narrows the
+    /// population most. Backends that cannot preserve the shared snapshot or
+    /// work bound must fail closed.
     async fn count_notes_filtered_bounded_in_snapshot(
         &self,
         _namespace: &str,

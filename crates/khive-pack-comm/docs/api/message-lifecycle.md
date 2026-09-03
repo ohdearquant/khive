@@ -183,9 +183,14 @@ page window and of `status` and sender filters — and is exact below
 `unread_count_cap` (1,000). `unread_count_saturated=false` means the number is
 exact, including when it equals the cap; `true` means the value is the lower
 bound "at least 1,000". The addressed and legacy-recipient partitions are
-counted through cap-limited subqueries in one storage snapshot. The sent box
-reports zero and `unread_count_saturated=false` because outbound rows have no
-recipient read state.
+counted through cap-limited subqueries in one storage snapshot, served by
+`idx_notes_unread_probe_recipient_direction` (recipient AND direction are both
+index key columns), so the work is bounded by the cap and the caller's own
+unread inbound population — never by the recipient's own outbound send
+history, which every `comm.send` durably extends but which the direction key
+excludes from the scan. The sent box reports zero and
+`unread_count_saturated=false` because outbound rows have no recipient read
+state.
 
 Every caller is filtered by `to_actor = caller OR to_actor IS NULL`. A
 configured actor therefore sees messages addressed to that actor plus legacy

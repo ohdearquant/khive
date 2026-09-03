@@ -2632,7 +2632,7 @@ fn transactional_write_refreshes_writer_task_after_construction_outside_runtime(
 // -- unread-probe partial index tests --
 
 /// The comm unread probe (badge count + inbox unread listing) must be served
-/// by `idx_notes_unread_probe_recipient`, so its work scales with the unread set, not
+/// by `idx_notes_unread_probe_recipient_direction`, so its work scales with the unread set, not
 /// total mailbox size. The assertions below are the actual discriminator: the
 /// generated WHERE SQL contains the literal form and `JsonTypeNeMissing` contributes
 /// no bind parameter. The plan before and after dropping the index is only an
@@ -2737,7 +2737,7 @@ async fn unread_probe_query_uses_partial_index() {
     };
     let indexed_plan = plan(&sql, &params);
     assert!(
-        indexed_plan.contains("idx_notes_unread_probe_recipient"),
+        indexed_plan.contains("idx_notes_unread_probe_recipient_direction"),
         "unread probe must be served by the partial index, got plan:\n{indexed_plan}"
     );
 
@@ -2750,11 +2750,11 @@ async fn unread_probe_query_uses_partial_index() {
     // a literal is provable at prepare time everywhere.)
     reader
         .conn()
-        .execute_batch("DROP INDEX idx_notes_unread_probe_recipient")
+        .execute_batch("DROP INDEX idx_notes_unread_probe_recipient_direction")
         .unwrap();
     let control_plan = plan(&sql, &params);
     assert!(
-        !control_plan.contains("idx_notes_unread_probe_recipient"),
+        !control_plan.contains("idx_notes_unread_probe_recipient_direction"),
         "control: dropped index must vanish from the plan, got:\n{control_plan}"
     );
 }
@@ -2835,14 +2835,14 @@ async fn unread_probe_legacy_partition_includes_null_and_uses_partial_index() {
         .collect();
     let plan = plan.join("\n");
     assert!(
-        plan.contains("idx_notes_unread_probe_recipient"),
+        plan.contains("idx_notes_unread_probe_recipient_direction"),
         "legacy recipient partition must use the partial index, got plan:\n{plan}"
     );
 }
 
 /// The unread probe's work must scale with the CALLER's unread set, not
 /// with other recipients' backlog: the recipient key column on
-/// `idx_notes_unread_probe_recipient` (the exact `ifnull(...)` expression
+/// `idx_notes_unread_probe_recipient_direction` (the exact `ifnull(...)` expression
 /// EqOrMissingIndexed generates) lets the planner exclude other actors' rows
 /// inside the index. Grow an irrelevant recipient's unread backlog 10x and
 /// assert the probe's VM step count stays flat — a recipient-blind scan
@@ -2953,6 +2953,306 @@ async fn unread_probe_work_is_bounded_by_callers_own_unread_rows() {
         "unread probe scanned other recipients' backlog: \
          {steps_small} VM steps at 200 irrelevant rows vs {steps_large} at 2000 \
          (a recipient-scoped probe stays flat; a blind scan grows ~10x)"
+    );
+}
+
+/// khive#2318 follow-up: every `comm.send` durably writes an outbound copy
+/// addressed to the recipient (`to_actor` set the same as the inbound copy)
+/// whose `read` property is never subsequently set to `true` — the sender's
+/// own copy is never opened by the recipient. That outbound row sits in the
+/// same `(namespace, kind, to_actor)` partition of the unread-probe partial
+/// index as the recipient's genuinely unread inbound rows for the rest of
+/// its life. `direction='inbound'` is a residual predicate (a bound
+/// parameter, not a key column) on both the bounded-count SQL
+/// (`count_notes_filtered_bounded_in_snapshot`) and the ordered unread
+/// listing SQL, so growing a recipient's own OUTBOUND history — not another
+/// recipient's backlog, not the recipient's own unread inbound count — must
+/// not grow the work either statement does. This pins the fix
+/// (`idx_notes_unread_probe_recipient_direction`'s direction key column)
+/// against the regression it closes: the control section below reproduces
+/// the pre-fix shape and shows it fails the same assertion.
+#[tokio::test]
+async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+    use rusqlite::StatementStatus;
+
+    const CAP: i64 = 1_000;
+
+    fn count_filter() -> NoteFilter {
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters: vec![
+                NotePropFilter {
+                    json_path: "$.direction".to_string(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text("inbound".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.read".to_string(),
+                    op: FilterOp::JsonTypeNeMissing,
+                    value: SqlValue::Text("true".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.to_actor".to_string(),
+                    op: FilterOp::EqOrMissingIndexed,
+                    value: SqlValue::Text("actor:a".to_string()),
+                },
+            ],
+            order_by: None,
+            ..Default::default()
+        }
+    }
+
+    // Mirrors count_notes_filtered_bounded_in_snapshot's inner SQL exactly
+    // (note.rs ~1618-1627): the LIMIT bounds rows that MATCH the full WHERE
+    // clause, not index entries visited before direction rejects them.
+    fn count_sql_and_params(filter: &NoteFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        params.push(Box::new(CAP + 1));
+        let limit_idx = params.len();
+        (
+            format!("SELECT COUNT(*) FROM (SELECT 1 FROM notes{where_sql} LIMIT ?{limit_idx})"),
+            params,
+        )
+    }
+
+    // Mirrors the ordered unread-listing shape (query_notes_filtered_bounded /
+    // the comm.inbox unread listing, note.rs ~1748-1752).
+    fn list_sql_and_params(filter: &NoteFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        params.push(Box::new(CAP + 1));
+        let limit_idx = params.len();
+        (
+            format!(
+                "SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT ?{limit_idx}"
+            ),
+            params,
+        )
+    }
+
+    fn seed_inbound(conn: &rusqlite::Connection, n: usize) {
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', 'inbound', 'to_actor', 'actor:a'), \
+                         ?3, ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("mine {i}"),
+                    i as i64
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    // Same recipient key (`to_actor: actor:a`) as the inbound rows above,
+    // direction='outbound', `read` absent — exactly the shape
+    // dual_write_message leaves behind for every message ever sent TO
+    // actor:a (the sender's own copy of that delivery), stamped strictly
+    // newer so a created_at DESC scan meets it before the caller's own rows.
+    fn seed_outbound(conn: &rusqlite::Connection, n: usize) {
+        let base: i64 = conn
+            .query_row("SELECT ifnull(max(created_at), 0) FROM notes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..n {
+            let stamp = base + 1 + i as i64;
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', 'outbound', 'to_actor', 'actor:a'), \
+                         ?3, ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("sent-copy {i}"),
+                    stamp
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    fn measure(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> (i64, i32) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let value: i64 = stmt.query_row(refs.as_slice(), |row| row.get(0)).unwrap();
+        (value, stmt.get_status(StatementStatus::VmStep))
+    }
+
+    fn measure_list(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> (usize, i32) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows: Vec<String> = stmt
+            .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let steps = stmt.get_status(StatementStatus::VmStep);
+        (rows.len(), steps)
+    }
+
+    // -- Fixed: idx_notes_unread_probe_recipient_direction is live. --
+    let pool = setup_pool();
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_inbound(conn, 5);
+    }
+
+    let filter = count_filter();
+    let (count_sql, count_params) = count_sql_and_params(&filter);
+    let (list_sql, list_params) = list_sql_and_params(&filter);
+
+    {
+        let reader = pool.reader().unwrap();
+        let plan = |sql: &str, params: &[Box<dyn rusqlite::types::ToSql>]| -> String {
+            let mut stmt = reader
+                .conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let details: Vec<String> = stmt
+                .query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            details.join("\n")
+        };
+        let count_plan = plan(&count_sql, &count_params);
+        assert!(
+            count_plan.contains("idx_notes_unread_probe_recipient_direction"),
+            "bounded-count query must be served by the direction-aware index, got:\n{count_plan}"
+        );
+        let list_plan = plan(&list_sql, &list_params);
+        assert!(
+            list_plan.contains("idx_notes_unread_probe_recipient_direction"),
+            "unread listing query must be served by the direction-aware index, got:\n{list_plan}"
+        );
+    }
+
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_outbound(conn, 3_000);
+    }
+    let (count_val_small, count_steps_small) = {
+        let reader = pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    let (list_rows_small, list_steps_small) = {
+        let reader = pool.reader().unwrap();
+        measure_list(reader.conn(), &list_sql, &list_params)
+    };
+    assert_eq!(
+        count_val_small, 5,
+        "only the caller's unread inbound rows count"
+    );
+    assert_eq!(
+        list_rows_small, 5,
+        "only the caller's unread inbound rows list"
+    );
+
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_outbound(conn, 27_000); // cumulative outbound backlog: 30_000 (10x)
+    }
+    let (count_val_large, count_steps_large) = {
+        let reader = pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    let (list_rows_large, list_steps_large) = {
+        let reader = pool.reader().unwrap();
+        measure_list(reader.conn(), &list_sql, &list_params)
+    };
+    assert_eq!(
+        count_val_large, 5,
+        "only the caller's unread inbound rows count"
+    );
+    assert_eq!(
+        list_rows_large, 5,
+        "only the caller's unread inbound rows list"
+    );
+
+    assert!(
+        count_steps_large < count_steps_small.saturating_mul(3),
+        "bounded-count work scaled with the recipient's own outbound history: \
+         {count_steps_small} VM steps at 3,000 outbound rows vs {count_steps_large} at 30,000 \
+         (a direction-scoped probe stays flat; a direction-blind scan grows ~10x)"
+    );
+    assert!(
+        list_steps_large < list_steps_small.saturating_mul(3),
+        "unread listing work scaled with the recipient's own outbound history: \
+         {list_steps_small} VM steps at 3,000 outbound rows vs {list_steps_large} at 30,000 \
+         (a direction-scoped probe stays flat; a direction-blind scan grows ~10x)"
+    );
+
+    // -- Control: reproduce the pre-fix (direction-blind) index shape and
+    // show the same assertion fails, proving the bound above is real and not
+    // an artifact of small numbers or an unrelated planner choice. --
+    let control_pool = setup_pool();
+    {
+        let writer = control_pool.writer().unwrap();
+        let conn = writer.conn();
+        conn.execute_batch(
+            "DROP INDEX idx_notes_unread_probe_recipient_direction;
+             CREATE INDEX idx_notes_unread_probe_recipient_control
+                 ON notes(namespace, kind,
+                          ifnull(json_extract(properties, '$.to_actor'), ''),
+                          created_at DESC, id ASC)
+                 WHERE (json_type(properties, '$.read') IS NULL
+                        OR json_type(properties, '$.read') != 'true')
+                   AND deleted_at IS NULL;",
+        )
+        .unwrap();
+        seed_inbound(conn, 5);
+        seed_outbound(conn, 3_000);
+    }
+    let (control_count_small, control_count_steps_small) = {
+        let reader = control_pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    {
+        let writer = control_pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_outbound(conn, 27_000);
+    }
+    let (control_count_large, control_count_steps_large) = {
+        let reader = control_pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    assert_eq!(
+        control_count_small, 5,
+        "control: same correct value at 3,000 outbound"
+    );
+    assert_eq!(
+        control_count_large, 5,
+        "control: same correct value at 30,000 outbound"
+    );
+    assert!(
+        control_count_steps_large > control_count_steps_small.saturating_mul(3),
+        "control instrument did not reproduce the pre-fix growth: \
+         {control_count_steps_small} VM steps at 3,000 outbound rows vs \
+         {control_count_steps_large} at 30,000 under the direction-blind index shape \
+         (expected clear growth, proving the fixed measurement above is falsifiable)"
     );
 }
 

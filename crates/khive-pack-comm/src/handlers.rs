@@ -913,9 +913,14 @@ async fn count_unread_messages(
     };
     // Count the disjoint addressed and legacy-recipient partitions in one
     // storage snapshot. Both predicates retain the recipient key expression
-    // required by idx_notes_unread_probe_recipient. Each limited subquery
-    // stops after cap + 1 matches; together they retain the exact value below
-    // the public cap and make saturation explicit above it.
+    // required by idx_notes_unread_probe_recipient_direction, and the
+    // leading `direction = 'inbound'` filter in base_filters retains that
+    // index's direction key column, so the scan never walks the recipient's
+    // own outbound send history (every comm.send leaves a durable outbound
+    // copy addressed to the recipient that is never marked read). Each
+    // limited subquery stops after cap + 1 matches; together they retain the
+    // exact value below the public cap and make saturation explicit above
+    // it.
     let counts = store
         .count_notes_filtered_bounded_in_snapshot(
             namespace,

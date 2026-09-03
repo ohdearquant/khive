@@ -825,8 +825,8 @@ fn build_note_filter_where(
             FilterOp::JsonTypeNeMissing => {
                 let type_expr = json_type_expr(&pf.json_path);
                 // Inlined as a validated literal, NOT a parameter: the
-                // partial unread index (`idx_notes_unread_probe_recipient`) carries
-                // this exact predicate in its WHERE clause, and SQLite can
+                // partial unread index (`idx_notes_unread_probe_recipient_direction`)
+                // carries this exact predicate in its WHERE clause, and SQLite can
                 // only prove a query implies an index predicate when the
                 // compared value is known at plan time — a bound parameter
                 // defeats the index and the scan degrades to
