@@ -132,8 +132,8 @@ pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};
 pub use presentation::{
-    apply_redundancy_drop, micros_to_iso, present, render_format, rfc3339_to_utc_micros,
-    OutputFormat, PresentationMode,
+    apply_redundancy_drop, micros_to_iso, prepare_format_value, present, render_format,
+    rfc3339_to_utc_micros, OutputFormat, PresentationMode, RedundancyScope,
 };
 pub use reference_resolution::{resolve_reference, ReferenceCandidate, ReferenceResolution};
 pub use reference_ring::{ReferenceRing, RingEntry};

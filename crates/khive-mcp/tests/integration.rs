@@ -157,6 +157,27 @@ async fn list_empty_pages_keep_structural_keys_in_agent_mode() -> anyhow::Result
     Ok(())
 }
 
+/// Keyset cursor pages from `knowledge.list(after=…)` keep their completion
+/// signals under the default Agent presentation: an empty `results` page and
+/// `next_after: null` are how a walk terminates (ADR-045 Amendment 4).
+#[tokio::test]
+async fn knowledge_list_empty_cursor_page_keeps_completion_signals_in_agent_mode(
+) -> anyhow::Result<()> {
+    let client = connect_knowledge().await?;
+
+    let page = agent_one(&client, r#"knowledge.list(after="", limit=10)"#).await?;
+    assert_eq!(page["results"], json!([]));
+    assert!(
+        page.get("results").is_some(),
+        "empty cursor page must retain results: {page}"
+    );
+    assert!(
+        page.get("next_after").is_some_and(Value::is_null),
+        "terminal cursor page must retain next_after:null: {page}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServer) {
     use std::os::unix::fs::PermissionsExt;
@@ -6383,6 +6404,106 @@ async fn format_per_op_override_selects_format_per_position() {
     // Summary envelope must be compact JSON regardless of format.
     assert_eq!(body["summary"]["total"], serde_json::json!(2));
     assert_eq!(body["summary"]["succeeded"], serde_json::json!(2));
+}
+
+/// Agent JSON applies ADR-078 redundancy reduction while Verbose JSON retains
+/// the canonical shape. Chain substitution must continue to read canonical
+/// pre-presentation results under both JSON and auto output.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
+    use khive_mcp::tools::request::RequestParams;
+
+    let server = make_format_server();
+
+    let agent_raw = server
+        .dispatch_request_local(RequestParams {
+            ops: r#"gtd.assign(title="agent-json-dedup", priority="p1", assignee="lambda:test")"#
+                .to_string(),
+            presentation: Some("agent".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("agent/json task creation must succeed");
+    let agent_body: serde_json::Value = serde_json::from_str(&agent_raw).unwrap();
+    let agent_task = &agent_body["results"][0]["result"];
+    for key in ["assignee", "priority", "status"] {
+        assert!(agent_task.get(key).is_some(), "top-level {key} must remain");
+        assert!(
+            agent_task["properties"].get(key).is_none(),
+            "agent/json must not duplicate {key} inside properties: {agent_task}"
+        );
+    }
+
+    let verbose_raw = server
+        .dispatch_request_local(RequestParams {
+            ops:
+                r#"gtd.assign(title="verbose-json-control", priority="p1", assignee="lambda:test")"#
+                    .to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("verbose/json task creation must succeed");
+    let verbose_body: serde_json::Value = serde_json::from_str(&verbose_raw).unwrap();
+    let verbose_task = &verbose_body["results"][0]["result"];
+    for key in ["assignee", "priority", "status"] {
+        assert_eq!(
+            verbose_task.get(key),
+            verbose_task["properties"].get(key),
+            "verbose/json must retain canonical duplicate {key}: {verbose_task}"
+        );
+    }
+
+    let target_raw = server
+        .dispatch_request_local(RequestParams {
+            ops: r#"create(kind="entity", entity_kind="concept", name="AgentJsonChainTarget")"#
+                .to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("chain target creation must succeed");
+    let target_body: serde_json::Value = serde_json::from_str(&target_raw).unwrap();
+    let target_id = target_body["results"][0]["result"]["id"]
+        .as_str()
+        .expect("target id")
+        .to_string();
+
+    for (format, source_name) in [
+        ("json", "AgentJsonChainSource"),
+        ("auto", "AgentAutoChainSource"),
+    ] {
+        let chain_raw = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(
+                    r#"create(kind="entity", entity_kind="concept", name="{source_name}") | link(source_id=$prev.id, target_id="{target_id}", relation="extends")"#
+                ),
+                presentation: Some("agent".to_string()),
+                presentation_per_op: None,
+                save_to: None,
+                format: Some(format.to_string()),
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("agent/{format} chain request failed: {error}"));
+        let chain_body: serde_json::Value = serde_json::from_str(&chain_raw).unwrap();
+        assert_eq!(chain_body["summary"]["succeeded"], serde_json::json!(2));
+        assert_eq!(chain_body["summary"]["failed"], serde_json::json!(0));
+    }
 }
 
 /// (fmt-3) `presentation_per_op=verbose` pins a verbose op under

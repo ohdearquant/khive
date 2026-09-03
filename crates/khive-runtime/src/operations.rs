@@ -3986,7 +3986,7 @@ impl KhiveRuntime {
             // Fast path: single namespace — use the dedicated query_notes method.
             let page = self
                 .notes(token)?
-                .query_notes(
+                .query_notes_count_free(
                     token.namespace().as_str(),
                     kind,
                     PageRequest {
@@ -4007,7 +4007,7 @@ impl KhiveRuntime {
         };
         let page = self
             .notes(token)?
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {

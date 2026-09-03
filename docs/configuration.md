@@ -128,12 +128,13 @@ path   = "~/.khive/khive.db"
 name   = "sessions"
 kind   = "sqlite"
 path   = "~/.khive/sessions.db"
+served_kinds = ["note", "event"]
 
 [packs.session]
 backend = "sessions"
 ```
 
-The full field reference (`name`, `kind`, `path`, `read_only`, and the
+The full field reference (`name`, `kind`, `path`, `served_kinds`, `read_only`, and the
 currently-rejected `cache_mb` / `journal_mode` fields) and the pack-routing
 model (which packs default to `main`, how a custom pack binds a backend, the
 `main`-backend requirement, canonical-path deduplication, and cross-backend

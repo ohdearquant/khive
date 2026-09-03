@@ -14,13 +14,17 @@ use khive_runtime::{
 use khive_score::DeterministicScore;
 use khive_storage::types::Direction;
 use khive_storage::EdgeRelation;
-use khive_types::namespace::Namespace;
+use khive_types::{namespace::Namespace, SubstrateKind};
 
 use super::dispatch::bounded_backend_cause_for_log;
 use super::{BackendRegistry, LocatorCache, SubstrateCoordinator, SubstrateCoordinatorService};
 
 fn memory_runtime() -> Arc<KhiveRuntime> {
     Arc::new(KhiveRuntime::memory().expect("memory runtime"))
+}
+
+fn backend_id(value: impl Into<String>) -> BackendId {
+    BackendId::parse(value).expect("valid backend id")
 }
 
 #[derive(Clone, Default)]
@@ -187,9 +191,66 @@ fn single_coordinator_is_single_backend() {
 fn registry_register_dedup() {
     let mut reg = BackendRegistry::new();
     let rt = memory_runtime();
-    assert!(reg.register(BackendId::new("main"), Arc::clone(&rt)));
-    assert!(!reg.register(BackendId::new("main"), Arc::clone(&rt)));
+    assert!(reg.register(backend_id("main"), Arc::clone(&rt)));
+    assert!(!reg.register(backend_id("main"), Arc::clone(&rt)));
     assert_eq!(reg.len(), 1);
+}
+
+#[test]
+fn registry_rejects_an_explicit_empty_served_kind_declaration() {
+    let mut registry = BackendRegistry::new();
+    let error = registry
+        .register_with_served_kinds(backend_id("main"), memory_runtime(), Some(BTreeSet::new()))
+        .expect_err("an explicit empty declaration must fail closed");
+
+    assert!(error.to_string().contains("served kinds must not be empty"));
+    assert!(registry.is_empty());
+}
+
+#[test]
+fn registry_without_a_served_kind_declaration_is_conservatively_included() {
+    let mut registry = BackendRegistry::new();
+    let id = backend_id("legacy");
+    assert!(registry.register(id.clone(), memory_runtime()));
+
+    let entry = registry.get(&id).expect("registered backend");
+    for kind in SubstrateKind::ALL {
+        assert!(entry.serves(kind), "absent declaration must serve {kind}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn fan_out_search_uses_served_kind_metadata_before_dispatch() {
+    let mut registry = BackendRegistry::new();
+    registry
+        .register_with_served_kinds(
+            backend_id("notes"),
+            memory_runtime(),
+            Some(BTreeSet::from([SubstrateKind::Note])),
+        )
+        .expect("valid note-serving backend");
+    registry
+        .register_with_served_kinds(
+            backend_id("entities-only"),
+            memory_runtime(),
+            Some(BTreeSet::from([SubstrateKind::Entity])),
+        )
+        .expect("valid entity-serving backend");
+    let coordinator = SubstrateCoordinator::new(registry).with_panicking_backend("entities-only");
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "note",
+        "query": "dispatch-filter-probe",
+        "limit": 10,
+    }));
+
+    let (_entity_hits, _note_hits, per_backend) = coordinator
+        .fan_out_search(&request, &Namespace::local())
+        .await;
+
+    assert_eq!(per_backend.len(), 1);
+    assert_eq!(per_backend[0].backend_id.as_str(), "notes");
+    assert!(per_backend[0].error.is_none());
 }
 
 #[test]
@@ -197,16 +258,16 @@ fn registry_primary_is_first_registered() {
     let mut reg = BackendRegistry::new();
     let rt1 = memory_runtime();
     let rt2 = memory_runtime();
-    reg.register(BackendId::new("main"), rt1);
-    reg.register(BackendId::new("lore"), rt2);
+    reg.register(backend_id("main"), rt1);
+    reg.register(backend_id("lore"), rt2);
     assert_eq!(reg.primary().unwrap().id.as_str(), "main");
 }
 
 #[test]
 fn multi_backend_coordinator_not_single() {
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), memory_runtime());
-    registry.register(BackendId::new("lore"), memory_runtime());
+    registry.register(backend_id("main"), memory_runtime());
+    registry.register(backend_id("lore"), memory_runtime());
     let coord = SubstrateCoordinator::new(registry);
     assert!(!coord.is_single_backend());
     assert_eq!(coord.backend_count(), 2);
@@ -214,7 +275,7 @@ fn multi_backend_coordinator_not_single() {
 
 #[test]
 fn backend_id_display() {
-    let id = BackendId::new("archive");
+    let id = backend_id("archive");
     assert_eq!(id.to_string(), "archive");
     assert_eq!(id.as_str(), "archive");
 }
@@ -237,7 +298,7 @@ fn locator_cache_miss_returns_none() {
 fn locator_cache_insert_then_get_returns_backend() {
     let cache = LocatorCache::new();
     let id = Uuid::new_v4();
-    cache.insert(id, BackendId::new("main"));
+    cache.insert(id, backend_id("main"));
     let result = cache.get(id);
     assert!(result.is_some());
     assert_eq!(result.unwrap().as_str(), "main");
@@ -248,7 +309,7 @@ fn locator_cache_expired_entry_returns_none() {
     // Use a 1-nanosecond TTL so entries expire immediately.
     let cache = LocatorCache::with_ttl(Duration::from_nanos(1));
     let id = Uuid::new_v4();
-    cache.insert(id, BackendId::new("main"));
+    cache.insert(id, backend_id("main"));
     // Sleep long enough for the TTL to elapse (1 µs is more than 1 ns).
     std::thread::sleep(Duration::from_micros(1));
     assert!(cache.get(id).is_none());
@@ -258,7 +319,7 @@ fn locator_cache_expired_entry_returns_none() {
 fn locator_cache_purge_removes_expired() {
     let cache = LocatorCache::with_ttl(Duration::from_nanos(1));
     for _ in 0..5 {
-        cache.insert(Uuid::new_v4(), BackendId::new("main"));
+        cache.insert(Uuid::new_v4(), backend_id("main"));
     }
     std::thread::sleep(Duration::from_micros(1));
     cache.purge_expired();
@@ -269,11 +330,11 @@ fn locator_cache_purge_removes_expired() {
 fn locator_cache_insert_purges_expired_entry() {
     let cache = LocatorCache::with_ttl(Duration::from_nanos(1));
     let expired_id = Uuid::new_v4();
-    cache.insert(expired_id, BackendId::new("main"));
+    cache.insert(expired_id, backend_id("main"));
     std::thread::sleep(Duration::from_micros(1));
 
     let live_id = Uuid::new_v4();
-    cache.insert(live_id, BackendId::new("main"));
+    cache.insert(live_id, backend_id("main"));
 
     assert_eq!(cache.len(), 1);
     assert!(cache.get(expired_id).is_none());
@@ -286,11 +347,11 @@ fn locator_cache_evicts_least_recently_used_at_capacity() {
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
     let third = Uuid::new_v4();
-    cache.insert(first, BackendId::new("main"));
-    cache.insert(second, BackendId::new("main"));
+    cache.insert(first, backend_id("main"));
+    cache.insert(second, backend_id("main"));
     assert!(cache.get(first).is_some());
 
-    cache.insert(third, BackendId::new("main"));
+    cache.insert(third, backend_id("main"));
 
     assert_eq!(cache.len(), 2);
     assert!(cache.get(second).is_none());
@@ -443,8 +504,8 @@ async fn fan_out_search_two_backends_merged() {
     let mut registry = BackendRegistry::new();
     let rt_main = memory_runtime();
     let rt_lore = memory_runtime();
-    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
-    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    registry.register(backend_id("main"), Arc::clone(&rt_main));
+    registry.register(backend_id("lore"), Arc::clone(&rt_lore));
     let coord = SubstrateCoordinator::new(registry);
     let ns = Namespace::local();
 
@@ -502,8 +563,8 @@ async fn fan_out_search_caps_merged_entity_hits_at_limit() {
     let mut registry = BackendRegistry::new();
     let rt_main = memory_runtime();
     let rt_lore = memory_runtime();
-    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
-    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    registry.register(backend_id("main"), Arc::clone(&rt_main));
+    registry.register(backend_id("lore"), Arc::clone(&rt_lore));
     let coord = SubstrateCoordinator::new(registry);
     let ns = Namespace::local();
 
@@ -552,8 +613,8 @@ async fn fan_out_search_caps_merged_note_hits_at_limit() {
     let mut registry = BackendRegistry::new();
     let rt_main = memory_runtime();
     let rt_lore = memory_runtime();
-    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
-    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    registry.register(backend_id("main"), Arc::clone(&rt_main));
+    registry.register(backend_id("lore"), Arc::clone(&rt_lore));
     let coord = SubstrateCoordinator::new(registry);
     let ns = Namespace::local();
 
@@ -613,8 +674,8 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
     let mut registry = BackendRegistry::new();
     let rt_main = memory_runtime();
     let rt_hung = memory_runtime();
-    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
-    registry.register(BackendId::new("hung"), Arc::clone(&rt_hung));
+    registry.register(backend_id("main"), Arc::clone(&rt_main));
+    registry.register(backend_id("hung"), Arc::clone(&rt_hung));
     let coord = SubstrateCoordinator::new(registry).with_hanging_backend("hung");
     let ns = Namespace::local();
 
@@ -679,7 +740,7 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
 async fn fan_out_search_multiple_hung_backends_share_one_absolute_deadline() {
     let mut registry = BackendRegistry::new();
     for backend in ["hung-a", "hung-b", "hung-c"] {
-        registry.register(BackendId::new(backend), memory_runtime());
+        registry.register(backend_id(backend), memory_runtime());
     }
     let coord =
         SubstrateCoordinator::new(registry).with_hanging_backends(["hung-a", "hung-b", "hung-c"]);
@@ -714,8 +775,8 @@ async fn fan_out_search_multiple_hung_backends_share_one_absolute_deadline() {
 #[serial_test::serial(config_ledger)]
 async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() {
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("a-hung"), memory_runtime());
-    registry.register(BackendId::new("b-late"), memory_runtime());
+    registry.register(backend_id("a-hung"), memory_runtime());
+    registry.register(backend_id("b-late"), memory_runtime());
     let coord = SubstrateCoordinator::new(registry)
         .with_hanging_backend("a-hung")
         .with_delayed_backend("b-late", Duration::from_millis(5_100));
@@ -762,7 +823,7 @@ async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() 
 async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate() {
     let mut registry = BackendRegistry::new();
     let rt_hung = memory_runtime();
-    registry.register(BackendId::new("hung"), Arc::clone(&rt_hung));
+    registry.register(backend_id("hung"), Arc::clone(&rt_hung));
     let coord = SubstrateCoordinator::new(registry).with_hanging_backend("hung");
     assert!(
         coord.is_single_backend(),
@@ -805,7 +866,7 @@ async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate()
 async fn fan_out_search_timeout_masks_backend_credentials_in_coordinator_warning() {
     let secret = format!("archive auth token sk_live_{}", "z".repeat(32));
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new(secret.clone()), memory_runtime());
+    registry.register(backend_id(secret.clone()), memory_runtime());
     let coord = SubstrateCoordinator::new(registry).with_hanging_backend(&secret);
     let request = validated_kg_search(serde_json::json!({
         "kind": "entity",
@@ -861,7 +922,7 @@ async fn fan_out_search_masks_real_authorization_cause_in_coordinator_warning() 
     let secret = format!("authorization token sk_live_{} denied", "r".repeat(32));
     let mut registry = BackendRegistry::new();
     registry.register(
-        BackendId::new("archive"),
+        backend_id("archive"),
         memory_runtime_denied_with(secret.clone()),
     );
     let coord = SubstrateCoordinator::new(registry);
@@ -906,7 +967,7 @@ async fn fan_out_search_masks_real_authorization_cause_in_coordinator_warning() 
 async fn fan_out_search_single_backend_hung_backend_times_out_note_substrate() {
     let mut registry = BackendRegistry::new();
     let rt_hung = memory_runtime();
-    registry.register(BackendId::new("hung"), Arc::clone(&rt_hung));
+    registry.register(backend_id("hung"), Arc::clone(&rt_hung));
     let coord = SubstrateCoordinator::new(registry).with_hanging_backend("hung");
     assert!(
         coord.is_single_backend(),
@@ -1016,8 +1077,8 @@ async fn fan_out_search_with_visibility_multi_backend_finds_extra_namespace_row(
     let mut registry = BackendRegistry::new();
     let rt_main = memory_runtime();
     let rt_lore = memory_runtime();
-    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
-    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    registry.register(backend_id("main"), Arc::clone(&rt_main));
+    registry.register(backend_id("lore"), Arc::clone(&rt_lore));
     let coord = SubstrateCoordinator::new(registry);
     let tenant_ns = Namespace::parse("tenant-b").expect("valid namespace");
 
@@ -1070,8 +1131,8 @@ async fn fan_out_search_with_visibility_multi_backend_finds_extra_namespace_row(
 #[serial_test::serial(config_ledger)]
 async fn fan_out_search_applies_source_filter_before_rrf_and_limit() {
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("alpha"), memory_runtime());
-    registry.register(BackendId::new("beta"), memory_runtime());
+    registry.register(backend_id("alpha"), memory_runtime());
+    registry.register(backend_id("beta"), memory_runtime());
 
     let vector_entity = Uuid::from_u128(1);
     let cross_source_entity = Uuid::from_u128(2);
@@ -1133,8 +1194,8 @@ async fn fan_out_search_applies_source_filter_before_rrf_and_limit() {
     );
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("alpha"), memory_runtime());
-    registry.register(BackendId::new("beta"), memory_runtime());
+    registry.register(backend_id("alpha"), memory_runtime());
+    registry.register(backend_id("beta"), memory_runtime());
     let vector_note = Uuid::from_u128(5);
     let cross_source_note = Uuid::from_u128(6);
     let text_note = Uuid::from_u128(7);
@@ -1193,8 +1254,8 @@ async fn fan_out_search_rrf_merge_uses_full_candidate_window_not_per_backend_lim
     let mut registry = BackendRegistry::new();
     let rt_a = memory_runtime();
     let rt_b = memory_runtime();
-    registry.register(BackendId::new("alpha"), Arc::clone(&rt_a));
-    registry.register(BackendId::new("beta"), Arc::clone(&rt_b));
+    registry.register(backend_id("alpha"), Arc::clone(&rt_a));
+    registry.register(backend_id("beta"), Arc::clone(&rt_b));
 
     let y = Uuid::from_u128(1);
     let x = Uuid::from_u128(2);
@@ -1280,8 +1341,8 @@ async fn fan_out_search_rrf_merge_uses_full_candidate_window_not_per_backend_lim
     let mut registry = BackendRegistry::new();
     let rt_a = memory_runtime();
     let rt_b = memory_runtime();
-    registry.register(BackendId::new("alpha"), Arc::clone(&rt_a));
-    registry.register(BackendId::new("beta"), Arc::clone(&rt_b));
+    registry.register(backend_id("alpha"), Arc::clone(&rt_a));
+    registry.register(backend_id("beta"), Arc::clone(&rt_b));
 
     let y = Uuid::from_u128(1);
     let x = Uuid::from_u128(2);
@@ -1461,8 +1522,8 @@ async fn fan_out_partial_failure_preserves_working_backend_hits() {
         .expect("create entity on lore");
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
-    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    registry.register(backend_id("main"), Arc::clone(&rt_main));
+    registry.register(backend_id("lore"), Arc::clone(&rt_lore));
 
     // Force "main" to error; "lore" should still return hits.
     let coord = SubstrateCoordinator::new(registry).with_failing_backend("main");
@@ -1536,8 +1597,8 @@ async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
         .expect("create entity on healthy backend");
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), rt_main);
-    registry.register(BackendId::new("lore"), rt_lore);
+    registry.register(backend_id("main"), rt_main);
+    registry.register(backend_id("lore"), rt_lore);
     let coord = SubstrateCoordinator::new(registry).with_panicking_backend("main");
     let request = validated_kg_search(serde_json::json!({
         "kind": "concept",
@@ -1628,7 +1689,7 @@ async fn locate_finds_note_uuid() {
 fn locator_cache_get_evicts_expired_entry() {
     let cache = LocatorCache::with_ttl(Duration::from_nanos(1));
     let id = Uuid::new_v4();
-    cache.insert(id, BackendId::new("main"));
+    cache.insert(id, backend_id("main"));
     assert_eq!(cache.len(), 1, "entry inserted");
     std::thread::sleep(Duration::from_micros(1));
     // get() should return None AND remove the entry from the map.
@@ -1642,7 +1703,7 @@ fn locator_cache_get_evicts_expired_entry() {
 fn locator_cache_remove_evicts_live_entry() {
     let cache = LocatorCache::new();
     let id = Uuid::new_v4();
-    cache.insert(id, BackendId::new("main"));
+    cache.insert(id, backend_id("main"));
     assert!(cache.get(id).is_some(), "entry live before remove");
     cache.remove(id);
     assert!(cache.get(id).is_none(), "entry gone after remove");
@@ -1745,8 +1806,8 @@ async fn t2_cross_backend_link_stamps_target_backend() {
     let rt_lore = memory_runtime();
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
-    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    registry.register(backend_id("main"), Arc::clone(&rt_main));
+    registry.register(backend_id("lore"), Arc::clone(&rt_lore));
     let coord = SubstrateCoordinator::new(registry);
     let ns = Namespace::local();
 
@@ -1814,8 +1875,8 @@ async fn cross_backend_illegal_entity_pair_rejected_and_not_persisted() {
     let rt_lore = memory_runtime();
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
-    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    registry.register(backend_id("main"), Arc::clone(&rt_main));
+    registry.register(backend_id("lore"), Arc::clone(&rt_lore));
     let coord = SubstrateCoordinator::new(registry);
     let ns = Namespace::local();
 
@@ -2181,8 +2242,8 @@ async fn t3_fan_out_search_merged_from_two_backends() {
     let rt_b = memory_runtime();
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("alpha"), Arc::clone(&rt_a));
-    registry.register(BackendId::new("beta"), Arc::clone(&rt_b));
+    registry.register(backend_id("alpha"), Arc::clone(&rt_a));
+    registry.register(backend_id("beta"), Arc::clone(&rt_b));
     let coord = SubstrateCoordinator::new(registry);
     let ns = Namespace::local();
 
@@ -2318,8 +2379,8 @@ async fn fan_out_note_search_two_backends() {
     let rt_b = memory_runtime();
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), Arc::clone(&rt_a));
-    registry.register(BackendId::new("lore"), Arc::clone(&rt_b));
+    registry.register(backend_id("main"), Arc::clone(&rt_a));
+    registry.register(backend_id("lore"), Arc::clone(&rt_b));
     let coord = SubstrateCoordinator::new(registry);
     let ns = Namespace::local();
 
@@ -2414,8 +2475,8 @@ async fn fan_out_search_props_filter_drops_non_matching() {
         .expect("create target on lore");
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), rt_main);
-    registry.register(BackendId::new("lore"), rt_lore);
+    registry.register(backend_id("main"), rt_main);
+    registry.register(backend_id("lore"), rt_lore);
     let coord = SubstrateCoordinator::new(registry);
 
     let request = validated_kg_search(serde_json::json!({
@@ -2546,8 +2607,8 @@ async fn fan_out_search_tags_filter_drops_non_matching() {
         .expect("create tagged on lore");
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), rt_main);
-    registry.register(BackendId::new("lore"), rt_lore);
+    registry.register(backend_id("main"), rt_main);
+    registry.register(backend_id("lore"), rt_lore);
     let coord = SubstrateCoordinator::new(registry);
 
     let request = validated_kg_search(serde_json::json!({
@@ -2644,8 +2705,8 @@ async fn fan_out_search_preserves_full_entity_filter_contract() {
         .expect("create matching entity");
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), rt_main);
-    registry.register(BackendId::new("lore"), rt_lore);
+    registry.register(backend_id("main"), rt_main);
+    registry.register(backend_id("lore"), rt_lore);
     let coord = SubstrateCoordinator::new(registry);
     let request = validated_kg_search(serde_json::json!({
         "kind": "concept",
@@ -2744,8 +2805,8 @@ async fn fan_out_search_preserves_full_note_filter_contract() {
         .expect("mark target note superseded");
 
     let mut registry = BackendRegistry::new();
-    registry.register(BackendId::new("main"), rt_main);
-    registry.register(BackendId::new("lore"), rt_lore);
+    registry.register(backend_id("main"), rt_main);
+    registry.register(backend_id("lore"), rt_lore);
     let coord = SubstrateCoordinator::new(registry);
     let include_request = validated_kg_search(serde_json::json!({
         "kind": "observation",
@@ -2823,8 +2884,8 @@ fn two_backend_server_with_packs(
     let registry = packs_registry(Arc::clone(&rt_a), pack_names);
     // Build a two-backend coordinator.
     let mut backend_reg = BackendRegistry::new();
-    backend_reg.register(BackendId::new("alpha"), Arc::clone(&rt_a));
-    backend_reg.register(BackendId::new("beta"), Arc::clone(&rt_b));
+    backend_reg.register(backend_id("alpha"), Arc::clone(&rt_a));
+    backend_reg.register(backend_id("beta"), Arc::clone(&rt_b));
     let coordinator = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
 
     khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
@@ -3225,7 +3286,7 @@ async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
 
     let mut backend_reg = BackendRegistry::new();
     let rt = memory_runtime();
-    backend_reg.register(BackendId::new("main"), Arc::clone(&rt));
+    backend_reg.register(backend_id("main"), Arc::clone(&rt));
     let service = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
     let ns = Namespace::local();
 

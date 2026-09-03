@@ -568,20 +568,7 @@ async fn build_multi_backend_server_with_coordinator_and_db_anchor(
         .get("schedule")
         .map(|rt| (**rt).clone());
 
-    // Build BackendRegistry: one entry per unique backend (deduplicated
-    // by backend_name so packs sharing a backend share one runtime).
-    let mut backend_reg = BackendRegistry::new();
-    for (pack_name, rt) in &multi.per_pack_runtimes {
-        let backend_name = khive_cfg
-            .packs
-            .get(pack_name.as_str())
-            .map(|pc| pc.backend.as_str())
-            .unwrap_or(BackendId::MAIN);
-        let backend_id = BackendId::new(backend_name);
-        // `BackendRegistry::register` is idempotent by backend_id —
-        // the second registration for the same id is a no-op.
-        backend_reg.register(backend_id, Arc::clone(rt));
-    }
+    let backend_reg = coordinator_backend_registry(&multi.per_pack_runtimes, khive_cfg)?;
 
     let coord = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
 
@@ -591,6 +578,31 @@ async fn build_multi_backend_server_with_coordinator_and_db_anchor(
         Some(Arc::new(coord) as Arc<dyn khive_mcp::coordinator::CoordinatorService>),
     );
     Ok((server, schedule_rt))
+}
+
+/// Build one coordinator registration per unique configured backend.
+fn coordinator_backend_registry(
+    per_pack_runtimes: &std::collections::HashMap<String, Arc<KhiveRuntime>>,
+    khive_cfg: &KhiveConfig,
+) -> Result<BackendRegistry> {
+    let mut backend_reg = BackendRegistry::new();
+    for (pack_name, rt) in per_pack_runtimes {
+        let backend_name = khive_cfg
+            .packs
+            .get(pack_name.as_str())
+            .map(|pc| pc.backend.as_str())
+            .unwrap_or(BackendId::MAIN);
+        let backend_id = BackendId::parse(backend_name)?;
+        let served_kinds = khive_cfg
+            .backends
+            .iter()
+            .find(|backend| backend.name == backend_name)
+            .and_then(|backend| backend.served_kinds.clone());
+        // `BackendRegistry::register` is idempotent by backend_id —
+        // the second registration for the same id is a no-op.
+        backend_reg.register_with_served_kinds(backend_id, Arc::clone(rt), served_kinds)?;
+    }
+    Ok(backend_reg)
 }
 
 async fn cmd_db(cmd: DbCommand) -> Result<()> {
@@ -1005,7 +1017,7 @@ fn cmd_backend(cmd: BackendCommand) -> Result<()> {
             Ok(())
         }
         BackendCommand::Info { name, human } => {
-            let id = BackendId::new(&name);
+            let id = BackendId::parse(&name)?;
             let entry = registry
                 .get(&id)
                 .with_context(|| format!("backend {name:?} is not registered"))?;
@@ -1787,10 +1799,31 @@ mod tests {
                 path,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
         }
+    }
+
+    #[test]
+    fn coordinator_registry_copies_backend_served_kind_declarations() {
+        let mut khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
+        khive_cfg.backends[0].served_kinds = Some(std::collections::BTreeSet::from([
+            khive_types::SubstrateKind::Note,
+        ]));
+        let runtimes = std::collections::HashMap::from([(
+            "kg".to_string(),
+            Arc::new(KhiveRuntime::memory().expect("memory runtime")),
+        )]);
+
+        let registry = coordinator_backend_registry(&runtimes, &khive_cfg)
+            .expect("valid coordinator registry");
+        let main = registry
+            .get(&BackendId::main())
+            .expect("main backend registered");
+        assert!(main.serves(khive_types::SubstrateKind::Note));
+        assert!(!main.serves(khive_types::SubstrateKind::Entity));
     }
 
     /// File-backed main: both boot paths must agree on every `WiringSurface`
@@ -2029,6 +2062,7 @@ mod tests {
             path: None,
             cache_mb: None,
             journal_mode: None,
+            served_kinds: None,
             read_only: false,
         });
 
@@ -2067,6 +2101,7 @@ mod tests {
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 khive_runtime::BackendConfig {
@@ -2075,6 +2110,7 @@ mod tests {
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],

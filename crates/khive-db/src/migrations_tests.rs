@@ -1015,9 +1015,12 @@ fn v22_upgrades_pre_index_database_for_read_only_open() {
         stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
         finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
         assert_eq!(read_schema_version(&conn).expect("read V21 ledger"), 21);
-        conn.execute("DROP INDEX idx_notes_unread_probe_recipient", [])
+        conn.execute("DROP INDEX idx_notes_unread_probe_recipient_direction", [])
             .expect("simulate pre-index V21 database");
-        assert!(!index_exists(&conn, "idx_notes_unread_probe_recipient"));
+        assert!(!index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
     }
 
     {
@@ -1026,12 +1029,70 @@ fn v22_upgrades_pre_index_database_for_read_only_open() {
             run_migrations(&mut conn).expect("apply V22 unread probe migration"),
             latest_schema_version()
         );
-        assert!(index_exists(&conn, "idx_notes_unread_probe_recipient"));
+        assert!(index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
     }
 
     let read_only = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .expect("open migrated database read-only");
-    assert!(index_exists(&read_only, "idx_notes_unread_probe_recipient"));
+    assert!(index_exists(
+        &read_only,
+        "idx_notes_unread_probe_recipient_direction"
+    ));
+    validate_schema_is_current(&read_only).expect("migrated read-only schema validates");
+}
+
+#[test]
+fn v25_upgrades_direction_blind_recipient_index_for_read_only_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pre-direction-index.db");
+
+    {
+        let mut conn = Connection::open(&path).expect("create pre-direction database");
+        migrate_through(&mut conn, 20);
+        stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+        finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+        assert_eq!(read_schema_version(&conn).expect("read V21 ledger"), 21);
+        conn.execute("DROP INDEX idx_notes_unread_probe_recipient_direction", [])
+            .expect("drop the direction-aware index installed by the V1 baseline");
+        conn.execute_batch(
+            "CREATE INDEX idx_notes_unread_probe_recipient
+                 ON notes(namespace, kind,
+                          ifnull(json_extract(properties, '$.to_actor'), ''),
+                          created_at DESC, id ASC)
+                 WHERE (json_type(properties, '$.read') IS NULL
+                        OR json_type(properties, '$.read') != 'true')
+                   AND deleted_at IS NULL;",
+        )
+        .expect("simulate a pre-V25 recipient index without the direction key");
+        assert!(index_exists(&conn, "idx_notes_unread_probe_recipient"));
+        assert!(!index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
+    }
+
+    {
+        let mut conn = Connection::open(&path).expect("reopen writable database");
+        assert_eq!(
+            run_migrations(&mut conn).expect("apply V25 direction-aware unread probe migration"),
+            latest_schema_version()
+        );
+        assert!(index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
+        assert!(!index_exists(&conn, "idx_notes_unread_probe_recipient"));
+    }
+
+    let read_only = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open migrated database read-only");
+    assert!(index_exists(
+        &read_only,
+        "idx_notes_unread_probe_recipient_direction"
+    ));
     validate_schema_is_current(&read_only).expect("migrated read-only schema validates");
 }
 
@@ -1290,7 +1351,7 @@ fn v24_rowid_map_backfills_dedups_and_sweeps_orphans() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     // -- fts_notes: duplicates collapsed, orphan gone, live rows kept. --
@@ -1383,7 +1444,7 @@ fn v24_null_key_fts_row_survives_unmapped() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     let still_present: i64 = conn
@@ -1461,7 +1522,7 @@ fn v24_orphan_sweep_is_null_safe_and_namespace_scoped() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     let orphan_survives: i64 = conn
@@ -1526,7 +1587,7 @@ fn v24_backfill_survivor_is_chosen_by_updated_at_not_rowid() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     let surviving_rowid: i64 = conn
@@ -1585,7 +1646,7 @@ fn v24_backfill_survivor_on_equal_updated_at_is_the_higher_rowid() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     let surviving_rowid: i64 = conn
@@ -1621,7 +1682,7 @@ fn v24_leaves_both_backfill_markers_present() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     for state in ["fts_entities_rowids_state", "fts_notes_rowids_state"] {
@@ -1687,7 +1748,7 @@ fn v24_wrong_key_map_row_removed_before_marker() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     let c_still_mapped: i64 = conn
@@ -1769,7 +1830,7 @@ fn v24_migration_and_runtime_backfill_reconcile_identical_malformed_state() {
     seed_malformed_legacy_fts_state(&migrated, "fts_notes", "fts_notes_rowids");
     assert_eq!(
         run_migrations(&mut migrated).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     // -- Path 2: the runtime backfill, via an arbitrary table_key that never
@@ -1920,6 +1981,171 @@ fn seed_malformed_legacy_fts_state(conn: &Connection, fts_table: &str, map_table
         [],
     )
     .expect("seed the stale wrong-key map row stealing B's rowid");
+}
+
+// ── V26: knowledge FTS repair tests ──────────────────────────────────────────
+
+#[test]
+fn v26_repairs_knowledge_fts_and_makes_atom_lifecycle_symmetric() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+    finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+
+    let v22 = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 22)
+        .expect("V22 migration registered");
+    let tx = conn.transaction().expect("begin V22 setup transaction");
+    tx.execute_batch(v22.up).expect("apply V22 migration body");
+    tx.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+        rusqlite::params![v22.version, v22.name],
+    )
+    .expect("record V22 migration");
+    tx.commit().expect("commit V22 setup");
+
+    conn.execute_batch(
+        "INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at) \
+             VALUES ('soft-hard', 'local', 'soft-hard', 'Soft Hard', \
+                     'soft deletion followed by a permanent deletion', 1, 1); \
+         INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at, deleted_at) \
+             VALUES ('born-deleted', 'local', 'born-deleted', 'Born Deleted', \
+                     'this atom never entered the historical FTS index', 1, 1, 7); \
+         INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at) \
+             VALUES ('section-parent', 'local', 'section-parent', 'Section Parent', \
+                     'parent for the section index repair regression', 1, 1); \
+         INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at, deleted_at) \
+             VALUES ('resurrect', 'local', 'resurrect', 'Resurrect', \
+                     'a deleted atom that later returns to the live projection', 1, 1, 8); \
+         INSERT INTO knowledge_sections \
+             (id, atom_id, namespace, section_type, heading, content, content_hash, \
+              created_at, updated_at) \
+             VALUES ('section-1', 'section-parent', 'local', 'overview', 'Overview', \
+                     'the original section body indexed before historical drift', 'hash-1', \
+                     1, 1); \
+         UPDATE knowledge_atoms SET deleted_at = 9 WHERE id = 'soft-hard';",
+    )
+    .expect("seed pre-V26 knowledge rows");
+
+    // Emulate a historical base-table write that bypassed the section trigger.
+    // V2 restored the narrow trigger but never rebuilt rows already divergent.
+    conn.execute("DROP TRIGGER fts_sections_au", [])
+        .expect("temporarily remove section update trigger");
+    conn.execute(
+        "UPDATE knowledge_sections SET content = 'the revised section body that the stale index never observed' \
+         WHERE id = 'section-1'",
+        [],
+    )
+    .expect("diverge the section external-content row");
+    let v2 = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 2)
+        .expect("V2 migration registered");
+    conn.execute_batch(v2.up)
+        .expect("restore the historical narrow trigger");
+
+    assert!(
+        conn.execute(
+            "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",
+            [],
+        )
+        .is_err(),
+        "the old content object includes tombstones the index deliberately omits"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO fts_sections(fts_sections, rank) VALUES('integrity-check', 1)",
+            [],
+        )
+        .is_err(),
+        "the deliberately stale section index must fail rank-1 integrity"
+    );
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V26 knowledge FTS repair"),
+        latest_schema_version()
+    );
+    conn.execute(
+        "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("atom FTS must match the live-row content view after V26");
+    conn.execute(
+        "INSERT INTO fts_sections(fts_sections, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("section FTS must be rebuilt after V26");
+
+    let content_ddl: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_knowledge'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read repaired FTS DDL");
+    assert!(content_ddl.contains("content=knowledge_atoms_fts_content"));
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM knowledge_atoms_fts_content \
+             WHERE id IN ('soft-hard', 'born-deleted')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0,
+        "the external-content view must expose live atoms only"
+    );
+
+    conn.execute("DELETE FROM knowledge_atoms WHERE id = 'soft-hard'", [])
+        .expect("hard delete after soft delete must no longer touch a missing FTS row");
+    conn.execute("DELETE FROM knowledge_atoms WHERE id = 'born-deleted'", [])
+        .expect("hard delete of a never-indexed atom must be an FTS no-op");
+    conn.execute(
+        "UPDATE knowledge_atoms SET deleted_at = NULL WHERE id = 'resurrect'",
+        [],
+    )
+    .expect("resurrection must insert the atom into FTS");
+    conn.execute(
+        "UPDATE knowledge_atoms \
+         SET content = 'the resurrected atom now has revised searchable content' \
+         WHERE id = 'resurrect'",
+        [],
+    )
+    .expect("live text update must replace the FTS document");
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM fts_knowledge WHERE fts_knowledge MATCH 'searchable'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    conn.execute(
+        "UPDATE knowledge_atoms SET deleted_at = 10 WHERE id = 'resurrect'",
+        [],
+    )
+    .expect("second soft delete must remove the live FTS row once");
+    conn.execute("DELETE FROM knowledge_atoms WHERE id = 'resurrect'", [])
+        .expect("hard delete after resurrection and re-tombstone must be safe");
+    conn.execute("DELETE FROM knowledge_sections WHERE id = 'section-1'", [])
+        .expect("rebuilt section index must support hard delete");
+
+    conn.execute(
+        "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("atom FTS must remain consistent across lifecycle transitions");
+    conn.execute(
+        "INSERT INTO fts_sections(fts_sections, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("section FTS must remain consistent after hard delete");
 }
 
 // ── V5: external_id unique index tests ──────────────────────────────────────
