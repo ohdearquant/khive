@@ -3329,16 +3329,22 @@ export function RepoShowcase({
     if (defaultModuleId) inspectModule(defaultModuleId);
   }
 
-  function normalizeCurrentLocation() {
-    const next = locationFor(
-      selectedModuleId,
-      activeView,
-      unresolvedModule?.path ?? null,
-    );
+  // Every in-app replaceState must also mark the new location as applied:
+  // the location-sync effect treats a sentinel that no longer matches the
+  // current href as a real navigation and would re-derive the selection from
+  // the URL, discarding the user's in-graph selection.
+  function replaceLocationAsApplied(next: URL) {
     window.history.replaceState(
       null,
       "",
       `${next.pathname}${next.search}${next.hash}`,
+    );
+    appliedLocationHrefRef.current = window.location.href;
+  }
+
+  function normalizeCurrentLocation() {
+    replaceLocationAsApplied(
+      locationFor(selectedModuleId, activeView, unresolvedModule?.path ?? null),
     );
     setLocationNotice(null);
     setCopyStatus("");
@@ -3368,11 +3374,7 @@ export function RepoShowcase({
       const sourceHref = window.location.href;
       await navigator.clipboard.writeText(share.href);
       if (window.location.href === sourceHref && current.href !== sourceHref) {
-        window.history.replaceState(
-          null,
-          "",
-          `${current.pathname}${current.search}${current.hash}`,
-        );
+        replaceLocationAsApplied(current);
         setLocationNotice(null);
       }
       setCopyStatus("Investigation link copied.");
