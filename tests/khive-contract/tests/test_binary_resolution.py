@@ -6,6 +6,9 @@ client must follow the same rule so a CI step that builds into a custom target
 directory runs the binary it just built rather than a stale default one.
 """
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 from khive_contract.client import _resolve_binary
@@ -42,3 +45,25 @@ def test_custom_cargo_target_dir_without_a_binary_is_not_found(tmp_path, monkeyp
 
     with pytest.raises(FileNotFoundError):
         _resolve_binary(None)
+
+
+def _shared_resolver():
+    root = Path(__file__).resolve().parents[3]
+    spec = importlib.util.spec_from_file_location(
+        "kkernel_binary", root / "tests" / "kkernel_binary.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_empty_cargo_target_dir_reads_as_unset():
+    # scripts/ci.sh expands ${CARGO_TARGET_DIR:-...}, which treats "" as unset;
+    # the shared resolver must select the same default binary.
+    resolver = _shared_resolver()
+    assert resolver.resolve_binary_path({"CARGO_TARGET_DIR": ""}) == resolver.resolve_binary_path(
+        {}
+    )
+    assert resolver.resolve_binary_path({"CARGO_TARGET_DIR": ""}).endswith(
+        "/crates/target/release/kkernel"
+    )

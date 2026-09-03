@@ -19,7 +19,8 @@ def resolve_binary_path(env=None) -> str:
     if explicit := env.get("KKERNEL_BINARY"):
         return explicit
 
-    target_dir = Path(env.get("CARGO_TARGET_DIR", "target"))
+    # An empty CARGO_TARGET_DIR reads as unset, matching the shell resolver.
+    target_dir = Path(env.get("CARGO_TARGET_DIR") or "target")
     if not target_dir.is_absolute():
         target_dir = REPO_ROOT / "crates" / target_dir
     return str(target_dir / "release" / "kkernel")
