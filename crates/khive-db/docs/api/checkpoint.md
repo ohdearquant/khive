@@ -212,7 +212,7 @@ session that keeps calling in) can keep extending its pin, closing the
 mid-flight with no
 further calls at all: `rusqlite::Connection` is thread-owned and not `Sync`,
 and a genuinely idle connection has no in-flight statement for
-`sqlite3_interrupt` to act on, so reaching *that* connection from outside
+`sqlite3_interrupt` to act on, so reaching _that_ connection from outside
 would need a live, forcibly-interruptible handle registry the pool does not
 keep today. That remains open design work, not something this change
 attempts.
