@@ -1,6 +1,6 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30, 2026-08-30b)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
@@ -32,6 +32,26 @@ existing status multiplier. It is not a probability, a cross-query comparable me
 absolute presence signal. The former `0.46`/`0.42` bands predated the squash and are retired;
 callers use response-local rank together with candidate and per-hit provenance. `min_score`
 continues to apply to the final returned score.
+
+## Amendment (2026-08-30b): request-wide bound on distinct FTS terms
+
+The lexical stage bounds the number of distinct scoreable terms that each issue their own FTS
+`MATCH` statement, independent of the per-term row cap the 2026-06 candidate-refill work
+introduced. Without this bound, a query with many distinct terms turns one request into a
+proportionally unbounded number of index probes and retained-row memory, checked only by the
+request read deadline. The bound is shared across every lexical fetch one `knowledge.search` or
+`knowledge.suggest` request makes — `search`'s query-decomposition path issues the lexical fetch
+up to three times (the full query plus two sub-queries) for a single request, and all three draw
+from one allowance rather than each getting their own, so a decomposed request cannot triple the
+effective cap.
+
+`candidate_provenance.terms_truncated` is `true` when the query supplied more distinct scoreable
+terms than the remaining request-wide budget; the lexical candidate set only reflects terms up to
+that bound. A query at or under the bound sees identical candidate generation and ranking to the
+unbounded behavior. The raw-existence eligibility probe that distinguishes `no_match` from
+`filtered` scopes itself to the same (possibly truncated) term set the candidate fetch actually
+searched, never to the full query: an untested term's eligibility is unknown, so a truncation-
+caused miss is reported as `no_match` (paired with `terms_truncated: true`), never as `filtered`.
 
 ## Amendment (2026-08-29): tri-state atom upsert patches
 
@@ -313,7 +333,7 @@ exhausted. Pure computation — no database access.
 #### `knowledge.search` — TF-IDF ranked search
 
 ```
-search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N, candidate_provenance: {lexical, fallback}}
+search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N, candidate_provenance: {lexical, fallback, terms_truncated}}
 ```
 
 FTS5 recall → in-memory TF-IDF scoring across name, tags, and content
