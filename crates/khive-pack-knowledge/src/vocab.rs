@@ -169,7 +169,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.index",
-        description: "Backfill atom embeddings; optionally rebuild and verify atom + section FTS",
+        description: "Backfill atom embeddings. Does not rebuild the global FTS indexes: that is a whole-database operation independent of the caller's namespace, with no per-caller cost admission on this verb, so it is reachable only through the `kkernel reindex` operator CLI (`--rebuild-fts`).",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -199,13 +199,6 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 param_type: "boolean",
                 required: false,
                 description: "Rebuild in-memory Vamana ANN index from embeddings (default false)",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "rebuild_fts",
-                param_type: "boolean",
-                required: false,
-                description: "Rebuild and rank-1 integrity-check the global atom and section FTS indexes (default false)",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -778,13 +771,7 @@ mod tests {
             ("knowledge.eval_retrieval", &["query_set"]),
             (
                 "knowledge.index",
-                &[
-                    "ids",
-                    "batch_size",
-                    "insert_only",
-                    "rebuild_ann",
-                    "rebuild_fts",
-                ],
+                &["ids", "batch_size", "insert_only", "rebuild_ann"],
             ),
             (
                 "knowledge.fold",

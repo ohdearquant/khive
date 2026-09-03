@@ -290,6 +290,7 @@ kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only sect
 | `--keep-existing`  | skip records already embedded (incremental top-up) instead of replacing them    |
 | `--batch-size <n>` | records per embedding batch (default 128, max 500)                              |
 | `--best-effort`    | downgrade partial failures to a warning and still exit 0 (default fails closed) |
+| `--rebuild-fts`    | rebuild + rank-1 integrity-check both global knowledge FTS indexes (see below)   |
 | `--human`          | readable report instead of JSON                                                 |
 
 There is no `--embeds-only`, `--ids`, or `--dry-run` mode. `--keep-existing` narrows
@@ -324,9 +325,19 @@ search retrieves via the default embedder's ANN, so the knowledge pass always
 uses the default embedder (fanning out would write vectors search never reads).
 
 The knowledge pass calls the `khive_pack_knowledge::reindex_knowledge` library
-entry directly (the full-corpus `knowledge.index` handler), rebuilds the Vamana
-ANN snapshot, and rebuilds plus rank-1 integrity-checks both external-content
-knowledge FTS indexes — no verb-DSL shell required.
+entry directly (the full-corpus `knowledge.index` handler) and rebuilds the
+Vamana ANN snapshot — no verb-DSL shell required.
+
+**FTS rebuild is opt-in and namespace-aware.** `fts_knowledge` and
+`fts_sections` are global tables, not scoped to `--namespace`, so rebuilding
+them is wasted work (and unnecessary writer contention) on anything less than
+a full-corpus run. `--rebuild-fts` is therefore OFF by default and only
+defaults ON when the run is an unrestricted full-corpus rebuild: no explicit
+`--namespace`/`KHIVE_NAMESPACE`, and both atoms and sections are in scope
+(neither `--sections-only` nor `--no-sections` narrowed it). Passing
+`--rebuild-fts` explicitly always forces it on, for any scope. The report
+carries a `knowledge_fts_rebuild` object (index names, elapsed milliseconds,
+integrity-check outcome) whenever the rebuild ran, and omits it otherwise.
 
 ```bash
 kkernel reindex --db ~/.khive/khive.db --knowledge-only      # just the corpus
@@ -338,8 +349,11 @@ low-level verb is still available via `exec`:
 
 ```bash
 kkernel exec 'knowledge.index(ids=["my-slug", "<uuid>"])' --db ~/.khive/khive.db
-kkernel exec 'knowledge.index(ids=[], rebuild_fts=true)' --db ~/.khive/khive.db
 ```
+
+`knowledge.index` does not accept `rebuild_fts` — rebuilding the global FTS
+indexes has no per-caller cost admission on the ordinary verb surface, so it
+is reachable only through `kkernel reindex --rebuild-fts` above.
 
 > Stop the MCP daemon before a large reindex to avoid SQLite write contention:
 > `pkill -f 'kkernel.*--daemon'` (or `KHIVE_NO_DAEMON=1`), then reindex, then let

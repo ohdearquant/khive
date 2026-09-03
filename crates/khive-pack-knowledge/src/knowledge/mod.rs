@@ -10,7 +10,7 @@ mod compose;
 mod crud;
 mod eval;
 mod fold_handler;
-mod index_handler;
+pub(crate) mod index_handler;
 mod search;
 mod sections;
 pub(crate) mod sections_index;

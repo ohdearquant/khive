@@ -191,9 +191,29 @@ pub struct ReindexArgs {
     #[arg(long, conflicts_with = "no_knowledge")]
     pub sections_only: bool,
 
+    /// Rebuild and rank-1 integrity-check both global knowledge FTS indexes
+    /// (`fts_knowledge`, `fts_sections`). These indexes cover the whole
+    /// database, not just the run's `--namespace`, so this defaults ON only
+    /// for an unrestricted full-corpus run (no explicit `--namespace` /
+    /// `KHIVE_NAMESPACE`, and neither `--sections-only` nor `--no-sections`
+    /// narrowed the knowledge pass) and OFF for any scoped run. Passing this
+    /// flag forces it on regardless of scope.
+    #[arg(long)]
+    pub rebuild_fts: bool,
+
     /// Print human-readable output instead of JSON.
     #[arg(long)]
     pub human: bool,
+}
+
+/// What a `--rebuild-fts` run actually did, so a caller never has to take
+/// "it rebuilt the FTS indexes" on faith — the names, wall time, and the
+/// rank-1 integrity-check outcome are all reported.
+#[derive(Serialize)]
+struct KnowledgeFtsRebuildReport {
+    indexes: Vec<String>,
+    elapsed_ms: u64,
+    integrity_ok: bool,
 }
 
 #[derive(Serialize)]
@@ -204,6 +224,9 @@ struct ReindexReport {
     knowledge_atoms_indexed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     knowledge_sections_indexed: Option<u64>,
+    /// Present only when `--rebuild-fts` actually ran the global FTS rebuild.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    knowledge_fts_rebuild: Option<KnowledgeFtsRebuildReport>,
     /// Atoms whose vector write failed during the knowledge pass.
     knowledge_atoms_failed: u64,
     /// True when the knowledge pass itself errored (could not run to completion).
@@ -507,6 +530,8 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let do_atoms = do_knowledge && !args.sections_only;
     let do_sections = do_knowledge && !args.no_sections;
 
+    let rebuild_fts = should_rebuild_fts(args.rebuild_fts, explicit, do_atoms, do_sections);
+
     // Explicit --model targets a single engine; otherwise fan out to ALL
     // registered engines, matching the runtime's multi-model write path so a
     // reindex reproduces exactly what create/update would have embedded.
@@ -716,6 +741,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut knowledge_pass_errored = false;
     let mut knowledge_ann_failed = false;
     let mut knowledge_sections_failed: u64 = 0;
+    let mut knowledge_fts_rebuild: Option<KnowledgeFtsRebuildReport> = None;
     if do_atoms || do_sections {
         let atom_bar = ProgressBar::new("atoms");
         let section_bar = ProgressBar::new("sections");
@@ -727,7 +753,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
             sections: do_sections,
             drop_existing,
             rebuild_ann: true,
-            rebuild_fts: true,
+            rebuild_fts,
             batch_size: Some(batch_size),
         };
         match khive_pack_knowledge::reindex_knowledge(
@@ -772,6 +798,24 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                         .and_then(|n| n.as_u64())
                         .unwrap_or(0);
                 }
+                if let Some(fts) = v.get("fts_rebuild").filter(|v| !v.is_null()) {
+                    knowledge_fts_rebuild = Some(KnowledgeFtsRebuildReport {
+                        indexes: fts
+                            .get("indexes")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        elapsed_ms: fts.get("elapsed_ms").and_then(|n| n.as_u64()).unwrap_or(0),
+                        integrity_ok: fts
+                            .get("integrity_ok")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false),
+                    });
+                }
             }
             Err(e) => {
                 tracing::error!(error = %e, "knowledge reindex failed");
@@ -794,6 +838,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         notes_processed,
         knowledge_atoms_indexed,
         knowledge_sections_indexed,
+        knowledge_fts_rebuild,
         knowledge_atoms_failed,
         knowledge_pass_errored,
         knowledge_ann_failed,
@@ -809,6 +854,23 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
 
     print_report(&report, args.human);
     finish(&report, args.best_effort)
+}
+
+/// Decide whether this run rebuilds and rank-1 integrity-checks the two
+/// global knowledge FTS indexes. They are not namespace-scoped, so
+/// rebuilding them is only free of waste on an unrestricted full-corpus run:
+/// no explicit `--namespace`/`KHIVE_NAMESPACE` target, and both atoms and
+/// sections in scope (neither `--sections-only` nor `--no-sections`
+/// narrowed the knowledge pass). Passing `--rebuild-fts` explicitly forces
+/// it on regardless of scope. Pure decision logic, unit-tested without
+/// running embedders.
+fn should_rebuild_fts(
+    flag: bool,
+    namespace_explicit: bool,
+    do_atoms: bool,
+    do_sections: bool,
+) -> bool {
+    flag || (!namespace_explicit && do_atoms && do_sections)
 }
 
 /// Decide the process exit from a completed report: `Ok(())` when clean or in
@@ -1251,6 +1313,14 @@ fn render_human_report(report: &ReindexReport) -> String {
     }
     if report.knowledge_ann_failed {
         output.push_str("Knowledge ANN: FAILED (snapshot not rebuilt/persisted)\n");
+    }
+    if let Some(fts) = &report.knowledge_fts_rebuild {
+        output.push_str(&format!(
+            "Knowledge FTS rebuild: {} in {}ms, integrity {}\n",
+            fts.indexes.join(", "),
+            fts.elapsed_ms,
+            if fts.integrity_ok { "OK" } else { "FAILED" }
+        ));
     }
     if !report.models_used.is_empty() {
         output.push_str(&format!("Models: {}\n", report.models_used.join(", ")));
@@ -1780,6 +1850,7 @@ mod tests {
             notes_processed: 0,
             knowledge_atoms_indexed: Some(0),
             knowledge_sections_indexed: None,
+            knowledge_fts_rebuild: None,
             knowledge_atoms_failed: k_failed,
             knowledge_pass_errored: k_errored,
             knowledge_ann_failed: false,
@@ -1868,6 +1939,7 @@ mod tests {
             notes_processed: 0,
             knowledge_atoms_indexed: Some(10),
             knowledge_sections_indexed: None,
+            knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: true,
@@ -1901,6 +1973,7 @@ mod tests {
             notes_processed: 0,
             knowledge_atoms_indexed: None,
             knowledge_sections_indexed: Some(0),
+            knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: false,
@@ -1943,6 +2016,37 @@ mod tests {
             "best-effort downgrades failures to exit 0"
         );
         assert!(decide_result(false, true).is_ok());
+    }
+
+    #[test]
+    fn should_rebuild_fts_defaults_on_only_for_unrestricted_full_corpus() {
+        // Unrestricted full-corpus run: no explicit namespace, atoms + sections.
+        assert!(
+            should_rebuild_fts(false, false, true, true),
+            "an unscoped full-corpus run must default to rebuilding FTS"
+        );
+        // Any restriction (explicit namespace, --sections-only, --no-sections)
+        // must default the rebuild OFF.
+        assert!(
+            !should_rebuild_fts(false, true, true, true),
+            "an explicit --namespace must default the rebuild OFF"
+        );
+        assert!(
+            !should_rebuild_fts(false, false, false, true),
+            "--sections-only (do_atoms=false) must default the rebuild OFF"
+        );
+        assert!(
+            !should_rebuild_fts(false, false, true, false),
+            "--no-sections (do_sections=false) must default the rebuild OFF"
+        );
+    }
+
+    #[test]
+    fn should_rebuild_fts_explicit_flag_forces_on_regardless_of_scope() {
+        assert!(
+            should_rebuild_fts(true, true, false, false),
+            "--rebuild-fts must force the rebuild on even for the narrowest scope"
+        );
     }
 
     // DB resolution parity with `kkernel exec` / `kkernel mcp`. The shared
@@ -2237,6 +2341,7 @@ mod tests {
             notes_processed: 0,
             knowledge_atoms_indexed: None,
             knowledge_sections_indexed: None,
+            knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: false,
@@ -2470,6 +2575,7 @@ mod tests {
             best_effort: true,
             no_sections: false,
             sections_only: false,
+            rebuild_fts: false,
             human: false,
         };
         run_reindex(args).await.expect("run_reindex must succeed");
@@ -2747,6 +2853,7 @@ mod tests {
             best_effort: true,
             no_sections: false,
             sections_only: false,
+            rebuild_fts: false,
             human: false,
         };
         run_reindex(args).await.expect("run_reindex must succeed");
@@ -2780,6 +2887,153 @@ mod tests {
         assert_eq!(
             count, 3,
             "run_reindex must populate entity FTS even when no embedding model is configured"
+        );
+    }
+
+    /// Seeds one knowledge atom and deliberately desynchronizes `fts_knowledge`
+    /// against it (same technique as the pack-level FTS-repair regression),
+    /// so a caller can observe whether a later `run_reindex` call repaired it.
+    async fn seed_desynced_knowledge_fts(db_path: &str, config: &std::path::Path) {
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(db_path),
+            config: Some(config),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config for seed");
+        let rt = KhiveRuntime::new(cfg).expect("seed runtime");
+        let mut writer = rt.sql().writer().await.expect("knowledge writer");
+        writer
+            .execute_batch(vec![
+                SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms \
+                          (id, namespace, slug, name, content, created_at, updated_at) \
+                          VALUES ('9de50000-0000-4000-8000-000000000001', 'local', \
+                                  'reindex-fts-scope', 'Reindex FTS Scope', \
+                                  'scopeable lexical atom document', 1, 1)"
+                        .into(),
+                    params: vec![],
+                    label: Some("test.reindex_fts_scope.atom".into()),
+                },
+                SqlStatement {
+                    sql: "INSERT INTO fts_knowledge \
+                          (fts_knowledge, rowid, id, namespace, slug, name, content) \
+                          SELECT 'delete', rowid, id, namespace, slug, name, content \
+                          FROM knowledge_atoms \
+                          WHERE id = '9de50000-0000-4000-8000-000000000001'"
+                        .into(),
+                    params: vec![],
+                    label: Some("test.reindex_fts_scope.desync".into()),
+                },
+            ])
+            .await
+            .expect("seed and desynchronize fts_knowledge");
+    }
+
+    /// True once `fts_knowledge` again matches the seeded atom's content —
+    /// i.e. the desync `seed_desynced_knowledge_fts` created was repaired.
+    async fn knowledge_fts_repaired(db_path: &str, config: &std::path::Path) -> bool {
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(db_path),
+            config: Some(config),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config for verify");
+        let rt = KhiveRuntime::new(cfg).expect("verify runtime");
+        let mut reader = rt.sql().reader().await.expect("knowledge reader");
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT count(*) AS n FROM fts_knowledge \
+                      WHERE fts_knowledge MATCH 'scopeable'"
+                    .into(),
+                params: vec![],
+                label: Some("test.reindex_fts_scope.verify".into()),
+            })
+            .await
+            .expect("query fts_knowledge")
+            .expect("count row");
+        matches!(row.get("n"), Some(SqlValue::Integer(1)))
+    }
+
+    // Regression for the FTS-rebuild scoping fix: an explicit `--namespace`
+    // makes the run scoped, and `fts_knowledge`/`fts_sections` are global —
+    // rebuilding them on a scoped run is exactly the wasted writer work this
+    // fix removes. Before the fix, `rebuild_fts` was unconditionally `true`
+    // and this desync would have been repaired regardless of scope.
+    #[tokio::test]
+    async fn run_reindex_scoped_run_does_not_rebuild_fts() {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_path = db_file.path().to_str().expect("utf8 path").to_string();
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let config = write_empty_test_config(config_dir.path());
+
+        seed_desynced_knowledge_fts(&db_path, &config).await;
+
+        let args = ReindexArgs {
+            db: Some(db_path.clone()),
+            config: Some(config.clone()),
+            model: None,
+            batch_size: 100,
+            keep_existing: false,
+            namespace: Some("local".to_string()), // explicit → scoped run
+            knowledge_only: false,
+            no_knowledge: false,
+            best_effort: true,
+            no_sections: false,
+            sections_only: false,
+            rebuild_fts: false,
+            human: false,
+        };
+        run_reindex(args).await.expect("run_reindex must succeed");
+
+        assert!(
+            !knowledge_fts_repaired(&db_path, &config).await,
+            "a namespace-scoped run must NOT rebuild the global knowledge FTS indexes"
+        );
+    }
+
+    // Companion to the scoped-run test above: an UNSCOPED full-corpus run
+    // (no explicit --namespace, atoms + sections both in scope) defaults
+    // `--rebuild-fts` on and repairs the same desync.
+    #[tokio::test]
+    async fn run_reindex_full_corpus_run_rebuilds_fts_by_default() {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_path = db_file.path().to_str().expect("utf8 path").to_string();
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let config = write_empty_test_config(config_dir.path());
+
+        seed_desynced_knowledge_fts(&db_path, &config).await;
+
+        let args = ReindexArgs {
+            db: Some(db_path.clone()),
+            config: Some(config.clone()),
+            model: None,
+            batch_size: 100,
+            keep_existing: false,
+            namespace: None, // no explicit namespace → unrestricted full-corpus run
+            knowledge_only: false,
+            no_knowledge: false,
+            best_effort: true,
+            no_sections: false,
+            sections_only: false,
+            rebuild_fts: false,
+            human: false,
+        };
+        run_reindex(args).await.expect("run_reindex must succeed");
+
+        assert!(
+            knowledge_fts_repaired(&db_path, &config).await,
+            "an unscoped full-corpus run must default to rebuilding and repairing \
+             the global knowledge FTS indexes"
         );
     }
 
@@ -2834,6 +3088,7 @@ mod tests {
             notes_processed: 0,
             knowledge_atoms_indexed: None,
             knowledge_sections_indexed: None,
+            knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: false,

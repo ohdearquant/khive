@@ -1290,7 +1290,7 @@ fn v24_rowid_map_backfills_dedups_and_sweeps_orphans() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     // -- fts_notes: duplicates collapsed, orphan gone, live rows kept. --
@@ -1383,7 +1383,7 @@ fn v24_null_key_fts_row_survives_unmapped() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     let still_present: i64 = conn
@@ -1461,7 +1461,7 @@ fn v24_orphan_sweep_is_null_safe_and_namespace_scoped() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     let orphan_survives: i64 = conn
@@ -1526,7 +1526,7 @@ fn v24_backfill_survivor_is_chosen_by_updated_at_not_rowid() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     let surviving_rowid: i64 = conn
@@ -1585,7 +1585,7 @@ fn v24_backfill_survivor_on_equal_updated_at_is_the_higher_rowid() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     let surviving_rowid: i64 = conn
@@ -1621,7 +1621,7 @@ fn v24_leaves_both_backfill_markers_present() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     for state in ["fts_entities_rowids_state", "fts_notes_rowids_state"] {
@@ -1687,7 +1687,7 @@ fn v24_wrong_key_map_row_removed_before_marker() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     let c_still_mapped: i64 = conn
@@ -1769,7 +1769,7 @@ fn v24_migration_and_runtime_backfill_reconcile_identical_malformed_state() {
     seed_malformed_legacy_fts_state(&migrated, "fts_notes", "fts_notes_rowids");
     assert_eq!(
         run_migrations(&mut migrated).expect("apply V24 rowid-map migration"),
-        24
+        latest_schema_version()
     );
 
     // -- Path 2: the runtime backfill, via an arbitrary table_key that never

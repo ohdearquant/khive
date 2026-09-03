@@ -21,7 +21,10 @@ pub struct KnowledgeReindexOptions {
     pub drop_existing: bool,
     /// Rebuild the atom Vamana ANN snapshot (only meaningful with `atoms`).
     pub rebuild_ann: bool,
-    /// Rebuild and verify both external-content knowledge FTS indexes.
+    /// Rebuild and rank-1 integrity-check both external-content knowledge FTS
+    /// indexes (`fts_knowledge`, `fts_sections`). These indexes are global —
+    /// not scoped to `token`'s namespace — so this is independent of `atoms`
+    /// and `sections` and runs even when both are false.
     pub rebuild_fts: bool,
     /// Records per embedding batch.
     pub batch_size: Option<u32>,
@@ -31,10 +34,17 @@ pub struct KnowledgeReindexOptions {
 /// sections with the default embedder and (optionally) rebuild the atom Vamana
 /// ANN snapshot and external-content FTS indexes.
 ///
-/// Library entry for `kkernel reindex` — callable without an MCP server.
+/// Library entry for `kkernel reindex` — callable without an MCP server. This
+/// is the ONLY entry point for `rebuild_fts`: the `knowledge.index` MCP verb
+/// does not accept it, because rebuilding both FTS indexes is a whole-database
+/// operation regardless of the caller's namespace, and the ordinary verb has
+/// no per-caller admission control to bound that cost.
+///
 /// Knowledge is single-model: atom indexing, section indexing, and search all
 /// use the default embedder. Returns `{atoms_indexed, sections_indexed, failed,
-/// ann_failed, fts_rebuilt, sections_failed, truncation_by_model}`.
+/// ann_failed, fts_rebuild, sections_failed, truncation_by_model}`, where
+/// `fts_rebuild` is `null` unless `rebuild_fts` was requested, in which case it
+/// is `{indexes, elapsed_ms, integrity_ok}`.
 ///
 /// Optional progress callbacks receive `(processed, total)` after each batch.
 pub async fn reindex_knowledge(
@@ -47,17 +57,12 @@ pub async fn reindex_knowledge(
     let mut atoms_indexed = 0u64;
     let mut failed = 0u64;
     let mut ann_failed = false;
-    let mut fts_rebuilt = false;
     let mut truncation_by_model = serde_json::Map::new();
-    if opts.atoms || opts.rebuild_fts {
+    if opts.atoms {
         let ann = knowledge::vamana::new_shared();
         let mut params = serde_json::Map::new();
         params.insert("rebuild_ann".into(), Value::Bool(opts.rebuild_ann));
-        params.insert("rebuild_fts".into(), Value::Bool(opts.rebuild_fts));
         params.insert("insert_only".into(), Value::Bool(!opts.drop_existing));
-        if !opts.atoms {
-            params.insert("ids".into(), Value::Array(Vec::new()));
-        }
         if let Some(bs) = opts.batch_size {
             params.insert("batch_size".into(), Value::from(bs));
         }
@@ -74,10 +79,6 @@ pub async fn reindex_knowledge(
         ann_failed = result
             .get("ann_failed")
             .and_then(|b| b.as_bool())
-            .unwrap_or(false);
-        fts_rebuilt = result
-            .get("fts_rebuilt")
-            .and_then(Value::as_bool)
             .unwrap_or(false);
         truncation_by_model = result
             .get("truncation_by_model")
@@ -126,12 +127,18 @@ pub async fn reindex_knowledge(
         }
     }
 
+    let fts_rebuild = if opts.rebuild_fts {
+        Some(knowledge::index_handler::rebuild_fts_indexes(runtime).await?)
+    } else {
+        None
+    };
+
     Ok(json!({
         "atoms_indexed": atoms_indexed,
         "sections_indexed": sections_indexed,
         "failed": failed,
         "ann_failed": ann_failed,
-        "fts_rebuilt": fts_rebuilt,
+        "fts_rebuild": fts_rebuild,
         "sections_failed": sections_failed,
         "truncation_by_model": truncation_by_model,
     }))

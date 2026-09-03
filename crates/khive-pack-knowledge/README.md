@@ -70,7 +70,7 @@ let report = reindex_knowledge(&runtime, &token, opts, None, None).await?;
 | --------------------------------------------------------------------------------- | -------------------------------------------------------- |
 | `knowledge.upsert_atoms` / `knowledge.upsert_domains`                             | Bulk insert or update atoms / domains                    |
 | `knowledge.get` / `knowledge.list` / `knowledge.delete_atoms` / `knowledge.stats` | Corpus CRUD and aggregate counts                         |
-| `knowledge.index`                                                                 | Backfill embeddings; optionally rebuild + verify FTS      |
+| `knowledge.index`                                                                 | Backfill embeddings (FTS rebuild is `kkernel reindex`-only) |
 | `knowledge.search` / `knowledge.suggest` / `knowledge.compose`                    | TF-IDF search, domain suggestion, briefing assembly      |
 | `knowledge.fold`                                                                  | Knapsack selection of scored candidates against a budget |
 | `knowledge.edit`                                                                  | Upsert one atom's sections without wiping the rest       |

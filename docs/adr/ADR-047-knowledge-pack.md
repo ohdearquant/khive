@@ -253,21 +253,26 @@ Sets `deleted_at` timestamp. FTS trigger automatically removes from search index
 stats() → {atoms: N, domains: N, ...}
 ```
 
-#### `knowledge.index` — backfill embeddings + FTS
+#### `knowledge.index` — backfill embeddings
 
 ```
 index(ids?: [<slug|uuid>], batch_size?: 500, insert_only?: false,
-      rebuild_ann?: false, rebuild_fts?: false) → {indexed: N, fts_rebuilt: bool}
+      rebuild_ann?: false) → {indexed: N}
 ```
 
-Backfills default-model embedding vectors. `rebuild_fts=true` globally rebuilds
-`fts_knowledge` and `fts_sections`, then runs each external-content table's
-rank-1 FTS5 integrity check before acknowledging `fts_rebuilt=true`; `ids=[]`
-provides an FTS-only maintenance call. The knowledge retrieval
+Backfills default-model embedding vectors. The knowledge retrieval
 paths read only the default model, so secondary registered models are not embedded
 until a model-aware or fused knowledge read path exists. When `ids` is omitted,
 indexes the entire corpus in batches. `insert_only` skips the delete-then-reinsert
 cycle for fresh corpus backfill.
+
+This verb does not accept `rebuild_fts`: rebuilding `fts_knowledge` and
+`fts_sections` is a whole-database operation independent of the caller's
+namespace, and the ordinary verb has no per-caller cost admission to bound it.
+That rebuild — which runs each external-content table's rank-1 FTS5 integrity
+check before reporting success — is reachable only through the `kkernel
+reindex` operator CLI (`--rebuild-fts`), whose report names both index names,
+elapsed time, and the integrity-check outcome.
 
 #### `knowledge.fold` — budget-constrained selection
 
