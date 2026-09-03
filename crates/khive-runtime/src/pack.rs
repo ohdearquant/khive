@@ -6384,6 +6384,792 @@ pub(crate) mod tests {
         }
     }
 
+    /// Recursively collect every `.rs` file under `dir` into `out`.
+    fn collect_rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_files(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every `crates/<crate>/src/**/*.rs` and `crates/<crate>/tests/**/*.rs`
+    /// file in the workspace, read to a `String` alongside its path.
+    ///
+    /// This is the compiled-test population an event-backed registry
+    /// constructor can actually be reached from: unit tests live under
+    /// `src/`, integration tests live under `tests/`. Anything outside those
+    /// two directories per crate (benches, examples) never runs as `cargo
+    /// test` and is out of scope for this census.
+    fn workspace_rust_sources() -> Vec<(std::path::PathBuf, String)> {
+        let crates_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("khive-runtime's Cargo.toml lives directly under crates/")
+            .to_path_buf();
+        let mut files = Vec::new();
+        let Ok(crate_dirs) = std::fs::read_dir(&crates_root) else {
+            return Vec::new();
+        };
+        for crate_dir in crate_dirs.filter_map(Result::ok) {
+            let crate_dir = crate_dir.path();
+            if !crate_dir.is_dir() {
+                continue;
+            }
+            for sub in ["src", "tests"] {
+                let sub_dir = crate_dir.join(sub);
+                if sub_dir.is_dir() {
+                    collect_rust_files(&sub_dir, &mut files);
+                }
+            }
+        }
+        files
+            .into_iter()
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((path, text))
+            })
+            .collect()
+    }
+
+    /// The name of the function whose signature starts at `sig_line`
+    /// (already stripped of leading whitespace), if any.
+    fn fn_name_from_signature(sig_line: &str) -> Option<&str> {
+        let mut rest = sig_line;
+        for prefix in ["pub(crate) ", "pub(super) ", "pub "] {
+            if let Some(stripped) = rest.strip_prefix(prefix) {
+                rest = stripped;
+            }
+        }
+        let rest = rest
+            .strip_prefix("async fn ")
+            .or_else(|| rest.strip_prefix("fn "))?;
+        Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest))
+    }
+
+    /// `true` if `line`, once whitespace is trimmed, is a top-level `fn`
+    /// signature start (covering the `pub`/`pub(crate)`/`pub(super)` and
+    /// `async` modifiers actually used across this workspace).
+    fn is_fn_signature_line(trimmed: &str) -> bool {
+        fn_name_from_signature(trimmed).is_some()
+    }
+
+    /// Blank out the contents of every `"..."` string literal in `text`
+    /// (escapes included), line by line, so a seam name mentioned in an
+    /// error message or `.expect(...)` string — e.g. `pack.rs`'s own
+    /// `"...do not call with_event_store() for this backend."` — can never
+    /// read as a call. This only needs to handle ordinary quoted strings:
+    /// nothing in this workspace's actual seam-adjacent code uses raw
+    /// strings or multi-line string literals for text that could collide
+    /// with a seam or helper name.
+    fn strip_string_literals(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        // Persists across lines on purpose: this workspace's longer error
+        // and `.expect(...)` messages routinely use backslash-newline
+        // string continuations (see `pack.rs`'s own
+        // `IncompatibleEventStore` message), so a literal spanning several
+        // source lines must stay "in string" across all of them.
+        let mut in_string = false;
+        for line in text.lines() {
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                if in_string {
+                    if c == '\\' {
+                        out.push(' ');
+                        if chars.next().is_some() {
+                            out.push(' ');
+                        }
+                        continue;
+                    }
+                    if c == '"' {
+                        in_string = false;
+                        out.push('"');
+                    } else {
+                        out.push(' ');
+                    }
+                } else {
+                    if c == '"' {
+                        in_string = true;
+                    }
+                    out.push(c);
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// `true` if `text` contains a call to `name` — `name` immediately
+    /// followed by `(` (optional whitespace between, including newlines —
+    /// `rustfmt` is free to break a long call onto its own line, and a call
+    /// site that happens to fit on one line today is not a
+    /// property this scan may rely on), with a non-identifier character (or
+    /// start of text) before it, not immediately preceded by `fn ` (which
+    /// would make this the definition, not a call), and not inside a string
+    /// literal (which would make this prose, not a call).
+    ///
+    /// The identifier-boundary check is load-bearing: a naive
+    /// `text.contains(format!("{name}("))` matches `fixture(` inside
+    /// `daemon_script_fixture(`, which is a different, unrelated function —
+    /// this is the difference between a real population scan and one that
+    /// explodes into every helper in the workspace that happens to share a
+    /// suffix.
+    fn calls_name(text: &str, name: &str) -> bool {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let text = strip_string_literals(text);
+        let bytes = text.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(name) {
+            let idx = search_from + rel;
+            let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+            let after = idx + name.len();
+            let mut j = after;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let after_ok = j < bytes.len() && bytes[j] == b'(';
+            let is_definition = text[..idx].ends_with("fn ");
+            if before_ok && after_ok && !is_definition {
+                return true;
+            }
+            search_from = idx + 1;
+        }
+        false
+    }
+
+    /// Regression for a scanner that only tolerated a space/tab between a
+    /// seam name and its `(` — `rustfmt` can and does break a call onto its
+    /// own line, and a scanner that only sees same-line whitespace would
+    /// silently stop finding calls the moment one gets formatted that way.
+    #[test]
+    fn calls_name_matches_across_a_newline_before_the_parenthesis() {
+        let text = "async fn wraps_it() {\n    with_event_store\n        (store)\n}";
+        assert!(calls_name(text, "with_event_store"));
+    }
+
+    /// `(name, body)` for every function defined in `text`, where `body`
+    /// spans from the function's signature line to the matching close of
+    /// its opening brace, found by [`brace_bounded_fn_end`]. The line
+    /// before the *next* function signature (or EOF) is passed to
+    /// `brace_bounded_fn_end` only as its own fallback bound — used when
+    /// brace counting never returns to depth zero, e.g. a signature shape
+    /// this scan doesn't recognize, or an actual brace imbalance — never as
+    /// this function's primary way of finding where a body ends.
+    fn fn_bodies(text: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let starts: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| is_fn_signature_line(line.trim_start()))
+            .map(|(index, _)| index)
+            .collect();
+        starts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &start)| {
+                let hard_limit = starts.get(index + 1).copied().unwrap_or(lines.len());
+                let end = brace_bounded_fn_end(&lines, start, hard_limit);
+                let name = fn_name_from_signature(lines[start].trim_start())?;
+                Some((name.to_string(), lines[start..end].join("\n")))
+            })
+            .collect()
+    }
+
+    /// The exclusive end index (within `lines`) of the function whose
+    /// signature line is `lines[sig_start]`, found by counting brace depth
+    /// from that line until it returns to zero, bounded by `hard_limit` (a
+    /// caller-supplied fallback — the next known function signature, or
+    /// EOF) if brace counting never finds a close.
+    ///
+    /// Bounding by "next signature" alone (the original design of
+    /// `fn_bodies`) reads past a function's real end whenever anything
+    /// between its `{` and the *next* recognized signature is not itself
+    /// matched as a signature — a nested nested `fn` with an unrecognized
+    /// visibility spelling, a closure, or simply a long function with a lot
+    /// of code after its logical end — and keeps scanning into whatever
+    /// comes next, which can misattribute an unrelated later call as this
+    /// function's own. Brace counting fixes that; `hard_limit` stays as a
+    /// safety net, never a primary bound, for the rare text this scan
+    /// cannot fully make sense of (a signature line this scan doesn't
+    /// recognize, or an actual brace imbalance).
+    fn brace_bounded_fn_end(lines: &[&str], sig_start: usize, hard_limit: usize) -> usize {
+        let joined = lines[sig_start..hard_limit].join("\n");
+        let stripped = strip_string_literals(&joined);
+        let mut depth = 0i32;
+        let mut opened = false;
+        for (line_index, line) in stripped.lines().enumerate() {
+            let code = match line.find("//") {
+                Some(comment_at) => &line[..comment_at],
+                None => line,
+            };
+            for ch in code.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if opened && depth <= 0 {
+                return (sig_start + line_index + 1).min(hard_limit);
+            }
+        }
+        hard_limit
+    }
+
+    /// `seed`, plus the name of every function *defined in this same text*
+    /// that transitively calls one of the `seed` names through a chain of
+    /// unambiguous same-text helpers — e.g. a local test-fixture helper
+    /// (`pack_with_events()`, `fixture()`, ...) that itself constructs an
+    /// event-backed registry, or a verb handler that calls a
+    /// `record_config_locked`-wrapping config reader through one or more
+    /// intermediate helpers (`handle_context` → `context_profile_enabled`
+    /// → `record_config_locked`).
+    ///
+    /// Two deliberate boundaries keep this from over-matching:
+    ///
+    /// - **Per input text, not per workspace.** A private helper named
+    ///   `fixture()` in one crate's test binary has nothing to do with an
+    ///   unrelated `fixture()` in another crate's — they're different
+    ///   functions in different compiled binaries. Resolving against
+    ///   exactly the text handed in (one file, or one crate's concatenated
+    ///   `src/` tree — the caller decides which) matches a real visibility
+    ///   boundary instead of conflating same-named helpers across the whole
+    ///   tree.
+    /// - **Closure gated by per-step uniqueness, not free transitive
+    ///   chasing.** Growing the known set one full pass at a time, and only
+    ///   ever promoting a name that is unambiguous (defined exactly once in
+    ///   the text) at the moment it is promoted, is what keeps a generic
+    ///   name like `new` or `build` — reused by dozens of unrelated types —
+    ///   from becoming a global false-positive match. Each pass reuses the
+    ///   exact single-hop check the uniqueness gate already relied on; only
+    ///   the number of passes changed; a wrapper that itself wraps a
+    ///   wrapper is still only promoted once every name on its path to
+    ///   `seed` has independently cleared that gate.
+    fn file_seam_names(text: &str, seed: &[&str]) -> Vec<String> {
+        let bodies = fn_bodies(text);
+        let mut name_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (name, _) in &bodies {
+            *name_counts.entry(name.as_str()).or_insert(0) += 1;
+        }
+
+        let mut known: Vec<String> = seed.iter().map(|s| s.to_string()).collect();
+        loop {
+            let mut grew = false;
+            for (name, body) in &bodies {
+                if known.iter().any(|k| k == name) {
+                    continue;
+                }
+                if name_counts.get(name.as_str()).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if known.iter().any(|seam| calls_name(body, seam)) {
+                    known.push(name.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        known
+    }
+
+    /// [`file_seam_names`]'s closure, widened to resolve an ordinary
+    /// function-call chain that crosses source files within one crate —
+    /// e.g. a coordinator method defined in one file calling a config
+    /// reader defined in another — while still rejecting a name this scan
+    /// cannot safely resolve.
+    ///
+    /// `bodies_by_file` is one [`fn_bodies`] list per file; each entry
+    /// keeps the same per-file uniqueness gate `file_seam_names` applies
+    /// (a name only counts as *that file's* definition when it is the only
+    /// one *in that file's own text*), but growth is shared across every
+    /// file, so a name promoted from one file's chain is immediately
+    /// available to every other file's bodies on the next pass.
+    ///
+    /// A name defined identically in more than one file of the crate (the
+    /// same function name reused by two unrelated types — this workspace
+    /// has a real instance: a coordinator's own search method and an
+    /// unrelated service wrapper by the same name, in different files) is
+    /// promoted only when *every* one of its per-file-unique definitions
+    /// independently reaches the known set. Requiring the concatenated
+    /// text's exact-one-definition count instead would block such a name
+    /// forever — even though each definition, read in its own file, is
+    /// unambiguous — so this loosens the count check exactly as far as
+    /// keeping every resolution provably seam-reaching allows, and no
+    /// further: a name with even one non-reaching definition among its
+    /// per-file-unique occurrences is never promoted, which is what keeps
+    /// a generic name like `new` from becoming a crate-wide false match
+    /// the moment any single type's constructor happens to reach a seam.
+    fn crate_seam_names(bodies_by_file: &[Vec<(String, String)>], seed: &[&str]) -> Vec<String> {
+        let per_file_unique: Vec<Vec<(&str, &str)>> = bodies_by_file
+            .iter()
+            .map(|bodies| {
+                let mut counts: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for (name, _) in bodies {
+                    *counts.entry(name.as_str()).or_insert(0) += 1;
+                }
+                bodies
+                    .iter()
+                    .filter(|(name, _)| counts.get(name.as_str()).copied() == Some(1))
+                    .map(|(name, body)| (name.as_str(), body.as_str()))
+                    .collect()
+            })
+            .collect();
+
+        let mut occurrences: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for unique_in_file in &per_file_unique {
+            for (name, body) in unique_in_file {
+                occurrences.entry(name).or_default().push(body);
+            }
+        }
+
+        let mut known: Vec<String> = seed.iter().map(|s| s.to_string()).collect();
+        loop {
+            let mut grew = false;
+            for (name, bodies) in &occurrences {
+                if known.iter().any(|k| k == name) {
+                    continue;
+                }
+                if bodies
+                    .iter()
+                    .all(|body| known.iter().any(|seam| calls_name(body, seam)))
+                {
+                    known.push((*name).to_string());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        known
+    }
+
+    /// The `crates/<name>` crate this source `path` belongs to, or `None`
+    /// if `path` is not under a `crates/<name>/...` layout.
+    fn crate_key(path: &std::path::Path) -> Option<String> {
+        let mut components = path.components();
+        while let Some(component) = components.next() {
+            if component.as_os_str() == "crates" {
+                return components
+                    .next()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned());
+            }
+        }
+        None
+    }
+
+    /// The first `handle_*` call found in `text`, if any — used to read off
+    /// the handler a dispatch match arm routes to.
+    fn find_handle_call(text: &str) -> Option<String> {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let bytes = text.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find("handle_") {
+            let start = search_from + rel;
+            if start > 0 && is_ident_byte(bytes[start - 1]) {
+                search_from = start + 1;
+                continue;
+            }
+            let mut end = start + "handle_".len();
+            while end < bytes.len() && is_ident_byte(bytes[end]) {
+                end += 1;
+            }
+            let mut j = end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                return Some(text[start..end].to_string());
+            }
+            search_from = end.max(start + 1);
+        }
+        None
+    }
+
+    /// `(verb, handler)` for every `"verb" => ... handle_name(` dispatch
+    /// match arm found in `text` — the pattern every pack's `dispatch`
+    /// (`crates/khive-pack-*/src/{dispatch,pack}.rs`) uses to route a verb
+    /// string to its handler method.
+    ///
+    /// This workspace's dispatch tables write one verb per arm ending in a
+    /// `self.handle_*(...)` call, occasionally wrapped in a short `{ }`
+    /// block (`"memory.recall" => { self.handle_recall_with_deadline(...)
+    /// .await }`), so the handler is looked up in a bounded window after
+    /// the arm's `=>` rather than requiring it on the same line. A combined
+    /// arm that dispatches on a second, nested `match` (`"create" | "list"
+    /// | "search" => { match verb { "create" => self.handle_create(...),
+    /// ... } }`) can misattribute the outer alias to the first inner
+    /// handler call instead of its real one; that under-attributes rather
+    /// than over-attributes a verb as ledger-reaching (a missed producer
+    /// verb is a false negative here, not a false positive), and none of
+    /// this workspace's combined arms currently route to a ledger
+    /// producer.
+    fn dispatch_verb_handlers(text: &str) -> Vec<(String, String)> {
+        let bytes = text.as_bytes();
+        let mut arms: Vec<(String, usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'"' && bytes[j] != b'\n' {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'"' {
+                i += 1;
+                continue;
+            }
+            let literal = &text[start..j];
+            let verb_like = !literal.is_empty()
+                && literal
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.');
+            let mut k = j + 1;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if verb_like && k + 1 < bytes.len() && bytes[k] == b'=' && bytes[k + 1] == b'>' {
+                arms.push((literal.to_string(), start - 1, k + 2));
+            }
+            i = j + 1;
+        }
+
+        let mut out = Vec::new();
+        for (index, (verb, _quote_start, arrow_end)) in arms.iter().enumerate() {
+            let next_arm_start = arms.get(index + 1).map(|arm| arm.1).unwrap_or(bytes.len());
+            let window_end = next_arm_start.min(arrow_end + 400).min(bytes.len());
+            if window_end <= *arrow_end {
+                continue;
+            }
+            if let Some(handler) = find_handle_call(&text[*arrow_end..window_end]) {
+                out.push((verb.clone(), handler));
+            }
+        }
+        out
+    }
+
+    /// `true` if `text` contains `dispatch(` (optional whitespace,
+    /// including newlines, before the `(`) whose first argument is the
+    /// exact string literal `"verb"` — the call shape every test in this
+    /// workspace uses to exercise a pack verb (`pack.dispatch("context",
+    /// ...)`, `registry.dispatch("memory.recall", ...)`).
+    fn calls_dispatch_with_verb(text: &str, verb: &str) -> bool {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let bytes = text.as_bytes();
+        let name = "dispatch";
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(name) {
+            let idx = search_from + rel;
+            let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+            let after = idx + name.len();
+            let mut j = after;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if before_ok && j < bytes.len() && bytes[j] == b'(' {
+                let mut k = j + 1;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                let quoted = format!("\"{verb}\"");
+                if text[k..].starts_with(&quoted) {
+                    return true;
+                }
+            }
+            search_from = idx + 1;
+        }
+        false
+    }
+
+    /// The exclusive end index (within `lines`) of the test function whose
+    /// `#[test]`/`#[tokio::test]` attribute starts at `lines[start]`,
+    /// bounded by `hard_limit` (the next test attribute, or EOF) as a
+    /// fallback if brace counting cannot find a close.
+    ///
+    /// A previous version bounded a test's span only by "next `#[test]`
+    /// attribute", which pulls a sibling helper function sitting between
+    /// two tests into the *first* test's span — a helper defined after one
+    /// test and before the next reads as part of the first test's body
+    /// even though it is a wholly separate top-level item. Ending the span
+    /// at the matching closing brace of the test's own `fn` instead means a
+    /// sibling helper's seam call is never misattributed.
+    fn test_body_end(lines: &[&str], start: usize, hard_limit: usize) -> usize {
+        let Some(sig_offset) = lines[start..hard_limit]
+            .iter()
+            .position(|line| is_fn_signature_line(line.trim_start()))
+        else {
+            return hard_limit;
+        };
+        brace_bounded_fn_end(lines, start + sig_offset, hard_limit)
+    }
+
+    /// An event-backed registry can drain the process-wide config ledger at
+    /// dispatch, and `record_config_locked` (and every `OnceLock` reader
+    /// that wraps it — `context_profile_enabled`, `recall_profile_enabled`,
+    /// `ann_overfetch_max_rounds`, `ann_ready_timeout_ms`,
+    /// `recall_deadline_ms`, `request_read_timeout`,
+    /// `backend_search_timeout_ms`, ... — enumerated here only as the
+    /// evidence that motivated widening the seed, never as the source of
+    /// truth for who counts) writes to it, so every compiled test that
+    /// reaches either — directly, through a same-text wrapper, or by
+    /// dispatching a verb whose handler reaches one — must join the
+    /// ledger's serial group even when its own assertion is about another
+    /// audit field.
+    ///
+    /// The seed is deliberately just the two true seams
+    /// (`with_event_store`, `record_config_locked`) rather than a
+    /// hand-maintained list of every wrapper: `file_seam_names` grows the
+    /// known set to a fixed point, so a future `OnceLock` reader that wraps
+    /// `record_config_locked` is picked up the moment it exists, without
+    /// anyone remembering to add it here.
+    #[test]
+    fn event_store_test_fixtures_are_config_ledger_serialized() {
+        let sources = workspace_rust_sources();
+        assert!(
+            !sources.is_empty(),
+            "the workspace source scan found no .rs files under crates/*/src or \
+             crates/*/tests; the census's own file walk is broken, not the population \
+             it walks"
+        );
+
+        let base_seed = ["with_event_store", "record_config_locked"];
+
+        // A dispatch match arm (`"context" => self.handle_context(...)`)
+        // and the handler it names are frequently split across files
+        // within one crate (`khive-pack-kg`'s `dispatch.rs` vs.
+        // `handlers/context.rs`), so resolving "does verb X's handler reach
+        // a ledger producer" needs a wider-than-one-file view. Per crate is
+        // still a real visibility boundary — a pack's dispatch table only
+        // ever calls its own handlers — unlike a workspace-wide view,
+        // which would risk resolving a handler name that happens to
+        // collide across unrelated crates. Built from `src/` text only:
+        // `tests/` helpers of the same name must never leak into what
+        // counts as "the crate's own handler".
+        let mut crate_src_blobs: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut crate_src_bodies: std::collections::HashMap<String, Vec<Vec<(String, String)>>> =
+            std::collections::HashMap::new();
+        for (path, text) in &sources {
+            if !path.components().any(|c| c.as_os_str() == "src") {
+                continue;
+            }
+            let Some(key) = crate_key(path) else {
+                continue;
+            };
+            let blob = crate_src_blobs.entry(key.clone()).or_default();
+            blob.push_str(text);
+            blob.push('\n');
+            crate_src_bodies
+                .entry(key)
+                .or_default()
+                .push(fn_bodies(text));
+        }
+        let mut crate_ledger_verbs: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (crate_name, blob) in &crate_src_blobs {
+            let empty = Vec::new();
+            let bodies_by_file = crate_src_bodies.get(crate_name).unwrap_or(&empty);
+            let producers = crate_seam_names(bodies_by_file, &base_seed);
+            let verbs: Vec<String> = dispatch_verb_handlers(blob)
+                .into_iter()
+                .filter(|(_, handler)| producers.iter().any(|p| p == handler))
+                .map(|(verb, _)| verb)
+                .collect();
+            crate_ledger_verbs.insert(crate_name.clone(), verbs);
+        }
+
+        // Every source file in the crate (`src/` and `tests/` alike) —
+        // resolves an ordinary same-crate function-call chain that crosses
+        // files (a coordinator method in `dispatch.rs` calling a config
+        // reader that lands in `dispatch.rs` too, reached from a test in
+        // `tests.rs`) for the direct-call match below. Kept separate from
+        // `crate_src_bodies` above: that population stays `src/`-only so a
+        // `tests/`-only helper can never be misread as a pack's own
+        // dispatch handler.
+        //
+        // A pack's own verb-dispatch table (`dispatch_verb_handlers`'s own
+        // target shape — one function whose body is a `"verb" => ...
+        // handle_x(...)` match with many arms) is excluded from this
+        // population: "body contains a call to a known name" is sound only
+        // for a body that always makes that call, and a dispatch table's
+        // body contains a call to nearly every handler in the pack while
+        // any one invocation only ever takes one arm. Leaving it in would
+        // promote the dispatch function itself the moment *any* single
+        // verb's handler reaches a seam, which reads as "every verb reaches
+        // the ledger" — the false-positive an ordinary wrapper closure
+        // cannot produce, verb-routing is already resolved precisely by the
+        // separate `crate_ledger_verbs`/`calls_dispatch_with_verb` path
+        // above, keyed by which verb string was actually invoked.
+        let mut crate_all_bodies: std::collections::HashMap<String, Vec<Vec<(String, String)>>> =
+            std::collections::HashMap::new();
+        for (path, text) in &sources {
+            let Some(key) = crate_key(path) else {
+                continue;
+            };
+            let bodies: Vec<(String, String)> = fn_bodies(text)
+                .into_iter()
+                .filter(|(_, body)| dispatch_verb_handlers(body).len() <= 1)
+                .collect();
+            crate_all_bodies.entry(key).or_default().push(bodies);
+        }
+        let mut crate_direct_seams: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (crate_name, bodies_by_file) in &crate_all_bodies {
+            crate_direct_seams.insert(
+                crate_name.clone(),
+                crate_seam_names(bodies_by_file, &base_seed),
+            );
+        }
+
+        let mut candidate_count = 0usize;
+        let mut offenders = Vec::new();
+        let mut order_offenders = Vec::new();
+
+        for (path, text) in &sources {
+            let seam_names = file_seam_names(text, &base_seed);
+            let crate_key_for_path = crate_key(path);
+            let crate_verbs = crate_key_for_path
+                .as_deref()
+                .and_then(|key| crate_ledger_verbs.get(key));
+            let crate_seams = crate_key_for_path
+                .as_deref()
+                .and_then(|key| crate_direct_seams.get(key));
+            let lines: Vec<&str> = text.lines().collect();
+            let test_starts: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let trimmed = line.trim();
+                    trimmed == "#[test]" || trimmed.starts_with("#[tokio::test")
+                })
+                .map(|(index, _)| index)
+                .collect();
+
+            for (index, start) in test_starts.iter().copied().enumerate() {
+                let hard_limit = test_starts.get(index + 1).copied().unwrap_or(lines.len());
+                let end = test_body_end(&lines, start, hard_limit);
+                let span = &lines[start..end];
+                let span_text = span.join("\n");
+
+                // `serial_test`'s derive sorts lock keys only *within* one
+                // `#[serial(...)]` attribute (`raw_args.sort()`), never
+                // across two attributes stacked on the same item. A test
+                // that takes the unkeyed group and `config_ledger` must
+                // therefore fix the acquisition order itself: two tests
+                // stacking the same pair of attributes in opposite textual
+                // order take the two locks in opposite order and deadlock
+                // each other, and every other serial test queues behind
+                // them. Checked unconditionally over every test span, not
+                // just config-ledger-reaching candidates below — the
+                // deadlock risk is about which attributes are stacked, not
+                // about whether this census's reachability heuristic can
+                // prove the seam call.
+                let unkeyed_attr_pos = span.iter().position(|line| {
+                    let trimmed = line.trim();
+                    trimmed == "#[serial]" || trimmed == "#[serial_test::serial]"
+                });
+                let config_ledger_attr_pos = span.iter().position(|line| {
+                    let trimmed = line.trim();
+                    trimmed == "#[serial(config_ledger)]"
+                        || trimmed == "#[serial_test::serial(config_ledger)]"
+                });
+                if let (Some(unkeyed_idx), Some(config_ledger_idx)) =
+                    (unkeyed_attr_pos, config_ledger_attr_pos)
+                {
+                    if config_ledger_idx < unkeyed_idx {
+                        let signature_offset = span
+                            .iter()
+                            .position(|line| is_fn_signature_line(line.trim_start()))
+                            .expect("test span has a function signature");
+                        let name = fn_name_from_signature(span[signature_offset].trim_start())
+                            .unwrap_or("<unknown>");
+                        order_offenders.push(format!("{}:{name}", path.display()));
+                    }
+                }
+
+                let matched_direct = seam_names
+                    .iter()
+                    .chain(crate_seams.into_iter().flatten())
+                    .find(|seam| calls_name(&span_text, seam));
+                let matched: Option<String> = matched_direct.cloned().or_else(|| {
+                    crate_verbs.and_then(|verbs| {
+                        verbs
+                            .iter()
+                            .find(|verb| calls_dispatch_with_verb(&span_text, verb))
+                            .map(|verb| format!("dispatch(\"{verb}\")"))
+                    })
+                });
+                let Some(matched) = matched else {
+                    continue;
+                };
+                candidate_count += 1;
+
+                let has_group = span.iter().any(|line| {
+                    let trimmed = line.trim();
+                    trimmed == "#[serial(config_ledger)]"
+                        || trimmed == "#[serial_test::serial(config_ledger)]"
+                });
+                if !has_group {
+                    let signature_offset = span
+                        .iter()
+                        .position(|line| is_fn_signature_line(line.trim_start()))
+                        .expect("test span has a function signature");
+                    let name = fn_name_from_signature(span[signature_offset].trim_start())
+                        .unwrap_or("<unknown>");
+                    offenders.push(format!(
+                        "{}:{name} (reaches config-ledger seam via `{matched}`)",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            candidate_count > 0,
+            "census found zero config-ledger-reaching test candidates across the whole \
+             workspace scan ({} source files) — the scan is broken, not the \
+             population it should have found (khive-runtime's own config-ledger \
+             tests alone are known callers)",
+            sources.len()
+        );
+        assert!(
+            offenders.is_empty(),
+            "config-ledger-reaching pack tests must use #[serial(config_ledger)]; \
+             offenders: {offenders:?}"
+        );
+        assert!(
+            order_offenders.is_empty(),
+            "a test stacking the unkeyed #[serial] group with #[serial(config_ledger)] \
+             must take the unkeyed attribute first: serial_test's derive sorts lock \
+             keys only within one #[serial(...)] attribute, never across two \
+             attributes stacked on the same item, so a test taking these two locks in \
+             the opposite textual order deadlocks against every test that took them in \
+             the canonical order; offenders: {order_offenders:?}"
+        );
+    }
+
     fn only_git_digest_event(store: &MemoryEventStore) -> Event {
         let events: Vec<Event> = store
             .events
@@ -6402,6 +7188,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn git_digest_success_returns_complete_durable_receipt() {
         let project_id = uuid::Uuid::new_v4();
         let store = Arc::new(MemoryEventStore::default());
@@ -6447,6 +7234,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn malformed_git_digest_report_appends_one_generic_error_audit() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -6478,6 +7266,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     #[serial(audit_append_failures)]
     #[serial(audit_obligation_append_failures)]
     async fn git_digest_receipt_append_failure_never_returns_unqualified_success() {
@@ -6535,6 +7324,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn git_digest_gate_unavailable_precedes_the_receipt_contract() {
         #[derive(Debug)]
         struct FailingGate;
@@ -6573,6 +7363,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_gate_error_returns_typed_refusal_without_invoking_operation() {
         #[derive(Debug)]
         struct FailingGate;
@@ -6583,6 +7374,13 @@ pub(crate) mod tests {
                 ))
             }
         }
+
+        // Entry reset, not exit: a `config_ledger`-grouped test that panics
+        // after queueing a row (elsewhere in this group) would otherwise
+        // leave it for whichever test the serial lock hands off to next;
+        // this test's exact `events.len() == 1` assertion below has no
+        // tolerance for an inherited row.
+        let _ = crate::config_ledger::drain_config_locked();
 
         let invoked = Arc::new(AtomicUsize::new(0));
         let invoked_by_operation = Arc::clone(&invoked);
@@ -6636,6 +7434,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_deny_remains_distinct_and_does_not_invoke_operation() {
         #[derive(Debug)]
         struct DenyingGate;
@@ -6644,6 +7443,10 @@ pub(crate) mod tests {
                 Ok(GateDecision::deny("intercepted policy denied"))
             }
         }
+
+        // Entry reset, not exit — see the sibling test above for why an
+        // exact `events.len() == 1` assertion needs a clean ledger.
+        let _ = crate::config_ledger::drain_config_locked();
 
         let invoked = Arc::new(AtomicUsize::new(0));
         let invoked_by_operation = Arc::clone(&invoked);
@@ -6679,6 +7482,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_git_digest_uses_the_same_receipt_contract() {
         let project_id = uuid::Uuid::new_v4();
         let store = Arc::new(MemoryEventStore::default());
@@ -6713,6 +7517,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_git_digest_receipt_preserves_typed_metadata() {
         let project_id = uuid::Uuid::new_v4();
         let store = Arc::new(MemoryEventStore::default());
@@ -6746,6 +7551,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_malformed_git_digest_appends_one_generic_error_audit() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -6997,6 +7803,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_persists_to_event_store_on_allow() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -7029,6 +7836,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     #[serial(audit_append_failures)]
     #[serial(audit_obligation_append_failures)]
     async fn audit_append_failure_fails_an_obligation_bearing_dispatch() {
@@ -7124,15 +7932,15 @@ pub(crate) mod tests {
     /// Not pinned here: that the row commits on a SEPARATE writer acquisition from the
     /// handler's. The store double has no writer to observe, so that half of the mechanism
     /// needs a different fixture than this one.
-    #[tokio::test]
-    #[serial(audit_append_failures)]
-    #[serial(audit_obligation_append_failures)]
     // The config ledger is process-global and an event-store dispatch drains its
     // queue before invoking the pack, so a concurrent config_ledger test can land
     // a submission ahead of this handler's effect and break the first-entry
     // assertion below. That group is held for the position assertion, not for the
-    // audit counters the two groups above cover.
+    // audit counters the other two groups cover.
+    #[tokio::test]
     #[serial(config_ledger)]
+    #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
     async fn obligation_failure_reports_a_write_that_already_committed() {
         /// `total` is what `cost_unit` is computed from, so this number is the
         /// test's handle on whether the audit row was built from the return
@@ -7457,6 +8265,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(config_ledger)]
     fn build_rejects_a_configured_event_store_incompatible_with_the_audit_batch_seam() {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
@@ -7562,6 +8371,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_duration_us_reflects_measured_dispatch_time() {
         // The persisted audit row's `duration_us` must carry the measured
         // pack-dispatch time, not the `Event::new` default of 0 (persisting
@@ -7598,6 +8408,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_unknown_verb_allowed_by_gate_still_persists_audit_row() {
         // Generalizing audit-row deferral to every Allow-outcome verb (not
         // just singleton `link`) must not silently drop the audit row for a
@@ -7635,6 +8446,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_persists_to_event_store_on_deny() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
@@ -7677,6 +8489,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn gate_error_returns_typed_refusal_without_invoking_pack() {
         #[derive(Debug)]
         struct FailingGate;
@@ -7735,6 +8548,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     #[serial(audit_append_failures)]
     async fn gate_error_audit_failure_cannot_reopen_dispatch_or_replace_typed_error() {
         #[derive(Debug)]
@@ -7939,6 +8753,7 @@ pub(crate) mod tests {
     // verifies the complete envelope survives append_event → query_events.
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_envelope_round_trips_deny_reason_and_gate_impl_through_event_store() {
         #[derive(Debug)]
         struct DenyGateWithName;
@@ -8011,6 +8826,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_envelope_round_trips_obligations_through_event_store() {
         use khive_gate::Obligation;
 
@@ -8078,6 +8894,7 @@ pub(crate) mod tests {
     // (Event.data is stored as TEXT and parsed back on read).
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn sql_backed_audit_envelope_round_trips_deny_reason_gate_impl_and_obligations() {
         #[derive(Debug)]
         struct SqlTestDenyGate;
@@ -8177,6 +8994,7 @@ pub(crate) mod tests {
     //   1. Raw Event.data["obligations"] is a non-empty JSON array.
     //   2. Deserialized AuditEvent.obligations[0] matches the expected variant.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn sql_backed_audit_envelope_round_trips_non_empty_obligations() {
         use khive_gate::Obligation;
 
@@ -8283,6 +9101,7 @@ pub(crate) mod tests {
     // through the EventStore. Ensures the wire shape is independent of which verb
     // triggers the gate check.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_payload_shape_for_create_verb() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8452,6 +9271,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_present_on_non_embedding_successful_dispatch() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8480,6 +9300,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_scales_with_registered_model_count_for_create() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8511,6 +9332,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_zero_registered_models_is_base_weight_only() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8539,6 +9361,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_when_dispatch_returns_error() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8578,6 +9401,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_when_no_pack_owns_the_verb() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8607,6 +9431,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_on_denied_dispatch() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
@@ -8643,6 +9468,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_present_on_link_singleton_success() {
         let store = Arc::new(MemoryEventStore::default());
         let edge_id = uuid::Uuid::new_v4();
@@ -8690,6 +9516,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_on_link_dispatch_failure() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8727,6 +9554,7 @@ pub(crate) mod tests {
 
     // Registry audit event must carry target_id when dispatch params include it.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_threads_target_id_from_dispatch_args() {
         let store = Arc::new(MemoryEventStore::default());
         let target = uuid::Uuid::new_v4();
@@ -8827,6 +9655,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_enriches_successful_singleton_with_edge_v2() {
         let store = Arc::new(MemoryEventStore::default());
         let edge_id = uuid::Uuid::new_v4();
@@ -8896,6 +9725,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_falls_back_to_v1_when_dispatch_fails() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8965,6 +9795,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_falls_back_to_v1_when_result_missing_edge_fields() {
         let store = Arc::new(MemoryEventStore::default());
         let target_arg = uuid::Uuid::new_v4();
@@ -9011,6 +9842,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_bulk_links_get_no_enrichment() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -9150,9 +9982,66 @@ pub(crate) mod tests {
         page.items[0].clone()
     }
 
+    /// A fresh `MemoryEventStore` for a test that will assert `first_event`'s
+    /// exact one-event count, with the process-wide config ledger drained
+    /// first.
+    ///
+    /// `first_event` itself runs *after* dispatch, so it cannot fix this: a
+    /// `config_ledger`-grouped test that panics after queueing a row (a
+    /// direct `record_config_locked` call, or a `OnceLock` reader it
+    /// invoked) but before its own event-backed dispatch never drains that
+    /// row itself, leaving it queued for whichever test the serial lock
+    /// hands off to next. If that next test builds its store with plain
+    /// `Arc::new(MemoryEventStore::default())`, its own dispatch call
+    /// drains the inherited row as an extra `ConfigLocked` event alongside
+    /// the one it expects, and `first_event`'s exact `page.items.len() ==
+    /// 1` assertion sees two. The fix has to run before dispatch, so it
+    /// lives in the store constructor every exact-one-event test calls, not
+    /// in the post-dispatch helper that reads the count.
+    fn clean_ledger_event_store() -> Arc<MemoryEventStore> {
+        let _ = crate::config_ledger::drain_config_locked();
+        Arc::new(MemoryEventStore::default())
+    }
+
+    /// Regression: a preceding
+    /// `config_ledger`-grouped test that queues a row (directly, or via a
+    /// `OnceLock` reader it invoked) and then panics before its own
+    /// event-backed dispatch drains it leaves that row queued for whichever
+    /// test the serial lock hands to next. Simulate exactly that leaked row
+    /// here and prove `clean_ledger_event_store` — not `first_event` itself,
+    /// which only runs after dispatch and so cannot fix a pre-dispatch race
+    /// — is what keeps `first_event`'s exact one-event assertion honest.
     #[tokio::test]
+    #[serial(config_ledger)]
+    async fn first_event_is_immune_to_a_ledger_row_a_prior_test_never_drained() {
+        let _ = crate::config_ledger::drain_config_locked();
+        crate::config_ledger::record_config_locked("simulated_leaked_key", "leaked_value");
+
+        let store = clean_ledger_event_store();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch_with_identity(
+            "list",
+            serde_json::json!({"namespace": "test-ns"}),
+            Some(RequestIdentity {
+                request_id: Some(9_001),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let ev = first_event(&store).await;
+        assert_eq!(ev.outcome, EventOutcome::Success);
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_success() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_event_store(store.clone());
@@ -9175,8 +10064,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_dispatch_error() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(FailingProbePack);
         builder.with_event_store(store.clone());
@@ -9201,6 +10091,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_denied() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
@@ -9210,7 +10101,7 @@ pub(crate) mod tests {
             }
         }
 
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_gate(Arc::new(AlwaysDenyGate));
@@ -9235,8 +10126,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_link_v2_success() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let edge_id = uuid::Uuid::new_v4();
         let source_id = uuid::Uuid::new_v4();
         let target_id = uuid::Uuid::new_v4();
@@ -9279,8 +10171,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_link_v1_fallback() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(LinkResultPack::err("target endpoint not found"));
         builder.with_event_store(store.clone());
@@ -9314,8 +10207,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_unknown_verb() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_event_store(store.clone());
@@ -9341,8 +10235,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_omits_request_id_key_when_absent() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_event_store(store.clone());
