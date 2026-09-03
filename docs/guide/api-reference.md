@@ -36,7 +36,15 @@ An always-machine-readable copy of this page is at
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
 `kkernel git-ingest` CLI drive. Its four verbs are `git.digest` (read/ingest) plus three
 write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that shell to system git
-with hardened, allowlisted argv construction.
+with hardened, allowlisted argv construction. A remote `git.digest` source whose initial
+clone or fetch setup fails returns a typed `RemoteFetchError` naming the redacted remote
+to in-process callers; the MCP `request` envelope renders it as a plain error message
+rather than structured fields (ADR-088 Amendment 1, Remote-URL mode, point 5). A
+clone/fetch failure hit later while repairing an already-cached clone surfaces as
+`InvalidInput` only when the bounded refetch-then-reclone repair ultimately fails (a
+successful repair earns one more snapshot attempt, and the digest completes only when
+that attempt succeeds); a source that parses as neither a local path nor a remote URL
+is `InvalidInput` as well.
 
 `workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
 
@@ -786,9 +794,30 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics for the main
-database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal`
-sidecar file size, and a WAL-pin holder census. Takes no parameters.
+Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for the
+main database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the
+`-wal` sidecar file size, page-level database size composition, and a WAL-pin holder census.
+Takes no parameters.
+
+`reader_contention` is scoped to the main `ConnectionPool` and resets only when that pool is
+reconstructed. `reader_admission_capacity` and `available_reader_admission_slots` are the
+configured total budget and its point-in-time availability; pooled reads and the explicit
+raw-SQL deferred-transaction exception share it. `reader_acquisitions` is the sum of
+`pooled_reader_checkouts` and request-path `standalone_reader_opens`, while
+`infrastructure_standalone_reader_opens` is deliberately separate. Ordinary file-backed reads
+must leave `standalone_reader_opens` flat. `reader_checkout_timeouts` counts admission waits that
+exhausted `KHIVE_CHECKOUT_TIMEOUT_SECS` before work began, not cooperative request cancellation.
+`active_pooled_reader_checkouts`, `peak_active_pooled_reader_checkouts`,
+`completed_pooled_reader_checkouts`, and `max_completed_reader_hold_micros` expose concurrency
+and lifecycle evidence; completed hold includes connection reset/replacement before reuse.
+`reader_replacement_open_failures` counts a disqualified pooled-reader return whose replacement
+connection then also failed to open, permanently shrinking the physical pool by one slot below
+`max_readers`; non-zero here means the pool has fewer physical reader connections than
+configured, and each occurrence is also logged at `warn`.
+
+The timeout setting applies to each admission attempt. A verb that issues several sequential
+reads can spend more than one configured timeout in total wall time, but each attempt is bounded
+and saturation never falls back to opening a standalone connection.
 
 `writer_contention` contains monotonic counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
@@ -797,7 +826,13 @@ finite-wait main-pool mutex checkouts, the second counts successful per-operatio
 standalone writer opens, and the third counts dequeued writer-task requests that acquired its
 dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
 `writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
-executes; SQLite `BEGIN`/statement failures are separate stages. `audit_append_failures` counts
+executes; SQLite `BEGIN`/statement failures are separate stages.
+`writer_task_begin_busy` counts every busy/locked `BEGIN IMMEDIATE` refusal, matching its
+pre-retry meaning: a nonzero value reflects total contention regardless of retry policy.
+`writer_task_begin_busy_absorbed` is a subset of it — refusals a bounded pre-execution retry
+absorbed before the request closure ran, so the caller never observed them. A refusal not
+absorbed by a retry also surfaces to the caller as the typed, retryable `writer_task_begin_busy`
+stage. The request closure is never retried. `audit_append_failures` counts
 process-wide best-effort audit appends whose storage error was logged and swallowed —
 pure-observability rows only. An obligation-bearing row's commit failure (a dispatch outcome, an
 unknown-verb row, a `git.digest` receipt, or a gate denial's own audit row) is never counted here:
@@ -856,9 +891,21 @@ deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded
 `unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
 `unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
 holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
-`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are cleanup-enumeration
-measurements: this request deliberately does not run that mutating enumeration, so both fields are
-omitted rather than reporting fabricated `false`/`0` values.
+The holder census is reconciled with a separate, bounded, read-only sidecar pass. A complete census
+and conclusive sidecar walk can therefore produce `wal_pin.status: "complete"`; truncated walks,
+unknown sidecar identities, and OS-confirmed holders missing sidecar evidence degrade explicitly.
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are measured by that pass. The
+latter is a forecast: diagnostics never performs the cleanup it reports.
+
+`size_composition` accounts SQLite pages by individual table or index using aggregate `dbstat`.
+It reports file-wide page/freelist/accounted/unaccounted byte totals plus operational class totals
+for ordinary row tables, indexes, FTS storage, vector storage, mixed row-and-embedding tables, and
+SQLite internal objects. A table that stores both ordinary columns and an `embedding BLOB` is kept
+in `mixed_embedding_bytes`: SQLite cannot attribute bytes within a shared page to one column, so
+the field is an upper bound for the embedding-bearing table, not a fabricated pure-vector byte
+count. Object detail is deterministic and capped at 4,096 rows; `objects_truncated` and
+`objects_omitted` make cap pressure explicit while the aggregate class totals still cover every
+object returned by `dbstat`. `size_composition_error` explains an unavailable report.
 
 `graph_edge_integrity` reports `duplicate_edge_id_groups`, `graph_edges_rows`,
 `graph_edges_seq_rows`, and `pre_v14_duplicate_edge_state_detected`. A non-zero duplicate group
@@ -1416,9 +1463,12 @@ request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 
 List and page through the caller's filtered inbound messages (default) or sent
 history (`box="sent"`).
-The response keeps the inbox envelope. `unread_count` is the exact mailbox-wide
-unread count for the caller — independent of the page window and of `status`
-and sender filters — and is zero for sent rows.
+The response keeps the inbox envelope and adds explicit bounded-count metadata.
+`unread_count` is the mailbox-wide unread count for the caller — independent of
+the page window and of `status` and sender filters — and is exact below
+`unread_count_cap` (1,000). When `unread_count_saturated` is `true`, the count
+equals the cap and means "at least this many"; `false` means it is exact. Sent
+rows report zero and `false`.
 With `wait_ms`, an initially empty fully filtered page waits for a newly
 committed matching message and otherwise returns at the deadline.
 
@@ -1467,6 +1517,9 @@ are errors. Omit it for the existing full-body response.
 
 Count-only view of the caller's unread inbound messages — the same filter as
 `comm.inbox(status="unread")`, without message payloads. Takes no parameters.
+Returns `{count, count_cap, count_saturated, actor}` with the same 1,000-row
+bound as the inbox metadata: `count_saturated=false` is exact, while `true`
+means `count == count_cap` is a lower bound.
 
 ```
 request(ops="comm.unread()")
@@ -1477,8 +1530,12 @@ request(ops="comm.unread()")
 Compatibility mark-read surface for one or more inbound messages. It does not retrieve message
 content; use `comm.inbox` or `comm.thread` for that. Outbound messages cannot be marked read. Mark writes
 are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
-remain fatal, but a post-read mark failure returns `read: false` with `mark_error`. Inspect each
-single or bulk result and re-issue failures later.
+remain fatal, but a post-read mark failure returns `status: "failed"`, `read: false`, and
+`mark_error`. A write whose execution seam terminated after being accepted (so it may already
+have applied) instead returns `status: "unknown"`, `read: null`, and `mark_error` — check the
+message's current state through `comm.inbox` before re-issuing; re-issuing is safe, since marking
+a message read is idempotent. Successful items carry `status: "success"`; inspect each result and
+re-issue failures (or unresolved unknowns) later.
 
 | Param | Type            | Required    | Notes                                                                   |
 | ----- | --------------- | ----------- | ----------------------------------------------------------------------- |
@@ -1491,8 +1548,9 @@ request(ops="comm.read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
 ```
 
 Exactly one of `id` or `ids` is required. The bulk response contains ordered
-`results` plus `requested_count`, `unique_count`, `marked_count`, and
-`failed_count`. Bulk updates are not atomic across messages: validation errors
+`results` plus `requested_count`, `unique_count`, `marked_count`, `unknown_count`, and
+`failed_count`, with aggregate `status=success|partial|failed|unknown`. Bulk updates are not atomic
+across messages: validation errors
 reject the call before any write, while later storage errors appear in each
 item's `read` and optional `mark_error`.
 
@@ -1720,17 +1778,31 @@ request(ops="knowledge.get(id=\"rope\", include_sections=true)")
 
 ### `knowledge.list` — Assertive
 
-Paginated listing of atoms or domains.
+Paginated listing of atoms or domains. Offset pages are ordered by
+`created_at DESC, id DESC`. For stable full-store traversal, start cursor mode
+with `after=""`, then reuse each non-null `next_after`; cursor pages are ordered
+by `created_at ASC, id ASC` and are not shifted by concurrent inserts.
 
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `type`   | string  | no       | `atom`\|`domain` (default `atom`). |
-| `limit`  | integer | no       | Default 20, max 500.               |
-| `offset` | integer | no       | Pagination offset.                 |
+| Param            | Type            | Required | Notes                                                                                                                       |
+| ---------------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `type`           | string          | no       | `atom`\|`domain` (default `atom`).                                                                                          |
+| `limit`          | integer         | no       | Default 20, max 500.                                                                                                        |
+| `offset`         | integer         | no       | Legacy offset pagination; mutually exclusive with `after`.                                                                  |
+| `after`          | string          | no       | `""` starts keyset mode; otherwise the full UUID from `next_after`. Missing, wrong-type, and out-of-namespace cursors fail. |
+| `fields`         | array\<string\> | no       | Strict non-empty projection. Use `["id","slug"]` for a key-only walk; unrequested content is not selected from storage.     |
+| `status`         | string/array    | no       | Atom status filter. Reuse it throughout a cursor walk.                                                                      |
+| `exclude_status` | string          | no       | Atom exclusion filter when `status` is absent. Reuse it throughout a cursor walk.                                           |
 
 ```
 request(ops="knowledge.list(type=\"domain\", limit=50)")
+request(ops="knowledge.list(type=\"atom\", fields=[\"id\",\"slug\"], after=\"\", limit=500)")
 ```
+
+Cursor traversal is live, not a snapshot. Inserts behind an issued boundary
+belong to a fresh walk; inserts ahead may extend the current walk. Existing
+rows are not shifted, skipped, or duplicated. Responses include machine-readable
+`order` and, in cursor mode, `next_after`. Stop when `next_after` is null;
+cursor pages carry no `total` (counting is a full scan per page), offset pages do.
 
 ### `knowledge.delete_atoms` — Commissive
 
@@ -1754,11 +1826,17 @@ request(ops="knowledge.stats()")
 
 ### `knowledge.index` — Commissive
 
-Backfill embeddings + FTS for atoms/domains.
+Backfill atom embeddings.
 
 The response includes `truncation_by_model`, keyed by every model that completed embedding work.
-Each value contains `truncated` and `discarded_bytes` counters derived from the actual embedding
-outcomes; atom source content remains complete in SQL and FTS.
+Each truncation value contains `truncated` and `discarded_bytes` counters derived from the actual
+embedding outcomes; atom source content remains complete in SQL and FTS.
+
+This verb does not rebuild the FTS indexes. Rebuilding `fts_knowledge`/`fts_sections` is a
+whole-database operation independent of the caller's namespace, and the ordinary verb has no
+per-caller cost admission to bound it, so that rebuild is reachable only through the
+`kkernel reindex` operator CLI (`--rebuild-fts`), which reports the indexes rebuilt, elapsed
+time, and the rank-1 integrity-check outcome.
 
 | Param         | Type            | Required | Notes                                                   |
 | ------------- | --------------- | -------- | ------------------------------------------------------- |

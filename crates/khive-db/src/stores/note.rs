@@ -11,7 +11,8 @@ use khive_storage::attachment::AttachmentSubstrate;
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::note::{FilterOp, Note, NoteFilter, SortDir};
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
+    BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
+    SqlStatement, SqlValue,
 };
 use khive_storage::NoteStore;
 use khive_storage::StorageCapability;
@@ -296,16 +297,16 @@ pub fn note_hard_delete_statement(id: Uuid) -> SqlStatement {
 /// A NoteStore backed by SQLite. Namespace is the caller's responsibility.
 ///
 /// UUID is globally unique — get/delete by ID alone. Query/count use the
-/// namespace parameter as passed. The store is just a pool + is_file_backed.
+/// namespace parameter as passed. Read routing is always pool-backed; the
+/// constructor's legacy file-backed flag is retained for API compatibility.
 pub struct SqlNoteStore {
     pool: Arc<ConnectionPool>,
-    is_file_backed: bool,
     writer_task: Option<WriterTaskHandle>,
 }
 
 impl SqlNoteStore {
     /// Create a new store.
-    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+    pub fn new(pool: Arc<ConnectionPool>, _is_file_backed: bool) -> Self {
         // Enabled by default for file-backed pools; explicit off/degraded
         // fallback remains possible (ADR-067 Component A, mirrors
         // entity.rs policy): a missing writer task — explicitly disabled,
@@ -314,11 +315,7 @@ impl SqlNoteStore {
         // re-resolves it and applies strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
-        Self {
-            pool,
-            is_file_backed,
-            writer_task,
-        }
+        Self { pool, writer_task }
     }
 
     fn current_writer_task(
@@ -435,36 +432,13 @@ impl SqlNoteStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Notes,
-                op,
-                move |scope| {
-                    scope.ensure_active()?;
-                    let conn = pool
-                        .open_standalone_reader()
-                        .map_err(|error| map_sqlite_err(error, op))?;
-                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        } else {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Notes,
-                op,
-                move |scope| {
-                    let mut guard = pool.resolve_reader_checkout(
-                        StorageCapability::Notes,
-                        op,
-                        pool.reader_until(|| scope.should_stop()),
-                    )?;
-                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        }
+        super::run_pooled_store_read(
+            Arc::clone(&self.pool),
+            StorageCapability::Notes,
+            op,
+            move |conn| f(conn).map_err(|error| map_err(error, op)),
+        )
+        .await
     }
 }
 
@@ -715,6 +689,29 @@ fn json_type_expr(path: &str) -> String {
     format!("json_type(properties, '{path}')")
 }
 
+/// Deterministic total order shared by exact-count and count-free filtered
+/// pages. Keeping the clause in one helper prevents the cheaper projection
+/// from drifting into a different offset sequence.
+fn note_filter_page_order_clause(filter: &NoteFilter) -> String {
+    match &filter.order_by {
+        Some((path, dir)) => {
+            let dir_str = match dir {
+                SortDir::Asc => "ASC",
+                SortDir::Desc => "DESC",
+            };
+            // #1671: append `id` as the final tiebreak in the sort field's
+            // direction so equal JSON sort values still form a total order.
+            format!(
+                " ORDER BY {} {dir_str}, id {dir_str}",
+                json_extract_expr(path)
+            )
+        }
+        // `id ASC` over the primary key is already the stable tiebreak for
+        // notes sharing a creation timestamp.
+        None => " ORDER BY created_at DESC, id ASC".to_string(),
+    }
+}
+
 /// Validate a value destined for inline comparison against `json_type()`.
 /// The only admissible values are SQLite's own json_type result strings —
 /// a closed vocabulary — so a validated value can be inlined into SQL text
@@ -825,11 +822,21 @@ fn build_note_filter_where(
                     "ifnull({expr}, '') = '' AND ({type_expr} IS NULL OR {type_expr} = 'null')"
                 ));
             }
+            FilterOp::EqOrLegacyIndexed => {
+                let expr = json_extract_expr(&pf.json_path);
+                let type_expr = json_type_expr(&pf.json_path);
+                params.push(sql_value_param(&pf.value)?);
+                let n = params.len();
+                conditions.push(format!(
+                    "ifnull({expr}, '') IN (?{n}, '') AND \
+                     ({type_expr} IS NULL OR {type_expr} = 'null' OR ifnull({expr}, '') != '')"
+                ));
+            }
             FilterOp::JsonTypeNeMissing => {
                 let type_expr = json_type_expr(&pf.json_path);
                 // Inlined as a validated literal, NOT a parameter: the
-                // partial unread index (`idx_notes_unread_probe_recipient`) carries
-                // this exact predicate in its WHERE clause, and SQLite can
+                // partial unread index (`idx_notes_unread_probe_recipient_direction`)
+                // carries this exact predicate in its WHERE clause, and SQLite can
                 // only prove a query implies an index predicate when the
                 // compared value is known at plan time — a bound parameter
                 // defeats the index and the scan degrades to
@@ -886,6 +893,7 @@ fn build_note_filter_where(
                     | FilterOp::JsonTypeEq
                     | FilterOp::JsonTypeMissing
                     | FilterOp::JsonTypeMissingOrNullIndexed
+                    | FilterOp::EqOrLegacyIndexed
                     | FilterOp::JsonTypeNeMissing
                     | FilterOp::In(_)
                     | FilterOp::NotInOrMissing(_) => {
@@ -1383,6 +1391,51 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
+    async fn query_notes_count_free(
+        &self,
+        namespace: &str,
+        kind: Option<&str>,
+        page: PageRequest,
+    ) -> Result<Page<Note>, StorageError> {
+        let namespace = namespace.to_string();
+        let kind = kind.map(str::to_string);
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: "query_notes_count_free".into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
+
+        self.with_reader("query_notes_count_free", move |conn| {
+            let (where_sql, mut params) = build_note_where(&namespace, kind.as_deref());
+            params.push(Box::new(limit_i64));
+            params.push(Box::new(offset_i64));
+            let limit_idx = params.len() - 1;
+            let offset_idx = params.len();
+            let sql = format!(
+                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
+                 expires_at, properties, created_at, updated_at, deleted_at \
+                 FROM notes{where_sql} ORDER BY created_at DESC, id ASC \
+                 LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+            );
+
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let mut rows = stmt.query(param_refs.as_slice())?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                items.push(read_note(row)?);
+            }
+
+            Ok(Page { items, total: None })
+        })
+        .await
+    }
+
     async fn query_notes_filtered(
         &self,
         namespace: &str,
@@ -1417,31 +1470,10 @@ impl NoteStore for SqlNoteStore {
             data_params.push(Box::new(limit_i64));
             data_params.push(Box::new(offset_i64));
 
-            let order_clause = match &filter.order_by {
-                Some((path, dir)) => {
-                    let dir_str = match dir {
-                        SortDir::Asc => "ASC",
-                        SortDir::Desc => "DESC",
-                    };
-                    // #1671: append `id` as the final tiebreak in the sort
-                    // field's direction so offset pages form a deterministic
-                    // total order even when the JSON sort value repeats. The
-                    // total order removes tie-order instability only — offset
-                    // paging can still duplicate or skip rows under concurrent
-                    // inserts/deletes or sort-key updates (that would need
-                    // snapshot isolation or keyset pagination).
-                    format!(
-                        " ORDER BY {} {dir_str}, id {dir_str}",
-                        json_extract_expr(path)
-                    )
-                }
-                // #1671: intentionally left unchanged — `id ASC` over the
-                // primary key already makes this clause a deterministic total
-                // order; flipping the direction would change the observable
-                // default order for existing consumers without fixing
-                // anything.
-                None => " ORDER BY created_at DESC, id ASC".to_string(),
-            };
+            // The total order removes tie-order instability only — offset
+            // paging can still duplicate or skip rows across separate requests
+            // under concurrent inserts/deletes or sort-key updates.
+            let order_clause = note_filter_page_order_clause(&filter);
 
             let limit_idx = data_params.len() - 1;
             let offset_idx = data_params.len();
@@ -1461,6 +1493,65 @@ impl NoteStore for SqlNoteStore {
                 &data_sql,
                 &data_params,
             )
+        })
+        .await
+    }
+
+    async fn query_notes_filtered_count_free(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
+        page: PageRequest,
+    ) -> Result<Page<Note>, StorageError> {
+        for property_filter in &filter.property_filters {
+            validate_json_path(&property_filter.json_path)?;
+        }
+        if let Some((path, _)) = &filter.order_by {
+            validate_json_path(path)?;
+        }
+
+        let namespace = namespace.to_string();
+        let filter = filter.clone();
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: "query_notes_filtered_count_free".into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
+
+        self.with_reader("query_notes_filtered_count_free", move |conn| {
+            let (where_sql, mut params) = build_note_filter_where(&namespace, &filter)?;
+            params.push(Box::new(limit_i64));
+            params.push(Box::new(offset_i64));
+            let limit_idx = params.len() - 1;
+            let offset_idx = params.len();
+            let order_clause = note_filter_page_order_clause(&filter);
+            let sql = format!(
+                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
+                 expires_at, properties, created_at, updated_at, deleted_at \
+                 FROM notes{where_sql}{order_clause} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+            );
+
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let mut rows = stmt.query(param_refs.as_slice())?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                items.push(read_note(row)?);
+                // A single SQLite statement pins its read snapshot on the
+                // first step. The test seam pauses there so a concurrent WAL
+                // commit can prove the remainder stays on that snapshot.
+                #[cfg(test)]
+                if items.len() == 1 {
+                    tests::page_snapshot_seam::hook("query_notes_filtered_count_free", &namespace);
+                }
+            }
+
+            Ok(Page { items, total: None })
         })
         .await
     }
@@ -1497,6 +1588,64 @@ impl NoteStore for SqlNoteStore {
                     params.iter().map(|param| param.as_ref()).collect();
                 let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
                 counts.push(count as u64);
+            }
+            tx.commit()?;
+            Ok(counts)
+        })
+        .await
+    }
+
+    async fn count_notes_filtered_bounded_in_snapshot(
+        &self,
+        namespace: &str,
+        filters: &[NoteFilter],
+        cap: u32,
+    ) -> Result<Vec<BoundedCount>, StorageError> {
+        for filter in filters {
+            for property_filter in &filter.property_filters {
+                validate_json_path(&property_filter.json_path)?;
+            }
+        }
+
+        let namespace = namespace.to_string();
+        let filters = filters.to_vec();
+        let cap_u64 = u64::from(cap);
+        let probe_limit_i64 = i64::from(cap) + 1;
+        self.with_reader("count_notes_filtered_bounded_in_snapshot", move |conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Deferred,
+            )?;
+            let mut counts = Vec::with_capacity(filters.len());
+            for filter in &filters {
+                #[cfg(test)]
+                if !counts.is_empty() {
+                    tests::page_snapshot_seam::hook(
+                        "count_notes_filtered_bounded_in_snapshot",
+                        &namespace,
+                    );
+                }
+
+                let (where_sql, mut params) = build_note_filter_where(&namespace, filter)?;
+                params.push(Box::new(probe_limit_i64));
+                let limit_idx = params.len();
+                // The inner LIMIT is the work bound. Selecting a constant
+                // and omitting ORDER BY lets SQLite stop after cap + 1
+                // matching index entries instead of hydrating or sorting
+                // the complete population.
+                let sql = format!(
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM notes{where_sql} LIMIT ?{limit_idx})"
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|param| param.as_ref()).collect();
+                let observed: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+                let observed = observed as u64;
+                counts.push(BoundedCount {
+                    count: observed.min(cap_u64),
+                    cap: cap_u64,
+                    saturated: observed > cap_u64,
+                });
             }
             tx.commit()?;
             Ok(counts)

@@ -6,7 +6,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::types::{
-    BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlValue, StorageResult,
+    BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlValue,
+    StorageResult,
 };
 
 /// A storage-level note record. Flat, SQL-friendly representation.
@@ -359,6 +360,80 @@ mod tests {
             "inherited snapshot count must not fall back to independent queries"
         );
     }
+
+    #[tokio::test]
+    async fn count_free_page_default_is_fail_closed_without_exact_query_fallback() {
+        let store = DefaultOnlyNoteStore::default();
+        let result = store
+            .query_notes_filtered_count_free(
+                "ns:test",
+                &NoteFilter::default(),
+                PageRequest::default(),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::StorageError::Unsupported { ref operation, .. })
+                    if operation == "query_notes_filtered_count_free"
+            ),
+            "inherited count-free query must fail closed, got {result:?}"
+        );
+        assert_eq!(
+            store.query_call_count(),
+            0,
+            "count-free default must not invoke the exact-count page"
+        );
+    }
+
+    #[tokio::test]
+    async fn unfiltered_count_free_page_default_is_fail_closed_without_exact_query_fallback() {
+        let store = DefaultOnlyNoteStore::default();
+        let result = store
+            .query_notes_count_free("ns:test", Some("message"), PageRequest::default())
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::StorageError::Unsupported { ref operation, .. })
+                    if operation == "query_notes_count_free"
+            ),
+            "inherited count-free query must fail closed, got {result:?}"
+        );
+        assert_eq!(
+            store.query_call_count(),
+            0,
+            "count-free default must not invoke the exact-count page"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_snapshot_count_default_is_fail_closed_without_query_fallback() {
+        let store = DefaultOnlyNoteStore::default();
+        let result = store
+            .count_notes_filtered_bounded_in_snapshot(
+                "ns:test",
+                &[NoteFilter::default(), NoteFilter::default()],
+                1_000,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::StorageError::Unsupported { ref operation, .. })
+                    if operation == "count_notes_filtered_bounded_in_snapshot"
+            ),
+            "inherited bounded snapshot count must fail closed, got {result:?}"
+        );
+        assert_eq!(
+            store.query_call_count(),
+            0,
+            "bounded snapshot count must not compose independent page queries"
+        );
+    }
 }
 
 /// Sort direction for filtered note queries.
@@ -389,6 +464,17 @@ pub enum FilterOp {
     /// the index-friendly legacy-recipient partition used with
     /// [`FilterOp::EqOrMissingIndexed`].
     JsonTypeMissingOrNullIndexed,
+    /// Combines the exact-value and legacy-recipient partitions
+    /// (`EqOrMissingIndexed` + `JsonTypeMissingOrNullIndexed`) into one
+    /// predicate over the same indexable `ifnull(json_extract(...), '')`
+    /// expression, so a single index seek serves both partitions instead of
+    /// two separate bounded queries. Matches rows where the field equals the
+    /// value, OR the field is absent/JSON-`null`. A present-but-empty JSON
+    /// string value does NOT match through the legacy branch — the same
+    /// `json_type` guard `JsonTypeMissingOrNullIndexed` uses excludes it —
+    /// so this reproduces `EqOrMissing` exactly, given a non-empty compared
+    /// value.
+    EqOrLegacyIndexed,
     /// Matches rows where a JSON text field equals the value, while treating
     /// every missing or non-text value as that same value. The SQL adapter
     /// emits `CASE WHEN json_type(...) = 'text' THEN json_extract(...) ELSE
@@ -620,6 +706,24 @@ pub trait NoteStore: Send + Sync + 'static {
         kind: Option<&str>,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Query notes by namespace and optional kind without computing an exact total.
+    ///
+    /// Implementations must return `total: None`. Backends that cannot
+    /// guarantee a count-free projection must fail closed rather than invoke
+    /// [`Self::query_notes`], whose exact total remains available to callers
+    /// that expose a snapshot-consistent count.
+    async fn query_notes_count_free(
+        &self,
+        _namespace: &str,
+        _kind: Option<&str>,
+        _page: PageRequest,
+    ) -> StorageResult<Page<Note>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "query_notes_count_free".into(),
+            message: "this backend does not implement count-free note paging".into(),
+        })
+    }
     /// Query notes with property-based filtering and custom sort.
     /// The returned total and page items must come from one consistent
     /// backend snapshot.
@@ -629,6 +733,25 @@ pub trait NoteStore: Send + Sync + 'static {
         filter: &NoteFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Query a filtered note page without computing an exact total.
+    ///
+    /// Implementations must return `total: None`; callers that need a
+    /// `has_more` bit should request one lookahead row. Backends that cannot
+    /// guarantee a count-free projection must fail closed rather than invoke
+    /// [`Self::query_notes_filtered`], whose exact total is intentionally
+    /// backlog-proportional.
+    async fn query_notes_filtered_count_free(
+        &self,
+        _namespace: &str,
+        _filter: &NoteFilter,
+        _page: PageRequest,
+    ) -> StorageResult<Page<Note>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "query_notes_filtered_count_free".into(),
+            message: "this backend does not implement count-free filtered note paging".into(),
+        })
+    }
     /// Count several filtered note populations in one consistent backend
     /// snapshot. Backends that cannot provide that guarantee must return
     /// [`crate::StorageError::Unsupported`] rather than composing independent
@@ -644,6 +767,37 @@ pub trait NoteStore: Send + Sync + 'static {
             capability: crate::StorageCapability::Notes,
             operation: "count_notes_filtered_in_snapshot".into(),
             message: "this backend does not implement snapshot-consistent filtered note counts"
+                .into(),
+        })
+    }
+    /// Count several filtered note populations in one backend snapshot, with
+    /// each count bounded by `cap`.
+    ///
+    /// A saturated entry reports `count == cap` and `saturated == true`; an
+    /// unsaturated entry is exact. SQL implementations should count over a
+    /// limited `SELECT 1` subquery so work is proportional to `cap` and the
+    /// caller's own matching population, never an unrelated backlog. That
+    /// bound holds only when every `property_filter` in the given
+    /// `NoteFilter` is servable as an index key column (equality on a bound
+    /// parameter or a plan-time-provable partial-index predicate) all the way
+    /// down to the filter that actually narrows the population — a residual
+    /// filter evaluated after the index seek (a bound parameter the index
+    /// cannot use to skip rows) degrades the bound to work proportional to
+    /// the rows *scanned* before `cap` matches are found, not the rows that
+    /// match. Callers building filters against this bound must ensure the
+    /// full predicate set is indexed, not just the predicate that narrows the
+    /// population most. Backends that cannot preserve the shared snapshot or
+    /// work bound must fail closed.
+    async fn count_notes_filtered_bounded_in_snapshot(
+        &self,
+        _namespace: &str,
+        _filters: &[NoteFilter],
+        _cap: u32,
+    ) -> StorageResult<Vec<BoundedCount>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "count_notes_filtered_bounded_in_snapshot".into(),
+            message: "this backend does not implement snapshot-consistent bounded note counts"
                 .into(),
         })
     }
