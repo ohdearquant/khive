@@ -165,6 +165,89 @@ impl EmbedderProvider for ControlledRankingProvider {
     }
 }
 
+/// Distinguishes the query embedding role from the generic/document role.
+/// `embed` (the generic call, and the role `embed_query`'s default trait
+/// implementation would collapse into on a model with no query instruction)
+/// maps text containing the marker onto one axis and everything else onto a
+/// second axis. `embed_query` is overridden directly to always return the
+/// marker's axis, regardless of text — modeling "the query role reaches a
+/// production-tuned query space", independent of what the raw query text
+/// says. A production call site that embeds the ANN query with the wrong
+/// role therefore surfaces the decoy candidate instead of the target.
+///
+/// The fresh cosine rerank (`embed_cosine_scores`) re-embeds the raw query
+/// together with the candidate texts in one generic-role batch call — by
+/// design, unrelated to which role the ANN leg used — which would otherwise
+/// overwrite the ANN-driven ranking this test isolates. `embed` fails that
+/// specific batched call closed (`texts.len() > 1` with the query text
+/// first), the same technique `ControlledRankingService` above uses, so
+/// `rerank_with_embeddings` fails open without touching the single-text
+/// calls indexing and the ANN leg make.
+struct QueryRoleAwareService;
+
+#[async_trait]
+impl EmbeddingService for QueryRoleAwareService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.len() > 1 && texts[0].contains("roleprobe") {
+            return Err(EmbedError::InferenceFailed(
+                "query-role-aware fixture: fresh rerank intentionally unavailable".into(),
+            ));
+        }
+        Ok(texts
+            .iter()
+            .map(|t| {
+                let mut v = vec![0.0f32; DIM];
+                v[usize::from(!t.contains("docroletargetmarker"))] = 1.0;
+                v
+            })
+            .collect())
+    }
+
+    async fn embed_query(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|_| {
+                let mut v = vec![0.0f32; DIM];
+                v[0] = 1.0;
+                v
+            })
+            .collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "query-role-aware"
+    }
+}
+
+struct QueryRoleAwareProvider;
+
+#[async_trait]
+impl EmbedderProvider for QueryRoleAwareProvider {
+    fn name(&self) -> &str {
+        MODEL_KEY
+    }
+
+    fn dimensions(&self) -> usize {
+        DIM
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(QueryRoleAwareService))
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn rt_with_fake_embedder() -> KhiveRuntime {
@@ -210,6 +293,29 @@ fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
     })
     .expect("in-memory runtime");
     rt.register_embedder(ControlledRankingProvider { fail_fresh_rerank });
+    rt
+}
+
+fn rt_with_query_role_aware_embedder() -> KhiveRuntime {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
+        db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        default_namespace: Namespace::local(),
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "knowledge".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+    })
+    .expect("in-memory runtime");
+    rt.register_embedder(QueryRoleAwareProvider);
     rt
 }
 
@@ -399,6 +505,133 @@ async fn controlled_lexical_timeout_keeps_concurrent_ann_result() {
     assert_eq!(
         result["results"][0]["name"], "Controlled Concurrent Timeout Domain",
         "the vector-backed domain must remain available: {result}"
+    );
+}
+
+// ── Issue #2312: a late ANN timeout must fail open ───────────────────────────
+
+/// Mirror image of the test above: block the ANN leg at its checkpoint, let
+/// the lexical leg run to completion, then advance paused time past the
+/// shared deadline before releasing ANN. `search_ann_candidates`'s
+/// `await_request_read_phase` call then observes the already-expired
+/// deadline and must report `timed_out` — a completed lexical hit must
+/// survive instead of the deadline-bound rerank below turning a successful
+/// lexical search into a verb-level error.
+#[tokio::test(start_paused = true)]
+async fn late_ann_timeout_after_lexical_success_fails_open_in_search() {
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "late-ann-timeout-atom",
+                    "name": "Late Ann Timeout Atom",
+                    "finalized": true,
+                    "content": "lateannsentinel transformer retrieval corpus benchmark search latency vector index nearest neighbor ranking fusion embedding cosine similarity attention encoder decoder positional normalization residual connection"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let control = search::CandidateStageTestControl::new(true, false);
+    let coordinator_control = control.clone();
+    let deadline = std::time::Duration::from_millis(200);
+
+    let call = khive_storage::scope_request_read_deadline(
+        deadline,
+        search::scope_candidate_stage_test_control(
+            control,
+            KnowledgeHandlers::search(&rt, &token, json!({ "query": "lateannsentinel" }), &ann),
+        ),
+    );
+    let coordinator = async move {
+        coordinator_control.lexical_finished.notified().await;
+        tokio::time::advance(deadline * 2).await;
+        coordinator_control.ann_release.notify_one();
+    };
+
+    let (result, ()) = tokio::join!(call, coordinator);
+    let result = result.expect("a late ANN timeout must degrade instead of failing search");
+    assert_eq!(
+        result["degraded"]["ann_timeout"], true,
+        "a late ANN timeout must be reported: {result}"
+    );
+    assert!(
+        result["total"].as_u64().unwrap_or_default() > 0,
+        "the lexical hit completed before the ANN timeout must survive: {result}"
+    );
+    assert_eq!(
+        result["results"][0]["name"], "Late Ann Timeout Atom",
+        "result: {result}"
+    );
+}
+
+/// `suggest` twin of the test above: the same late-ANN-timeout schedule must
+/// skip the deadline-bound fresh rerank and return the lexical/domain hit
+/// with `degraded.ann_timeout`, never a verb-level error.
+#[tokio::test(start_paused = true)]
+async fn late_ann_timeout_after_lexical_success_fails_open_in_suggest() {
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [{
+                "slug": "late-ann-timeout-domain",
+                "name": "Late Ann Timeout Domain",
+                "description": "lateannsentinel term0 term1 term2 term3 term4 term5 term6 term7 deterministic late ANN timeout regression for suggest while lexical candidates already succeeded",
+                "members": []
+            }]}),
+        )
+        .await
+        .expect("upsert domain");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let control = search::CandidateStageTestControl::new(true, false);
+    let coordinator_control = control.clone();
+    let deadline = std::time::Duration::from_millis(200);
+    let query = "lateannsentinel term0 term1 term2 term3";
+
+    let call = khive_storage::scope_request_read_deadline(
+        deadline,
+        search::scope_candidate_stage_test_control(
+            control,
+            KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+        ),
+    );
+    let coordinator = async move {
+        coordinator_control.lexical_finished.notified().await;
+        tokio::time::advance(deadline * 2).await;
+        coordinator_control.ann_release.notify_one();
+    };
+
+    let (result, ()) = tokio::join!(call, coordinator);
+    let result = result.expect("a late ANN timeout must degrade instead of failing suggest");
+    assert_eq!(
+        result["degraded"]["ann_timeout"], true,
+        "a late ANN timeout must be reported: {result}"
+    );
+    assert!(
+        result["total"].as_u64().unwrap_or_default() > 0,
+        "the lexical/domain hit completed before the ANN timeout must survive: {result}"
+    );
+    assert_eq!(
+        result["results"][0]["name"], "Late Ann Timeout Domain",
+        "result: {result}"
     );
 }
 
@@ -923,4 +1156,115 @@ async fn malformed_fts5_match_expression_still_errors() {
         !matches!(err, khive_storage::StorageError::Timeout { .. }),
         "a syntax error must not be classified as StorageError::Timeout, got {err:?}"
     );
+}
+
+// ── ANN candidate query embeds under the query role, not the generic embed ──
+
+/// Behavioural replacement for a prior regression test that asserted on
+/// `search.rs`'s literal source text (exact call-site spellings and
+/// occurrence counts) instead of on observable behaviour. The property that
+/// mattered was never "the source contains this substring" — it is that the
+/// ANN candidate leg in both `search` and `suggest` embeds the raw query
+/// under the query role (`KhiveRuntime::embed_query`), not the generic
+/// document role, since an instruction-tuned model puts query and document
+/// vectors in different parts of its embedding space.
+///
+/// `QueryRoleAwareService::embed_query` is overridden to return a fixed
+/// "target" vector regardless of text, while its `embed` (the generic role,
+/// and the role `embed_query`'s default trait method would collapse into on
+/// a model with no query instruction) maps text without the marker to a
+/// different axis. Lexical/FTS candidates are forced empty by construction
+/// (see the sentinel atom below), so the fused top hit is decided purely by
+/// the ANN leg's query vector: the correct call site (`embed_query`) surfaces
+/// the target domain; the regression this guards against — calling the
+/// generic `embed` on the raw query — would surface the decoy instead.
+#[tokio::test]
+async fn ann_candidate_query_embeds_under_query_role_not_generic_embed() {
+    // This test's fresh, unwarmed `SharedAnn` runs the real bounded warm-wait
+    // before falling back to the fresh-tail scan. Serialize against the
+    // override-setting tests above so a concurrently-running test cannot
+    // leave the process-global warm-wait timeout at its 50ms override while
+    // this test's own ANN lookup is in flight, which would misreport a
+    // healthy fresh-tail scan as `ann_unavailable`.
+    let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
+    for suggest in [false, true] {
+        let rt = rt_with_query_role_aware_embedder();
+        let registry = build_registry(&rt);
+
+        registry
+            .dispatch(
+                "knowledge.upsert_domains",
+                json!({"domains": [
+                    {
+                        "slug": "query-role-target-domain",
+                        "name": "Query Role Target Domain",
+                        "description": "docroletargetmarker demonstrates retrieval consistency between symbolic content descriptions used for embedding role verification in this regression covering candidate retrieval fusion and ranking behavior end to end",
+                        "members": []
+                    },
+                    {
+                        "slug": "query-role-decoy-domain",
+                        "name": "Query Role Decoy Domain",
+                        "description": "unrelated placeholder narrative content used only as a distractor for the embedding role verification regression scenario covering candidate retrieval fusion and ranking behavior end to end",
+                        "members": []
+                    }
+                ]}),
+            )
+            .await
+            .expect("upsert domains");
+
+        // A plain (non-domain) atom whose content shares a term with the
+        // query. This makes the untyped FTS eligibility probe in
+        // `fetch_fts_candidates` find a match, so the domain-typed candidate
+        // fetch returns genuinely empty (a lexical match whose only row was
+        // ineligible) instead of falling back to an unfiltered full scan
+        // that would otherwise hand both domains to the lexical leg too.
+        registry
+            .dispatch(
+                "knowledge.upsert_atoms",
+                json!({
+                    "atoms": [{
+                        "slug": "query-role-sentinel-atom",
+                        "name": "Query Role Sentinel Atom",
+                        "content": "roleprobe filler beta gamma delta padding words added only to satisfy the minimum atom content length while keeping this atom lexically ineligible for the domain-typed candidate fetch"
+                    }]
+                }),
+            )
+            .await
+            .expect("upsert sentinel atom");
+
+        registry
+            .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+            .await
+            .expect("index");
+
+        let ann = vamana::new_shared();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let query = "roleprobe filler beta gamma delta";
+
+        let result = if suggest {
+            KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann).await
+        } else {
+            KnowledgeHandlers::search(
+                &rt,
+                &token,
+                json!({ "query": query, "kind": "domain" }),
+                &ann,
+            )
+            .await
+        }
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} must not Err: {e}",
+                if suggest { "suggest" } else { "search" }
+            )
+        });
+
+        assert_eq!(
+            result["results"][0]["name"],
+            "Query Role Target Domain",
+            "{}: the ANN candidate query must embed under the query role, not the \
+             generic embed, or the decoy wins the fused ranking instead; result: {result}",
+            if suggest { "suggest" } else { "search" }
+        );
+    }
 }

@@ -429,6 +429,7 @@ pub(crate) struct CandidateStageTestControl {
     pub(crate) ann_finished: std::sync::Arc<tokio::sync::Notify>,
     pub(crate) lexical_started: std::sync::Arc<tokio::sync::Notify>,
     pub(crate) lexical_release: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) lexical_finished: std::sync::Arc<tokio::sync::Notify>,
     block_ann: bool,
     block_lexical: bool,
 }
@@ -442,6 +443,7 @@ impl CandidateStageTestControl {
             ann_finished: std::sync::Arc::new(tokio::sync::Notify::new()),
             lexical_started: std::sync::Arc::new(tokio::sync::Notify::new()),
             lexical_release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            lexical_finished: std::sync::Arc::new(tokio::sync::Notify::new()),
             block_ann,
             block_lexical,
         }
@@ -497,7 +499,7 @@ async fn candidate_stage_test_start(stage: CandidateStage) {
 fn candidate_stage_test_finish(stage: CandidateStage) {
     let _ = CANDIDATE_STAGE_TEST_CONTROL.try_with(|control| match stage {
         CandidateStage::Ann => control.ann_finished.notify_one(),
-        CandidateStage::Lexical => {}
+        CandidateStage::Lexical => control.lexical_finished.notify_one(),
     });
 }
 
@@ -1264,6 +1266,21 @@ fn attach_lexical_timeout_degradation(out: &mut Value) {
     out["degraded"]["lexical_timeout"] = json!(true);
 }
 
+/// Flag that the ANN candidate leg hit the request read deadline. Reported
+/// beside `lexical_timeout` rather than folded into it: the two legs time
+/// out independently, and a late ANN timeout after the lexical leg already
+/// succeeded degrades the response the same way a lexical timeout does — it
+/// never fails the verb outright.
+fn attach_ann_timeout_degradation(out: &mut Value) {
+    if !out
+        .get("degraded")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        out["degraded"] = json!({});
+    }
+    out["degraded"]["ann_timeout"] = json!(true);
+}
+
 /// Flag that the best-effort body-line aggregate hit the request read
 /// deadline after the search itself completed. The ranked hits are kept and
 /// their atom rows report `body_lines: null`; the timeout degrades metadata,
@@ -1289,6 +1306,11 @@ struct AnnCandidateOutcome {
     hits: Vec<ScoredHit>,
     availability: Option<AnnAvailability>,
     hydration_failures: usize,
+    /// Set only when the ANN leg itself hit the shared request read
+    /// deadline. `availability` stays `None` on this path — it is only
+    /// known once the eligible search actually ran — so callers must check
+    /// this field, not infer a timeout from an absent availability.
+    timed_out: bool,
 }
 
 /// Retrieve an ANN pool whose bounded, rank-preserving truncation happens only
@@ -1408,13 +1430,20 @@ async fn search_ann_candidates(
                         hits,
                         availability: Some(availability),
                         hydration_failures,
+                        timed_out: false,
                     }),
-                    Err(e) if is_read_timeout(&e) => Ok(AnnCandidateOutcome::default()),
+                    Err(e) if is_read_timeout(&e) => Ok(AnnCandidateOutcome {
+                        timed_out: true,
+                        ..Default::default()
+                    }),
                     Err(e) => Err(e),
                 }
             }
             Ok(Err(_)) => Ok(AnnCandidateOutcome::default()),
-            Err(e) if is_timeout(&e) => Ok(AnnCandidateOutcome::default()),
+            Err(e) if is_timeout(&e) => Ok(AnnCandidateOutcome {
+                timed_out: true,
+                ..Default::default()
+            }),
             Err(e) => Err(e.into()),
         };
 
@@ -2135,11 +2164,14 @@ impl KnowledgeHandlers {
         let lexical_future = async {
             #[cfg(test)]
             candidate_stage_test_start(CandidateStage::Lexical).await;
-            if do_decompose && non_stop_count >= decompose_threshold {
+            let outcome = if do_decompose && non_stop_count >= decompose_threshold {
                 search_decomposed(&ctx, &raw_query, intersection_bonus).await
             } else {
                 search_core(&ctx, &raw_query).await
-            }
+            };
+            #[cfg(test)]
+            candidate_stage_test_finish(CandidateStage::Lexical);
+            outcome
         };
         let (ann_result, lexical_result) = join_candidate_stages(ann_future, lexical_future).await;
         // Preserve the pre-concurrency hard-error precedence: ANN was awaited
@@ -2148,11 +2180,17 @@ impl KnowledgeHandlers {
             hits: ann_hits,
             availability: ann_availability,
             hydration_failures,
+            timed_out: ann_timed_out,
         } = ann_result?;
         let SearchCoreOutcome {
             mut hits,
             lexical_timed_out,
         } = lexical_result?;
+        // A late ANN timeout — the deadline already spent by the time the ANN
+        // leg gives up — must fail open exactly like a lexical timeout: the
+        // reads below would otherwise observe the same expired deadline and
+        // turn a successful lexical search into a verb-level error.
+        let candidates_degraded = lexical_timed_out || ann_timed_out;
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -2174,11 +2212,11 @@ impl KnowledgeHandlers {
         filter_hits_by_status(&mut hits, &requested_statuses, &effective_exclude_statuses);
         filter_hits_by_type(&mut hits, type_filter);
 
-        // See `suggest`'s matching guard: a lexical-stage timeout means the
-        // request read deadline is already spent, so skip the further
-        // embedding read rather than let it convert a degraded-but-ok
-        // response into a verb-level error.
-        if do_rerank && !hits.is_empty() && !lexical_timed_out {
+        // See `suggest`'s matching guard: a lexical-stage or ANN-stage
+        // timeout means the request read deadline is already spent, so skip
+        // the further embedding read rather than let it convert a
+        // degraded-but-ok response into a verb-level error.
+        if do_rerank && !hits.is_empty() && !candidates_degraded {
             rerank_with_embeddings(runtime, &raw_query, &mut hits, rerank_alpha).await?;
         }
 
@@ -2192,7 +2230,7 @@ impl KnowledgeHandlers {
             .map(|hit| hit.id.clone())
             .collect();
         let mut body_lines_timed_out = false;
-        let body_line_counts = if lexical_timed_out {
+        let body_line_counts = if candidates_degraded {
             None
         } else {
             match load_atom_body_line_counts(runtime, &ns, &atom_ids).await? {
@@ -2237,14 +2275,18 @@ impl KnowledgeHandlers {
         if lexical_timed_out {
             attach_lexical_timeout_degradation(&mut out);
         }
+        if ann_timed_out {
+            attach_ann_timeout_degradation(&mut out);
+        }
         if body_lines_timed_out {
             attach_body_lines_timeout_degradation(&mut out);
         }
         attach_hydration_degradation(&mut out, hydration_failures);
-        // A lexical-stage or body-line-stage timeout already committed this
-        // call to a degraded response (never a verb-level error, issue #1930)
-        // — re-checking the same expired deadline here would discard it.
-        if !lexical_timed_out && !body_lines_timed_out {
+        // A lexical-stage, ANN-stage, or body-line-stage timeout already
+        // committed this call to a degraded response (never a verb-level
+        // error, issue #1930) — re-checking the same expired deadline here
+        // would discard it.
+        if !candidates_degraded && !body_lines_timed_out {
             khive_storage::ensure_request_read_active("knowledge.search")?;
         }
         Ok(out)
@@ -2309,18 +2351,27 @@ impl KnowledgeHandlers {
         let lexical_future = async {
             #[cfg(test)]
             candidate_stage_test_start(CandidateStage::Lexical).await;
-            search_core(&ctx, &raw_query).await
+            let outcome = search_core(&ctx, &raw_query).await;
+            #[cfg(test)]
+            candidate_stage_test_finish(CandidateStage::Lexical);
+            outcome
         };
         let (ann_result, lexical_result) = join_candidate_stages(ann_future, lexical_future).await;
         let AnnCandidateOutcome {
             hits: ann_hits,
             availability: ann_availability,
             hydration_failures,
+            timed_out: ann_timed_out,
         } = ann_result?;
         let SearchCoreOutcome {
             mut hits,
             lexical_timed_out,
         } = lexical_result?;
+        // A late ANN timeout — the deadline already spent by the time the ANN
+        // leg gives up — must fail open exactly like a lexical timeout: the
+        // reads below would otherwise observe the same expired deadline and
+        // turn a successful lexical search into a verb-level error.
+        let candidates_degraded = lexical_timed_out || ann_timed_out;
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -2335,11 +2386,11 @@ impl KnowledgeHandlers {
         filter_hits_by_status(&mut hits, &[], SUGGEST_EXCLUDE);
         filter_hits_by_type(&mut hits, Some("domain"));
 
-        // A lexical-stage timeout already committed this call to a degraded,
-        // ANN-backed response — the request read deadline is spent, so
-        // skip further reads/embedding calls rather than let them convert
-        // this into a verb-level error.
-        let fresh_rerank_applied = if lexical_timed_out {
+        // A lexical-stage or ANN-stage timeout already committed this call
+        // to a degraded, ANN-backed response — the request read deadline is
+        // spent, so skip further reads/embedding calls rather than let them
+        // convert this into a verb-level error.
+        let fresh_rerank_applied = if candidates_degraded {
             false
         } else {
             rerank_with_embeddings(runtime, &raw_query, &mut hits, D_SUGGEST_RERANK_ALPHA).await?
@@ -2350,12 +2401,12 @@ impl KnowledgeHandlers {
         hits.truncate(limit);
 
         let domain_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
-        let member_token_sizes = if lexical_timed_out {
+        let member_token_sizes = if candidates_degraded {
             HashMap::new()
         } else {
             load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?
         };
-        if !lexical_timed_out {
+        if !candidates_degraded {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
 
@@ -2418,8 +2469,11 @@ impl KnowledgeHandlers {
         if lexical_timed_out {
             attach_lexical_timeout_degradation(&mut out);
         }
+        if ann_timed_out {
+            attach_ann_timeout_degradation(&mut out);
+        }
         attach_hydration_degradation(&mut out, hydration_failures);
-        if !lexical_timed_out {
+        if !candidates_degraded {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
         Ok(out)
@@ -3472,55 +3526,14 @@ mod tests {
         assert!(hits.iter().any(|hit| hit.slug == "local-two"));
     }
 
-    // ── embed-intent regression ───────────────────────────────────────────────
-    // Guard that the ANN query paths in `search` and `suggest` use the
-    // query-intent embedding call, not the generic `runtime.embed(...)`.
-    // Uses include_str! so the assertion runs on the actual source bytes,
-    // but splits the needle to avoid matching the needle itself in test source.
-    #[test]
-    fn knowledge_ann_query_paths_use_query_intent_embed() {
-        let src = include_str!("search.rs");
-        // Build needle at runtime to avoid self-match in include_str.
-        let generic_borrowed_needle: String = [".embed(", "&raw_query)"].concat();
-        let generic_direct_needle: String = [".embed(", "raw_query)"].concat();
-        let generic_count = src
-            .lines()
-            // Skip lines that are part of this test body (contain "concat" or "needle").
-            .filter(|l| !l.contains("concat") && !l.contains("needle"))
-            .filter(|l| l.contains(&generic_borrowed_needle) || l.contains(&generic_direct_needle))
-            .count();
-        assert_eq!(
-            generic_count, 0,
-            "ANN query paths must not call generic embed with raw_query; \
-             found {generic_count} occurrence(s) — use embed_query instead"
-        );
-        // Search and suggest share one ANN helper after #1996, while section
-        // scoring retains its own query-intent call. Confirm both handler call
-        // sites route through that helper and both query-intent sites remain.
-        let ann_helper_needle: String = ["let ann_future = ", "search_ann_candidates("].concat();
-        let ann_helper_count = src
-            .lines()
-            .filter(|l| !l.contains("concat"))
-            .filter(|l| l.contains(&ann_helper_needle))
-            .count();
-        assert_eq!(
-            ann_helper_count, 2,
-            "expected search and suggest to route through the shared ANN helper; \
-             found {ann_helper_count} call(s)"
-        );
-
-        let query_intent_needle: String = [".embed_query", "("].concat();
-        let query_intent_count = src
-            .lines()
-            .filter(|l| !l.contains("concat"))
-            .filter(|l| l.contains(&query_intent_needle))
-            .count();
-        assert_eq!(
-            query_intent_count, 2,
-            "expected the shared ANN helper and section scoring to use \
-             {query_intent_needle}; found {query_intent_count} occurrence(s)"
-        );
-    }
+    // The embed-intent regression that used to live here asserted on this
+    // file's literal source text (exact call-site spellings and occurrence
+    // counts) instead of on behaviour. It is replaced by
+    // `ann_candidate_query_embeds_under_query_role_not_generic_embed` in
+    // `ann_degrade_tests` (issue #2312), which drives `search` and `suggest`
+    // through a fake embedder that returns different vectors for the query
+    // role vs. the generic role and asserts on which candidate wins the
+    // fused ranking.
 
     // ── filter_by_excluded_statuses ───────────────────────────────────────────
 
