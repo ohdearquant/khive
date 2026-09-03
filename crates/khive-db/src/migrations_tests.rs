@@ -1983,6 +1983,171 @@ fn seed_malformed_legacy_fts_state(conn: &Connection, fts_table: &str, map_table
     .expect("seed the stale wrong-key map row stealing B's rowid");
 }
 
+// ── V26: knowledge FTS repair tests ──────────────────────────────────────────
+
+#[test]
+fn v26_repairs_knowledge_fts_and_makes_atom_lifecycle_symmetric() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+    finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+
+    let v22 = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 22)
+        .expect("V22 migration registered");
+    let tx = conn.transaction().expect("begin V22 setup transaction");
+    tx.execute_batch(v22.up).expect("apply V22 migration body");
+    tx.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+        rusqlite::params![v22.version, v22.name],
+    )
+    .expect("record V22 migration");
+    tx.commit().expect("commit V22 setup");
+
+    conn.execute_batch(
+        "INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at) \
+             VALUES ('soft-hard', 'local', 'soft-hard', 'Soft Hard', \
+                     'soft deletion followed by a permanent deletion', 1, 1); \
+         INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at, deleted_at) \
+             VALUES ('born-deleted', 'local', 'born-deleted', 'Born Deleted', \
+                     'this atom never entered the historical FTS index', 1, 1, 7); \
+         INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at) \
+             VALUES ('section-parent', 'local', 'section-parent', 'Section Parent', \
+                     'parent for the section index repair regression', 1, 1); \
+         INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at, deleted_at) \
+             VALUES ('resurrect', 'local', 'resurrect', 'Resurrect', \
+                     'a deleted atom that later returns to the live projection', 1, 1, 8); \
+         INSERT INTO knowledge_sections \
+             (id, atom_id, namespace, section_type, heading, content, content_hash, \
+              created_at, updated_at) \
+             VALUES ('section-1', 'section-parent', 'local', 'overview', 'Overview', \
+                     'the original section body indexed before historical drift', 'hash-1', \
+                     1, 1); \
+         UPDATE knowledge_atoms SET deleted_at = 9 WHERE id = 'soft-hard';",
+    )
+    .expect("seed pre-V26 knowledge rows");
+
+    // Emulate a historical base-table write that bypassed the section trigger.
+    // V2 restored the narrow trigger but never rebuilt rows already divergent.
+    conn.execute("DROP TRIGGER fts_sections_au", [])
+        .expect("temporarily remove section update trigger");
+    conn.execute(
+        "UPDATE knowledge_sections SET content = 'the revised section body that the stale index never observed' \
+         WHERE id = 'section-1'",
+        [],
+    )
+    .expect("diverge the section external-content row");
+    let v2 = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 2)
+        .expect("V2 migration registered");
+    conn.execute_batch(v2.up)
+        .expect("restore the historical narrow trigger");
+
+    assert!(
+        conn.execute(
+            "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",
+            [],
+        )
+        .is_err(),
+        "the old content object includes tombstones the index deliberately omits"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO fts_sections(fts_sections, rank) VALUES('integrity-check', 1)",
+            [],
+        )
+        .is_err(),
+        "the deliberately stale section index must fail rank-1 integrity"
+    );
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V26 knowledge FTS repair"),
+        latest_schema_version()
+    );
+    conn.execute(
+        "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("atom FTS must match the live-row content view after V26");
+    conn.execute(
+        "INSERT INTO fts_sections(fts_sections, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("section FTS must be rebuilt after V26");
+
+    let content_ddl: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_knowledge'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read repaired FTS DDL");
+    assert!(content_ddl.contains("content=knowledge_atoms_fts_content"));
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM knowledge_atoms_fts_content \
+             WHERE id IN ('soft-hard', 'born-deleted')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0,
+        "the external-content view must expose live atoms only"
+    );
+
+    conn.execute("DELETE FROM knowledge_atoms WHERE id = 'soft-hard'", [])
+        .expect("hard delete after soft delete must no longer touch a missing FTS row");
+    conn.execute("DELETE FROM knowledge_atoms WHERE id = 'born-deleted'", [])
+        .expect("hard delete of a never-indexed atom must be an FTS no-op");
+    conn.execute(
+        "UPDATE knowledge_atoms SET deleted_at = NULL WHERE id = 'resurrect'",
+        [],
+    )
+    .expect("resurrection must insert the atom into FTS");
+    conn.execute(
+        "UPDATE knowledge_atoms \
+         SET content = 'the resurrected atom now has revised searchable content' \
+         WHERE id = 'resurrect'",
+        [],
+    )
+    .expect("live text update must replace the FTS document");
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM fts_knowledge WHERE fts_knowledge MATCH 'searchable'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    conn.execute(
+        "UPDATE knowledge_atoms SET deleted_at = 10 WHERE id = 'resurrect'",
+        [],
+    )
+    .expect("second soft delete must remove the live FTS row once");
+    conn.execute("DELETE FROM knowledge_atoms WHERE id = 'resurrect'", [])
+        .expect("hard delete after resurrection and re-tombstone must be safe");
+    conn.execute("DELETE FROM knowledge_sections WHERE id = 'section-1'", [])
+        .expect("rebuilt section index must support hard delete");
+
+    conn.execute(
+        "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("atom FTS must remain consistent across lifecycle transitions");
+    conn.execute(
+        "INSERT INTO fts_sections(fts_sections, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("section FTS must remain consistent after hard delete");
+}
+
 // ── V5: external_id unique index tests ──────────────────────────────────────
 
 fn index_exists(conn: &Connection, name: &str) -> bool {

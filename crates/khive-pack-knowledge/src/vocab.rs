@@ -169,7 +169,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.index",
-        description: "Backfill embeddings + FTS for atoms/domains",
+        description: "Backfill atom embeddings. Does not rebuild the global FTS indexes: that is a whole-database operation independent of the caller's namespace, with no per-caller cost admission on this verb, so it is reachable only through the `kkernel reindex` operator CLI (`--rebuild-fts`).",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[

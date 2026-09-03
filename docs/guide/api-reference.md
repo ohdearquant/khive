@@ -1803,11 +1803,17 @@ request(ops="knowledge.stats()")
 
 ### `knowledge.index` — Commissive
 
-Backfill embeddings + FTS for atoms/domains.
+Backfill atom embeddings.
 
 The response includes `truncation_by_model`, keyed by every model that completed embedding work.
-Each value contains `truncated` and `discarded_bytes` counters derived from the actual embedding
-outcomes; atom source content remains complete in SQL and FTS.
+Each truncation value contains `truncated` and `discarded_bytes` counters derived from the actual
+embedding outcomes; atom source content remains complete in SQL and FTS.
+
+This verb does not rebuild the FTS indexes. Rebuilding `fts_knowledge`/`fts_sections` is a
+whole-database operation independent of the caller's namespace, and the ordinary verb has no
+per-caller cost admission to bound it, so that rebuild is reachable only through the
+`kkernel reindex` operator CLI (`--rebuild-fts`), which reports the indexes rebuilt, elapsed
+time, and the rank-1 integrity-check outcome.
 
 | Param         | Type            | Required | Notes                                                   |
 | ------------- | --------------- | -------- | ------------------------------------------------------- |

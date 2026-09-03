@@ -2132,6 +2132,114 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
 
 // ── delete_atoms ──────────────────────────────────────────────────────────────
 
+// `knowledge.index` deliberately does not accept a FTS rebuild — rebuilding
+// both global FTS indexes is a whole-database operation with no per-caller
+// cost admission on the ordinary verb, and the namespace-scoped
+// `reindex_knowledge` options do not offer it either. The only entry point is
+// the operator call `khive_pack_knowledge::rebuild_knowledge_fts_indexes`
+// (what `kkernel reindex --rebuild-fts` uses), which takes no namespace
+// token, not the MCP verb dispatch this fixture drives for every other test
+// in this file.
+#[tokio::test]
+async fn index_rebuild_fts_repairs_atom_and_section_external_content_drift() {
+    let runtime = rt();
+    let atom_id = "22730000-0000-4000-8000-000000000001";
+
+    let mut writer = runtime.sql().writer().await.expect("knowledge writer");
+    writer
+        .execute_batch(vec![
+            SqlStatement {
+                sql: "INSERT INTO knowledge_atoms \
+                      (id, namespace, slug, name, content, created_at, updated_at) \
+                      VALUES (?1, 'local', 'fts-repair-atom', 'FTS Repair Atom', \
+                              'repairable lexical atom document', 1, 1)"
+                    .into(),
+                params: vec![SqlValue::Text(atom_id.into())],
+                label: Some("test.knowledge_fts_repair.atom".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO knowledge_sections \
+                      (id, atom_id, namespace, section_type, heading, content, content_hash, \
+                       created_at, updated_at) \
+                      VALUES ('22730000-0000-4000-8000-000000000002', ?1, 'local', \
+                              'overview', 'Repairable Overview', \
+                              'repairable lexical section document', 'repair-hash', 1, 1)"
+                    .into(),
+                params: vec![SqlValue::Text(atom_id.into())],
+                label: Some("test.knowledge_fts_repair.section".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO fts_knowledge \
+                      (fts_knowledge, rowid, id, namespace, slug, name, content) \
+                      SELECT 'delete', rowid, id, namespace, slug, name, content \
+                      FROM knowledge_atoms WHERE id = ?1"
+                    .into(),
+                params: vec![SqlValue::Text(atom_id.into())],
+                label: Some("test.knowledge_fts_repair.desync_atom".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO fts_sections \
+                      (fts_sections, rowid, id, namespace, atom_id, section_type, heading, content) \
+                      SELECT 'delete', rowid, id, namespace, atom_id, section_type, heading, content \
+                      FROM knowledge_sections WHERE atom_id = ?1"
+                    .into(),
+                params: vec![SqlValue::Text(atom_id.into())],
+                label: Some("test.knowledge_fts_repair.desync_section".into()),
+            },
+        ])
+        .await
+        .expect("seed and deliberately desynchronize both knowledge FTS indexes");
+    drop(writer);
+
+    let result = khive_pack_knowledge::rebuild_knowledge_fts_indexes(&runtime)
+        .await
+        .expect("knowledge FTS repair must succeed");
+    assert_eq!(result["integrity_ok"], true, "repair result: {result}");
+    let indexes: Vec<&str> = result["indexes"]
+        .as_array()
+        .expect("indexes array")
+        .iter()
+        .map(|v| v.as_str().expect("index name"))
+        .collect();
+    assert_eq!(
+        indexes,
+        vec!["fts_knowledge", "fts_sections"],
+        "repair result: {result}"
+    );
+    assert!(
+        result.get("atoms_indexed").is_none(),
+        "the rebuild is FTS-only maintenance and reports no embedding work: {result}"
+    );
+
+    let mut reader = runtime.sql().reader().await.expect("knowledge reader");
+    for (label, sql) in [
+        (
+            "atom",
+            "SELECT count(*) AS n FROM fts_knowledge \
+             WHERE fts_knowledge MATCH 'repairable'",
+        ),
+        (
+            "section",
+            "SELECT count(*) AS n FROM fts_sections \
+             WHERE fts_sections MATCH 'repairable'",
+        ),
+    ] {
+        let row = reader
+            .query_row(SqlStatement {
+                sql: sql.into(),
+                params: vec![],
+                label: Some(format!("test.knowledge_fts_repair.verify_{label}")),
+            })
+            .await
+            .expect("query repaired FTS index")
+            .expect("count row");
+        assert!(
+            matches!(row.get("n"), Some(SqlValue::Integer(1))),
+            "{label} FTS document must be restored; row={row:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn delete_atoms_soft_deletes_by_slug() {
     let f = pack(rt());

@@ -27,9 +27,13 @@ impl KnowledgeHandlers {
 
         let default_model_name = runtime.default_embedder_name();
         if default_model_name.is_empty() {
-            return Ok(
-                json!({ "indexed": 0, "skipped": 0, "failed": 0, "total": 0, "reason": "no embedding model configured" }),
-            );
+            return Ok(json!({
+                "indexed": 0,
+                "skipped": 0,
+                "failed": 0,
+                "total": 0,
+                "reason": "no embedding model configured",
+            }));
         }
         let sql = runtime.sql();
         let batch_size = p.batch_size.unwrap_or(DEFAULT_EMBED_BATCH).clamp(1, 1000);
@@ -220,6 +224,63 @@ impl KnowledgeHandlers {
             "truncation_by_model": truncation_by_model,
         }))
     }
+}
+
+/// Rebuild both external-content FTS indexes and verify that each one matches
+/// its content object. The writer batch is atomic: callers never receive a
+/// successful repair acknowledgement after only one index was rebuilt.
+///
+/// Not reachable from the `knowledge.index` MCP verb: rebuilding both indexes
+/// touches the whole database regardless of the caller's namespace, so the
+/// only entry point is the `kkernel reindex` operator CLI, via
+/// [`crate::rebuild_knowledge_fts_indexes`]. The returned value reports what the rebuild
+/// actually did — index names, wall time, and the integrity-check outcome —
+/// so that CLI path never has to promise a rebuild happened without evidence.
+pub(crate) async fn rebuild_fts_indexes(runtime: &KhiveRuntime) -> Result<Value, RuntimeError> {
+    let start = std::time::Instant::now();
+    let mut writer = runtime
+        .sql()
+        .writer()
+        .await
+        .map_err(|e| sql_err("knowledge FTS rebuild writer", e))?;
+    writer
+        .execute_batch(vec![
+            SqlStatement {
+                sql: "INSERT INTO fts_knowledge(fts_knowledge) VALUES('rebuild')".into(),
+                params: vec![],
+                label: Some("knowledge.index.fts_knowledge.rebuild".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO fts_sections(fts_sections) VALUES('rebuild')".into(),
+                params: vec![],
+                label: Some("knowledge.index.fts_sections.rebuild".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO fts_knowledge(fts_knowledge, rank) \
+                      VALUES('integrity-check', 1)"
+                    .into(),
+                params: vec![],
+                label: Some("knowledge.index.fts_knowledge.integrity".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO fts_sections(fts_sections, rank) \
+                      VALUES('integrity-check', 1)"
+                    .into(),
+                params: vec![],
+                label: Some("knowledge.index.fts_sections.integrity".into()),
+            },
+        ])
+        .await
+        .map_err(|e| sql_err("knowledge FTS rebuild", e))?;
+    // The writer batch above is one atomic transaction (ADR-067 Component A):
+    // either both rebuild statements AND both rank-1 integrity checks
+    // succeeded, or the whole thing rolled back and the `?` above already
+    // returned. Reaching this line therefore means integrity passed for both.
+    Ok(json!({
+        "indexes": ["fts_knowledge", "fts_sections"],
+        "elapsed_ms": start.elapsed().as_millis() as u64,
+        "integrity_ok": true,
+    }))
 }
 
 /// One default-model indexing outcome, counted in vectors.
