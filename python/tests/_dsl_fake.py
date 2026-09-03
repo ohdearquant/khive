@@ -343,18 +343,75 @@ def _parse_value(text: str, in_chain: bool = False, depth: int = 0) -> Any:
             return []
         return [_parse_value(p, in_chain, child_depth) for p in _split_top_level(inner, ",")]
     if text[0] == "{":
-        if text[-1] != "}":
-            raise DslParseError(f"unterminated object: {text!r}")
         child_depth = depth + 1
         if child_depth > NESTING_DEPTH_LIMIT:
             raise DslParseError(
                 f"container nesting depth {child_depth} exceeds max {NESTING_DEPTH_LIMIT}"
             )
+        if text[-1] != "}":
+            # Mirrors `parser_impl.rs::parse_object_arg_body`'s key-position
+            # match (P113): reaching true end-of-input right after `{`, with
+            # no key or `}` yet, is the `None` arm and gets its own reason —
+            # distinct from any other unterminated shape, which this fake
+            # still reports as a generic unterminated object.
+            if not text[1:].strip():
+                raise DslParseError(
+                    f"unexpected end of input while expecting an object key: {text!r}"
+                )
+            raise DslParseError(f"unterminated object: {text!r}")
         return _parse_object(text, in_chain, child_depth)
     if _JSON_NUMBER_RE.match(text):
         parsed = json.loads(text, parse_constant=_reject_non_finite_constant)
         return _coerce_out_of_range_int(parsed)
+    _reject_unclosed_local_bracket(text)
     raise DslParseError(f"unparseable value: {text!r}")
+
+
+def _reject_unclosed_local_bracket(text: str) -> None:
+    """Mirrors `parser_impl.rs::scan_value_end`'s `'}'` arm (P116) over a raw
+    scalar slice that is not itself one of `_parse_value`'s recognized
+    container/scalar shapes: a `}` reached while a local `[` or `(` earlier
+    in the same slice is still open is rejected as `UnclosedBracket { kind:
+    '{' }`, the same outcome `v(a=1[})`'s "1[}" value slice reaches in the
+    real parser, distinct from the unparseable-scalar fallback this slice
+    would otherwise hit."""
+    depth_brack = 0
+    depth_paren = 0
+    for ch in text:
+        if ch == "[":
+            depth_brack += 1
+        elif ch == "(":
+            depth_paren += 1
+        elif ch == "]" and depth_brack > 0:
+            depth_brack -= 1
+        elif ch == ")" and depth_paren > 0:
+            depth_paren -= 1
+        elif ch == "}" and (depth_brack > 0 or depth_paren > 0):
+            raise DslParseError(f"unclosed bracket: unmatched '{{' while scanning {text!r}")
+
+
+def _parse_args(argtext: str, in_chain: bool) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    if not argtext:
+        return args
+    for piece in _split_top_level(argtext, ","):
+        piece = piece.strip()
+        if not piece:
+            # Mirrors `parser_impl.rs::parse_op`: after a `,` the loop
+            # always expects another `name=value`, so a trailing comma
+            # (or any empty piece) is rejected, not skipped.
+            raise DslParseError(f"malformed arg list: trailing or empty argument in {argtext!r}")
+        if "=" not in piece:
+            raise DslParseError(f"malformed arg: {piece!r}")
+        key, _, val = piece.partition("=")
+        key = key.strip()
+        if not _IDENT_RE.fullmatch(key):
+            raise DslParseError(f"invalid argument name: {key!r}")
+        if key in args:
+            # Mirrors `parser_impl.rs::parse_op`'s `DuplicateArg`.
+            raise DslParseError(f"duplicate argument: {key!r}")
+        args[key] = _parse_value(val.strip(), in_chain)
+    return args
 
 
 def _parse_op(text: str, in_chain: bool = False) -> tuple[str, dict[str, Any]]:
@@ -364,35 +421,14 @@ def _parse_op(text: str, in_chain: bool = False) -> tuple[str, dict[str, Any]]:
     if pos >= len(text) or text[pos] != "(":
         raise DslParseError(f"not a call: {text!r}")
     if text[-1] != ")":
-        # Mirrors `parser_impl.rs`'s object-value EOF-while-expecting-a-key
-        # arm (P113): the input ends immediately after an open `{`, with no
-        # key or `}` yet — the same shape whether or not the outer call is
-        # also left unclosed.
-        if text[-1] == "{":
-            raise DslParseError(f"unexpected end of input while expecting an object key: {text!r}")
+        # Not a well-formed call. Still route the tail through the same
+        # argument/value grammar a real call uses so a shape like an object
+        # literal reaching end-of-input while expecting a key (P113) fails
+        # with the reason `parser_impl.rs::parse_object_arg_body` gives,
+        # rather than a generic "not a call" that never inspects the tail.
+        _parse_args(text[pos + 1 :].strip(), in_chain)
         raise DslParseError(f"not a call: {text!r}")
-    argtext = text[pos + 1 : -1].strip()
-    args: dict[str, Any] = {}
-    if argtext:
-        for piece in _split_top_level(argtext, ","):
-            piece = piece.strip()
-            if not piece:
-                # Mirrors `parser_impl.rs::parse_op`: after a `,` the loop
-                # always expects another `name=value`, so a trailing comma
-                # (or any empty piece) is rejected, not skipped.
-                raise DslParseError(
-                    f"malformed arg list: trailing or empty argument in {argtext!r}"
-                )
-            if "=" not in piece:
-                raise DslParseError(f"malformed arg: {piece!r}")
-            key, _, val = piece.partition("=")
-            key = key.strip()
-            if not _IDENT_RE.fullmatch(key):
-                raise DslParseError(f"invalid argument name: {key!r}")
-            if key in args:
-                # Mirrors `parser_impl.rs::parse_op`'s `DuplicateArg`.
-                raise DslParseError(f"duplicate argument: {key!r}")
-            args[key] = _parse_value(val.strip(), in_chain)
+    args = _parse_args(text[pos + 1 : -1].strip(), in_chain)
     return tool, args
 
 

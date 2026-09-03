@@ -105,14 +105,16 @@ def test_rule_count_is_pinned():
 def test_every_cited_line_exists_in_the_parser_source():
     """Two checks per citation: the quoted text exists in the file it names
     (a parser change that removes or rewrites a rule fails this test until
-    the doc is updated), and it uniquely identifies the line it cites —
-    existence alone does not prove a citation names the *decision* it
-    claims to, only that the substring is present somewhere in the file
-    (see `docs/DSL_WIRE_CONTRACT.md`'s "Citation" note). A citation whose
-    exact text legitimately recurs at N sites (the same guard or helper
-    call, reused unchanged — e.g. the two `MAX_OPS` cap checks) must be
-    marked `{shared=N}` and match exactly N lines; every other citation must
-    match exactly one line."""
+    the doc is updated), and it matches at the declared occurrence count.
+    This proves presence and count, not branch identity: existence alone
+    does not prove a citation names the *decision* it claims to, only that
+    the substring is present somewhere in the file (see
+    `docs/DSL_WIRE_CONTRACT.md`'s "Citation" note) — naming the deciding
+    branch a row claims is a reading obligation on that row's author, not
+    something this test can check. A citation whose exact text legitimately
+    recurs at N sites (the same guard or helper call, reused unchanged —
+    e.g. the two `MAX_OPS` cap checks) must be marked `{shared=N}` and match
+    exactly N lines; every other citation must match exactly one line."""
     failures: list[str] = []
     file_cache: dict[str, str | None] = {}
     for rule in RULES:
@@ -1119,6 +1121,15 @@ def _check_p99():
 _add("P99", "renders", _check_p99)
 
 
+def test_nested_object_backspace_and_form_feed_use_short_json_escapes():
+    """`\\b` (backspace) and `\\f` (form feed) are standard JSON short
+    escapes, distinct from the `\\uXXXX` fallback P99 covers above for a
+    control with no short form (NUL)."""
+    rendered, parsed = _rt("verb", properties={"a": "x\bY\fz"})
+    assert "\\b" in rendered and "\\f" in rendered
+    assert parsed["properties"] == {"a": "x\bY\fz"}
+
+
 # -- P100: the renderer never emits a backslash immediately before a raw
 #          control byte (it always names the escape) ------------------------
 def _check_p100():
@@ -1295,8 +1306,11 @@ def _check_p113():
     # `v(a={)` reaches the "quoted string key" arm instead (the next byte
     # after `{` is the real character `)`, not end-of-input) — the request
     # must end right after the `{` to reach the EOF-while-expecting-a-key
-    # arm this rule describes.
-    with pytest.raises(DslParseError):
+    # arm this rule describes. The fake reaches this through its normal
+    # argument/value parser (not a dedicated shortcut), so the reason it
+    # raises is the same "object key" wording the real parser's `None` arm
+    # names.
+    with pytest.raises(DslParseError, match="object key"):
         parse_dsl("v(a={")
 
 
@@ -1314,11 +1328,17 @@ _add("P114", "not_emitted", _generic_not_emitted_check, reason=_JSON_FORM_NOT_EM
 _add("P115", "not_emitted", _generic_not_emitted_check, reason=_JSON_FORM_NOT_EMITTED_REASON)
 
 
-# -- P116: an unmatched closing brace inside an unquoted scalar/value slice
-#          is refused immediately, distinct from P106's trailing check -----
+# -- P116: an unmatched closing brace inside an unquoted scalar/value slice,
+#          while a different local bracket/paren is still open, is refused
+#          immediately, distinct from P106's trailing check ----------------
 def _check_p116():
-    with pytest.raises(DslParseError):
-        parse_dsl("v(a=1})")
+    # `v(a=1})` alone reaches `UnexpectedChar` instead (no local container is
+    # open when the top-level `}` is hit, so `scan_value_end` treats it as an
+    # ordinary value boundary and the arg-list loop rejects the leftover `}`)
+    # — the `[` here is what keeps a local container open through the `}`,
+    # reaching this rule's `UnclosedBracket` outcome.
+    with pytest.raises(DslParseError, match="unclosed bracket"):
+        parse_dsl("v(a=1[})")
 
 
 _add("P116", "fake", _check_p116)

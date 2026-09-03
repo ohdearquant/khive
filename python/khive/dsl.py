@@ -14,9 +14,11 @@ string using only the escapes `\\"` `\\n` `\\t` `\\r` `\\\\` (at the scalar
 string path — a bare string argument or one nested in an array — this
 renderer never emits `\\uXXXX`; non-ASCII text is emitted raw). A string
 nested inside an object argument instead goes through `json.dumps`, which
-emits the standard JSON `\\uXXXX` escape for a raw control byte other than
-newline, tab, or carriage return (non-ASCII text still stays raw there,
-since `ensure_ascii=False`). An integer within
+emits the standard JSON escapes for a raw control byte other than newline,
+tab, or carriage return — the short forms `\\b`/`\\f` for backspace/form
+feed, and `\\uXXXX` for every other control (e.g. NUL) that has no short
+form (non-ASCII text still stays raw there, since `ensure_ascii=False`). An
+integer within
 `[-2**63, 2**64 - 1]` (see `_MIN_SIGNED_64`/`_MAX_UNSIGNED_64` below — an
 integer outside that range has no exact representation in the parser's
 decoded value and is refused rather than silently reinterpreted), a finite

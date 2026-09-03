@@ -63,6 +63,29 @@ fn single_op_with_multiple_typed_args() {
     assert_eq!(val(&v[0].args["active"]), &json!(true));
 }
 
+#[test]
+fn function_form_integer_boundaries_match_serde_json_value_representation() {
+    // Mirrors `crates/khive-wire-protocol/src/codec.rs`'s boundary test for
+    // `decode_payload`'s `serde_json::from_slice` seam, but exercises the
+    // request parser's own scalar decode instead (`parser_impl.rs::parse_value`'s
+    // `serde_json::from_str(trimmed)` call) — a literal within
+    // `[i64::MIN, u64::MAX]` decodes as an exact integer there too; past
+    // either endpoint it silently becomes `f64`, changing the JSON type.
+    let min_i64 = ops("v(a=-9223372036854775808)");
+    assert!(val(&min_i64[0].args["a"]).is_i64());
+
+    let max_u64 = ops("v(a=18446744073709551615)");
+    assert!(val(&max_u64[0].args["a"]).is_u64());
+
+    let below_min = ops("v(a=-9223372036854775809)");
+    assert!(val(&below_min[0].args["a"]).is_f64());
+    assert!(!val(&below_min[0].args["a"]).is_i64());
+
+    let above_max = ops("v(a=18446744073709551616)");
+    assert!(val(&above_max[0].args["a"]).is_f64());
+    assert!(!val(&above_max[0].args["a"]).is_u64());
+}
+
 // ── Batch ─────────────────────────────────────────────────────────────────────
 
 #[test]
