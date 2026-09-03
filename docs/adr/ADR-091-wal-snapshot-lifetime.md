@@ -1544,3 +1544,58 @@ statement still marks the checkout dirty unconditionally, so `Drop` pays the
 pristine-state scan (or, in degraded shared-lease mode, the settings/
 rollback verification) before the connection is reused or the shared lease
 is released.
+
+### 2026-08-30 amendment (Amendment 15): read-only reconciliation and bounded producer-temp cleanup
+
+**Supersession.** This amendment supersedes Amendment 6 only where it says
+`db_diagnostics` cannot enumerate the sidecar and must omit
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap`. The daemon's one-pass-per-tick
+rule, housekeeping/attribution distinction, and evidence-retention policy remain unchanged.
+
+**Read-only operator reconciliation.** `walpin::inspect_live` is a third enumeration purpose. It
+shares the descriptor-bound directory and entry validation, identity/freshness classification,
+entry-size limit, and 512-entry work cap with checkpoint attribution, but every deletion policy is
+disabled. Dead, reused, malformed, stale, symlinked, and producer-temp evidence remains on disk.
+The report states whether listing truncated and how many trusted stale producer temps ordinary
+housekeeping would reap. `db_diagnostics` reconciles that result with the independently bounded OS
+holder census: `complete` requires a complete census, an untruncated sidecar walk, no unknown
+sidecar classifications, and sidecar evidence for every confirmed holder. Each missing condition
+is an explicit degradation reason. The diagnostic request therefore measures cleanup candidates
+but never becomes the actor that consumes its own forensic evidence. Amendment 6's disable rule
+applies here too: an operator who has explicitly disabled the sidecar gets a degraded result
+naming that as the reason, never a silent `inspect_live` call against a facility they turned off.
+Every operational path this pass touches — the sidecar directory and the WAL file it reasons
+about — is derived from the pool's canonical path, not its raw configured one, matching the
+checkpoint sidecar writers; a symlinked or otherwise aliased configured path must not send this
+reconciliation looking beside the alias while the evidence sits beside the canonical file.
+
+**Producer-temp residue.** The atomic writers' exact `.<pid>.json.tmp` and
+`.<pid>.beacon.tmp` names are now recognized in a separate bounded listing lane instead of being
+indistinguishable from arbitrary hidden files. Ordinary housekeeping and checkpoint attribution
+may remove a candidate only after it is older than the staleness window, its body parses as its
+recorded kind, its recorded PID matches its filename, and its producer is positively dead or its
+parsed start-time identity proves PID reuse. A malformed body or a filename/body PID mismatch is
+retained and reported as unknown evidence regardless of whether the named PID is alive or dead —
+identity is validated before liveness is ever consulted, so a crash-truncated write or an
+already-recycled PID slot cannot be reaped on liveness alone. Fresh temps, live matching
+producers, uninspectable processes, non-owned entries, symlinks, and all unrecognized dot-names
+are likewise retained. The candidate is opened with the existing non-following, regular-file,
+ownership, and size checks; immediately before unlink, its device/inode identity is rechecked
+against the classified object, closing the wide races (stale content lingering, a symlink swapped
+in). POSIX has no delete-if-still-this-inode primitive for a plain unlink, so the recheck and the
+unlink remain two separate syscalls: a producer that replaces the same name in the instant between
+them can still have its new write removed. A producer that loses this narrow race observes its own
+rename fail because the temp it just wrote is already gone — every writer here already treats a
+missing temp as a transient failure to retry on the next tick, never as data loss, so this is the
+outcome such a producer must tolerate, not a race this recheck actually closes. The ordinary and
+producer-temp result sets each cap at 512 entries and the raw directory scan retains its existing
+bounded multiplier. Thus a crash population drains over bounded ticks without letting one cleanup
+pass scale with historical residue.
+
+**Database byte composition.** The same operator report now runs SQLite's read-only aggregate
+`dbstat` view on its guarded standalone connection. It returns per-object page/byte totals and
+file-wide row-table, index, FTS, vector, mixed row-and-embedding, internal, freelist, and
+unaccounted totals. Tables containing both ordinary rows and an embedding BLOB stay in the mixed
+class because SQLite pages cannot support a defensible per-column split. Object detail is capped
+and reports truncation/omission explicitly; aggregate class totals continue across the full
+`dbstat` result.
