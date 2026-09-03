@@ -176,6 +176,13 @@ impl FtsMaintenanceState {
         }
     }
 
+    /// Whether the next `run_if_due` call would do any work. The checkpoint
+    /// loop asks this before moving its connection onto a blocking thread, so
+    /// an ordinary tick between maintenance intervals costs one clock read.
+    pub(crate) fn is_due(&self, config: &FtsMaintenanceConfig, now: Instant) -> bool {
+        config.enabled && now.saturating_duration_since(self.last_check) >= config.interval
+    }
+
     #[cfg(test)]
     fn table_in_progress(&self, table: &str) -> bool {
         FTS_TABLES
@@ -273,6 +280,16 @@ pub(crate) fn parse_structure_record(bytes: &[u8]) -> Result<FtsIndexStructure, 
     for level in 0..level_count {
         let merge_input_segments = read_varint(bytes, &mut cursor)?;
         let level_segments = read_varint(bytes, &mut cursor)?;
+        // A merge consumes the oldest segments of its own level, so the
+        // in-progress merge input can never exceed the level's segment count.
+        // Accepting a larger value would report a phantom active merge and
+        // mask a corrupt or misparsed record.
+        if merge_input_segments > level_segments {
+            return Err(format!(
+                "FTS5 level {level} declares {merge_input_segments} merge input segments but only \
+                 {level_segments} segments"
+            ));
+        }
         let remaining = bytes.len().saturating_sub(cursor);
         if level_segments > remaining as u64 / bytes_per_segment {
             return Err(format!(
@@ -418,7 +435,7 @@ pub(crate) fn run_if_due(
     state: &mut FtsMaintenanceState,
     now: Instant,
 ) -> Result<Option<FtsMaintenanceStep>, String> {
-    if !config.enabled || now.saturating_duration_since(state.last_check) < config.interval {
+    if !state.is_due(config, now) {
         return Ok(None);
     }
     state.last_check = now;
@@ -651,6 +668,35 @@ mod tests {
         let error = parse_structure_record(&inconsistent)
             .expect_err("declared total must equal per-level total");
         assert!(error.contains("segment count"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn rejects_merge_input_exceeding_the_level_segment_count() {
+        // One level, two segments, but a merge claiming three inputs: the
+        // record is self-inconsistent and must surface as a parse error
+        // rather than as an active merge over segments that do not exist.
+        let mut bytes = vec![0, 0, 0, 0];
+        push_varint(1, &mut bytes); // level_count
+        push_varint(2, &mut bytes); // segment_count
+        push_varint(2, &mut bytes); // write_counter
+        push_varint(3, &mut bytes); // level 0 merge_input_segments (> level_segments)
+        push_varint(2, &mut bytes); // level 0 level_segments
+        for segment in 1..=2 {
+            push_varint(segment, &mut bytes);
+            push_varint(1, &mut bytes);
+            push_varint(1, &mut bytes);
+        }
+
+        let error = parse_structure_record(&bytes)
+            .expect_err("merge input segments must not exceed the level's segment count");
+        assert!(error.contains("merge input"), "unexpected error: {error}");
+
+        // The same record with a consistent merge input parses and reports
+        // the merge, so the guard rejects only the impossible value.
+        bytes[7] = 2;
+        let parsed = parse_structure_record(&bytes).expect("consistent record parses");
+        assert_eq!(parsed.levels[0].merge_input_segments, 2);
+        assert!(has_active_merge(&parsed));
     }
 
     #[test]

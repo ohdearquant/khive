@@ -2106,30 +2106,40 @@ pub async fn run_checkpoint_task(
                     #[cfg(not(unix))]
                     let _ = outcome.sidecar_attribution;
 
-                    let fts_result = match run_fts_maintenance_off_worker(
-                        conn,
-                        fts_maintenance_config.clone(),
-                        fts_maintenance_state,
-                        Instant::now(),
-                    )
-                    .await
+                    // Only a due tick moves the connection onto a blocking
+                    // thread; an ordinary tick between maintenance intervals
+                    // keeps it here and records a no-op.
+                    let fts_result = if !fts_maintenance_state
+                        .is_due(&fts_maintenance_config, Instant::now())
                     {
-                        Ok((conn, state, fts_result)) => {
-                            fts_maintenance_state = state;
-                            checkpoint_conn.conn = Some(conn);
-                            fts_result
-                        }
-                        Err(join_err) => {
-                            // The step panicked on the blocking thread. The
-                            // connection and scheduler state moved into it
-                            // are gone; `ensure_open` reopens the connection
-                            // next tick and the schedule restarts from now.
-                            // The checkpoint pragma itself already succeeded.
-                            fts_maintenance_state =
-                                crate::fts_maintenance::FtsMaintenanceState::new(Instant::now());
-                            Err(format!(
-                                "bounded FTS5 segment maintenance task panicked: {join_err}"
-                            ))
+                        checkpoint_conn.conn = Some(conn);
+                        Ok(None)
+                    } else {
+                        match run_fts_maintenance_off_worker(
+                            conn,
+                            fts_maintenance_config.clone(),
+                            fts_maintenance_state,
+                            Instant::now(),
+                        )
+                        .await
+                        {
+                            Ok((conn, state, fts_result)) => {
+                                fts_maintenance_state = state;
+                                checkpoint_conn.conn = Some(conn);
+                                fts_result
+                            }
+                            Err(join_err) => {
+                                // The step panicked on the blocking thread. The
+                                // connection and scheduler state moved into it
+                                // are gone; `ensure_open` reopens the connection
+                                // next tick and the schedule restarts from now.
+                                // The checkpoint pragma itself already succeeded.
+                                fts_maintenance_state =
+                                    crate::fts_maintenance::FtsMaintenanceState::new(Instant::now());
+                                Err(format!(
+                                    "bounded FTS5 segment maintenance task panicked: {join_err}"
+                                ))
+                            }
                         }
                     };
 
