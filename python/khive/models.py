@@ -155,6 +155,29 @@ class Edge(_Record):
                 return m.weight
         raise KeyError(f"{node_id} is not a member of edge {self.id}")
 
+class Embedding(BaseModel):
+    """A client-supplied vector (the pgvector model: YOU embed, the db stores).
+
+    `model` names the embedding space — vectors from different models are
+    never comparable, so the server must index per model name. PENDING
+    server support: today's daemon only embeds server-side (lattice native
+    models; `embedding_content` overrides the text, not the vector)."""
+
+    model: str
+    vector: list[float]
+
+
+class Attachment(BaseModel):
+    """A blob attached to a record under a role (one blob per role)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    content_ref: str  # BLAKE3 of the bytes, from blob.put
+    role: str = "attachment"
+    media_type: str | None = None
+    size: int | None = None
+
+
 class Page(BaseModel, Generic[T]):
     """One page of results. `total=None` means the server skipped the count."""
 

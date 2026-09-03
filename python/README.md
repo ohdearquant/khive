@@ -30,10 +30,55 @@ db.diagnostics()          # writer/WAL/checkpoint counters
   target contract; where the daemon still speaks older field names
   (`relation`, top-level `weight`) the client translates at the wire
   boundary until the server follows.
-- The transport is swappable (`Transport` ABC); Unix socket today, HTTP
-  planned for remote use. Client code does not change.
+- The transport is swappable (`Transport` ABC): a Unix socket to a local
+  daemon, or `HttpTransport` to a khive-cloud deployment (below). Client
+  code does not change.
 - A `batch()` is one request, not a transaction: ops succeed or fail
   individually and the per-op results say which.
+
+## khive-cloud
+
+The same `Khive` facade works against a remote khive-cloud deployment over
+`HttpTransport` — install the `cloud` extra first (`pip install
+'khive-py[cloud]'`, or `uv pip install -e '.[cloud]'` from a checkout):
+
+```python
+import khive
+
+url = "https://khive-cloud.example"
+db = khive.cloud(url, api_key)
+# equivalent: khive.Khive(transport=khive.HttpTransport(url, api_key))
+
+db.stats()
+db.search("low rank adaptation", kind="entity")
+```
+
+`HttpTransport` speaks `POST /v1/request` (the same op-dispatch envelope the
+socket daemon returns) and `GET /health`; a non-2xx response raises
+`AuthError` (401/403), `RateLimited` (429), `BadRequest` (4xx), or
+`ServerError` (5xx) — all subclasses of `HttpError`. An `AsyncHttpTransport`
+twin is available for asyncio callers (used directly; `Session` itself stays
+sync). Client-side identity (`namespace`, `actor_id`, `visible_namespaces`)
+is not sent over this transport — khive-cloud resolves the principal from
+the API key alone.
+
+A plain `http://` base URL is refused unless its host is loopback
+(`127.0.0.1`, `::1`, `localhost`); pass `allow_insecure=True` to
+`khive.cloud(...)` or `HttpTransport(...)` to talk to a non-loopback host
+over `http://` anyway.
+
+MCP access — the same deployment's `request` tool over streamable HTTP — is
+in `khive.mcp`:
+
+```python
+from khive.mcp import mcp_list_tools, mcp_request, mcp_session
+
+mcp_list_tools(url, api_key)  # -> ["request"]
+mcp_request(url, api_key, "stats()")  # sync convenience, asyncio.run under the hood
+
+async with mcp_session(url, api_key) as session:
+    await session.call_tool("request", {"ops": "stats()"})
+```
 
 ## Scratch database
 
@@ -57,3 +102,9 @@ db = Khive(socket_path="/tmp/khive-scratch.sock")
 uv pip install -e '.[dev]'
 pytest tests/
 ```
+
+The cloud/MCP tests run against offline fake servers and need the
+`cloud` extra (`uv pip install -e '.[dev,cloud]'`); without it they skip
+cleanly rather than failing. `tests/test_cloud_live.py` is the exception —
+it talks to a real khive-cloud deployment and is skipped unless
+`KHIVE_CLOUD_URL` and `KHIVE_CLOUD_API_KEY` are both set.

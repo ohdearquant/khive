@@ -9,9 +9,11 @@ directions. Admission is peer-uid: the daemon only serves connections from
 its own uid, so there is no credential in the frame — `namespace` and
 `actor_id` are attribution inputs, not authentication.
 
-`Transport` is the seam a remote (HTTP) implementation will plug into
-later: everything above it — models, ops, the client facade — is
-transport-agnostic. Only `SocketTransport` exists today.
+`Transport` is the seam a remote (HTTP) implementation plugs into:
+everything above it — models, ops, the client facade — is
+transport-agnostic. `SocketTransport` talks to a local daemon;
+`HttpTransport` (below) talks to a khive-cloud deployment over
+`POST /v1/request`.
 
 Handshake: on first use the client sends a `metrics_only` frame (the one
 request the daemon answers regardless of `config_id`) to learn the daemon's
@@ -28,15 +30,21 @@ import socket
 import struct
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
+from urllib.parse import urlsplit
 
+from pydantic import ValidationError
+
+from .dsl import render_dsl
 from .errors import (
     ConfigMismatch,
     FrameTooLarge,
     ProtocolMismatch,
     RequestRejected,
     TransportError,
+    raise_for_status,
 )
+from .models import OpResult
 
 PROTOCOL_VERSION = 4
 MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -70,7 +78,7 @@ class SocketTransport(Transport):
                 sock.connect(str(self.path))
                 sock.sendall(struct.pack(">I", len(payload)) + payload)
                 raw = self._read_frame(sock)
-        except (OSError, socket.timeout) as exc:
+        except (TimeoutError, OSError) as exc:
             raise TransportError(f"khived at {self.path}: {exc}") from exc
         try:
             return json.loads(raw.decode("utf-8"))
@@ -93,6 +101,316 @@ class SocketTransport(Transport):
                 raise TransportError(f"connection closed after {len(buf)} of {n} bytes")
             buf.extend(chunk)
         return bytes(buf)
+
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _check_base_url_security(base_url: str, allow_insecure: bool) -> None:
+    """Refuse a plain `http://` base URL that is not loopback.
+
+    An API key sent in an `Authorization` header over plain HTTP to a
+    non-loopback host is a credential leak to every hop in between. Loopback
+    (a local dev server, or the offline fakes this package's own tests run
+    against) is exempt; anything else needs `https://` or an explicit
+    `allow_insecure=True`.
+    """
+    parsed = urlsplit(base_url)
+    if parsed.scheme != "http" or allow_insecure:
+        return
+    host = (parsed.hostname or "").lower()
+    if host in _LOOPBACK_HOSTS:
+        return
+    raise ValueError(
+        f"refusing a {parsed.scheme}:// base URL with non-loopback host {host!r}; "
+        "pass allow_insecure=True to allow this"
+    )
+
+
+def _cloud_config_id(base_url: str) -> str:
+    return "http:" + base_url.rstrip("/")
+
+
+def _render_ops_field(ops_field: str) -> str:
+    """Turn `frame["ops"]` into the DSL text the cloud parser accepts.
+
+    `frame["ops"]` is always a JSON document (`Session`/`ops.encode` build
+    it for both transports): the client's internal `[{"tool","args"}]`
+    array, which is rendered; or, when a caller handed `raw()` DSL text
+    instead of op dicts, a JSON string (or a list mixing DSL strings and op
+    dicts), whose DSL text passes through untouched."""
+    if not ops_field:
+        return ""
+    try:
+        parsed = json.loads(ops_field)
+    except ValueError as exc:
+        raise TransportError(f"malformed ops payload: {exc}") from exc
+    if not parsed:
+        return ""
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    return render_dsl(parsed)
+
+
+def _parse_json_body(response: Any) -> Any:
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise TransportError(f"malformed JSON body from {response.url}: {exc}") from exc
+
+
+def _parse_envelope(response: Any) -> dict[str, Any]:
+    payload = _parse_json_body(response)
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise TransportError(
+            f"response from {response.url} is not a request envelope: {str(payload)[:200]}"
+        )
+    return payload
+
+
+def _is_minimal_aborted_entry(entry: Any) -> bool:
+    """Whether `entry` is the cloud's minimal aborted-chain-entry shape:
+    `{"ok": false, "aborted": true}`, with no `tool` — an op that was never
+    dispatched because an earlier op in the same chain failed. `OpResult`
+    requires `tool`, so this shape needs its own admission rule rather than
+    going through `OpResult.model_validate` like an ordinary entry."""
+    return (
+        isinstance(entry, dict)
+        and entry.get("ok") is False
+        and entry.get("aborted") is True
+        and "tool" not in entry
+    )
+
+
+def _validate_envelope_results(envelope: dict[str, Any], url: str) -> dict[str, Any]:
+    """Reject an envelope whose result entries do not match `OpResult`.
+
+    Runs after `_stringify_op_errors`, so a per-op error is already the
+    plain string `OpResult.error` expects, not khive-cloud's
+    `{"code","message"}` object — a top-level-only check would otherwise let
+    e.g. `{"results": [42]}` or an entry missing `ok`/`tool` reach the caller
+    as a successful response.
+
+    A minimal aborted entry (see `_is_minimal_aborted_entry`) is admitted
+    without going through `OpResult`, but normalized in place to carry
+    `tool: ""` first — `models.py` stays untouched, so this is the seam that
+    keeps every entry (aborted or not) satisfying `OpResult.tool: str`
+    exactly as the socket transport's daemon-native aborted entries already
+    do, giving both transports the same caller-visible object.
+    """
+    for index, entry in enumerate(envelope["results"]):
+        if _is_minimal_aborted_entry(entry):
+            entry["tool"] = ""
+            continue
+        try:
+            OpResult.model_validate(entry)
+        except ValidationError as exc:
+            raise TransportError(
+                f"response from {url} has a malformed result at index {index}: {exc}"
+            ) from exc
+    return envelope
+
+
+def _stringify_op_errors(envelope: Any, url: str) -> Any:
+    """Flatten khive-cloud's `{"code","message"}` per-op error objects to a
+    string, in place, so each entry still validates against
+    `OpResult.error: str | None` (`client.py` is unmodified — this is the
+    wire-adapter's job, same as `client._edge_from_wire`).
+
+    Validates the error object's shape first: `code`, when present, and
+    `message` must both be strings — anything else is a malformed cloud
+    entry, not a value to flatten and pass along.
+    """
+    if not isinstance(envelope, dict):
+        return envelope
+    for index, entry in enumerate(envelope.get("results", [])):
+        if not isinstance(entry, dict):
+            continue
+        err = entry.get("error")
+        if not isinstance(err, dict):
+            continue
+        code = err.get("code")
+        if code is not None and not isinstance(code, str):
+            raise TransportError(
+                f"response from {url} has a malformed error object at index {index}: "
+                f"'code' must be a string, got {type(code).__name__}"
+            )
+        message = err.get("message")
+        if not isinstance(message, str):
+            raise TransportError(
+                f"response from {url} has a malformed error object at index {index}: "
+                f"'message' must be a string, got {type(message).__name__}"
+            )
+        entry["error"] = f"{code}: {message}" if code else message
+    return envelope
+
+
+class HttpTransport(Transport):
+    """Talks to a khive-cloud deployment over `POST {base_url}/v1/request`.
+
+    The cloud has no local engine config to hand-shake against, so a
+    `metrics_only` frame is answered without a POST: `served_config_id` is
+    derived deterministically from the base URL (stable across calls, so
+    `Session`'s config-coherence check is trivially satisfied) and `metrics`
+    is `GET /health`'s body. Every other frame carries `ops` in the client's
+    internal `[{"tool", "args"}]` JSON-array form (what `Session`/`ops.encode`
+    build for both transports); this one decodes it and posts
+    `{"ops": render_dsl(...)}` — the cloud's `POST /v1/request` only accepts
+    the request DSL as one string, not that JSON array (see `khive.dsl`).
+    `config_mismatch` never occurs on this transport since the config id is
+    a pure function of the URL.
+
+    The API key is sent only as the `Authorization` header — never logged,
+    never in `repr`, never folded into an error message.
+
+    `frame`'s identity fields (`Session._base_frame`'s `namespace`,
+    `actor_id`, `visible_namespaces`) are never put on the wire: khive-cloud
+    resolves the principal from the API key alone, so those fields only
+    matter to `SocketTransport`'s local daemon.
+
+    By default a plain `http://` base URL is refused unless its host is
+    loopback (`127.0.0.1`, `::1`, `localhost`) — an API key sent over plain
+    HTTP to anything else leaks to every hop in between. Pass
+    `allow_insecure=True` to talk to a non-loopback host over `http://`
+    anyway.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        timeout: float = 30.0,
+        allow_insecure: bool = False,
+    ) -> None:
+        import httpx
+
+        _check_base_url_security(base_url, allow_insecure)
+        self._base_url = base_url.rstrip("/")
+        self._client = httpx.Client(
+            base_url=self._base_url,
+            headers={"Authorization": f"ApiKey {api_key}"},
+            timeout=timeout,
+        )
+
+    def round_trip(self, frame: dict[str, Any], timeout: float) -> dict[str, Any]:
+        import httpx
+
+        if frame.get("metrics_only"):
+            try:
+                response = self._client.get("/health", timeout=timeout)
+            except httpx.HTTPError as exc:
+                raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
+            raise_for_status(response.status_code, response.text, str(response.url))
+            return {
+                "ok": True,
+                "served_config_id": _cloud_config_id(self._base_url),
+                "protocol_version": PROTOCOL_VERSION,
+                "metrics": _parse_json_body(response),
+            }
+        return self._post(_render_ops_field(frame.get("ops", "")), timeout)
+
+    def send_dsl(self, ops: str, *, timeout: float) -> dict[str, Any]:
+        """Send an already-rendered DSL ops string verbatim.
+
+        For callers that already hold DSL text (a script, a notebook, a
+        REPL). `round_trip` is the other path: it decodes the client's
+        internal ops-array form and renders it.
+        """
+        return self._post(ops, timeout)
+
+    def _post(self, dsl_body: str, timeout: float) -> dict[str, Any]:
+        import httpx
+
+        try:
+            response = self._client.post("/v1/request", json={"ops": dsl_body}, timeout=timeout)
+        except httpx.HTTPError as exc:
+            raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
+        raise_for_status(response.status_code, response.text, str(response.url))
+        envelope = _stringify_op_errors(_parse_envelope(response), str(response.url))
+        _validate_envelope_results(envelope, str(response.url))
+        return {"ok": True, "result": envelope}
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
+class AsyncHttpTransport:
+    """Async twin of `HttpTransport`.
+
+    Not a `Transport` subclass — `Transport.round_trip` is synchronous and
+    `Session` drives it synchronously, so this is used directly by callers
+    who are already inside an event loop rather than through `Session`.
+
+    `frame`'s identity fields (`Session._base_frame`'s `namespace`,
+    `actor_id`, `visible_namespaces`) are never put on the wire: khive-cloud
+    resolves the principal from the API key alone, so those fields only
+    matter to `SocketTransport`'s local daemon.
+
+    By default a plain `http://` base URL is refused unless its host is
+    loopback (`127.0.0.1`, `::1`, `localhost`); pass `allow_insecure=True`
+    to talk to a non-loopback host over `http://` anyway.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        timeout: float = 30.0,
+        allow_insecure: bool = False,
+    ) -> None:
+        import httpx
+
+        _check_base_url_security(base_url, allow_insecure)
+        self._base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(
+            base_url=self._base_url,
+            headers={"Authorization": f"ApiKey {api_key}"},
+            timeout=timeout,
+        )
+
+    async def round_trip(self, frame: dict[str, Any], timeout: float) -> dict[str, Any]:
+        import httpx
+
+        if frame.get("metrics_only"):
+            try:
+                response = await self._client.get("/health", timeout=timeout)
+            except httpx.HTTPError as exc:
+                raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
+            raise_for_status(response.status_code, response.text, str(response.url))
+            return {
+                "ok": True,
+                "served_config_id": _cloud_config_id(self._base_url),
+                "protocol_version": PROTOCOL_VERSION,
+                "metrics": _parse_json_body(response),
+            }
+        dsl_body = _render_ops_field(frame.get("ops", ""))
+        try:
+            response = await self._client.post(
+                "/v1/request", json={"ops": dsl_body}, timeout=timeout
+            )
+        except httpx.HTTPError as exc:
+            raise TransportError(f"khive-cloud at {self._base_url}: {exc}") from exc
+        raise_for_status(response.status_code, response.text, str(response.url))
+        envelope = _stringify_op_errors(_parse_envelope(response), str(response.url))
+        _validate_envelope_results(envelope, str(response.url))
+        return {"ok": True, "result": envelope}
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()
 
 
 class Session:

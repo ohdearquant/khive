@@ -6,42 +6,70 @@ wire contract.
 """
 
 from .client import Khive
+from .cloud import cloud
 from .errors import (
+    AuthError,
+    BadRequest,
     BatchError,
     ConfigMismatch,
     FrameTooLarge,
+    HttpError,
     KhiveError,
     OperationError,
     ProtocolMismatch,
+    RateLimited,
     RequestRejected,
+    ServerError,
     TransportError,
+    http_op_error_code,
 )
-from .models import Edge, EdgeRelation, Entity, Incidence, Note, OpResult, Page
+from .models import (
+    Attachment,
+    Edge,
+    EdgeRelation,
+    Embedding,
+    Entity,
+    Incidence,
+    Note,
+    OpResult,
+    Page,
+)
 from .ops import encode, op
-from .transport import Session, SocketTransport, Transport
+from .transport import AsyncHttpTransport, HttpTransport, Session, SocketTransport, Transport
 
 __all__ = [
-    "Khive",
-    "Entity",
-    "Incidence",
-    "Note",
+    "AsyncHttpTransport",
+    "Attachment",
+    "AuthError",
+    "BadRequest",
+    "BatchError",
+    "ConfigMismatch",
     "Edge",
     "EdgeRelation",
-    "Page",
-    "OpResult",
-    "op",
-    "encode",
-    "Transport",
-    "SocketTransport",
-    "Session",
-    "KhiveError",
-    "TransportError",
+    "Embedding",
+    "Entity",
     "FrameTooLarge",
-    "ProtocolMismatch",
-    "ConfigMismatch",
-    "RequestRejected",
+    "HttpError",
+    "HttpTransport",
+    "Incidence",
+    "Khive",
+    "KhiveError",
+    "Note",
+    "OpResult",
     "OperationError",
-    "BatchError",
+    "Page",
+    "ProtocolMismatch",
+    "RateLimited",
+    "RequestRejected",
+    "ServerError",
+    "Session",
+    "SocketTransport",
+    "Transport",
+    "TransportError",
+    "cloud",
+    "encode",
+    "http_op_error_code",
+    "op",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
