@@ -157,9 +157,7 @@ class Case:
 CASES: dict[str, Case] = {}
 
 
-def _add(
-    rule_id: str, kind: str, check: Callable[[], None], *, reason: str | None = None
-) -> None:
+def _add(rule_id: str, kind: str, check: Callable[[], None], *, reason: str | None = None) -> None:
     assert kind in ("renders", "refuses", "fake", "not_emitted")
     if kind == "not_emitted":
         assert reason, f"{rule_id}: a not_emitted case must state its reason"

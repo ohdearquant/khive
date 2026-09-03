@@ -273,9 +273,12 @@ def _coerce_out_of_range_int(value: Any) -> Any:
     `arbitrary_precision`) only holds i64/u64 exactly — a literal outside
     `[_MIN_SIGNED_64, _MAX_UNSIGNED_64]` decodes as `f64` there, so this
     coerces the same literal to a Python `float` here."""
-    if isinstance(value, int) and not isinstance(value, bool):
-        if value < _MIN_SIGNED_64 or value > _MAX_UNSIGNED_64:
-            return float(value)
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and (value < _MIN_SIGNED_64 or value > _MAX_UNSIGNED_64)
+    ):
+        return float(value)
     return value
 
 
