@@ -766,7 +766,12 @@ jobs:
   coverage-measurement:
     name: Coverage measurement (advisory)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The measuring step carries its own budget below. A job-level timeout
+    # cancels the job, and a cancelled job is neither success nor skipped, so
+    # the gate would read an advisory measurement's timeout as a failure while
+    # the unavailable-measurement step never ran. This job-level value only
+    # bounds setup around the step.
+    timeout-minutes: 40
     outputs:
       available: ${{ steps.compute_coverage.outcome == 'success' }}
       current: ${{ steps.compute_coverage.outputs.current }}
@@ -800,6 +805,10 @@ jobs:
       - name: Compute coverage
         id: compute_coverage
         continue-on-error: true
+        # A step timeout is a step failure, which the unavailable-measurement
+        # path below already handles; the job stays green and the ratchet is
+        # skipped, as for any other measurement failure.
+        timeout-minutes: 28
         working-directory: crates
         # #705: this job runs every workspace test binary alongside instrumented
         # (and therefore slower) execution, which widens the writer-checkout

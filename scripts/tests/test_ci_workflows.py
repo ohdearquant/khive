@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 import pathlib
 import runpy
+import subprocess
 import sys
+import tempfile
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -236,6 +240,113 @@ class HarnessEnvironmentTests(unittest.TestCase):
         self.assertIn('cargo_target_dir=${CARGO_TARGET_DIR:-', script)
         self.assertIn('KKERNEL_BINARY="$cargo_target_dir/release/kkernel"', script)
         self.assertIn("export KKERNEL_BINARY", script)
+
+
+class NpmReleaseWorkflowTests(unittest.TestCase):
+    def test_release_publishes_cli_alias_after_exact_version_umbrella(self):
+        workflow = workflow_text("release.yml")
+
+        self.assertIn("ALIAS_VERSION=$(node -p", workflow)
+        self.assertIn("ALIAS_KHIVE_VERSION=$(node -p", workflow)
+        self.assertIn('if [ "$VERSION" != "$ALIAS_VERSION" ]', workflow)
+        self.assertIn('if [ "$VERSION" != "$ALIAS_KHIVE_VERSION" ]', workflow)
+
+        umbrella_publish = workflow.index("- name: Publish khive (umbrella)")
+        alias_rewrite = workflow.index("- name: Set CLI alias version and khive dependency")
+        alias_publish = workflow.index("- name: Publish @khive-ai/cli (compatibility alias)")
+        self.assertLess(umbrella_publish, alias_rewrite)
+        self.assertLess(alias_rewrite, alias_publish)
+        self.assertIn("working-directory: npm/cli-alias", workflow[alias_publish:])
+
+    def test_local_publish_dry_run_includes_cli_alias_after_umbrella(self):
+        publish_script = REPO_ROOT / "scripts" / "npm-publish.sh"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            npm_stub = pathlib.Path(temp_dir) / "npm"
+            npm_stub.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = view ]; then echo 'npm ERR! code E404' >&2; exit 1; fi\n"
+                "echo \"unexpected npm command: $*\" >&2\n"
+                "exit 97\n"
+            )
+            npm_stub.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{temp_dir}:{env['PATH']}"
+            completed = subprocess.run(
+                ["bash", str(publish_script), "--dry-run"],
+                cwd=REPO_ROOT,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        version = json.loads((REPO_ROOT / "npm" / "package.json").read_text())["version"]
+        umbrella = f"[dry-run] would publish khive@{version}"
+        alias = f"[dry-run] would publish @khive-ai/cli@{version}"
+        self.assertIn(umbrella, completed.stdout)
+        self.assertIn(alias, completed.stdout)
+        self.assertLess(completed.stdout.index(umbrella), completed.stdout.index(alias))
+
+    def test_local_publish_refuses_published_alias_with_wrong_khive_dependency(self):
+        publish_script = REPO_ROOT / "scripts" / "npm-publish.sh"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            npm_stub = pathlib.Path(temp_dir) / "npm"
+            npm_stub.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = view ]; then\n"
+                "  case \"${2:-}\" in @khive-ai/cli@*) echo 0.0.1; exit 0;; esac\n"
+                "  exit 1\n"
+                "fi\n"
+                "echo \"unexpected npm command: $*\" >&2\n"
+                "exit 97\n"
+            )
+            npm_stub.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{temp_dir}:{env['PATH']}"
+            completed = subprocess.run(
+                ["bash", str(publish_script), "--dry-run"],
+                cwd=REPO_ROOT,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        version = json.loads((REPO_ROOT / "npm" / "package.json").read_text())["version"]
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        self.assertIn(f"depends on khive 0.0.1, expected {version}", completed.stderr)
+        self.assertNotIn("would publish @khive-ai/cli", completed.stdout)
+
+    def test_local_publish_stops_when_the_alias_lookup_fails_for_another_reason(self):
+        publish_script = REPO_ROOT / "scripts" / "npm-publish.sh"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            npm_stub = pathlib.Path(temp_dir) / "npm"
+            npm_stub.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = view ]; then\n"
+                "  case \"${2:-}\" in @khive-ai/cli@*) echo 'npm ERR! code ECONNREFUSED' >&2; exit 1;; esac\n"
+                "  echo 'npm ERR! code E404' >&2; exit 1\n"
+                "fi\n"
+                "echo \"unexpected npm command: $*\" >&2\n"
+                "exit 97\n"
+            )
+            npm_stub.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{temp_dir}:{env['PATH']}"
+            completed = subprocess.run(
+                ["bash", str(publish_script), "--dry-run"],
+                cwd=REPO_ROOT,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        self.assertIn("could not look up @khive-ai/cli@", completed.stderr)
+        self.assertIn("ECONNREFUSED", completed.stderr)
+        self.assertNotIn("would publish @khive-ai/cli", completed.stdout)
 
 
 if __name__ == "__main__":

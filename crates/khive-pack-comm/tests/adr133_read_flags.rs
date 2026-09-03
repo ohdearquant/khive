@@ -112,6 +112,7 @@ async fn seed_inbound_ids(registry: &khive_runtime::VerbRegistry, n: usize) -> V
 /// none of the batch — the whole dispatch errors rather than partially
 /// marking the valid targets.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn comm_mark_read_atomic_uses_one_transaction() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (registry, rt) = file_backed_registry(dir.path().join("adr133-d6-atomic.db"));
@@ -235,6 +236,7 @@ async fn comm_mark_read_atomic_uses_one_transaction() {
 /// duplicate ids in the same call collapse to one result, not one per
 /// occurrence — and makes no one-acquisition claim.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn comm_read_bulk_preserves_independent_results() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (registry, _rt) = file_backed_registry(dir.path().join("adr133-d6-read-bulk.db"));
@@ -265,6 +267,7 @@ async fn comm_read_bulk_preserves_independent_results() {
 /// one result per unique id, deduplicating repeats in the same call, and
 /// makes no one-acquisition claim (unlike the atomic path).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn comm_mark_read_non_atomic_preserves_independent_results() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (registry, _rt) = file_backed_registry(dir.path().join("adr133-d6-nonatomic.db"));

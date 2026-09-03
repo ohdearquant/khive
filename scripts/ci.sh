@@ -37,6 +37,12 @@ phase_lint() {
     echo "=== ADR Reference Lint Self-Test ==="
     sh "$SCRIPT_DIR/lint-adr-refs.sh" --self-test
 
+    echo "=== ADR Status Lint ==="
+    python3 "$SCRIPT_DIR/lint-adr-status.py"
+
+    echo "=== ADR Status Lint Self-Test ==="
+    python3 "$SCRIPT_DIR/lint-adr-status.py" --self-test
+
     echo "=== Local Build Artifact Verification Tests ==="
     python3 "$SCRIPT_DIR/tests/test_verify_local_artifact.py"
 
