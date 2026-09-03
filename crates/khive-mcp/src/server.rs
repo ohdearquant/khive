@@ -2195,6 +2195,10 @@ async fn dispatch_via_coordinator_inner(
                 .and_then(Value::as_f64)
                 .unwrap_or(1.0);
             let metadata = args_value.get("metadata").cloned();
+            let resurrect = args_value
+                .get("resurrect")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
 
             let result = registry
                 .dispatch_intercepted_with_identity(
@@ -2203,7 +2207,10 @@ async fn dispatch_via_coordinator_inner(
                     identity,
                     |namespace| async move {
                         let coord_result = coord
-                            .link(&namespace, source_id, target_id, relation, weight, metadata)
+                            .link(
+                                &namespace, source_id, target_id, relation, weight, metadata,
+                                resurrect,
+                            )
                             .await
                             .map_err(RuntimeError::from)?;
                         let mut raw = serde_json::to_value(&coord_result.edge)
@@ -2213,6 +2220,9 @@ async fn dispatch_via_coordinator_inner(
                                 obj.insert("source_id".to_string(), json!(source_id.to_string()));
                                 obj.insert("target_id".to_string(), json!(target_id.to_string()));
                             }
+                        }
+                        if let Some(obj) = raw.as_object_mut() {
+                            obj.insert("mutation".to_string(), json!(coord_result.mutation.name()));
                         }
                         Ok(raw)
                     },

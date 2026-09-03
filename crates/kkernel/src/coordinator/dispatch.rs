@@ -430,6 +430,25 @@ impl SubstrateCoordinator {
         weight: f64,
         metadata: Option<serde_json::Value>,
     ) -> Result<khive_storage::Edge, String> {
+        self.link_cross_backend_observed(
+            namespace, source_id, target_id, relation, weight, metadata, false,
+        )
+        .await
+        .map(|row| row.edge)
+    }
+
+    /// Observable, policy-aware form of [`Self::link_cross_backend`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_cross_backend_observed(
+        &self,
+        namespace: &Namespace,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<serde_json::Value>,
+        resurrect: bool,
+    ) -> Result<khive_storage::EdgeUpsertResult, String> {
         let src_located = self
             .locate_endpoint(source_id, namespace)
             .await
@@ -512,7 +531,7 @@ impl SubstrateCoordinator {
         };
 
         let edge = src_runtime
-            .link_with_target_backend(
+            .link_with_target_backend_observed(
                 &token,
                 source_id,
                 target_id,
@@ -520,6 +539,7 @@ impl SubstrateCoordinator {
                 weight,
                 metadata,
                 target_backend_stamp,
+                resurrect,
             )
             .await
             .map_err(|e| e.to_string())?;

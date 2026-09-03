@@ -266,8 +266,12 @@ The canonical v1 set:
 Profile-aware events additionally carry `served_by_profile_id: Option<String>` and
 `serve_attribution` inside `payload` (ADR-032 §3 and Amendment 2). The tri-state marker
 distinguishes a successful profile serve from a failed profile read and legacy omission.
-Provenance observations linking an event to specific entities live in the sibling
-`event_observations` projection table (ADR-041 §2), NOT in the events row itself.
+Provenance observations linking an event to specific records live in the
+sibling `event_observations` projection table (ADR-041 §2), NOT in the events
+row itself. Its `referent_kind` vocabulary is `entity | note | edge`: `edge`
+identifies an addressable graph-layer record and does not add a fourth
+`SubstrateKind`. `LinkCreated`, `EdgeUpdated`, and `EdgeDeleted` project their
+target edge ID with this referent kind.
 
 ### Event vs Note boundary
 

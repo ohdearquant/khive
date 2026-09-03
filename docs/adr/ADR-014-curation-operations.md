@@ -53,13 +53,21 @@ verbs:
 | `update(kind=..., id=..., ...)`                         | entity, edge, note | Patch-style field updates        |
 | `merge(kind=..., into_id=..., from_id=..., policy=...)` | entity, note       | Deduplicate two records into one |
 | `delete(kind=..., id=..., hard?=...)`                   | entity, edge, note | Soft (default) or hard delete    |
-| `link(source_id=..., target_id=..., relation=...)`      | edges (create)     | Create a typed edge              |
+| `link(source_id=..., target_id=..., relation=...)`      | edges              | Create or replace a typed edge   |
 | `get/list(kind="edge", ...)`                            | edges              | Inspect existing edges           |
 
 Edges have no `merge` operation. Two edges sharing the same
 `(namespace, source, target, relation)` are deduplicated at insert time by the
 unique-triple constraint (ADR-002 symmetric canonicalization + ADR-009 upsert
 semantics). Edge curation is `update_edge` + `delete_edge`.
+
+`link` preserves replacement semantics for an already-live natural-key row:
+the incoming weight and metadata replace the stored values and the response
+reports `mutation="updated"`. It never resurrects a tombstone implicitly.
+Callers must pass `resurrect=true`, which reports `mutation="resurrected"`;
+omission refuses without modifying the tombstone. A new row reports
+`mutation="created"`. These dispositions are determined in the storage write
+transaction, not reconstructed by a post-write lookup.
 
 ### Patch-style updates
 
@@ -419,6 +427,8 @@ merge_note    → note_merged     { into_id, from_id, policy, edges_rewired, edg
 delete_entity → entity_deleted  { id, namespace, hard }
 delete_edge   → edge_deleted    { id, namespace }
 delete_note   → note_deleted    { id, namespace, hard }
+link (create) → link_created    { id, namespace, mutation, source_id, target_id, relation, weight, metadata }
+link (replace/resurrect) → edge_updated { id, namespace, mutation, source_id, target_id, relation, weight, metadata, previous }
 ```
 
 Events carry the actor (from `NamespaceToken.principal_id`) and the timestamp.
@@ -547,7 +557,8 @@ note of the right kind.
 
 ### Neutral
 
-- Edge soft-delete is not provided — edges are always hard-deleted.
+- Edge soft-delete is provided. A later `link` with the same natural key does
+  not reverse it unless the caller explicitly passes `resurrect=true`.
 - Note merge requires same-kind. Different-kind merging is expressed via
   supersession.
 - The verb-dispatch surface (ADR-016) routes `update/merge/delete` through the

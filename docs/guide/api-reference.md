@@ -515,7 +515,11 @@ identify the hit. It diverges from both `neighbors` and `list`'s row shapes abov
 
 ### `link` — Commissive
 
-Create a typed directed edge.
+Create or replace a typed directed edge. The natural key is
+`(namespace, source_id, target_id, relation)` after symmetric endpoint
+canonicalization. A live match retains its row ID and creation time while
+replacing weight and metadata. A soft-deleted match is refused unless the
+caller explicitly opts into restoration.
 
 | Param       | Type   | Required | Notes                                                                                                                                                                                                                                                                     |
 | ----------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -523,10 +527,20 @@ Create a typed directed edge.
 | `target_id` | uuid   | yes      | Target node.                                                                                                                                                                                                                                                              |
 | `relation`  | string | yes      | One of the 17 canonical relations: `contains`\|`part_of`\|`instance_of`\|`extends`\|`variant_of`\|`introduced_by`\|`supersedes`\|`derived_from`\|`precedes`\|`depends_on`\|`enables`\|`implements`\|`competes_with`\|`composed_with`\|`annotates`\|`supports`\|`refutes`. |
 | `weight`    | number | no       | Default 1.0. 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible.                                                                                                                                                                                                         |
+| `metadata`  | object | no       | Edge metadata. On a live natural-key match this replaces the prior metadata object; it is not merged.                                                                                                                                                                     |
+| `resurrect` | bool   | no       | Default `false`. Set `true` to restore a soft-deleted natural-key edge; omission never clears `deleted_at`.                                                                                                                                                               |
 
 ```
 request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"extends\")")
 ```
+
+The singleton response contains the persisted edge plus `mutation`, one of
+`created`, `updated`, or `resurrected`. Bulk summaries report those three
+counts separately; verbose bulk rows carry the same per-edge field. Every
+successful mutation emits `LinkCreated` (create) or `EdgeUpdated`
+(replacement/restoration), with the previous edge snapshot for non-create
+mutations. `list(kind="event", observed=["<edge-uuid>"])` therefore retrieves
+the edge's mutation history.
 
 ### `neighbors` — Assertive
 

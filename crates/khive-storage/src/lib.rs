@@ -59,7 +59,9 @@ pub use vectors::VectorStore;
 
 pub use types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
+    EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult,
+    GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedEdgeBatchRefusal,
+    GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome,
     IndexRebuildScope, LinkId, MissingEndpoints, NeighborHit, NeighborQuery, OrphanSweepConfig,
     OrphanSweepResult, Page, PageRequest, PathNode, PropertyFilter, PropertyOp, SeekCursor,
     SeekPage, SortDirection, SortOrder, SparseRecord, SparseSearchHit, SparseSearchRequest,

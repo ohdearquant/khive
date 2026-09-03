@@ -6,9 +6,8 @@ use khive_storage::types::{
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
 
-/// Deterministic barrier at the exact insert-to-probe seam
-/// [`edge_insert_guarded`] calls into (via `#[cfg(test)] hook(...)`) after a
-/// guarded `INSERT` is refused, before the missing-endpoint probe runs.
+/// Deterministic barrier immediately before the in-transaction endpoint
+/// probe used by an observed guarded edge write.
 ///
 /// A pure wall-clock race at this seam is not observable: a refused,
 /// zero-row `INSERT` autocommits (and so releases SQLite's write lock)
@@ -408,6 +407,126 @@ async fn test_upsert_and_get_edge() {
     assert_eq!(fetched.target_id, tgt);
     assert_eq!(fetched.relation, EdgeRelation::Extends);
     assert!((fetched.weight - 0.8).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn observed_upsert_distinguishes_replace_refusal_and_resurrection() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+    let mut original = make_edge(source, target, EdgeRelation::Extends, 0.4);
+    original.metadata = Some(serde_json::json!({"revision": 1}));
+    let original_id = original.id;
+
+    let created = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: original.clone(),
+            resurrect: false,
+        })
+        .await
+        .unwrap();
+    let GuardedEdgeUpsertOutcome::Written(created) = created else {
+        panic!("first natural-key write must succeed");
+    };
+    assert_eq!(created.disposition, EdgeUpsertDisposition::Created);
+    assert!(created.previous.is_none());
+
+    let mut replacement = make_edge(source, target, EdgeRelation::Extends, 0.9);
+    replacement.metadata = Some(serde_json::json!({"revision": 2}));
+    let updated = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: replacement.clone(),
+            resurrect: false,
+        })
+        .await
+        .unwrap();
+    let GuardedEdgeUpsertOutcome::Written(updated) = updated else {
+        panic!("live natural-key replacement must succeed");
+    };
+    assert_eq!(updated.disposition, EdgeUpsertDisposition::Updated);
+    assert_eq!(updated.edge.id, original_id);
+    assert_eq!(updated.edge.metadata, replacement.metadata);
+    assert_eq!(updated.previous.unwrap().metadata, original.metadata);
+
+    store
+        .delete_edge(original_id, DeleteMode::Soft)
+        .await
+        .unwrap();
+    let refused = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: replacement.clone(),
+            resurrect: false,
+        })
+        .await
+        .unwrap();
+    let GuardedEdgeUpsertOutcome::Refused(EdgeUpsertRefusal::ResurrectionRequired {
+        edge: tombstone,
+    }) = refused
+    else {
+        panic!("implicit resurrection must be refused");
+    };
+    assert_eq!(tombstone.id, original_id);
+    assert!(tombstone.deleted_at.is_some());
+
+    replacement.weight = 0.7;
+    replacement.metadata = Some(serde_json::json!({"revision": 3}));
+    let resurrected = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: replacement.clone(),
+            resurrect: true,
+        })
+        .await
+        .unwrap();
+    let GuardedEdgeUpsertOutcome::Written(resurrected) = resurrected else {
+        panic!("explicit resurrection must succeed");
+    };
+    assert_eq!(resurrected.disposition, EdgeUpsertDisposition::Resurrected);
+    assert_eq!(resurrected.edge.id, original_id);
+    assert!(resurrected.edge.deleted_at.is_none());
+    assert_eq!(resurrected.edge.metadata, replacement.metadata);
+    assert!(resurrected.previous.unwrap().deleted_at.is_some());
+}
+
+#[tokio::test]
+async fn observed_upsert_uses_canonical_symmetric_natural_key() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let left = Uuid::new_v4();
+    let right = Uuid::new_v4();
+    insert_live_entity(&pool, left);
+    insert_live_entity(&pool, right);
+    let first = make_edge(left, right, EdgeRelation::CompetesWith, 0.4);
+    let first_id = first.id;
+    let created = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: first,
+            resurrect: false,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        created,
+        GuardedEdgeUpsertOutcome::Written(EdgeUpsertResult {
+            disposition: EdgeUpsertDisposition::Created,
+            ..
+        })
+    ));
+
+    let reverse = make_edge(right, left, EdgeRelation::CompetesWith, 0.8);
+    let updated = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: reverse,
+            resurrect: false,
+        })
+        .await
+        .unwrap();
+    let GuardedEdgeUpsertOutcome::Written(updated) = updated else {
+        panic!("reverse symmetric edge must target the canonical row");
+    };
+    assert_eq!(updated.disposition, EdgeUpsertDisposition::Updated);
+    assert_eq!(updated.edge.id, first_id);
+    assert_eq!(updated.edge.weight, 0.8);
 }
 
 /// The base `PRIMARY KEY (namespace, id)` alone would let two namespaces
@@ -4143,9 +4262,9 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
 /// every time.
 ///
 /// So this version does not race at all. [`insert_probe_seam`] has
-/// production code itself (`edge_insert_guarded`, `#[cfg(test)]`-only)
-/// park the guarded call at the exact seam between its `INSERT` and its
-/// probe, keyed on this test's own `(source, target)` pair so unrelated
+/// production code itself (`observed_edge_upsert`, `#[cfg(test)]`-only)
+/// park the guarded call immediately before its endpoint probe, keyed on
+/// this test's own `(source, target)` pair so unrelated
 /// concurrent tests are unaffected. The racer's write is then forced to
 /// attempt landing at that exact seam:
 ///   - unwrapped (pre-fix) code holds no lock at the seam, so the racer's
@@ -4199,7 +4318,7 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     let edge_id = edge.id;
 
     // Install the seam barrier before spawning the guarded call, keyed on
-    // the exact (source, target) pair `edge_insert_guarded` canonicalizes
+    // the exact (source, target) pair `observed_edge_upsert` canonicalizes
     // to and passes into `insert_probe_seam::hook` (Extends is not a
     // symmetric relation, so canonicalization is a no-op here).
     let (reached_rx, proceed_tx) = insert_probe_seam::install((source, target));
@@ -4210,7 +4329,7 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     };
 
     // Deterministic rendezvous: blocks until the guarded call has actually
-    // executed its refused INSERT and is parked at the seam. No sleep, no
+    // entered the write transaction and is parked before the probe. No sleep, no
     // guess — a real signal sent from production code at that exact point.
     tokio::task::spawn_blocking(move || reached_rx.recv())
         .await

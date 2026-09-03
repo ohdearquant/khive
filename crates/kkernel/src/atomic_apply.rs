@@ -786,6 +786,10 @@ async fn prepare_one(
                     .and_then(Value::as_f64)
                     .unwrap_or(1.0),
                 metadata: resolved.get("metadata").cloned(),
+                resurrect: resolved
+                    .get("resurrect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             };
             registry
                 .validate_link_hooks(runtime, token, std::slice::from_ref(&spec))
@@ -1123,6 +1127,9 @@ async fn build_op_result(
                     obj.insert("source_id".to_string(), orig_source);
                     obj.insert("target_id".to_string(), orig_target);
                 }
+            }
+            if let Some(obj) = raw.as_object_mut() {
+                obj.insert("mutation".to_string(), json!(p.disposition().name()));
             }
             Ok(raw)
         }

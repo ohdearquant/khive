@@ -12,7 +12,7 @@ use uuid::Uuid;
 use khive_pack_kg::handlers::ValidatedSearchRequest;
 use khive_runtime::Namespace;
 use khive_runtime::{BackendId, NoteSearchHit, SearchHit};
-use khive_storage::{Edge, EdgeRelation};
+use khive_storage::{Edge, EdgeRelation, EdgeUpsertDisposition};
 
 /// Result of a cross-backend link operation.
 pub struct CoordLinkResult {
@@ -22,6 +22,8 @@ pub struct CoordLinkResult {
     pub cross_backend: bool,
     /// The target backend id when `cross_backend` is true.
     pub target_backend_id: Option<BackendId>,
+    /// Transaction-observed natural-key mutation disposition.
+    pub mutation: EdgeUpsertDisposition,
 }
 
 /// Error variants the coordinator can produce.
@@ -126,6 +128,7 @@ pub trait CoordinatorService: Send + Sync {
     /// Cross-backend link (D3). Locates both endpoints, validates the relation,
     /// and writes the edge on the source backend with `target_backend` stamped
     /// when the endpoints are on different backends.
+    #[allow(clippy::too_many_arguments)]
     async fn link(
         &self,
         namespace: &Namespace,
@@ -134,6 +137,7 @@ pub trait CoordinatorService: Send + Sync {
         relation: EdgeRelation,
         weight: f64,
         metadata: Option<serde_json::Value>,
+        resurrect: bool,
     ) -> Result<CoordLinkResult, CoordError>;
 
     /// Fan-out search across all registered backends (D4).
@@ -272,6 +276,7 @@ pub(crate) mod tests {
             Some(BackendId::main())
         }
 
+        #[allow(clippy::too_many_arguments)]
         async fn link(
             &self,
             _namespace: &Namespace,
@@ -280,6 +285,7 @@ pub(crate) mod tests {
             _relation: EdgeRelation,
             _weight: f64,
             _metadata: Option<serde_json::Value>,
+            _resurrect: bool,
         ) -> Result<CoordLinkResult, CoordError> {
             self.link_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);

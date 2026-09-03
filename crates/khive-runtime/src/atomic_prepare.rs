@@ -20,7 +20,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_storage::types::SqlValue;
-use khive_storage::{AttachmentSubstrate, EdgeRelation, SqlStatement};
+use khive_storage::{AttachmentSubstrate, EdgeRelation, EdgeUpsertDisposition, SqlStatement};
 use khive_types::{EventKind, SubstrateKind};
 
 use crate::atomic_plan::{
@@ -45,7 +45,8 @@ use khive_db::stores::entity::{
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{
-    edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
+    edge_hard_delete_statement, edge_insert_new_guarded_by_endpoints_statement,
+    edge_link_replace_if_unchanged_and_endpoints_exist_statement,
     edge_replace_if_unchanged_statement, edge_soft_delete_statement,
     edge_symmetric_absorb_or_update_inplace_statement, edge_symmetric_delete_if_conflict_statement,
     purge_incident_edges_statement,
@@ -368,8 +369,9 @@ async fn push_index_purge_statements(
 /// lifecycle event after their row mutation: `update_entity` ->
 /// `EntityUpdated`, `delete_entity` -> `EntityDeleted`, `delete_note` ->
 /// `NoteDeleted`, `update_edge` -> `EdgeUpdated`, `delete_edge` ->
-/// `EdgeDeleted`. `update_note` and `link` append no event and must never
-/// call this. See `docs/api/atomic_prepare.md#event_append_statements` for why
+/// `EdgeDeleted`, and `link` -> `LinkCreated`/`EdgeUpdated`. `update_note`
+/// appends no event and must never call this. See
+/// `docs/api/atomic_prepare.md#event_append_statements` for why
 /// this is a `PlanStatement` rather than a `PostCommitEffect`.
 ///
 /// Invariant: returned statements are unguarded — appended after the plan's
@@ -1510,6 +1512,15 @@ async fn prepare_link(
     let relation = parse_edge_relation(require_str(args, "relation")?)?;
     let weight = optional_f64(args, "weight")?.unwrap_or(1.0);
     let metadata = obj(args)?.get("metadata").cloned();
+    let resurrect = match obj(args)?.get("resurrect") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(other) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "resurrect must be a boolean, got: {other}"
+            )))
+        }
+    };
 
     // Top-level `dependency_kind` param merges into `metadata`: only fills
     // the key when metadata doesn't already carry one. Calls the same
@@ -1547,41 +1558,101 @@ async fn prepare_link(
     }
 
     validate_edge_metadata(relation, metadata.as_ref())?;
-    let edge_id = Uuid::new_v4();
     let namespace = token.namespace().as_str().to_string();
-    let now = chrono::Utc::now().timestamp_micros();
-    let metadata_str = metadata.map(|m| serde_json::to_string(&m).unwrap_or_default());
+    let previous = runtime
+        .get_edge_by_natural_key_including_deleted(
+            token,
+            &namespace,
+            canon_source,
+            canon_target,
+            relation,
+        )
+        .await?;
+    if let Some(edge) = previous.as_ref() {
+        if edge.deleted_at.is_some() && !resurrect {
+            return Err(RuntimeError::InvalidInput(format!(
+                "edge natural key is soft-deleted; pass resurrect=true to link explicitly: {}",
+                Uuid::from(edge.id)
+            )));
+        }
+    }
 
-    // The guarded `INSERT ... SELECT ... WHERE EXISTS(...)` shape is
-    // load-bearing (see `LinkPlan`'s own doc comment): it re-probes both
-    // endpoints inside the transaction, closing the intra-batch hazard
-    // where an earlier op in the same atomic unit, e.g. `delete(X, hard)`,
-    // could invalidate this op's prepare-time endpoint validation before
-    // commit. The conflict-arm SET list shares the same
-    // `EDGE_NATURAL_KEY_CONFLICT_SET` text `edge_upsert_statement`
-    // (canonical `link`'s builder) uses, so the two cannot silently diverge
-    // (a prior bug: this atomic literal never set
-    // `target_backend = excluded.target_backend`, so a re-link of an edge
-    // carrying a cross-backend `target_backend` stamp behaved differently
-    // under `--atomic`).
-    let statement = edge_insert_guarded_by_endpoints_statement(
-        &namespace,
-        edge_id,
-        canon_source,
-        canon_target,
-        relation,
-        weight,
-        now,
-        metadata_str.as_deref(),
+    let disposition = match previous.as_ref() {
+        None => EdgeUpsertDisposition::Created,
+        Some(edge) if edge.deleted_at.is_some() => EdgeUpsertDisposition::Resurrected,
+        Some(_) => EdgeUpsertDisposition::Updated,
+    };
+    let edge_id = previous
+        .as_ref()
+        .map(|edge| Uuid::from(edge.id))
+        .unwrap_or_else(Uuid::new_v4);
+    let now = previous.as_ref().map_or_else(
+        || chrono::Utc::now().timestamp_micros(),
+        |edge| {
+            chrono::Utc::now()
+                .timestamp_micros()
+                .max(edge.updated_at.timestamp_micros().saturating_add(1))
+        },
     );
+    let metadata_str = metadata
+        .as_ref()
+        .map(|value| serde_json::to_string(value).unwrap_or_default());
+
+    // The guarded mutation closes both atomic seams: endpoints are re-probed
+    // inside the transaction, and the natural-key row must still match the
+    // prepare snapshot. That makes the disposition used below truthful.
+    let statement = match previous.as_ref() {
+        None => edge_insert_new_guarded_by_endpoints_statement(
+            &namespace,
+            edge_id,
+            canon_source,
+            canon_target,
+            relation,
+            weight,
+            now,
+            metadata_str.as_deref(),
+        ),
+        Some(edge) => edge_link_replace_if_unchanged_and_endpoints_exist_statement(
+            edge,
+            weight,
+            now,
+            metadata_str.as_deref(),
+        ),
+    };
+    let mut statements = vec![PlanStatement {
+        statement,
+        guard: Some(AffectedRowGuard::exactly(1)),
+    }];
+    let kind = match disposition {
+        EdgeUpsertDisposition::Created => EventKind::LinkCreated,
+        EdgeUpsertDisposition::Updated | EdgeUpsertDisposition::Resurrected => {
+            EventKind::EdgeUpdated
+        }
+    };
+    statements.extend(event_append_statements(
+        &namespace,
+        "link",
+        kind,
+        SubstrateKind::Entity,
+        edge_id,
+        serde_json::json!({
+            "id": edge_id,
+            "namespace": namespace,
+            "mutation": disposition.name(),
+            "source_id": canon_source,
+            "target_id": canon_target,
+            "relation": relation,
+            "weight": weight,
+            "metadata": metadata,
+            "previous": previous,
+        }),
+    )?);
 
     Ok(AtomicOpPlan::Link(LinkPlan {
         source_id: canon_source,
         target_id: canon_target,
-        statement: PlanStatement {
-            statement,
-            guard: Some(AffectedRowGuard::exactly(1)),
-        },
+        statements,
+        disposition,
     }))
 }
 
@@ -2540,7 +2611,7 @@ mod tests {
                 AtomicOpPlan::Link(p) => p,
                 other => panic!("expected an AtomicOpPlan::Link, got {other:?}"),
             };
-            match link_plan.statement.statement.params.last() {
+            match link_plan.statements[0].statement.params.last() {
                 Some(SqlValue::Text(s)) => s.clone(),
                 other => panic!("expected the metadata param to be SqlValue::Text, got {other:?}"),
             }
@@ -2738,9 +2809,8 @@ mod tests {
         assert!(deleted_at.is_none());
     }
 
-    /// Atomic `link` of a soft-deleted triple must resurrect it
-    /// (`deleted_at = NULL`), matching `upsert_edge`'s natural-key
-    /// `ON CONFLICT ... DO UPDATE SET deleted_at = NULL`.
+    /// Atomic `link` refuses a soft-deleted triple by default and only
+    /// resurrects it when the caller opts in explicitly.
     #[tokio::test]
     async fn atomic_link_of_soft_deleted_triple_resurrects_it() {
         let runtime = scratch_runtime();
@@ -2803,9 +2873,7 @@ mod tests {
             "row must be soft-deleted before the resurrect attempt"
         );
 
-        // Re-link the same triple: must resurrect (deleted_at -> NULL), not
-        // fail on the UNIQUE constraint of the still-present soft-deleted row.
-        let plan_relink = prepare_link(
+        let refusal = prepare_link(
             &runtime,
             &token,
             &json!({
@@ -2816,7 +2884,29 @@ mod tests {
             }),
         )
         .await
-        .expect("prepare resurrecting link");
+        .expect_err("implicit resurrection must be refused at prepare time");
+        assert!(matches!(
+            refusal,
+            RuntimeError::InvalidInput(message) if message.contains("resurrect=true")
+        ));
+        let (_, weight, _, deleted_at) =
+            probe_edge_natural_key(&runtime, "local", a_id, b_id, "extends").await;
+        assert_eq!(weight, Some(1.0), "refusal must preserve the tombstone");
+        assert!(deleted_at.is_some());
+
+        let plan_relink = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": a_id.to_string(),
+                "target_id": b_id.to_string(),
+                "relation": "extends",
+                "weight": 0.75,
+                "resurrect": true,
+            }),
+        )
+        .await
+        .expect("prepare explicitly resurrecting link");
         let outcome_relink =
             crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan_relink])
                 .await
@@ -4624,10 +4714,10 @@ mod tests {
         );
     }
 
-    /// Parity boundary: atomic `link` must append no event: canonical
-    /// `link` never calls `append_event`.
+    /// Atomic `link` commits its mutation and event-plane observation in the
+    /// same unit.
     #[tokio::test]
-    async fn atomic_link_appends_no_event() {
+    async fn atomic_link_appends_created_event_with_edge_observation() {
         let runtime = scratch_runtime();
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
@@ -4670,16 +4760,30 @@ mod tests {
         let event_store = runtime.events(&token).expect("event store");
         let page = event_store
             .query_events(
-                khive_storage::EventFilter::default(),
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::LinkCreated],
+                    ..khive_storage::EventFilter::default()
+                },
                 khive_storage::types::PageRequest::default(),
             )
             .await
             .expect("query_events");
-        assert!(
-            page.items.is_empty(),
-            "link must append no event; found: {:?}",
-            page.items
-        );
+        assert_eq!(page.items.len(), 1, "link must append one created event");
+        let event = &page.items[0];
+        assert_eq!(event.payload["mutation"], "created");
+        let edge_id = event.target_id.expect("link event targets its edge");
+        let observed = event_store
+            .query_events(
+                khive_storage::EventFilter {
+                    observed: vec![edge_id],
+                    ..khive_storage::EventFilter::default()
+                },
+                khive_storage::types::PageRequest::default(),
+            )
+            .await
+            .expect("query observed edge");
+        assert_eq!(observed.items.len(), 1);
+        assert_eq!(observed.items[0].id, event.id);
     }
 
     // ------------------------------------------------------------------
