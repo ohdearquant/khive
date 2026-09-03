@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{uuid_prefix_bounds, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{
+    micros_to_iso, uuid_prefix_bounds, KhiveRuntime, NamespaceToken, RuntimeError,
+};
 use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::schema::{
@@ -18,6 +20,171 @@ use super::util::{
     tags_to_json, validate_atom_content,
 };
 use super::KnowledgeHandlers;
+
+const ATOM_LIST_FIELDS: &[&str] = &[
+    "id",
+    "namespace",
+    "slug",
+    "name",
+    "content",
+    "tags",
+    "properties",
+    "status",
+    "source_uri",
+    "source_type",
+    "finalized",
+    "kind",
+    "created_at",
+    "updated_at",
+];
+
+const DOMAIN_LIST_FIELDS: &[&str] = &[
+    "id",
+    "namespace",
+    "slug",
+    "name",
+    "description",
+    "tags",
+    "members",
+    "kind",
+    "created_at",
+    "updated_at",
+];
+
+const LIST_CURSOR_ORDER: &str = "created_at_asc_id_asc";
+const LIST_OFFSET_ORDER: &str = "created_at_desc_id_desc";
+
+#[derive(Clone, Copy)]
+enum KnowledgeListKind {
+    Atom,
+    Domain,
+}
+
+impl KnowledgeListKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Atom => "atom",
+            Self::Domain => "domain",
+        }
+    }
+
+    fn projection_fields(self) -> &'static [&'static str] {
+        match self {
+            Self::Atom => ATOM_LIST_FIELDS,
+            Self::Domain => DOMAIN_LIST_FIELDS,
+        }
+    }
+}
+
+fn parse_list_after(raw: &str) -> Result<Option<Uuid>, RuntimeError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    Uuid::parse_str(raw).map(Some).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "knowledge.list: `after` must be a full UUID returned as `next_after`; \
+             prefixes are unsafe for keyset pagination; got {raw:?}: {error}"
+        ))
+    })
+}
+
+fn validate_list_fields(
+    kind: KnowledgeListKind,
+    fields: Option<&[String]>,
+) -> Result<(), RuntimeError> {
+    let Some(fields) = fields else {
+        return Ok(());
+    };
+    if fields.is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "knowledge.list: `fields` must be non-empty".into(),
+        ));
+    }
+    if let Some(unknown) = fields
+        .iter()
+        .find(|field| !kind.projection_fields().contains(&field.as_str()))
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "knowledge.list: unknown {} projection field {unknown:?}; expected one of: {}",
+            kind.name(),
+            kind.projection_fields().join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Projection reads include the sort key internally, but the renderer below
+/// emits only caller-requested fields. This is the byte-saving boundary: an
+/// `id`/`slug` walk never selects atom `content` from SQLite.
+fn list_select_columns(fields: Option<&[String]>) -> String {
+    let Some(fields) = fields else {
+        return "*".into();
+    };
+
+    let mut columns: Vec<&str> = Vec::with_capacity(fields.len() + 2);
+    for field in fields {
+        if field != "kind" && !columns.contains(&field.as_str()) {
+            columns.push(field);
+        }
+    }
+    for pagination_column in ["id", "created_at"] {
+        if !columns.contains(&pagination_column) {
+            columns.push(pagination_column);
+        }
+    }
+    columns.join(", ")
+}
+
+fn json_text_column(row: &khive_storage::types::SqlRow, column: &str) -> Value {
+    row_str(row, column).map_or(Value::Null, Value::String)
+}
+
+fn json_array_column(row: &khive_storage::types::SqlRow, column: &str) -> Value {
+    row_str(row, column)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| Value::Array(vec![]))
+}
+
+fn json_object_column(row: &khive_storage::types::SqlRow, column: &str) -> Value {
+    row_str(row, column)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn json_timestamp_column(row: &khive_storage::types::SqlRow, column: &str) -> Value {
+    row_i64(row, column)
+        .map(micros_to_iso)
+        .map_or(Value::Null, Value::String)
+}
+
+fn project_list_row(
+    row: &khive_storage::types::SqlRow,
+    kind: KnowledgeListKind,
+    fields: Option<&[String]>,
+) -> Option<Value> {
+    let Some(fields) = fields else {
+        return match kind {
+            KnowledgeListKind::Atom => atom_from_row(row).map(|atom| atom_to_json(&atom)),
+            KnowledgeListKind::Domain => domain_from_row(row).map(|domain| domain_to_json(&domain)),
+        };
+    };
+
+    let mut projected = serde_json::Map::new();
+    for field in fields {
+        let value = match field.as_str() {
+            "id" | "namespace" | "slug" | "name" | "content" | "description" | "status"
+            | "source_uri" | "source_type" => json_text_column(row, field),
+            "tags" | "members" => json_array_column(row, field),
+            "properties" => json_object_column(row, field),
+            "finalized" => Value::Bool(row_i64(row, field).is_some_and(|value| value == 1)),
+            "kind" => Value::String(kind.name().into()),
+            "created_at" | "updated_at" => json_timestamp_column(row, field),
+            _ => unreachable!("projection field was validated"),
+        };
+        projected.insert(field.clone(), value);
+    }
+    Some(Value::Object(projected))
+}
 
 fn knowledge_get_prefix_statement(prefix: &str) -> Option<SqlStatement> {
     let (lower, upper) = uuid_prefix_bounds(prefix)?;
@@ -638,50 +805,175 @@ impl KnowledgeHandlers {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: ListParams = deser(params)?;
+        let kind = match p.kind.as_deref() {
+            Some("domain") => KnowledgeListKind::Domain,
+            Some("atom") | None => KnowledgeListKind::Atom,
+            Some(other) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "unknown type {other:?}; valid: atom | domain"
+                )))
+            }
+        };
+        let cursor_mode = p.after.is_some();
+        if cursor_mode && p.offset.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "knowledge.list: `after` and `offset` are mutually exclusive".into(),
+            ));
+        }
+        validate_list_fields(kind, p.fields.as_deref())?;
+        let after_id = p
+            .after
+            .as_deref()
+            .map(parse_list_after)
+            .transpose()?
+            .flatten();
+
         let ns = token.namespace().as_str().to_owned();
         let sql = runtime.sql();
-        let limit = p.limit.unwrap_or(20).clamp(1, 500) as i64;
+        let limit_usize = p.limit.unwrap_or(20).clamp(1, 500);
+        let limit = limit_usize as i64;
         let offset = p.offset.unwrap_or(0) as i64;
+        let select_columns = list_select_columns(p.fields.as_deref());
 
         let mut reader = sql.reader().await.map_err(|e| sql_err("list reader", e))?;
 
-        match p.kind.as_deref() {
-            Some("domain") => {
-                let rows = reader
-                    .query_all(SqlStatement {
+        // A full cursor UUID resolves to the immutable seek tuple. Deliberately
+        // allow a soft-deleted boundary to keep an in-flight walk resumable;
+        // hard deletion, the wrong namespace, or the wrong list type fails.
+        let cursor_key = if let Some(after_id) = after_id {
+            let cursor_sql = match kind {
+                KnowledgeListKind::Atom => {
+                    "SELECT created_at, id FROM knowledge_atoms WHERE namespace = ?1 AND id = ?2 AND tags NOT LIKE '%type:domain%' LIMIT 1"
+                }
+                KnowledgeListKind::Domain => {
+                    "SELECT created_at, id FROM knowledge_domains WHERE namespace = ?1 AND id = ?2 LIMIT 1"
+                }
+            };
+            let row = reader
+                .query_row(SqlStatement {
+                    sql: cursor_sql.into(),
+                    params: vec![
+                        SqlValue::Text(ns.clone()),
+                        SqlValue::Text(after_id.to_string()),
+                    ],
+                    label: Some(format!("knowledge.list.{}.cursor", kind.name())),
+                })
+                .await
+                .map_err(|e| sql_err("resolve list cursor", e))?
+                .ok_or_else(|| {
+                    RuntimeError::NotFound(format!(
+                        "knowledge.list: {} cursor {} not found in namespace {ns:?}",
+                        kind.name(),
+                        after_id
+                    ))
+                })?;
+            let created_at = row_i64(&row, "created_at").ok_or_else(|| {
+                RuntimeError::Internal("knowledge.list cursor row lacks created_at".into())
+            })?;
+            let id = row_str(&row, "id").ok_or_else(|| {
+                RuntimeError::Internal("knowledge.list cursor row lacks id".into())
+            })?;
+            Some((created_at, id))
+        } else {
+            None
+        };
+
+        match kind {
+            KnowledgeListKind::Domain => {
+                let (data_sql, data_params) = if cursor_mode {
+                    let fetch_limit = limit.saturating_add(1);
+                    match cursor_key.as_ref() {
+                        Some((created_at, id)) => (
+                            format!(
+                                "SELECT {select_columns} FROM knowledge_domains \
+                                 WHERE namespace = ?1 AND deleted_at IS NULL \
+                                 AND (created_at > ?2 OR (created_at = ?2 AND id > ?3)) \
+                                 ORDER BY created_at ASC, id ASC LIMIT ?4"
+                            ),
+                            vec![
+                                SqlValue::Text(ns.clone()),
+                                SqlValue::Integer(*created_at),
+                                SqlValue::Text(id.clone()),
+                                SqlValue::Integer(fetch_limit),
+                            ],
+                        ),
+                        None => (
+                            format!(
+                                "SELECT {select_columns} FROM knowledge_domains \
+                                 WHERE namespace = ?1 AND deleted_at IS NULL \
+                                 ORDER BY created_at ASC, id ASC LIMIT ?2"
+                            ),
+                            vec![SqlValue::Text(ns.clone()), SqlValue::Integer(fetch_limit)],
+                        ),
+                    }
+                } else {
+                    (
                         // #1671: `id` tiebreak — deterministic total order for offset pages.
-                        sql: "SELECT * FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3".into(),
-                        params: vec![
+                        format!(
+                            "SELECT {select_columns} FROM knowledge_domains \
+                             WHERE namespace = ?1 AND deleted_at IS NULL \
+                             ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3"
+                        ),
+                        vec![
                             SqlValue::Text(ns.clone()),
                             SqlValue::Integer(limit),
                             SqlValue::Integer(offset),
                         ],
-                        label: None,
+                    )
+                };
+                let mut rows = reader
+                    .query_all(SqlStatement {
+                        sql: data_sql,
+                        params: data_params,
+                        label: Some("knowledge.list.domains".into()),
                     })
                     .await
                     .map_err(|e| sql_err("list domains", e))?;
 
-                let total_row = reader
-                    .query_scalar(SqlStatement {
-                        sql: "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL".into(),
-                        params: vec![SqlValue::Text(ns)],
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("list domains count", e))?;
-                let total = match total_row {
-                    Some(SqlValue::Integer(n)) => n,
-                    _ => 0,
-                };
-
+                let has_more = cursor_mode && rows.len() > limit_usize;
+                if has_more {
+                    rows.truncate(limit_usize);
+                }
+                let next_after = has_more
+                    .then(|| rows.last().and_then(|row| row_str(row, "id")))
+                    .flatten();
                 let items: Vec<Value> = rows
                     .iter()
-                    .filter_map(|r| domain_from_row(r).map(|d| domain_to_json(&d)))
+                    .filter_map(|row| project_list_row(row, kind, p.fields.as_deref()))
                     .collect();
 
-                Ok(json!({ "results": items, "total": total, "limit": limit, "offset": offset }))
+                // A cursor page carries no total: counting the namespace is a
+                // full scan per page, and next_after is the completion signal.
+                if cursor_mode {
+                    Ok(json!({
+                        "results": items,
+                        "limit": limit,
+                        "order": LIST_CURSOR_ORDER,
+                        "next_after": next_after,
+                    }))
+                } else {
+                    let total_row = reader
+                        .query_scalar(SqlStatement {
+                            sql: "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL".into(),
+                            params: vec![SqlValue::Text(ns)],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| sql_err("list domains count", e))?;
+                    let total = match total_row {
+                        Some(SqlValue::Integer(n)) => n,
+                        _ => 0,
+                    };
+                    Ok(json!({
+                        "results": items,
+                        "total": total,
+                        "limit": limit,
+                        "offset": offset,
+                        "order": LIST_OFFSET_ORDER,
+                    }))
+                }
             }
-            Some("atom") | None => {
+            KnowledgeListKind::Atom => {
                 let requested_statuses = status_values(p.status.as_ref());
                 let exclude_buf: Vec<&str> = p
                     .exclude_status
@@ -689,61 +981,131 @@ impl KnowledgeHandlers {
                     .filter(|s| !s.trim().is_empty())
                     .into_iter()
                     .collect();
-                let (data_status_clause, data_status_params) =
-                    status_sql_clause(&requested_statuses, &exclude_buf, 4);
                 let (count_status_clause, count_status_params) =
                     status_sql_clause(&requested_statuses, &exclude_buf, 2);
 
-                let sql_str = format!(
-                    "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{} ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
-                    data_status_clause
-                );
+                let (sql_str, row_params) = if cursor_mode {
+                    let fetch_limit = limit.saturating_add(1);
+                    match cursor_key.as_ref() {
+                        Some((created_at, id)) => {
+                            let (data_status_clause, data_status_params) =
+                                status_sql_clause(&requested_statuses, &exclude_buf, 5);
+                            let mut row_params = vec![
+                                SqlValue::Text(ns.clone()),
+                                SqlValue::Integer(*created_at),
+                                SqlValue::Text(id.clone()),
+                                SqlValue::Integer(fetch_limit),
+                            ];
+                            row_params.extend(data_status_params);
+                            (
+                                format!(
+                                    "SELECT {select_columns} FROM knowledge_atoms \
+                                     WHERE namespace = ?1 AND deleted_at IS NULL \
+                                     AND tags NOT LIKE '%type:domain%' \
+                                     AND (created_at > ?2 OR (created_at = ?2 AND id > ?3)){} \
+                                     ORDER BY created_at ASC, id ASC LIMIT ?4",
+                                    data_status_clause
+                                ),
+                                row_params,
+                            )
+                        }
+                        None => {
+                            let (data_status_clause, data_status_params) =
+                                status_sql_clause(&requested_statuses, &exclude_buf, 3);
+                            let mut row_params =
+                                vec![SqlValue::Text(ns.clone()), SqlValue::Integer(fetch_limit)];
+                            row_params.extend(data_status_params);
+                            (
+                                format!(
+                                    "SELECT {select_columns} FROM knowledge_atoms \
+                                     WHERE namespace = ?1 AND deleted_at IS NULL \
+                                     AND tags NOT LIKE '%type:domain%'{} \
+                                     ORDER BY created_at ASC, id ASC LIMIT ?2",
+                                    data_status_clause
+                                ),
+                                row_params,
+                            )
+                        }
+                    }
+                } else {
+                    let (data_status_clause, data_status_params) =
+                        status_sql_clause(&requested_statuses, &exclude_buf, 4);
+                    let mut row_params = vec![
+                        SqlValue::Text(ns.clone()),
+                        SqlValue::Integer(limit),
+                        SqlValue::Integer(offset),
+                    ];
+                    row_params.extend(data_status_params);
+                    (
+                        format!(
+                            "SELECT {select_columns} FROM knowledge_atoms \
+                             WHERE namespace = ?1 AND deleted_at IS NULL \
+                             AND tags NOT LIKE '%type:domain%'{} \
+                             ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
+                            data_status_clause
+                        ),
+                        row_params,
+                    )
+                };
                 let count_sql = format!(
                     "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{}",
                     count_status_clause
                 );
 
-                let mut row_params = vec![
-                    SqlValue::Text(ns.clone()),
-                    SqlValue::Integer(limit),
-                    SqlValue::Integer(offset),
-                ];
-                row_params.extend(data_status_params);
-
-                let rows = reader
+                let mut rows = reader
                     .query_all(SqlStatement {
                         sql: sql_str,
                         params: row_params,
-                        label: None,
+                        label: Some("knowledge.list.atoms".into()),
                     })
                     .await
                     .map_err(|e| sql_err("list atoms", e))?;
 
-                let mut count_params = vec![SqlValue::Text(ns)];
-                count_params.extend(count_status_params);
-                let total_row = reader
-                    .query_scalar(SqlStatement {
-                        sql: count_sql,
-                        params: count_params,
-                        label: None,
-                    })
-                    .await
-                    .map_err(|e| sql_err("list atoms count", e))?;
-                let total = match total_row {
-                    Some(SqlValue::Integer(n)) => n,
-                    _ => 0,
-                };
-
+                let has_more = cursor_mode && rows.len() > limit_usize;
+                if has_more {
+                    rows.truncate(limit_usize);
+                }
+                let next_after = has_more
+                    .then(|| rows.last().and_then(|row| row_str(row, "id")))
+                    .flatten();
                 let items: Vec<Value> = rows
                     .iter()
-                    .filter_map(|r| atom_from_row(r).map(|a| atom_to_json(&a)))
+                    .filter_map(|row| project_list_row(row, kind, p.fields.as_deref()))
                     .collect();
 
-                Ok(json!({ "results": items, "total": total, "limit": limit, "offset": offset }))
+                // A cursor page carries no total: counting the namespace is a
+                // full scan per page, and next_after is the completion signal.
+                if cursor_mode {
+                    Ok(json!({
+                        "results": items,
+                        "limit": limit,
+                        "order": LIST_CURSOR_ORDER,
+                        "next_after": next_after,
+                    }))
+                } else {
+                    let mut count_params = vec![SqlValue::Text(ns)];
+                    count_params.extend(count_status_params);
+                    let total_row = reader
+                        .query_scalar(SqlStatement {
+                            sql: count_sql,
+                            params: count_params,
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| sql_err("list atoms count", e))?;
+                    let total = match total_row {
+                        Some(SqlValue::Integer(n)) => n,
+                        _ => 0,
+                    };
+                    Ok(json!({
+                        "results": items,
+                        "total": total,
+                        "limit": limit,
+                        "offset": offset,
+                        "order": LIST_OFFSET_ORDER,
+                    }))
+                }
             }
-            Some(other) => Err(RuntimeError::InvalidInput(format!(
-                "unknown type {other:?}; valid: atom | domain"
-            ))),
         }
     }
 
@@ -1034,6 +1396,14 @@ mod tests {
     use khive_runtime::secret_gate::check;
     use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
     use khive_storage::SqlValue;
+
+    #[test]
+    fn key_only_list_projection_does_not_select_atom_content() {
+        let fields = vec!["id".to_string(), "slug".to_string()];
+        let columns = super::list_select_columns(Some(&fields));
+        assert_eq!(columns, "id, slug, created_at");
+        assert!(!columns.contains("content"));
+    }
 
     #[tokio::test]
     async fn get_prefix_query_plan_uses_primary_key_range_seeks() {

@@ -973,6 +973,61 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // portable 999-variable ceiling.
 const HYDRATION_ID_CHUNK: usize = 900;
 
+/// Build the atom hydration statement for one id chunk.
+///
+/// The `IN (...)` list runs off `knowledge_atoms`' primary key, so the
+/// namespace predicate is deliberately kept out of index selection with
+/// SQLite's unary `+` (`+namespace`): a scratch or freshly vacuumed store has
+/// no `sqlite_stat1`, and without statistics the planner's default guess for
+/// an indexed namespace equality (~10 rows) beats a 250+ id primary-key
+/// probe, so it picks `idx_knowledge_atoms_ns_created` and walks the whole
+/// namespace once per chunk instead of doing 250 point lookups. `+namespace`
+/// removes the column from consideration as an index term so the primary key
+/// wins regardless of table size or missing statistics. Do not remove it.
+fn hydrate_atoms_statement(ns: &str, ids: &[String]) -> SqlStatement {
+    let placeholders = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(ids.iter().cloned().map(SqlValue::Text));
+    SqlStatement {
+        sql: format!(
+            "SELECT id, slug, name, content, tags, finalized, status FROM knowledge_atoms \
+             WHERE id IN ({placeholders}) AND +namespace = ?1 AND deleted_at IS NULL"
+        ),
+        params,
+        label: None,
+    }
+}
+
+/// Build the domain hydration statement for one id chunk.
+///
+/// Same primary-key-first shape as [`hydrate_atoms_statement`], for the same
+/// reason: `knowledge_domains` also carries a namespace index
+/// (`idx_knowledge_domains_ns`) that the no-statistics planner would
+/// otherwise prefer over the primary key on a large id list.
+fn hydrate_domains_statement(ns: &str, ids: &[String]) -> SqlStatement {
+    let placeholders = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(ids.iter().cloned().map(SqlValue::Text));
+    SqlStatement {
+        sql: format!(
+            "SELECT id, slug, name, description, tags, status FROM knowledge_domains \
+             WHERE id IN ({placeholders}) AND +namespace = ?1 AND deleted_at IS NULL"
+        ),
+        params,
+        label: None,
+    }
+}
+
 /// Hydrate ANN-only hit shells from the canonical corpus tables.
 ///
 /// Returns the number of candidate rows that could not be hydrated. Missing
@@ -1006,25 +1061,7 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
 
     let mut atom_rows = Vec::new();
     for chunk in ids.chunks(HYDRATION_ID_CHUNK) {
-        let placeholders = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut params = vec![SqlValue::Text(ns.to_owned())];
-        params.extend(chunk.iter().cloned().map(SqlValue::Text));
-
-        match reader
-            .query_all(SqlStatement {
-                sql: format!(
-                    "SELECT id, slug, name, content, tags, finalized, status FROM knowledge_atoms WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
-                ),
-                params,
-                label: None,
-            })
-            .await
-        {
+        match reader.query_all(hydrate_atoms_statement(ns, chunk)).await {
             Ok(rows) => atom_rows.extend(rows),
             Err(error) => {
                 tracing::warn!(
@@ -1072,25 +1109,7 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
 
     let mut domain_rows = Vec::new();
     for chunk in missing_ids.chunks(HYDRATION_ID_CHUNK) {
-        let placeholders = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut params = vec![SqlValue::Text(ns.to_owned())];
-        params.extend(chunk.iter().cloned().map(SqlValue::Text));
-
-        match reader
-            .query_all(SqlStatement {
-                sql: format!(
-                    "SELECT id, slug, name, description, tags, status FROM knowledge_domains WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
-                ),
-                params,
-                label: None,
-            })
-            .await
-        {
+        match reader.query_all(hydrate_domains_statement(ns, chunk)).await {
             Ok(rows) => domain_rows.extend(rows),
             Err(error) => {
                 tracing::warn!(
@@ -3258,6 +3277,151 @@ mod tests {
         assert_eq!(failures, 0);
         assert_eq!(hits.len(), 1005);
         assert!(hits.iter().all(|hit| hit.slug.starts_with("hydrate-")));
+    }
+
+    /// Pins the production plan measured on the live store (179,809-row
+    /// `knowledge_atoms`, no `sqlite_stat1`): with 250 literal ids and no
+    /// `ANALYZE`, the planner must pick the primary-key auto-index, never a
+    /// namespace index. A scratch, statistics-free database reproduces the
+    /// same wrong-index choice the live store made, because the planner's
+    /// default no-statistics guess (an indexed equality is ~10 rows) is what
+    /// drove the original defect, not data volume.
+    #[tokio::test]
+    async fn hydrate_atoms_statement_plan_uses_primary_key_not_namespace_index() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let ids: Vec<String> = (0..250)
+            .map(|i| format!("aaaaaaaa-0000-0000-0000-{i:012}"))
+            .collect();
+
+        let mut reader = runtime.sql().reader().await.expect("plan reader");
+        let rows = reader
+            .explain(hydrate_atoms_statement("local", &ids))
+            .await
+            .expect("explain atom hydration statement");
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("USING INDEX sqlite_autoindex_knowledge_atoms_1")),
+            "atom hydration must seek the primary key: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("idx_knowledge_atoms_ns")),
+            "atom hydration must not fall back to a namespace index: {details:?}"
+        );
+    }
+
+    /// Domains twin of the atoms plan-pin above — same shape, same reason
+    /// (`knowledge_domains` also carries a namespace index that the
+    /// no-statistics planner would otherwise prefer).
+    #[tokio::test]
+    async fn hydrate_domains_statement_plan_uses_primary_key_not_namespace_index() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let ids: Vec<String> = (0..250)
+            .map(|i| format!("bbbbbbbb-0000-0000-0000-{i:012}"))
+            .collect();
+
+        let mut reader = runtime.sql().reader().await.expect("plan reader");
+        let rows = reader
+            .explain(hydrate_domains_statement("local", &ids))
+            .await
+            .expect("explain domain hydration statement");
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("USING INDEX sqlite_autoindex_knowledge_domains_1")
+            }),
+            "domain hydration must seek the primary key: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("idx_knowledge_domains_ns")),
+            "domain hydration must not fall back to a namespace index: {details:?}"
+        );
+    }
+
+    /// Functional companion to the plan-pin tests above: the primary-key-first
+    /// rewrite must not weaken namespace scoping. Seed atoms in two
+    /// namespaces, hydrate ids drawn from both against a single namespace,
+    /// and confirm the other namespace's row never comes back.
+    #[tokio::test]
+    async fn hydrate_atoms_statement_still_scopes_by_namespace() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES \
+                      ('90000000-0000-0000-0000-000000000001', 'local', 'local-one', \
+                       'Local One', 'local content', '[]', NULL, 1, 'reviewed', NULL, NULL, \
+                       1, 1, NULL), \
+                      ('90000000-0000-0000-0000-000000000002', 'local', 'local-two', \
+                       'Local Two', 'local content', '[]', NULL, 1, 'reviewed', NULL, NULL, \
+                       2, 2, NULL), \
+                      ('90000000-0000-0000-0000-000000000003', 'other', 'other-one', \
+                       'Other One', 'other content', '[]', NULL, 1, 'reviewed', NULL, NULL, \
+                       3, 3, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed cross-namespace atoms");
+        drop(writer);
+
+        let mut hits: Vec<ScoredHit> = [
+            "90000000-0000-0000-0000-000000000001",
+            "90000000-0000-0000-0000-000000000002",
+            "90000000-0000-0000-0000-000000000003",
+        ]
+        .iter()
+        .map(|id| ScoredHit {
+            id: id.to_string(),
+            slug: String::new(),
+            name: String::new(),
+            content: None,
+            tags: None,
+            finalized: false,
+            is_domain: false,
+            status: None,
+            score: 1.0,
+        })
+        .collect();
+
+        let failures = hydrate_empty_hits(&runtime, "local", &mut hits).await;
+        assert_eq!(
+            failures, 1,
+            "the other-namespace row must be reported as an unhydrated candidate"
+        );
+        assert_eq!(hits.len(), 2, "only the local-namespace rows may hydrate");
+        assert!(
+            hits.iter()
+                .all(|hit| hit.id != "90000000-0000-0000-0000-000000000003"),
+            "the other-namespace row must never be returned: {:?}",
+            hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
+        assert!(hits.iter().any(|hit| hit.slug == "local-one"));
+        assert!(hits.iter().any(|hit| hit.slug == "local-two"));
     }
 
     // ── embed-intent regression ───────────────────────────────────────────────

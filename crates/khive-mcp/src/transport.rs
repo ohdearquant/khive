@@ -15,6 +15,74 @@ use crate::server::KhiveMcpServer;
 
 type RequestId = rmcp::model::RequestId;
 
+#[cfg(not(test))]
+type OutstandingEntries = HashMap<RequestId, OutstandingRequest>;
+
+#[cfg(test)]
+mod counted_outstanding_entries {
+    use std::cell::Cell;
+
+    use super::{HashMap, OutstandingRequest, RequestId};
+
+    // Every method that reaches an element counts it; a traversal method,
+    // should one be added, must count each element it yields.
+    #[derive(Default)]
+    pub(super) struct OutstandingEntries {
+        inner: HashMap<RequestId, OutstandingRequest>,
+        element_touches: Cell<usize>,
+    }
+
+    impl OutstandingEntries {
+        fn record_element_touch(&self) {
+            self.element_touches.set(self.element_touches.get() + 1);
+        }
+
+        pub(super) fn contains_key(&self, id: &RequestId) -> bool {
+            self.record_element_touch();
+            self.inner.contains_key(id)
+        }
+
+        pub(super) fn get(&self, id: &RequestId) -> Option<&OutstandingRequest> {
+            self.record_element_touch();
+            self.inner.get(id)
+        }
+
+        pub(super) fn get_mut(&mut self, id: &RequestId) -> Option<&mut OutstandingRequest> {
+            self.record_element_touch();
+            self.inner.get_mut(id)
+        }
+
+        pub(super) fn remove(&mut self, id: &RequestId) -> Option<OutstandingRequest> {
+            self.record_element_touch();
+            self.inner.remove(id)
+        }
+
+        pub(super) fn insert(
+            &mut self,
+            id: RequestId,
+            obligation: OutstandingRequest,
+        ) -> Option<OutstandingRequest> {
+            self.record_element_touch();
+            self.inner.insert(id, obligation)
+        }
+
+        pub(super) fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        pub(super) fn is_empty(&self) -> bool {
+            self.inner.is_empty()
+        }
+
+        pub(super) fn take_element_touches(&self) -> usize {
+            self.element_touches.replace(0)
+        }
+    }
+}
+
+#[cfg(test)]
+use counted_outstanding_entries::OutstandingEntries;
+
 /// Outstanding request obligations in admission order.
 ///
 /// The map makes duplicate detection and retirement O(1) on average. Each
@@ -23,7 +91,7 @@ type RequestId = rmcp::model::RequestId;
 /// a linear scan when a response retires a newer request.
 #[derive(Default)]
 pub(crate) struct OutstandingRequests {
-    entries: HashMap<RequestId, OutstandingRequest>,
+    entries: OutstandingEntries,
     oldest: Option<RequestId>,
     newest: Option<RequestId>,
 }
@@ -346,6 +414,88 @@ pub(crate) const DEFAULT_MAX_OUTSTANDING_REQUESTS: usize = 1024;
 #[cfg(test)]
 mod outstanding_request_tests {
     use super::*;
+
+    const SMALL_POPULATION: usize = 64;
+    const LARGE_POPULATION: usize = 1024;
+
+    #[derive(Clone, Copy)]
+    struct TrackerWork {
+        contains: usize,
+        admit: usize,
+        retire: usize,
+        sweep: usize,
+    }
+
+    fn request_id(value: usize) -> RequestId {
+        RequestId::Number(i64::try_from(value).expect("test request id must fit in i64"))
+    }
+
+    fn populated_tracker(population: usize) -> OutstandingRequests {
+        let mut outstanding = OutstandingRequests::default();
+        let admitted_at = Instant::now();
+        for value in 0..population {
+            assert!(outstanding.admit(request_id(value), admitted_at, population));
+        }
+        outstanding.entries.take_element_touches();
+        outstanding
+    }
+
+    fn measure_tracker_work(population: usize) -> TrackerWork {
+        let mut outstanding = populated_tracker(population);
+
+        assert!(!outstanding.contains(&request_id(population + 1)));
+        let contains = outstanding.entries.take_element_touches();
+
+        assert!(outstanding.admit(request_id(population), Instant::now(), population + 1));
+        let admit = outstanding.entries.take_element_touches();
+
+        outstanding.retire(&request_id(population / 2));
+        let retire = outstanding.entries.take_element_touches();
+
+        outstanding.drop_stale(Some(std::time::Duration::from_secs(60)));
+        let sweep = outstanding.entries.take_element_touches();
+
+        TrackerWork {
+            contains,
+            admit,
+            retire,
+            sweep,
+        }
+    }
+
+    // Exact counts are the oracle: a counter that stops incrementing reads 0
+    // and a scan reads the population, so neither can pass as keyed work.
+    fn assert_keyed_work(
+        operation: &str,
+        expected_touches: usize,
+        small_touches: usize,
+        large_touches: usize,
+    ) {
+        assert!(
+            small_touches == expected_touches && large_touches == expected_touches,
+            "{operation} must touch exactly {expected_touches} element(s) at any population: \
+             {SMALL_POPULATION} entries touched {small_touches}, {LARGE_POPULATION} entries \
+             touched {large_touches}"
+        );
+    }
+
+    #[test]
+    fn outstanding_request_tracker_work_is_population_independent() {
+        let small = measure_tracker_work(SMALL_POPULATION);
+        let large = measure_tracker_work(LARGE_POPULATION);
+
+        // contains: one lookup. admit: the duplicate check, the newest link
+        // update, the insert. retire (middle): the removal plus both neighbour
+        // links. sweep with nothing stale: one look at the oldest entry.
+        for (operation, expected_touches, small_touches, large_touches) in [
+            ("contains", 1, small.contains, large.contains),
+            ("admit", 3, small.admit, large.admit),
+            ("retire", 3, small.retire, large.retire),
+            ("non-stale sweep", 1, small.sweep, large.sweep),
+        ] {
+            assert_keyed_work(operation, expected_touches, small_touches, large_touches);
+        }
+    }
 
     #[test]
     fn outstanding_request_tracker_rejects_admission_past_capacity() {
