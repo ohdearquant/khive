@@ -26,7 +26,7 @@ use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_state
 use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
 use khive_db::stores::note::note_hard_delete_statement;
-use khive_db::stores::text::insert_document_statement;
+use khive_db::stores::text::insert_document_statements;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
@@ -3764,7 +3764,14 @@ impl KhiveRuntime {
                     let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                 }
                 if let Ok(fts) = self.text_for_notes(token) {
-                    let _ = fts.delete_document(ns, note.id).await;
+                    if let Err(fts_err) = fts.delete_document(ns, note.id).await {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %fts_err,
+                            "compensating FTS delete failed after single-model embed failure; \
+                             the note row was already removed, but its FTS document may remain"
+                        );
+                    }
                 }
                 return Err(e);
             }
@@ -3807,7 +3814,15 @@ impl KhiveRuntime {
                         let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                     }
                     if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
+                        if let Err(fts_err) = fts.delete_document(ns, note.id).await {
+                            tracing::warn!(
+                                note_id = %note.id,
+                                error = %fts_err,
+                                "compensating FTS delete failed after multi-model embed \
+                                 failure; the note row was already removed, but its FTS \
+                                 document may remain"
+                            );
+                        }
                     }
                     return Err(e);
                 }
@@ -3835,7 +3850,15 @@ impl KhiveRuntime {
                         let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                     }
                     if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
+                        if let Err(fts_err) = fts.delete_document(ns, note.id).await {
+                            tracing::warn!(
+                                note_id = %note.id,
+                                error = %fts_err,
+                                "compensating FTS delete failed after a vector insert \
+                                 failure; the note row was already removed, but its FTS \
+                                 document may remain"
+                            );
+                        }
                     }
                     for m in &inserted_models {
                         if let Ok(vs) = self.vectors_for_model(token, m) {
@@ -3923,7 +3946,15 @@ impl KhiveRuntime {
                         let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                     }
                     if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
+                        if let Err(fts_err) = fts.delete_document(ns, note.id).await {
+                            tracing::warn!(
+                                note_id = %note.id,
+                                error = %fts_err,
+                                "compensating FTS delete failed after an annotates-link \
+                                 failure; the note row was already removed, but its FTS \
+                                 document may remain"
+                            );
+                        }
                     }
                     for model_name in &embed_model_names {
                         if let Ok(vs) = self.vectors_for_model(token, model_name) {
@@ -6290,28 +6321,29 @@ impl KhiveRuntime {
             .iter()
             .enumerate()
             .map(|(index, entity)| {
-                let mut fts_statement =
-                    insert_document_statement("fts_entities", &entity_fts_document(entity));
-                if injected_failure_index == Some(index) {
-                    fts_statement = SqlStatement {
+                let fts_statements: Vec<SqlStatement> = if injected_failure_index == Some(index) {
+                    vec![SqlStatement {
                         sql: "INSERT INTO __khive_create_many_injected_failure__ DEFAULT VALUES"
                             .to_string(),
                         params: vec![],
                         label: Some("fts-insert-injected-failure".to_string()),
-                    };
-                }
+                    }]
+                } else {
+                    // Order-sensitive pair — see `insert_document_statements`'s
+                    // adjacency contract.
+                    insert_document_statements("fts_entities", &entity_fts_document(entity)).into()
+                };
+                let mut statements = vec![PlanStatement {
+                    statement: entity_upsert_statement(entity),
+                    guard: Some(AffectedRowGuard::exactly(1)),
+                }];
+                statements.extend(fts_statements.into_iter().map(|statement| PlanStatement {
+                    statement,
+                    guard: None,
+                }));
                 AtomicOpPlan::AddEntity(AddEntityPlan {
                     entity_id: entity.id,
-                    statements: vec![
-                        PlanStatement {
-                            statement: entity_upsert_statement(entity),
-                            guard: Some(AffectedRowGuard::exactly(1)),
-                        },
-                        PlanStatement {
-                            statement: fts_statement,
-                            guard: None,
-                        },
-                    ],
+                    statements,
                     post_commit: PostCommitEffect::None,
                 })
             })

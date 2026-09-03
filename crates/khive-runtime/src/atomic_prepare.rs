@@ -54,7 +54,7 @@ use khive_db::stores::note::{
     note_hard_delete_statement, note_replace_if_unchanged_statement, note_soft_delete_statement,
     note_upsert_statement,
 };
-use khive_db::stores::text::insert_document_statement;
+use khive_db::stores::text::{delete_document_statements, insert_document_statements};
 
 // ---------------------------------------------------------------------------
 // arg extraction helpers
@@ -251,7 +251,13 @@ fn vector_table_names(runtime: &KhiveRuntime) -> Vec<String> {
 
 /// A guarded (`guard: None` — best-effort mirror, matching the non-atomic
 /// index-cleanup calls which don't assert a row existed) `DELETE` statement
-/// against one FTS or vector table for a single subject, scoped by namespace.
+/// against one vector table for a single subject, scoped by namespace.
+///
+/// Vector tables carry a real index on `(subject_id, namespace)`
+/// ([`khive_db::stores::vectors`]) — this row-scan predicate is not the FTS
+/// full-table-scan class this module's `purge_fts_document_statements`
+/// exists to avoid, so it is left as a direct `namespace = ? AND subject_id =
+/// ?` predicate.
 fn purge_index_row_statement(
     table: &str,
     namespace: &str,
@@ -269,6 +275,33 @@ fn purge_index_row_statement(
         },
         guard: None,
     }
+}
+
+/// The FTS-document half of an index purge: `fts_table`'s row for `subject_id`
+/// (looked up via `khive_db::stores::text::rowid_map_table`, not a
+/// `namespace`/`subject_id` scan — those columns are `UNINDEXED` in every
+/// FTS5 DDL) plus that row's own entry in the sidecar map. Order-sensitive:
+/// index 0 must run before index 1 — see `delete_document_statements`'s
+/// adjacency contract.
+fn purge_fts_document_statements(
+    fts_table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+    label_prefix: &str,
+) -> [PlanStatement; 2] {
+    let [mut fts_stmt, mut map_stmt] = delete_document_statements(fts_table, namespace, subject_id);
+    fts_stmt.label = Some(label_prefix.to_string());
+    map_stmt.label = Some(format!("{label_prefix}-map"));
+    [
+        PlanStatement {
+            statement: fts_stmt,
+            guard: None,
+        },
+        PlanStatement {
+            statement: map_stmt,
+            guard: None,
+        },
+    ]
 }
 
 fn log_vector_row_delete_statement(
@@ -339,7 +372,7 @@ async fn push_index_purge_statements(
     subject_id: Uuid,
     label_prefix: &str,
 ) -> RuntimeResult<()> {
-    statements.push(purge_index_row_statement(
+    statements.extend(purge_fts_document_statements(
         fts_table,
         namespace,
         subject_id,
@@ -512,16 +545,19 @@ pub async fn prepare_add_entity(
         entity = entity.with_tags(tags);
     }
 
-    let statements = vec![
-        PlanStatement {
-            statement: entity_upsert_statement(&entity),
-            guard: Some(AffectedRowGuard::exactly(1)),
-        },
-        PlanStatement {
-            statement: insert_document_statement("fts_entities", &entity_fts_document(&entity)),
+    let mut statements = vec![PlanStatement {
+        statement: entity_upsert_statement(&entity),
+        guard: Some(AffectedRowGuard::exactly(1)),
+    }];
+    // Order-sensitive pair — see `insert_document_statements`'s adjacency
+    // contract: the map upsert's `last_insert_rowid()` must read back the
+    // FTS insert immediately before it.
+    for statement in insert_document_statements("fts_entities", &entity_fts_document(&entity)) {
+        statements.push(PlanStatement {
+            statement,
             guard: None,
-        },
-    ];
+        });
+    }
 
     Ok(AtomicOpPlan::AddEntity(AddEntityPlan {
         entity_id: entity.id,
@@ -573,16 +609,18 @@ pub async fn prepare_add_note(
         note = note.with_properties(p);
     }
 
-    let statements = vec![
-        PlanStatement {
-            statement: note_upsert_statement(&note),
-            guard: Some(AffectedRowGuard::exactly(1)),
-        },
-        PlanStatement {
-            statement: insert_document_statement("fts_notes", &note_fts_document(&note)),
+    let mut statements = vec![PlanStatement {
+        statement: note_upsert_statement(&note),
+        guard: Some(AffectedRowGuard::exactly(1)),
+    }];
+    // Order-sensitive pair — see `insert_document_statements`'s adjacency
+    // contract.
+    for statement in insert_document_statements("fts_notes", &note_fts_document(&note)) {
+        statements.push(PlanStatement {
+            statement,
             guard: None,
-        },
-    ];
+        });
+    }
 
     Ok(AtomicOpPlan::AddNote(AddNotePlan {
         note_id: note.id,
