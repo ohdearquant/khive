@@ -125,7 +125,7 @@ pub enum AuditTerminalReason {
     /// because a row counted here may still commit, unlike one refused
     /// before enqueue.
     AdmissionDeadlineExpired,
-    /// Reached only through [`AuditBatch::submit_until_resolved`]: the row's
+    /// Reached only through `AuditBatch::submit_until_resolved`: the row's
     /// [`Self::AdmissionDeadlineExpired`] wait had already elapsed, and this
     /// caller's own `AuditBatchConfig::resolution_deadline` then also
     /// elapsed still waiting for the row's real generation outcome. The
@@ -204,7 +204,7 @@ pub struct AuditBatchConfig {
     pub max_commit_attempts: std::num::NonZeroU8,
     pub retry_backoff: Duration,
     pub admission_deadline: Duration,
-    /// Caps how much longer [`AuditBatch::submit_until_resolved`] keeps
+    /// Caps how much longer `AuditBatch::submit_until_resolved` keeps
     /// waiting on a row's real generation outcome once `admission_deadline`
     /// has already elapsed on it. Without this bound a generation stuck on a
     /// stalled `EventStore::append_events_idempotent` call retains the
