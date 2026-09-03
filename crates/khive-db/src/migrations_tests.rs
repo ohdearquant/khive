@@ -2007,7 +2007,7 @@ fn v25_repairs_knowledge_fts_and_makes_atom_lifecycle_symmetric() {
 
     assert_eq!(
         run_migrations(&mut conn).expect("apply V25 knowledge FTS repair"),
-        25
+        latest_schema_version()
     );
     conn.execute(
         "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",

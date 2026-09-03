@@ -21,30 +21,23 @@ pub struct KnowledgeReindexOptions {
     pub drop_existing: bool,
     /// Rebuild the atom Vamana ANN snapshot (only meaningful with `atoms`).
     pub rebuild_ann: bool,
-    /// Rebuild and rank-1 integrity-check both external-content knowledge FTS
-    /// indexes (`fts_knowledge`, `fts_sections`). These indexes are global —
-    /// not scoped to `token`'s namespace — so this is independent of `atoms`
-    /// and `sections` and runs even when both are false.
-    pub rebuild_fts: bool,
     /// Records per embedding batch.
     pub batch_size: Option<u32>,
 }
 
 /// Reindex the knowledge corpus for `token`'s namespace: embed atoms and/or
 /// sections with the default embedder and (optionally) rebuild the atom Vamana
-/// ANN snapshot and external-content FTS indexes.
+/// ANN snapshot.
 ///
-/// Library entry for `kkernel reindex` — callable without an MCP server. This
-/// is the ONLY entry point for `rebuild_fts`: the `knowledge.index` MCP verb
-/// does not accept it, because rebuilding both FTS indexes is a whole-database
-/// operation regardless of the caller's namespace, and the ordinary verb has
-/// no per-caller admission control to bound that cost.
+/// Library entry for `kkernel reindex` — callable without an MCP server. Every
+/// effect is scoped to `token`'s namespace; the whole-database FTS rebuild is
+/// deliberately not an option here but a separate operator entry point,
+/// [`rebuild_knowledge_fts_indexes`], so that holding a namespace token never
+/// grants a cost that spans every namespace.
 ///
 /// Knowledge is single-model: atom indexing, section indexing, and search all
 /// use the default embedder. Returns `{atoms_indexed, sections_indexed, failed,
-/// ann_failed, fts_rebuild, sections_failed, truncation_by_model}`, where
-/// `fts_rebuild` is `null` unless `rebuild_fts` was requested, in which case it
-/// is `{indexes, elapsed_ms, integrity_ok}`.
+/// ann_failed, sections_failed, truncation_by_model}`.
 ///
 /// Optional progress callbacks receive `(processed, total)` after each batch.
 pub async fn reindex_knowledge(
@@ -127,19 +120,27 @@ pub async fn reindex_knowledge(
         }
     }
 
-    let fts_rebuild = if opts.rebuild_fts {
-        Some(knowledge::index_handler::rebuild_fts_indexes(runtime).await?)
-    } else {
-        None
-    };
-
     Ok(json!({
         "atoms_indexed": atoms_indexed,
         "sections_indexed": sections_indexed,
         "failed": failed,
         "ann_failed": ann_failed,
-        "fts_rebuild": fts_rebuild,
         "sections_failed": sections_failed,
         "truncation_by_model": truncation_by_model,
     }))
+}
+
+/// Rebuild and rank-1 integrity-check both external-content knowledge FTS
+/// indexes (`fts_knowledge`, `fts_sections`).
+///
+/// Operator entry point for `kkernel reindex --rebuild-fts`. Both indexes are
+/// global — they cover every namespace in the database — so this takes no
+/// namespace token and is never reachable from a namespace-scoped verb: the
+/// `knowledge.index` MCP verb does not accept it, and [`reindex_knowledge`]
+/// does not offer it as an option, because neither has per-caller admission
+/// control to bound a whole-database cost. The writer batch is atomic, and the
+/// returned `{indexes, elapsed_ms, integrity_ok}` reports what the rebuild
+/// actually did.
+pub async fn rebuild_knowledge_fts_indexes(runtime: &KhiveRuntime) -> Result<Value, RuntimeError> {
+    knowledge::index_handler::rebuild_fts_indexes(runtime).await
 }

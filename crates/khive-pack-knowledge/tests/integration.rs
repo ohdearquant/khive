@@ -2132,18 +2132,17 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
 
 // ── delete_atoms ──────────────────────────────────────────────────────────────
 
-// `knowledge.index` deliberately does not accept `rebuild_fts` — rebuilding
+// `knowledge.index` deliberately does not accept a FTS rebuild — rebuilding
 // both global FTS indexes is a whole-database operation with no per-caller
-// cost admission on the ordinary verb, so the only entry point is
-// `khive_pack_knowledge::reindex_knowledge` (the same library call
-// `kkernel reindex --rebuild-fts` uses), not the MCP verb dispatch this
-// fixture drives for every other test in this file.
+// cost admission on the ordinary verb, and the namespace-scoped
+// `reindex_knowledge` options do not offer it either. The only entry point is
+// the operator call `khive_pack_knowledge::rebuild_knowledge_fts_indexes`
+// (what `kkernel reindex --rebuild-fts` uses), which takes no namespace
+// token, not the MCP verb dispatch this fixture drives for every other test
+// in this file.
 #[tokio::test]
 async fn index_rebuild_fts_repairs_atom_and_section_external_content_drift() {
     let runtime = rt();
-    let token = runtime
-        .authorize(khive_types::Namespace::local())
-        .expect("authorize");
     let atom_id = "22730000-0000-4000-8000-000000000001";
 
     let mut writer = runtime.sql().writer().await.expect("knowledge writer");
@@ -2192,25 +2191,11 @@ async fn index_rebuild_fts_repairs_atom_and_section_external_content_drift() {
         .expect("seed and deliberately desynchronize both knowledge FTS indexes");
     drop(writer);
 
-    let result = khive_pack_knowledge::reindex_knowledge(
-        &runtime,
-        &token,
-        khive_pack_knowledge::KnowledgeReindexOptions {
-            atoms: false,
-            sections: false,
-            drop_existing: true,
-            rebuild_ann: false,
-            rebuild_fts: true,
-            batch_size: None,
-        },
-        None,
-        None,
-    )
-    .await
-    .expect("knowledge FTS repair must succeed");
-    let fts_rebuild = &result["fts_rebuild"];
-    assert_eq!(fts_rebuild["integrity_ok"], true, "repair result: {result}");
-    let indexes: Vec<&str> = fts_rebuild["indexes"]
+    let result = khive_pack_knowledge::rebuild_knowledge_fts_indexes(&runtime)
+        .await
+        .expect("knowledge FTS repair must succeed");
+    assert_eq!(result["integrity_ok"], true, "repair result: {result}");
+    let indexes: Vec<&str> = result["indexes"]
         .as_array()
         .expect("indexes array")
         .iter()
@@ -2221,9 +2206,9 @@ async fn index_rebuild_fts_repairs_atom_and_section_external_content_drift() {
         vec!["fts_knowledge", "fts_sections"],
         "repair result: {result}"
     );
-    assert_eq!(
-        result["atoms_indexed"], 0,
-        "atoms=false, sections=false must permit FTS-only maintenance: {result}"
+    assert!(
+        result.get("atoms_indexed").is_none(),
+        "the rebuild is FTS-only maintenance and reports no embedding work: {result}"
     );
 
     let mut reader = runtime.sql().reader().await.expect("knowledge reader");

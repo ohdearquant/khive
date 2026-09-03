@@ -233,7 +233,7 @@ impl KnowledgeHandlers {
 /// Not reachable from the `knowledge.index` MCP verb: rebuilding both indexes
 /// touches the whole database regardless of the caller's namespace, so the
 /// only entry point is the `kkernel reindex` operator CLI, via
-/// [`crate::reindex_knowledge`]. The returned value reports what the rebuild
+/// [`crate::rebuild_knowledge_fts_indexes`]. The returned value reports what the rebuild
 /// actually did — index names, wall time, and the integrity-check outcome —
 /// so that CLI path never has to promise a rebuild happened without evidence.
 pub(crate) async fn rebuild_fts_indexes(runtime: &KhiveRuntime) -> Result<Value, RuntimeError> {
