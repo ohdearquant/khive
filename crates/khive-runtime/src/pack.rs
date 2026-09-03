@@ -4062,7 +4062,7 @@ pub(crate) mod tests {
     use crate::ActorRef;
     use khive_types::Pack;
 
-    /// Verbs known, by prior review (khive#2147/khive#2217 round 1), to have
+    /// Verbs known (khive#2147/khive#2217) to have
     /// their own accounting-bearing side effect despite being declared
     /// `VerbCategory::Assertive` — see [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s
     /// doc for why each is excluded. `VerbCategory::Assertive` alone cannot
@@ -4111,7 +4111,7 @@ pub(crate) mod tests {
             assert!(
                 !KNOWN_INCIDENTAL_WRITE_VERBS.contains(verb),
                 "admission-degrade-safe verb {verb:?} is a known incidental-write verb \
-                 (khive#2147/khive#2217 round 1); it must not be re-added to \
+                 (khive#2147/khive#2217); it must not be re-added to \
                  ADMISSION_DEGRADE_SAFE_VERBS even though it is VerbCategory::Assertive"
             );
             // Anchored to exactly 8 leading spaces: that is the indentation

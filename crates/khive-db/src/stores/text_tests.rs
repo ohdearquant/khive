@@ -187,9 +187,9 @@ async fn test_phrase_search() {
     assert_eq!(hits.len(), 2);
 }
 
-/// Round 2 review finding 3: a stale map entry — left behind by a crash
-/// between an FTS-row delete and its own map-row delete, before this fix —
-/// must not make `get_document`/`delete_document` operate on whatever
+/// A stale map entry — left behind by a crash between an FTS-row delete and
+/// its own map-row delete — must not make `get_document`/`delete_document`
+/// operate on whatever
 /// unrelated document FTS5 later reuses that freed rowid for. Seeds A,
 /// removes A's FTS row directly via raw SQL while leaving its map entry
 /// dangling (reproducing the crash window), inserts B at the exact freed
@@ -275,22 +275,110 @@ async fn stale_map_entry_never_returns_or_deletes_the_wrong_document() {
     );
 }
 
-/// Round 3 review: `delete_document_dml`'s unmanaged (no-writer-task) path
-/// wraps the FTS-row delete and the map-row delete in one explicit `BEGIN
-/// IMMEDIATE` / `COMMIT` / `ROLLBACK` block (`Fts5TextSearch::delete_document`'s
-/// fallback, used when `current_writer_task` returns `None`) so a failure
-/// between the two statements rolls both back together instead of leaving the
-/// FTS row deleted while its map row survives. Forces that failure via the
-/// `delete_dml_test_seam` flag and asserts on the raw rows that neither
-/// statement's effect was left half-committed, then clears the seam and
-/// confirms a real delete still removes both rows.
-///
-/// `#[serial_test::serial]`: the seam flag is a process-wide `AtomicBool`
-/// (see `delete_dml_test_seam`'s doc comment for why), so this test cannot
-/// run concurrently with anything else that calls `delete_document` on the
-/// unmanaged path.
+/// The batch upsert path (`batch_upsert_documents_dml`) must recheck the
+/// same key predicate the single-row delete already does: a stale map entry
+/// for A pointing at a rowid B now occupies must not let `upsert_documents`
+/// delete B while re-inserting A. Reproduces the same crash-window setup as
+/// `stale_map_entry_never_returns_or_deletes_the_wrong_document` above, then
+/// drives the fix via the batch path instead of the single-document path.
 #[tokio::test]
-#[serial_test::serial(delete_dml_test_seam)]
+async fn batch_upsert_never_deletes_the_wrong_document_via_a_stale_map_entry() {
+    let store = setup_memory_store("stale_map_batch_upsert");
+    let ns = "test_ns";
+
+    let a = Uuid::new_v4();
+    store
+        .upsert_document(make_document(a, "Doc A", "first document"))
+        .await
+        .unwrap();
+
+    let table = store.table_name.clone();
+    let a_rowid: i64 = {
+        let writer = store.pool.writer().unwrap();
+        let rowid: i64 = writer
+            .conn()
+            .query_row(
+                &format!("SELECT rowid FROM {table} WHERE subject_id = ?1"),
+                rusqlite::params![a.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read A's rowid");
+        writer
+            .conn()
+            .execute(
+                &format!("DELETE FROM {table} WHERE rowid = ?1"),
+                rusqlite::params![rowid],
+            )
+            .expect("delete A's FTS row directly, leaving its map entry stale");
+        rowid
+    };
+
+    let b = Uuid::new_v4();
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {table} \
+                     (rowid, subject_id, kind, title, body, tags, namespace, metadata, \
+                      updated_at, record_kind) \
+                     VALUES (?1, ?2, 'note', '', 'second document', '[]', ?3, NULL, 0, NULL)"
+                ),
+                rusqlite::params![a_rowid, b.to_string(), ns],
+            )
+            .expect("insert B reusing A's freed rowid");
+        writer
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {table}_rowids (namespace, subject_id, rowid) VALUES (?1, ?2, ?3)"
+                ),
+                rusqlite::params![ns, b.to_string(), a_rowid],
+            )
+            .expect("insert B's own map entry");
+    }
+
+    let summary = store
+        .upsert_documents(vec![make_document(a, "Doc A v2", "updated document")])
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.failed, 0,
+        "the batch upsert itself must succeed, got {summary:?}"
+    );
+    assert_eq!(summary.affected, 1);
+
+    let fetched_b = store.get_document(ns, b).await.unwrap();
+    assert!(
+        fetched_b.is_some(),
+        "a stale map entry for A must not let batch upsert delete B's row, got None"
+    );
+    assert_eq!(fetched_b.unwrap().body, "second document");
+
+    let fetched_a = store.get_document(ns, a).await.unwrap();
+    assert!(
+        fetched_a.is_some(),
+        "A must be inserted and correctly mapped by the batch upsert"
+    );
+    assert_eq!(fetched_a.unwrap().body, "updated document");
+}
+
+/// `delete_document_dml`'s unmanaged (no-writer-task) path wraps the FTS-row
+/// delete and the map-row delete in one explicit `BEGIN IMMEDIATE` / `COMMIT`
+/// / `ROLLBACK` block (`Fts5TextSearch::delete_document`'s fallback, used
+/// when `current_writer_task` returns `None`) so a failure between the two
+/// statements rolls both back together instead of leaving the FTS row
+/// deleted while its map row survives. Forces that failure via the
+/// `delete_dml_test_seam` for this test's own `(ns, a)` key and asserts on
+/// the raw rows that neither statement's effect was left half-committed,
+/// then disarms the seam and confirms a real delete still removes both rows.
+///
+/// No `#[serial_test::serial]` needed: the seam only fires for the armed
+/// `(namespace, subject_id)` key, so a concurrent test operating on a
+/// different key (e.g. `test_delete_document`) is unaffected even while this
+/// test's seam is armed.
+#[tokio::test]
 async fn unmanaged_delete_rolls_back_the_fts_row_when_the_map_delete_fails() {
     let store = setup_memory_store("unmanaged_delete_rollback");
     assert!(
@@ -316,12 +404,11 @@ async fn unmanaged_delete_rolls_back_the_fts_row_when_the_map_delete_fails() {
     struct ResetSeamOnDrop;
     impl Drop for ResetSeamOnDrop {
         fn drop(&mut self) {
-            delete_dml_test_seam::FAIL_BEFORE_MAP_DELETE
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            delete_dml_test_seam::disarm();
         }
     }
     let reset_seam = ResetSeamOnDrop;
-    delete_dml_test_seam::FAIL_BEFORE_MAP_DELETE.store(true, std::sync::atomic::Ordering::SeqCst);
+    delete_dml_test_seam::arm(ns, a);
 
     let result = store.delete_document(ns, a).await;
     assert!(

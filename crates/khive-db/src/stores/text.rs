@@ -37,17 +37,36 @@ pub fn rowid_map_table(table: &str) -> String {
     format!("{table}_rowids")
 }
 
-/// DDL for [`rowid_map_table`]'s sidecar. `IF NOT EXISTS` so every creation
-/// site (backend ensure-path, migrations, test helpers) can call it
-/// unconditionally. `table` must already be a trusted, sanitized table name.
+/// Name of [`rowid_map_table`]'s own state sidecar: a `key -> value` table
+/// recording whether the map's one-time legacy backfill has completed, so
+/// completion is a durable, transactionally-written fact instead of being
+/// inferred from the map's row count.
+pub fn rowid_map_state_table(table: &str) -> String {
+    format!("{}_state", rowid_map_table(table))
+}
+
+/// Value of the `backfill` key in [`rowid_map_state_table`] once
+/// `ensure_fts_rowid_map_backfilled` has completed a full reconciliation
+/// pass over `table`.
+pub const ROWID_MAP_BACKFILL_COMPLETE: &str = "complete";
+
+/// DDL for [`rowid_map_table`]'s sidecar and its [`rowid_map_state_table`].
+/// `IF NOT EXISTS` so every creation site (backend ensure-path, migrations,
+/// test helpers) can call it unconditionally. `table` must already be a
+/// trusted, sanitized table name.
 pub fn rowid_map_ddl(table: &str) -> String {
     let map = rowid_map_table(table);
+    let state = rowid_map_state_table(table);
     format!(
         "CREATE TABLE IF NOT EXISTS {map} (\
          namespace TEXT NOT NULL, \
          subject_id TEXT NOT NULL, \
          rowid INTEGER NOT NULL, \
          PRIMARY KEY (namespace, subject_id)\
+         ) WITHOUT ROWID; \
+         CREATE TABLE IF NOT EXISTS {state} (\
+         key TEXT PRIMARY KEY, \
+         value TEXT NOT NULL\
          ) WITHOUT ROWID"
     )
 }
@@ -922,17 +941,38 @@ fn build_filter_clause(
 /// mid-transaction. Compiles to nothing outside `#[cfg(test)]` — production
 /// code never reads this flag.
 ///
-/// A process-wide `AtomicBool` rather than a thread-local: the unmanaged
-/// path runs the DML closure inside `tokio::task::spawn_blocking`
-/// (`with_writer_unmanaged`), on a worker thread distinct from the test's
-/// own thread, so a thread-local set by the test would never be observed by
-/// the closure. Callers must serialize against this flag (e.g.
-/// `#[serial_test::serial]`) since it is shared across concurrently running
-/// tests.
+/// A process-wide `Mutex<Option<(String, Uuid)>>` rather than a
+/// thread-local: the unmanaged path runs the DML closure inside
+/// `tokio::task::spawn_blocking` (`with_writer_unmanaged`), on a worker
+/// thread distinct from the test's own thread, so a thread-local set by the
+/// test would never be observed by the closure. The stored value is the
+/// exact `(namespace, subject_id)` the seam should target — `delete_document_dml`
+/// only forces the failure when its own arguments match, so an unrelated
+/// delete running concurrently (e.g. `test_delete_document`, which is not
+/// `#[serial]` against this seam) on a different key is unaffected even
+/// while another test's seam target is armed.
 #[cfg(test)]
 pub(crate) mod delete_dml_test_seam {
-    pub(crate) static FAIL_BEFORE_MAP_DELETE: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    pub(crate) static TARGET: Mutex<Option<(String, Uuid)>> = Mutex::new(None);
+
+    pub(crate) fn arm(namespace: &str, subject_id: Uuid) {
+        *TARGET.lock().unwrap() = Some((namespace.to_string(), subject_id));
+    }
+
+    pub(crate) fn disarm() {
+        *TARGET.lock().unwrap() = None;
+    }
+
+    pub(crate) fn matches(namespace: &str, subject_id: Uuid) -> bool {
+        TARGET
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(ns, id)| ns == namespace && *id == subject_id)
+    }
 }
 
 /// DML-only single-document delete shared by both the legacy (flag-off) and
@@ -942,7 +982,7 @@ pub(crate) mod delete_dml_test_seam {
 /// enclosing transaction. Both statements (the FTS row, looked up through
 /// the map, then the map row itself) must commit atomically: a crash
 /// between them would leave the map pointing at a rowid FTS5 may later
-/// reuse for a different document (round 2 review finding 1).
+/// reuse for a different document.
 fn delete_document_dml(
     conn: &rusqlite::Connection,
     table: &str,
@@ -957,7 +997,7 @@ fn delete_document_dml(
     drop(stmt);
 
     #[cfg(test)]
-    if delete_dml_test_seam::FAIL_BEFORE_MAP_DELETE.load(std::sync::atomic::Ordering::SeqCst) {
+    if delete_dml_test_seam::matches(namespace, subject_id) {
         return Err(SqliteError::InvalidData(
             "delete_document_dml test seam: forced failure between the FTS-row \
              delete and the map-row delete"
@@ -1014,10 +1054,15 @@ fn batch_upsert_documents_dml(
 ) -> Result<BatchWriteSummary, rusqlite::Error> {
     let map = rowid_map_table(table);
     // Delete via the map's primary key instead of a `namespace`/`subject_id`
-    // scan of the (UNINDEXED on those columns) FTS table itself.
+    // scan of the (UNINDEXED on those columns) FTS table itself. The trailing
+    // `AND namespace = ?1 AND subject_id = ?2` re-checks the key on the
+    // rowid-narrowed candidate row: a stale map entry pointing at a rowid
+    // FTS5 has since reused for a different document must delete zero rows,
+    // not that unrelated document (mirrors `delete_document_statement`).
     let del_sql = format!(
         "DELETE FROM {table} WHERE rowid IN \
-         (SELECT rowid FROM {map} WHERE namespace = ?1 AND subject_id = ?2)"
+         (SELECT rowid FROM {map} WHERE namespace = ?1 AND subject_id = ?2) \
+         AND namespace = ?1 AND subject_id = ?2"
     );
     let ins_sql = format!(
         "INSERT INTO {} \
@@ -1202,7 +1247,7 @@ impl TextSearch for Fts5TextSearch {
         // both statements in one explicit transaction: a crash between the
         // FTS-row delete and the map-row delete must never persist only one
         // of the two, or a later insert could reuse the freed rowid while
-        // the map still points at it (round 2 review finding 1).
+        // the map still points at it.
         if let Some(writer_task) = self.current_writer_task("fts_delete")? {
             let table2 = table.clone();
             let namespace2 = namespace.clone();

@@ -52,6 +52,23 @@ CREATE TABLE IF NOT EXISTS fts_notes_rowids (
     PRIMARY KEY (namespace, subject_id)
 ) WITHOUT ROWID;
 
+-- Durable completion marker for each map, checked by
+-- `ensure_fts_rowid_map_backfilled` in place of inferring completeness from
+-- the map's row count (a map can legitimately be empty for a table with no
+-- rows yet, which is indistinguishable from "never backfilled" by row count
+-- alone). Written in the same transaction as this migration's own backfill
+-- below, so a database migrated through V24 never re-scans its FTS tables at
+-- runtime.
+CREATE TABLE IF NOT EXISTS fts_entities_rowids_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS fts_notes_rowids_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+
 INSERT OR REPLACE INTO fts_entities_rowids (namespace, subject_id, rowid)
 SELECT namespace, subject_id, rowid FROM fts_entities
 WHERE namespace IS NOT NULL AND subject_id IS NOT NULL
@@ -99,3 +116,8 @@ DELETE FROM fts_notes_rowids
 WHERE NOT EXISTS (
     SELECT 1 FROM fts_notes WHERE fts_notes.rowid = fts_notes_rowids.rowid
 );
+
+-- Mark both backfills complete in this same transaction: a migrated
+-- database's rowid maps never need the runtime backfill to re-scan.
+INSERT OR REPLACE INTO fts_entities_rowids_state (key, value) VALUES ('backfill', 'complete');
+INSERT OR REPLACE INTO fts_notes_rowids_state (key, value) VALUES ('backfill', 'complete');

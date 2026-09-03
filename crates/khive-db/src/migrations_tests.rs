@@ -1362,7 +1362,7 @@ fn v24_rowid_map_backfills_dedups_and_sweeps_orphans() {
     assert_eq!(mapped_rowid, 200);
 }
 
-/// Round 2 review finding 4: a legacy FTS row with NULL `namespace`/
+/// A legacy FTS row with NULL `namespace`/
 /// `subject_id` (permitted — both are UNINDEXED FTS5 columns) cannot be
 /// attributed to a (namespace, subject_id) key at all. It must survive V24
 /// completely unmapped: neither backfilled into the map (impossible — the
@@ -1411,7 +1411,7 @@ fn v24_null_key_fts_row_survives_unmapped() {
     );
 }
 
-/// Round 2 review finding 5: the orphan sweep's `NOT EXISTS` predicate must
+/// The orphan sweep's `NOT EXISTS` predicate must
 /// stay NULL-safe (a NULL `entities.id`/`notes.id` row must not silence the
 /// sweep of a genuine orphan the way the old `subject_id NOT IN (...)` form
 /// did) and namespace-scoped (a subject that exists only in a DIFFERENT
@@ -1490,7 +1490,7 @@ fn v24_orphan_sweep_is_null_safe_and_namespace_scoped() {
     );
 }
 
-/// Round 2 review finding 6: FTS5 rowid is not a write timestamp — explicit
+/// FTS5 rowid is not a write timestamp — explicit
 /// rowids are legal and V23's replacement-table repopulation carries no
 /// ORDER BY. The backfill must choose the survivor by `updated_at`, with
 /// rowid only as a tie-break, not by rowid alone.
@@ -1549,6 +1549,96 @@ fn v24_backfill_survivor_is_chosen_by_updated_at_not_rowid() {
         )
         .expect("read note-id map entry");
     assert_eq!(mapped_rowid, 100);
+}
+
+/// `ORDER BY updated_at ASC, rowid ASC` feeding `INSERT OR REPLACE` means an
+/// exact `updated_at` tie is broken by rowid: the higher rowid is processed
+/// last and wins the map entry. Reversing or dropping the rowid tie-breaker
+/// would leave `v24_backfill_survivor_is_chosen_by_updated_at_not_rowid`
+/// (unequal timestamps) green while changing this specified behavior.
+#[test]
+fn v24_backfill_survivor_on_equal_updated_at_is_the_higher_rowid() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, status, content, created_at, updated_at) \
+         VALUES ('note-id', 'local', 'memory', 'active', 'content', 1, 1)",
+        [],
+    )
+    .expect("insert live note");
+
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (100, 'note-id', 'note', '', 'lower rowid body', '[]', 'local', NULL, 500, 'memory')",
+        [],
+    )
+    .expect("insert lower-rowid fts_notes row");
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (200, 'note-id', 'note', '', 'higher rowid body', '[]', 'local', NULL, 500, 'memory')",
+        [],
+    )
+    .expect("insert higher-rowid fts_notes row with the SAME updated_at");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        24
+    );
+
+    let surviving_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes WHERE subject_id = 'note-id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read surviving fts_notes row for note-id");
+    assert_eq!(
+        surviving_rowid, 200,
+        "an exact updated_at tie must be broken toward the higher rowid"
+    );
+
+    let mapped_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes_rowids WHERE namespace = 'local' AND subject_id = 'note-id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read note-id map entry");
+    assert_eq!(mapped_rowid, 200);
+}
+
+/// Migration 024 writes a durable completion marker for each map's own
+/// state sidecar in the same transaction as its backfill, so a migrated
+/// database's runtime `ensure_fts_rowid_map_backfilled` short-circuit never
+/// re-scans `fts_entities`/`fts_notes`.
+#[test]
+fn v24_leaves_both_backfill_markers_present() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        24
+    );
+
+    for state in ["fts_entities_rowids_state", "fts_notes_rowids_state"] {
+        let marked: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM {state} WHERE key = 'backfill' AND value = 'complete')"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| panic!("read {state} marker: {e}"));
+        assert!(
+            marked,
+            "{state} must carry a complete backfill marker after V24"
+        );
+    }
 }
 
 // ── V5: external_id unique index tests ──────────────────────────────────────
