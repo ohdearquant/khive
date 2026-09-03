@@ -20,7 +20,7 @@ pub use graph::{
     MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS,
     MAX_TRAVERSAL_WORK,
 };
-pub use pagination::{Page, PageRequest, SeekCursor, SeekPage};
+pub use pagination::{BoundedCount, Page, PageRequest, SeekCursor, SeekPage};
 pub use sparse::{
     SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector, MAX_SPARSE_SEARCH_TOP_K,
 };

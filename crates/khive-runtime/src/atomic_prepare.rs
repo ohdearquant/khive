@@ -1818,6 +1818,20 @@ mod tests {
     use crate::embedder_registry::EmbedderProvider;
     use crate::runtime::RuntimeConfig;
 
+    /// Owns a file-backed runtime and removes its database directory after shutdown.
+    struct TestRuntime {
+        runtime: KhiveRuntime,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestRuntime {
+        type Target = KhiveRuntime;
+
+        fn deref(&self) -> &Self::Target {
+            &self.runtime
+        }
+    }
+
     const STUB_MODEL: &str = "stub-adr099-b3";
     const STUB_DIMS: usize = 4;
 
@@ -1859,18 +1873,20 @@ mod tests {
         }
     }
 
-    fn scratch_runtime() -> KhiveRuntime {
+    fn scratch_runtime() -> TestRuntime {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("atomic_prepare_reindex.db");
-        let rt = KhiveRuntime::new(RuntimeConfig {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: Some(path),
             embedding_model: None,
             additional_embedding_models: vec![],
             ..RuntimeConfig::default()
         })
         .expect("runtime");
-        std::mem::forget(dir);
-        rt
+        TestRuntime {
+            runtime,
+            _temp_dir: dir,
+        }
     }
 
     /// Atomic `update` must reject a field that does not apply to the
