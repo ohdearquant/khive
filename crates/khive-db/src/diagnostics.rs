@@ -723,15 +723,15 @@ pub struct WriterContentionDiagnostics {
     pub writer_task_acquisitions: u64,
     /// Main-pool writer checkouts that exhausted their finite deadline.
     pub writer_acquisition_timeouts: u64,
-    /// Writer-task `BEGIN IMMEDIATE` attempts whose final busy or locked
-    /// refusal surfaced to a caller as the retryable `writer_task_begin_busy`
-    /// stage. A nonzero value here therefore has a matching failed request on
-    /// the caller's side.
+    /// Every writer-task `BEGIN IMMEDIATE` attempt refused busy or locked,
+    /// whether or not a subsequent bounded retry absorbed it. A refusal not
+    /// absorbed by a retry also surfaces to the caller as the retryable
+    /// `writer_task_begin_busy` stage.
     pub writer_task_begin_busy: u64,
-    /// Busy or locked `BEGIN IMMEDIATE` refusals absorbed by the bounded
-    /// retry before the request closure ran. This is disjoint from
-    /// `writer_task_begin_busy`: every refusal is counted in exactly one field
-    /// according to whether another BEGIN attempt followed it.
+    /// Subset of `writer_task_begin_busy` absorbed by the bounded retry
+    /// before the request closure ran, so the caller never observed that
+    /// particular refusal. `writer_task_begin_busy - writer_task_begin_busy_absorbed`
+    /// is the count of refusals a caller actually observed.
     pub writer_task_begin_busy_absorbed: u64,
     /// Writer-task `BEGIN IMMEDIATE` attempts that failed for a reason other
     /// than busy or locked.

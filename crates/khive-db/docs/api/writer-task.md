@@ -3,9 +3,11 @@
 `WriterTask` (`crates/khive-db/src/writer_task.rs`) is the ADR-067
 Component A single-writer-connection mechanism: a dedicated background task
 that owns one standalone writer `rusqlite::Connection` and drains a bounded
-channel of typed write requests, issuing `BEGIN IMMEDIATE` once per request.
-This is the function-specific technical reference for its migration scope
-and failure modes.
+channel of typed write requests, issuing `BEGIN IMMEDIATE` for each request
+with a bounded retry (up to three attempts) on a busy/locked refusal, the
+attempts sharing one configured `busy_timeout` acquisition budget. This is
+the function-specific technical reference for its migration scope and
+failure modes.
 
 ## Migration-slice scope (historical) — current routed-call inventory and admission mode live elsewhere
 
@@ -106,10 +108,15 @@ A busy/locked `BEGIN IMMEDIATE` refusal (for example, from an explicitly
 exempt writer or a non-strict compatibility fallback still holding another
 writer connection) is retried only at this pre-execution seam. The writer
 makes at most three total BEGIN attempts, sleeping 5 ms and then 10 ms between
-them. Each SQLite attempt remains bounded by the configured `busy_timeout`, so
-persistent contention can add at most two more busy-timeout windows plus 15 ms;
-the request's operation closure remains owned and uninvoked throughout.
-Non-busy BEGIN failures are never retried. After the bounded attempts, a final
+them, and the attempts together share a single configured `busy_timeout`
+acquisition budget rather than each waiting out a full window of their own:
+before each retry the connection's busy timeout is lowered to whatever
+remains of that budget and restored afterward, and a refusal that has
+already exhausted the budget is not retried. Persistent contention is
+therefore bounded to at most one busy-timeout window plus 15 ms of explicit
+backoff, not the sum of three; the request's operation closure remains owned
+and uninvoked throughout. Non-busy BEGIN failures are never retried. After
+the bounded attempts, a final
 failure replies via `AnyWriteRequest::reply_error` without ever invoking the
 request's operation closure via `AnyWriteRequest::execute_and_reply`.
 For transaction-wrapped requests, the scoped `writer_task_tx` registry span
@@ -178,13 +185,19 @@ queue, not by its own execution.
 runtime-supplied `audit_*` fields, they come straight from the pool and are
 never `Option`.
 
-BEGIN contention has two additional disjoint counters at the same surface:
-`writer_task_begin_busy_absorbed` increments for each busy/locked refusal that
-is followed by another bounded BEGIN attempt, while the backward-compatible
-`writer_task_begin_busy` field increments only for the final refusal surfaced
-to the caller. A successful retry can therefore move the absorbed counter
-without fabricating a caller failure; an exhausted three-attempt request moves
-the absorbed counter twice and the surfaced counter once.
+BEGIN contention has two additional counters at the same surface, one a
+subset of the other: the backward-compatible `writer_task_begin_busy` field
+increments for every busy/locked `BEGIN IMMEDIATE` refusal, whether or not a
+retry follows it — this preserves its pre-retry meaning as the total
+contention count. `writer_task_begin_busy_absorbed` increments for the
+subset of those refusals that a subsequent bounded BEGIN attempt went on to
+absorb, so the caller never observed them; `writer_task_begin_busy -
+writer_task_begin_busy_absorbed` is the count the caller actually observed
+as a failure. A successful retry therefore still moves `writer_task_begin_busy`
+without the caller ever seeing a failure; a request refused N times before
+either the delay schedule or the shared `busy_timeout` budget runs out moves
+`writer_task_begin_busy` N times and `writer_task_begin_busy_absorbed`
+N-1 times (every refusal but the final, unretried one).
 
 ### Bounded enqueue admission (#1382)
 
