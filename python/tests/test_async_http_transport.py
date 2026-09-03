@@ -159,7 +159,7 @@ def test_chained_abort_returns_minimal_entry(rest_server, api_key):
         transport = AsyncHttpTransport(rest_server.url, api_key)
         try:
             response = await transport.round_trip(
-                {"ops": json.dumps("[nope() | stats()]")}, timeout=5.0
+                {"ops": json.dumps("nope() | stats()")}, timeout=5.0
             )
         finally:
             await transport.aclose()

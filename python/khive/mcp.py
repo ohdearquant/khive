@@ -23,7 +23,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from .errors import AuthError, KhiveError
-from .transport import _check_base_url_security
+from .transport import _check_base_url_security, _stringify_op_errors, _validate_envelope_results
 
 _TRANSPORT_LOGGER = "mcp.client.streamable_http"
 
@@ -197,7 +197,8 @@ async def acall_request(
             text = result.content[0].text if result.content else "unknown MCP error"
             raise KhiveError(text)
         text = result.content[0].text if result.content else "null"
-        return json.loads(text)
+        payload = json.loads(text)
+        return _validate_envelope_results(_stringify_op_errors(payload, url), url)
 
 
 def _run_sync(make_coro: Any) -> Any:

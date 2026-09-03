@@ -60,6 +60,11 @@ def test_bare_top_level_chain_parses_as_chain():
     assert parse_dsl("stats() | whoami()") == [("stats", {}), ("whoami", {})]
 
 
+def test_bracketed_chain_rejected_as_mixed_separators():
+    with pytest.raises(DslParseError):
+        parse_dsl("[stats() | whoami()]")
+
+
 def test_prev_reference_resolved_inside_a_chain():
     [_first, (verb, args)] = parse_dsl('get(id="x") | update(id=$prev.id)')
     assert verb == "update"
@@ -76,3 +81,21 @@ def test_prev_literal_escape_decodes_back_to_the_original_text():
     # escaping) to one literal backslash ahead of the $prev-shaped text —
     # the escaped-literal form `string_as_prev_ref` strips back to plain text.
     assert parse_dsl(r'verb(query="\\$prev.id")') == [("verb", {"query": "$prev.id"})]
+
+
+def test_raw_newline_inside_quoted_value_decodes():
+    assert parse_dsl('verb(note="line1\nline2")') == [("verb", {"note": "line1\nline2"})]
+
+
+def test_unicode_escape_decodes():
+    assert parse_dsl('verb(note="\\u0061")') == [("verb", {"note": "a"})]
+
+
+def test_single_quote_escape_rejected():
+    with pytest.raises(DslParseError):
+        parse_dsl('verb(note="bad \\\' escape")')
+
+
+def test_invalid_argument_name_rejected():
+    with pytest.raises(DslParseError):
+        parse_dsl("verb(1x=2)")

@@ -3,7 +3,7 @@
 Used only to make the offline fake REST/MCP servers in `conftest.py` enforce
 the real wire contract (`ops` is one request DSL string, not the client's
 internal JSON ops-array form) instead of silently accepting whatever the
-submitted renderer happens to send.
+renderer under test happens to send.
 """
 
 from __future__ import annotations
@@ -228,31 +228,37 @@ def _apply_prev_ref_rules(value: Any, in_chain: bool) -> Any:
     return value
 
 
+_RAW_CONTROL_ESCAPE = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
 def _parse_string(text: str) -> str:
+    """Mirrors `parser_impl.rs::decode_quoted_json_string`: a raw newline/CR/
+    tab byte may appear literally inside the quoted span and is rewritten to
+    its JSON escape before the whole literal is decoded strictly with
+    `json.loads` (this also makes `\\uXXXX` decode, unlike a hand-rolled
+    escape table). Any other raw control byte is left as-is, which
+    `json.loads` rejects exactly as strict JSON does. JSON does not define
+    `\\'`, so that sequence is rejected too, not decoded to `'`."""
     if len(text) < 2 or text[-1] != '"':
         raise DslParseError(f"unterminated string: {text!r}")
     body = text[1:-1]
-    out: list[str] = []
+    normalized: list[str] = ['"']
     i = 0
     n = len(body)
     while i < n:
         ch = body[i]
         if ch == "\\" and i + 1 < n:
-            nxt = body[i + 1]
-            decoded = {"\\": "\\", '"': '"', "'": "'", "n": "\n", "t": "\t", "r": "\r"}.get(nxt)
-            if decoded is not None:
-                out.append(decoded)
-                i += 2
-                continue
-            # any other backslash sequence is kept literally
-            out.append(ch)
-            i += 1
+            normalized.append(ch)
+            normalized.append(body[i + 1])
+            i += 2
             continue
-        if ord(ch) < 0x20:
-            raise DslParseError(f"raw control character in string literal: {ch!r}")
-        out.append(ch)
+        normalized.append(_RAW_CONTROL_ESCAPE.get(ch, ch))
         i += 1
-    return "".join(out)
+    normalized.append('"')
+    try:
+        return json.loads("".join(normalized))
+    except ValueError as exc:
+        raise DslParseError(f"malformed string literal: {text!r}") from exc
 
 
 def _parse_value(text: str, in_chain: bool = False) -> Any:
@@ -303,7 +309,10 @@ def _parse_op(text: str, in_chain: bool = False) -> tuple[str, dict[str, Any]]:
             if "=" not in piece:
                 raise DslParseError(f"malformed arg: {piece!r}")
             key, _, val = piece.partition("=")
-            args[key.strip()] = _parse_value(val.strip(), in_chain)
+            key = key.strip()
+            if not _IDENT_RE.fullmatch(key):
+                raise DslParseError(f"invalid argument name: {key!r}")
+            args[key] = _parse_value(val.strip(), in_chain)
     return tool, args
 
 
@@ -320,9 +329,8 @@ def parse_dsl_with_mode(text: str) -> tuple[list[tuple[str, dict[str, Any]]], st
         inner = text[1:-1].strip()
         if not inner:
             return [], "parallel"
-        chain_parts = _split_top_level(inner, "|")
-        if len(chain_parts) > 1:
-            return [_parse_op(p, in_chain=True) for p in chain_parts], "chain"
+        if len(_split_top_level(inner, "|")) > 1:
+            raise DslParseError("mixed separators: '|' is not allowed inside '[...]'")
         return [_parse_op(p, in_chain=False) for p in _split_top_level(inner, ",")], "parallel"
     chain_parts = _split_top_level(text, "|")
     if len(chain_parts) > 1:

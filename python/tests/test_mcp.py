@@ -11,7 +11,7 @@ import pytest
 pytest.importorskip("mcp")
 
 import khive.mcp as mcp_module
-from khive import AuthError, KhiveError
+from khive import AuthError, HttpTransport, KhiveError
 from khive.mcp import (
     _TRANSPORT_LOGGER,
     _AcceptedTerminationFilter,
@@ -31,6 +31,23 @@ def test_mcp_request_round_trip(mcp_server, api_key):
     result = mcp_request(mcp_server.url, api_key, "stats()")
     assert result["summary"]["succeeded"] == 1
     assert result["results"][0]["result"] == {"entities": 1, "edges": 0, "notes": 0}
+
+
+def test_mcp_chained_abort_matches_rest_normalized_entry(rest_server, mcp_server, api_key):
+    """A chain whose second op aborts must produce the identical
+    caller-visible entry through the MCP path and the REST path — both
+    normalize through `_stringify_op_errors`/`_validate_envelope_results`."""
+    dsl = "nope() | stats()"
+    mcp_result = mcp_request(mcp_server.url, api_key, dsl)
+
+    rest_transport = HttpTransport(rest_server.url, api_key)
+    try:
+        rest_envelope = rest_transport.send_dsl(dsl, timeout=5.0)["result"]
+    finally:
+        rest_transport.close()
+
+    assert mcp_result["results"][1] == rest_envelope["results"][1]
+    assert mcp_result["results"][1] == {"ok": False, "aborted": True, "tool": ""}
 
 
 def test_mcp_wrong_key_raises_auth_error(mcp_server):

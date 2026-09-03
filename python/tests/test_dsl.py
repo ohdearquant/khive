@@ -98,7 +98,7 @@ def test_old_daemon_shaped_string_refused_by_fake(rest_server, api_key):
 
 def test_dsl_text_passes_through_untouched():
     assert render_dsl("whoami()") == "whoami()"
-    chain = "[whoami() | stats()]"
+    chain = "whoami() | stats()"
     assert render_dsl(chain) == chain
     assert render_dsl(" [whoami(),  stats()] ") == " [whoami(),  stats()] "
 
@@ -135,6 +135,16 @@ def test_entry_without_tool_name_raises_transport_error():
 def test_non_op_entry_raises_transport_error():
     with pytest.raises(TransportError, match="cannot render int"):
         render_dsl([3])
+
+
+def test_missing_args_key_renders_empty_call():
+    assert render_dsl([{"tool": "stats"}]) == "stats()"
+
+
+@pytest.mark.parametrize("bad_args", [[], "", 0, False, None])
+def test_non_dict_args_value_raises_transport_error(bad_args):
+    with pytest.raises(TransportError, match="args must be an object"):
+        render_dsl([{"tool": "stats", "args": bad_args}])
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
@@ -226,13 +236,87 @@ def test_prev_shaped_literal_round_trips_nested(prev_like):
     assert parsed_args == {"tags": [prev_like], "properties": {"note": prev_like}}
 
 
+@pytest.mark.parametrize(
+    "prev_like",
+    [
+        "$prev",
+        "$prev.id",
+        "$prev[0]",
+    ],
+)
+def test_single_backslash_prev_literal_raises_top_level(prev_like):
+    """A caller value with exactly one leading backslash ahead of `$prev`-shaped
+    text has no wire representation (see `khive.dsl` module docstring) — it
+    must raise rather than silently decode back to something else."""
+    with pytest.raises(TransportError, match="no representation"):
+        render_dsl([op("verb", query="\\" + prev_like)])
+
+
+@pytest.mark.parametrize(
+    "prev_like",
+    [
+        "$prev",
+        "$prev.id",
+        "$prev[0]",
+    ],
+)
+def test_single_backslash_prev_literal_raises_nested_in_list(prev_like):
+    with pytest.raises(TransportError, match="no representation"):
+        render_dsl([op("verb", tags=["\\" + prev_like])])
+
+
+@pytest.mark.parametrize(
+    "prev_like",
+    [
+        "$prev",
+        "$prev.id",
+        "$prev[0]",
+    ],
+)
+def test_single_backslash_prev_literal_raises_nested_in_object(prev_like):
+    with pytest.raises(TransportError, match="no representation"):
+        render_dsl([op("verb", properties={"note": "\\" + prev_like})])
+
+
+@pytest.mark.parametrize(
+    "prev_like",
+    [
+        "$prev",
+        "$prev.id",
+        "$prev[0]",
+    ],
+)
+def test_double_backslash_prev_literal_round_trips_top_level(prev_like):
+    value = "\\\\" + prev_like
+    rendered = render_dsl([op("verb", query=value)])
+    [(verb, parsed_args)] = parse_dsl(rendered)
+    assert verb == "verb"
+    assert parsed_args == {"query": value}
+
+
+@pytest.mark.parametrize(
+    "prev_like",
+    [
+        "$prev",
+        "$prev.id",
+        "$prev[0]",
+    ],
+)
+def test_double_backslash_prev_literal_round_trips_nested(prev_like):
+    value = "\\\\" + prev_like
+    rendered = render_dsl([op("verb", tags=[value], properties={"note": value})])
+    [(verb, parsed_args)] = parse_dsl(rendered)
+    assert verb == "verb"
+    assert parsed_args == {"tags": [value], "properties": {"note": value}}
+
+
 def test_intentional_prev_reference_in_a_chain_still_parses_as_a_reference():
     """Control for the two tests above: a caller who deliberately writes a
     `$prev` reference as raw DSL text inside a chain must still get a
     reference back, not a literal — the escape only applies to values
     `render_dsl` itself renders from Python values, never to DSL text a
     caller already holds."""
-    [(_get_verb, _get_args), (verb, args)] = parse_dsl('[get(id="x") | update(id=$prev.id)]')
+    [(_get_verb, _get_args), (verb, args)] = parse_dsl('get(id="x") | update(id=$prev.id)')
     assert verb == "update"
     assert args == {"id": PrevRef("id")}
 

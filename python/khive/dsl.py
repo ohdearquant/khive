@@ -24,6 +24,15 @@ element, or an object value). A caller's own string that merely starts with
 that text is rendered with one extra leading backslash so it decodes back to
 the literal text instead of being resolved as a reference; the same rule
 applies wherever such a string appears, nested or not.
+
+A caller's own string with exactly one leading backslash followed by that
+same `$prev`-shaped text has no representation in this grammar: rendered
+plainly it decodes back to the bare `$prev`-shaped text (the parser's escape
+rule strips exactly one leading backslash before matching), and rendered
+with this module's own escape it decodes to two backslashes instead of one.
+Such a value raises `TransportError` rather than being silently corrupted.
+Two or more leading backslashes are unaffected — they render unchanged and
+round-trip exactly.
 """
 
 from __future__ import annotations
@@ -42,6 +51,26 @@ def _needs_prev_escape(value: str) -> bool:
     escaped to survive as a literal (see `parser_impl.rs::string_as_prev_ref`
     — matched here on the same three prefixes, at any nesting depth)."""
     return value == "$prev" or value.startswith(("$prev.", "$prev["))
+
+
+def _is_unrepresentable_prev_literal(value: str) -> bool:
+    """Whether `value` has exactly one leading backslash followed by a
+    `$prev`-shaped string — the one literal this grammar cannot carry (see
+    the module docstring): the parser's escape rule strips exactly one
+    leading backslash before matching `$prev`/`$prev.`/`$prev[`, so rendering
+    it plainly loses the backslash and rendering it with this module's own
+    escape produces two backslashes instead of one. Two or more leading
+    backslashes are unaffected."""
+    return value.startswith("\\") and not value.startswith("\\\\") and _needs_prev_escape(value[1:])
+
+
+def _reject_unrepresentable_prev_literal(value: str, arg_name: str) -> None:
+    if _is_unrepresentable_prev_literal(value):
+        raise TransportError(
+            f"argument {arg_name!r}: a string with exactly one leading backslash "
+            "followed by a '$prev'-shaped reference has no representation in the "
+            "request DSL"
+        )
 
 
 def _render_string(value: str, arg_name: str) -> str:
@@ -65,6 +94,7 @@ def _render_string_value(value: str, arg_name: str) -> str:
     """Renders a string in argument-VALUE position, applying the `$prev`
     literal escape (never applied to object keys, which are never resolved
     as references)."""
+    _reject_unrepresentable_prev_literal(value, arg_name)
     if _needs_prev_escape(value):
         value = "\\" + value
     return _render_string(value, arg_name)
@@ -76,6 +106,7 @@ def _prep_for_json(value: Any, arg_name: str) -> Any:
     outside objects — the cloud parser resolves `$prev` references at any
     depth of an object argument, not just at its top level."""
     if isinstance(value, str):
+        _reject_unrepresentable_prev_literal(value, arg_name)
         return "\\" + value if _needs_prev_escape(value) else value
     if isinstance(value, list):
         return [_prep_for_json(v, arg_name) for v in value]
@@ -127,9 +158,12 @@ def _render_op(entry: dict[str, Any]) -> str:
     tool = entry.get("tool")
     if not isinstance(tool, str) or not tool:
         raise TransportError(f"op entry has no 'tool' name: {str(entry)[:120]}")
-    args = entry.get("args") or {}
-    if not isinstance(args, dict):
-        raise TransportError(f"op {tool!r} args must be an object, got {type(args).__name__}")
+    if "args" in entry:
+        args = entry["args"]
+        if not isinstance(args, dict):
+            raise TransportError(f"op {tool!r} args must be an object, got {type(args).__name__}")
+    else:
+        args = {}
     rendered_args = ", ".join(f"{k}={_render_value(v, k)}" for k, v in args.items())
     return f"{tool}({rendered_args})"
 

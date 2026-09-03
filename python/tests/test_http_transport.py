@@ -67,7 +67,7 @@ def test_raw_accepts_dsl_batch_text(db: Khive):
 
 
 def test_raw_accepts_dsl_chain_text(db: Khive):
-    results = db.raw("[whoami() | stats()]")
+    results = db.raw("whoami() | stats()")
     assert [(r.ok, r.tool) for r in results] == [(True, "whoami"), (True, "stats")]
 
 
@@ -233,7 +233,7 @@ def test_send_dsl_with_delimiters_sent_verbatim(rest_server, api_key):
 
 
 def test_chained_abort_returns_minimal_entry(db: Khive):
-    results = db.raw("[nope() | stats()]")
+    results = db.raw("nope() | stats()")
     assert [(r.ok, r.tool) for r in results] == [(False, "nope"), (False, "")]
     assert results[1].result is None
     assert results[1].error is None
@@ -245,7 +245,7 @@ def test_chained_abort_same_object_sync_and_async(rest_server, api_key):
     aborted entry whether it is dispatched through the sync or the async
     HTTP transport — both funnel through the same `_validate_envelope_results`
     normalization."""
-    dsl = "[nope() | stats()]"
+    dsl = "nope() | stats()"
 
     async def _async_side():
         from khive import AsyncHttpTransport

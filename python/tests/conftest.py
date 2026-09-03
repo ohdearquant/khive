@@ -11,8 +11,8 @@ transports offline: a real REST endpoint over `http.server`, and a real MCP
 same `Authorization: ApiKey <key>` scheme as the live deployment, on every
 route including the health check, and both dispatching through
 `_dispatch_ops`, which enforces the real `ops` wire contract (one request
-DSL string — see `_dsl_fake.py`) rather than accepting whatever a submitted
-renderer happens to send. Neither import their optional dependency
+DSL string — see `_dsl_fake.py`) rather than accepting whatever the
+renderer under test happens to send. Neither import their optional dependency
 (`uvicorn`, `mcp`'s `FastMCP`) at module scope, so collecting this file
 never requires the `cloud` extra; only actually requesting `mcp_server`
 does.
