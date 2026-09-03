@@ -210,20 +210,22 @@ fn mask_mcp_diagnostic(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn bounded_backend_error_message(message: &str) -> String {
-    let bounded_input: String = message
-        .chars()
-        .take(MAX_BACKEND_ERROR_INPUT_CHARS)
-        .collect();
-    let masked = mask_mcp_diagnostic(&bounded_input);
+    // Mask the FULL message before any truncation: a detector's terminating
+    // span (e.g. the `@` closing a `scheme://user:pass@host` credential) can
+    // sit past any fixed input window, and a masker that only sees a
+    // truncated prefix cannot recognize a match it cannot see the end of.
+    let masked = mask_mcp_diagnostic(message);
     if masked.trim().is_empty() {
         return MISSING_BACKEND_ERROR_MESSAGE.to_string();
     }
-    let mut chars = masked.chars();
+    let masked_input_truncated = masked.chars().nth(MAX_BACKEND_ERROR_INPUT_CHARS).is_some();
+    let bounded_masked: String = masked.chars().take(MAX_BACKEND_ERROR_INPUT_CHARS).collect();
+    let mut chars = bounded_masked.chars();
     let mut bounded: String = chars
         .by_ref()
         .take(MAX_BACKEND_ERROR_MESSAGE_CHARS)
         .collect();
-    if chars.next().is_some() || message.chars().nth(MAX_BACKEND_ERROR_INPUT_CHARS).is_some() {
+    if chars.next().is_some() || masked_input_truncated {
         bounded.push('…');
     }
     bounded
@@ -5772,6 +5774,43 @@ mod tests {
         assert_eq!(
             bounded_backend_error_message(" \t\n"),
             MISSING_BACKEND_ERROR_MESSAGE
+        );
+    }
+
+    #[test]
+    fn backend_error_message_masks_a_url_credential_whose_terminator_crosses_the_input_cap() {
+        // The credential's `scheme://user:` opens well inside the
+        // MAX_BACKEND_ERROR_INPUT_CHARS window (and well inside the visible
+        // MAX_BACKEND_ERROR_MESSAGE_CHARS output window), but the password is
+        // padded long enough that the terminating `@` lands past the input
+        // cap. A masker that only sees the first MAX_BACKEND_ERROR_INPUT_CHARS
+        // characters can never observe that `@`, so it can never recognize
+        // the span as a credential and the password prefix — including this
+        // marker — survives untouched in the truncated output. The padding
+        // character is repeated so the run stays low-entropy and cannot be
+        // caught by the entropy heuristic instead of the url-userinfo
+        // detector this test targets.
+        let marker = "CustomDbPassMarkerXYZ789";
+        let padding = "z".repeat(MAX_BACKEND_ERROR_INPUT_CHARS + 200);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.com/db");
+        let message = format!("backend probe failed: {url}");
+
+        let at_offset = message.find('@').expect("test fixture must contain '@'");
+        assert!(at_offset > MAX_BACKEND_ERROR_INPUT_CHARS);
+        let marker_offset = message
+            .find(marker)
+            .expect("test fixture must contain marker");
+        assert!(marker_offset < MAX_BACKEND_ERROR_MESSAGE_CHARS);
+
+        let masked = bounded_backend_error_message(&message);
+        assert!(
+            !masked.contains(marker),
+            "no fragment of the credential may survive masking: {masked}"
+        );
+        assert!(
+            masked.contains("***MASKED***"),
+            "the redaction marker must be present: {masked}"
         );
     }
 

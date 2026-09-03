@@ -263,14 +263,22 @@ ADR-115 Amendment 2 declares three permanent mask-only surfaces through the publ
 `RedactionSurface` enum and `redaction_surface_contract`:
 
 - `GitIngest` stores masked commit/issue/pull-request entity and note fields.
-- `SessionMirror` stores masked `session_messages.text` and `session_messages.raw` projections.
-- `McpDiagnostic` returns a bounded masked diagnostic and has no durable stored target.
+- `SessionMirror` stores masked `session_messages.text`, `session_messages.raw`, and `sessions.slug`
+  projections — the latter covers every parsed title/slug field (ChatGPT export `title`, Claude Code
+  `slug`, claude.ai export `name`/`summary`), not just the message body columns.
+- `McpDiagnostic` returns a bounded masked diagnostic and has no durable stored target. Backend error
+  message masking runs over the full, untruncated message text before the input and output length
+  caps are applied, so a detector match whose terminating span crosses a caller-visible truncation
+  boundary is still found.
 
 Each call site uses `mask_for_redaction_surface`. Every contract has mode `PermanentMaskOnly`, no
 stamp property, and no atomic exemption-success event. The wrapper has no manifest input and cannot
 return an exemption outcome. The Git and session surfaces persist only their masked values; MCP
 diagnostics are response data and are not durable records. Adding an admission mode is an ADR-level
-contract change, not a caller-selectable sensitivity option.
+contract change, not a caller-selectable sensitivity option. `redaction_surface_contract` sources its
+`final_stored_target` strings from the `GIT_INGEST_STORED_TARGET` and `SESSION_MIRROR_STORED_TARGET`
+constants, and the contract test compares against those same constants rather than a second copy of
+the prose.
 
 ## mask_secrets
 

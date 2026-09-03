@@ -128,7 +128,10 @@ pub fn parse_cc_line(line: &str) -> Option<ParsedEvent> {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    let slug = map.get("slug").and_then(|v| v.as_str()).map(str::to_string);
+    let slug = map
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .map(|s| mask_session_mirror(s).into_owned());
 
     let created_at_micros = map
         .get("timestamp")
@@ -704,7 +707,7 @@ fn parse_conversation(conv: &Value, out: &mut Vec<ParsedEvent>) {
         .get("title")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        .map(|title| mask_session_mirror(title).into_owned());
 
     let conv_created_at_micros = conv_obj
         .get("create_time")
@@ -954,6 +957,23 @@ mod tests {
         assert_eq!(ev.slug.as_deref(), Some("my-proj"));
         assert!(ev.created_at_micros > 0);
         assert!(!ev.is_sidechain);
+    }
+
+    #[test]
+    fn test_cc_line_masks_secret_bearing_slug() {
+        let secret = format!("{}{}", "AKIA", "FAKEKEY1234567890");
+        let line = make_line(
+            "aaaa-bbbb",
+            "sess-1111",
+            "user",
+            &format!(
+                r#","message":{{"role":"user","content":"Hello world"}},"slug":"prod creds {secret}""#
+            ),
+        );
+        let ev = parse_cc_line(&line).expect("should parse");
+        let slug = ev.slug.as_deref().expect("slug");
+        assert!(!slug.contains(&secret));
+        assert!(slug.contains("***MASKED***"));
     }
 
     #[test]
@@ -1540,6 +1560,42 @@ mod tests {
         assert_eq!(events[1].text.as_deref(), Some("Hi there"));
         assert_eq!(events[1].parent_uuid.as_deref(), Some("msg-user"));
         assert!(!events[1].is_sidechain);
+    }
+
+    #[test]
+    fn test_chatgpt_export_masks_secret_bearing_title() {
+        let secret = format!("{}{}", "AKIA", "FAKEKEY1234567890");
+        let export = serde_json::json!([{
+            "id": "conv-secret-title",
+            "title": format!("prod creds {secret}"),
+            "current_node": "msg-user",
+            "create_time": 1_700_000_000.0,
+            "mapping": {
+                "root": {
+                    "id": "root",
+                    "message": null,
+                    "parent": null,
+                    "children": ["msg-user"]
+                },
+                "msg-user": {
+                    "id": "msg-user",
+                    "parent": "root",
+                    "children": [],
+                    "message": {
+                        "id": "msg-user",
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": ["Hello"]}
+                    }
+                }
+            }
+        }]);
+        let content = serde_json::to_string(&export).unwrap();
+
+        let events = parse_chatgpt_export(&content).expect("valid export must parse");
+        assert_eq!(events.len(), 1);
+        let slug = events[0].slug.as_deref().expect("event slug");
+        assert!(!slug.contains(&secret));
+        assert!(slug.contains("***MASKED***"));
     }
 
     #[test]

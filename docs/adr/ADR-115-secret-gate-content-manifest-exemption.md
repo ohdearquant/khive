@@ -932,13 +932,14 @@ change, not an untyped boolean or caller option.
 
 ### 2. Session mirror (#2060)
 
-- **Final stored target:** `session_messages.text` and `session_messages.raw`, plus the parsed title
-  projections that share the same masker. Masking occurs while constructing the parsed event,
-  before the mirror writes it.
+- **Final stored target:** `session_messages.text`, `session_messages.raw`, and `sessions.slug` —
+  the parsed title/slug projections (ChatGPT export `title`, Claude Code `slug`, and the claude.ai
+  export `name`/`summary` title) share the same masker as `text` and `raw`. Masking occurs while
+  constructing the parsed event or session record, before the mirror writes it.
 - **Stamp location:** none. Session rows have no exemption posture property.
 - **Atomic success event:** none. Mirror persistence remains idempotent under its existing cursor
   and row semantics; masking is a deterministic transformation, not an admitted exemption.
-- **Readback:** only the masked text/raw projections are returned. The mirror never retains an
+- **Readback:** only the masked text/raw/slug projections are returned. The mirror never retains an
   alternate unmasked payload for later recovery.
 
 ### 3. MCP diagnostics (#2061)
@@ -948,8 +949,11 @@ change, not an untyped boolean or caller option.
 - **Stamp location:** none.
 - **Atomic success event:** none. Transport sanitization happens independently of operation result
   persistence and cannot assert exemption success.
-- **Readback:** not applicable. The bounded diagnostic is masked before it is returned; truncation
-  and omission metadata remain transport concerns and do not create a durable redaction record.
+- **Readback:** not applicable. Backend error message masking runs over the full, untruncated
+  message text before the input and output length caps are applied — a detector whose match spans
+  past a fixed truncation boundary (e.g. the terminating `@` of a `scheme://user:pass@host`
+  credential) must still be found. Truncation and omission metadata remain transport concerns and
+  do not create a durable redaction record.
 
 ### 4. Security and acceptance invariants
 

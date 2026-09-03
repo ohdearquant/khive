@@ -310,11 +310,22 @@ pub struct RedactionSurfaceContract {
     pub atomic_success_event: Option<&'static str>,
 }
 
+/// Final stored target for [`RedactionSurface::GitIngest`] — see
+/// [`redaction_surface_contract`].
+pub const GIT_INGEST_STORED_TARGET: &str = "final git-ingest entity/note fields";
+
+/// Final stored target for [`RedactionSurface::SessionMirror`] — see
+/// [`redaction_surface_contract`]. Names every column the session mirror
+/// writes a masked provider-export projection into, not just the message
+/// body columns.
+pub const SESSION_MIRROR_STORED_TARGET: &str =
+    "session_messages.text, session_messages.raw, and sessions.slug";
+
 /// Return the closed contract for a named redact-not-block surface.
 pub const fn redaction_surface_contract(surface: RedactionSurface) -> RedactionSurfaceContract {
     let final_stored_target = match surface {
-        RedactionSurface::GitIngest => Some("final git-ingest entity/note fields"),
-        RedactionSurface::SessionMirror => Some("session_messages.text and session_messages.raw"),
+        RedactionSurface::GitIngest => Some(GIT_INGEST_STORED_TARGET),
+        RedactionSurface::SessionMirror => Some(SESSION_MIRROR_STORED_TARGET),
         RedactionSurface::McpDiagnostic => None,
     };
 
@@ -4503,13 +4514,10 @@ mod tests {
     #[test]
     fn named_redaction_surfaces_are_permanently_mask_only() {
         let contracts = [
-            (
-                RedactionSurface::GitIngest,
-                Some("final git-ingest entity/note fields"),
-            ),
+            (RedactionSurface::GitIngest, Some(GIT_INGEST_STORED_TARGET)),
             (
                 RedactionSurface::SessionMirror,
-                Some("session_messages.text and session_messages.raw"),
+                Some(SESSION_MIRROR_STORED_TARGET),
             ),
             (RedactionSurface::McpDiagnostic, None),
         ];

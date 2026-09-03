@@ -32,7 +32,10 @@ that don't change as the DFS walks the mapping tree: `mapping`,
 `current_path` (the current-node root-to-tip set), `session_id`,
 `conv_created_at_micros` (conversation-level `create_time` in micros, 0 if
 absent — the fallback used when a message's own `create_time` is
-null/absent), and `slug`.
+null/absent), and `slug`. The conversation `title` is passed through the same
+`SessionMirror` permanent mask-only surface as `text` and `raw` before it
+becomes `slug`, both on the per-event projection and on the `sessions.slug`
+column it feeds — a credential-bearing title cannot reach storage unmasked.
 
 ## `parse_claude_ai_export` — `chat_messages` and active branches
 

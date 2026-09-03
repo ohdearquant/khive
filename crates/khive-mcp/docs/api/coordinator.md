@@ -68,7 +68,11 @@ causes and one per-operation wire budget are retained; truncation is explicit
 through `backend_errors_truncated` and `backend_errors_omitted`. Backend ids and
 messages are credential-masked before exposure; changed backend ids carry a
 stable hash suffix and `backend_id_masked: true`, ids are capped at 256 Unicode
-scalar values, and messages are capped at 1,024 Unicode scalar values.
+scalar values, and messages are capped at 1,024 Unicode scalar values. Message
+masking runs over the full, untruncated message text before either length cap
+is applied — truncating first would let a detector's terminating span (e.g. the
+`@` closing a `scheme://user:pass@host` credential) fall outside the scanned
+window and leak.
 This is the permanent mask-only `McpDiagnostic` surface from ADR-115 Amendment 2: it has no durable
 stored target, manifest admission, posture stamp, or exemption-success event.
 
