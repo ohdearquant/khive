@@ -311,12 +311,24 @@ def _parse_object(text: str, in_chain: bool, depth: int = 0) -> dict[str, Any]:
     return obj
 
 
-def _parse_value(text: str, in_chain: bool = False, depth: int = 0) -> Any:
+def _parse_value(
+    text: str,
+    in_chain: bool = False,
+    depth: int = 0,
+    *,
+    followed_by_close_paren: bool = False,
+) -> Any:
     """`depth` is the container depth already entered before `text`'s own
     value (see `_dsl_fake.NESTING_DEPTH_LIMIT`); entering `text`, when it is
     itself an array or object, is one more increment, checked before
     recursing — mirrors `parser_impl.rs::Parser::enter_container` (depth 64
-    accepted, 65 refused)."""
+    accepted, 65 refused). `followed_by_close_paren` is set only for the
+    last argument of a well-formed call (`_parse_op`'s `text[-1] == ")"`
+    branch, via `_parse_args`): the call's own `)` was sliced off before
+    `text` ever reached here, so an unterminated `{` at the end of `text`
+    was, in the real source, immediately followed by that `)` rather than by
+    true end-of-input — the same distinction `parser_impl.rs::
+    parse_object_arg_body`'s `Some(c)` vs `None` arms (about 271-282) make."""
     text = text.strip()
     if not text:
         raise DslParseError("empty value")
@@ -353,8 +365,17 @@ def _parse_value(text: str, in_chain: bool = False, depth: int = 0) -> Any:
             # match (P113): reaching true end-of-input right after `{`, with
             # no key or `}` yet, is the `None` arm and gets its own reason —
             # distinct from any other unterminated shape, which this fake
-            # still reports as a generic unterminated object.
+            # still reports as a generic unterminated object. When this same
+            # empty-after-`{` slice was in fact followed by the call's own
+            # `)` in the real source (`followed_by_close_paren`), the real
+            # parser never reaches end-of-input at all — it peeks that `)`
+            # and takes the `Some(c)` arm instead, so this reports the
+            # quoted-key reason, not the end-of-input one.
             if not text[1:].strip():
+                if followed_by_close_paren:
+                    raise DslParseError(
+                        f"unexpected ')' while expecting a quoted string key: {text!r}"
+                    )
                 raise DslParseError(
                     f"unexpected end of input while expecting an object key: {text!r}"
                 )
@@ -374,10 +395,30 @@ def _reject_unclosed_local_bracket(text: str) -> None:
     in the same slice is still open is rejected as `UnclosedBracket { kind:
     '{' }`, the same outcome `v(a=1[})`'s "1[}" value slice reaches in the
     real parser, distinct from the unparseable-scalar fallback this slice
-    would otherwise hit."""
+    would otherwise hit. `scan_value_end` dispatches a `'"'` byte to
+    `scan_string_end` (`parser/scan.rs` lines 10-23) before ever looking at
+    `[`/`(`/`}` depth, so a `}` inside a quoted span — e.g. the value slice
+    `1["x}"]` — is consumed as ordinary string content and never reaches the
+    `'}'` arm at all; this mirrors that same quote-skip (backslash-pair skip,
+    stop at the next unescaped `"`) before resuming the bracket/paren scan,
+    so this helper does not raise for that shape either."""
     depth_brack = 0
     depth_paren = 0
-    for ch in text:
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            i += 1
+            while i < n:
+                c2 = text[i]
+                if c2 == "\\":
+                    i += 2
+                    continue
+                i += 1
+                if c2 == '"':
+                    break
+            continue
         if ch == "[":
             depth_brack += 1
         elif ch == "(":
@@ -388,13 +429,22 @@ def _reject_unclosed_local_bracket(text: str) -> None:
             depth_paren -= 1
         elif ch == "}" and (depth_brack > 0 or depth_paren > 0):
             raise DslParseError(f"unclosed bracket: unmatched '{{' while scanning {text!r}")
+        i += 1
 
 
-def _parse_args(argtext: str, in_chain: bool) -> dict[str, Any]:
+def _parse_args(argtext: str, in_chain: bool, *, closed: bool = False) -> dict[str, Any]:
+    """`closed` marks a well-formed call's args slice (`_parse_op`'s
+    `text[-1] == ")"` branch): that trailing `)` was sliced off before
+    `argtext` got here, so only the LAST piece could possibly have been
+    immediately followed by it in the real source (any earlier piece is
+    followed by a `,` instead, inside `argtext` itself) — see
+    `_parse_value`'s `followed_by_close_paren` parameter."""
     args: dict[str, Any] = {}
     if not argtext:
         return args
-    for piece in _split_top_level(argtext, ","):
+    pieces = _split_top_level(argtext, ",")
+    last_index = len(pieces) - 1
+    for index, piece in enumerate(pieces):
         piece = piece.strip()
         if not piece:
             # Mirrors `parser_impl.rs::parse_op`: after a `,` the loop
@@ -410,7 +460,11 @@ def _parse_args(argtext: str, in_chain: bool) -> dict[str, Any]:
         if key in args:
             # Mirrors `parser_impl.rs::parse_op`'s `DuplicateArg`.
             raise DslParseError(f"duplicate argument: {key!r}")
-        args[key] = _parse_value(val.strip(), in_chain)
+        args[key] = _parse_value(
+            val.strip(),
+            in_chain,
+            followed_by_close_paren=closed and index == last_index,
+        )
     return args
 
 
@@ -428,7 +482,7 @@ def _parse_op(text: str, in_chain: bool = False) -> tuple[str, dict[str, Any]]:
         # rather than a generic "not a call" that never inspects the tail.
         _parse_args(text[pos + 1 :].strip(), in_chain)
         raise DslParseError(f"not a call: {text!r}")
-    args = _parse_args(text[pos + 1 : -1].strip(), in_chain)
+    args = _parse_args(text[pos + 1 : -1].strip(), in_chain, closed=True)
     return tool, args
 
 

@@ -1312,6 +1312,16 @@ def _check_p113():
     # names.
     with pytest.raises(DslParseError, match="object key"):
         parse_dsl("v(a={")
+    # The near case: `v(a={)` looks the same at a glance, but the call
+    # actually closes. The real parser's object-key match peeks the very
+    # next byte after `{`, which here is the real character `)`, not
+    # end-of-input — so it takes the `Some(c)` quoted-string-key arm
+    # (`parser_impl.rs` about 271-276), never the `None` arm this rule
+    # describes. The fake must report the quoted-key reason for this shape,
+    # not the end-of-input one.
+    with pytest.raises(DslParseError, match="quoted string key") as exc_info:
+        parse_dsl("v(a={)")
+    assert "object key" not in str(exc_info.value)
 
 
 _add("P113", "fake", _check_p113)
@@ -1339,6 +1349,17 @@ def _check_p116():
     # reaching this rule's `UnclosedBracket` outcome.
     with pytest.raises(DslParseError, match="unclosed bracket"):
         parse_dsl("v(a=1[})")
+    # `v(a=1["x}"])` looks similar at a glance, but the `}` sits inside a
+    # quoted span. `scan_value_end` dispatches `'"'` to `scan_string_end`
+    # (`parser/scan.rs` lines 10-23) before ever inspecting bracket depth, so
+    # the quoted `"x}"` is consumed whole and the `}` is never seen by the
+    # `'}'` arm this rule describes — the real parser closes the local `[`
+    # and then rejects the malformed scalar `1["x}"]` through the
+    # `InvalidValue` mapping instead (`parser_impl.rs` lines 411-429). The
+    # fake must not raise "unclosed bracket" for this shape.
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl('v(a=1["x}"])')
+    assert "unclosed bracket" not in str(exc_info.value)
 
 
 _add("P116", "fake", _check_p116)
