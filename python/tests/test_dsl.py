@@ -375,3 +375,20 @@ def test_triple_segment_tool_name_raises_transport_error():
 def test_tool_name_starting_with_digit_raises_transport_error():
     with pytest.raises(TransportError, match="1x"):
         render_dsl([{"tool": "1x", "args": {}}])
+
+
+def test_render_stops_at_the_byte_cap_before_rendering_later_entries():
+    # Two 600 KiB entries already exceed the 1 MiB request cap. The third entry
+    # is unrenderable, so reaching it would raise a different error: the cap
+    # must fire first, proving later entries are never rendered or joined.
+    big = "x" * (600 * 1024)
+    ops = [op("blob.put", bytes=big), op("blob.put", bytes=big), {"tool": 42}]
+    with pytest.raises(TransportError, match="exceeds 1048576 bytes after 2 of 3"):
+        render_dsl(ops)
+
+
+def test_render_under_the_byte_cap_still_joins_every_entry():
+    small = "x" * 1024
+    rendered = render_dsl([op("blob.put", bytes=small), op("blob.put", bytes=small)])
+    assert rendered.startswith("[blob.put(") and rendered.endswith(")]")
+    assert rendered.count("blob.put(") == 2

@@ -334,7 +334,22 @@ def render_dsl(ops: str | list[str | dict[str, Any]], *, chained: bool = False) 
             f"cannot render {len(ops)} operations: the request parser accepts at most "
             f"{MAX_OPS} in a chain, batch, or JSON-form request"
         )
-    rendered = [_render_entry(entry) for entry in ops]
+    rendered: list[str] = []
+    rendered_bytes = 0
+    for entry in ops:
+        text = _render_entry(entry)
+        # Every rendered entry appears verbatim in the joined request, so the
+        # running sum of entry bytes is a lower bound on the final trimmed
+        # length: stop rendering as soon as that bound alone exceeds the cap
+        # instead of building (and holding) the whole oversized request first.
+        rendered_bytes += len(text.encode("utf-8"))
+        if rendered_bytes > MAX_OPS_INPUT_LEN:
+            raise TransportError(
+                f"rendered request exceeds {MAX_OPS_INPUT_LEN} bytes after "
+                f"{len(rendered) + 1} of {len(ops)} operations; the request parser "
+                f"accepts at most {MAX_OPS_INPUT_LEN} bytes"
+            )
+        rendered.append(text)
     if len(rendered) == 1:
         text = rendered[0]
     elif chained:

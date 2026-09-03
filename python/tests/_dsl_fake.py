@@ -18,6 +18,7 @@ mirroring every positional arm of the real parser is not this file's job.
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -130,7 +131,7 @@ def _parse_tool_name(text: str, pos: int) -> tuple[str, int]:
     tool = m.group(0)
     pos = m.end()
     if pos < len(text) and text[pos] == ".":
-        pos += 1
+        pos = _skip_ws(text, pos + 1)
         m2 = _IDENT_RE.match(text, pos)
         if not m2:
             raise DslParseError(
@@ -238,7 +239,7 @@ def _parse_bare_prev_ref(
     while pos < n:
         c = text[pos]
         if c == ".":
-            pos += 1
+            pos = _skip_ws(text, pos + 1)
             m = _IDENT_RE.match(text, pos)
             if not m:
                 raise DslParseError(
@@ -483,6 +484,10 @@ def _parse_scalar(text: str, in_chain: bool) -> Any:
         return None
     if _JSON_NUMBER_RE.match(text):
         parsed = json.loads(text, parse_constant=_reject_non_finite_constant)
+        if isinstance(parsed, float) and not math.isfinite(parsed):
+            # `json.loads` overflows a well-formed but out-of-range float
+            # spelling such as `1e9999` to infinity; the real parser rejects it.
+            raise DslParseError(f"number out of range: {text!r}", variant="InvalidValue")
         return _coerce_out_of_range_int(parsed)
     raise DslParseError(f"unparseable value: {text!r}", variant="InvalidValue")
 
@@ -638,7 +643,7 @@ def parse_dsl_with_mode(text: str) -> tuple[list[tuple[str, dict[str, Any]]], st
             raise DslParseError(f"unterminated batch: {text!r}")
         inner = text[1:-1].strip()
         if not inner:
-            return [], "parallel"
+            raise DslParseError("empty batch: '[]'", variant="EmptyBatch")
         if len(_split_top_level(inner, "|")) > 1:
             raise DslParseError(
                 "mixed separators: '|' is not allowed inside '[...]'", variant="MixedSeparators"

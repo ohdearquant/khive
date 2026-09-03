@@ -179,3 +179,38 @@ def test_an_unclassified_rejection_carries_no_variant():
     with pytest.raises(DslParseError) as exc_info:
         parse_dsl('v(a={"k"')
     assert exc_info.value.variant is None
+
+
+def test_empty_batch_rejected_as_empty_batch():
+    # `dispatch.rs::parse_batch` reports `[]` as `EmptyBatch`; the fake must not
+    # hand a test server an empty parallel batch the real parser refuses.
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl("[]")
+    assert exc_info.value.variant == "EmptyBatch"
+
+
+def test_whitespace_after_pack_dot_tolerated():
+    # `parser_impl.rs::parse_op` reads the verb after the dot through
+    # `parse_identifier`, which skips ASCII whitespace first.
+    assert parse_dsl('blob. put(bytes="x")') == [("blob.put", {"bytes": "x"})]
+    assert parse_dsl('blob.\tput(bytes="x")') == [("blob.put", {"bytes": "x"})]
+
+
+def test_whitespace_after_prev_path_dot_tolerated():
+    # `parser_impl.rs::parse_prev_ref` reads each path segment through
+    # `parse_identifier`, so `$prev. id` names the same path as `$prev.id`.
+    ops = parse_dsl("a() | b(id=$prev. id)")
+    assert ops[1] == ("b", {"id": PrevRef("id")})
+
+
+@pytest.mark.parametrize("spelling", ["1e9999", "-1e9999", "1.5e400"])
+def test_out_of_range_number_rejected_as_invalid_value(spelling):
+    # serde_json refuses a float spelling that overflows f64; `json.loads`
+    # would silently produce infinity instead.
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl(f"verb(x={spelling})")
+    assert exc_info.value.variant == "InvalidValue"
+
+
+def test_in_range_large_exponent_still_accepted():
+    assert parse_dsl("verb(x=1e300)") == [("verb", {"x": 1e300})]
