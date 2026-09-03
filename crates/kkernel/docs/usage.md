@@ -55,6 +55,12 @@ kkernel mcp --db :memory: --no-embed
 Key flags: `--db`, `--actor`/`--namespace`, `--no-embed`, `--pack` (repeatable),
 `--config`, `--daemon`, `--transport <name>`, `--bind <addr>`.
 
+Every successful startup writes the resolved actor to stderr as
+`actor: "<id>" (resolved; attributed)` or explicitly marks the unattributed
+`local` fallback. This line is emitted at the forced `khive.boot` log target,
+so it remains visible under the default `--log warn` setting without touching
+the MCP stdout protocol.
+
 ### Transports are registerable
 
 `--transport` selects a foreground transport by name from a registry
@@ -254,6 +260,10 @@ kkernel exec 'create(kind="concept", name="X")' \
 kkernel exec 'stats()' --expect-actor lambda:worker  # validate config/env resolution
 ```
 
+Before a successful dispatch, `exec` also writes the resolved actor line to
+stderr. This is symmetrical for attributed and `local` identities and leaves
+the JSON result on stdout unchanged.
+
 ---
 
 ## Reindex — `kkernel reindex`
@@ -280,6 +290,7 @@ kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only sect
 | `--keep-existing`  | skip records already embedded (incremental top-up) instead of replacing them    |
 | `--batch-size <n>` | records per embedding batch (default 128, max 500)                              |
 | `--best-effort`    | downgrade partial failures to a warning and still exit 0 (default fails closed) |
+| `--rebuild-fts`    | rebuild + rank-1 integrity-check both global knowledge FTS indexes (see below)  |
 | `--human`          | readable report instead of JSON                                                 |
 
 There is no `--embeds-only`, `--ids`, or `--dry-run` mode. `--keep-existing` narrows
@@ -317,6 +328,14 @@ The knowledge pass calls the `khive_pack_knowledge::reindex_knowledge` library
 entry directly (the full-corpus `knowledge.index` handler) and rebuilds the
 Vamana ANN snapshot — no verb-DSL shell required.
 
+**FTS rebuild is opt-in.** `fts_knowledge` and `fts_sections` are global
+tables, not scoped to `--namespace`, so rebuilding them is whole-database
+work (and writer contention) whatever the run's scope. No run shape implies
+the rebuild: it is off unless `--rebuild-fts` is passed, and passing it
+rebuilds both indexes for any scope. The report carries a
+`knowledge_fts_rebuild` object (index names, elapsed milliseconds,
+integrity-check outcome) whenever the rebuild ran, and omits it otherwise.
+
 ```bash
 kkernel reindex --db ~/.khive/khive.db --knowledge-only      # just the corpus
 kkernel reindex --db ~/.khive/khive.db --no-knowledge        # just graph substrate
@@ -328,6 +347,10 @@ low-level verb is still available via `exec`:
 ```bash
 kkernel exec 'knowledge.index(ids=["my-slug", "<uuid>"])' --db ~/.khive/khive.db
 ```
+
+`knowledge.index` does not accept `rebuild_fts` — rebuilding the global FTS
+indexes has no per-caller cost admission on the ordinary verb surface, so it
+is reachable only through `kkernel reindex --rebuild-fts` above.
 
 > Stop the MCP daemon before a large reindex to avoid SQLite write contention:
 > `pkill -f 'kkernel.*--daemon'` (or `KHIVE_NO_DAEMON=1`), then reindex, then let

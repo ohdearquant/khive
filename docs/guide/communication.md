@@ -141,11 +141,15 @@ request(ops="comm.read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
 
 `comm.mark_read` requires `ids` with 1-500 full UUIDs or 8-character hex prefixes. It validates
 every target before mutation, deduplicates resolved IDs, and returns ordered results plus
-`requested_count`, `unique_count`, `marked_count`, and `failed_count`. The default
-`atomic=false` reuses the best-effort bulk behavior: later storage failures appear in each
-result's `read=false` and `mark_error` without rolling back an earlier success. With
-`atomic=true`, all unique marks are guarded and committed in one transaction; any failed
-recheck or storage statement rolls back the full set.
+`requested_count`, `unique_count`, `marked_count`, `unknown_count`, and `failed_count`. Each item
+carries `status=success|failed|unknown`; the aggregate carries
+`status=success|partial|failed|unknown`. The default `atomic=false` reuses the best-effort bulk
+behavior: later storage failures appear in each result's `read=false` and `mark_error` without
+rolling back an earlier success. A write whose execution seam terminated after being accepted (so
+it may already have applied) instead carries `status=unknown`, `read=null` — check the message's
+current state through `comm.inbox` before re-issuing that mark; re-issuing is safe, since marking
+a message read is idempotent. With `atomic=true`, all unique marks are guarded and committed in
+one transaction; any failed recheck or storage statement rolls back the full set.
 
 `comm.read` remains compatible with the 0.7.0 surface: exactly one of `id` or `ids` is required,
 and its bulk form remains best-effort. Prefer the named verb for new bulk callers.
@@ -283,7 +287,8 @@ request(ops="comm.send(to=\"email:prof.sheng@example.edu\", subject=\"Draft read
 
 `comm.send` itself only writes the note; it does not talk to SMTP directly.
 A background outbox loop polls every 5 seconds for undelivered outbound
-notes:
+notes. A note is eligible only when it has no terminal `delivery` value and
+its optional RFC 3339 `next_attempt_at` deadline is due:
 
 ```
 list(namespace=<ingest_namespace>, kind="message", direction="outbound", delivered=false, limit=200)
@@ -297,6 +302,17 @@ sent over SMTP, using the note's `subject`, `content`, and any
 `thread_id`/`in_reply_to_message_id`/`references_chain` properties to set the
 RFC 822 `Message-ID`, `In-Reply-To`, and `References` headers so replies group
 correctly in native mail clients.
+
+Delivery outcomes are durable note properties. Success records
+`delivery="delivered"` and `delivered_at`; a definitive configuration,
+authentication, allowlist, SMTP 5xx, or transport-specific client rejection
+records terminal `delivery="failed"`, `failed_at`, and `last_error`. Network
+failures, token-endpoint pressure, SMTP 4xx responses, Telegram 408/429/5xx
+responses, and similar transient errors leave the note pending, increment
+`delivery_attempts`, and set `next_attempt_at` using exponential backoff from
+5 seconds to a 30-minute ceiling. Polls skip the note until that deadline.
+There is no attempt-count promotion to failure; a later successful delivery
+clears `delivery_attempts` and `next_attempt_at`.
 
 ### How inbound ingestion works
 

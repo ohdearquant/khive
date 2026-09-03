@@ -26,7 +26,7 @@ use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_state
 use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
 use khive_db::stores::note::note_hard_delete_statement;
-use khive_db::stores::text::insert_document_statement;
+use khive_db::stores::text::insert_document_statements;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
@@ -2757,7 +2757,7 @@ impl KhiveRuntime {
         self.enrich_neighbor_hits(token, &mut hits).await;
         // Filter out soft-deleted entity nodes.
         let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.node_id).collect();
-        let deleted = self.deleted_entity_ids(candidate_ids).await;
+        let deleted = self.deleted_entity_ids(candidate_ids).await?;
         if !deleted.is_empty() {
             hits.retain(|h| !deleted.contains(&h.node_id));
         }
@@ -2891,7 +2891,7 @@ impl KhiveRuntime {
 
         // Filter out soft-deleted entity nodes.
         let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.hit.node_id).collect();
-        let deleted = self.deleted_entity_ids(candidate_ids).await;
+        let deleted = self.deleted_entity_ids(candidate_ids).await?;
         if !deleted.is_empty() {
             hits.retain(|h| !deleted.contains(&h.hit.node_id));
         }
@@ -2949,7 +2949,7 @@ impl KhiveRuntime {
             .iter()
             .flat_map(|p| p.nodes.iter().map(|n| n.node_id))
             .collect();
-        let deleted = self.deleted_entity_ids(all_node_ids).await;
+        let deleted = self.deleted_entity_ids(all_node_ids).await?;
         if !deleted.is_empty() {
             for path in paths.iter_mut() {
                 path.nodes.retain(|n| !deleted.contains(&n.node_id));
@@ -2972,9 +2972,19 @@ impl KhiveRuntime {
     /// Returns the subset of `ids` that have `deleted_at IS NOT NULL` in
     /// either table. Takes `Vec<Uuid>` (not an iterator) so the async state
     /// machine holds only owned data — no iterator borrow across yields.
-    async fn deleted_entity_ids(&self, ids: Vec<Uuid>) -> std::collections::HashSet<Uuid> {
+    ///
+    /// Propagates reader-admission and other storage errors instead of
+    /// treating them as "nothing is deleted": on a saturated pool this query
+    /// now runs on the bounded reader pool like any other read, and silently
+    /// swallowing its failure would let soft-deleted nodes back into
+    /// `neighbors`/`traverse` results instead of surfacing the retryable
+    /// admission failure those callers otherwise promise.
+    async fn deleted_entity_ids(
+        &self,
+        ids: Vec<Uuid>,
+    ) -> RuntimeResult<std::collections::HashSet<Uuid>> {
         if ids.is_empty() {
-            return std::collections::HashSet::new();
+            return Ok(std::collections::HashSet::new());
         }
         let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
         let n = id_strs.len();
@@ -3011,21 +3021,18 @@ impl KhiveRuntime {
         };
         let mut out = std::collections::HashSet::new();
         let sql = self.sql();
-        if let Ok(mut reader) = sql.reader().await {
-            if let Ok(rows) = reader.query_all(stmt).await {
-                for row in rows {
-                    if let Some(col) = row.columns.first() {
-                        if let SqlValue::Text(s) = &col.value {
-                            if let Ok(u) = s.parse::<Uuid>() {
-                                out.insert(u);
-                            }
-                        }
+        let mut reader = sql.reader().await?;
+        let rows = reader.query_all(stmt).await?;
+        for row in rows {
+            if let Some(col) = row.columns.first() {
+                if let SqlValue::Text(s) = &col.value {
+                    if let Ok(u) = s.parse::<Uuid>() {
+                        out.insert(u);
                     }
                 }
             }
-            // best-effort: on reader or query error, treat none as deleted
         }
-        out
+        Ok(out)
     }
 
     /// Populate `name` and `kind` on each `NeighborHit` from the corresponding
@@ -3757,7 +3764,14 @@ impl KhiveRuntime {
                     let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                 }
                 if let Ok(fts) = self.text_for_notes(token) {
-                    let _ = fts.delete_document(ns, note.id).await;
+                    if let Err(fts_err) = fts.delete_document(ns, note.id).await {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %fts_err,
+                            "compensating FTS delete failed after single-model embed failure; \
+                             the note row was already removed, but its FTS document may remain"
+                        );
+                    }
                 }
                 return Err(e);
             }
@@ -3800,7 +3814,15 @@ impl KhiveRuntime {
                         let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                     }
                     if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
+                        if let Err(fts_err) = fts.delete_document(ns, note.id).await {
+                            tracing::warn!(
+                                note_id = %note.id,
+                                error = %fts_err,
+                                "compensating FTS delete failed after multi-model embed \
+                                 failure; the note row was already removed, but its FTS \
+                                 document may remain"
+                            );
+                        }
                     }
                     return Err(e);
                 }
@@ -3828,7 +3850,15 @@ impl KhiveRuntime {
                         let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                     }
                     if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
+                        if let Err(fts_err) = fts.delete_document(ns, note.id).await {
+                            tracing::warn!(
+                                note_id = %note.id,
+                                error = %fts_err,
+                                "compensating FTS delete failed after a vector insert \
+                                 failure; the note row was already removed, but its FTS \
+                                 document may remain"
+                            );
+                        }
                     }
                     for m in &inserted_models {
                         if let Ok(vs) = self.vectors_for_model(token, m) {
@@ -3916,7 +3946,15 @@ impl KhiveRuntime {
                         let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                     }
                     if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
+                        if let Err(fts_err) = fts.delete_document(ns, note.id).await {
+                            tracing::warn!(
+                                note_id = %note.id,
+                                error = %fts_err,
+                                "compensating FTS delete failed after an annotates-link \
+                                 failure; the note row was already removed, but its FTS \
+                                 document may remain"
+                            );
+                        }
                     }
                     for model_name in &embed_model_names {
                         if let Ok(vs) = self.vectors_for_model(token, model_name) {
@@ -3948,7 +3986,7 @@ impl KhiveRuntime {
             // Fast path: single namespace — use the dedicated query_notes method.
             let page = self
                 .notes(token)?
-                .query_notes(
+                .query_notes_count_free(
                     token.namespace().as_str(),
                     kind,
                     PageRequest {
@@ -3969,7 +4007,7 @@ impl KhiveRuntime {
         };
         let page = self
             .notes(token)?
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
@@ -4751,7 +4789,7 @@ impl KhiveRuntime {
         };
 
         // Route index cleanup through the RECORD's namespace, not the caller's.
-        let record_tok = NamespaceToken::for_namespace(
+        let record_tok = token.with_namespace(
             khive_types::Namespace::parse(&note.namespace)
                 .map_err(|e| RuntimeError::Internal(format!("note namespace invalid: {e}")))?,
         );
@@ -4798,7 +4836,7 @@ impl KhiveRuntime {
             deleted
         };
         if deleted {
-            let event_store = self.events(token)?;
+            let event_store = self.events(&record_tok)?;
             let event = khive_storage::event::Event::new(
                 record_ns.clone(),
                 "delete",
@@ -5111,7 +5149,7 @@ impl KhiveRuntime {
         };
 
         // Route cascade and index cleanup through the RECORD's namespace, not the caller's.
-        let record_tok = NamespaceToken::for_namespace(
+        let record_tok = token.with_namespace(
             khive_types::Namespace::parse(&entity.namespace)
                 .map_err(|e| RuntimeError::Internal(format!("entity namespace invalid: {e}")))?,
         );
@@ -5141,7 +5179,7 @@ impl KhiveRuntime {
             deleted
         };
         if deleted {
-            let event_store = self.events(token)?;
+            let event_store = self.events(&record_tok)?;
             let ns = entity.namespace.clone();
             let event = khive_storage::event::Event::new(
                 ns.clone(),
@@ -5725,7 +5763,7 @@ impl KhiveRuntime {
         // namespace so that endpoint validation, raw-SQL predicates, and graph routing
         // all address the correct backend partition.
         let record_ns: String = edge.namespace.clone();
-        let record_tok = NamespaceToken::for_namespace(
+        let record_tok = token.with_namespace(
             khive_types::Namespace::parse(&record_ns)
                 .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
         );
@@ -5969,7 +6007,7 @@ impl KhiveRuntime {
 
         // Derive record_ns / record_tok from the fetched edge (mirrors update_edge).
         let record_ns: String = edge.namespace.clone();
-        let record_tok = NamespaceToken::for_namespace(
+        let record_tok = token.with_namespace(
             khive_types::Namespace::parse(&record_ns)
                 .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
         );
@@ -6283,28 +6321,29 @@ impl KhiveRuntime {
             .iter()
             .enumerate()
             .map(|(index, entity)| {
-                let mut fts_statement =
-                    insert_document_statement("fts_entities", &entity_fts_document(entity));
-                if injected_failure_index == Some(index) {
-                    fts_statement = SqlStatement {
+                let fts_statements: Vec<SqlStatement> = if injected_failure_index == Some(index) {
+                    vec![SqlStatement {
                         sql: "INSERT INTO __khive_create_many_injected_failure__ DEFAULT VALUES"
                             .to_string(),
                         params: vec![],
                         label: Some("fts-insert-injected-failure".to_string()),
-                    };
-                }
+                    }]
+                } else {
+                    // Order-sensitive pair — see `insert_document_statements`'s
+                    // adjacency contract.
+                    insert_document_statements("fts_entities", &entity_fts_document(entity)).into()
+                };
+                let mut statements = vec![PlanStatement {
+                    statement: entity_upsert_statement(entity),
+                    guard: Some(AffectedRowGuard::exactly(1)),
+                }];
+                statements.extend(fts_statements.into_iter().map(|statement| PlanStatement {
+                    statement,
+                    guard: None,
+                }));
                 AtomicOpPlan::AddEntity(AddEntityPlan {
                     entity_id: entity.id,
-                    statements: vec![
-                        PlanStatement {
-                            statement: entity_upsert_statement(entity),
-                            guard: Some(AffectedRowGuard::exactly(1)),
-                        },
-                        PlanStatement {
-                            statement: fts_statement,
-                            guard: None,
-                        },
-                    ],
+                    statements,
                     post_commit: PostCommitEffect::None,
                 })
             })
@@ -13409,6 +13448,7 @@ mod tests {
             .count(TextFilter {
                 ids: vec![],
                 kinds: vec![],
+                record_kinds: vec![],
                 namespaces: vec![ns.clone()],
             })
             .await
@@ -13522,6 +13562,7 @@ mod tests {
             .count(TextFilter {
                 ids: vec![],
                 kinds: vec![],
+                record_kinds: vec![],
                 namespaces: vec![ns.clone()],
             })
             .await
@@ -13621,6 +13662,58 @@ mod tests {
             matches!(absent, Ok(None)),
             "absent edge must return Ok(None), got {absent:?}"
         );
+    }
+
+    // `deleted_entity_ids` now runs its query on the bounded reader pool
+    // (same as any other read) instead of a dedicated standalone connection.
+    // A saturated pool must surface the retryable `AdmissionTimeout`, not
+    // silently report "nothing is deleted" — the old `if let Ok(...) = ...`
+    // best-effort shape would have returned `Ok(HashSet::new())` here,
+    // which would let `neighbors`/`traverse` return soft-deleted nodes
+    // instead of the admission failure.
+    //
+    // A saturation broad enough to also block `substrate_exists_in_ns` (the
+    // check `traverse` runs before it ever reaches `deleted_entity_ids`)
+    // would already have failed the traversal before my fix, since that
+    // earlier read already propagates its error correctly — it would not
+    // isolate this specific defect. This test instead calls
+    // `deleted_entity_ids` directly, which is the exact unit whose error
+    // was swallowed.
+    #[tokio::test]
+    async fn deleted_entity_ids_propagates_reader_pool_admission_timeout_instead_of_swallowing_it()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("deleted-entity-ids-saturation.db");
+        let rt = KhiveRuntime::new(crate::config::RuntimeConfig {
+            db_path: Some(db_path),
+            ..crate::config::RuntimeConfig::no_embeddings()
+        })
+        .expect("file-backed runtime construction must succeed");
+        let ns = NamespaceToken::for_namespace(Namespace::parse("saturation-ns").unwrap());
+        let a = rt
+            .create_entity(&ns, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+
+        let pool = rt.backend().pool_arc();
+        let capacity = pool.reader_acquisition_snapshot().reader_admission_capacity;
+        let held: Vec<_> = (0..capacity)
+            .map(|_| pool.reader().expect("hold every pooled reader"))
+            .collect();
+
+        let result = rt.deleted_entity_ids(vec![a.id]).await;
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::Storage(
+                    khive_storage::StorageError::AdmissionTimeout { .. }
+                ))
+            ),
+            "a saturated reader pool must surface AdmissionTimeout, not an empty deleted \
+             set; got {result:?}"
+        );
+
+        drop(held);
     }
 
     // get_entity finds any entity by UUID; traverse finds the root and returns paths

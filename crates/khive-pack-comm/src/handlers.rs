@@ -119,7 +119,7 @@ async fn require_existing_thread_root(
     };
     let store = runtime.notes(token)?;
     let page = store
-        .query_notes_filtered(
+        .query_notes_filtered_count_free(
             token.namespace().as_str(),
             &filter,
             PageRequest {
@@ -554,7 +554,7 @@ pub(crate) async fn handle_inbox(
     }
 
     if raw_limit == 0 {
-        let unread_count = if mailbox == "inbox" {
+        let unread = if mailbox == "inbox" {
             let store = runtime.notes(token)?;
             count_unread_messages(
                 store.as_ref(),
@@ -563,12 +563,14 @@ pub(crate) async fn handle_inbox(
             )
             .await?
         } else {
-            0
+            UnreadCount::zero()
         };
         return Ok(json!({
             "messages": [],
             "count": 0,
-            "unread_count": unread_count,
+            "unread_count": unread.count,
+            "unread_count_cap": unread.cap,
+            "unread_count_saturated": unread.saturated,
             "offset": offset,
             "next_offset": Value::Null,
             "has_more": false,
@@ -609,11 +611,15 @@ pub(crate) async fn handle_inbox(
     }
 
     if mailbox == "inbox" {
-        // ADR-057 Q3: to_actor filter, EqOrMissing so legacy to_actor-less messages stay
-        // visible; closes the #199 multi-actor read leak for non-"local" callers.
+        // ADR-057 Q3: to_actor filter, legacy to_actor-less messages stay visible;
+        // closes the #199 multi-actor read leak for non-"local" callers.
+        // EqOrLegacyIndexed (not EqOrMissing) so this seeks
+        // idx_notes_unread_probe_recipient_direction on status="unread" instead of
+        // falling back to a namespace-wide direction-only scan; both partitions match
+        // the same rows EqOrMissing would (khive-storage/src/note.rs FilterOp docs).
         property_filters.push(PropertyFilter {
             json_path: "$.to_actor".to_string(),
-            op: FilterOp::EqOrMissing,
+            op: FilterOp::EqOrLegacyIndexed,
             value: SqlValue::Text(caller_actor.clone()),
         });
         if let Some(from_actor) = p.from_actor.as_ref() {
@@ -759,7 +765,7 @@ async fn query_inbox_response(
         let mut db_offset: u64 = 0;
         loop {
             let page = store
-                .query_notes_filtered(
+                .query_notes_filtered_count_free(
                     namespace,
                     filter,
                     PageRequest {
@@ -792,7 +798,7 @@ async fn query_inbox_response(
         collected
     } else {
         let page = store
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 namespace,
                 filter,
                 PageRequest {
@@ -810,10 +816,10 @@ async fn query_inbox_response(
     }
     let count = messages.len();
     // This is a mailbox-wide signal; page and status filters only shape `messages`.
-    let unread_count = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
+    let unread = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
         count_unread_messages(store, namespace, caller_actor).await?
     } else {
-        0
+        UnreadCount::zero()
     };
     let next_offset = if has_more {
         Some(offset.checked_add(count as u64).ok_or_else(|| {
@@ -829,7 +835,9 @@ async fn query_inbox_response(
     Ok(json!({
         "messages": messages,
         "count": count,
-        "unread_count": unread_count,
+        "unread_count": unread.count,
+        "unread_count_cap": unread.cap,
+        "unread_count_saturated": unread.saturated,
         "offset": offset,
         "next_offset": next_offset,
         "has_more": has_more,
@@ -846,17 +854,41 @@ pub(crate) async fn handle_unread(
     let _: UnreadParams = deser(params)?;
     let caller_actor = token.actor().id.clone();
     let store = runtime.notes(token)?;
-    let count =
+    let unread =
         count_unread_messages(store.as_ref(), token.namespace().as_str(), &caller_actor).await?;
 
-    Ok(json!({ "count": count, "actor": caller_actor }))
+    Ok(json!({
+        "count": unread.count,
+        "count_cap": unread.cap,
+        "count_saturated": unread.saturated,
+        "actor": caller_actor,
+    }))
+}
+
+const UNREAD_COUNT_CAP: u32 = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnreadCount {
+    count: u64,
+    cap: u64,
+    saturated: bool,
+}
+
+impl UnreadCount {
+    fn zero() -> Self {
+        Self {
+            count: 0,
+            cap: u64::from(UNREAD_COUNT_CAP),
+            saturated: false,
+        }
+    }
 }
 
 async fn count_unread_messages(
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
     caller_actor: &str,
-) -> Result<u64, RuntimeError> {
+) -> Result<UnreadCount, RuntimeError> {
     let base_filters = vec![
         PropertyFilter {
             json_path: "$.direction".to_string(),
@@ -885,15 +917,22 @@ async fn count_unread_messages(
     };
     // Count the disjoint addressed and legacy-recipient partitions in one
     // storage snapshot. Both predicates retain the recipient key expression
-    // required by idx_notes_unread_probe_recipient; the legacy partition's
-    // empty key includes both absent and explicit JSON-null recipients.
+    // required by idx_notes_unread_probe_recipient_direction, and the
+    // leading `direction = 'inbound'` filter in base_filters retains that
+    // index's direction key column, so the scan never walks the recipient's
+    // own outbound send history (every comm.send leaves a durable outbound
+    // copy addressed to the recipient that is never marked read). Each
+    // limited subquery stops after cap + 1 matches; together they retain the
+    // exact value below the public cap and make saturation explicit above
+    // it.
     let counts = store
-        .count_notes_filtered_in_snapshot(
+        .count_notes_filtered_bounded_in_snapshot(
             namespace,
             &[
                 count_filter(FilterOp::EqOrMissingIndexed),
                 count_filter(FilterOp::JsonTypeMissingOrNullIndexed),
             ],
+            UNREAD_COUNT_CAP,
         )
         .await?;
     let [exact, legacy] = counts.as_slice() else {
@@ -901,7 +940,18 @@ async fn count_unread_messages(
             "comm.unread: storage returned an invalid partition count vector".into(),
         ));
     };
-    Ok(exact + legacy)
+    let cap = u64::from(UNREAD_COUNT_CAP);
+    if exact.cap != cap || legacy.cap != cap {
+        return Err(RuntimeError::Internal(
+            "comm.unread: storage returned an invalid bounded-count cap".into(),
+        ));
+    }
+    let observed = exact.count.saturating_add(legacy.count);
+    Ok(UnreadCount {
+        count: observed.min(cap),
+        cap,
+        saturated: exact.saturated || legacy.saturated || observed > cap,
+    })
 }
 
 /// `read` — mark a message as read.
@@ -989,13 +1039,25 @@ async fn mark_read_targets_best_effort(
         let original_properties = note.properties.clone();
         match mark_read_target(runtime, token, id, note).await {
             Ok(result) => results.push(result),
-            Err(error) => results.push(json!({
-                "id": short_id(id),
-                "full_id": id.as_hyphenated().to_string(),
-                "read": false,
-                "mark_error": error.to_string(),
-                "properties": original_properties,
-            })),
+            Err(error) => {
+                let (status, read) = match &error {
+                    RuntimeError::Storage(storage_error) => {
+                        match classify_mark_read_error(storage_error) {
+                            MarkReadFailure::Unknown => ("unknown", Value::Null),
+                            MarkReadFailure::Failed => ("failed", json!(false)),
+                        }
+                    }
+                    _ => ("failed", json!(false)),
+                };
+                results.push(json!({
+                    "id": short_id(id),
+                    "full_id": id.as_hyphenated().to_string(),
+                    "status": status,
+                    "read": read,
+                    "mark_error": error.to_string(),
+                    "properties": original_properties,
+                }));
+            }
         }
     }
     Ok(bulk_read_response(requested_count, results))
@@ -1035,6 +1097,7 @@ async fn mark_read_targets_atomic(
         results.push(json!({
             "id": short_id(id),
             "full_id": id.as_hyphenated().to_string(),
+            "status": "success",
             "read": true,
             "properties": properties,
         }));
@@ -1047,13 +1110,28 @@ fn bulk_read_response(requested_count: usize, results: Vec<Value>) -> Value {
         .iter()
         .filter(|result| result["read"].as_bool() == Some(true))
         .count();
+    let unknown_count = results
+        .iter()
+        .filter(|result| result["status"].as_str() == Some("unknown"))
+        .count();
     let unique_count = results.len();
-    let failed_count = unique_count - marked_count;
+    let failed_count = unique_count - marked_count - unknown_count;
+    let status = if failed_count == 0 && unknown_count == 0 {
+        "success"
+    } else if marked_count == 0 && unknown_count == 0 {
+        "failed"
+    } else if marked_count == 0 && failed_count == 0 {
+        "unknown"
+    } else {
+        "partial"
+    };
     json!({
         "results": results,
+        "status": status,
         "requested_count": requested_count,
         "unique_count": unique_count,
         "marked_count": marked_count,
+        "unknown_count": unknown_count,
         "failed_count": failed_count,
     })
 }
@@ -1158,6 +1236,28 @@ fn read_recheck_filter(caller_actor: &str) -> NoteFilter {
     }
 }
 
+/// Whether a mark-read write error means the patch definitely did not apply,
+/// or whether the writer seam terminated after accepting the request with no
+/// way to tell whether it landed.
+enum MarkReadFailure {
+    Failed,
+    Unknown,
+}
+
+/// Classify a mark-read storage error by its real variant, never by its
+/// display text. `SideEffectsUnknown` means the write was accepted before its
+/// execution seam terminated — the patch may already be committed, so it must
+/// not be reported as a definite failure. Same match shape as
+/// `message::attach_outbound_id_to_ambiguous_write`'s dual-write classifier.
+fn classify_mark_read_error(error: &khive_storage::StorageError) -> MarkReadFailure {
+    match error {
+        khive_storage::StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        } => MarkReadFailure::Unknown,
+        _ => MarkReadFailure::Failed,
+    }
+}
+
 async fn mark_read_target(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1252,12 +1352,14 @@ fn read_response(
         Ok(true) => json!({
             "id": short,
             "full_id": full,
+            "status": "success",
             "read": true,
             "properties": patched_properties,
         }),
         Ok(false) => json!({
             "id": short,
             "full_id": full,
+            "status": "failed",
             "read": false,
             "mark_error": "no live row updated",
             "properties": original_properties,
@@ -1267,15 +1369,26 @@ fn read_response(
                 id = %full,
                 error = %e,
                 "comm mark-read: update failed under writer contention; \
-                 degrading to read:false (best-effort)"
+                 degrading (best-effort)"
             );
-            json!({
-                "id": short,
-                "full_id": full,
-                "read": false,
-                "mark_error": e.to_string(),
-                "properties": original_properties,
-            })
+            match classify_mark_read_error(&e) {
+                MarkReadFailure::Unknown => json!({
+                    "id": short,
+                    "full_id": full,
+                    "status": "unknown",
+                    "read": Value::Null,
+                    "mark_error": e.to_string(),
+                    "properties": original_properties,
+                }),
+                MarkReadFailure::Failed => json!({
+                    "id": short,
+                    "full_id": full,
+                    "status": "failed",
+                    "read": false,
+                    "mark_error": e.to_string(),
+                    "properties": original_properties,
+                }),
+            }
         }
     }
 }
@@ -1603,7 +1716,7 @@ pub(crate) async fn handle_thread(
     let mut seen_row_ids = HashSet::new();
     loop {
         let page = thread_store
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &thread_filter,
                 PageRequest {
@@ -1930,7 +2043,7 @@ pub(crate) async fn handle_ingest(
                     ..Default::default()
                 };
                 let corr_page = store
-                    .query_notes_filtered(
+                    .query_notes_filtered_count_free(
                         ns,
                         &corr_filter,
                         PageRequest {
@@ -1997,7 +2110,7 @@ pub(crate) async fn handle_ingest(
                         ..Default::default()
                     };
                     let thread_page = store
-                        .query_notes_filtered(
+                        .query_notes_filtered_count_free(
                             ns,
                             &thread_filter,
                             PageRequest {
@@ -2150,7 +2263,7 @@ pub(crate) async fn handle_ingest(
                 ..Default::default()
             };
             let duplicate_page = store
-                .query_notes_filtered(
+                .query_notes_filtered_count_free(
                     ns,
                     &duplicate_filter,
                     PageRequest {
@@ -2664,7 +2777,7 @@ pub(crate) async fn handle_health(
         ..Default::default()
     };
     let page = store
-        .query_notes_filtered(
+        .query_notes_filtered_count_free(
             token.namespace().as_str(),
             &filter,
             PageRequest {
@@ -3307,10 +3420,10 @@ mod race_seam {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_embedding_truncation_warning, build_references_header, channel_stalled,
-        heartbeat_note_id, mark_read_target, message_id_match_candidates, parent_references_chain,
-        parent_wire_message_id, read_response, sanitize_reference_token, send_response_thread_id,
-        validate_read_target, wait_for_inbox_response, wrap_message_id,
+        add_embedding_truncation_warning, build_references_header, bulk_read_response,
+        channel_stalled, heartbeat_note_id, mark_read_target, message_id_match_candidates,
+        parent_references_chain, parent_wire_message_id, read_response, sanitize_reference_token,
+        send_response_thread_id, validate_read_target, wait_for_inbox_response, wrap_message_id,
     };
     use crate::inbox_signal::InboxSignal;
     use khive_storage::note::Note;
@@ -4295,6 +4408,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("success"));
         assert_eq!(resp["read"], json!(true));
         assert_eq!(resp["properties"], patched);
         assert!(
@@ -4316,6 +4430,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(
             resp["mark_error"],
@@ -4341,6 +4456,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(
             resp["properties"],
@@ -4367,6 +4483,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(resp["mark_error"], json!(err_text));
         assert_eq!(
@@ -4390,6 +4507,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(
             resp["properties"],
@@ -4397,6 +4515,103 @@ mod tests {
             "a stored SQL-NULL properties column must round-trip as JSON \
              null, never as {{}}; got {resp}"
         );
+    }
+
+    #[test]
+    fn read_response_side_effects_unknown_reports_unknown_not_failed() {
+        let original = json!({ "direction": "inbound", "read": false });
+        let patched = json!({ "direction": "inbound", "read": true });
+        let err = StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        };
+        let err_text = err.to_string();
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Err(err),
+            Some(original.clone()),
+            patched,
+        );
+        assert_eq!(resp["id"], json!("abc123"));
+        assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(
+            resp["status"],
+            json!("unknown"),
+            "a write whose seam terminated after acceptance may already have \
+             landed and must not be reported as a definite failure; got {resp}"
+        );
+        assert_eq!(
+            resp["read"],
+            Value::Null,
+            "an indeterminate outcome is neither true nor false; got {resp}"
+        );
+        assert_eq!(resp["mark_error"], json!(err_text));
+        assert_eq!(resp["properties"], original);
+    }
+
+    #[test]
+    fn read_response_writer_task_terminated_rolled_back_still_reports_failed() {
+        let original = json!({ "direction": "inbound", "read": false });
+        let patched = json!({ "direction": "inbound", "read": true });
+        let err = StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+        };
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Err(err),
+            Some(original),
+            patched,
+        );
+        assert_eq!(
+            resp["status"],
+            json!("failed"),
+            "a proven rollback is a definite failure, not an indeterminate \
+             outcome; got {resp}"
+        );
+        assert_eq!(resp["read"], json!(false));
+    }
+
+    #[test]
+    fn bulk_read_response_reports_success_partial_failed_and_unknown_statuses() {
+        let response = |outcomes: &[bool]| {
+            bulk_read_response(
+                outcomes.len(),
+                outcomes
+                    .iter()
+                    .map(|read| json!({ "read": read }))
+                    .collect(),
+            )
+        };
+
+        assert_eq!(response(&[true, true])["status"], "success");
+        assert_eq!(response(&[true, false])["status"], "partial");
+        assert_eq!(response(&[false, false])["status"], "failed");
+
+        let mixed = bulk_read_response(
+            3,
+            vec![
+                json!({ "status": "success", "read": true }),
+                json!({ "status": "failed", "read": false }),
+                json!({ "status": "unknown", "read": Value::Null }),
+            ],
+        );
+        assert_eq!(mixed["status"], "partial");
+        assert_eq!(mixed["marked_count"], 1);
+        assert_eq!(mixed["failed_count"], 1);
+        assert_eq!(mixed["unknown_count"], 1);
+
+        let all_unknown = bulk_read_response(
+            2,
+            vec![
+                json!({ "status": "unknown", "read": Value::Null }),
+                json!({ "status": "unknown", "read": Value::Null }),
+            ],
+        );
+        assert_eq!(all_unknown["status"], "unknown");
+        assert_eq!(all_unknown["marked_count"], 0);
+        assert_eq!(all_unknown["failed_count"], 0);
+        assert_eq!(all_unknown["unknown_count"], 2);
     }
 
     // Regression for the bulk-read lost-update: prevalidation (`validate_read_target`)

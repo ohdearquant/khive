@@ -996,7 +996,11 @@ impl KhiveRuntime {
             crate::retrieval::EmbeddingTruncationReport::default()
         };
 
-        let event_store = self.events(token)?;
+        let event_token =
+            token.with_namespace(crate::Namespace::parse(&entity.namespace).map_err(|error| {
+                RuntimeError::Internal(format!("entity namespace invalid: {error}"))
+            })?);
+        let event_store = self.events(&event_token)?;
         let event = khive_storage::event::Event::new(
             entity.namespace.clone(),
             "update",
@@ -1251,7 +1255,11 @@ impl KhiveRuntime {
 
         // Dry-run is a read-only preview: it must not append a merge event.
         if !dry_run {
-            let event_store = self.events(token)?;
+            let event_token =
+                token.with_namespace(crate::Namespace::parse(&updated_entity.namespace).map_err(
+                    |error| RuntimeError::Internal(format!("entity namespace invalid: {error}")),
+                )?);
+            let event_store = self.events(&event_token)?;
             // Mirror the wire-level strategy spelling from MergeParams so consumers
             // can round-trip the policy string back into a request.
             let policy_str = match strategy {
@@ -1766,8 +1774,10 @@ impl KhiveRuntime {
     /// 10k scan cap as the generic `list` verb's filtered offset path) and
     /// returns those with `properties.direction == "outbound"` that are still
     /// pending delivery, capped at `limit`. Pending means `delivered_at` is
-    /// absent or null AND `properties.delivery` carries no terminal state
-    /// (`"delivered"` / `"failed"`, ADR-122 §1). When `to_prefix` is given,
+    /// absent or null, `properties.delivery` carries no terminal state
+    /// (`"delivered"` / `"failed"`), and a valid `next_attempt_at` is absent
+    /// or due (ADR-122 §1). Malformed legacy deadlines fail open so a bad
+    /// property cannot strand mail forever. When `to_prefix` is given,
     /// only rows whose `properties.to_actor` starts with it are counted —
     /// the channel predicate must run BEFORE the limit, otherwise a backlog
     /// of another channel's pending rows starves this channel indefinitely.
@@ -1788,6 +1798,7 @@ impl KhiveRuntime {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let now_micros = chrono::Utc::now().timestamp_micros();
         let mut collected: Vec<khive_storage::note::Note> = Vec::new();
         let mut db_offset: u32 = 0;
         loop {
@@ -1820,7 +1831,7 @@ impl KhiveRuntime {
                         continue;
                     }
                 }
-                // Must match `note_already_delivered` in the delivery loop: a
+                // Must match the delivery loop's terminal-state guard: a
                 // present-but-null `delivered_at` is undelivered, and a
                 // terminal `delivery` state ("delivered"/"failed") is not
                 // pending even without `delivered_at` (ADR-122 §1).
@@ -1837,6 +1848,14 @@ impl KhiveRuntime {
                 if terminal {
                     continue;
                 }
+                let retry_deferred = props
+                    .and_then(|p| p.get("next_attempt_at"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .is_some_and(|deadline| deadline.timestamp_micros() > now_micros);
+                if retry_deferred {
+                    continue;
+                }
                 collected.push(note);
                 if collected.len() >= limit as usize {
                     return Ok(collected);
@@ -1850,12 +1869,15 @@ impl KhiveRuntime {
         Ok(collected)
     }
 
-    /// Assert that `id` names a live outbound `message` note, returning
-    /// `InvalidInput` otherwise. Guard shared by the delivery-outcome
-    /// markers: they take caller-supplied UUIDs, and the generic
-    /// `update_note` they patch through would happily stamp delivery
-    /// properties onto any note kind.
-    async fn assert_outbound_message(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<()> {
+    /// Load a live outbound `message` note, returning `InvalidInput`
+    /// otherwise. Guard shared by the delivery-outcome markers: they take
+    /// caller-supplied UUIDs, and the generic note patch path would happily
+    /// stamp delivery properties onto any note kind.
+    async fn outbound_message(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<khive_storage::note::Note> {
         let note = self
             .notes(token)?
             .get_note(id)
@@ -1879,15 +1901,129 @@ impl KhiveRuntime {
                 "note {id} is not an outbound message"
             )));
         }
-        Ok(())
+        Ok(note)
+    }
+
+    async fn replace_outbound_message_properties(
+        &self,
+        token: &NamespaceToken,
+        mut snapshot: khive_storage::note::Note,
+        properties: serde_json::Map<String, Value>,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let expected_updated_at = snapshot.updated_at;
+        let expected_deleted_at = snapshot.deleted_at;
+        let id = snapshot.id;
+        snapshot.properties = Some(Value::Object(properties));
+        snapshot.updated_at = chrono::Utc::now().timestamp_micros().max(
+            expected_updated_at.checked_add(1).ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "note {id} updated_at is already at i64::MAX and cannot advance"
+                ))
+            })?,
+        );
+
+        let persisted = self
+            .notes(token)?
+            .replace_note_if_unchanged(snapshot.clone(), expected_updated_at, expected_deleted_at)
+            .await?;
+        if !persisted {
+            return Err(stale_note_snapshot_error(id));
+        }
+        Ok(snapshot)
+    }
+
+    /// True once a `delivery` outcome has been terminally recorded
+    /// (`"delivered"` or `"failed"`). Shared by every delivery-outcome
+    /// marker: concurrent outbox workers (two daemon processes overlapping
+    /// during a restart, per ADR-122 §4/Consequences) can both load the same
+    /// pending note before either writes, so a marker must re-check the
+    /// freshly loaded snapshot rather than trust the compare-and-swap alone
+    /// -- the CAS only rejects a write against a snapshot that has since
+    /// changed, not a write that starts from an up-to-date terminal snapshot
+    /// and would otherwise happily overwrite it with a different outcome.
+    fn outbound_delivery_is_terminal(props: Option<&serde_json::Map<String, Value>>) -> bool {
+        props
+            .and_then(|properties| properties.get("delivery"))
+            .and_then(Value::as_str)
+            .is_some_and(|state| state == "delivered" || state == "failed")
+    }
+
+    /// Record a transient transport failure while leaving the message
+    /// pending. The retry deadline is derived from the incremented persisted
+    /// attempt count, using `base_delay * 2^(attempt - 1)` capped at
+    /// `max_delay`.
+    pub async fn mark_outbound_message_transient_failure(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        attempted_at: chrono::DateTime<chrono::Utc>,
+        last_error: String,
+        base_delay: std::time::Duration,
+        max_delay: std::time::Duration,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        if base_delay.is_zero() || max_delay < base_delay {
+            return Err(RuntimeError::InvalidInput(
+                "outbound retry delays require a non-zero base no greater than the ceiling"
+                    .to_string(),
+            ));
+        }
+
+        crate::secret_gate::check_json(&serde_json::json!({
+            "last_error": &last_error,
+        }))?;
+
+        let snapshot = self.outbound_message(token, id).await?;
+        let props = snapshot.properties.as_ref().and_then(Value::as_object);
+        if Self::outbound_delivery_is_terminal(props) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "outbound message {id} already has a terminal delivery outcome"
+            )));
+        }
+
+        let attempts = props
+            .and_then(|properties| properties.get("delivery_attempts"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let exponent = attempts.saturating_sub(1).min(127) as u32;
+        let delay_nanos = base_delay
+            .as_nanos()
+            .checked_shl(exponent)
+            .unwrap_or(u128::MAX)
+            .min(max_delay.as_nanos());
+        let delay = std::time::Duration::new(
+            (delay_nanos / 1_000_000_000) as u64,
+            (delay_nanos % 1_000_000_000) as u32,
+        );
+        let chrono_delay = chrono::TimeDelta::from_std(delay).map_err(|_| {
+            RuntimeError::InvalidInput("outbound retry ceiling exceeds RFC 3339 range".to_string())
+        })?;
+        let next_attempt_at = attempted_at
+            .checked_add_signed(chrono_delay)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "outbound retry deadline exceeds RFC 3339 range".to_string(),
+                )
+            })?;
+
+        let mut properties = props.cloned().unwrap_or_default();
+        properties.insert("delivery_attempts".to_string(), Value::from(attempts));
+        properties.insert(
+            "next_attempt_at".to_string(),
+            Value::String(next_attempt_at.to_rfc3339()),
+        );
+        properties.insert("last_error".to_string(), Value::String(last_error));
+        self.replace_outbound_message_properties(token, snapshot, properties)
+            .await
     }
 
     /// Mark an outbound `message` note delivered by merging the ADR-122 §1
     /// terminal-outcome properties (`delivery = "delivered"`, `delivered_at`,
-    /// and `transport_message_id` when the transport minted one), through the
-    /// same patch path the generic `update` verb uses (`delivered_at` is
-    /// deliberately not owner-established, pinned by
-    /// `generic_update_can_still_patch_delivered_at_on_message_note`).
+    /// and `transport_message_id` when the transport minted one), and clearing
+    /// `delivery_attempts` / `next_attempt_at`. The compare-and-swap protects
+    /// unrelated properties from a concurrent full-row overwrite;
+    /// `delivered_at` remains deliberately caller-patchable, pinned by
+    /// `generic_update_can_still_patch_delivered_at_on_message_note`.
     /// Refuses (`InvalidInput`) unless `id` names a live outbound `message`
     /// note. Non-wire companion to
     /// [`Self::list_undelivered_outbound_messages`] so the delivery loop
@@ -1899,8 +2035,26 @@ impl KhiveRuntime {
         delivered_at: String,
         transport_message_id: Option<String>,
     ) -> RuntimeResult<khive_storage::note::Note> {
-        self.assert_outbound_message(token, id).await?;
-        let mut props = serde_json::Map::new();
+        crate::secret_gate::check_json(&serde_json::json!({
+            "delivered_at": &delivered_at,
+            "transport_message_id": &transport_message_id,
+        }))?;
+        let snapshot = self.outbound_message(token, id).await?;
+        if Self::outbound_delivery_is_terminal(
+            snapshot.properties.as_ref().and_then(Value::as_object),
+        ) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "outbound message {id} already has a terminal delivery outcome"
+            )));
+        }
+        let mut props = snapshot
+            .properties
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        props.remove("delivery_attempts");
+        props.remove("next_attempt_at");
         props.insert("delivery".into(), Value::String("delivered".into()));
         props.insert("delivered_at".into(), Value::String(delivered_at));
         if let Some(transport_message_id) = transport_message_id {
@@ -1909,21 +2063,15 @@ impl KhiveRuntime {
                 Value::String(transport_message_id),
             );
         }
-        self.update_note(
-            token,
-            id,
-            NotePatch {
-                properties: Some(Value::Object(props)),
-                ..NotePatch::default()
-            },
-        )
-        .await
+        self.replace_outbound_message_properties(token, snapshot, props)
+            .await
     }
 
     /// Record a permanent delivery failure on an outbound `message` note:
     /// `delivery = "failed"`, `failed_at`, `last_error` (ADR-122 §2 — an
     /// allowlist rejection must be recorded, not skipped, or the row stays
-    /// pending forever while the caller saw `ok: true`). Refuses
+    /// pending forever while the caller saw `ok: true`). Any retry counter and
+    /// deadline are cleared because the outcome is terminal. Refuses
     /// (`InvalidInput`) unless `id` names a live outbound `message` note.
     pub async fn mark_outbound_message_failed(
         &self,
@@ -1932,20 +2080,31 @@ impl KhiveRuntime {
         failed_at: String,
         last_error: String,
     ) -> RuntimeResult<khive_storage::note::Note> {
-        self.assert_outbound_message(token, id).await?;
-        self.update_note(
-            token,
-            id,
-            NotePatch {
-                properties: Some(serde_json::json!({
-                    "delivery": "failed",
-                    "failed_at": failed_at,
-                    "last_error": last_error,
-                })),
-                ..NotePatch::default()
-            },
-        )
-        .await
+        crate::secret_gate::check_json(&serde_json::json!({
+            "failed_at": &failed_at,
+            "last_error": &last_error,
+        }))?;
+        let snapshot = self.outbound_message(token, id).await?;
+        if Self::outbound_delivery_is_terminal(
+            snapshot.properties.as_ref().and_then(Value::as_object),
+        ) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "outbound message {id} already has a terminal delivery outcome"
+            )));
+        }
+        let mut props = snapshot
+            .properties
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        props.remove("delivery_attempts");
+        props.remove("next_attempt_at");
+        props.insert("delivery".into(), Value::String("failed".into()));
+        props.insert("failed_at".into(), Value::String(failed_at));
+        props.insert("last_error".into(), Value::String(last_error));
+        self.replace_outbound_message_properties(token, snapshot, props)
+            .await
     }
 
     /// Merge `from_id` note into `into_id` note.
@@ -2116,7 +2275,11 @@ impl KhiveRuntime {
 
         // Dry-run is a read-only preview: it must not append a merge event.
         if !dry_run {
-            let event_store = self.events(token)?;
+            let event_token =
+                token.with_namespace(crate::Namespace::parse(&updated_note.namespace).map_err(
+                    |error| RuntimeError::Internal(format!("note namespace invalid: {error}")),
+                )?);
+            let event_store = self.events(&event_token)?;
             // Mirror the wire-level strategy spelling from MergeParams so consumers
             // can round-trip the policy string back into a request.
             let policy_str = match strategy {
@@ -2219,6 +2382,7 @@ pub fn entity_fts_document(entity: &Entity) -> TextDocument {
     TextDocument {
         subject_id: entity.id,
         kind: SubstrateKind::Entity,
+        record_kind: Some(entity.kind.clone()),
         title: Some(entity.name.clone()),
         body: entity_embedding_text(entity),
         tags: entity.tags.clone(),
@@ -2250,6 +2414,7 @@ pub fn note_fts_document(note: &Note) -> TextDocument {
     TextDocument {
         subject_id: note.id,
         kind: SubstrateKind::Note,
+        record_kind: Some(note.kind.clone()),
         title: note.name.clone(),
         body,
         tags: vec![],
@@ -2265,6 +2430,8 @@ pub fn note_fts_document(note: &Note) -> TextDocument {
 /// exactly what [`Fts5TextSearch::upsert_document`] would write, preventing
 /// null/empty-string divergence on the `title` column for nameless notes.
 pub(crate) struct NoteFtsScalars {
+    /// Granular note kind used by the indexed corpus classifier.
+    pub record_kind: String,
     /// Empty string when `note.name` is `None` — matches the `unwrap_or("")` in
     /// `Fts5TextSearch::upsert_document`.
     pub title: String,
@@ -2284,6 +2451,7 @@ pub(crate) struct NoteFtsScalars {
 pub(crate) fn note_fts_scalars(note: &Note) -> NoteFtsScalars {
     let doc = note_fts_document(note);
     NoteFtsScalars {
+        record_kind: doc.record_kind.unwrap_or_default(),
         title: doc.title.unwrap_or_default(),
         body: doc.body,
         tags: "[]".to_string(),
@@ -2807,19 +2975,26 @@ fn merge_entity_sql(
             _ => merged_name.clone(),
         };
         let kind_str = SubstrateKind::Entity.to_string();
+        let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
 
+        // `into`'s old FTS row (via the map, not a namespace/subject_id
+        // scan), then the new merged row, then the map upsert to the new
+        // rowid. No separate map-row delete first: `INSERT OR REPLACE`
+        // overwrites it in place (see `delete_document_statement`'s doc
+        // comment in khive-db).
         conn.execute(
             &format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                fts_table
+                "DELETE FROM {fts_table} WHERE rowid IN \
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
             ),
             rusqlite::params![&namespace, &into_str],
         )?;
         conn.execute(
             &format!(
                 "INSERT INTO {} \
-                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 fts_table
             ),
             rusqlite::params![
@@ -2831,14 +3006,30 @@ fn merge_entity_sql(
                 &namespace,
                 &props_str,
                 now,
+                &into_entity.kind,
             ],
         )?;
-
         conn.execute(
             &format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                fts_table
+                "INSERT OR REPLACE INTO {fts_map} (namespace, subject_id, rowid) \
+                 VALUES (?1, ?2, last_insert_rowid())"
             ),
+            rusqlite::params![&namespace, &into_str],
+        )?;
+
+        // `from`'s FTS row is gone for good (merged away, not reinserted) —
+        // its map row must be removed too, or it would keep pointing at a
+        // rowid the DELETE above already reclaimed.
+        conn.execute(
+            &format!(
+                "DELETE FROM {fts_table} WHERE rowid IN \
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
+            ),
+            rusqlite::params![&namespace, &from_str],
+        )?;
+        conn.execute(
+            &format!("DELETE FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2"),
             rusqlite::params![&namespace, &from_str],
         )?;
 
@@ -3410,10 +3601,16 @@ fn merge_note_sql(
                 into_note.deleted_at,
             ])?;
 
+        let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
+
+        // `into`'s old FTS row (via the map), then the new merged row, then
+        // the map upsert to the new rowid — see `merge_entity_sql`'s matching
+        // comment for why no separate map-row delete is needed here.
         conn.execute(
             &format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                fts_table
+                "DELETE FROM {fts_table} WHERE rowid IN \
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
             ),
             rusqlite::params![&namespace, &into_str],
         )?;
@@ -3432,8 +3629,8 @@ fn merge_note_sql(
         conn.execute(
             &format!(
                 "INSERT INTO {} \
-                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 fts_table
             ),
             rusqlite::params![
@@ -3445,14 +3642,28 @@ fn merge_note_sql(
                 &namespace,
                 &fts_merged.metadata,
                 fts_merged.updated_at_micros,
+                &fts_merged.record_kind,
             ],
         )?;
-
         conn.execute(
             &format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                fts_table
+                "INSERT OR REPLACE INTO {fts_map} (namespace, subject_id, rowid) \
+                 VALUES (?1, ?2, last_insert_rowid())"
             ),
+            rusqlite::params![&namespace, &into_str],
+        )?;
+
+        // `from`'s FTS row is gone for good — remove its map row too.
+        conn.execute(
+            &format!(
+                "DELETE FROM {fts_table} WHERE rowid IN \
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
+            ),
+            rusqlite::params![&namespace, &from_str],
+        )?;
+        conn.execute(
+            &format!("DELETE FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2"),
             rusqlite::params![&namespace, &from_str],
         )?;
 
@@ -3956,6 +4167,54 @@ mod tests {
         assert!(zero.is_empty(), "limit=0 returns no rows, not one");
     }
 
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_skips_only_future_retry_deadlines() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let mut future = outbound_message_note();
+        future.properties = Some(serde_json::json!({
+            "direction": "outbound",
+            "next_attempt_at": "2999-01-01T00:00:00Z",
+        }));
+        let future_id = future.id;
+
+        let mut overdue = outbound_message_note();
+        overdue.properties = Some(serde_json::json!({
+            "direction": "outbound",
+            "next_attempt_at": "2000-01-01T00:00:00Z",
+        }));
+        let overdue_id = overdue.id;
+
+        let mut malformed = outbound_message_note();
+        malformed.properties = Some(serde_json::json!({
+            "direction": "outbound",
+            "next_attempt_at": "not-a-timestamp",
+        }));
+        let malformed_id = malformed.id;
+
+        for note in [future, overdue, malformed] {
+            store.upsert_note(note).await.expect("seed note");
+        }
+
+        let ids: HashSet<_> = rt
+            .list_undelivered_outbound_messages(&tok, None, 200)
+            .await
+            .expect("scan succeeds")
+            .into_iter()
+            .map(|note| note.id)
+            .collect();
+
+        assert!(!ids.contains(&future_id), "future retry must stay parked");
+        assert!(ids.contains(&overdue_id), "overdue retry must be eligible");
+        assert!(
+            ids.contains(&malformed_id),
+            "malformed legacy retry state must fail open instead of stranding the note"
+        );
+    }
+
     /// The channel prefix runs BEFORE the limit: a backlog of another
     /// channel's pending rows must not consume the scan budget and starve
     /// the requested channel (the pre-fix defect: filter-after-limit).
@@ -4112,6 +4371,192 @@ mod tests {
                 "{label}: expected InvalidInput, got {err:?}"
             );
         }
+    }
+
+    /// Regression: two concurrent outbox workers (two overlapping daemon
+    /// processes during a restart, per ADR-122 §4/Consequences) can both
+    /// load the same pending note before either writes. Without a terminal
+    /// re-check, a worker that lost the race to record a failure still
+    /// re-fetches a fresh snapshot right before writing -- which already
+    /// carries the winner's "delivered" outcome -- and the compare-and-swap
+    /// alone does not stop it from blindly overwriting that success with
+    /// "failed" (or vice versa).
+    #[tokio::test]
+    async fn outbound_delivery_marker_refuses_to_overwrite_existing_terminal_outcome() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let delivered_first = outbound_message_note();
+        let delivered_first_id = delivered_first.id;
+        let failed_first = outbound_message_note();
+        let failed_first_id = failed_first.id;
+        for note in [delivered_first, failed_first] {
+            store.upsert_note(note).await.expect("seed note");
+        }
+
+        rt.mark_outbound_message_delivered(
+            &tok,
+            delivered_first_id,
+            "2026-08-28T00:00:00Z".to_string(),
+            None,
+        )
+        .await
+        .expect("first delivery marker wins the race");
+
+        let err = rt
+            .mark_outbound_message_failed(
+                &tok,
+                delivered_first_id,
+                "2026-08-28T00:00:01Z".to_string(),
+                "duplicate send rejected".to_string(),
+            )
+            .await
+            .expect_err("a losing failure marker must not clobber the recorded success");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+
+        let note = store
+            .get_note(delivered_first_id)
+            .await
+            .expect("get note")
+            .expect("note exists");
+        let props = note
+            .properties
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            props.get("delivery").and_then(|v| v.as_str()),
+            Some("delivered"),
+            "recorded success must survive the losing worker's overwrite attempt"
+        );
+
+        rt.mark_outbound_message_failed(
+            &tok,
+            failed_first_id,
+            "2026-08-28T00:00:00Z".to_string(),
+            "recipient rejected".to_string(),
+        )
+        .await
+        .expect("first failure marker wins the race");
+
+        let err = rt
+            .mark_outbound_message_delivered(
+                &tok,
+                failed_first_id,
+                "2026-08-28T00:00:01Z".to_string(),
+                None,
+            )
+            .await
+            .expect_err("a late success marker must not clobber a recorded failure");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn outbound_transient_failure_increments_attempts_and_arms_bounded_backoff() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let mut note = outbound_message_note();
+        note.properties = Some(serde_json::json!({
+            "direction": "outbound",
+            "delivery_attempts": 3,
+            "unrelated": "preserved",
+        }));
+        let id = note.id;
+        store.upsert_note(note).await.expect("seed note");
+
+        let attempted_at = chrono::DateTime::parse_from_rfc3339("2026-08-30T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let marked = rt
+            .mark_outbound_message_transient_failure(
+                &tok,
+                id,
+                attempted_at,
+                "mailbox temporarily unavailable".to_string(),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .expect("transient marker succeeds");
+        let props = marked.properties.unwrap();
+
+        assert_eq!(props["delivery_attempts"].as_u64(), Some(4));
+        assert_eq!(
+            props["next_attempt_at"].as_str(),
+            Some("2026-08-30T00:00:20+00:00"),
+            "5 * 2^(4-1) is capped at the configured 20-second ceiling"
+        );
+        assert_eq!(
+            props["last_error"].as_str(),
+            Some("mailbox temporarily unavailable")
+        );
+        assert_eq!(props["unrelated"].as_str(), Some("preserved"));
+        assert!(
+            props.get("delivery").is_none(),
+            "a transient failure must remain pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_terminal_markers_clear_retry_schedule() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let mut delivered = outbound_message_note();
+        delivered.properties = Some(serde_json::json!({
+            "direction": "outbound",
+            "delivery_attempts": 2,
+            "next_attempt_at": "2999-01-01T00:00:00Z",
+            "last_error": "temporary",
+        }));
+        let delivered_id = delivered.id;
+
+        let mut failed = outbound_message_note();
+        failed.properties = Some(serde_json::json!({
+            "direction": "outbound",
+            "delivery_attempts": 7,
+            "next_attempt_at": "2999-01-01T00:00:00Z",
+        }));
+        let failed_id = failed.id;
+
+        for note in [delivered, failed] {
+            store.upsert_note(note).await.expect("seed note");
+        }
+
+        let delivered = rt
+            .mark_outbound_message_delivered(
+                &tok,
+                delivered_id,
+                "2026-08-30T00:00:00Z".to_string(),
+                None,
+            )
+            .await
+            .expect("delivery marker succeeds");
+        let delivered_props = delivered.properties.unwrap();
+        assert!(delivered_props.get("delivery_attempts").is_none());
+        assert!(delivered_props.get("next_attempt_at").is_none());
+        assert_eq!(delivered_props["last_error"].as_str(), Some("temporary"));
+
+        let failed = rt
+            .mark_outbound_message_failed(
+                &tok,
+                failed_id,
+                "2026-08-30T00:00:01Z".to_string(),
+                "recipient rejected".to_string(),
+            )
+            .await
+            .expect("permanent marker succeeds");
+        let failed_props = failed.properties.unwrap();
+        assert!(failed_props.get("delivery_attempts").is_none());
+        assert!(failed_props.get("next_attempt_at").is_none());
+        assert_eq!(failed_props["delivery"].as_str(), Some("failed"));
     }
 
     #[tokio::test]
