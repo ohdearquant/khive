@@ -1476,7 +1476,7 @@ mod tests {
         // busy-handler wait absorbs the contention transparently within a
         // single `BEGIN IMMEDIATE` call. This is the common case the
         // shared retry budget (exercised by
-        // `begin_retry_budget_bounds_total_wait_to_one_busy_timeout_window`
+        // `begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention`
         // below) must not regress: recovery inside one busy_timeout window
         // should never touch the Rust-level retry loop or its counters.
         let dir = tempfile::tempdir().unwrap();
@@ -1554,7 +1554,7 @@ mod tests {
         // own busy handler already spends the entire configured
         // `busy_timeout` internally before this call returns BUSY — the
         // shared retry budget introduced to bound total acquisition time to
-        // one window (see `begin_retry_budget_bounds_total_wait_to_one_busy_timeout_window`)
+        // one window (see `begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention`)
         // is therefore already spent the instant this first refusal
         // surfaces, and no further attempt is retried. Real, sustained
         // contention against a single busy_timeout window can only ever
@@ -1659,7 +1659,7 @@ mod tests {
     // `begin_immediate_failure_replies_error_without_running_op`.
     #[tokio::test]
     #[serial(tx_registry)]
-    async fn begin_retry_budget_bounds_total_wait_to_one_busy_timeout_window() {
+    async fn begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention() {
         // Before this fix, three BEGIN attempts each ran under their own
         // full `busy_timeout`, so persistent contention could hold the
         // serialized writer for roughly three windows plus the 15 ms of
@@ -1688,7 +1688,6 @@ mod tests {
         let lock_holder = pool.try_writer().unwrap();
         lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        let started = Instant::now();
         let result = handle
             .send(|conn| {
                 conn.execute("INSERT INTO t (id) VALUES (1)", [])
@@ -1698,21 +1697,27 @@ mod tests {
                     })
             })
             .await;
-        let elapsed = started.elapsed();
 
         assert!(
             matches!(&result, Err(StorageError::WriterTaskBusy { .. })),
             "precondition: the request must actually be refused busy, got {result:?}"
         );
-        // Three unbounded attempts against a lock that is never released
-        // would take roughly 3 * busy_timeout + 15ms (~465ms here); one
-        // shared budget bounds it to roughly one window plus the sleeps.
-        // The bound below sits well under the old three-window total while
-        // leaving generous slack for scheduling jitter on a loaded host.
-        assert!(
-            elapsed < busy_timeout * 2,
-            "expected total acquisition wait to stay within roughly one busy_timeout \
-             window plus backoff, got {elapsed:?} against a {busy_timeout:?} window"
+        // Against a lock that is never released, SQLite's busy handler spends
+        // the whole configured window inside the first `BEGIN IMMEDIATE`, so
+        // the shared budget is exhausted the moment that refusal surfaces:
+        // exactly one attempt is made and nothing is absorbed. Three
+        // unbounded attempts would have recorded two absorbed refusals and
+        // waited roughly three windows. The attempt count is the bound's
+        // deterministic signature; wall-clock time is not asserted because
+        // scheduler delay on a loaded host dwarfs a 150 ms window.
+        let counters = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            counters.writer_task_begin_busy, 1,
+            "one busy refusal must surface after the shared budget is spent"
+        );
+        assert_eq!(
+            counters.writer_task_begin_busy_absorbed, 0,
+            "a refusal that already consumed the whole budget must not be retried"
         );
 
         lock_holder.conn().execute_batch("ROLLBACK").unwrap();
