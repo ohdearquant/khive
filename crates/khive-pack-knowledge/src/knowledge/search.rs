@@ -21,6 +21,7 @@ use super::scoring::{
     compute_idf, exact_name_bonus, expand_terms, load_candidates_from_atoms, score_candidate,
     Candidate, Weights,
 };
+use super::sections::to_slug;
 use super::util::{
     atom_embed_text, atom_from_row, compose_item_char_cost, deser, domain_from_row,
     estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_i64, row_str,
@@ -464,6 +465,7 @@ struct FtsFetchOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LexicalCandidateState {
     Matched,
+    ExactName,
     NoMatch,
     Filtered,
     PartialTimeout,
@@ -474,6 +476,7 @@ impl LexicalCandidateState {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Matched => "matched",
+            Self::ExactName => "exact_name",
             Self::NoMatch => "no_match",
             Self::Filtered => "filtered",
             Self::PartialTimeout => "partial_timeout",
@@ -502,6 +505,9 @@ impl LexicalCandidateState {
         }
         if states.contains(&Self::Matched) {
             return Self::Matched;
+        }
+        if states.contains(&Self::ExactName) {
+            return Self::ExactName;
         }
         if states.contains(&Self::Filtered) {
             return Self::Filtered;
@@ -715,6 +721,60 @@ async fn fetch_fts_candidates(
     })
 }
 
+/// Indexed exact-name fallback for a query with no scoreable term (every
+/// token shorter than `MIN_TERM_LEN`, e.g. "AI"). The trigram FTS tokenizer
+/// cannot match a phrase that short, so [`fetch_fts_candidates`] always
+/// misses for such a query and the atom would otherwise be unreachable
+/// without ANN. `knowledge_atoms` carries no index on `name`, but the unique
+/// `(namespace, slug)` index does exist, so this probes it with the query
+/// normalized through the same ASCII-lowercase-hyphenate convention this
+/// pack's own import path uses ([`to_slug`]). A caller-chosen slug that does
+/// not follow that convention stays outside this probe's reach. A deadline
+/// expiry inside the probe is reported as [`ExactNameProbe::TimedOut`], never
+/// folded into a miss, so the caller can degrade the response the way it does
+/// for any other lexical-stage timeout.
+async fn fetch_exact_name_candidate(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    raw_query: &str,
+) -> Result<ExactNameProbe, RuntimeError> {
+    let slug = to_slug(raw_query);
+    if slug.is_empty() {
+        return Ok(ExactNameProbe::Miss);
+    }
+    let sql = runtime.sql();
+    let mut reader = match sql.reader().await {
+        Ok(reader) => reader,
+        Err(e) if is_timeout(&e) => return Ok(ExactNameProbe::TimedOut),
+        Err(e) => return Err(sql_err("search exact-name reader", e)),
+    };
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT * FROM knowledge_atoms \
+                  WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1"
+                .to_string(),
+            params: vec![SqlValue::Text(ns.to_owned()), SqlValue::Text(slug)],
+            label: None,
+        })
+        .await;
+    match row {
+        Ok(Some(row)) => Ok(atom_from_row(&row).map_or(ExactNameProbe::Miss, |atom| {
+            ExactNameProbe::Hit(Box::new(atom))
+        })),
+        Ok(None) => Ok(ExactNameProbe::Miss),
+        Err(e) if is_timeout(&e) => Ok(ExactNameProbe::TimedOut),
+        Err(e) => Err(sql_err("search exact-name query", e)),
+    }
+}
+
+/// Outcome of the indexed exact-name probe.
+#[derive(Debug)]
+enum ExactNameProbe {
+    Hit(Box<Atom>),
+    Miss,
+    TimedOut,
+}
+
 // ─── search context ───────────────────────────────────────────────────────────
 
 struct SearchCtx<'a> {
@@ -793,6 +853,52 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     )
     .await?;
     if atoms.is_empty() {
+        // A query with no scoreable term (e.g. "AI") never reaches FTS as
+        // anything but the raw phrase, which the trigram tokenizer cannot
+        // match below three characters. Fall back to the indexed slug probe
+        // rather than leaving a short exact name unreachable without ANN.
+        // The role prefix is scored but never searched, so this reads the raw
+        // query: a role-qualified short query must reach the same probe.
+        let raw_terms_only_exact = !matching::tokenize_field(&raw_query)
+            .iter()
+            .any(|w| w.len() >= MIN_TERM_LEN && !is_stop(w));
+        if raw_terms_only_exact && !state.timed_out() {
+            match fetch_exact_name_candidate(runtime, ns, &raw_query).await? {
+                ExactNameProbe::Hit(atom) => {
+                    let candidates = load_candidates_from_atoms(
+                        std::slice::from_ref(atom.as_ref()),
+                        type_filter,
+                    );
+                    if let Some(cand) = candidates.first() {
+                        let base = w.w_exact_name;
+                        if base >= min_score {
+                            return Ok(SearchCoreOutcome {
+                                hits: vec![ScoredHit {
+                                    id: cand.id.clone(),
+                                    slug: cand.slug.clone(),
+                                    name: cand.name_raw.clone(),
+                                    content: cand.content_raw.clone(),
+                                    tags: cand.tags_raw.clone(),
+                                    status: cand.status_raw.clone(),
+                                    finalized: cand.finalized,
+                                    is_domain: cand.is_domain,
+                                    score: base,
+                                    provenance: ScoreProvenance::lexical(),
+                                }],
+                                lexical_state: LexicalCandidateState::ExactName,
+                            });
+                        }
+                    }
+                }
+                ExactNameProbe::TimedOut => {
+                    return Ok(SearchCoreOutcome {
+                        hits: Vec::new(),
+                        lexical_state: LexicalCandidateState::TimedOut,
+                    });
+                }
+                ExactNameProbe::Miss => {}
+            }
+        }
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
             lexical_state: state,
@@ -3320,6 +3426,159 @@ mod tests {
 
         assert!(outcome.atoms.is_empty());
         assert_eq!(outcome.state, LexicalCandidateState::Filtered);
+    }
+
+    /// Issue: `MIN_TERM_LEN=3` drops every token of a query like "AI" before
+    /// FTS ever sees it, and the trigram tokenizer cannot match a phrase that
+    /// short either, so the atom was unreachable without ANN. The indexed
+    /// slug probe in `search_core` must restore discoverability for both the
+    /// atom's exact-case name and a case-insensitive spelling, while a query
+    /// that matches no slug at all must still report a genuine miss.
+    #[tokio::test]
+    async fn short_exact_name_is_discoverable_without_ann() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '93000000-0000-0000-0000-000000000001', 'local', \
+                              'ai', 'AI', \
+                              'artificial intelligence overview content for the corpus', '[]', \
+                              NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed short-name atom");
+        }
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+
+        let exact_case = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "AI", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("exact-case short-name search must not error");
+        assert_eq!(exact_case["total"], 1);
+        assert_eq!(exact_case["results"][0]["slug"], "ai");
+        assert_eq!(exact_case["candidate_provenance"]["lexical"], "exact_name");
+
+        let lower_case = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "ai", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("lower-case short-name search must not error");
+        assert_eq!(lower_case["total"], 1);
+        assert_eq!(lower_case["results"][0]["slug"], "ai");
+        assert_eq!(lower_case["candidate_provenance"]["lexical"], "exact_name");
+
+        let miss = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "zz", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("non-matching short query must not error");
+        assert_eq!(miss["total"], 0);
+        assert_eq!(miss["candidate_provenance"]["lexical"], "no_match");
+
+        // A role prefix is scored, never searched: it must not hide the probe.
+        let role_qualified = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "AI", "role": "researcher", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("role-qualified short-name search must not error");
+        assert_eq!(role_qualified["total"], 1);
+        assert_eq!(role_qualified["results"][0]["slug"], "ai");
+        assert_eq!(
+            role_qualified["candidate_provenance"]["lexical"],
+            "exact_name"
+        );
+    }
+
+    /// A deadline that expires inside the exact-name probe is a lexical
+    /// timeout, not a miss: the caller degrades the response on `TimedOut`
+    /// and would otherwise reach the final active-read check and error.
+    #[tokio::test]
+    async fn exact_name_probe_reports_an_expired_deadline_as_a_timeout() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+
+        let expired = khive_storage::scope_request_read_deadline(
+            std::time::Duration::ZERO,
+            fetch_exact_name_candidate(&runtime, "local", "AI"),
+        )
+        .await;
+        assert!(
+            matches!(expired, Ok(ExactNameProbe::TimedOut)),
+            "an expired read deadline must surface as TimedOut, never as a \
+             miss; got {expired:?}"
+        );
+
+        let healthy = fetch_exact_name_candidate(&runtime, "local", "AI")
+            .await
+            .expect("undeadlined probe must succeed");
+        assert!(
+            matches!(healthy, ExactNameProbe::Miss),
+            "control: without a deadline an unseeded name is a plain miss; got {healthy:?}"
+        );
+    }
+
+    /// The indexed exact-name probe must use the unique `(namespace, slug)`
+    /// index, never a full-namespace scan on `name` — no such index exists.
+    /// Same `EXPLAIN QUERY PLAN` style as
+    /// `crud::get_prefix_query_plan_uses_primary_key_range_seeks`.
+    #[tokio::test]
+    async fn exact_name_probe_query_plan_uses_slug_index() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut reader = runtime.sql().reader().await.expect("exact-name reader");
+        let rows = reader
+            .explain(SqlStatement {
+                sql: "SELECT * FROM knowledge_atoms \
+                      WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text("local".to_string()),
+                    SqlValue::Text("ai".to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("explain exact-name probe");
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("SEARCH knowledge_atoms") && d.contains("USING INDEX")),
+            "exact-name probe must use an index seek, not a table scan: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.contains("SCAN knowledge_atoms")),
+            "exact-name probe must never full-scan knowledge_atoms: {details:?}"
+        );
     }
 
     #[tokio::test]

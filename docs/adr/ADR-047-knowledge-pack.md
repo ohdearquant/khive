@@ -1,6 +1,6 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30, 2026-08-30c)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
@@ -18,8 +18,8 @@ an embedder and index can supply it.
 
 `knowledge.search` adds backward-compatible provenance fields:
 
-- Top-level `candidate_provenance.lexical` is `matched`, `no_match`, `filtered`, `partial_timeout`,
-  or `timed_out`.
+- Top-level `candidate_provenance.lexical` is `matched`, `exact_name`, `no_match`, `filtered`,
+  `partial_timeout`, or `timed_out`.
 - Top-level `candidate_provenance.fallback` is `ann` only when the returned set has ANN
   evidence and no returned result has lexical evidence; otherwise it is `none`.
 - Each result adds `score_provenance` with a stable-order `sources` subset of `lexical` and
@@ -32,6 +32,21 @@ existing status multiplier. It is not a probability, a cross-query comparable me
 absolute presence signal. The former `0.46`/`0.42` bands predated the squash and are retired;
 callers use response-local rank together with candidate and per-hit provenance. `min_score`
 continues to apply to the final returned score.
+
+## Amendment (2026-08-30c): indexed exact-name recovery for short queries
+
+A query whose every token falls below the minimum scoreable term length (e.g. "AI") never
+reaches FTS as anything but the raw phrase, which the trigram tokenizer cannot match below
+three characters. Such a query was unreachable without ANN even when an atom with that exact
+name existed. `candidate_provenance.lexical: "exact_name"` covers this case: when the lexical
+FTS stage produces no candidates and no query token was scoreable, `knowledge.search` probes
+the unique `(namespace, slug)` index with the query normalized through the pack's own slug
+convention (the same one `knowledge.edit`'s import path uses), recovering the atom when FTS
+could not. A caller-chosen slug that departs from that convention stays outside this probe's
+reach — it is a narrower guarantee than a general name index would give, not a substring match.
+A role prefix on the query is scored but never searched, so the probe reads the raw query: a
+role-qualified short query reaches the same recovery path. A read-deadline expiry inside the
+probe reports `timed_out`, the same degradation contract as every other lexical-stage timeout.
 
 ## Amendment (2026-08-29): tri-state atom upsert patches
 
