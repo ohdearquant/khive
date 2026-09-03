@@ -1641,6 +1641,287 @@ fn v24_leaves_both_backfill_markers_present() {
     }
 }
 
+/// A map row that already existed at V23 (the map's own DDL is `CREATE
+/// TABLE IF NOT EXISTS`, so a pre-created copy survives V24's own `CREATE
+/// TABLE IF NOT EXISTS` untouched) pointing at a rowid under the WRONG key
+/// must be removed by V24's map-cleanup statements, not merely left in place
+/// alongside the correct entry the backfill inserts. Reproduces a database
+/// that somehow already carries a rowid-map (e.g. a partially-applied
+/// migration from an interrupted run) with one stale, wrong-key row.
+#[test]
+fn v24_wrong_key_map_row_removed_before_marker() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    conn.execute(
+        "INSERT INTO notes \
+         (id, namespace, kind, status, content, created_at, updated_at) \
+         VALUES ('B', 'local', 'memory', 'active', 'doc b', 1, 1)",
+        [],
+    )
+    .expect("insert backing note for B, so sweep 2 does not treat B as an orphan");
+
+    // Pre-create the map table exactly like V24's own `CREATE TABLE IF NOT
+    // EXISTS` does, then seed a wrong-key row before V24 runs at all.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS fts_notes_rowids ( \
+             namespace  TEXT NOT NULL, \
+             subject_id TEXT NOT NULL, \
+             rowid      INTEGER NOT NULL, \
+             PRIMARY KEY (namespace, subject_id) \
+         ) WITHOUT ROWID;",
+    )
+    .expect("pre-create the map table before V24 runs");
+    conn.execute(
+        "INSERT INTO fts_notes_rowids (namespace, subject_id, rowid) VALUES ('local', 'C', 30)",
+        [],
+    )
+    .expect("seed a stale wrong-key map row pointing at B's rowid");
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (30, 'B', 'note', '', 'doc b', '[]', 'local', NULL, 1, 'memory')",
+        [],
+    )
+    .expect("insert B's live fts row at rowid 30");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        24
+    );
+
+    let c_still_mapped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_notes_rowids WHERE subject_id = 'C'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count C's map rows");
+    assert_eq!(
+        c_still_mapped, 0,
+        "the pre-existing wrong-key map row for C must be removed by V24, not left \
+         alongside the correct entry for B"
+    );
+
+    let b_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes_rowids WHERE namespace = 'local' AND subject_id = 'B'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read B's own map entry");
+    assert_eq!(b_rowid, 30);
+
+    let marked: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM fts_notes_rowids_state \
+             WHERE key = 'backfill' AND value = 'complete')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read backfill marker");
+    assert!(
+        marked,
+        "the completion marker must still be written once the wrong-key row is cleaned up"
+    );
+}
+
+/// Migration 024's reconciliation and `ensure_fts_rowid_map_backfilled`'s
+/// runtime reconciliation (`crates/khive-db/src/backend.rs`) are two
+/// independent implementations of the same invariant, sharing no SQL text.
+/// Seeds the SAME malformed legacy state -- a wrong-key map row, a
+/// duplicate `(namespace, subject_id)` pair at two rowids, and an
+/// unattributable NULL-key row -- into two databases, drives one through
+/// migration 024 (on `fts_notes`, with backing `notes` rows for every live
+/// key so the migration's own entities/notes orphan sweep is a no-op and
+/// does not diverge from the runtime path, which has no such sweep) and the
+/// other through the runtime backfill (an arbitrary `table_key`, with the
+/// map table pre-created and the marker cleared), and asserts the two
+/// converge on the same set of surviving FTS rows and the same set of map
+/// rows.
+#[test]
+fn v24_migration_and_runtime_backfill_reconcile_identical_malformed_state() {
+    // -- Path 1: migration 024, via `fts_notes` with a real `notes` backing table. --
+    let mut migrated = open_memory();
+    migrate_through(&mut migrated, 23);
+    for id in ["A", "B"] {
+        migrated
+            .execute(
+                &format!(
+                    "INSERT INTO notes \
+                     (id, namespace, kind, status, content, created_at, updated_at) \
+                     VALUES ('{id}', 'local', 'memory', 'active', 'doc {id}', 1, 1)"
+                ),
+                [],
+            )
+            .unwrap_or_else(|e| panic!("insert backing note {id}: {e}"));
+    }
+    migrated
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS fts_notes_rowids ( \
+                 namespace  TEXT NOT NULL, \
+                 subject_id TEXT NOT NULL, \
+                 rowid      INTEGER NOT NULL, \
+                 PRIMARY KEY (namespace, subject_id) \
+             ) WITHOUT ROWID;",
+        )
+        .expect("pre-create the map table before V24 runs");
+    seed_malformed_legacy_fts_state(&migrated, "fts_notes", "fts_notes_rowids");
+    assert_eq!(
+        run_migrations(&mut migrated).expect("apply V24 rowid-map migration"),
+        24
+    );
+
+    // -- Path 2: the runtime backfill, via an arbitrary table_key that never
+    // goes through the migration system at all. --
+    let backend = crate::backend::StorageBackend::memory().expect("open in-memory backend");
+    let table_key = "state_parity_runtime";
+    let table = format!("fts_{table_key}");
+    let map = format!("{table}_rowids");
+    let state = format!("{map}_state");
+    // Establishes the schema; the table is empty so the marker is left
+    // deliberately unwritten (see `ensure_fts_rowid_map_backfilled`'s doc).
+    let _ = backend.text(table_key).unwrap();
+    {
+        let writer = backend.pool().writer().unwrap();
+        writer.conn().execute_batch("BEGIN").unwrap();
+        seed_malformed_legacy_fts_state(writer.conn(), &table, &map);
+        writer
+            .conn()
+            .execute(&format!("DELETE FROM {state} WHERE key = 'backfill'"), [])
+            .expect("clear the marker the empty-table open above did not write anyway");
+        writer.conn().execute_batch("COMMIT").unwrap();
+    }
+    // Triggers the real runtime reconciliation.
+    let _ = backend.text(table_key).unwrap();
+
+    let migrated_fts: Vec<(i64, String, String, i64)> = migrated
+        .prepare("SELECT rowid, namespace, subject_id, updated_at FROM fts_notes ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let runtime_fts: Vec<(i64, String, String, i64)> = {
+        let writer = backend.pool().writer().unwrap();
+        let rows = writer
+            .conn()
+            .prepare(&format!(
+                "SELECT rowid, namespace, subject_id, updated_at FROM {table} ORDER BY rowid"
+            ))
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(
+        migrated_fts, runtime_fts,
+        "migration 024 and the runtime backfill must reconcile the same malformed legacy \
+         state to the identical set of surviving FTS rows"
+    );
+
+    let migrated_map: Vec<(String, String, i64)> = migrated
+        .prepare("SELECT namespace, subject_id, rowid FROM fts_notes_rowids ORDER BY subject_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let runtime_map: Vec<(String, String, i64)> = {
+        let writer = backend.pool().writer().unwrap();
+        let rows = writer
+            .conn()
+            .prepare(&format!(
+                "SELECT namespace, subject_id, rowid FROM {map} ORDER BY subject_id"
+            ))
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(
+        migrated_map, runtime_map,
+        "migration 024 and the runtime backfill must reconcile the same malformed legacy \
+         state to the identical set of map rows"
+    );
+}
+
+/// Seeds the same malformed legacy state into `fts_table`/`map_table`:
+/// duplicate `(local, "A")` at rowid 10 (older, must lose the survivor
+/// race) and rowid 20 (newer, must survive); a single `(local, "B")` row at
+/// rowid 30; a pre-existing wrong-key map row `(local, "C", 30)` stealing
+/// B's rowid; and an unattributable NULL-key row at rowid 40. Shared by
+/// [`v24_migration_and_runtime_backfill_reconcile_identical_malformed_state`]
+/// so both paths start from byte-identical input.
+fn seed_malformed_legacy_fts_state(conn: &Connection, fts_table: &str, map_table: &str) {
+    conn.execute(
+        &format!(
+            "INSERT INTO {fts_table} \
+             (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, \
+              record_kind) \
+             VALUES (10, 'A', 'note', '', 'older dup', '[]', 'local', NULL, 1, 'memory')"
+        ),
+        [],
+    )
+    .expect("insert A's older/losing duplicate");
+    conn.execute(
+        &format!(
+            "INSERT INTO {fts_table} \
+             (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, \
+              record_kind) \
+             VALUES (20, 'A', 'note', '', 'newer dup', '[]', 'local', NULL, 5, 'memory')"
+        ),
+        [],
+    )
+    .expect("insert A's newer/surviving duplicate");
+    conn.execute(
+        &format!(
+            "INSERT INTO {fts_table} \
+             (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, \
+              record_kind) \
+             VALUES (30, 'B', 'note', '', 'doc b', '[]', 'local', NULL, 2, 'memory')"
+        ),
+        [],
+    )
+    .expect("insert B's single live row");
+    conn.execute(
+        &format!(
+            "INSERT INTO {fts_table} \
+             (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, \
+              record_kind) \
+             VALUES (40, NULL, 'note', '', 'legacy null-key body', '[]', NULL, NULL, 3, '')"
+        ),
+        [],
+    )
+    .expect("insert the unattributable NULL-key row");
+    conn.execute(
+        &format!(
+            "INSERT INTO {map_table} (namespace, subject_id, rowid) VALUES ('local', 'C', 30)"
+        ),
+        [],
+    )
+    .expect("seed the stale wrong-key map row stealing B's rowid");
+}
+
 // ── V5: external_id unique index tests ──────────────────────────────────────
 
 fn index_exists(conn: &Connection, name: &str) -> bool {

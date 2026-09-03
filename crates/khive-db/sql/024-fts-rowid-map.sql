@@ -106,15 +106,26 @@ WHERE f.namespace IS NOT NULL AND f.subject_id IS NOT NULL
   );
 
 -- Keep the map consistent with sweep 2's removals (sweep 1's removals were
--- never in the map to begin with, by construction).
+-- never in the map to begin with, by construction), AND remove any
+-- pre-existing map row that survives at the right rowid but the wrong key --
+-- e.g. a row left behind after FTS5 reused a rowid for a different
+-- (namespace, subject_id) before this migration ran. Checking rowid alone
+-- would leave that row in the map, silently misdirecting a lookup for its
+-- stale key at the live document now sitting at that rowid.
 DELETE FROM fts_entities_rowids
 WHERE NOT EXISTS (
-    SELECT 1 FROM fts_entities WHERE fts_entities.rowid = fts_entities_rowids.rowid
+    SELECT 1 FROM fts_entities
+    WHERE fts_entities.rowid = fts_entities_rowids.rowid
+      AND fts_entities.namespace = fts_entities_rowids.namespace
+      AND fts_entities.subject_id = fts_entities_rowids.subject_id
 );
 
 DELETE FROM fts_notes_rowids
 WHERE NOT EXISTS (
-    SELECT 1 FROM fts_notes WHERE fts_notes.rowid = fts_notes_rowids.rowid
+    SELECT 1 FROM fts_notes
+    WHERE fts_notes.rowid = fts_notes_rowids.rowid
+      AND fts_notes.namespace = fts_notes_rowids.namespace
+      AND fts_notes.subject_id = fts_notes_rowids.subject_id
 );
 
 -- Mark both backfills complete in this same transaction: a migrated

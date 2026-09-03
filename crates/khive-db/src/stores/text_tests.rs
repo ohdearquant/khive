@@ -401,13 +401,19 @@ async fn unmanaged_delete_rolls_back_the_fts_row_when_the_map_delete_fails() {
     let table = store.table_name.clone();
     let map_table = rowid_map_table(&table);
 
-    struct ResetSeamOnDrop;
+    struct ResetSeamOnDrop {
+        namespace: String,
+        subject_id: Uuid,
+    }
     impl Drop for ResetSeamOnDrop {
         fn drop(&mut self) {
-            delete_dml_test_seam::disarm();
+            delete_dml_test_seam::disarm(&self.namespace, self.subject_id);
         }
     }
-    let reset_seam = ResetSeamOnDrop;
+    let reset_seam = ResetSeamOnDrop {
+        namespace: ns.to_string(),
+        subject_id: a,
+    };
     delete_dml_test_seam::arm(ns, a);
 
     let result = store.delete_document(ns, a).await;
@@ -486,6 +492,89 @@ async fn unmanaged_delete_rolls_back_the_fts_row_when_the_map_delete_fails() {
     assert_eq!(
         map_count, 0,
         "the map row must be gone after the real delete"
+    );
+}
+
+/// The seam's targets are stored in a shared set, not a single `Option`
+/// slot -- two independently armed `(namespace, subject_id)` targets must
+/// not clobber each other: arming a second target must not disturb the
+/// first, disarming one target must remove only that target and leave the
+/// other armed, and a delete against either target while armed must roll
+/// back on its own key regardless of what else is armed at the time.
+#[tokio::test]
+async fn delete_dml_test_seam_isolates_two_independently_armed_targets() {
+    let store = setup_memory_store("seam_isolation");
+    let ns = "test_ns";
+    let a = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    store
+        .upsert_document(make_document(a, "Doc A", "doc a body"))
+        .await
+        .unwrap();
+    store
+        .upsert_document(make_document(c, "Doc C", "doc c body"))
+        .await
+        .unwrap();
+
+    delete_dml_test_seam::arm(ns, a);
+    delete_dml_test_seam::arm(ns, c);
+    assert!(
+        delete_dml_test_seam::matches(ns, a),
+        "arming a second target must not un-arm the first"
+    );
+    assert!(
+        delete_dml_test_seam::matches(ns, c),
+        "the second target must itself be armed"
+    );
+
+    // Both targets armed concurrently: each delete must roll back under its
+    // own key, independent of the other's armed state.
+    let (result_a, result_c) =
+        tokio::join!(store.delete_document(ns, a), store.delete_document(ns, c));
+    assert!(
+        result_a.is_err(),
+        "A's forced failure must fire while A is armed"
+    );
+    assert!(
+        result_c.is_err(),
+        "C's forced failure must fire while C is armed, independent of A"
+    );
+    assert!(
+        store.get_document(ns, a).await.unwrap().is_some(),
+        "A's rolled-back delete must leave A readable"
+    );
+    assert!(
+        store.get_document(ns, c).await.unwrap().is_some(),
+        "C's rolled-back delete must leave C readable"
+    );
+
+    // Disarm only A -- C's own target must survive untouched.
+    delete_dml_test_seam::disarm(ns, a);
+    assert!(
+        !delete_dml_test_seam::matches(ns, a),
+        "disarming A must remove exactly A's own target"
+    );
+    assert!(
+        delete_dml_test_seam::matches(ns, c),
+        "disarming A must leave C's independently armed target in place"
+    );
+
+    let deleted_a = store.delete_document(ns, a).await.unwrap();
+    assert!(
+        deleted_a,
+        "with A disarmed, its delete must succeed for real"
+    );
+    let result_c_still_armed = store.delete_document(ns, c).await;
+    assert!(
+        result_c_still_armed.is_err(),
+        "C must still force-fail: disarming A must not have disarmed C"
+    );
+
+    delete_dml_test_seam::disarm(ns, c);
+    let deleted_c = store.delete_document(ns, c).await.unwrap();
+    assert!(
+        deleted_c,
+        "with C disarmed, its delete must succeed for real"
     );
 }
 

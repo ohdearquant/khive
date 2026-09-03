@@ -55,13 +55,33 @@ fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool,
 /// that later gains rows through anything other than the maintained write
 /// paths (a raw-SQL legacy seed, or a restored pre-map snapshot) is still
 /// picked up and reconciled the next time this runs. Once the table holds at
-/// least one row, the backfill below re-populates the map from every current
-/// FTS row (`INSERT OR REPLACE`), which reconciles a partially populated map
-/// rather than only filling a wholly empty one, then writes the marker in
-/// the same transaction. `updated_at ASC, rowid ASC` matches migration 024's
-/// own backfill ordering: for any legacy duplicate `(namespace, subject_id)`
-/// pair, the row with the newest `updated_at` survives `INSERT OR REPLACE`,
-/// breaking a tie toward the higher rowid.
+/// least one row, the marker asserts a bijection — every live row has
+/// exactly one map row pointing at it, and every map row points at a live
+/// row with the same key — so reconciliation runs in three steps before the
+/// marker is written, all inside one transaction:
+///
+/// 1. Any existing map row that no longer has a matching live FTS row at the
+///    same rowid AND the same `(namespace, subject_id)` is removed first. A
+///    map row can otherwise survive with the wrong key after FTS5 reuses its
+///    rowid for a different document (the crash window
+///    `delete_document_dml` guards against at the single-delete level; this
+///    is the same class of staleness surviving into a legacy/reconciliation
+///    pass instead).
+/// 2. The map is (re)built from every current FTS row (`INSERT OR REPLACE`),
+///    which reconciles a partially populated map rather than only filling a
+///    wholly empty one. `updated_at ASC, rowid ASC` matches migration 024's
+///    own backfill ordering: for any legacy duplicate `(namespace,
+///    subject_id)` pair, the row with the newest `updated_at` survives
+///    `INSERT OR REPLACE`, breaking a tie toward the higher rowid.
+/// 3. Any non-NULL-key FTS row that lost step 2's survivor race — a
+///    duplicate whose rowid the map no longer points at — is deleted,
+///    mirroring migration 024's own first sweep, so no live row is left
+///    without a map entry.
+///
+/// The marker is then written in the same transaction. This function never
+/// checks `entities`/`notes` for orphaned subjects — that sweep is specific
+/// to those two backing tables and stays in migration 024's SQL; a generic
+/// `table_key` here has no fixed backing table to check against.
 fn ensure_fts_rowid_map_backfilled(
     conn: &rusqlite::Connection,
     table: &str,
@@ -88,10 +108,23 @@ fn ensure_fts_rowid_map_backfilled(
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result: Result<(), SqliteError> = (|| {
         conn.execute_batch(&format!(
+            "DELETE FROM {map} WHERE NOT EXISTS ( \
+                 SELECT 1 FROM {table} \
+                 WHERE {table}.rowid = {map}.rowid \
+                   AND {table}.namespace = {map}.namespace \
+                   AND {table}.subject_id = {map}.subject_id \
+             )"
+        ))?;
+        conn.execute_batch(&format!(
             "INSERT OR REPLACE INTO {map} (namespace, subject_id, rowid) \
              SELECT namespace, subject_id, rowid FROM {table} \
              WHERE namespace IS NOT NULL AND subject_id IS NOT NULL \
              ORDER BY updated_at ASC, rowid ASC"
+        ))?;
+        conn.execute_batch(&format!(
+            "DELETE FROM {table} \
+             WHERE namespace IS NOT NULL AND subject_id IS NOT NULL \
+               AND rowid NOT IN (SELECT rowid FROM {map})"
         ))?;
         conn.execute(
             &format!("INSERT OR REPLACE INTO {state} (key, value) VALUES ('backfill', ?1)"),
@@ -122,8 +155,11 @@ fn warn_scan_fallback_once(table: &str) {
     WARNED.call_once(|| {
         tracing::warn!(
             table,
-            "opened a read-only text-search table with no rowid-map sidecar; falling back to \
-             pre-map namespace/subject_id scan predicates for get/delete on this table"
+            "opened a read-only text-search table with no rowid-map sidecar, or with a sidecar \
+             that has never proven a completed backfill (no durable completion marker); a \
+             read-only connection cannot create, backfill, or reconcile the map itself, so this \
+             falls back to pre-map namespace/subject_id scan predicates for get/delete on this \
+             table rather than trusting a map that might be partial"
         );
     });
 }
@@ -897,18 +933,21 @@ impl StorageBackend {
                 table_key
             )));
         }
-        // `text::rowid_map_table` names a table's sidecar map
-        // `{table}_rowids` — a `table_key` ending in `_rowids` (e.g.
-        // "entities_rowids") would resolve to `fts_entities_rowids`, the
-        // exact core sidecar table name already reserved for the `entities`
-        // FTS table's own map. `CREATE VIRTUAL TABLE IF NOT EXISTS` would
-        // then silently accept that ordinary (non-FTS5) table as if it were
-        // this key's FTS table, and every later point read/write against it
-        // would fail against the wrong schema.
-        if table_key.ends_with("_rowids") {
+        // `text::rowid_map_table`/`text::rowid_map_state_table` name a
+        // table's sidecar map `{table}_rowids` and that map's own completion
+        // marker `{table}_rowids_state` — a `table_key` ending in either
+        // reserved suffix (e.g. "entities_rowids" or "entities_rowids_state")
+        // would resolve to the exact sidecar table name another key's own
+        // map or marker already reserves. `CREATE VIRTUAL TABLE IF NOT
+        // EXISTS` would then silently accept that ordinary (non-FTS5) table
+        // as if it were this key's FTS table, and every later point
+        // read/write against it would fail against the wrong schema.
+        if table_key.ends_with("_rowids") || table_key.ends_with("_rowids_state") {
             return Err(SqliteError::InvalidData(format!(
-                "invalid table_key '{}': must not end in '_rowids' — that suffix is reserved \
-                 for a text table's own rowid-map sidecar (see text::rowid_map_table)",
+                "invalid table_key '{}': must not end in '_rowids' or '_rowids_state' — those \
+                 suffixes are reserved for a text table's own rowid-map sidecar and its \
+                 completion-marker state table (see text::rowid_map_table, \
+                 text::rowid_map_state_table)",
                 table_key
             )));
         }
@@ -948,14 +987,35 @@ impl StorageBackend {
                      it in a writable copy before opening the snapshot"
                 )));
             }
-            // A read-only connection cannot create or backfill the rowid-map
-            // sidecar: a snapshot taken before this migration shipped can
-            // have the FTS table without its map. Fall back to the pre-map
-            // scan predicates rather than constructing a store whose
-            // get/delete would fail against a sidecar table that does not
-            // exist.
+            // A read-only connection cannot create, backfill, or reconcile
+            // the rowid-map sidecar: a snapshot taken before this migration
+            // shipped can have the FTS table without its map at all, and a
+            // snapshot taken mid-backfill (a crash, or a copy made between
+            // the map's creation and its completion marker being written) can
+            // have a map table that is only partially populated. Trusting an
+            // unproven map here would silently hide live rows the map
+            // doesn't yet know about — only a map with a durable completion
+            // marker (`ROWID_MAP_BACKFILL_COMPLETE`) is safe to join against
+            // read-only; anything else falls back to the pre-map scan
+            // predicates rather than constructing a store whose get/delete
+            // would either fail against a nonexistent sidecar or silently
+            // miss rows an unreconciled map doesn't cover.
             let map = text::rowid_map_table(&table);
-            if !sqlite_table_exists(reader.conn(), &map)? {
+            let map_exists = sqlite_table_exists(reader.conn(), &map)?;
+            let marker_present = if map_exists {
+                let state = text::rowid_map_state_table(&table);
+                sqlite_table_exists(reader.conn(), &state)?
+                    && reader.conn().query_row(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM {state} WHERE key = 'backfill' AND value = ?1)"
+                        ),
+                        rusqlite::params![text::ROWID_MAP_BACKFILL_COMPLETE],
+                        |row| row.get(0),
+                    )?
+            } else {
+                false
+            };
+            if !map_exists || !marker_present {
                 warn_scan_fallback_once(&table);
                 return Ok(Arc::new(text::Fts5TextSearch::new_scan_fallback(
                     Arc::clone(&self.pool),
@@ -1901,6 +1961,186 @@ mod tests {
         );
     }
 
+    /// A map row surviving at the right rowid but the WRONG key (the crash
+    /// window `delete_document_dml`'s trailing key re-check guards against at
+    /// the single-delete level, but which this reconciliation pass must also
+    /// clean up if it survived into a legacy/pre-marker database) must be
+    /// removed, not merely supplemented by a second, correct map row for the
+    /// same rowid. Seeds the FTS table with ONE live row at rowid 7 keyed
+    /// `(test_ns, B)`, seeds a stale map row `(test_ns, A, 7)` -- as if A's
+    /// document once lived at rowid 7 and was replaced by B without the map
+    /// being repaired -- clears the marker, and asserts the next open leaves
+    /// the map with exactly `(test_ns, B, 7)`: A's stale entry gone, B's
+    /// entry present, and `get_document` for each key answering accordingly.
+    #[tokio::test]
+    async fn text_open_removes_a_wrong_key_map_row_before_backfilling_the_right_one() {
+        let backend = StorageBackend::memory().unwrap();
+        let table_key = "wrong_key_map_row";
+        let table = format!("fts_{table_key}");
+        let map = format!("{table}_rowids");
+        let state = format!("{map}_state");
+
+        let _ = backend.text(table_key).unwrap();
+
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer.conn().execute_batch("BEGIN").unwrap();
+            writer
+                .conn()
+                .execute(
+                    &format!(
+                        "INSERT INTO {table} \
+                         (rowid, subject_id, kind, title, body, tags, namespace, metadata, \
+                          updated_at, record_kind) \
+                         VALUES (7, ?1, 'note', '', 'doc b', '[]', 'test_ns', NULL, 0, 'memory')"
+                    ),
+                    rusqlite::params![b.to_string()],
+                )
+                .expect("insert B's live fts row at rowid 7");
+            writer
+                .conn()
+                .execute(
+                    &format!(
+                        "INSERT INTO {map} (namespace, subject_id, rowid) VALUES ('test_ns', ?1, 7)"
+                    ),
+                    rusqlite::params![a.to_string()],
+                )
+                .expect("insert A's stale map row still pointing at rowid 7");
+            writer
+                .conn()
+                .execute(&format!("DELETE FROM {state} WHERE key = 'backfill'"), [])
+                .expect("clear the completion marker");
+            writer.conn().execute_batch("COMMIT").unwrap();
+        }
+
+        let store = backend.text(table_key).unwrap();
+
+        let map_rows: Vec<(String, i64)> = {
+            let writer = backend.pool().writer().unwrap();
+            let mut stmt = writer
+                .conn()
+                .prepare(&format!(
+                    "SELECT subject_id, rowid FROM {map} ORDER BY rowid"
+                ))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(
+            map_rows,
+            vec![(b.to_string(), 7)],
+            "the stale (A, 7) map row must be removed and replaced by the correct (B, 7) row, \
+             not left alongside it"
+        );
+
+        assert!(
+            store.get_document("test_ns", a).await.unwrap().is_none(),
+            "A's stale map entry is gone, so get_document(A) must find nothing"
+        );
+        let fetched_b = store.get_document("test_ns", b).await.unwrap();
+        assert!(
+            fetched_b.is_some(),
+            "get_document(B) must find the live row now correctly mapped"
+        );
+        assert_eq!(fetched_b.unwrap().body, "doc b");
+    }
+
+    /// Two non-NULL-key FTS rows for the SAME `(namespace, subject_id)` at
+    /// different rowids (a pre-atomic-upsert-era duplicate) must resolve to
+    /// exactly one map row at the survivor rowid, with the OTHER, losing row
+    /// actually removed from the FTS table -- not merely left unmapped and
+    /// invisible to every keyed lookup. Mirrors migration 024's own sweep,
+    /// which this function's step 3 must reproduce at runtime.
+    #[tokio::test]
+    async fn text_open_sweeps_the_duplicate_that_lost_the_survivor_race() {
+        let backend = StorageBackend::memory().unwrap();
+        let table_key = "duplicate_loser_swept";
+        let table = format!("fts_{table_key}");
+        let map = format!("{table}_rowids");
+        let state = format!("{map}_state");
+
+        let _ = backend.text(table_key).unwrap();
+
+        let dup = uuid::Uuid::new_v4();
+        {
+            let writer = backend.pool().writer().unwrap();
+            writer.conn().execute_batch("BEGIN").unwrap();
+            // Lower rowid, OLDER updated_at -- must lose the survivor race.
+            writer
+                .conn()
+                .execute(
+                    &format!(
+                        "INSERT INTO {table} \
+                         (rowid, subject_id, kind, title, body, tags, namespace, metadata, \
+                          updated_at, record_kind) \
+                         VALUES (10, ?1, 'note', '', 'older body', '[]', 'test_ns', NULL, 1, \
+                          'memory')"
+                    ),
+                    rusqlite::params![dup.to_string()],
+                )
+                .expect("insert the older/losing duplicate");
+            // Higher rowid, NEWER updated_at -- must survive.
+            writer
+                .conn()
+                .execute(
+                    &format!(
+                        "INSERT INTO {table} \
+                         (rowid, subject_id, kind, title, body, tags, namespace, metadata, \
+                          updated_at, record_kind) \
+                         VALUES (20, ?1, 'note', '', 'newer body', '[]', 'test_ns', NULL, 5, \
+                          'memory')"
+                    ),
+                    rusqlite::params![dup.to_string()],
+                )
+                .expect("insert the newer/surviving duplicate");
+            writer
+                .conn()
+                .execute(&format!("DELETE FROM {state} WHERE key = 'backfill'"), [])
+                .expect("clear the completion marker");
+            writer.conn().execute_batch("COMMIT").unwrap();
+        }
+
+        let _ = backend.text(table_key).unwrap();
+
+        let writer = backend.pool().writer().unwrap();
+        let map_rows: Vec<i64> = writer
+            .conn()
+            .prepare(&format!(
+                "SELECT rowid FROM {map} WHERE namespace = 'test_ns' AND subject_id = ?1"
+            ))
+            .unwrap()
+            .query_map(rusqlite::params![dup.to_string()], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            map_rows,
+            vec![20],
+            "exactly one map row must survive, at the newer (by updated_at) rowid"
+        );
+
+        let fts_rowids: Vec<i64> = writer
+            .conn()
+            .prepare(&format!("SELECT rowid FROM {table} ORDER BY rowid"))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            fts_rowids,
+            vec![20],
+            "the losing duplicate (rowid 10) must be deleted from the FTS table itself, not just \
+             left out of the map as an unmapped live row"
+        );
+    }
+
     /// Once `ensure_fts_rowid_map_backfilled` has written the completion
     /// marker, a later open must not re-scan the FTS table at all -- not
     /// even to reconcile it. Corrupts the map after the real backfill by
@@ -2151,6 +2391,28 @@ mod tests {
         assert!(backend.text("rowids_but_not_at_the_end").is_ok());
     }
 
+    /// A `table_key` ending in `_rowids_state` must be rejected outright too
+    /// — it would otherwise resolve to the exact sidecar completion-marker
+    /// table name another key's own rowid map already reserves (e.g.
+    /// `"entities_rowids_state"` -> `fts_entities_rowids_state`, colliding
+    /// with `"entities"`'s own map-state table). This suffix does not end in
+    /// `_rowids`, so it needs its own check separate from the one above.
+    #[test]
+    fn table_key_ending_in_rowids_state_suffix_rejected() {
+        let backend = StorageBackend::memory().unwrap();
+        assert!(backend.text("entities_rowids_state").is_err());
+        assert!(backend.text("notes_rowids_state").is_err());
+        assert!(backend.text("anything_rowids_state").is_err());
+    }
+
+    /// The accepted case for the `_rowids_state` suffix: a key that merely
+    /// contains, but does not end in, the reserved suffix must still work.
+    #[test]
+    fn table_key_containing_but_not_ending_in_rowids_state_suffix_accepted() {
+        let backend = StorageBackend::memory().unwrap();
+        assert!(backend.text("rowids_state_but_not_at_the_end").is_ok());
+    }
+
     #[tokio::test]
     async fn sqlite_read_only_graph_store_rejects_upsert_edge() {
         use khive_storage::types::Edge;
@@ -2325,6 +2587,89 @@ mod tests {
             "scan-fallback get_document must still find the legacy row"
         );
         assert_eq!(fetched.unwrap().subject_id, id);
+    }
+
+    /// A read-only snapshot whose sidecar map table EXISTS but whose
+    /// completion marker was never written (the exact state a crash between
+    /// the map's creation and `ensure_fts_rowid_map_backfilled` finishing
+    /// could leave a copy in, since a read-only connection can never run
+    /// that reconciliation itself) must still fall back to the scan
+    /// predicates, not trust a map that might be partial. Seeds FTS rows for
+    /// A and B directly, seeds the map (and its state sidecar, via the same
+    /// DDL `text_with_tokenizer` uses) with a row for B only, and never
+    /// writes the `backfill = complete` marker.
+    #[tokio::test]
+    async fn sqlite_read_only_text_store_with_unmarked_map_falls_back_to_scan_predicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro_text_unmarked_map.db");
+
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        {
+            let writable = StorageBackend::sqlite(&path).unwrap();
+            let writer = writable.pool().try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS fts_ro_unmarked USING fts5(\
+                     subject_id UNINDEXED, kind UNINDEXED, title, body, tags UNINDEXED, \
+                     namespace UNINDEXED, metadata UNINDEXED, updated_at UNINDEXED, \
+                     record_kind, tokenize = 'trigram')",
+                )
+                .unwrap();
+            writer
+                .conn()
+                .execute_batch(&text::rowid_map_ddl("fts_ro_unmarked"))
+                .unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO fts_ro_unmarked \
+                     (rowid, subject_id, kind, title, body, tags, namespace, metadata, \
+                      updated_at, record_kind) \
+                     VALUES (1, ?1, 'note', '', 'doc a', '[]', 'local', NULL, 0, NULL)",
+                    rusqlite::params![a.to_string()],
+                )
+                .unwrap();
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO fts_ro_unmarked \
+                     (rowid, subject_id, kind, title, body, tags, namespace, metadata, \
+                      updated_at, record_kind) \
+                     VALUES (2, ?1, 'note', '', 'doc b', '[]', 'local', NULL, 0, NULL)",
+                    rusqlite::params![b.to_string()],
+                )
+                .unwrap();
+            // Only B gets a map entry, and the `_state` sidecar is left
+            // without a `backfill` row -- no marker exists at all.
+            writer
+                .conn()
+                .execute(
+                    "INSERT INTO fts_ro_unmarked_rowids (namespace, subject_id, rowid) \
+                     VALUES ('local', ?1, 2)",
+                    rusqlite::params![b.to_string()],
+                )
+                .unwrap();
+        }
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&path);
+
+        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
+        let store = ro
+            .text("ro_unmarked")
+            .expect("a read-only FTS table with an unmarked map must still open successfully");
+
+        let fetched_a = store
+            .get_document("local", a)
+            .await
+            .expect("scan-fallback get_document must not error against an unmarked map");
+        assert!(
+            fetched_a.is_some(),
+            "A has no map entry, so only the scan fallback (not a map join) can find it -- \
+             proving the unmarked map was not trusted"
+        );
+        assert_eq!(fetched_a.unwrap().body, "doc a");
     }
 
     #[tokio::test]

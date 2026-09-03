@@ -941,37 +941,50 @@ fn build_filter_clause(
 /// mid-transaction. Compiles to nothing outside `#[cfg(test)]` — production
 /// code never reads this flag.
 ///
-/// A process-wide `Mutex<Option<(String, Uuid)>>` rather than a
+/// A process-wide `Mutex<HashSet<(String, Uuid)>>` rather than a
 /// thread-local: the unmanaged path runs the DML closure inside
 /// `tokio::task::spawn_blocking` (`with_writer_unmanaged`), on a worker
 /// thread distinct from the test's own thread, so a thread-local set by the
-/// test would never be observed by the closure. The stored value is the
-/// exact `(namespace, subject_id)` the seam should target — `delete_document_dml`
-/// only forces the failure when its own arguments match, so an unrelated
-/// delete running concurrently (e.g. `test_delete_document`, which is not
-/// `#[serial]` against this seam) on a different key is unaffected even
-/// while another test's seam target is armed.
+/// test would never be observed by the closure. Each `(namespace,
+/// subject_id)` target is armed/disarmed independently in the shared set —
+/// `arm` inserts its own tuple and `disarm` removes only that same tuple —
+/// so two tests running concurrently, each targeting a different key, cannot
+/// clobber each other's armed state the way a single shared `Option` slot
+/// would (one test's `disarm` would otherwise clear a target a second test
+/// armed after the first but before the first's own disarm ran).
+/// `delete_document_dml` only forces the failure when its own arguments are
+/// a member of the set, so an unrelated delete running concurrently (e.g.
+/// `test_delete_document`, which is not `#[serial]` against this seam) on a
+/// key that was never armed is unaffected regardless of what else is armed
+/// at the time.
 #[cfg(test)]
 pub(crate) mod delete_dml_test_seam {
+    use std::collections::HashSet;
     use std::sync::Mutex;
     use uuid::Uuid;
 
-    pub(crate) static TARGET: Mutex<Option<(String, Uuid)>> = Mutex::new(None);
+    pub(crate) static TARGETS: Mutex<Option<HashSet<(String, Uuid)>>> = Mutex::new(None);
 
     pub(crate) fn arm(namespace: &str, subject_id: Uuid) {
-        *TARGET.lock().unwrap() = Some((namespace.to_string(), subject_id));
+        TARGETS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashSet::new)
+            .insert((namespace.to_string(), subject_id));
     }
 
-    pub(crate) fn disarm() {
-        *TARGET.lock().unwrap() = None;
+    pub(crate) fn disarm(namespace: &str, subject_id: Uuid) {
+        if let Some(targets) = TARGETS.lock().unwrap().as_mut() {
+            targets.remove(&(namespace.to_string(), subject_id));
+        }
     }
 
     pub(crate) fn matches(namespace: &str, subject_id: Uuid) -> bool {
-        TARGET
+        TARGETS
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|(ns, id)| ns == namespace && *id == subject_id)
+            .is_some_and(|targets| targets.contains(&(namespace.to_string(), subject_id)))
     }
 }
 

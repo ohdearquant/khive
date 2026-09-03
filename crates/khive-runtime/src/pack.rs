@@ -709,7 +709,7 @@ impl VerbRegistryBuilder {
     /// `None` (the default) uses `AuditBatchConfig::default()`. Exposed for
     /// tests that need to force a small `max_pending_rows` or a short
     /// `admission_deadline` to exercise admission-pressure paths
-    /// deterministically (khive#2117, khive#2147, khive#2208, khive#2217).
+    /// deterministically (#2117, #2147, #2208, #2217).
     pub fn with_audit_batch_config(
         &mut self,
         config: crate::audit_batch::AuditBatchConfig,
@@ -1454,7 +1454,7 @@ impl VerbRegistry {
     /// seam. `None` when no `EventStore` was configured (the batch is lazily
     /// constructed from one). Exposed so admission-pressure mechanism tests
     /// can saturate and drain the SAME instance a real dispatch uses
-    /// (khive#2117, khive#2147, khive#2208, khive#2217) instead of testing a
+    /// (#2117, #2147, #2208, #2217) instead of testing a
     /// look-alike.
     pub fn audit_batch_handle(&self) -> Option<Arc<crate::audit_batch::AuditBatch>> {
         self.audit_batch.clone()
@@ -1495,7 +1495,7 @@ impl VerbRegistry {
     }
 
     /// Explicit, fail-closed opt-in for admission-pressure audit degradation
-    /// (khive#2147/khive#2217). `VerbCategory::Assertive` alone is NOT a
+    /// (#2147/#2217). `VerbCategory::Assertive` alone is NOT a
     /// sound proxy for "safe to drop this dispatch's own audit row under
     /// audit-lane admission pressure": several Assertive handlers have
     /// their own accounting-bearing side effects. Two known examples,
@@ -3582,7 +3582,7 @@ pub(crate) fn audit_obligation_append_failure_count() -> u64 {
 
 /// Process-wide count of `DispatchObligation` rows **refused before they
 /// could be enqueued** (`AuditTerminalReason::QueueAdmissionExhausted`) for an
-/// [`VerbRegistry::admission_degrade_safe`] verb (khive#2147/khive#2217).
+/// [`VerbRegistry::admission_degrade_safe`] verb (#2147/#2217).
 /// This is a confirmed, terminal accounting loss: the row never shared a
 /// generation with anyone and will never commit. Disjoint from both
 /// [`AUDIT_APPEND_FAILURES`] and [`AUDIT_OBLIGATION_APPEND_FAILURES`]: this
@@ -3617,7 +3617,7 @@ pub fn audit_admission_refused_obligation_count() -> u64 {
 /// Process-wide count of `DispatchObligation` rows that were **already
 /// enqueued but had not resolved by the time the caller's admission wait
 /// deadline elapsed** (`AuditTerminalReason::AdmissionDeadlineExpired`) for an
-/// [`VerbRegistry::admission_degrade_safe`] verb (khive#2147/khive#2217).
+/// [`VerbRegistry::admission_degrade_safe`] verb (#2147/#2217).
 /// Unlike [`AUDIT_ADMISSION_REFUSED_OBLIGATIONS`], a row counted here is not
 /// a confirmed loss: per `AuditTerminalReason::AdmissionDeadlineExpired`'s own
 /// doc, the row may still be committed (or terminally failed) by the
@@ -3817,7 +3817,7 @@ async fn persist_git_digest_receipt(
 /// neither a swallowed observability failure nor a propagated obligation
 /// failure.
 ///
-/// `degrade_allowlisted` (khive#2147/khive#2217) narrows that obligation for
+/// `degrade_allowlisted` (#2147/#2217) narrows that obligation for
 /// one specific case: a *successful* dispatch (`AuditProducer::DispatchSucceeded`)
 /// for a verb that [`VerbRegistry::admission_degrade_safe`] has explicitly
 /// opted in (Assertive alone is not a sufficient signal — see that method's
@@ -3860,7 +3860,7 @@ async fn append_audit_event_best_effort(
             .await
         {
             if is_obligation {
-                // khive#2147/khive#2217: a read verb performs no domain write, so
+                // #2147/#2217: a read verb performs no domain write, so
                 // when the audit-lane's OWN admission is merely under transient
                 // pressure (the row was refused before enqueue, or the caller's
                 // wait deadline elapsed on a row that is still likely to commit),
@@ -4062,7 +4062,7 @@ pub(crate) mod tests {
     use crate::ActorRef;
     use khive_types::Pack;
 
-    /// Verbs known (khive#2147/khive#2217) to have
+    /// Verbs known (#2147/#2217) to have
     /// their own accounting-bearing side effect despite being declared
     /// `VerbCategory::Assertive` — see [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s
     /// doc for why each is excluded. `VerbCategory::Assertive` alone cannot
@@ -4111,7 +4111,7 @@ pub(crate) mod tests {
             assert!(
                 !KNOWN_INCIDENTAL_WRITE_VERBS.contains(verb),
                 "admission-degrade-safe verb {verb:?} is a known incidental-write verb \
-                 (khive#2147/khive#2217); it must not be re-added to \
+                 (#2147/#2217); it must not be re-added to \
                  ADMISSION_DEGRADE_SAFE_VERBS even though it is VerbCategory::Assertive"
             );
             // Anchored to exactly 8 leading spaces: that is the indentation
