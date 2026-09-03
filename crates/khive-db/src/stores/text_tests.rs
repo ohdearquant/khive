@@ -187,6 +187,94 @@ async fn test_phrase_search() {
     assert_eq!(hits.len(), 2);
 }
 
+/// Round 2 review finding 3: a stale map entry — left behind by a crash
+/// between an FTS-row delete and its own map-row delete, before this fix —
+/// must not make `get_document`/`delete_document` operate on whatever
+/// unrelated document FTS5 later reuses that freed rowid for. Seeds A,
+/// removes A's FTS row directly via raw SQL while leaving its map entry
+/// dangling (reproducing the crash window), inserts B at the exact freed
+/// rowid (pinned explicitly rather than relying on FTS5's own rowid-reuse
+/// policy), then asserts `get_document(A)` is `None`, `delete_document(A)`
+/// returns `false`, and B is untouched.
+#[tokio::test]
+async fn stale_map_entry_never_returns_or_deletes_the_wrong_document() {
+    let store = setup_memory_store("stale_map_wrong_doc");
+    let ns = "test_ns";
+
+    let a = Uuid::new_v4();
+    store
+        .upsert_document(make_document(a, "Doc A", "first document"))
+        .await
+        .unwrap();
+
+    let table = store.table_name.clone();
+    let a_rowid: i64 = {
+        let writer = store.pool.writer().unwrap();
+        let rowid: i64 = writer
+            .conn()
+            .query_row(
+                &format!("SELECT rowid FROM {table} WHERE subject_id = ?1"),
+                rusqlite::params![a.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read A's rowid");
+        writer
+            .conn()
+            .execute(
+                &format!("DELETE FROM {table} WHERE rowid = ?1"),
+                rusqlite::params![rowid],
+            )
+            .expect("delete A's FTS row directly, leaving its map entry stale");
+        rowid
+    };
+
+    let b = Uuid::new_v4();
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {table} \
+                     (rowid, subject_id, kind, title, body, tags, namespace, metadata, \
+                      updated_at, record_kind) \
+                     VALUES (?1, ?2, 'note', '', 'second document', '[]', ?3, NULL, 0, NULL)"
+                ),
+                rusqlite::params![a_rowid, b.to_string(), ns],
+            )
+            .expect("insert B reusing A's freed rowid");
+        // A real upsert would also write B's own map entry — do that here so
+        // the assertions below isolate A's stale entry as the only anomaly.
+        writer
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {table}_rowids (namespace, subject_id, rowid) VALUES (?1, ?2, ?3)"
+                ),
+                rusqlite::params![ns, b.to_string(), a_rowid],
+            )
+            .expect("insert B's own map entry");
+    }
+
+    let fetched_a = store.get_document(ns, a).await.unwrap();
+    assert!(
+        fetched_a.is_none(),
+        "a stale map entry must not resolve get_document(A) to B's document, got {fetched_a:?}"
+    );
+
+    let deleted_a = store.delete_document(ns, a).await.unwrap();
+    assert!(
+        !deleted_a,
+        "a stale map entry must not let delete_document(A) delete B's row"
+    );
+
+    let fetched_b = store.get_document(ns, b).await.unwrap();
+    assert!(
+        fetched_b.is_some(),
+        "B's document must remain intact after A's stale-map operations"
+    );
+}
+
 #[tokio::test]
 async fn test_delete_document() {
     let store = setup_memory_store("delete");

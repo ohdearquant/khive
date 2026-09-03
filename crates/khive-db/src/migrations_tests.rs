@@ -1362,6 +1362,195 @@ fn v24_rowid_map_backfills_dedups_and_sweeps_orphans() {
     assert_eq!(mapped_rowid, 200);
 }
 
+/// Round 2 review finding 4: a legacy FTS row with NULL `namespace`/
+/// `subject_id` (permitted — both are UNINDEXED FTS5 columns) cannot be
+/// attributed to a (namespace, subject_id) key at all. It must survive V24
+/// completely unmapped: neither backfilled into the map (impossible — the
+/// map's columns are NOT NULL) nor swept by either sweep as if it were an
+/// unmapped duplicate or an orphan.
+#[test]
+fn v24_null_key_fts_row_survives_unmapped() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (900, NULL, 'note', '', 'legacy null-key body', '[]', NULL, NULL, 1, '')",
+        [],
+    )
+    .expect("insert legacy NULL-key fts_notes row");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        24
+    );
+
+    let still_present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_notes WHERE rowid = 900",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count NULL-key fts_notes row");
+    assert_eq!(
+        still_present, 1,
+        "a NULL-key FTS row must survive V24 unmapped, not be swept by either sweep"
+    );
+
+    let mapped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_notes_rowids WHERE rowid = 900",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count map rows at rowid 900");
+    assert_eq!(
+        mapped, 0,
+        "a NULL-key row can never be mapped (its key cannot be attributed)"
+    );
+}
+
+/// Round 2 review finding 5: the orphan sweep's `NOT EXISTS` predicate must
+/// stay NULL-safe (a NULL `entities.id`/`notes.id` row must not silence the
+/// sweep of a genuine orphan the way the old `subject_id NOT IN (...)` form
+/// did) and namespace-scoped (a subject that exists only in a DIFFERENT
+/// namespace is still an orphan of this namespace's row).
+#[test]
+fn v24_orphan_sweep_is_null_safe_and_namespace_scoped() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    // A NULL `id` in the backing table must not suppress the sweep of a
+    // real orphan. `entities.id` carries no explicit NOT NULL (only the
+    // list-cursor trigger's own `entities_seq.entity_id` requires one), so
+    // drop that trigger for this one insert — it is irrelevant to what V24
+    // checks and would otherwise make this legitimate (if unusual) row
+    // impossible to construct.
+    conn.execute("DROP TRIGGER IF EXISTS assign_entity_list_seq", [])
+        .expect("drop list-cursor trigger for the NULL-id fixture insert");
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, tags, created_at, updated_at) \
+         VALUES (NULL, 'local', 'concept', 'null-id row', '[]', 1, 1)",
+        [],
+    )
+    .expect("insert entities row with NULL id");
+    conn.execute(
+        "INSERT INTO fts_entities \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (700, 'pure-orphan-id', 'entity', 'Gone', 'Gone', '[]', 'local', NULL, 1, 'concept')",
+        [],
+    )
+    .expect("insert pure orphan fts_entities row");
+
+    // A subject that exists, but only in a DIFFERENT namespace, must still
+    // count as an orphan of this namespace's row.
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, tags, created_at, updated_at) \
+         VALUES ('cross-ns-id', 'other_ns', 'concept', 'other namespace concept', '[]', 1, 1)",
+        [],
+    )
+    .expect("insert entities row in a different namespace");
+    conn.execute(
+        "INSERT INTO fts_entities \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (800, 'cross-ns-id', 'entity', 'Wrong namespace', 'Wrong namespace', '[]', 'local', NULL, 1, 'concept')",
+        [],
+    )
+    .expect("insert fts_entities row whose subject exists only in another namespace");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        24
+    );
+
+    let orphan_survives: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_entities WHERE rowid = 700",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count pure orphan row");
+    assert_eq!(
+        orphan_survives, 0,
+        "a real orphan must be swept even though the backing table has a NULL id row"
+    );
+
+    let cross_ns_survives: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_entities WHERE rowid = 800",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count cross-namespace row");
+    assert_eq!(
+        cross_ns_survives, 0,
+        "a subject existing only in a different namespace must still be swept as an orphan \
+         of this namespace's row"
+    );
+}
+
+/// Round 2 review finding 6: FTS5 rowid is not a write timestamp — explicit
+/// rowids are legal and V23's replacement-table repopulation carries no
+/// ORDER BY. The backfill must choose the survivor by `updated_at`, with
+/// rowid only as a tie-break, not by rowid alone.
+#[test]
+fn v24_backfill_survivor_is_chosen_by_updated_at_not_rowid() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, status, content, created_at, updated_at) \
+         VALUES ('note-id', 'local', 'memory', 'active', 'content', 1, 1)",
+        [],
+    )
+    .expect("insert live note");
+
+    // Lower rowid, but NEWER updated_at -- the correct, more recent write.
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (100, 'note-id', 'note', '', 'newer body', '[]', 'local', NULL, 500, 'memory')",
+        [],
+    )
+    .expect("insert newer-but-lower-rowid fts_notes row");
+    // Higher rowid, but OLDER updated_at -- a stale write that landed at a
+    // later rowid.
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (200, 'note-id', 'note', '', 'older body', '[]', 'local', NULL, 100, 'memory')",
+        [],
+    )
+    .expect("insert older-but-higher-rowid fts_notes row");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        24
+    );
+
+    let surviving_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes WHERE subject_id = 'note-id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read surviving fts_notes row for note-id");
+    assert_eq!(
+        surviving_rowid, 100,
+        "the newer document (by updated_at) must survive even though its rowid is lower"
+    );
+
+    let mapped_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes_rowids WHERE namespace = 'local' AND subject_id = 'note-id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read note-id map entry");
+    assert_eq!(mapped_rowid, 100);
+}
+
 // ── V5: external_id unique index tests ──────────────────────────────────────
 
 fn index_exists(conn: &Connection, name: &str) -> bool {

@@ -2834,7 +2834,8 @@ fn merge_entity_sql(
         conn.execute(
             &format!(
                 "DELETE FROM {fts_table} WHERE rowid IN \
-                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2)"
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
             ),
             rusqlite::params![&namespace, &into_str],
         )?;
@@ -2871,7 +2872,8 @@ fn merge_entity_sql(
         conn.execute(
             &format!(
                 "DELETE FROM {fts_table} WHERE rowid IN \
-                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2)"
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
             ),
             rusqlite::params![&namespace, &from_str],
         )?;
@@ -3456,7 +3458,8 @@ fn merge_note_sql(
         conn.execute(
             &format!(
                 "DELETE FROM {fts_table} WHERE rowid IN \
-                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2)"
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
             ),
             rusqlite::params![&namespace, &into_str],
         )?;
@@ -3503,7 +3506,8 @@ fn merge_note_sql(
         conn.execute(
             &format!(
                 "DELETE FROM {fts_table} WHERE rowid IN \
-                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2)"
+                 (SELECT rowid FROM {fts_map} WHERE namespace = ?1 AND subject_id = ?2) \
+                 AND namespace = ?1 AND subject_id = ?2"
             ),
             rusqlite::params![&namespace, &from_str],
         )?;

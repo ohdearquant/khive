@@ -61,6 +61,16 @@ pub fn rowid_map_ddl(table: &str) -> String {
 /// pre-existing lack of a placeholder for table names — `format!` is
 /// required since table identifiers cannot be bound as SQL parameters).
 ///
+/// The trailing `AND namespace = ?1 AND subject_id = ?2` re-checks the key
+/// on the (already rowid-narrowed) candidate row itself: if the map ever
+/// held a stale entry — e.g. a crash between an earlier delete's FTS-row
+/// removal and its own map-row removal, before FTS5 reused that rowid for a
+/// different document — this statement would otherwise delete whatever
+/// unrelated document now lives at that rowid instead of affecting zero
+/// rows. Cheap: the `rowid IN (...)` subquery already narrows to at most one
+/// candidate row via the map's primary key, so this is a single-row
+/// post-filter, not a second table scan.
+///
 /// Callers that also need the sidecar's own row removed (a real delete, not
 /// half of an upsert) must additionally run [`delete_document_map_statement`]
 /// — see [`delete_document_statements`] for the paired, order-safe form.
@@ -69,13 +79,35 @@ pub fn delete_document_statement(table: &str, namespace: &str, subject_id: Uuid)
     SqlStatement {
         sql: format!(
             "DELETE FROM {table} WHERE rowid IN \
-             (SELECT rowid FROM {map} WHERE namespace = ?1 AND subject_id = ?2)"
+             (SELECT rowid FROM {map} WHERE namespace = ?1 AND subject_id = ?2) \
+             AND namespace = ?1 AND subject_id = ?2"
         ),
         params: vec![
             SqlValue::Text(namespace.to_string()),
             SqlValue::Text(subject_id.to_string()),
         ],
         label: Some(format!("fts-delete-{table}")),
+    }
+}
+
+/// Pre-map fallback: the literal delete this store issued before the rowid
+/// map existed, scanning `table`'s `UNINDEXED` `namespace`/`subject_id`
+/// columns directly. Used only by [`Fts5TextSearch`] instances constructed
+/// in scan-fallback mode (a read-only snapshot whose FTS table predates the
+/// sidecar map — see `StorageBackend::text_with_tokenizer`'s read-only
+/// branch), where the map table does not exist to route through.
+fn delete_document_statement_scan_fallback(
+    table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+) -> SqlStatement {
+    SqlStatement {
+        sql: format!("DELETE FROM {table} WHERE namespace = ?1 AND subject_id = ?2"),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(subject_id.to_string()),
+        ],
+        label: Some(format!("fts-delete-scan-fallback-{table}")),
     }
 }
 
@@ -251,13 +283,46 @@ pub struct Fts5TextSearch {
     is_file_backed: bool,
     table_name: String,
     writer_task: Option<WriterTaskHandle>,
+    /// Set only for a read-only snapshot whose FTS table predates the
+    /// [`rowid_map_table`] sidecar (see `StorageBackend::text_with_tokenizer`'s
+    /// read-only branch, which cannot create/backfill the map on a read-only
+    /// connection). `get_document`/`delete_document` fall back to the
+    /// pre-map `namespace`/`subject_id` scan predicates in this mode instead
+    /// of joining/subquerying a map table that does not exist.
+    scan_fallback: bool,
 }
 
 impl Fts5TextSearch {
     /// Create a new FTS5 text search instance.
     ///
-    /// The FTS5 virtual table must already exist (created by `StorageBackend::text()`).
+    /// The FTS5 virtual table (and its [`rowid_map_table`] sidecar) must
+    /// already exist (created by `StorageBackend::text()`).
     pub(crate) fn new(pool: Arc<ConnectionPool>, is_file_backed: bool, table_key: String) -> Self {
+        Self::new_with_mode(pool, is_file_backed, table_key, false)
+    }
+
+    /// Create an instance in scan-fallback mode: the sidecar map is assumed
+    /// absent, so every point lookup/delete falls back to the pre-map
+    /// `namespace`/`subject_id` scan predicates. Reserved for a read-only
+    /// snapshot whose FTS table predates the map (see the [`scan_fallback`]
+    /// field doc and `StorageBackend::text_with_tokenizer`'s read-only
+    /// branch).
+    ///
+    /// [`scan_fallback`]: Self::scan_fallback
+    pub(crate) fn new_scan_fallback(
+        pool: Arc<ConnectionPool>,
+        is_file_backed: bool,
+        table_key: String,
+    ) -> Self {
+        Self::new_with_mode(pool, is_file_backed, table_key, true)
+    }
+
+    fn new_with_mode(
+        pool: Arc<ConnectionPool>,
+        is_file_backed: bool,
+        table_key: String,
+        scan_fallback: bool,
+    ) -> Self {
         let table_name = format!("fts_{}", table_key);
         // Enabled by default for file-backed pools; explicit off/degraded
         // construction remains synchronous (ADR-067 Component A, mirrors
@@ -270,6 +335,7 @@ impl Fts5TextSearch {
             is_file_backed,
             table_name,
             writer_task,
+            scan_fallback,
         }
     }
 
@@ -849,6 +915,34 @@ fn build_filter_clause(
     }
 }
 
+/// DML-only single-document delete shared by both the legacy (flag-off) and
+/// WriterTask-routed (flag-on) `delete_document` paths.
+///
+/// Issues no `BEGIN` / `COMMIT` / `ROLLBACK` itself — the caller owns the
+/// enclosing transaction. Both statements (the FTS row, looked up through
+/// the map, then the map row itself) must commit atomically: a crash
+/// between them would leave the map pointing at a rowid FTS5 may later
+/// reuse for a different document (round 2 review finding 1).
+fn delete_document_dml(
+    conn: &rusqlite::Connection,
+    table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+) -> Result<bool, rusqlite::Error> {
+    let [fts_statement, map_statement] = delete_document_statements(table, namespace, subject_id);
+
+    let mut stmt = conn.prepare(&fts_statement.sql)?;
+    bind_params(&mut stmt, &fts_statement.params)?;
+    let deleted = stmt.raw_execute()? > 0;
+    drop(stmt);
+
+    let mut map_stmt = conn.prepare(&map_statement.sql)?;
+    bind_params(&mut map_stmt, &map_statement.params)?;
+    map_stmt.raw_execute()?;
+
+    Ok(deleted)
+}
+
 /// DML-only single-document upsert shared by both the legacy (flag-off) and
 /// WriterTask-routed (flag-on) `upsert_document` paths (ADR-067 Component A).
 ///
@@ -1059,20 +1153,56 @@ impl TextSearch for Fts5TextSearch {
         namespace: &str,
         subject_id: Uuid,
     ) -> Result<bool, StorageError> {
-        let [fts_statement, map_statement] =
-            delete_document_statements(&self.table_name, namespace, subject_id);
+        let table = self.table_name.clone();
+        let namespace = namespace.to_string();
 
+        if self.scan_fallback {
+            let statement = delete_document_statement_scan_fallback(&table, &namespace, subject_id);
+            return self
+                .with_writer("fts_delete_scan_fallback", move |conn| {
+                    let mut stmt = conn.prepare(&statement.sql)?;
+                    bind_params(&mut stmt, &statement.params)?;
+                    Ok(stmt.raw_execute()? > 0)
+                })
+                .await;
+        }
+
+        // Route through the shared WriterTask (DML-only closure — the
+        // queue's run loop owns the transaction) when available, exactly
+        // like `upsert_document`'s matching branch. The fallback below wraps
+        // both statements in one explicit transaction: a crash between the
+        // FTS-row delete and the map-row delete must never persist only one
+        // of the two, or a later insert could reuse the freed rowid while
+        // the map still points at it (round 2 review finding 1).
+        if let Some(writer_task) = self.current_writer_task("fts_delete")? {
+            let table2 = table.clone();
+            let namespace2 = namespace.clone();
+            return writer_task
+                .send_bounded(move |conn| {
+                    delete_document_dml(conn, &table2, &namespace2, subject_id)
+                        .map_err(|e| map_err(e, "fts_delete"))
+                })
+                .await;
+        }
+
+        let origin = self.pool.origin();
         self.with_writer("fts_delete", move |conn| {
-            let mut stmt = conn.prepare(&fts_statement.sql)?;
-            bind_params(&mut stmt, &fts_statement.params)?;
-            let deleted = stmt.raw_execute()? > 0;
-            drop(stmt);
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some("text_delete_document".to_string()),
+                origin,
+            );
 
-            let mut map_stmt = conn.prepare(&map_statement.sql)?;
-            bind_params(&mut map_stmt, &map_statement.params)?;
-            map_stmt.raw_execute()?;
-
-            Ok(deleted)
+            match delete_document_dml(conn, &table, &namespace, subject_id) {
+                Ok(deleted) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(deleted)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
         })
         .await
     }
@@ -1084,15 +1214,25 @@ impl TextSearch for Fts5TextSearch {
     ) -> Result<Option<TextDocument>, StorageError> {
         let namespace = namespace.to_string();
         let table = self.table_name.clone();
+        let scan_fallback = self.scan_fallback;
 
         self.with_reader("fts_get", move |conn| {
-            let map = rowid_map_table(&table);
-            let sql = format!(
-                "SELECT t.subject_id, t.kind, t.title, t.body, t.tags, t.namespace, \
-                 t.metadata, t.updated_at, t.record_kind \
-                 FROM {table} AS t JOIN {map} AS m ON m.rowid = t.rowid \
-                 WHERE m.namespace = ?1 AND m.subject_id = ?2"
-            );
+            let sql = if scan_fallback {
+                format!(
+                    "SELECT subject_id, kind, title, body, tags, namespace, \
+                     metadata, updated_at, record_kind \
+                     FROM {table} WHERE namespace = ?1 AND subject_id = ?2"
+                )
+            } else {
+                let map = rowid_map_table(&table);
+                format!(
+                    "SELECT t.subject_id, t.kind, t.title, t.body, t.tags, t.namespace, \
+                     t.metadata, t.updated_at, t.record_kind \
+                     FROM {table} AS t JOIN {map} AS m ON m.rowid = t.rowid \
+                     WHERE m.namespace = ?1 AND m.subject_id = ?2 \
+                     AND t.namespace = ?1 AND t.subject_id = ?2"
+                )
+            };
             let mut stmt = conn.prepare(&sql)?;
             let mut rows = stmt.query(rusqlite::params![namespace, subject_id.to_string()])?;
 
