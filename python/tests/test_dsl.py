@@ -317,18 +317,23 @@ def test_prev_reference_outside_a_chain_is_rejected():
         parse_dsl("[update(id=$prev.id), other()]")
 
 
-# -- wire-invalid renders (REVIEW_2362_r5.md issue 2) -----------------------
+# -- wire-invalid renders ----------------------------------------------------
 #
-# `render_dsl` must reject a call it cannot legally hand to the cloud
-# parser, rather than returning wire-invalid text for the REST/MCP
-# transports to send. Each case below is rejected identically by the Rust
-# grammar (`parser_impl.rs`) and by the offline fake (`_dsl_fake.py`); the
-# defect this pins is the renderer disagreeing with both.
+# `render_dsl` must reject a call it cannot legally hand to the request
+# parser, rather than returning wire-invalid text for a transport to send.
+# Each case below is rejected identically by the Rust grammar
+# (`parser_impl.rs`) and by the offline fake (`_dsl_fake.py`), pinning the
+# renderer to the same decision both make.
 
 
 def test_invalid_argument_name_raises_transport_error():
     with pytest.raises(TransportError, match="bad-name"):
         render_dsl([{"tool": "verb", "args": {"bad-name": 1}}])
+
+
+def test_non_string_argument_name_raises_transport_error():
+    with pytest.raises(TransportError, match="must be a string"):
+        render_dsl([{"tool": "verb", "args": {1: 2}}])
 
 
 def test_empty_operation_list_raises_transport_error():

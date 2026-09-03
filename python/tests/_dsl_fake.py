@@ -15,6 +15,17 @@ from typing import Any
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _JSON_NUMBER_RE = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$")
 
+# Mirrors `crates/khive-request/src/types.rs::MAX_OPS`.
+MAX_OPS = 100
+# Mirrors `crates/khive-request/src/types.rs::MAX_OPS_INPUT_LEN`.
+MAX_OPS_INPUT_LEN = 1024 * 1024
+# Mirrors `crates/khive-request/src/types.rs::NESTING_DEPTH_LIMIT`.
+NESTING_DEPTH_LIMIT = 64
+# The exact range `serde_json::Value::Number` (default features) can hold as
+# an integer; outside it, serde decodes the literal as `f64`.
+_MIN_SIGNED_64 = -(2**63)
+_MAX_UNSIGNED_64 = 2**64 - 1
+
 
 class DslParseError(ValueError):
     pass
@@ -255,14 +266,29 @@ def _parse_string(text: str) -> str:
         raise DslParseError(f"malformed string literal: {text!r}") from exc
 
 
-def _parse_object(text: str, in_chain: bool) -> dict[str, Any]:
+def _coerce_out_of_range_int(value: Any) -> Any:
+    """Mirrors `serde_json::Value::Number`'s exact integer range: Python's
+    `json` module always returns an arbitrary-precision `int` for an
+    integer-looking literal, but serde (default features, no
+    `arbitrary_precision`) only holds i64/u64 exactly — a literal outside
+    `[_MIN_SIGNED_64, _MAX_UNSIGNED_64]` decodes as `f64` there, so this
+    coerces the same literal to a Python `float` here."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value < _MIN_SIGNED_64 or value > _MAX_UNSIGNED_64:
+            return float(value)
+    return value
+
+
+def _parse_object(text: str, in_chain: bool, depth: int = 0) -> dict[str, Any]:
     """Mirrors `parser_impl.rs::Parser::parse_object_arg_body`: each value is
     parsed through the same value grammar as an argument's own top level
     (`_parse_value`, recursively) rather than decoded as one JSON blob — so a
     bare `$prev` reference, or a quoted string with a raw newline/CR/tab
     byte, is accepted at any object depth exactly as it is at the top
     level. A key must be a quoted string (`parser_impl.rs` rejects a bare
-    key with `UnexpectedChar { expected: "quoted string key" }`)."""
+    key with `UnexpectedChar { expected: "quoted string key" }`). `depth` is
+    the container depth already entered for this object (see `_parse_value`
+    — the `{` branch increments before calling here)."""
     inner = text[1:-1].strip()
     if not inner:
         return {}
@@ -278,11 +304,16 @@ def _parse_object(text: str, in_chain: bool) -> dict[str, Any]:
         if not key_text.startswith('"'):
             raise DslParseError(f"object key must be a quoted string: {key_text!r}")
         key = _parse_string(key_text)
-        obj[key] = _parse_value(parts[1].strip(), in_chain)
+        obj[key] = _parse_value(parts[1].strip(), in_chain, depth)
     return obj
 
 
-def _parse_value(text: str, in_chain: bool = False) -> Any:
+def _parse_value(text: str, in_chain: bool = False, depth: int = 0) -> Any:
+    """`depth` is the container depth already entered before `text`'s own
+    value (see `_dsl_fake.NESTING_DEPTH_LIMIT`); entering `text`, when it is
+    itself an array or object, is one more increment, checked before
+    recursing — mirrors `parser_impl.rs::Parser::enter_container` (depth 64
+    accepted, 65 refused)."""
     text = text.strip()
     if not text:
         raise DslParseError("empty value")
@@ -299,16 +330,27 @@ def _parse_value(text: str, in_chain: bool = False) -> Any:
     if text[0] == "[":
         if text[-1] != "]":
             raise DslParseError(f"unterminated array: {text!r}")
+        child_depth = depth + 1
+        if child_depth > NESTING_DEPTH_LIMIT:
+            raise DslParseError(
+                f"container nesting depth {child_depth} exceeds max {NESTING_DEPTH_LIMIT}"
+            )
         inner = text[1:-1].strip()
         if not inner:
             return []
-        return [_parse_value(p, in_chain) for p in _split_top_level(inner, ",")]
+        return [_parse_value(p, in_chain, child_depth) for p in _split_top_level(inner, ",")]
     if text[0] == "{":
         if text[-1] != "}":
             raise DslParseError(f"unterminated object: {text!r}")
-        return _parse_object(text, in_chain)
+        child_depth = depth + 1
+        if child_depth > NESTING_DEPTH_LIMIT:
+            raise DslParseError(
+                f"container nesting depth {child_depth} exceeds max {NESTING_DEPTH_LIMIT}"
+            )
+        return _parse_object(text, in_chain, child_depth)
     if _JSON_NUMBER_RE.match(text):
-        return json.loads(text, parse_constant=_reject_non_finite_constant)
+        parsed = json.loads(text, parse_constant=_reject_non_finite_constant)
+        return _coerce_out_of_range_int(parsed)
     raise DslParseError(f"unparseable value: {text!r}")
 
 
@@ -346,10 +388,18 @@ def _parse_op(text: str, in_chain: bool = False) -> tuple[str, dict[str, Any]]:
 def parse_dsl_with_mode(text: str) -> tuple[list[tuple[str, dict[str, Any]]], str]:
     """Parses a request DSL string into `([(verb, args), ...], mode)`, where
     `mode` is `"single"`, `"parallel"`, or `"chain"` — a `$prev` reference is
-    accepted only in the last of these (`dispatch.rs::parse_chain_tail`)."""
+    accepted only in the last of these (`dispatch.rs::parse_chain_tail`).
+    Mirrors `dispatch.rs::parse_request`'s ordering: the raw-empty check
+    (`Empty`), then the raw byte-length cap (`InputTooLarge`), both before
+    any routing or parsing; the chain/batch operation-count cap
+    (`TooManyOps`) is then checked once the operation list for that mode is
+    known."""
     text = text.strip()
     if not text:
         raise DslParseError("empty ops string")
+    raw_len = len(text.encode("utf-8"))
+    if raw_len > MAX_OPS_INPUT_LEN:
+        raise DslParseError(f"ops input is {raw_len} bytes; max is {MAX_OPS_INPUT_LEN} bytes")
     if text[0] == "[":
         if text[-1] != "]":
             raise DslParseError(f"unterminated batch: {text!r}")
@@ -358,9 +408,14 @@ def parse_dsl_with_mode(text: str) -> tuple[list[tuple[str, dict[str, Any]]], st
             return [], "parallel"
         if len(_split_top_level(inner, "|")) > 1:
             raise DslParseError("mixed separators: '|' is not allowed inside '[...]'")
-        return [_parse_op(p, in_chain=False) for p in _split_top_level(inner, ",")], "parallel"
+        parts = _split_top_level(inner, ",")
+        if len(parts) > MAX_OPS:
+            raise DslParseError(f"batch has {len(parts)} ops; max is {MAX_OPS}")
+        return [_parse_op(p, in_chain=False) for p in parts], "parallel"
     chain_parts = _split_top_level(text, "|")
     if len(chain_parts) > 1:
+        if len(chain_parts) > MAX_OPS:
+            raise DslParseError(f"chain has {len(chain_parts)} ops; max is {MAX_OPS}")
         return [_parse_op(p, in_chain=True) for p in chain_parts], "chain"
     return [_parse_op(text, in_chain=False)], "single"
 

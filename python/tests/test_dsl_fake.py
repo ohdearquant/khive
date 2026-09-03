@@ -102,10 +102,10 @@ def test_invalid_argument_name_rejected():
 
 
 def test_object_value_resolves_prev_reference_inside_a_chain():
-    # Reproduces REVIEW_2362_r5.md issue 3: an object value is parsed
-    # through the same recursive value grammar as a top-level argument, not
-    # decoded as one JSON blob, so a bare `$prev` reference inside an object
-    # is promoted exactly as it is at the top level.
+    # An object value is parsed through the same recursive value grammar as
+    # a top-level argument, not decoded as one JSON blob, so a bare `$prev`
+    # reference inside an object is promoted exactly as it is at the top
+    # level.
     [_first, (verb, args)] = parse_dsl('first() | second(properties={"id": $prev.id})')
     assert verb == "second"
     assert args == {"properties": {"id": PrevRef("id")}}
@@ -136,10 +136,10 @@ def test_object_key_must_be_a_quoted_string():
 
 
 def test_non_ascii_digit_prev_index_stays_a_literal_string():
-    # Reproduces REVIEW_2362_r5.md issue 3: Python's `str.isdigit()` accepts
-    # non-ASCII digits (Arabic-indic `١`); the Rust source requires
-    # `char::is_ascii_digit`, so this must stay a literal string, never a
-    # PrevRef, both as a bare reference and as a quoted one.
+    # Python's `str.isdigit()` accepts non-ASCII digits (Arabic-indic `١`);
+    # the Rust source requires `char::is_ascii_digit`, so this must stay a
+    # literal string, never a PrevRef, both as a bare reference and as a
+    # quoted one.
     assert parse_dsl('verb(x="$prev[١]")') == [("verb", {"x": "$prev[١]"})]
     with pytest.raises(DslParseError):
         parse_dsl("first() | second(x=$prev[١])")

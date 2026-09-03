@@ -1,12 +1,15 @@
-"""Normalizes a request envelope from any transport into the shape `OpResult`
-validates, so every transport hands the caller the same object.
+"""Envelope-normalization functions for the request envelope's response
+shape (`{"results": [...]}`), each `OpResult`-shaped per the daemon's wire
+contract.
 
-A transport decodes raw bytes into JSON, checks the result is a request
-envelope shape, flattens each per-op error object to the plain string
-`OpResult.error` expects, and admits the daemon's minimal aborted-chain-entry
-shape before validating every entry against `OpResult` — shared here so a
-malformed body, a malformed envelope, or a malformed per-op entry is the
-same error class on every transport that calls into this module.
+This module provides the steps a transport needs to turn raw response
+bytes into validated `OpResult` entries: decode JSON, check the result is a
+request-envelope shape, flatten each per-op error object to the plain
+string `OpResult.error` expects, admit the daemon's minimal
+aborted-chain-entry shape, and validate every entry against `OpResult`. It
+is transport-agnostic and calls no transport itself — a transport that
+wants a malformed body, a malformed envelope, or a malformed per-op entry
+to raise the same error class calls these functions explicitly.
 """
 
 from __future__ import annotations

@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 from _dsl_fake import DslParseError, PrevRef, parse_dsl, parse_dsl_with_mode
 
-from khive.dsl import render_dsl
+from khive.dsl import MAX_OPS, MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT, render_dsl
 from khive.errors import TransportError
 from khive.ops import op
 
@@ -28,7 +28,12 @@ DOC_PATH = Path(__file__).resolve().parents[1] / "docs" / "DSL_WIRE_CONTRACT.md"
 DOC_TEXT = DOC_PATH.read_text()
 
 _ID_RE = re.compile(r"^P\d+$")
-_CITE_RE = re.compile(r'([\w./\-]+) — "((?:\\.|[^"\\])*)"')
+# A citation is `path — "quoted line"`, optionally followed immediately by
+# `{shared=N}` when the exact quoted text legitimately recurs at N sites in
+# that file (the same guard or helper call reused unchanged across modes —
+# e.g. the two `MAX_OPS` cap checks) — see
+# `test_every_cited_line_exists_in_the_parser_source`.
+_CITE_RE = re.compile(r'([\w./\-]+) — "((?:\\.|[^"\\])*)"(?:\{shared=(\d+)\})?')
 
 
 def _unescape(text: str) -> str:
@@ -52,7 +57,8 @@ def _unescape(text: str) -> str:
 class Rule:
     id: str
     site_cell: str
-    citations: tuple[tuple[str, str], ...]  # (path, quoted-line-text)
+    # (path, quoted-line-text, expected-occurrence-count-or-None-for-"exactly one")
+    citations: tuple[tuple[str, str, int | None], ...]
 
 
 def _parse_rules(doc_text: str) -> list[Rule]:
@@ -67,7 +73,10 @@ def _parse_rules(doc_text: str) -> list[Rule]:
         if not _ID_RE.match(rid):
             continue
         site_cell = cells[1]
-        citations = tuple((m.group(1), _unescape(m.group(2))) for m in _CITE_RE.finditer(site_cell))
+        citations = tuple(
+            (m.group(1), _unescape(m.group(2)), int(m.group(3)) if m.group(3) else None)
+            for m in _CITE_RE.finditer(site_cell)
+        )
         rules.append(Rule(id=rid, site_cell=site_cell, citations=citations))
     return rules
 
@@ -84,8 +93,9 @@ def test_rule_ids_are_exactly_p1_through_pn_with_no_gap_or_duplicate():
 
 def test_rule_count_is_pinned():
     # A silent row loss (or gain) fails here even if the id sequence still
-    # happens to be contiguous.
-    assert len(RULES) == 111
+    # happens to be contiguous. 111 original rules + P112-P118: six
+    # previously-uncited parser sites, plus P118's integer-range rule.
+    assert len(RULES) == 118
 
 
 @pytest.mark.skipif(
@@ -93,10 +103,20 @@ def test_rule_count_is_pinned():
     reason="crates/khive-request is not present in this checkout",
 )
 def test_every_cited_line_exists_in_the_parser_source():
+    """Two checks per citation: the quoted text exists in the file it names
+    (a parser change that removes or rewrites a rule fails this test until
+    the doc is updated), and it uniquely identifies the line it cites —
+    existence alone does not prove a citation names the *decision* it
+    claims to, only that the substring is present somewhere in the file
+    (see `docs/DSL_WIRE_CONTRACT.md`'s "Citation" note). A citation whose
+    exact text legitimately recurs at N sites (the same guard or helper
+    call, reused unchanged — e.g. the two `MAX_OPS` cap checks) must be
+    marked `{shared=N}` and match exactly N lines; every other citation must
+    match exactly one line."""
     failures: list[str] = []
     file_cache: dict[str, str | None] = {}
     for rule in RULES:
-        for path, quoted in rule.citations:
+        for path, quoted, shared in rule.citations:
             if path not in file_cache:
                 try:
                     file_cache[path] = (REPO_ROOT / path).read_text()
@@ -106,8 +126,16 @@ def test_every_cited_line_exists_in_the_parser_source():
             if content is None:
                 failures.append(f"{rule.id}: file not found: {path}")
                 continue
-            if not any(quoted in line for line in content.splitlines()):
+            matches = sum(1 for line in content.splitlines() if quoted in line)
+            expected = shared if shared is not None else 1
+            if matches == 0:
                 failures.append(f"{rule.id}: {path!r} has no line containing {quoted!r}")
+            elif matches != expected:
+                marker = f"{{shared={shared}}}" if shared is not None else "(no shared marker)"
+                failures.append(
+                    f"{rule.id}: {path!r} citation {quoted!r} matches {matches} lines "
+                    f"{marker}, expected {expected}"
+                )
     assert not failures, "\n".join(failures)
 
 
@@ -121,15 +149,22 @@ def test_every_cited_line_exists_in_the_parser_source():
 class Case:
     kind: str  # "renders" | "refuses" | "fake" | "not_emitted"
     check: Callable[[], None]
+    # Required for kind == "not_emitted": why this rule's obligation has no
+    # renderer- or fake-observable behavior to assert.
+    reason: str | None = None
 
 
 CASES: dict[str, Case] = {}
 
 
-def _add(rule_id: str, kind: str, check: Callable[[], None]) -> None:
+def _add(
+    rule_id: str, kind: str, check: Callable[[], None], *, reason: str | None = None
+) -> None:
     assert kind in ("renders", "refuses", "fake", "not_emitted")
+    if kind == "not_emitted":
+        assert reason, f"{rule_id}: a not_emitted case must state its reason"
     assert rule_id not in CASES
-    CASES[rule_id] = Case(kind=kind, check=check)
+    CASES[rule_id] = Case(kind=kind, check=check, reason=reason)
 
 
 def _rt(tool: str = "verb", **kwargs: Any) -> tuple[str, dict[str, Any]]:
@@ -149,27 +184,43 @@ def _refuses(ops: Any, *, match: str | None = None) -> None:
         render_dsl(ops)
 
 
-# -- P1: input must not render to nothing -----------------------------------
+# -- P1: an empty/whitespace-only raw request is refused, never rendered ----
 def _check_p1():
-    rendered = render_dsl([op("whoami")])
-    assert rendered.strip() != ""
-    assert parse_dsl(rendered) == [("whoami", {})]
+    # A structured render always emits at least "tool()" — non-empty. Only
+    # raw DSL text a caller passes through verbatim can be empty; the
+    # renderer refuses it there instead of forwarding it (see the module
+    # docstring's "Raw DSL text" paragraph).
+    _refuses("")
+    _refuses("   \t\n  ")
+    assert render_dsl("whoami()") == "whoami()"
 
 
-_add("P1", "renders", _check_p1)
+_add("P1", "refuses", _check_p1)
 
 
-# -- P2: InputTooLarge (1 MiB) — the renderer has no size cap ----------------
+# -- P2: InputTooLarge (1 MiB) — enforced on the rendered byte length --------
+_OP_TEXT_OVERHEAD = len('verb(note="")')  # bytes around the note value itself
+
+
 def _check_p2():
-    # Finding: rule P2 — a single huge string argument — render_dsl emits it
-    # in full with no 1 MiB (or any) length check; the cloud parser would
-    # reject the resulting request text once it exceeds MAX_OPS_INPUT_LEN.
-    huge = "x" * (1024 * 1024 + 1)
-    rendered = render_dsl([op("verb", note=huge)])
-    assert len(rendered) > 1024 * 1024
+    boundary_content = "x" * (MAX_OPS_INPUT_LEN - _OP_TEXT_OVERHEAD)
+    rendered_ok = render_dsl([op("verb", note=boundary_content)])
+    assert len(rendered_ok.encode("utf-8")) == MAX_OPS_INPUT_LEN
+    assert parse_dsl(rendered_ok) == [("verb", {"note": boundary_content})]
+
+    over_content = boundary_content + "x"
+    with pytest.raises(TransportError, match=str(MAX_OPS_INPUT_LEN)):
+        render_dsl([op("verb", note=over_content)])
+
+    # Hand-built without the renderer, to prove the fake enforces the same
+    # cap independently of whether render_dsl ever produces this text.
+    hand_built = 'verb(note="' + over_content + '")'
+    assert len(hand_built.encode("utf-8")) == MAX_OPS_INPUT_LEN + 1
+    with pytest.raises(DslParseError):
+        parse_dsl(hand_built)
 
 
-_add("P2", "fake", _check_p2)
+_add("P2", "refuses", _check_p2)
 
 
 def _generic_not_emitted_check():
@@ -180,14 +231,31 @@ def _generic_not_emitted_check():
         assert not inner.startswith("{")
 
 
+_JSON_FORM_NOT_EMITTED_REASON = (
+    "render_dsl never emits JSON-object request syntax (JSON-form batches, typed "
+    "args) — it always emits function-call syntax (see the module docstring), so "
+    "this rule's JSON-form obligation has no renderer-observable behavior beyond "
+    "'the renderer's own output never begins with {'."
+)
+
 for _pid in (
     "P3",
     "P4",
-    "P5",
     *[f"P{i}" for i in range(13, 20)],
     *[f"P{i}" for i in range(27, 40)],
 ):
-    _add(_pid, "not_emitted", _generic_not_emitted_check)
+    _add(_pid, "not_emitted", _generic_not_emitted_check, reason=_JSON_FORM_NOT_EMITTED_REASON)
+
+
+# -- P5: a valid batch element is a complete function call, never a bare value
+def _check_p5():
+    rendered = render_dsl([op("stats"), op("whoami")])
+    parsed = parse_dsl(rendered)
+    assert parsed == [("stats", {}), ("whoami", {})]
+    assert len(parsed) == 2
+
+
+_add("P5", "renders", _check_p5)
 
 
 # -- P6: non-JSON requests always choose function-call syntax ----------------
@@ -213,10 +281,11 @@ _add("P7", "renders", _check_p7)
 
 # -- P8: single mode must never carry a dynamic $prev reference --------------
 def _check_p8():
-    # Finding: rule P8 — render_dsl(["update(id=$prev.id)"]) — a raw
-    # passthrough DSL string is rendered verbatim in single mode with no
-    # check that it lacks a $prev reference; the real parser rejects this
-    # exact text with PrevRefOutsideChain.
+    # A raw passthrough DSL string is rendered verbatim (see the module
+    # docstring: the renderer has no way to validate text it did not itself
+    # construct) — this element happens to carry a $prev reference outside a
+    # chain, which the real parser rejects with PrevRefOutsideChain; the
+    # renderer forwards it unchanged and only the daemon parser catches it.
     rendered = render_dsl(["update(id=$prev.id)"])
     assert rendered == "update(id=$prev.id)"
     with pytest.raises(DslParseError):
@@ -277,17 +346,24 @@ def _check_p20():
 _add("P20", "refuses", _check_p20)
 
 
-# -- P21: chains longer than 100 — the renderer has no cap -------------------
+# -- P21: chains longer than 100 are refused, at both the exact boundary
+#         and one past it, including the fake's own independent check ------
 def _check_p21():
-    # Finding: rule P21 — a 101-op chain — render_dsl joins all 101 calls
-    # with " | " with no TooManyOps-style cap; the parser rejects a chain
-    # this long.
-    ops = [op("v", i=i) for i in range(101)]
-    rendered = render_dsl(ops, chained=True)
-    assert rendered.count(" | ") == 100
+    ops100 = [op("v", i=i) for i in range(100)]
+    rendered_ok = render_dsl(ops100, chained=True)
+    assert rendered_ok.count(" | ") == 99
+    assert len(parse_dsl(rendered_ok)) == 100
+
+    ops101 = [op("v", i=i) for i in range(101)]
+    with pytest.raises(TransportError, match=str(MAX_OPS)):
+        render_dsl(ops101, chained=True)
+
+    hand_built = " | ".join(f"v(i={i})" for i in range(101))
+    with pytest.raises(DslParseError):
+        parse_dsl(hand_built)
 
 
-_add("P21", "fake", _check_p21)
+_add("P21", "refuses", _check_p21)
 
 
 # -- P22: a complete operation follows every chain separator -----------------
@@ -322,13 +398,49 @@ def _check_p24():
 _add("P24", "renders", _check_p24)
 
 
-# -- P25: a chain never mixes in a top-level comma ---------------------------
+def _segment_has_top_level_comma(segment: str) -> bool:
+    """Quote/bracket-aware scan for a comma outside every nested `()`, `[]`,
+    `{}` — checks every chain segment, not just one, so a smuggled
+    top-level comma in *any* segment (not only the last) would be caught."""
+    depth = 0
+    in_string = False
+    i = 0
+    n = len(segment)
+    while i < n:
+        ch = segment[i]
+        if in_string:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return True
+        i += 1
+    return False
+
+
+# -- P25: a chain never mixes in a top-level comma, in ANY segment ----------
 def _check_p25():
-    rendered = render_dsl([op("v", tags=["a", "b"]), op("w")], chained=True)
-    # The only commas in a chain must be inside a balanced container.
+    rendered = render_dsl(
+        [
+            op("v", tags=["a", "b"], properties={"x": 1, "y": 2}),
+            op("w", note="a,b(c)[d]{e}"),
+        ],
+        chained=True,
+    )
     top_level = rendered.split(" | ")
     assert len(top_level) == 2
-    assert "," not in top_level[1]
+    for segment in top_level:
+        assert not _segment_has_top_level_comma(segment)
 
 
 _add("P25", "renders", _check_p25)
@@ -362,17 +474,24 @@ def _check_p41():
 _add("P41", "refuses", _check_p41)
 
 
-# -- P42: batches over 100 ops — the renderer has no cap ---------------------
+# -- P42: batches over 100 ops are refused, at both the exact boundary and
+#         one past it, including the fake's own independent check ---------
 def _check_p42():
-    # Finding: rule P42 — a 101-op parallel batch — render_dsl emits all 101
-    # calls with no TooManyOps-style cap; the parser rejects a batch this
-    # long.
-    ops = [op("v", i=i) for i in range(101)]
-    rendered = render_dsl(ops)
-    assert rendered.count(",") == 100
+    ops100 = [op("v", i=i) for i in range(100)]
+    rendered_ok = render_dsl(ops100)
+    assert rendered_ok.count(",") == 99
+    assert len(parse_dsl(rendered_ok)) == 100
+
+    ops101 = [op("v", i=i) for i in range(101)]
+    with pytest.raises(TransportError, match=str(MAX_OPS)):
+        render_dsl(ops101)
+
+    hand_built = "[" + ", ".join(f"v(i={i})" for i in range(101)) + "]"
+    with pytest.raises(DslParseError):
+        parse_dsl(hand_built)
 
 
-_add("P42", "fake", _check_p42)
+_add("P42", "refuses", _check_p42)
 
 
 # -- P43: batch elements are complete function calls, never bare values -----
@@ -458,10 +577,10 @@ _add("P50", "renders", _check_p50)
 
 # -- P51: no dynamic $prev nested anywhere in a parallel batch ---------------
 def _check_p51():
-    # Finding: rule P51 — render_dsl(["update(id=$prev.id)", "other()"]) — a
-    # raw passthrough element is rendered verbatim inside a parallel batch
-    # with no check that it lacks a $prev reference; the real parser rejects
-    # this exact text with PrevRefOutsideChain.
+    # A raw passthrough element is rendered verbatim (see the module
+    # docstring) inside a parallel batch; this one carries a $prev reference
+    # outside a chain, which the real parser rejects with
+    # PrevRefOutsideChain — the renderer forwards it unchanged.
     rendered = render_dsl(["update(id=$prev.id)", "other()"])
     assert rendered == "[update(id=$prev.id), other()]"
     with pytest.raises(DslParseError):
@@ -639,7 +758,9 @@ def _check_p68():
 _add("P68", "renders", _check_p68)
 
 
-# -- P69: function-arg array/object nesting past depth 64 — no renderer cap -
+# -- P69: function-arg list nesting is refused past depth 64, at both the
+#         exact boundary and one past it, including the fake's own
+#         independent check ---------------------------------------------
 def _make_nested_list(depth: int) -> Any:
     value: Any = 0
     for _ in range(depth):
@@ -648,15 +769,24 @@ def _make_nested_list(depth: int) -> Any:
 
 
 def _check_p69():
-    # Finding: rule P69 — a 70-level-deep nested list argument — render_dsl
-    # emits it in full with no NestingTooDeep-style cap; the parser rejects
-    # function-form argument nesting past depth 64.
-    deep = _make_nested_list(70)
-    rendered = render_dsl([op("verb", data=deep)])
-    assert rendered.count("[") >= 70
+    ok_deep = _make_nested_list(NESTING_DEPTH_LIMIT)
+    rendered_ok = render_dsl([op("verb", data=ok_deep)])
+    [(verb, parsed_args)] = parse_dsl(rendered_ok)
+    assert verb == "verb"
+    assert parsed_args == {"data": ok_deep}
+
+    too_deep = _make_nested_list(NESTING_DEPTH_LIMIT + 1)
+    with pytest.raises(TransportError, match=str(NESTING_DEPTH_LIMIT)):
+        render_dsl([op("verb", data=too_deep)])
+
+    hand_built = (
+        "verb(data=" + "[" * (NESTING_DEPTH_LIMIT + 1) + "0" + "]" * (NESTING_DEPTH_LIMIT + 1) + ")"
+    )
+    with pytest.raises(DslParseError):
+        parse_dsl(hand_built)
 
 
-_add("P69", "fake", _check_p69)
+_add("P69", "refuses", _check_p69)
 
 
 # -- P70: an empty array literal is a valid argument value -------------------
@@ -706,7 +836,9 @@ def _check_p74():
 _add("P74", "renders", _check_p74)
 
 
-# -- P75: object nesting past depth 64 — no renderer cap ---------------------
+# -- P75: object nesting is refused past depth 64, at both the exact
+#         boundary and one past it, including the fake's own independent
+#         check --------------------------------------------------------
 def _make_nested_obj(depth: int) -> Any:
     value: Any = 0
     for _ in range(depth):
@@ -715,14 +847,28 @@ def _make_nested_obj(depth: int) -> Any:
 
 
 def _check_p75():
-    # Finding: rule P75 — a 70-level-deep nested object argument —
-    # render_dsl emits it in full with no NestingTooDeep-style cap.
-    deep = _make_nested_obj(70)
-    rendered = render_dsl([op("verb", data=deep)])
-    assert rendered.count("{") >= 70
+    ok_deep = _make_nested_obj(NESTING_DEPTH_LIMIT)
+    rendered_ok = render_dsl([op("verb", data=ok_deep)])
+    [(verb, parsed_args)] = parse_dsl(rendered_ok)
+    assert verb == "verb"
+    assert parsed_args == {"data": ok_deep}
+
+    too_deep = _make_nested_obj(NESTING_DEPTH_LIMIT + 1)
+    with pytest.raises(TransportError, match=str(NESTING_DEPTH_LIMIT)):
+        render_dsl([op("verb", data=too_deep)])
+
+    hand_built = (
+        "verb(data="
+        + '{"a": ' * (NESTING_DEPTH_LIMIT + 1)
+        + "0"
+        + "}" * (NESTING_DEPTH_LIMIT + 1)
+        + ")"
+    )
+    with pytest.raises(DslParseError):
+        parse_dsl(hand_built)
 
 
-_add("P75", "fake", _check_p75)
+_add("P75", "refuses", _check_p75)
 
 
 # -- P76: an empty object literal is a valid argument value ------------------
@@ -856,9 +1002,9 @@ _add("P88", "renders", _check_p88)
 
 # -- P89: an empty/signed/quoted bracket index must never be emitted --------
 def _check_p89():
-    # Finding: rule P89 — render_dsl("first() | second(x=$prev[])") — a
-    # passthrough chain is not validated by the renderer; the fake (mirroring
-    # the real parser) rejects the malformed index it forwards unchanged.
+    # A raw passthrough chain is not validated by the renderer; the fake
+    # (mirroring the real parser) rejects the malformed index it forwards
+    # unchanged.
     rendered = render_dsl("first() | second(x=$prev[])")
     assert rendered == "first() | second(x=$prev[])"
     with pytest.raises(DslParseError):
@@ -870,8 +1016,7 @@ _add("P89", "fake", _check_p89)
 
 # -- P90: an index must close immediately after its digits -------------------
 def _check_p90():
-    # Finding: rule P90 — render_dsl("first() | second(x=$prev[0x])") — same
-    # passthrough gap as P89, for a malformed index terminator.
+    # Same passthrough gap as P89, for a malformed index terminator.
     rendered = render_dsl("first() | second(x=$prev[0x])")
     with pytest.raises(DslParseError):
         parse_dsl(rendered)
@@ -882,9 +1027,8 @@ _add("P90", "fake", _check_p90)
 
 # -- P91: no unparsed punctuation trails a bare path -------------------------
 def _check_p91():
-    # Finding: rule P91 — render_dsl("first() | second(x=$prev.foo-bar)") —
-    # same passthrough gap; the fake rejects the trailing punctuation the
-    # renderer forwarded unchanged.
+    # Same passthrough gap as P89/P90; the fake rejects the trailing
+    # punctuation the renderer forwarded unchanged.
     rendered = render_dsl("first() | second(x=$prev.foo-bar)")
     with pytest.raises(DslParseError):
         parse_dsl(rendered)
@@ -1001,10 +1145,17 @@ _add("P101", "renders", _check_p101)
 
 # -- P102: true/false/null are always lowercase ------------------------------
 def _check_p102():
-    rendered, parsed = _rt("verb", hard=True, soft=False, kind="x", missing=None)
+    rendered, parsed = _rt("verb", hard=True, soft=False, kind="x")
     assert "true" in rendered and "false" in rendered
-    assert "null" not in rendered  # `kind=None` never reaches _rt's kwargs as None here
     assert parsed == {"hard": True, "soft": False, "kind": "x"}
+
+    # `op()` prunes `None` args before render_dsl ever sees them (see
+    # `khive.ops.op`), so exercising the `null` obligation itself needs a
+    # raw op dict built past that helper.
+    raw_op = {"tool": "verb", "args": {"missing": None}}
+    rendered_null = render_dsl([raw_op])
+    assert "null" in rendered_null
+    assert parse_dsl(rendered_null) == [("verb", {"missing": None})]
 
 
 _add("P102", "renders", _check_p102)
@@ -1060,19 +1211,35 @@ def _check_p107():
 _add("P107", "renders", _check_p107)
 
 
-# -- P108: runtime index resolution is beyond the parser ---------------------
+# -- P108: an index that fits usize resolves; parser acceptance alone does
+#          not guarantee a hit -----------------------------------------------
 def _check_p108():
     """Reference resolution (turning `$prev[0]` into an actual lookup) is a
     runtime concern that starts only after the parser has accepted the
-    reference; this case only pins that the renderer emits plain ASCII-digit
-    indices for the resolver to consume."""
+    reference. This pins that the renderer emits plain ASCII-digit indices
+    for the resolver to consume, and that an index too large to fit a
+    platform usize is still grammar-accepted syntax passed through
+    unchanged — it only fails later, at runtime resolution in
+    `path.rs::apply_path_segment`. This offline fake has no mirror of that
+    runtime resolution step (it only mirrors the parser grammar), so whether
+    an oversized index actually misses at resolution is not assertable here
+    and is left unverified.
+    """
     text = "first() | second(x=$prev[12])"
     rendered = render_dsl(text)
     m = re.search(r"\$prev\[(\d+)\]", rendered)
     assert m and m.group(1).isascii() and m.group(1).isdigit()
+    parsed = parse_dsl(rendered)
+    assert parsed[1] == ("second", {"x": PrevRef("[12]")})
+
+    oversized_text = "first() | second(x=$prev[99999999999999999999])"
+    rendered_oversized = render_dsl(oversized_text)
+    assert rendered_oversized == oversized_text
+    parsed_oversized = parse_dsl(rendered_oversized)
+    assert parsed_oversized[1] == ("second", {"x": PrevRef("[99999999999999999999]")})
 
 
-_add("P108", "not_emitted", _check_p108)
+_add("P108", "renders", _check_p108)
 
 
 # -- P109: the renderer never emits a \\uXXXX escape (raw unicode instead),
@@ -1109,6 +1276,102 @@ def _check_p111():
 
 
 _add("P111", "renders", _check_p111)
+
+
+# -- P112: reject_reserved_args runs identically at every call site ---------
+def _check_p112():
+    _refuses([op("verb", presentation="table")], match="presentation")
+    _refuses([op("verb", presentation_per_op="table")], match="presentation_per_op")
+    _rendered, parsed = _rt("verb", note="x")
+    assert parsed == {"note": "x"}
+
+
+_add("P112", "refuses", _check_p112)
+
+
+# -- P113: an object literal reaching EOF while a key is expected is refused,
+#          distinct from the empty-object accept at P76 ---------------------
+def _check_p113():
+    with pytest.raises(DslParseError):
+        parse_dsl("v(a={)")
+
+
+_add("P113", "fake", _check_p113)
+
+
+# -- P114: past NESTING_DEPTH_LIMIT, json_value_contains_prev_ref_at treats a
+#          nested JSON value as conservatively containing a $prev reference —
+#          a json-mode-only concern the renderer never reaches ------------
+_add("P114", "not_emitted", _generic_not_emitted_check, reason=_JSON_FORM_NOT_EMITTED_REASON)
+
+
+# -- P115: value_nesting_within_limit applies the same depth-exceeded
+#          rejection to both Array and Object — a json-mode-only concern --
+_add("P115", "not_emitted", _generic_not_emitted_check, reason=_JSON_FORM_NOT_EMITTED_REASON)
+
+
+# -- P116: an unmatched closing brace inside an unquoted scalar/value slice
+#          is refused immediately, distinct from P106's trailing check -----
+def _check_p116():
+    with pytest.raises(DslParseError):
+        parse_dsl("v(a=1})")
+
+
+_add("P116", "fake", _check_p116)
+
+
+# -- P117: split_path resolves dotted text as Field lookups and non-usize
+#          bracket text as an always-miss Malformed segment, at chain
+#          runtime resolution, after the parser has already accepted the
+#          reference (same boundary as P108) -------------------------------
+def _check_p117():
+    """`split_path`'s Field/Malformed classification runs after parsing, at
+    resolution time; this offline fake has no mirror of `split_path` or
+    `apply_path_segment` (no Python port exists), so only the
+    renderer/parser-observable half of the obligation is assertable here:
+    dot-separated field text and bracket index text both pass through the
+    renderer and the fake's grammar-level parse unchanged. Whether a given
+    reference actually resolves at runtime is left unverified.
+    """
+    text = 'first() | second(x="$prev.a.b")'
+    rendered = render_dsl(text)
+    parsed = parse_dsl(rendered)
+    assert parsed[1] == ("second", {"x": PrevRef("a.b")})
+
+    oversized_text = "first() | second(x=$prev[99999999999999999999])"
+    rendered_oversized = render_dsl(oversized_text)
+    parsed_oversized = parse_dsl(rendered_oversized)
+    assert parsed_oversized[1] == ("second", {"x": PrevRef("[99999999999999999999]")})
+
+
+_add("P117", "renders", _check_p117)
+
+
+# -- P118: an integer literal outside [-2**63, 2**64 - 1] is not a
+#          parser-time rejection — it silently decodes as f64 on the wire;
+#          render_dsl refuses it instead of changing its type -------------
+def _check_p118():
+    max_u64 = 2**64 - 1
+    min_i64 = -(2**63)
+
+    _rendered_ok, parsed_ok = _rt("verb", big=max_u64, small=min_i64)
+    assert parsed_ok == {"big": max_u64, "small": min_i64}
+
+    with pytest.raises(TransportError, match="outside"):
+        render_dsl([op("verb", big=max_u64 + 1)])
+    with pytest.raises(TransportError, match="outside"):
+        render_dsl([op("verb", small=min_i64 - 1)])
+
+    # Hand-built without the renderer, to prove the fake mirrors serde_json's
+    # default-feature decode: an out-of-range integer literal is not
+    # rejected, it is silently converted to a float on the wire.
+    hand_built = f"verb(big={max_u64 + 1})"
+    [(_verb, parsed)] = parse_dsl(hand_built)
+    assert parsed["big"] == float(max_u64 + 1)
+    assert isinstance(parsed["big"], float)
+
+
+_add("P118", "refuses", _check_p118)
 
 
 def test_every_rule_id_has_exactly_one_case():

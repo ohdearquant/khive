@@ -4,6 +4,8 @@ entries, per-entry `OpResult` validation, and per-op error flattening."""
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from khive.envelope import (
@@ -15,14 +17,19 @@ from khive.envelope import (
 )
 from khive.errors import TransportError
 
+# Sentinel URL used in every negative assertion below, so a match on it
+# proves the raised error actually names the URL this module was given —
+# not just any string that happens to contain "url" verbatim.
+_SENTINEL_URL = "http://sentinel.invalid/x"
+
 
 def test_decode_json_text_valid():
     assert _decode_json_text('{"a": 1}', "http://x") == {"a": 1}
 
 
 def test_decode_json_text_malformed_raises_naming_url():
-    with pytest.raises(TransportError, match="http://example/x"):
-        _decode_json_text("{not json", "http://example/x")
+    with pytest.raises(TransportError, match=re.escape(_SENTINEL_URL)):
+        _decode_json_text("{not json", _SENTINEL_URL)
 
 
 def test_envelope_from_payload_accepts_dict_with_list_results():
@@ -43,8 +50,8 @@ def test_envelope_from_payload_accepts_dict_with_list_results():
     ],
 )
 def test_envelope_from_payload_rejects_non_envelope_shapes(payload):
-    with pytest.raises(TransportError):
-        _envelope_from_payload(payload, "url")
+    with pytest.raises(TransportError, match=re.escape(_SENTINEL_URL)):
+        _envelope_from_payload(payload, _SENTINEL_URL)
 
 
 def test_is_minimal_aborted_entry_true():
@@ -82,18 +89,18 @@ def test_validate_envelope_results_admits_minimal_aborted_entry_with_empty_tool(
 
 
 def test_validate_envelope_results_rejects_non_dict_entry():
-    with pytest.raises(TransportError, match="index 0"):
-        _validate_envelope_results({"results": [42]}, "url")
+    with pytest.raises(TransportError, match=f"{re.escape(_SENTINEL_URL)}.*index 0"):
+        _validate_envelope_results({"results": [42]}, _SENTINEL_URL)
 
 
 def test_validate_envelope_results_rejects_entry_missing_ok():
-    with pytest.raises(TransportError, match="index 0"):
-        _validate_envelope_results({"results": [{"tool": "whoami"}]}, "url")
+    with pytest.raises(TransportError, match=f"{re.escape(_SENTINEL_URL)}.*index 0"):
+        _validate_envelope_results({"results": [{"tool": "whoami"}]}, _SENTINEL_URL)
 
 
 def test_validate_envelope_results_rejects_entry_missing_tool():
-    with pytest.raises(TransportError, match="index 0"):
-        _validate_envelope_results({"results": [{"ok": True}]}, "url")
+    with pytest.raises(TransportError, match=f"{re.escape(_SENTINEL_URL)}.*index 0"):
+        _validate_envelope_results({"results": [{"ok": True}]}, _SENTINEL_URL)
 
 
 def test_stringify_op_errors_code_and_message():
@@ -110,20 +117,20 @@ def test_stringify_op_errors_message_only():
 
 def test_stringify_op_errors_non_string_code_raises():
     envelope = {"results": [{"ok": False, "tool": "v", "error": {"code": 1, "message": "m"}}]}
-    with pytest.raises(TransportError, match="index 0"):
-        _stringify_op_errors(envelope, "url")
+    with pytest.raises(TransportError, match=f"{re.escape(_SENTINEL_URL)}.*index 0"):
+        _stringify_op_errors(envelope, _SENTINEL_URL)
 
 
 def test_stringify_op_errors_non_string_message_raises():
     envelope = {"results": [{"ok": False, "tool": "v", "error": {"code": "x", "message": 1}}]}
-    with pytest.raises(TransportError, match="index 0"):
-        _stringify_op_errors(envelope, "url")
+    with pytest.raises(TransportError, match=f"{re.escape(_SENTINEL_URL)}.*index 0"):
+        _stringify_op_errors(envelope, _SENTINEL_URL)
 
 
 def test_stringify_op_errors_missing_message_raises():
     envelope = {"results": [{"ok": False, "tool": "v", "error": {"code": "x"}}]}
-    with pytest.raises(TransportError, match="index 0"):
-        _stringify_op_errors(envelope, "url")
+    with pytest.raises(TransportError, match=f"{re.escape(_SENTINEL_URL)}.*index 0"):
+        _stringify_op_errors(envelope, _SENTINEL_URL)
 
 
 def test_stringify_op_errors_non_dict_envelope_returned_unchanged():
