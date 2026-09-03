@@ -157,6 +157,27 @@ async fn list_empty_pages_keep_structural_keys_in_agent_mode() -> anyhow::Result
     Ok(())
 }
 
+/// Keyset cursor pages from `knowledge.list(after=…)` keep their completion
+/// signals under the default Agent presentation: an empty `results` page and
+/// `next_after: null` are how a walk terminates (ADR-045 Amendment 4).
+#[tokio::test]
+async fn knowledge_list_empty_cursor_page_keeps_completion_signals_in_agent_mode(
+) -> anyhow::Result<()> {
+    let client = connect_knowledge().await?;
+
+    let page = agent_one(&client, r#"knowledge.list(after="", limit=10)"#).await?;
+    assert_eq!(page["results"], json!([]));
+    assert!(
+        page.get("results").is_some(),
+        "empty cursor page must retain results: {page}"
+    );
+    assert!(
+        page.get("next_after").is_some_and(Value::is_null),
+        "terminal cursor page must retain next_after:null: {page}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServer) {
     use std::os::unix::fs::PermissionsExt;

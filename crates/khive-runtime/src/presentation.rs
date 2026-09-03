@@ -478,7 +478,7 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
 /// survive Agent-mode compaction. Dropping these turns an empty page into a
 /// different response type and leaves callers unable to distinguish an empty
 /// result from a missing/unsupported field.
-const EMPTY_ARRAY_PRESERVE: &[&str] = &["items", "entities", "notes", "edges"];
+const EMPTY_ARRAY_PRESERVE: &[&str] = &["items", "entities", "notes", "edges", "results"];
 
 fn is_stable_list_envelope(map: &Map<String, Value>) -> bool {
     map.contains_key("requested_limit")
@@ -487,6 +487,16 @@ fn is_stable_list_envelope(map: &Map<String, Value>) -> bool {
         && EMPTY_ARRAY_PRESERVE
             .iter()
             .any(|field| map.contains_key(*field))
+}
+
+/// Keyset cursor pages outside the ADR-023 envelope — `knowledge.list(after=…)`
+/// returns `{results, limit, order, next_after}` — are structural in the same
+/// way (ADR-045 Amendment 4): an empty `results` page and a terminal
+/// `next_after: null` are the walk's completion signals, so a caller that
+/// cannot see them cannot stop. A `results` array without a sibling
+/// `next_after` key is an ordinary response and gets the generic transform.
+fn is_keyset_cursor_envelope(map: &Map<String, Value>) -> bool {
+    map.contains_key("next_after") && map.get("results").is_some_and(Value::is_array)
 }
 
 /// Field names carrying caller-supplied payload timestamps that must never be
@@ -597,7 +607,8 @@ fn transform_agent(
 ) -> Value {
     match value {
         Value::Object(map) => {
-            let preserve_list_envelope = is_stable_list_envelope(&map);
+            let preserve_list_envelope =
+                is_stable_list_envelope(&map) || is_keyset_cursor_envelope(&map);
             let mut out = Map::new();
             for (k, v) in map {
                 // ADR-045 Amendment 3 scopes the empty-string carve-out to
@@ -1011,6 +1022,7 @@ mod tests {
             "entities": [],
             "notes": [],
             "edges": [],
+            "results": [],
             "next_after": null,
             "requested_limit": 10,
             "effective_limit": 10,
@@ -1021,6 +1033,28 @@ mod tests {
             assert_eq!(out[*key], json!([]), "missing structural key {key}");
         }
         assert_eq!(out["next_after"], json!(null));
+    }
+
+    #[test]
+    fn agent_preserves_keyset_cursor_envelope_completion_signals() {
+        // knowledge.list(after=…) terminal/empty page: both signals survive.
+        let out = agent(json!({
+            "results": [],
+            "limit": 500,
+            "order": "created_at ASC, id ASC",
+            "next_after": null,
+        }));
+        assert_eq!(out["results"], json!([]));
+        assert!(
+            out.get("next_after").is_some_and(Value::is_null),
+            "terminal cursor page must keep next_after:null: {out}"
+        );
+    }
+
+    #[test]
+    fn agent_results_without_next_after_is_not_a_cursor_envelope() {
+        let out = agent(json!({"results": [], "limit": 500, "title": "ordinary response"}));
+        assert!(out.get("results").is_none());
     }
 
     #[test]
