@@ -271,7 +271,6 @@ fn validate_model_key(model_key: &str) -> Result<(), SqliteError> {
 /// (count, delete, info). Access control is enforced at the runtime layer.
 pub struct SqliteVecStore {
     pool: Arc<ConnectionPool>,
-    is_file_backed: bool,
     model_key: String,
     embedding_model: String,
     dimensions: usize,
@@ -286,7 +285,7 @@ impl SqliteVecStore {
     /// Returns an error if `model_key` contains characters unsafe for table name interpolation.
     pub fn new(
         pool: Arc<ConnectionPool>,
-        is_file_backed: bool,
+        _is_file_backed: bool,
         model_key: String,
         embedding_model: String,
         dimensions: usize,
@@ -301,7 +300,6 @@ impl SqliteVecStore {
         let writer_task = pool.writer_task_handle().ok().flatten();
         Ok(Self {
             pool,
-            is_file_backed,
             model_key,
             embedding_model,
             dimensions,
@@ -370,36 +368,13 @@ impl SqliteVecStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Vectors,
-                op,
-                move |scope| {
-                    scope.ensure_active()?;
-                    let conn = pool
-                        .open_standalone_reader()
-                        .map_err(|error| map_sqlite_err(error, op))?;
-                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        } else {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Vectors,
-                op,
-                move |scope| {
-                    let mut guard = pool.resolve_reader_checkout(
-                        StorageCapability::Vectors,
-                        op,
-                        pool.reader_until(|| scope.should_stop()),
-                    )?;
-                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        }
+        super::run_pooled_store_read(
+            Arc::clone(&self.pool),
+            StorageCapability::Vectors,
+            op,
+            move |conn| f(conn).map_err(|error| map_err(error, op)),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]

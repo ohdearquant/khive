@@ -158,6 +158,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         khive_runtime::daemon::acquire_recovery_lock()
     };
     let (server, schedule_rt) = build_server(&args).await?;
+    tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
 
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, &args);
@@ -2004,6 +2005,7 @@ pub async fn serve_server(
              in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
         );
     }
+    tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, args);
     #[cfg(feature = "channel-telegram")]
@@ -2878,10 +2880,8 @@ async fn build_registry_for_multi_backend_inner(
 
     if default_runtime.is_read_only() {
         builder.with_read_only_audit_store();
-    } else if let Ok(tok) = default_runtime.authorize(khive_runtime::Namespace::local()) {
-        if let Ok(event_store) = default_runtime.events(&tok) {
-            builder.with_event_store(event_store);
-        }
+    } else if let Err(error) = builder.with_runtime_event_store(&default_runtime) {
+        tracing::warn!(%error, "registry audit event store is unavailable");
     }
 
     khive_runtime::PackRegistry::register_packs_with_runtimes(
@@ -3861,6 +3861,20 @@ pub fn resolved_database_disclosure(
     }
 }
 
+/// One-line, stdout-safe disclosure of the actor selected by the resolved
+/// CLI/project/environment precedence chain.
+pub fn resolved_actor_disclosure(actor_id: Option<&str>) -> String {
+    let actor = khive_runtime::resolve_actor(actor_id);
+    if khive_runtime::actor_is_unattributed(&actor) {
+        format!(
+            "actor: {:?} (resolved; unattributed local fallback)",
+            actor.id
+        )
+    } else {
+        format!("actor: {:?} (resolved; attributed)", actor.id)
+    }
+}
+
 /// Inputs for [`resolve_runtime_config`] — the subset of serve-time arguments
 /// that determine the resolved [`RuntimeConfig`]. Callers other than
 /// `kkernel mcp` (e.g. `kkernel reindex`) supply these directly so they resolve
@@ -4332,6 +4346,21 @@ mod tests {
         assert!(
             line.contains(":memory:") && line.contains("ephemeral"),
             "in-memory disclosure must say the target is ephemeral; got: {line}"
+        );
+    }
+
+    #[test]
+    fn resolved_actor_disclosure_names_attributed_actor() {
+        let line = resolved_actor_disclosure(Some("lambda:worker"));
+        assert_eq!(line, "actor: \"lambda:worker\" (resolved; attributed)");
+    }
+
+    #[test]
+    fn resolved_actor_disclosure_marks_local_unattributed() {
+        let line = resolved_actor_disclosure(None);
+        assert_eq!(
+            line,
+            "actor: \"local\" (resolved; unattributed local fallback)"
         );
     }
 
@@ -5505,6 +5534,7 @@ id = "lambda:project-actor"
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn secondary_legacy_ref_blocks_before_zero_ref_main_can_enable_v21_gc() {
         use khive_db::migrations::AttachmentCutoverStatus;
         use khive_db::stores::blob::FsBlobStore;
@@ -5594,6 +5624,7 @@ id = "lambda:project-actor"
     /// packs must be functional.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_boots_ok_with_two_memory_backends() {
         use crate::tools::request::RequestParams;
         use khive_runtime::PackConfig;
@@ -5702,6 +5733,7 @@ id = "lambda:project-actor"
     /// it restored.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_boot_installs_owned_note_kinds_so_update_is_refused() {
         use crate::tools::request::RequestParams;
 
@@ -5838,6 +5870,7 @@ id = "lambda:project-actor"
     /// survives) and pass with them restored.
     #[tokio::test]
     #[serial]
+    #[serial(config_ledger)]
     async fn multi_backend_boot_installs_note_write_validator_on_every_runtime() {
         use crate::tools::request::RequestParams;
 
@@ -5951,6 +5984,7 @@ id = "lambda:project-actor"
     /// (single-backend path) using this file's multi-backend entry point instead.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_brain_dispatch_hook_updates_state_visible_through_same_instance() {
         let khive_cfg = KhiveConfig {
             backends: vec![BackendConfig {
@@ -6013,6 +6047,7 @@ id = "lambda:project-actor"
     /// exercises the actual coordinator branch.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn kkernel_multi_backend_path_wires_pool_for_file_backed_main() {
         let dir = tempfile::tempdir().expect("temp dir");
         let main_path = dir.path().join("main.db");
@@ -6048,6 +6083,7 @@ id = "lambda:project-actor"
     /// sibling test above.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn kkernel_multi_backend_path_leaves_pool_none_for_in_memory_main() {
         let khive_cfg = KhiveConfig {
             backends: vec![BackendConfig {
@@ -6085,6 +6121,7 @@ id = "lambda:project-actor"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn single_backend_boot_wires_configured_s3_blob_store() {
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_ACTOR");
@@ -6141,6 +6178,7 @@ region = "us-east-1"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_boot_wires_configured_s3_blob_store() {
         let prev_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let prev_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
@@ -6310,6 +6348,7 @@ region = "us-east-1"
     /// inspection.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn single_backend_boot_installs_s3_blob_store_on_successful_selection() {
         let _env = ClearedKhiveEnvGuard::clear();
         let _creds = DummyAwsCredsGuard::set();
@@ -6420,6 +6459,7 @@ region = "us-east-1"
     /// install it on every per-pack runtime this boot produces.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_boot_installs_s3_blob_store_on_successful_selection() {
         let _creds = DummyAwsCredsGuard::set();
 
@@ -6463,6 +6503,7 @@ region = "us-east-1"
     // happens when the optional khive-pack-moodboard crate is linked in.
     #[cfg(feature = "pack-moodboard")]
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_boot_shares_one_hydrator_across_default_core_blob_and_moodboard() {
         let blob_root = tempfile::tempdir().expect("blob root");
         let khive_cfg = KhiveConfig {
@@ -6570,6 +6611,7 @@ region = "us-east-1"
     /// already-installed runtime (`:1847`) is returned for inspection.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn single_backend_boot_default_fs_blob_store_is_usable_without_storage_section() {
         let _env = ClearedKhiveEnvGuard::clear();
 
@@ -6731,6 +6773,7 @@ region = "us-east-1"
     /// read-only mode before attempting any physical store write.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn read_only_single_backend_neither_creates_blob_root_nor_accepts_blob_put() {
         let _env = ClearedKhiveEnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
@@ -6774,6 +6817,7 @@ region = "us-east-1"
     /// make a read-only blob secondary writable or create its default fs root.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn read_only_blob_secondary_refuses_put_beside_writable_main() {
         use khive_runtime::PackConfig;
 
@@ -6842,6 +6886,7 @@ region = "us-east-1"
     /// a blob pack explicitly routed to a writable secondary.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn writable_blob_secondary_accepts_put_beside_read_only_main() {
         use khive_runtime::PackConfig;
 
@@ -6914,6 +6959,7 @@ region = "us-east-1"
     /// one place and prevents any future path from drifting.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn secondary_pack_runtime_core_resolves_to_main_after_build_registry() {
         use khive_runtime::PackConfig;
 
@@ -6990,6 +7036,7 @@ region = "us-east-1"
     #[tokio::test]
     #[serial]
     #[cfg(unix)]
+    #[serial_test::serial(config_ledger)]
     async fn secondary_pools_dedup_by_canonical_identity_across_alias_spellings() {
         use khive_runtime::PackConfig;
 
@@ -7090,6 +7137,7 @@ region = "us-east-1"
     /// created on disk.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn memory_override_forces_all_backends_in_memory_and_never_creates_sqlite_file() {
         use khive_runtime::PackConfig;
 
@@ -7191,6 +7239,7 @@ region = "us-east-1"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn concrete_db_override_matching_declared_main_backend_path_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let main_path = dir.path().join("main.db");
@@ -7373,6 +7422,7 @@ region = "us-east-1"
     #[tokio::test]
     #[serial]
     #[cfg(unix)]
+    #[serial_test::serial(config_ledger)]
     async fn concrete_db_override_matching_declared_main_backend_via_dangling_symlink_is_accepted()
     {
         let dir = tempfile::tempdir().unwrap();
@@ -7537,6 +7587,7 @@ region = "us-east-1"
     /// silently collapsing distinct backends onto one path.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn concrete_db_override_with_backends_declared_is_rejected() {
         use khive_runtime::PackConfig;
 
@@ -7617,6 +7668,7 @@ region = "us-east-1"
     /// appear in `actor-b`'s inbox, while one addressed to `"actor-b"` must.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_preserves_actor_filtering() {
         use crate::tools::request::RequestParams;
         use khive_runtime::PackConfig;
@@ -7718,6 +7770,7 @@ region = "us-east-1"
     /// message mentions `"main"` so operators know what to fix.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_missing_main_returns_error_mentioning_main() {
         let khive_cfg = KhiveConfig {
             backends: vec![BackendConfig {
@@ -7756,6 +7809,7 @@ region = "us-east-1"
     /// defined backends.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_registry_rejects_undefined_pack_backend() {
         use khive_runtime::PackConfig;
 
@@ -7815,6 +7869,7 @@ region = "us-east-1"
     /// own independent per-pack backend resolution loop.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_server_rejects_undefined_pack_backend() {
         use khive_runtime::PackConfig;
 
@@ -7968,6 +8023,7 @@ region = "us-east-1"
 
     #[tokio::test]
     #[serial]
+    #[serial(config_ledger)]
     async fn multi_backend_read_only_construction_and_pack_schema_paths_acquire_no_writer() {
         use khive_runtime::PackConfig;
 
@@ -8080,6 +8136,7 @@ region = "us-east-1"
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     #[tokio::test]
     #[serial]
+    #[serial(config_ledger)]
     async fn mixed_topology_channel_admission_follows_the_runtime_that_backs_each_loop() {
         use clap::Parser;
         use khive_runtime::PackConfig;
@@ -8387,6 +8444,7 @@ region = "us-east-1"
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn legacy_registry_rejects_mismatched_explicit_db_override() {
         let base_cfg = RuntimeConfig {
             db_path: Some(PathBuf::from("/tmp/khive-resolved.db")),
@@ -8404,6 +8462,7 @@ region = "us-east-1"
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn legacy_server_rejects_mismatched_explicit_db_override() {
         let base_cfg = RuntimeConfig {
             db_path: Some(PathBuf::from("/tmp/khive-resolved.db")),
@@ -8422,6 +8481,7 @@ region = "us-east-1"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn legacy_registry_rejects_unset_db_after_home_changes() {
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
@@ -8436,6 +8496,7 @@ region = "us-east-1"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn legacy_server_rejects_unset_db_after_home_changes() {
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
@@ -8454,6 +8515,7 @@ region = "us-east-1"
     /// `./` prefix while pointing at the same absolute path.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn duplicate_sqlite_paths_deduplicated_to_single_backend() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("shared.db");
@@ -8472,6 +8534,7 @@ region = "us-east-1"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn duplicate_sqlite_aliases_reject_conflicting_read_only_modes() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("shared-mode.db");
@@ -8499,6 +8562,7 @@ region = "us-east-1"
     /// anchor used by the consistency guard.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_boot_uses_anchor_captured_by_runtime_config() {
         let first_home = tempfile::tempdir().unwrap();
         let _home_guard = HomeGuard::redirect_to(first_home.path());
@@ -8550,6 +8614,7 @@ region = "us-east-1"
     /// paths must never be created on disk.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn memory_override_forces_all_backends_in_memory_and_never_creates_sqlite_file_via_build_server_multi_backend(
     ) {
         use khive_runtime::PackConfig;
@@ -8620,6 +8685,7 @@ region = "us-east-1"
     /// collapsing distinct backends onto one path.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn concrete_db_override_with_backends_declared_is_rejected_via_build_server_multi_backend(
     ) {
         use khive_runtime::PackConfig;
@@ -8790,6 +8856,7 @@ region = "us-east-1"
     /// must load the extension or query through a runtime instead.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_isolates_pack_data_to_separate_files() {
         use crate::tools::request::RequestParams;
         use khive_runtime::PackConfig;
@@ -9672,6 +9739,7 @@ region = "us-east-1"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_configured_backend_not_the_home_default() {
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
@@ -9701,6 +9769,7 @@ region = "us-east-1"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_configured_actor_identity() {
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
         let _seat_env = SeatEnv::enter(seat_dir.path());
@@ -9733,6 +9802,7 @@ region = "us-east-1"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_is_none_when_schedule_pack_is_not_in_the_restricted_pack_set(
     ) {
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -9760,6 +9830,7 @@ region = "us-east-1"
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn default_read_only_server_omits_schedule_tick_and_warms_without_a_writer() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -9815,6 +9886,7 @@ region = "us-east-1"
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn multi_backend_schedule_tick_and_warm_use_each_assigned_backend_mode() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -9953,6 +10025,7 @@ backend = "schedule-backend"
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn client_role_never_starts_the_schedule_component() {
         use clap::Parser;
         let args = Args::parse_from(["mcp"]);
@@ -9976,6 +10049,7 @@ backend = "schedule-backend"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_runtime_satisfies_strict_actor_mode_like_the_live_server() {
         // Regression for the exact "strict actor mode can make every tick
         // fail" scenario this fix addressed: before this fix, the
@@ -10031,6 +10105,7 @@ backend = "schedule-backend"
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_uses_the_declared_multi_backend_not_main() {
         // Multi-backend (ADR-028 [[backends]]) config-backed targeting: the
         // "schedule" pack is explicitly routed to its OWN backend, distinct
@@ -10162,6 +10237,7 @@ backend = "schedule-backend"
     /// replayed action's own write shows up only in `kg`'s declared backend.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn build_server_schedule_tick_dispatches_actions_through_the_declared_multi_backend_not_schedule(
     ) {
         let seat_dir = tempfile::tempdir().expect("seat tempdir");
@@ -10697,6 +10773,7 @@ backend = "kg-backend"
 
         #[tokio::test]
         #[serial]
+        #[serial(config_ledger)]
         async fn kg_secondary_runtime_owns_external_id_claim_and_delivery_mark() {
             let dir = tempfile::tempdir().unwrap();
             let main_path = dir.path().join("main.db");
@@ -10835,6 +10912,7 @@ backend = "kg-backend"
         /// control: same base config, embedders retained.
         #[tokio::test]
         #[serial]
+        #[serial(config_ledger)]
         async fn pack_no_embed_strips_embedders_from_that_runtime_only() {
             let dir = tempfile::tempdir().unwrap();
             let khive_cfg = KhiveConfig {
@@ -10943,6 +11021,7 @@ backend = "kg-backend"
         /// which is exactly why the loop must not use it.
         #[tokio::test]
         #[serial]
+        #[serial(config_ledger)]
         async fn comm_secondary_runtime_owns_outbox_scan_claim_and_delivery_mark() {
             let dir = tempfile::tempdir().unwrap();
             let main_path = dir.path().join("main.db");
@@ -11189,6 +11268,7 @@ backend = "kg-backend"
         }
 
         #[test]
+        #[serial_test::serial(config_ledger)]
         fn email_plan_gates_poll_and_outbox_on_daemon_role_and_backing_runtime_modes() {
             use clap::Parser;
 
@@ -11284,6 +11364,7 @@ backend = "kg-backend"
         use super::*;
 
         #[test]
+        #[serial_test::serial(config_ledger)]
         fn telegram_plan_gates_poll_and_outbox_on_backing_runtime_modes() {
             use clap::Parser;
 
@@ -11545,6 +11626,7 @@ backend = "kg-backend"
         /// makes this assertion fail: it is an order check, not a mere
         /// presence/count check.
         #[tokio::test(start_paused = true)]
+        #[serial(config_ledger)]
         async fn channel_lifecycle_events_are_sequenced_across_a_failure_then_recovery() {
             let mut ch_registry = ChannelRegistry::new();
             ch_registry.register(Arc::new(FlakyOnceChannel {
@@ -12795,6 +12877,7 @@ backend = "kg-backend"
     /// and awaited, not leaked past the error return).
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn serve_with_session_sweep_completes_shutdown_on_unknown_transport() {
         use clap::Parser;
 
@@ -12850,6 +12933,7 @@ backend = "kg-backend"
     /// synchronously the moment the guard returns.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn serve_guard_awaits_sweep_shutdown_before_returning() {
         use clap::Parser;
         use std::sync::atomic::{AtomicBool, Ordering};

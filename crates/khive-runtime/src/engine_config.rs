@@ -44,6 +44,9 @@ pub enum ConfigError {
     #[error("actor.id {id:?} is not a valid namespace: {reason}")]
     InvalidActorId { id: String, reason: String },
 
+    #[error("[gate].granted_actors entry {id:?} is not a valid actor id: {reason}")]
+    InvalidGrantedActorId { id: String, reason: String },
+
     #[error("duplicate backend name: {name:?}")]
     DuplicateBackendName { name: String },
 
@@ -81,9 +84,10 @@ pub enum ConfigError {
     #[error("the explicitly selected config file does not exist: {path}")]
     ExplicitConfigMissing { path: PathBuf },
 
-    #[error(
-        "[gate] configuration is not supported by this build; refusing to start because the requested caller-enrollment policy would not be enforced"
-    )]
+    /// Retained for source compatibility with callers that matched the
+    /// fail-loud behavior of older builds. Supported `[gate]` sections no
+    /// longer produce this error.
+    #[error("[gate] configuration is not supported by this build")]
     UnsupportedGateSection,
 
     #[error(
@@ -218,6 +222,24 @@ pub struct ActorConfig {
     /// for any actor that does not add this field.
     #[serde(default)]
     pub allowed_outbound_namespaces: Vec<String>,
+}
+
+/// Built-in caller-enrollment policy configured by `[gate]`.
+///
+/// The table is intentionally closed: misspelled or future keys fail startup
+/// instead of being silently ignored at an authorization boundary. Presence
+/// installs [`khive_gate::CallerEnrollmentGate`]; absence preserves the gate
+/// already supplied in the base [`crate::RuntimeConfig`].
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateSectionConfig {
+    /// Exact resolved actor ids permitted to dispatch requests.
+    #[serde(default)]
+    pub granted_actors: Vec<String>,
+
+    /// Whether the implicit anonymous/local caller is admitted.
+    #[serde(default)]
+    pub grant_unattributed: bool,
 }
 
 // ---- Per-pack backend config (ADR-028) ----
@@ -406,15 +428,15 @@ pub struct GitWriteSectionConfig {
 /// Sections consumed today:
 /// - `[[engines]]`: embedding engine declarations
 /// - `[actor]`: default namespace / identity (OSS actor model)
+/// - `[gate]`: built-in caller enrollment
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
 /// - `[display]`: rendering timezone (ADR-169)
 ///
-/// Unknown keys are silently ignored by serde for forward compatibility. The
-/// security-sensitive `[gate]` exception is detected by [`KhiveConfig::load`]
-/// before deserialization so a request for caller enrollment can never be
-/// mistaken for active enforcement.
+/// Unknown top-level keys are silently ignored by serde for forward
+/// compatibility. The security-sensitive `[gate]` table itself is closed with
+/// `deny_unknown_fields` so a misspelled policy key always fails startup.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
     /// Typed only so a top-level `db` key can be rejected loudly by
@@ -438,6 +460,12 @@ pub struct KhiveConfig {
     /// Cloud model derives actor identity from an authenticated token.
     #[serde(default)]
     pub actor: ActorConfig,
+
+    /// Optional caller-enrollment policy. A present, even empty, table is an
+    /// explicit fail-closed policy; an absent table preserves the runtime's
+    /// existing gate.
+    #[serde(default)]
+    pub gate: Option<GateSectionConfig>,
 
     /// Runtime knobs: namespace overrides, brain profile, etc.
     #[serde(default)]
@@ -566,17 +594,7 @@ impl KhiveConfig {
         let diagnostic_path = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
         let raw = std::fs::read_to_string(&resolved)
             .map_err(|source| ConfigError::from(source).in_file(&diagnostic_path))?;
-        let parsed: toml::Value = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
-            path: diagnostic_path.clone(),
-            source,
-        })?;
-        if parsed
-            .as_table()
-            .is_some_and(|table| table.contains_key("gate"))
-        {
-            return Err(ConfigError::UnsupportedGateSection.in_file(&diagnostic_path));
-        }
-        let cfg: KhiveConfig = parsed.try_into().map_err(|source| ConfigError::Parse {
+        let cfg: KhiveConfig = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
         })?;
@@ -816,6 +834,21 @@ impl KhiveConfig {
             }
         }
 
+        if let Some(gate) = &self.gate {
+            for id in &gate.granted_actors {
+                if id.is_empty() {
+                    return Err(ConfigError::InvalidGrantedActorId {
+                        id: id.clone(),
+                        reason: "actor ids must not be empty".to_string(),
+                    });
+                }
+                Namespace::parse(id).map_err(|error| ConfigError::InvalidGrantedActorId {
+                    id: id.clone(),
+                    reason: error.to_string(),
+                })?;
+            }
+        }
+
         // Validate actor.allowed_outbound_namespaces (fail-closed at startup on malformed entry).
         for ns_str in &self.actor.allowed_outbound_namespaces {
             if ns_str.is_empty() {
@@ -1051,18 +1084,25 @@ mod tests {
         path
     }
 
+    fn in_memory_runtime_config() -> crate::RuntimeConfig {
+        crate::RuntimeConfig {
+            db_path: None,
+            ..crate::RuntimeConfig::no_embeddings()
+        }
+    }
+
     /// Load errors must name the config file they came from (#1892): the
-    /// gate refusal, validation errors, and I/O errors gain the loader's
-    /// `InFile` context, while `Parse` keeps carrying its own path. The
-    /// message suffix is the user-facing contract.
+    /// validation and I/O errors gain the loader's `InFile` context, while
+    /// `Parse` keeps carrying its own path. The message suffix is the
+    /// user-facing contract.
     #[test]
     fn load_errors_name_the_config_file() {
         let dir = tempfile::tempdir().unwrap();
 
         let gate = write_toml(&dir, "[gate]\nmode = \"x\"\n");
-        let err = KhiveConfig::load(Some(&gate)).expect_err("gate section must fail");
+        let err = KhiveConfig::load(Some(&gate)).expect_err("unknown gate key must fail");
         assert!(
-            err.to_string().contains("(config file: ") && err.to_string().contains("config.toml"),
+            err.to_string().contains(&gate.display().to_string()),
             "gate error must name the file, got: {err}"
         );
 
@@ -1535,7 +1575,7 @@ default = true
     }
 
     #[test]
-    fn home_gate_config_is_rejected_while_explicit_empty_config_is_hermetic() {
+    fn home_gate_config_loads_while_explicit_empty_config_is_hermetic() {
         let project_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
@@ -1545,12 +1585,13 @@ default = true
         )
         .unwrap();
 
-        let err = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
-            .expect_err("an unsupported home gate policy must still fail loud");
-        assert!(matches!(
-            config_error_root(&err),
-            ConfigError::UnsupportedGateSection
-        ));
+        let loaded = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
+            .expect("supported home gate policy loads")
+            .expect("home config exists");
+        assert_eq!(
+            loaded.gate.expect("gate table").granted_actors,
+            vec!["lambda:enrolled"]
+        );
 
         let empty = project_dir.path().join("empty-khive-config.toml");
         std::fs::write(&empty, "").unwrap();
@@ -1559,6 +1600,7 @@ default = true
             .expect("the explicit config exists");
         assert!(isolated.engines.is_empty());
         assert!(isolated.actor.id.is_none());
+        assert!(isolated.gate.is_none());
     }
 
     #[test]
@@ -2203,7 +2245,7 @@ db = "/tmp/scratch/demo.db"
     }
 
     #[test]
-    fn gate_caller_enrollment_is_rejected_instead_of_ignored() {
+    fn gate_caller_enrollment_config_loads_for_runtime_enforcement() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(
             &dir,
@@ -2214,27 +2256,104 @@ grant_unattributed = false
 "#,
         );
 
-        let err = KhiveConfig::load(Some(&path))
-            .expect_err("an unenforced caller-enrollment policy must abort startup");
-        assert!(
-            matches!(config_error_root(&err), ConfigError::UnsupportedGateSection),
-            "expected UnsupportedGateSection, got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("would not be enforced"),
-            "operator-facing error must explain the fail-loud reason: {err}"
-        );
+        let config = KhiveConfig::load(Some(&path))
+            .expect("the supported caller-enrollment policy must parse")
+            .expect("config exists");
+        let gate = config.gate.expect("gate section");
+        assert_eq!(gate.granted_actors, vec!["lambda:enrolled"]);
+        assert!(!gate.grant_unattributed);
     }
 
     #[test]
-    fn empty_gate_table_is_still_rejected() {
+    fn caller_enrollment_policy_is_enforced_at_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[actor]
+id = "lambda:enrolled"
+
+[gate]
+granted_actors = ["lambda:enrolled"]
+grant_unattributed = false
+"#,
+        );
+        let mut config = KhiveConfig::load(Some(&path))
+            .expect("load")
+            .expect("config exists");
+        let allowed = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        let runtime = crate::KhiveRuntime::new(allowed).expect("runtime");
+        runtime
+            .authorize(Namespace::local())
+            .expect("listed actor is admitted");
+
+        config.actor.id = Some("lambda:other".to_string());
+        let denied = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        let runtime = crate::KhiveRuntime::new(denied).expect("runtime");
+        assert!(matches!(
+            runtime.authorize(Namespace::local()),
+            Err(crate::RuntimeError::PermissionDenied { ref verb, ref reason })
+                if verb == "authorize" && reason == "actor is not enrolled"
+        ));
+    }
+
+    #[test]
+    fn grant_unattributed_controls_anonymous_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[gate]\ngrant_unattributed = false\n");
+        let mut config = KhiveConfig::load(Some(&path))
+            .expect("load")
+            .expect("config exists");
+        let denied = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        let runtime = crate::KhiveRuntime::new(denied).expect("runtime");
+        assert!(matches!(
+            runtime.authorize(Namespace::local()),
+            Err(crate::RuntimeError::PermissionDenied { ref reason, .. })
+                if reason == "unattributed caller is not enrolled"
+        ));
+
+        config.gate.as_mut().expect("gate").grant_unattributed = true;
+        let allowed = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        crate::KhiveRuntime::new(allowed)
+            .expect("runtime")
+            .authorize(Namespace::local())
+            .expect("anonymous caller is explicitly admitted");
+    }
+
+    #[test]
+    fn empty_gate_table_is_explicit_deny_all_policy() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(&dir, "[gate]\n");
-        let err = KhiveConfig::load(Some(&path))
-            .expect_err("a present gate table must never disappear through serde defaults");
+        let config = KhiveConfig::load(Some(&path))
+            .expect("empty gate table parses")
+            .expect("config exists");
+        assert_eq!(config.gate, Some(GateSectionConfig::default()));
+        let runtime_config =
+            crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        let runtime = crate::KhiveRuntime::new(runtime_config).expect("runtime");
+        assert!(matches!(
+            runtime.authorize(Namespace::local()),
+            Err(crate::RuntimeError::PermissionDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_gate_key_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[gate]\ngranted_actor = [\"lambda:typo\"]\n");
+        let err = KhiveConfig::load(Some(&path)).expect_err("unknown gate key must fail");
+        assert!(matches!(err, ConfigError::Parse { .. }));
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn invalid_granted_actor_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[gate]\ngranted_actors = [\"not valid\"]\n");
+        let err = KhiveConfig::load(Some(&path)).expect_err("invalid actor id must fail");
         assert!(matches!(
             config_error_root(&err),
-            ConfigError::UnsupportedGateSection
+            ConfigError::InvalidGrantedActorId { id, .. } if id == "not valid"
         ));
     }
 

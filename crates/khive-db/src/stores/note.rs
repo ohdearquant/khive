@@ -296,16 +296,16 @@ pub fn note_hard_delete_statement(id: Uuid) -> SqlStatement {
 /// A NoteStore backed by SQLite. Namespace is the caller's responsibility.
 ///
 /// UUID is globally unique — get/delete by ID alone. Query/count use the
-/// namespace parameter as passed. The store is just a pool + is_file_backed.
+/// namespace parameter as passed. Read routing is always pool-backed; the
+/// constructor's legacy file-backed flag is retained for API compatibility.
 pub struct SqlNoteStore {
     pool: Arc<ConnectionPool>,
-    is_file_backed: bool,
     writer_task: Option<WriterTaskHandle>,
 }
 
 impl SqlNoteStore {
     /// Create a new store.
-    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+    pub fn new(pool: Arc<ConnectionPool>, _is_file_backed: bool) -> Self {
         // Enabled by default for file-backed pools; explicit off/degraded
         // fallback remains possible (ADR-067 Component A, mirrors
         // entity.rs policy): a missing writer task — explicitly disabled,
@@ -314,11 +314,7 @@ impl SqlNoteStore {
         // re-resolves it and applies strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
-        Self {
-            pool,
-            is_file_backed,
-            writer_task,
-        }
+        Self { pool, writer_task }
     }
 
     fn current_writer_task(
@@ -435,36 +431,13 @@ impl SqlNoteStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Notes,
-                op,
-                move |scope| {
-                    scope.ensure_active()?;
-                    let conn = pool
-                        .open_standalone_reader()
-                        .map_err(|error| map_sqlite_err(error, op))?;
-                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        } else {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Notes,
-                op,
-                move |scope| {
-                    let mut guard = pool.resolve_reader_checkout(
-                        StorageCapability::Notes,
-                        op,
-                        pool.reader_until(|| scope.should_stop()),
-                    )?;
-                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        }
+        super::run_pooled_store_read(
+            Arc::clone(&self.pool),
+            StorageCapability::Notes,
+            op,
+            move |conn| f(conn).map_err(|error| map_err(error, op)),
+        )
+        .await
     }
 }
 
