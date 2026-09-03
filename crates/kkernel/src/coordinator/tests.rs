@@ -220,6 +220,7 @@ fn registry_without_a_served_kind_declaration_is_conservatively_included() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn fan_out_search_uses_served_kind_metadata_before_dispatch() {
     let mut registry = BackendRegistry::new();
     registry
