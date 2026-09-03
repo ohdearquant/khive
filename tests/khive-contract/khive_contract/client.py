@@ -8,6 +8,7 @@ never open subprocesses directly.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 from pathlib import Path
@@ -78,6 +79,17 @@ def _find_repo_root(start: Path) -> Path | None:
     return None
 
 
+def _load_shared_resolver(repo_root: Path):
+    """Import tests/kkernel_binary.py by path; this package has no import path to it."""
+    module_path = repo_root / "tests" / "kkernel_binary.py"
+    spec = importlib.util.spec_from_file_location("kkernel_binary", module_path)
+    if spec is None or spec.loader is None:
+        raise FileNotFoundError(f"shared kkernel resolver not found at {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _resolve_binary(binary: str | Path | None) -> Path:
     if binary is not None:
         return Path(binary)
@@ -88,10 +100,13 @@ def _resolve_binary(binary: str | Path | None) -> Path:
         return Path(env_val)
     repo_root = _find_repo_root(Path(__file__).parent)
     if repo_root is not None:
-        release = repo_root / "crates" / "target" / "release" / "kkernel"
+        # One resolution rule for every harness: tests/kkernel_binary.py mirrors
+        # scripts/ci.sh, so a custom CARGO_TARGET_DIR selects the same binary
+        # here as in the smoke harnesses.
+        release = Path(_load_shared_resolver(repo_root).resolve_binary_path())
         if release.exists():
             return release
-        debug = repo_root / "crates" / "target" / "debug" / "kkernel"
+        debug = release.parent.parent / "debug" / "kkernel"
         if debug.exists():
             return debug
     raise FileNotFoundError(
