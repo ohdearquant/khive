@@ -444,9 +444,10 @@ impl DispatchFailure {
 ///
 /// When `khive_cfg` is supplied and contains a non-empty `[[backends]]`
 /// declaration, the backend topology (sorted backend list, explicit read-only
-/// modes, and pack→backend assignments) is folded into the fingerprint so that
-/// two configs differing only in routing or access mode produce different ids
-/// (ADR-049 / B-SHOULD-FIX-4). Delimiter-free topologies retain their legacy
+/// modes, served-substrate declarations, and pack→backend assignments) is
+/// folded into the fingerprint so that two configs differing only in routing
+/// or access mode produce different ids (ADR-049 / B-SHOULD-FIX-4).
+/// Delimiter-free topologies retain their legacy
 /// spelling; a topology containing reserved delimiter text uses an injective,
 /// escaped v2 encoding so path data can never impersonate access mode.
 ///
@@ -682,7 +683,7 @@ fn escape_topology_component(value: &str) -> String {
 
 fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
     let mut legacy_safe = true;
-    let mut backend_rows: Vec<(String, String, String, bool)> = cfg
+    let mut backend_rows: Vec<(String, String, String, bool, Option<String>)> = cfg
         .backends
         .iter()
         .map(|backend| {
@@ -698,7 +699,20 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
                     .path
                     .as_ref()
                     .is_none_or(|_| legacy_topology_component_is_safe(&path));
-            (backend.name.clone(), kind, path, backend.read_only)
+            let served_kinds = backend.served_kinds.as_ref().map(|kinds| {
+                kinds
+                    .iter()
+                    .map(|kind| kind.name())
+                    .collect::<Vec<_>>()
+                    .join("+")
+            });
+            (
+                backend.name.clone(),
+                kind,
+                path,
+                backend.read_only,
+                served_kinds,
+            )
         })
         .collect();
     backend_rows.sort();
@@ -721,9 +735,13 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
     let (backends, pack_backends) = if legacy_safe {
         let backends = backend_rows
             .iter()
-            .map(|(name, kind, path, is_read_only)| {
+            .map(|(name, kind, path, is_read_only, served_kinds)| {
                 let read_only = if *is_read_only { ":read_only" } else { "" };
-                format!("{name}:{kind}:{path}{read_only}")
+                let served_kinds = served_kinds
+                    .as_deref()
+                    .map(|kinds| format!(":serves={kinds}"))
+                    .unwrap_or_default();
+                format!("{name}:{kind}:{path}{read_only}{served_kinds}")
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -742,10 +760,14 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
     } else {
         let backends = backend_rows
             .iter()
-            .map(|(name, kind, path, read_only)| {
+            .map(|(name, kind, path, read_only, served_kinds)| {
                 let mode = if *read_only { "r" } else { "w" };
+                let served_kinds = served_kinds
+                    .as_deref()
+                    .map(|kinds| format!(":serves={kinds}"))
+                    .unwrap_or_default();
                 format!(
-                    "{}:{}:{}:{mode}",
+                    "{}:{}:{}:{mode}{served_kinds}",
                     escape_topology_component(name),
                     escape_topology_component(kind),
                     escape_topology_component(path),
@@ -5676,10 +5698,11 @@ mod tests {
             let mut per_backend: Vec<crate::coordinator::BackendSearchResult> = (0
                 ..MAX_BACKEND_ERROR_ENTRIES + 9)
                 .map(|index| crate::coordinator::BackendSearchResult {
-                    backend_id: khive_runtime::BackendId::new(format!(
+                    backend_id: khive_runtime::BackendId::parse(format!(
                         "backend-{index:03}-{}",
                         "x".repeat(MAX_BACKEND_ERROR_KEY_CHARS)
-                    )),
+                    ))
+                    .expect("valid backend id"),
                     entity_hits: Vec::new(),
                     note_hits: Vec::new(),
                     error: Some(format!(
@@ -5758,7 +5781,8 @@ mod tests {
             entity_hits: Vec::new(),
             note_hits: Vec::new(),
             per_backend: vec![crate::coordinator::BackendSearchResult {
-                backend_id: khive_runtime::BackendId::new(secret.clone()),
+                backend_id: khive_runtime::BackendId::parse(secret.clone())
+                    .expect("valid backend id"),
                 entity_hits: Vec::new(),
                 note_hits: Vec::new(),
                 error: Some("storage unavailable".to_string()),
@@ -6359,6 +6383,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("./data/main.db")),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -6412,6 +6437,7 @@ mod tests {
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -6420,6 +6446,7 @@ mod tests {
                     path: Some(path),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only,
                 },
             ],
@@ -6467,6 +6494,7 @@ mod tests {
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             packs: std::collections::HashMap::from([(
@@ -6487,6 +6515,41 @@ mod tests {
         assert!(
             config_id.ends_with(&expected_suffix),
             "delimiter-free topologies must retain their legacy fingerprint spelling; got {config_id}"
+        );
+    }
+
+    #[test]
+    fn config_id_differs_when_backend_served_kinds_differ() {
+        use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig};
+        use khive_types::SubstrateKind;
+
+        let runtime = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let topology_for = |served_kinds| KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                served_kinds,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let legacy = topology_for(None);
+        let entity_only = topology_for(Some(std::collections::BTreeSet::from([
+            SubstrateKind::Entity,
+        ])));
+        assert_ne!(
+            compute_config_id(&runtime, Some(&legacy)),
+            compute_config_id(&runtime, Some(&entity_only)),
+            "dispatch-shaping served-kind metadata must move daemon identity"
         );
     }
 
@@ -6515,6 +6578,7 @@ mod tests {
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             packs: std::collections::HashMap::from([(
@@ -6578,6 +6642,7 @@ mod tests {
                 path: runtime.db_path.clone(),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
