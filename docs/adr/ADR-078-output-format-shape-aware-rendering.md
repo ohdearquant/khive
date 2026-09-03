@@ -612,7 +612,7 @@ the view layer honest in the interim rather than lossy.
 **Current contract.** Two axes govern reduction: presentation mode and format, and the §7
 reductions now apply at one of two scopes. `PresentationMode::Verbose` is lossless in every
 format — JSON, `auto`, and `table` alike — and is the sole escape hatch a caller can rely on
-unconditionally for the *full* set of reductions. Under `PresentationMode::Agent` or
+unconditionally for the _full_ set of reductions. Under `PresentationMode::Agent` or
 `PresentationMode::Human`, `format=auto` and `format=table` have applied the full §7 reduction
 set (View scope: `full_id` suppression, `properties` dedup, `namespace` elision) since this ADR's
 original text — unchanged by this amendment. This amendment extends only the `properties`-dedup
