@@ -294,6 +294,7 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
 /// write as a failure and invite an unsafe retry.
 #[serial]
 #[tokio::test]
+#[serial(config_ledger)]
 async fn write_verb_waits_past_audit_deadline_until_row_commits() {
     let append_started = Arc::new(tokio::sync::Notify::new());
     let append_release = Arc::new(tokio::sync::Notify::new());
@@ -350,6 +351,156 @@ async fn write_verb_waits_past_audit_deadline_until_row_commits() {
         store.events.lock().expect("events lock").len(),
         1,
         "the successful dispatch must have exactly one durable audit row"
+    );
+}
+
+/// khive#2331: the earlier `write_verb_waits_past_audit_deadline_until_row_commits`
+/// test only proves the case where the store eventually releases (80ms in,
+/// well inside its huge default `resolution_deadline`). A store that never
+/// returns at all must not pin the caller — and the completed write's
+/// handler — forever. Once `resolution_deadline` also elapses past
+/// `admission_deadline`, the dispatch must give up and report the new
+/// terminal reason rather than await the stalled generation indefinitely.
+/// The outer `tokio::time::timeout` wrapping the dispatch join is a test
+/// safety net, not the mechanism under test: pre-fix, this would hang past
+/// it and fail loudly instead of hanging the whole suite.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn write_verb_gives_up_after_resolution_deadline_when_store_never_returns() {
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store = Arc::new(MemoryEventStore {
+        append_started: Some(Arc::clone(&append_started)),
+        // `append_release` is never notified: `append_events_idempotent`
+        // blocks on `Notify::notified()` forever — a genuinely stalled store.
+        append_release: Some(Arc::new(tokio::sync::Notify::new())),
+        ..MemoryEventStore::default()
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(RecordingWritePack {
+        effects: Arc::clone(&effects),
+    });
+    builder.with_event_store(store.clone());
+    builder.with_audit_batch_config(AuditBatchConfig {
+        admission_deadline: std::time::Duration::from_millis(30),
+        resolution_deadline: std::time::Duration::from_millis(100),
+        ..AuditBatchConfig::default()
+    });
+    let registry = Arc::new(builder.build().expect("registry builds"));
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("event store configured, so the batch seam is too");
+
+    let dispatch = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move { registry.dispatch("create", Value::Null).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("audit generation reaches the blocking store");
+    assert_eq!(
+        effects.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the domain effect must already be committed before the audit wait"
+    );
+
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch)
+        .await
+        .expect("dispatch resolves within the resolution deadline instead of hanging forever")
+        .expect("dispatch task joins")
+        .expect_err("a stalled audit store must not report the committed write as success");
+    assert!(
+        err.to_string().contains("ResolutionDeadlineExpired"),
+        "the caller must learn the effect committed and the audit outcome is unresolved, \
+         distinctly from a plain admission-deadline expiry: {err}"
+    );
+    assert_eq!(
+        effects.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "giving up on the audit wait must not rerun the non-idempotent handler"
+    );
+    let snap = audit_batch.test_snapshot();
+    assert!(
+        snap.in_flight_generation.is_some() && snap.driver_active,
+        "the stalled generation must still be owned by the driver, not abandoned or re-enqueued"
+    );
+    assert_eq!(
+        snap.pending_rows, 0,
+        "the row must not be pushed back onto the pending queue for a retry"
+    );
+}
+
+/// khive#2331: the capacity-exhaustion arm — multiple concurrent committed
+/// writes stalled behind the same never-returning audit store must each give
+/// up at their own resolution deadline rather than piling up unbounded
+/// request/audit capacity. `submitted_rows` grows by exactly N and the
+/// pending queue is empty afterward: nothing was retried, duplicated, or
+/// left queued.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn concurrent_write_verbs_all_give_up_after_resolution_deadline() {
+    const N: usize = 3;
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store = Arc::new(MemoryEventStore {
+        append_started: Some(Arc::clone(&append_started)),
+        append_release: Some(Arc::new(tokio::sync::Notify::new())),
+        ..MemoryEventStore::default()
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(RecordingWritePack {
+        effects: Arc::clone(&effects),
+    });
+    builder.with_event_store(store.clone());
+    builder.with_audit_batch_config(AuditBatchConfig {
+        admission_deadline: std::time::Duration::from_millis(30),
+        resolution_deadline: std::time::Duration::from_millis(100),
+        ..AuditBatchConfig::default()
+    });
+    let registry = Arc::new(builder.build().expect("registry builds"));
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("event store configured, so the batch seam is too");
+    let before = audit_batch.test_snapshot();
+
+    let mut dispatches = Vec::with_capacity(N);
+    for _ in 0..N {
+        let registry = Arc::clone(&registry);
+        dispatches.push(tokio::spawn(async move {
+            registry.dispatch("create", Value::Null).await
+        }));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("audit generation reaches the blocking store");
+
+    for dispatch in dispatches {
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch)
+            .await
+            .expect("each dispatch resolves within the resolution deadline instead of hanging")
+            .expect("dispatch task joins")
+            .expect_err("a stalled audit store must not report a committed write as success");
+        assert!(
+            err.to_string().contains("ResolutionDeadlineExpired"),
+            "unexpected error: {err}"
+        );
+    }
+    assert_eq!(
+        effects.load(std::sync::atomic::Ordering::SeqCst),
+        N,
+        "every handler must have run exactly once, never rerun while awaiting audit resolution"
+    );
+    let after = audit_batch.test_snapshot();
+    assert_eq!(
+        after.submitted_rows - before.submitted_rows,
+        N as u64,
+        "exactly N rows were submitted; giving up on the wait must not re-enqueue or duplicate them"
+    );
+    assert_eq!(
+        after.pending_rows, 0,
+        "no row is pushed back onto the pending queue after its caller gives up"
     );
 }
 

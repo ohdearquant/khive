@@ -801,3 +801,11 @@ async fn admission_deadline_expired_row_stays_enqueued() {
 
     drop(occupant);
 }
+
+// `submit_until_resolved` is `pub(crate)` — only `khive-runtime`'s own
+// `pack.rs` call sites reach it, so it cannot be exercised directly from this
+// external test binary. Its `ResolutionDeadlineExpired` bound (khive#2331) is
+// covered end-to-end, through those call sites, by
+// `write_verb_gives_up_after_resolution_deadline_when_store_never_returns`
+// and `concurrent_write_verbs_all_give_up_after_resolution_deadline` in
+// `tests/read_verb_admission_exhaustion.rs`.

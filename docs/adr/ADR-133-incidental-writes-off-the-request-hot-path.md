@@ -739,3 +739,30 @@ The distinction at the two admission boundaries remains exact:
 Gate-denial, unknown-verb, failed-dispatch, and pure-observability rows retain bounded submission:
 their caller-visible operation outcome is already fixed, or their contract is explicitly
 best-effort. The eleven admission-degrade-safe reads remain governed by Amendment 1 unchanged.
+
+## Amendment 4 (2026-09-03): Bound the Resolved Wait Itself
+
+**Status**: Accepted, implemented for khive#2331.
+
+Amendment 3's resolved-wait mode kept the enqueued audit receiver alive with no upper bound once
+`admission_deadline` elapsed: a stalled `EventStore::append_events_idempotent()` call (a wedged
+writer task, an unreachable events daemon that never times out at that layer, and so on) retained
+the completed write's caller, its request slot, and its audit-lane waiter indefinitely. The stalled
+generation also stops the driver from draining any row queued behind it, so both request and audit
+capacity exhaust together rather than the caller ever observing a terminal outcome.
+
+`AuditBatchConfig` gains a second, larger bound, `resolution_deadline`, which caps how much longer
+`AuditBatch::submit_until_resolved` may wait once `admission_deadline` has already elapsed on the
+row. It defaults to 6x `admission_deadline` and is validated (debug-only, at `AuditBatch`
+construction) to be no shorter than `admission_deadline`.
+
+If `resolution_deadline` also elapses, the caller receives a new terminal reason,
+`AuditTerminalReason::ResolutionDeadlineExpired`, distinct from `AdmissionDeadlineExpired`: the
+domain effect has already committed, so it is not retried and the row is not re-enqueued, but the
+audit outcome itself is now unknown to the caller rather than merely slow. The row is left exactly
+where the driver holds it — in `state.pending`, or already mid-generation — for the driver to
+resolve independently, the same non-removal contract Amendment 1 established for
+`AdmissionDeadlineExpired`. Every other boundary in Amendment 3 is unchanged: `QueueAdmissionExhausted`
+still returns immediately with no audit row to await, and a genuine `IdentityConflict`,
+`StoreFailure`, unsupported-idempotency, or driver terminal failure that resolves before
+`resolution_deadline` still fails the successful dispatch exactly as before.

@@ -74,12 +74,18 @@ every failure for a non-opted-in verb, is unaffected.
 
 For a successful non-degrade-safe operation, the domain effect may already be committed when its
 deferred audit row is enqueued. Those rows, and `GitDigestReceipt` rows, use
-`AuditBatch::submit_until_resolved()` (khive#2256): crossing `admission_deadline` emits a warning but
-keeps awaiting the same generation receiver until it commits or reaches a genuine terminal
-failure. The handler is not invoked again and the row is not re-enqueued. Pre-enqueue
-`QueueAdmissionExhausted` and real store/driver failures still return errors. Ordinary `submit()`
-retains the bounded deadline contract for admission-degrade reads, failed/denied outcomes, and
-pure observability.
+`AuditBatch::submit_until_resolved()` (khive#2256): crossing `admission_deadline` emits a warning
+but keeps awaiting the same generation receiver, now bounded by a second, larger
+`AuditBatchConfig::resolution_deadline` (khive#2331) rather than unbounded — a stalled
+`append_events_idempotent()` call must not retain the completed write's caller, its request slot,
+and its audit-lane waiter forever, exhausting both request and audit capacity. If
+`resolution_deadline` also elapses, the caller gets the dedicated `ResolutionDeadlineExpired`
+reason instead of `AdmissionDeadlineExpired`, so a caller (and diagnostics reading the reason) can
+tell a merely-slow admission wait apart from a resolution wait that gave up entirely. Either way
+the handler is not invoked again and the row is not re-enqueued — the row is left exactly where
+the driver holds it for the driver to resolve independently. Pre-enqueue `QueueAdmissionExhausted`
+and real store/driver failures still return errors. Ordinary `submit()` retains the bounded
+deadline contract for admission-degrade reads, failed/denied outcomes, and pure observability.
 
 ## Supervision and failure ownership (owner ruling R1)
 

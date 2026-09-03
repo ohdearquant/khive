@@ -125,6 +125,21 @@ pub enum AuditTerminalReason {
     /// because a row counted here may still commit, unlike one refused
     /// before enqueue.
     AdmissionDeadlineExpired,
+    /// Reached only through [`AuditBatch::submit_until_resolved`]: the row's
+    /// [`Self::AdmissionDeadlineExpired`] wait had already elapsed, and this
+    /// caller's own `AuditBatchConfig::resolution_deadline` then also
+    /// elapsed still waiting for the row's real generation outcome. The
+    /// caller reaches this only after its domain effect has already
+    /// committed, so the effect is never retried and the row is never
+    /// re-enqueued — but unlike an ordinary commit, the caller now learns
+    /// the effect committed while the audit outcome itself is unresolved.
+    /// Same as [`Self::AdmissionDeadlineExpired`], the row is left exactly
+    /// where the driver holds it (`state.pending`, or already mid-generation)
+    /// for the driver to resolve independently — this reason performs no
+    /// removal. Kept distinct from [`Self::AdmissionDeadlineExpired`] so a
+    /// caller, and diagnostics reading this reason, can tell a merely-slow
+    /// admission wait apart from a resolution wait that gave up entirely.
+    ResolutionDeadlineExpired,
     /// A row shared this generation's id with a previously stored row whose
     /// columns or observation projection did not match exactly.
     IdentityConflict,
@@ -189,16 +204,27 @@ pub struct AuditBatchConfig {
     pub max_commit_attempts: std::num::NonZeroU8,
     pub retry_backoff: Duration,
     pub admission_deadline: Duration,
+    /// Caps how much longer [`AuditBatch::submit_until_resolved`] keeps
+    /// waiting on a row's real generation outcome once `admission_deadline`
+    /// has already elapsed on it. Without this bound a generation stuck on a
+    /// stalled `EventStore::append_events_idempotent` call retains the
+    /// completed write's caller, its request slot, and its audit-lane waiter
+    /// forever, exhausting both request and audit capacity (khive#2331).
+    /// Must be at least `admission_deadline` — validated (debug-only) in
+    /// [`AuditBatch::new`]. Defaults to 6x `admission_deadline`.
+    pub resolution_deadline: Duration,
 }
 
 impl Default for AuditBatchConfig {
     fn default() -> Self {
+        let admission_deadline = Duration::from_secs(5);
         Self {
             max_pending_rows: std::num::NonZeroUsize::new(4096).unwrap(),
             max_rows_per_generation: std::num::NonZeroUsize::new(256).unwrap(),
             max_commit_attempts: std::num::NonZeroU8::new(3).unwrap(),
             retry_backoff: Duration::from_millis(20),
-            admission_deadline: Duration::from_secs(5),
+            admission_deadline,
+            resolution_deadline: admission_deadline * 6,
         }
     }
 }
@@ -463,6 +489,12 @@ pub struct AuditBatch {
 
 impl AuditBatch {
     pub fn new(store: Arc<dyn EventStore>, config: AuditBatchConfig) -> Arc<Self> {
+        debug_assert!(
+            config.resolution_deadline >= config.admission_deadline,
+            "resolution_deadline ({:?}) must be at least admission_deadline ({:?})",
+            config.resolution_deadline,
+            config.admission_deadline
+        );
         Arc::new(Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State::new()),
@@ -498,15 +530,19 @@ impl AuditBatch {
         *self.supervisor.lock() = Some(handle);
     }
 
-    /// Enqueue one row and wait for its real generation outcome even when
-    /// the ordinary admission wait deadline elapses.
+    /// Enqueue one row and keep waiting for its real generation outcome past
+    /// the ordinary admission wait deadline, up to `resolution_deadline`.
     ///
     /// This is the narrow khive#2256 seam for a successful operation whose
     /// domain effect has already committed. Returning
     /// [`AuditTerminalReason::AdmissionDeadlineExpired`] there would report a
     /// false operation failure and invite an unsafe retry while the same
     /// audit row remains enqueued. Pre-enqueue refusal and genuine terminal
-    /// generation failures still return normally.
+    /// generation failures still return normally. The post-admission wait is
+    /// itself bounded by `resolution_deadline`
+    /// ([`AuditTerminalReason::ResolutionDeadlineExpired`]) so a stalled
+    /// store cannot retain this caller, its request slot, and its audit-lane
+    /// waiter forever (khive#2331).
     pub(crate) async fn submit_until_resolved(
         &self,
         row: PreparedAuditRow,
@@ -562,12 +598,26 @@ impl AuditBatch {
                 Err(_elapsed) => tracing::warn!(
                     ?producer,
                     "strict audit obligation remains enqueued after the admission wait deadline; \
-                     waiting for its real terminal outcome"
+                     waiting up to the resolution deadline for its real terminal outcome"
                 ),
             }
-            return match rx.await {
-                Ok(result) => result,
-                Err(_recv_error) => Err(AuditTerminalReason::DriverJoinLost),
+            return match tokio::time::timeout(self.config.resolution_deadline, rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_recv_error)) => Err(AuditTerminalReason::DriverJoinLost),
+                // Same non-removal contract as the `AdmissionDeadlineExpired`
+                // arm below: the row is left exactly where the driver holds
+                // it. The caller's domain effect already committed by the
+                // time it reached this wait, so it is never retried here;
+                // the audit outcome itself is what remains unresolved.
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        ?producer,
+                        "strict audit obligation remains unresolved after the resolution \
+                         deadline; giving up on this caller's wait — the committed effect is \
+                         not retried and the row is not re-enqueued"
+                    );
+                    Err(AuditTerminalReason::ResolutionDeadlineExpired)
+                }
             };
         }
 
