@@ -1015,9 +1015,12 @@ fn v22_upgrades_pre_index_database_for_read_only_open() {
         stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
         finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
         assert_eq!(read_schema_version(&conn).expect("read V21 ledger"), 21);
-        conn.execute("DROP INDEX idx_notes_unread_probe_recipient", [])
+        conn.execute("DROP INDEX idx_notes_unread_probe_recipient_direction", [])
             .expect("simulate pre-index V21 database");
-        assert!(!index_exists(&conn, "idx_notes_unread_probe_recipient"));
+        assert!(!index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
     }
 
     {
@@ -1026,13 +1029,1123 @@ fn v22_upgrades_pre_index_database_for_read_only_open() {
             run_migrations(&mut conn).expect("apply V22 unread probe migration"),
             latest_schema_version()
         );
-        assert!(index_exists(&conn, "idx_notes_unread_probe_recipient"));
+        assert!(index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
     }
 
     let read_only = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .expect("open migrated database read-only");
-    assert!(index_exists(&read_only, "idx_notes_unread_probe_recipient"));
+    assert!(index_exists(
+        &read_only,
+        "idx_notes_unread_probe_recipient_direction"
+    ));
     validate_schema_is_current(&read_only).expect("migrated read-only schema validates");
+}
+
+#[test]
+fn v25_upgrades_direction_blind_recipient_index_for_read_only_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pre-direction-index.db");
+
+    {
+        let mut conn = Connection::open(&path).expect("create pre-direction database");
+        migrate_through(&mut conn, 20);
+        stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+        finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+        assert_eq!(read_schema_version(&conn).expect("read V21 ledger"), 21);
+        conn.execute("DROP INDEX idx_notes_unread_probe_recipient_direction", [])
+            .expect("drop the direction-aware index installed by the V1 baseline");
+        conn.execute_batch(
+            "CREATE INDEX idx_notes_unread_probe_recipient
+                 ON notes(namespace, kind,
+                          ifnull(json_extract(properties, '$.to_actor'), ''),
+                          created_at DESC, id ASC)
+                 WHERE (json_type(properties, '$.read') IS NULL
+                        OR json_type(properties, '$.read') != 'true')
+                   AND deleted_at IS NULL;",
+        )
+        .expect("simulate a pre-V25 recipient index without the direction key");
+        assert!(index_exists(&conn, "idx_notes_unread_probe_recipient"));
+        assert!(!index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
+    }
+
+    {
+        let mut conn = Connection::open(&path).expect("reopen writable database");
+        assert_eq!(
+            run_migrations(&mut conn).expect("apply V25 direction-aware unread probe migration"),
+            latest_schema_version()
+        );
+        assert!(index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
+        assert!(!index_exists(&conn, "idx_notes_unread_probe_recipient"));
+    }
+
+    let read_only = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open migrated database read-only");
+    assert!(index_exists(
+        &read_only,
+        "idx_notes_unread_probe_recipient_direction"
+    ));
+    validate_schema_is_current(&read_only).expect("migrated read-only schema validates");
+}
+
+#[test]
+fn v23_backfills_indexed_record_kinds_and_preserves_unmatched_fts_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pre-record-kind.db");
+
+    {
+        let mut conn = Connection::open(&path).expect("create pre-V23 database");
+        migrate_through(&mut conn, 20);
+        stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+        finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+
+        let v22 = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 22)
+            .expect("V22 migration");
+        let tx = conn.transaction().expect("begin V22 migration");
+        tx.execute_batch(v22.up).expect("apply V22 migration");
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![v22.version, v22.name],
+        )
+        .expect("record V22 migration");
+        tx.commit().expect("commit V22 migration");
+        assert_eq!(read_schema_version(&conn).expect("read V22 ledger"), 22);
+        assert!(!column_exists(&conn, "fts_notes", "record_kind"));
+
+        conn.execute(
+            "INSERT INTO notes \
+             (id, namespace, kind, status, content, created_at, updated_at) \
+             VALUES ('memory-id', 'local', 'memory', 'active', 'common recall token', 1, 1)",
+            [],
+        )
+        .expect("insert memory note");
+        conn.execute(
+            "INSERT INTO notes \
+             (id, namespace, kind, status, content, created_at, updated_at) \
+             VALUES ('message-id', 'local', 'message', 'active', 'common recall token', 1, 1)",
+            [],
+        )
+        .expect("insert message note");
+        conn.execute(
+            "INSERT INTO notes \
+             (id, namespace, kind, status, content, created_at, updated_at, deleted_at) \
+             VALUES ('deleted-memory-id', 'local', 'memory', 'deleted', \
+                     'common recall token', 1, 2, 2)",
+            [],
+        )
+        .expect("insert soft-deleted memory note");
+        conn.execute(
+            "INSERT INTO entities \
+             (id, namespace, kind, name, tags, created_at, updated_at) \
+             VALUES ('concept-id', 'local', 'concept', 'Common concept', '[]', 1, 1)",
+            [],
+        )
+        .expect("insert concept entity");
+
+        let insert_legacy_fts = |table: &str, id: &str, body: &str| {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} \
+                     (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
+                     VALUES (?1, ?2, '', ?3, '[]', 'local', NULL, 1)"
+                ),
+                rusqlite::params![
+                    id,
+                    if table == "fts_notes" {
+                        "note"
+                    } else {
+                        "entity"
+                    },
+                    body
+                ],
+            )
+            .expect("insert legacy FTS row");
+        };
+        insert_legacy_fts("fts_notes", "memory-id", "common recall token");
+        insert_legacy_fts("fts_notes", "message-id", "common recall token");
+        insert_legacy_fts("fts_notes", "deleted-memory-id", "common recall token");
+        insert_legacy_fts("fts_notes", "stale-id", "common recall token");
+        insert_legacy_fts("fts_entities", "concept-id", "common concept token");
+
+        // This test is specifically about V23's own preservation behavior
+        // (every prior FTS row survives, classified or not), so it stops at
+        // V23 explicitly rather than running the full chain: V24 introduces
+        // its own orphan sweep that would remove `stale-id` (see
+        // `v24_rowid_map_backfills_dedups_and_sweeps_orphans` below), which
+        // would make this test's "preserves every row" assertion false for a
+        // reason that has nothing to do with V23.
+        let v23 = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 23)
+            .expect("V23 migration");
+        let tx = conn.transaction().expect("begin V23 migration");
+        tx.execute_batch(v23.up).expect("apply V23 migration");
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![v23.version, v23.name],
+        )
+        .expect("record V23 migration");
+        tx.commit().expect("commit V23 migration");
+        assert_eq!(read_schema_version(&conn).expect("read V23 ledger"), 23);
+        assert!(column_exists(&conn, "fts_notes", "record_kind"));
+        assert!(column_exists(&conn, "fts_entities", "record_kind"));
+
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_notes'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rebuilt FTS DDL");
+        assert!(table_sql.contains("record_kind"), "{table_sql}");
+        assert!(
+            !table_sql.contains("record_kind UNINDEXED"),
+            "record_kind must participate in the FTS index: {table_sql}"
+        );
+
+        let rows = conn
+            .prepare(
+                "SELECT subject_id, record_kind FROM fts_notes \
+                 ORDER BY subject_id",
+            )
+            .expect("prepare backfill read")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query backfilled rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect backfilled rows");
+        assert_eq!(
+            rows,
+            vec![
+                ("deleted-memory-id".to_string(), String::new()),
+                ("memory-id".to_string(), "memory".to_string()),
+                ("message-id".to_string(), "message".to_string()),
+                ("stale-id".to_string(), String::new()),
+            ],
+            "V23 must preserve every prior FTS row while classifying live records"
+        );
+        let memory_matches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_notes \
+                 WHERE fts_notes MATCH 'record_kind : \"memory\" AND common'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query indexed memory classifier");
+        assert_eq!(memory_matches, 1);
+        let entity_kind: String = conn
+            .query_row(
+                "SELECT record_kind FROM fts_entities WHERE subject_id = 'concept-id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read entity classifier");
+        assert_eq!(entity_kind, "concept");
+    }
+
+    // Deliberately not `validate_schema_is_current`: this fixture stops at
+    // V23 on purpose (see the comment above the V23 application), so V24 is
+    // still pending.
+    let read_only = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open V23 database read-only");
+    assert_eq!(
+        read_schema_version(&read_only).expect("read V23 ledger read-only"),
+        23
+    );
+}
+
+/// V24: the sidecar rowid map must end up covering every surviving FTS row
+/// exactly once, legacy duplicates must collapse to the highest (most
+/// recent) rowid, orphaned rows (no backing `notes`/`entities` record at all)
+/// must be gone, and a soft-deleted-but-still-present note's FTS row must
+/// survive untouched (soft delete is a view-layer filter, not a data-layer
+/// deletion — see `crates/khive-db/sql/024-fts-rowid-map.sql`'s header).
+#[test]
+fn v24_rowid_map_backfills_dedups_and_sweeps_orphans() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    conn.execute(
+        "INSERT INTO notes \
+         (id, namespace, kind, status, content, created_at, updated_at) \
+         VALUES ('memory-id', 'local', 'memory', 'active', 'common recall token', 1, 1)",
+        [],
+    )
+    .expect("insert live memory note");
+    conn.execute(
+        "INSERT INTO notes \
+         (id, namespace, kind, status, content, created_at, updated_at, deleted_at) \
+         VALUES ('deleted-memory-id', 'local', 'memory', 'deleted', \
+                 'common recall token', 1, 2, 2)",
+        [],
+    )
+    .expect("insert soft-deleted memory note (still present in `notes`)");
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, name, tags, created_at, updated_at) \
+         VALUES ('concept-id', 'local', 'concept', 'Common concept', '[]', 1, 1)",
+        [],
+    )
+    .expect("insert live concept entity");
+
+    // `memory-id` has TWO legacy FTS rows at different rowids — a pre-atomic
+    // upsert race that left both a stale and a fresh copy behind. Rowid 200
+    // is the later (correct) one and must be the survivor.
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (100, 'memory-id', 'note', '', 'stale duplicate body', '[]', 'local', NULL, 1, 'memory')",
+        [],
+    )
+    .expect("insert stale duplicate fts_notes row");
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (200, 'memory-id', 'note', '', 'fresh body', '[]', 'local', NULL, 2, 'memory')",
+        [],
+    )
+    .expect("insert fresh fts_notes row for the same subject");
+    // A soft-deleted note's FTS row: still backed by a real `notes` row, so
+    // the sweep must NOT remove it.
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (300, 'deleted-memory-id', 'note', '', 'soft deleted body', '[]', 'local', NULL, 2, '')",
+        [],
+    )
+    .expect("insert fts_notes row for soft-deleted note");
+    // A pure orphan: no `notes` row named `stale-id` exists at all.
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (400, 'stale-id', 'note', '', 'orphan body', '[]', 'local', NULL, 2, '')",
+        [],
+    )
+    .expect("insert orphaned fts_notes row");
+    conn.execute(
+        "INSERT INTO fts_entities \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (500, 'concept-id', 'entity', 'Common concept', 'Common concept', '[]', 'local', NULL, 1, 'concept')",
+        [],
+    )
+    .expect("insert live fts_entities row");
+    // A pure orphan on the entity side too.
+    conn.execute(
+        "INSERT INTO fts_entities \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (600, 'stale-entity-id', 'entity', 'Gone', 'Gone', '[]', 'local', NULL, 1, 'concept')",
+        [],
+    )
+    .expect("insert orphaned fts_entities row");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        latest_schema_version()
+    );
+
+    // -- fts_notes: duplicates collapsed, orphan gone, live rows kept. --
+    let mut note_rows: Vec<(i64, String)> = conn
+        .prepare("SELECT rowid, subject_id FROM fts_notes ORDER BY rowid")
+        .expect("prepare fts_notes read")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query fts_notes rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect fts_notes rows");
+    note_rows.sort();
+    assert_eq!(
+        note_rows,
+        vec![
+            (200, "memory-id".to_string()),
+            (300, "deleted-memory-id".to_string()),
+        ],
+        "rowid 100 (stale duplicate) and stale-id (pure orphan) must both be swept; \
+         the soft-deleted-but-still-present note's row must survive"
+    );
+
+    // -- fts_entities: orphan gone, live row kept. --
+    let entity_rows: Vec<String> = conn
+        .prepare("SELECT subject_id FROM fts_entities ORDER BY subject_id")
+        .expect("prepare fts_entities read")
+        .query_map([], |row| row.get(0))
+        .expect("query fts_entities rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect fts_entities rows");
+    assert_eq!(entity_rows, vec!["concept-id".to_string()]);
+
+    // -- The map covers every surviving row exactly once, at its own rowid. --
+    for (table, map) in [
+        ("fts_notes", "fts_notes_rowids"),
+        ("fts_entities", "fts_entities_rowids"),
+    ] {
+        let fts_count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count fts rows");
+        let map_count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {map}"), [], |row| row.get(0))
+            .expect("count map rows");
+        assert_eq!(fts_count, map_count, "{table}/{map} row-count parity");
+
+        let mismatched: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} AS t \
+                     LEFT JOIN {map} AS m ON m.rowid = t.rowid \
+                     WHERE m.rowid IS NULL"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("count fts rows missing a map entry");
+        assert_eq!(mismatched, 0, "every {table} row must have a {map} entry");
+    }
+
+    // The map's own row for `memory-id` must point at the surviving rowid.
+    let mapped_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes_rowids WHERE namespace = 'local' AND subject_id = 'memory-id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read memory-id map entry");
+    assert_eq!(mapped_rowid, 200);
+}
+
+/// A legacy FTS row with NULL `namespace`/
+/// `subject_id` (permitted — both are UNINDEXED FTS5 columns) cannot be
+/// attributed to a (namespace, subject_id) key at all. It must survive V24
+/// completely unmapped: neither backfilled into the map (impossible — the
+/// map's columns are NOT NULL) nor swept by either sweep as if it were an
+/// unmapped duplicate or an orphan.
+#[test]
+fn v24_null_key_fts_row_survives_unmapped() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (900, NULL, 'note', '', 'legacy null-key body', '[]', NULL, NULL, 1, '')",
+        [],
+    )
+    .expect("insert legacy NULL-key fts_notes row");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        latest_schema_version()
+    );
+
+    let still_present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_notes WHERE rowid = 900",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count NULL-key fts_notes row");
+    assert_eq!(
+        still_present, 1,
+        "a NULL-key FTS row must survive V24 unmapped, not be swept by either sweep"
+    );
+
+    let mapped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_notes_rowids WHERE rowid = 900",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count map rows at rowid 900");
+    assert_eq!(
+        mapped, 0,
+        "a NULL-key row can never be mapped (its key cannot be attributed)"
+    );
+}
+
+/// The orphan sweep's `NOT EXISTS` predicate must
+/// stay NULL-safe (a NULL `entities.id`/`notes.id` row must not silence the
+/// sweep of a genuine orphan the way the old `subject_id NOT IN (...)` form
+/// did) and namespace-scoped (a subject that exists only in a DIFFERENT
+/// namespace is still an orphan of this namespace's row).
+#[test]
+fn v24_orphan_sweep_is_null_safe_and_namespace_scoped() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    // A NULL `id` in the backing table must not suppress the sweep of a
+    // real orphan. `entities.id` carries no explicit NOT NULL (only the
+    // list-cursor trigger's own `entities_seq.entity_id` requires one), so
+    // drop that trigger for this one insert — it is irrelevant to what V24
+    // checks and would otherwise make this legitimate (if unusual) row
+    // impossible to construct.
+    conn.execute("DROP TRIGGER IF EXISTS assign_entity_list_seq", [])
+        .expect("drop list-cursor trigger for the NULL-id fixture insert");
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, tags, created_at, updated_at) \
+         VALUES (NULL, 'local', 'concept', 'null-id row', '[]', 1, 1)",
+        [],
+    )
+    .expect("insert entities row with NULL id");
+    conn.execute(
+        "INSERT INTO fts_entities \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (700, 'pure-orphan-id', 'entity', 'Gone', 'Gone', '[]', 'local', NULL, 1, 'concept')",
+        [],
+    )
+    .expect("insert pure orphan fts_entities row");
+
+    // A subject that exists, but only in a DIFFERENT namespace, must still
+    // count as an orphan of this namespace's row.
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, tags, created_at, updated_at) \
+         VALUES ('cross-ns-id', 'other_ns', 'concept', 'other namespace concept', '[]', 1, 1)",
+        [],
+    )
+    .expect("insert entities row in a different namespace");
+    conn.execute(
+        "INSERT INTO fts_entities \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (800, 'cross-ns-id', 'entity', 'Wrong namespace', 'Wrong namespace', '[]', 'local', NULL, 1, 'concept')",
+        [],
+    )
+    .expect("insert fts_entities row whose subject exists only in another namespace");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        latest_schema_version()
+    );
+
+    let orphan_survives: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_entities WHERE rowid = 700",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count pure orphan row");
+    assert_eq!(
+        orphan_survives, 0,
+        "a real orphan must be swept even though the backing table has a NULL id row"
+    );
+
+    let cross_ns_survives: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_entities WHERE rowid = 800",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count cross-namespace row");
+    assert_eq!(
+        cross_ns_survives, 0,
+        "a subject existing only in a different namespace must still be swept as an orphan \
+         of this namespace's row"
+    );
+}
+
+/// FTS5 rowid is not a write timestamp — explicit
+/// rowids are legal and V23's replacement-table repopulation carries no
+/// ORDER BY. The backfill must choose the survivor by `updated_at`, with
+/// rowid only as a tie-break, not by rowid alone.
+#[test]
+fn v24_backfill_survivor_is_chosen_by_updated_at_not_rowid() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, status, content, created_at, updated_at) \
+         VALUES ('note-id', 'local', 'memory', 'active', 'content', 1, 1)",
+        [],
+    )
+    .expect("insert live note");
+
+    // Lower rowid, but NEWER updated_at -- the correct, more recent write.
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (100, 'note-id', 'note', '', 'newer body', '[]', 'local', NULL, 500, 'memory')",
+        [],
+    )
+    .expect("insert newer-but-lower-rowid fts_notes row");
+    // Higher rowid, but OLDER updated_at -- a stale write that landed at a
+    // later rowid.
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (200, 'note-id', 'note', '', 'older body', '[]', 'local', NULL, 100, 'memory')",
+        [],
+    )
+    .expect("insert older-but-higher-rowid fts_notes row");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        latest_schema_version()
+    );
+
+    let surviving_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes WHERE subject_id = 'note-id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read surviving fts_notes row for note-id");
+    assert_eq!(
+        surviving_rowid, 100,
+        "the newer document (by updated_at) must survive even though its rowid is lower"
+    );
+
+    let mapped_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes_rowids WHERE namespace = 'local' AND subject_id = 'note-id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read note-id map entry");
+    assert_eq!(mapped_rowid, 100);
+}
+
+/// `ORDER BY updated_at ASC, rowid ASC` feeding `INSERT OR REPLACE` means an
+/// exact `updated_at` tie is broken by rowid: the higher rowid is processed
+/// last and wins the map entry. Reversing or dropping the rowid tie-breaker
+/// would leave `v24_backfill_survivor_is_chosen_by_updated_at_not_rowid`
+/// (unequal timestamps) green while changing this specified behavior.
+#[test]
+fn v24_backfill_survivor_on_equal_updated_at_is_the_higher_rowid() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, status, content, created_at, updated_at) \
+         VALUES ('note-id', 'local', 'memory', 'active', 'content', 1, 1)",
+        [],
+    )
+    .expect("insert live note");
+
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (100, 'note-id', 'note', '', 'lower rowid body', '[]', 'local', NULL, 500, 'memory')",
+        [],
+    )
+    .expect("insert lower-rowid fts_notes row");
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (200, 'note-id', 'note', '', 'higher rowid body', '[]', 'local', NULL, 500, 'memory')",
+        [],
+    )
+    .expect("insert higher-rowid fts_notes row with the SAME updated_at");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        latest_schema_version()
+    );
+
+    let surviving_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes WHERE subject_id = 'note-id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read surviving fts_notes row for note-id");
+    assert_eq!(
+        surviving_rowid, 200,
+        "an exact updated_at tie must be broken toward the higher rowid"
+    );
+
+    let mapped_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes_rowids WHERE namespace = 'local' AND subject_id = 'note-id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read note-id map entry");
+    assert_eq!(mapped_rowid, 200);
+}
+
+/// Migration 024 writes a durable completion marker for each map's own
+/// state sidecar in the same transaction as its backfill, so a migrated
+/// database's runtime `ensure_fts_rowid_map_backfilled` short-circuit never
+/// re-scans `fts_entities`/`fts_notes`.
+#[test]
+fn v24_leaves_both_backfill_markers_present() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        latest_schema_version()
+    );
+
+    for state in ["fts_entities_rowids_state", "fts_notes_rowids_state"] {
+        let marked: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM {state} WHERE key = 'backfill' AND value = 'complete')"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| panic!("read {state} marker: {e}"));
+        assert!(
+            marked,
+            "{state} must carry a complete backfill marker after V24"
+        );
+    }
+}
+
+/// A map row that already existed at V23 (the map's own DDL is `CREATE
+/// TABLE IF NOT EXISTS`, so a pre-created copy survives V24's own `CREATE
+/// TABLE IF NOT EXISTS` untouched) pointing at a rowid under the WRONG key
+/// must be removed by V24's map-cleanup statements, not merely left in place
+/// alongside the correct entry the backfill inserts. Reproduces a database
+/// that somehow already carries a rowid-map (e.g. a partially-applied
+/// migration from an interrupted run) with one stale, wrong-key row.
+#[test]
+fn v24_wrong_key_map_row_removed_before_marker() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 23);
+
+    conn.execute(
+        "INSERT INTO notes \
+         (id, namespace, kind, status, content, created_at, updated_at) \
+         VALUES ('B', 'local', 'memory', 'active', 'doc b', 1, 1)",
+        [],
+    )
+    .expect("insert backing note for B, so sweep 2 does not treat B as an orphan");
+
+    // Pre-create the map table exactly like V24's own `CREATE TABLE IF NOT
+    // EXISTS` does, then seed a wrong-key row before V24 runs at all.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS fts_notes_rowids ( \
+             namespace  TEXT NOT NULL, \
+             subject_id TEXT NOT NULL, \
+             rowid      INTEGER NOT NULL, \
+             PRIMARY KEY (namespace, subject_id) \
+         ) WITHOUT ROWID;",
+    )
+    .expect("pre-create the map table before V24 runs");
+    conn.execute(
+        "INSERT INTO fts_notes_rowids (namespace, subject_id, rowid) VALUES ('local', 'C', 30)",
+        [],
+    )
+    .expect("seed a stale wrong-key map row pointing at B's rowid");
+    conn.execute(
+        "INSERT INTO fts_notes \
+         (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+         VALUES (30, 'B', 'note', '', 'doc b', '[]', 'local', NULL, 1, 'memory')",
+        [],
+    )
+    .expect("insert B's live fts row at rowid 30");
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V24 rowid-map migration"),
+        latest_schema_version()
+    );
+
+    let c_still_mapped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_notes_rowids WHERE subject_id = 'C'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count C's map rows");
+    assert_eq!(
+        c_still_mapped, 0,
+        "the pre-existing wrong-key map row for C must be removed by V24, not left \
+         alongside the correct entry for B"
+    );
+
+    let b_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM fts_notes_rowids WHERE namespace = 'local' AND subject_id = 'B'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read B's own map entry");
+    assert_eq!(b_rowid, 30);
+
+    let marked: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM fts_notes_rowids_state \
+             WHERE key = 'backfill' AND value = 'complete')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read backfill marker");
+    assert!(
+        marked,
+        "the completion marker must still be written once the wrong-key row is cleaned up"
+    );
+}
+
+/// Migration 024's reconciliation and `ensure_fts_rowid_map_backfilled`'s
+/// runtime reconciliation (`crates/khive-db/src/backend.rs`) are two
+/// independent implementations of the same invariant, sharing no SQL text.
+/// Seeds the SAME malformed legacy state -- a wrong-key map row, a
+/// duplicate `(namespace, subject_id)` pair at two rowids, and an
+/// unattributable NULL-key row -- into two databases, drives one through
+/// migration 024 (on `fts_notes`, with backing `notes` rows for every live
+/// key so the migration's own entities/notes orphan sweep is a no-op and
+/// does not diverge from the runtime path, which has no such sweep) and the
+/// other through the runtime backfill (an arbitrary `table_key`, with the
+/// map table pre-created and the marker cleared), and asserts the two
+/// converge on the same set of surviving FTS rows and the same set of map
+/// rows.
+#[test]
+fn v24_migration_and_runtime_backfill_reconcile_identical_malformed_state() {
+    // -- Path 1: migration 024, via `fts_notes` with a real `notes` backing table. --
+    let mut migrated = open_memory();
+    migrate_through(&mut migrated, 23);
+    for id in ["A", "B"] {
+        migrated
+            .execute(
+                &format!(
+                    "INSERT INTO notes \
+                     (id, namespace, kind, status, content, created_at, updated_at) \
+                     VALUES ('{id}', 'local', 'memory', 'active', 'doc {id}', 1, 1)"
+                ),
+                [],
+            )
+            .unwrap_or_else(|e| panic!("insert backing note {id}: {e}"));
+    }
+    migrated
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS fts_notes_rowids ( \
+                 namespace  TEXT NOT NULL, \
+                 subject_id TEXT NOT NULL, \
+                 rowid      INTEGER NOT NULL, \
+                 PRIMARY KEY (namespace, subject_id) \
+             ) WITHOUT ROWID;",
+        )
+        .expect("pre-create the map table before V24 runs");
+    seed_malformed_legacy_fts_state(&migrated, "fts_notes", "fts_notes_rowids");
+    assert_eq!(
+        run_migrations(&mut migrated).expect("apply V24 rowid-map migration"),
+        latest_schema_version()
+    );
+
+    // -- Path 2: the runtime backfill, via an arbitrary table_key that never
+    // goes through the migration system at all. --
+    let backend = crate::backend::StorageBackend::memory().expect("open in-memory backend");
+    let table_key = "state_parity_runtime";
+    let table = format!("fts_{table_key}");
+    let map = format!("{table}_rowids");
+    let state = format!("{map}_state");
+    // Establishes the schema; the table is empty so the marker is left
+    // deliberately unwritten (see `ensure_fts_rowid_map_backfilled`'s doc).
+    let _ = backend.text(table_key).unwrap();
+    {
+        let writer = backend.pool().writer().unwrap();
+        writer.conn().execute_batch("BEGIN").unwrap();
+        seed_malformed_legacy_fts_state(writer.conn(), &table, &map);
+        writer
+            .conn()
+            .execute(&format!("DELETE FROM {state} WHERE key = 'backfill'"), [])
+            .expect("clear the marker the empty-table open above did not write anyway");
+        writer.conn().execute_batch("COMMIT").unwrap();
+    }
+    // Triggers the real runtime reconciliation.
+    let _ = backend.text(table_key).unwrap();
+
+    let migrated_fts: Vec<(i64, String, String, i64)> = migrated
+        .prepare("SELECT rowid, namespace, subject_id, updated_at FROM fts_notes ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let runtime_fts: Vec<(i64, String, String, i64)> = {
+        let writer = backend.pool().writer().unwrap();
+        let rows = writer
+            .conn()
+            .prepare(&format!(
+                "SELECT rowid, namespace, subject_id, updated_at FROM {table} ORDER BY rowid"
+            ))
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(
+        migrated_fts, runtime_fts,
+        "migration 024 and the runtime backfill must reconcile the same malformed legacy \
+         state to the identical set of surviving FTS rows"
+    );
+
+    let migrated_map: Vec<(String, String, i64)> = migrated
+        .prepare("SELECT namespace, subject_id, rowid FROM fts_notes_rowids ORDER BY subject_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let runtime_map: Vec<(String, String, i64)> = {
+        let writer = backend.pool().writer().unwrap();
+        let rows = writer
+            .conn()
+            .prepare(&format!(
+                "SELECT namespace, subject_id, rowid FROM {map} ORDER BY subject_id"
+            ))
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(
+        migrated_map, runtime_map,
+        "migration 024 and the runtime backfill must reconcile the same malformed legacy \
+         state to the identical set of map rows"
+    );
+}
+
+/// Seeds the same malformed legacy state into `fts_table`/`map_table`:
+/// duplicate `(local, "A")` at rowid 10 (older, must lose the survivor
+/// race) and rowid 20 (newer, must survive); a single `(local, "B")` row at
+/// rowid 30; a pre-existing wrong-key map row `(local, "C", 30)` stealing
+/// B's rowid; and an unattributable NULL-key row at rowid 40. Shared by
+/// [`v24_migration_and_runtime_backfill_reconcile_identical_malformed_state`]
+/// so both paths start from byte-identical input.
+fn seed_malformed_legacy_fts_state(conn: &Connection, fts_table: &str, map_table: &str) {
+    conn.execute(
+        &format!(
+            "INSERT INTO {fts_table} \
+             (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, \
+              record_kind) \
+             VALUES (10, 'A', 'note', '', 'older dup', '[]', 'local', NULL, 1, 'memory')"
+        ),
+        [],
+    )
+    .expect("insert A's older/losing duplicate");
+    conn.execute(
+        &format!(
+            "INSERT INTO {fts_table} \
+             (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, \
+              record_kind) \
+             VALUES (20, 'A', 'note', '', 'newer dup', '[]', 'local', NULL, 5, 'memory')"
+        ),
+        [],
+    )
+    .expect("insert A's newer/surviving duplicate");
+    conn.execute(
+        &format!(
+            "INSERT INTO {fts_table} \
+             (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, \
+              record_kind) \
+             VALUES (30, 'B', 'note', '', 'doc b', '[]', 'local', NULL, 2, 'memory')"
+        ),
+        [],
+    )
+    .expect("insert B's single live row");
+    conn.execute(
+        &format!(
+            "INSERT INTO {fts_table} \
+             (rowid, subject_id, kind, title, body, tags, namespace, metadata, updated_at, \
+              record_kind) \
+             VALUES (40, NULL, 'note', '', 'legacy null-key body', '[]', NULL, NULL, 3, '')"
+        ),
+        [],
+    )
+    .expect("insert the unattributable NULL-key row");
+    conn.execute(
+        &format!(
+            "INSERT INTO {map_table} (namespace, subject_id, rowid) VALUES ('local', 'C', 30)"
+        ),
+        [],
+    )
+    .expect("seed the stale wrong-key map row stealing B's rowid");
+}
+
+// ── V26: knowledge FTS repair tests ──────────────────────────────────────────
+
+#[test]
+fn v26_repairs_knowledge_fts_and_makes_atom_lifecycle_symmetric() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+    finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+
+    let v22 = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 22)
+        .expect("V22 migration registered");
+    let tx = conn.transaction().expect("begin V22 setup transaction");
+    tx.execute_batch(v22.up).expect("apply V22 migration body");
+    tx.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+        rusqlite::params![v22.version, v22.name],
+    )
+    .expect("record V22 migration");
+    tx.commit().expect("commit V22 setup");
+
+    conn.execute_batch(
+        "INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at) \
+             VALUES ('soft-hard', 'local', 'soft-hard', 'Soft Hard', \
+                     'soft deletion followed by a permanent deletion', 1, 1); \
+         INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at, deleted_at) \
+             VALUES ('born-deleted', 'local', 'born-deleted', 'Born Deleted', \
+                     'this atom never entered the historical FTS index', 1, 1, 7); \
+         INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at) \
+             VALUES ('section-parent', 'local', 'section-parent', 'Section Parent', \
+                     'parent for the section index repair regression', 1, 1); \
+         INSERT INTO knowledge_atoms \
+             (id, namespace, slug, name, content, created_at, updated_at, deleted_at) \
+             VALUES ('resurrect', 'local', 'resurrect', 'Resurrect', \
+                     'a deleted atom that later returns to the live projection', 1, 1, 8); \
+         INSERT INTO knowledge_sections \
+             (id, atom_id, namespace, section_type, heading, content, content_hash, \
+              created_at, updated_at) \
+             VALUES ('section-1', 'section-parent', 'local', 'overview', 'Overview', \
+                     'the original section body indexed before historical drift', 'hash-1', \
+                     1, 1); \
+         UPDATE knowledge_atoms SET deleted_at = 9 WHERE id = 'soft-hard';",
+    )
+    .expect("seed pre-V26 knowledge rows");
+
+    // Emulate a historical base-table write that bypassed the section trigger.
+    // V2 restored the narrow trigger but never rebuilt rows already divergent.
+    conn.execute("DROP TRIGGER fts_sections_au", [])
+        .expect("temporarily remove section update trigger");
+    conn.execute(
+        "UPDATE knowledge_sections SET content = 'the revised section body that the stale index never observed' \
+         WHERE id = 'section-1'",
+        [],
+    )
+    .expect("diverge the section external-content row");
+    let v2 = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 2)
+        .expect("V2 migration registered");
+    conn.execute_batch(v2.up)
+        .expect("restore the historical narrow trigger");
+
+    assert!(
+        conn.execute(
+            "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",
+            [],
+        )
+        .is_err(),
+        "the old content object includes tombstones the index deliberately omits"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO fts_sections(fts_sections, rank) VALUES('integrity-check', 1)",
+            [],
+        )
+        .is_err(),
+        "the deliberately stale section index must fail rank-1 integrity"
+    );
+
+    assert_eq!(
+        run_migrations(&mut conn).expect("apply V26 knowledge FTS repair"),
+        latest_schema_version()
+    );
+    conn.execute(
+        "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("atom FTS must match the live-row content view after V26");
+    conn.execute(
+        "INSERT INTO fts_sections(fts_sections, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("section FTS must be rebuilt after V26");
+
+    let content_ddl: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_knowledge'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read repaired FTS DDL");
+    assert!(content_ddl.contains("content=knowledge_atoms_fts_content"));
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM knowledge_atoms_fts_content \
+             WHERE id IN ('soft-hard', 'born-deleted')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0,
+        "the external-content view must expose live atoms only"
+    );
+
+    conn.execute("DELETE FROM knowledge_atoms WHERE id = 'soft-hard'", [])
+        .expect("hard delete after soft delete must no longer touch a missing FTS row");
+    conn.execute("DELETE FROM knowledge_atoms WHERE id = 'born-deleted'", [])
+        .expect("hard delete of a never-indexed atom must be an FTS no-op");
+    conn.execute(
+        "UPDATE knowledge_atoms SET deleted_at = NULL WHERE id = 'resurrect'",
+        [],
+    )
+    .expect("resurrection must insert the atom into FTS");
+    conn.execute(
+        "UPDATE knowledge_atoms \
+         SET content = 'the resurrected atom now has revised searchable content' \
+         WHERE id = 'resurrect'",
+        [],
+    )
+    .expect("live text update must replace the FTS document");
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM fts_knowledge WHERE fts_knowledge MATCH 'searchable'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    conn.execute(
+        "UPDATE knowledge_atoms SET deleted_at = 10 WHERE id = 'resurrect'",
+        [],
+    )
+    .expect("second soft delete must remove the live FTS row once");
+    conn.execute("DELETE FROM knowledge_atoms WHERE id = 'resurrect'", [])
+        .expect("hard delete after resurrection and re-tombstone must be safe");
+    conn.execute("DELETE FROM knowledge_sections WHERE id = 'section-1'", [])
+        .expect("rebuilt section index must support hard delete");
+
+    conn.execute(
+        "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("atom FTS must remain consistent across lifecycle transitions");
+    conn.execute(
+        "INSERT INTO fts_sections(fts_sections, rank) VALUES('integrity-check', 1)",
+        [],
+    )
+    .expect("section FTS must remain consistent after hard delete");
 }
 
 // ── V5: external_id unique index tests ──────────────────────────────────────

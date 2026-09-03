@@ -66,8 +66,7 @@ impl EventStore for FakeStore {
         Ok(BatchWriteSummary {
             attempted: n,
             affected: n,
-            failed: 0,
-            first_error: String::new(),
+            ..BatchWriteSummary::default()
         })
     }
     async fn get_event(&self, id: uuid::Uuid) -> StorageResult<Option<Event>> {
@@ -102,7 +101,12 @@ impl EventStore for FakeStore {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_next.load(Ordering::SeqCst) > 0 {
             self.fail_next.fetch_sub(1, Ordering::SeqCst);
-            return Err(StorageError::WriterTaskBusy { timeout_ms: 1 });
+            return Err(StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source: Box::new(StorageError::Internal(
+                    "simulated operation error after proven rollback".into(),
+                )),
+            });
         }
         if self.fail_pool_next.load(Ordering::SeqCst) > 0 {
             self.fail_pool_next.fetch_sub(1, Ordering::SeqCst);
@@ -312,7 +316,7 @@ async fn d1_retry_table_uses_typed_request_state() {
     assert_eq!(
         store.calls.load(Ordering::SeqCst),
         2,
-        "one failure then one successful retry"
+        "a proven rollback makes the idempotent batch replay effect-safe even when the source error is not independently transient"
     );
 }
 

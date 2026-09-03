@@ -157,6 +157,27 @@ async fn list_empty_pages_keep_structural_keys_in_agent_mode() -> anyhow::Result
     Ok(())
 }
 
+/// Keyset cursor pages from `knowledge.list(after=…)` keep their completion
+/// signals under the default Agent presentation: an empty `results` page and
+/// `next_after: null` are how a walk terminates (ADR-045 Amendment 4).
+#[tokio::test]
+async fn knowledge_list_empty_cursor_page_keeps_completion_signals_in_agent_mode(
+) -> anyhow::Result<()> {
+    let client = connect_knowledge().await?;
+
+    let page = agent_one(&client, r#"knowledge.list(after="", limit=10)"#).await?;
+    assert_eq!(page["results"], json!([]));
+    assert!(
+        page.get("results").is_some(),
+        "empty cursor page must retain results: {page}"
+    );
+    assert!(
+        page.get("next_after").is_some_and(Value::is_null),
+        "terminal cursor page must retain next_after:null: {page}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServer) {
     use std::os::unix::fs::PermissionsExt;
@@ -211,6 +232,7 @@ async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServe
 /// append beside each canonical result. The same backend still rejects writes.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advisory() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -279,6 +301,7 @@ async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advis
 
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn chmod_read_only_snapshot_default_list_keeps_items_envelope_and_sibling_audit_advisory() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -1902,6 +1925,20 @@ impl khive_types::Pack for ErrorInjectPack {
             params: &[],
         },
         HandlerDef {
+            name: "writer_task_rolled_back",
+            description: "returns an ordinary writer request error after proven rollback",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "writer_task_side_effects_unknown",
+            description: "returns a terminal writer error with ambiguous side effects",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
             name: "storage_admission_timeout",
             description: "returns a typed storage-admission timeout error",
             visibility: Visibility::Verb,
@@ -1969,6 +2006,24 @@ impl PackRuntime for ErrorInjectPack {
         if verb == "writer_task_busy" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 },
+            ));
+        }
+        if verb == "writer_task_rolled_back" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::WriterTaskRequestFailed {
+                    request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                    source: Box::new(khive_storage::StorageError::Pool {
+                        operation: "writer_task_commit".into(),
+                        message: "commit refused".into(),
+                    }),
+                },
+            ));
+        }
+        if verb == "writer_task_side_effects_unknown" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::WriterTaskTerminated {
+                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                },
             ));
         }
         if verb == "storage_admission_timeout" {
@@ -2205,6 +2260,57 @@ async fn writer_task_busy_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
             "retry_after_ms": serde_json::Value::Null,
         }),
         "BEGIN contention must remain distinguishable and safely retryable"
+    );
+
+    Ok(())
+}
+
+/// Request finality and writer-task liveness are independent. A COMMIT error
+/// followed by verified rollback is safe from duplicate effects and keeps the
+/// writer alive; a failed rollback is terminal and ambiguous. Preserve both
+/// facts as structured MCP fields rather than forcing clients to parse text.
+#[tokio::test]
+async fn writer_task_finality_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+
+    let rolled_back = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "writer_task_rolled_back()"}),
+    )
+    .await?;
+    let rolled_back_body: serde_json::Value = serde_json::from_str(&first_text(&rolled_back))?;
+    assert_eq!(
+        rolled_back_body["results"][0]["error"],
+        serde_json::json!({
+            "kind": "storage",
+            "code": "writer_task_request_failed",
+            "stage": "writer_task_request_failed",
+            "message": "storage: writer task request failed (request_state=transaction_rolled_back): pool failure during writer_task_commit: commit refused",
+            "retryable": true,
+            "request_state": "transaction_rolled_back",
+            "task_terminated": false,
+        })
+    );
+
+    let unknown = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "writer_task_side_effects_unknown()"}),
+    )
+    .await?;
+    let unknown_body: serde_json::Value = serde_json::from_str(&first_text(&unknown))?;
+    assert_eq!(
+        unknown_body["results"][0]["error"],
+        serde_json::json!({
+            "kind": "storage",
+            "code": "writer_task_terminated",
+            "stage": "writer_task_terminated",
+            "message": "storage: writer task terminated (request_state=side_effects_unknown)",
+            "retryable": false,
+            "request_state": "side_effects_unknown",
+            "task_terminated": true,
+        })
     );
 
     Ok(())
@@ -3618,6 +3724,7 @@ async fn subhandler_verbs_are_blocked_at_mcp_boundary() -> anyhow::Result<()> {
 /// when the gate lived in the shared dispatch — every handler had to be
 /// promoted to `Verb` to stay reachable, which is exactly what we are undoing.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
     use khive_mcp::tools::request::RequestParams;
 
@@ -5411,6 +5518,7 @@ async fn brain_feedback_default_agent_response_preserves_full_target_id() -> any
 /// behavior: create → output parses clean; update → output parses clean;
 /// content round-trips byte-identical.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Result<()> {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6041,6 +6149,7 @@ fn compute_config_id_normalizes_absent_and_present_but_empty_git_write_to_same_f
 /// assertion (b) fails (the entity namespace would be `"local"`) and the scoped
 /// list in (c) would be empty.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     use khive_mcp::tools::request::RequestParams;
     use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
@@ -6176,6 +6285,7 @@ fn make_format_server() -> KhiveMcpServer {
 /// ADR-078 §8.2: error envelopes are never passed through auto/table renderers.
 /// ADR-078 §8.4: ok results are rendered per-op.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn format_auto_mixed_ok_error_batch_error_stays_compact() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6236,6 +6346,7 @@ async fn format_auto_mixed_ok_error_batch_error_stays_compact() {
 /// Pins ADR-078 §8.4: a single `format` applies uniformly; `format_per_op`
 /// overrides per position.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn format_per_op_override_selects_format_per_position() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6295,6 +6406,106 @@ async fn format_per_op_override_selects_format_per_position() {
     assert_eq!(body["summary"]["succeeded"], serde_json::json!(2));
 }
 
+/// Agent JSON applies ADR-078 redundancy reduction while Verbose JSON retains
+/// the canonical shape. Chain substitution must continue to read canonical
+/// pre-presentation results under both JSON and auto output.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
+    use khive_mcp::tools::request::RequestParams;
+
+    let server = make_format_server();
+
+    let agent_raw = server
+        .dispatch_request_local(RequestParams {
+            ops: r#"gtd.assign(title="agent-json-dedup", priority="p1", assignee="lambda:test")"#
+                .to_string(),
+            presentation: Some("agent".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("agent/json task creation must succeed");
+    let agent_body: serde_json::Value = serde_json::from_str(&agent_raw).unwrap();
+    let agent_task = &agent_body["results"][0]["result"];
+    for key in ["assignee", "priority", "status"] {
+        assert!(agent_task.get(key).is_some(), "top-level {key} must remain");
+        assert!(
+            agent_task["properties"].get(key).is_none(),
+            "agent/json must not duplicate {key} inside properties: {agent_task}"
+        );
+    }
+
+    let verbose_raw = server
+        .dispatch_request_local(RequestParams {
+            ops:
+                r#"gtd.assign(title="verbose-json-control", priority="p1", assignee="lambda:test")"#
+                    .to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("verbose/json task creation must succeed");
+    let verbose_body: serde_json::Value = serde_json::from_str(&verbose_raw).unwrap();
+    let verbose_task = &verbose_body["results"][0]["result"];
+    for key in ["assignee", "priority", "status"] {
+        assert_eq!(
+            verbose_task.get(key),
+            verbose_task["properties"].get(key),
+            "verbose/json must retain canonical duplicate {key}: {verbose_task}"
+        );
+    }
+
+    let target_raw = server
+        .dispatch_request_local(RequestParams {
+            ops: r#"create(kind="entity", entity_kind="concept", name="AgentJsonChainTarget")"#
+                .to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: Some("json".to_string()),
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("chain target creation must succeed");
+    let target_body: serde_json::Value = serde_json::from_str(&target_raw).unwrap();
+    let target_id = target_body["results"][0]["result"]["id"]
+        .as_str()
+        .expect("target id")
+        .to_string();
+
+    for (format, source_name) in [
+        ("json", "AgentJsonChainSource"),
+        ("auto", "AgentAutoChainSource"),
+    ] {
+        let chain_raw = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(
+                    r#"create(kind="entity", entity_kind="concept", name="{source_name}") | link(source_id=$prev.id, target_id="{target_id}", relation="extends")"#
+                ),
+                presentation: Some("agent".to_string()),
+                presentation_per_op: None,
+                save_to: None,
+                format: Some(format.to_string()),
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("agent/{format} chain request failed: {error}"));
+        let chain_body: serde_json::Value = serde_json::from_str(&chain_raw).unwrap();
+        assert_eq!(chain_body["summary"]["succeeded"], serde_json::json!(2));
+        assert_eq!(chain_body["summary"]["failed"], serde_json::json!(0));
+    }
+}
+
 /// (fmt-3) `presentation_per_op=verbose` pins a verbose op under
 /// `format=auto` must preserve `full_id`, `namespace="local"`, and duplicate
 /// `properties` keys — the redundancy-drop pre-pass must be skipped.
@@ -6304,6 +6515,7 @@ async fn format_per_op_override_selects_format_per_position() {
 /// effective presentation, so `full_id`/`namespace`/duplicate-props could
 /// be stripped even when that specific op was verbose.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6423,6 +6635,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
 /// AlwaysVerbose policy into the format-seam presentation. This is the *implicit
 /// policy* sibling of `presentation_per_op_verbose_preserves_*` (explicit override).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override() {
     use khive_mcp::tools::request::RequestParams;
 
