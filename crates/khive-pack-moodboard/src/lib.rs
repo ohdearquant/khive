@@ -28,6 +28,7 @@ pub use preference_artifact::{
 };
 
 pub(crate) const PACK_NAME: &str = "moodboard";
+pub(crate) const LATTICE_VERSION: &str = "0.9.0";
 
 /// Opt-in Moodboard visual-retrieval and preference-learning pack.
 pub struct MoodboardPack {
@@ -59,5 +60,45 @@ impl MoodboardPack {
 
     pub(crate) fn model_state(&self) -> &VisionModelState {
         &self.model
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LATTICE_VERSION;
+
+    #[test]
+    fn lattice_provenance_version_matches_all_exact_workspace_pins() {
+        let workspace_manifest_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.toml");
+        let manifest_source = match std::fs::read_to_string(workspace_manifest_path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                println!(
+                    "workspace Cargo.toml not found at {workspace_manifest_path} \
+                     (published crate archive does not carry it); skipping the pin check"
+                );
+                return;
+            }
+            Err(error) => {
+                panic!("workspace Cargo.toml at {workspace_manifest_path} is unreadable: {error}")
+            }
+        };
+        let manifest: toml::Value = manifest_source
+            .parse()
+            .expect("workspace Cargo.toml must parse");
+        let dependencies = manifest["workspace"]["dependencies"]
+            .as_table()
+            .expect("workspace.dependencies must be a table");
+
+        for dependency in ["lattice-embed", "lattice-inference", "lattice-fann"] {
+            let pin = match &dependencies[dependency] {
+                toml::Value::String(version) => version.as_str(),
+                toml::Value::Table(specification) => specification["version"]
+                    .as_str()
+                    .expect("lattice dependency table must contain a version"),
+                value => panic!("unexpected {dependency} dependency shape: {value:?}"),
+            };
+            assert_eq!(pin, format!("={LATTICE_VERSION}"), "{dependency}");
+        }
     }
 }

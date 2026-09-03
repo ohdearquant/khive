@@ -34,3 +34,4 @@ khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
 tempfile = { workspace = true }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime", features = ["fault-injection"] }
 lattice-embed = { workspace = true }
+serial_test = { workspace = true }

@@ -722,6 +722,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn schedule_roster_contains_exactly_one_dynamic_component_when_resolved() {
         let (_f, db) = tmp_db();
         let cfg = RuntimeConfig {
@@ -758,6 +759,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn schedule_roster_omits_read_only_assigned_runtime_without_writer_acquisition() {
         let (_f, db) = tmp_db();
         let cfg = RuntimeConfig {
@@ -791,6 +793,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn supervised_schedule_component_heartbeats_and_stops_cooperatively() {
         let (_f, db) = tmp_db();
         let cfg = RuntimeConfig {

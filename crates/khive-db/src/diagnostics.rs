@@ -34,22 +34,18 @@
 //!    `ConnectionPool::open_standalone_writer_untracked`, opened without
 //!    `SQLITE_OPEN_CREATE`. A missing database yields `checkpoint_probe:
 //!    null` plus a `checkpoint_probe_error`, never a freshly created file.
-//! 3. WAL-pin attribution performs only the read-only OS holder census
-//!    (`walpin::census_holders`) and does not inspect the sidecar directory.
-//!    This tree's `khive-db` has no non-destructive reconciliation primitive:
-//!    `walpin::enumerate_live` and `walpin::housekeep_live` both unlink
-//!    entries under their respective cleanup policies. A diagnostic request
-//!    must not be what destroys that forensic evidence, so
-//!    `wal_pin_attribution` deliberately calls neither mutating path.
-//!    Sidecar-to-holder reconciliation (`reporting`/`registered_silent_pids`/
-//!    `sidecar_entries`/`fully_attributed`) is therefore reported empty with
-//!    an explicit `unavailable_reason` rather than fabricated from a
-//!    mutating enumeration. Cleanup-derived counters are omitted entirely,
-//!    so a skipped measurement never looks like measured `0`/`false`.
-//! 4. Graph-edge integrity and FTS structure inspection share one interruptible
-//!    read phase on the guarded standalone connection. The graph side uses
-//!    three scalar SELECTs, exposes the exact pre-V14 duplicate-ID group count
-//!    plus raw live-edge/list-ledger counts, and never repairs or deletes data.
+//! 3. WAL-pin attribution combines the read-only OS holder census with
+//!    `walpin::inspect_live`, a separate bounded sidecar enumerator whose
+//!    purpose flag prohibits every unlink. It applies the same descriptor-
+//!    bound trust and liveness checks as checkpoint attribution, but reports
+//!    stale cleanup candidates rather than consuming them. A complete census
+//!    plus a complete, conclusive sidecar walk can therefore report complete;
+//!    truncation, unknown entries, or holders absent from the sidecar degrade
+//!    explicitly.
+//! 4. Graph-edge integrity uses three scalar SELECTs on the same guarded
+//!    standalone connection. It exposes the exact pre-V14 duplicate-ID group
+//!    count plus raw live-edge/list-ledger counts and never repairs or deletes
+//!    data.
 //! 5. FTS5 segment diagnostics decode each index's documented one-row
 //!    structure record (`%_data.id = 10`). They never run `COUNT(*)` over or
 //!    scan a `%_idx` table, so observing segment health is bounded even when
@@ -65,6 +61,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use khive_storage::error::StorageError;
 use khive_storage::types::StorageResult;
@@ -226,9 +224,9 @@ fn wal_sidecar_path(db_path: &Path) -> PathBuf {
 ///
 /// `status`, `status_reasons`, and the tagged `census` field are the
 /// authoritative wire contract. The older sibling booleans and PID arrays
-/// remain available to Rust callers but are not serialized. This tree's
-/// `khive-db` lacks a read-only sidecar enumeration primitive (see the module
-/// docs), so the sidecar-derived fields below are always empty here.
+/// remain available to Rust callers but are not serialized. Sidecar evidence
+/// is collected through the handle-checked, bounded, non-mutating diagnostics
+/// enumerator and reconciled with the OS holder census.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WalPinAttribution {
     /// Authoritative quality of the complete attribution answer.
@@ -250,32 +248,32 @@ pub struct WalPinAttribution {
     pub census_truncated: bool,
     #[serde(skip_serializing)]
     pub census_is_complete: bool,
-    /// Always empty in this port — see the module docs.
+    /// Live, identity-matched heartbeats found in the sidecar.
     pub reporting: Vec<WalPinHolder>,
-    /// Always empty in this port — see the module docs.
+    /// Live, identity-matched beacons with no over-threshold heartbeat.
     pub registered_silent_pids: Vec<u32>,
-    /// Always empty in this port — see the module docs.
+    /// Sidecar entries whose identity or freshness could not be established.
     pub unknown_pids: Vec<u32>,
-    /// Always empty in this port — see the module docs.
+    /// OS-confirmed holders absent from every sidecar classification.
     pub census_pids_without_attribution: Vec<u32>,
-    /// Always `false` in this port: sidecar reconciliation never ran, so
-    /// completeness can never be claimed.
+    /// Whether both evidence sources completed and every holder was present
+    /// in a conclusive sidecar classification.
     pub fully_attributed: bool,
-    /// Always empty in this port — see the module docs.
+    /// Machine-readable sidecar classifications, ordered by PID and status.
     pub sidecar_entries: Vec<serde_json::Value>,
     /// Present only when this request actually enumerated the sidecar.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sidecar_listing_truncated: Option<bool>,
-    /// Present only when this request actually ran the mutating cleanup pass.
+    /// Number of stale producer temps a housekeeping pass would reap. The
+    /// diagnostic pass itself never performs that cleanup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sidecar_entries_cleanup_would_reap: Option<usize>,
 }
 
 /// Overall quality of the WAL-pin attribution answer.
 ///
-/// The current non-mutating diagnostics path can return `degraded` with a
-/// useful OS census, but cannot claim `complete` while sidecar reconciliation
-/// would require the mutating cleanup enumerator.
+/// A result is `complete` only when both the OS census and read-only sidecar
+/// enumeration completed and every holder has sidecar evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WalPinAttributionStatus {
@@ -320,9 +318,7 @@ pub enum WalPinCensus {
     },
 }
 
-/// One PID's heartbeat as reported to an operator. Retained for shape
-/// compatibility with the reference payload; this port never populates it
-/// (see [`WalPinAttribution`] docs).
+/// One PID's live heartbeat as reported to an operator.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WalPinHolder {
     pub pid: u32,
@@ -359,13 +355,19 @@ impl WalPinAttribution {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn wal_pin_attribution_from_census(census: crate::walpin::CensusResult) -> WalPinAttribution {
-    const SIDECAR_REASON: &str = "sidecar-to-holder reconciliation not available: this tree's \
-        khive-db has no non-destructive sidecar reconciliation primitive; walpin::enumerate_live \
-        and walpin::housekeep_live both perform mutating cleanup, so diagnostics called neither \
-        and collected only the read-only OS holder census below";
+    wal_pin_attribution_without_sidecar(
+        census,
+        "read-only sidecar enumeration did not run for this attribution snapshot".to_string(),
+    )
+}
 
+#[cfg(unix)]
+fn wal_pin_attribution_without_sidecar(
+    census: crate::walpin::CensusResult,
+    sidecar_reason: String,
+) -> WalPinAttribution {
     let census_is_complete = census.is_complete();
     let mut census_holder_pids: Vec<u32> = census.holders.iter().copied().collect();
     census_holder_pids.sort_unstable();
@@ -374,7 +376,7 @@ fn wal_pin_attribution_from_census(census: crate::walpin::CensusResult) -> WalPi
     census_uninspectable_pids.dedup();
     let census_truncated = census.truncated;
 
-    let mut status_reasons = vec![SIDECAR_REASON.to_string()];
+    let mut status_reasons = vec![sidecar_reason];
     let census = if census_is_complete {
         WalPinCensus::Complete {
             holder_pids: census_holder_pids.clone(),
@@ -424,24 +426,278 @@ fn wal_pin_attribution_from_census(census: crate::walpin::CensusResult) -> WalPi
     }
 }
 
+#[cfg(unix)]
+fn wal_pin_attribution_from_evidence(
+    census: crate::walpin::CensusResult,
+    sidecar: crate::walpin::WalpinReport,
+) -> WalPinAttribution {
+    use std::collections::BTreeSet;
+
+    let census_is_complete = census.is_complete();
+    let mut census_holder_pids: Vec<u32> = census.holders.iter().copied().collect();
+    census_holder_pids.sort_unstable();
+    let mut census_uninspectable_pids = census.uninspectable_pids;
+    census_uninspectable_pids.sort_unstable();
+    census_uninspectable_pids.dedup();
+    let census_truncated = census.truncated;
+    let census_carrier = if census_is_complete {
+        WalPinCensus::Complete {
+            holder_pids: census_holder_pids.clone(),
+        }
+    } else {
+        let mut causes = Vec::new();
+        if census_truncated {
+            causes.push("the OS process walk was truncated".to_string());
+        }
+        if !census_uninspectable_pids.is_empty() {
+            causes.push(format!(
+                "{} PID(s) could not be inspected",
+                census_uninspectable_pids.len()
+            ));
+        }
+        let reason = format!(
+            "OS holder census is incomplete: {}; additional database holders cannot be ruled out",
+            causes.join("; ")
+        );
+        WalPinCensus::Incomplete {
+            holder_pids: census_holder_pids.clone(),
+            uninspectable_pids: census_uninspectable_pids.clone(),
+            truncated: census_truncated,
+            reason,
+        }
+    };
+
+    let now_epoch_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let sidecar_listing_truncated = sidecar.sidecar_listing_truncated;
+    let sidecar_entries_cleanup_would_reap = sidecar.cleanup_would_reap;
+    let mut reporting = Vec::new();
+    let mut registered_silent_pids = Vec::new();
+    let mut unknown_pids = Vec::new();
+    let mut sidecar_entries = Vec::new();
+    let mut sidecar_known_pids = BTreeSet::new();
+
+    for entry in sidecar.entries {
+        match entry {
+            crate::walpin::WalpinPidHealth::Reporting(heartbeat) => {
+                let current_oldest_tx_age_secs =
+                    heartbeat.current_oldest_tx_age_secs(now_epoch_secs);
+                let attribution_is_evidence_backed = heartbeat.attribution_is_evidence_backed();
+                sidecar_known_pids.insert(heartbeat.pid);
+                reporting.push(WalPinHolder {
+                    pid: heartbeat.pid,
+                    process_role: heartbeat.process_role.clone(),
+                    current_oldest_tx_age_secs,
+                    oldest_tx_label: heartbeat.oldest_tx_label.clone(),
+                    attribution_is_evidence_backed,
+                });
+                sidecar_entries.push((
+                    heartbeat.pid,
+                    0u8,
+                    serde_json::json!({
+                        "pid": heartbeat.pid,
+                        "status": "reporting",
+                        "process_role": heartbeat.process_role,
+                        "current_oldest_tx_age_secs": current_oldest_tx_age_secs,
+                        "oldest_tx_label": heartbeat.oldest_tx_label,
+                        "attribution_is_evidence_backed": attribution_is_evidence_backed,
+                    }),
+                ));
+            }
+            crate::walpin::WalpinPidHealth::RegisteredSilent { pid } => {
+                sidecar_known_pids.insert(pid);
+                registered_silent_pids.push(pid);
+                sidecar_entries.push((
+                    pid,
+                    1u8,
+                    serde_json::json!({"pid": pid, "status": "registered_silent"}),
+                ));
+            }
+            crate::walpin::WalpinPidHealth::Unknown { pid, reason } => {
+                sidecar_known_pids.insert(pid);
+                unknown_pids.push(pid);
+                sidecar_entries.push((
+                    pid,
+                    2u8,
+                    serde_json::json!({"pid": pid, "status": "unknown", "reason": reason}),
+                ));
+            }
+        }
+    }
+
+    reporting.sort_by_key(|holder| holder.pid);
+    reporting.dedup_by_key(|holder| holder.pid);
+    registered_silent_pids.sort_unstable();
+    registered_silent_pids.dedup();
+    unknown_pids.sort_unstable();
+    unknown_pids.dedup();
+    sidecar_entries.sort_by_key(|(pid, status_rank, _)| (*pid, *status_rank));
+    let sidecar_entries = sidecar_entries
+        .into_iter()
+        .map(|(_, _, entry)| entry)
+        .collect();
+    let census_pids_without_attribution: Vec<u32> = census_holder_pids
+        .iter()
+        .copied()
+        .filter(|pid| !sidecar_known_pids.contains(pid))
+        .collect();
+
+    let mut status_reasons = Vec::new();
+    if let WalPinCensus::Incomplete { reason, .. } = &census_carrier {
+        status_reasons.push(reason.clone());
+    }
+    if sidecar_listing_truncated {
+        status_reasons.push(
+            "read-only sidecar enumeration reached its entry cap; additional entries may exist"
+                .to_string(),
+        );
+    }
+    if !unknown_pids.is_empty() {
+        status_reasons.push(format!(
+            "{} sidecar PID(s) could not be classified conclusively",
+            unknown_pids.len()
+        ));
+    }
+    if !census_pids_without_attribution.is_empty() {
+        status_reasons.push(format!(
+            "{} OS-confirmed holder(s) have no sidecar attribution",
+            census_pids_without_attribution.len()
+        ));
+    }
+
+    let fully_attributed = census_is_complete
+        && !sidecar_listing_truncated
+        && unknown_pids.is_empty()
+        && census_pids_without_attribution.is_empty();
+    let status = if fully_attributed {
+        WalPinAttributionStatus::Complete
+    } else {
+        WalPinAttributionStatus::Degraded
+    };
+    let unavailable_reason = (!fully_attributed).then(|| status_reasons.join("; "));
+
+    WalPinAttribution {
+        status,
+        status_reasons,
+        census: census_carrier,
+        available: fully_attributed,
+        unavailable_reason,
+        census_holder_pids,
+        census_uninspectable_pids,
+        census_truncated,
+        census_is_complete,
+        reporting,
+        registered_silent_pids,
+        unknown_pids,
+        census_pids_without_attribution,
+        fully_attributed,
+        sidecar_entries,
+        sidecar_listing_truncated: Some(sidecar_listing_truncated),
+        sidecar_entries_cleanup_would_reap: Some(sidecar_entries_cleanup_would_reap),
+    }
+}
+
 /// Build the WAL-pin attribution for `db_path`.
 ///
 /// Unix-only: the OS census requires it. Everywhere else this degrades to
 /// `available: false` with a reason rather than failing the whole report.
+/// An operator who has explicitly disabled the sidecar (`KHIVE_WALPIN_SIDECAR`)
+/// also disables this request's sidecar collection, per ADR-091 Amendment 6 —
+/// the census still runs, but there is no sidecar evidence to reconcile it
+/// against.
 #[cfg(unix)]
-pub fn wal_pin_attribution(db_path: &Path, _sweep_interval: Duration) -> WalPinAttribution {
+pub fn wal_pin_attribution(db_path: &Path, sweep_interval: Duration) -> WalPinAttribution {
     use crate::walpin;
 
     let census = match walpin::census_holders(db_path) {
         Ok(c) => c,
         Err(e) => return WalPinAttribution::unavailable(format!("census_holders failed: {e}")),
     };
-    wal_pin_attribution_from_census(census)
+    if !walpin::sidecar_enabled(true) {
+        return wal_pin_attribution_without_sidecar(census, SIDECAR_DISABLED_REASON.to_string());
+    }
+    match walpin::inspect_live(&walpin::sidecar_dir_for(db_path), sweep_interval) {
+        Ok(sidecar) => wal_pin_attribution_from_evidence(census, sidecar),
+        Err(error) => wal_pin_attribution_without_sidecar(
+            census,
+            format!("read-only sidecar enumeration failed: {error}"),
+        ),
+    }
 }
+
+/// Shared with the async collection path in `inspect_file_state_interruptibly`.
+#[cfg(unix)]
+const SIDECAR_DISABLED_REASON: &str =
+    "walpin sidecar is explicitly disabled (KHIVE_WALPIN_SIDECAR); attribution has no sidecar \
+     evidence to reconcile against the OS holder census";
 
 #[cfg(not(unix))]
 pub fn wal_pin_attribution(_db_path: &Path, _sweep_interval: Duration) -> WalPinAttribution {
     WalPinAttribution::unavailable("WAL-pin attribution requires a Unix platform")
+}
+
+/// One typed snapshot of reader route, saturation, and hold-lifecycle signals.
+///
+/// Every field is pool-scoped. Monotonic counters reset only when the
+/// [`ConnectionPool`] is reconstructed; the active value is point-in-time.
+/// Infrastructure standalone opens are kept separate from request traffic so
+/// a boot/schema probe cannot make a hot path look like it churned readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ReaderContentionDiagnostics {
+    /// Configured total reader admission budget shared by pooled readers and
+    /// explicit raw-SQL read transactions.
+    pub reader_admission_capacity: usize,
+    /// Point-in-time permits not held when this snapshot was captured.
+    pub available_reader_admission_slots: usize,
+    /// Successful request-path acquisitions (pooled plus enumerated
+    /// standalone request exceptions; infrastructure excluded).
+    pub reader_acquisitions: u64,
+    /// Successful bounded pooled-reader checkouts.
+    pub pooled_reader_checkouts: u64,
+    /// Successful request-path standalone reader opens. Under ADR-165 Slice
+    /// 2 this is limited to the explicit raw-SQL read-transaction exception.
+    pub standalone_reader_opens: u64,
+    /// Successful standalone opens owned by an enumerated boot/diagnostic
+    /// infrastructure exception.
+    pub infrastructure_standalone_reader_opens: u64,
+    /// Pool-wide reader-admission waits that exhausted `checkout_timeout`
+    /// before work began. Cooperative request cancellation is excluded.
+    pub reader_checkout_timeouts: u64,
+    /// Pooled reader guards live when the snapshot was captured.
+    pub active_pooled_reader_checkouts: u64,
+    /// Highest observed concurrent pooled-reader guard count.
+    pub peak_active_pooled_reader_checkouts: u64,
+    /// Pooled guards that completed return/reset.
+    pub completed_pooled_reader_checkouts: u64,
+    /// Longest completed hold, including return/reset, in microseconds.
+    pub max_completed_reader_hold_micros: u64,
+    /// A disqualified pooled-reader return whose replacement connection then
+    /// also failed to open, permanently shrinking the physical pool by one
+    /// slot below `max_readers`. Non-zero here means the pool has fewer
+    /// physical reader connections than configured.
+    pub reader_replacement_open_failures: u64,
+}
+
+impl ReaderContentionDiagnostics {
+    fn snapshot(pool: &ConnectionPool) -> Self {
+        let reader = pool.reader_acquisition_snapshot();
+        Self {
+            reader_admission_capacity: reader.reader_admission_capacity,
+            available_reader_admission_slots: reader.available_reader_admission_slots,
+            reader_acquisitions: reader.acquisitions,
+            pooled_reader_checkouts: reader.pooled_checkouts,
+            standalone_reader_opens: reader.standalone_opens,
+            infrastructure_standalone_reader_opens: reader.infrastructure_standalone_opens,
+            reader_checkout_timeouts: reader.checkout_timeouts,
+            active_pooled_reader_checkouts: reader.active_pooled_checkouts,
+            peak_active_pooled_reader_checkouts: reader.peak_active_pooled_checkouts,
+            completed_pooled_reader_checkouts: reader.completed_pooled_checkouts,
+            max_completed_reader_hold_micros: reader.max_completed_hold_micros,
+            reader_replacement_open_failures: reader.reader_replacement_open_failures,
+        }
+    }
 }
 
 /// One typed snapshot of writer-contention signals.
@@ -668,7 +924,205 @@ fn graph_edge_integrity(conn: &Connection) -> rusqlite::Result<GraphEdgeIntegrit
     )
 }
 
-/// The full database-integrity, writer-contention, and WAL/checkpoint payload.
+const MAX_DATABASE_SIZE_OBJECTS: usize = 4_096;
+
+/// SQLite b-tree role reported by the size-composition diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseObjectKind {
+    Table,
+    Index,
+    Internal,
+}
+
+/// Operational storage grouping. `mixed_row_and_embedding` is deliberately
+/// separate: SQLite cannot attribute bytes within a table page to one column,
+/// so counting all of `knowledge_sections` as pure vector bytes would be a
+/// false precision claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseStorageClass {
+    RowTable,
+    Index,
+    FullText,
+    Vector,
+    MixedRowAndEmbedding,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatabaseObjectSize {
+    pub name: String,
+    pub owner_table: Option<String>,
+    pub object_kind: DatabaseObjectKind,
+    pub storage_class: DatabaseStorageClass,
+    pub pages: u64,
+    pub bytes: u64,
+}
+
+/// Page-accounted file-size composition from SQLite's read-only `dbstat`
+/// virtual table in aggregate mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatabaseSizeComposition {
+    pub page_size_bytes: u64,
+    pub page_count: u64,
+    pub freelist_pages: u64,
+    pub database_bytes: u64,
+    pub freelist_bytes: u64,
+    pub accounted_bytes: u64,
+    pub unaccounted_bytes: u64,
+    pub row_table_bytes: u64,
+    pub index_bytes: u64,
+    pub full_text_bytes: u64,
+    pub vector_bytes: u64,
+    pub mixed_embedding_bytes: u64,
+    pub internal_bytes: u64,
+    pub objects: Vec<DatabaseObjectSize>,
+    pub objects_truncated: bool,
+    pub objects_omitted: usize,
+}
+
+fn nonnegative_sqlite_integer(column: usize, value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
+}
+
+fn declares_embedding_blob(sql: Option<&str>) -> bool {
+    let Some(sql) = sql else {
+        return false;
+    };
+    let tokens: Vec<_> = sql
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|token| !token.is_empty())
+        .collect();
+    tokens.windows(2).any(|pair| {
+        pair[0].eq_ignore_ascii_case("embedding") && pair[1].eq_ignore_ascii_case("blob")
+    })
+}
+
+fn classify_database_object(
+    name: &str,
+    sqlite_type: &str,
+    sql: Option<&str>,
+) -> (DatabaseObjectKind, DatabaseStorageClass) {
+    let object_kind = match sqlite_type {
+        "table" => DatabaseObjectKind::Table,
+        "index" => DatabaseObjectKind::Index,
+        _ => DatabaseObjectKind::Internal,
+    };
+    let lower_name = name.to_ascii_lowercase();
+    let lower_sql = sql.unwrap_or_default().to_ascii_lowercase();
+    let storage_class = if lower_name.starts_with("fts_") || lower_sql.contains("using fts5") {
+        DatabaseStorageClass::FullText
+    } else if lower_name.starts_with("vec_")
+        || lower_name == "_embedding_models"
+        || lower_sql.contains("using vec0")
+    {
+        DatabaseStorageClass::Vector
+    } else if declares_embedding_blob(sql) {
+        DatabaseStorageClass::MixedRowAndEmbedding
+    } else if object_kind == DatabaseObjectKind::Index {
+        DatabaseStorageClass::Index
+    } else if name.starts_with("sqlite_") || object_kind == DatabaseObjectKind::Internal {
+        DatabaseStorageClass::Internal
+    } else {
+        DatabaseStorageClass::RowTable
+    };
+    (object_kind, storage_class)
+}
+
+fn database_size_composition(conn: &Connection) -> rusqlite::Result<DatabaseSizeComposition> {
+    let page_size = nonnegative_sqlite_integer(
+        0,
+        conn.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))?,
+    )?;
+    let page_count = nonnegative_sqlite_integer(
+        0,
+        conn.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?,
+    )?;
+    let freelist_pages = nonnegative_sqlite_integer(
+        0,
+        conn.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?,
+    )?;
+
+    let mut statement = conn.prepare(
+        "SELECT d.name, COALESCE(s.type, 'internal'), s.tbl_name, s.sql, d.pageno, d.pgsize
+         FROM dbstat AS d
+         LEFT JOIN sqlite_schema AS s ON s.name = d.name
+         WHERE d.aggregate = TRUE
+         ORDER BY d.name",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut objects = Vec::new();
+    let mut objects_omitted = 0usize;
+    let mut accounted_bytes = 0u64;
+    let mut row_table_bytes = 0u64;
+    let mut index_bytes = 0u64;
+    let mut full_text_bytes = 0u64;
+    let mut vector_bytes = 0u64;
+    let mut mixed_embedding_bytes = 0u64;
+    let mut internal_bytes = 0u64;
+
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
+        let sqlite_type: String = row.get(1)?;
+        let owner_table: Option<String> = row.get(2)?;
+        let sql: Option<String> = row.get(3)?;
+        let pages = nonnegative_sqlite_integer(4, row.get(4)?)?;
+        let bytes = nonnegative_sqlite_integer(5, row.get(5)?)?;
+        let (object_kind, storage_class) =
+            classify_database_object(&name, &sqlite_type, sql.as_deref());
+        accounted_bytes = accounted_bytes.saturating_add(bytes);
+        let class_total = match storage_class {
+            DatabaseStorageClass::RowTable => &mut row_table_bytes,
+            DatabaseStorageClass::Index => &mut index_bytes,
+            DatabaseStorageClass::FullText => &mut full_text_bytes,
+            DatabaseStorageClass::Vector => &mut vector_bytes,
+            DatabaseStorageClass::MixedRowAndEmbedding => &mut mixed_embedding_bytes,
+            DatabaseStorageClass::Internal => &mut internal_bytes,
+        };
+        *class_total = class_total.saturating_add(bytes);
+
+        if objects.len() < MAX_DATABASE_SIZE_OBJECTS {
+            objects.push(DatabaseObjectSize {
+                name,
+                owner_table,
+                object_kind,
+                storage_class,
+                pages,
+                bytes,
+            });
+        } else {
+            objects_omitted = objects_omitted.saturating_add(1);
+        }
+    }
+
+    let database_bytes = page_count.saturating_mul(page_size);
+    let freelist_bytes = freelist_pages.saturating_mul(page_size);
+    let unaccounted_bytes = database_bytes
+        .saturating_sub(freelist_bytes)
+        .saturating_sub(accounted_bytes);
+    Ok(DatabaseSizeComposition {
+        page_size_bytes: page_size,
+        page_count,
+        freelist_pages,
+        database_bytes,
+        freelist_bytes,
+        accounted_bytes,
+        unaccounted_bytes,
+        row_table_bytes,
+        index_bytes,
+        full_text_bytes,
+        vector_bytes,
+        mixed_embedding_bytes,
+        internal_bytes,
+        objects,
+        objects_truncated: objects_omitted > 0,
+        objects_omitted,
+    })
+}
+
+/// The full database-integrity, reader/writer-contention, and WAL/checkpoint
+/// payload.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DbDiagnostics {
     pub build: BuildIdentity,
@@ -679,8 +1133,12 @@ pub struct DbDiagnostics {
     pub checkpoint_counters: CheckpointCounters,
     pub checkpoint_probe: Option<CheckpointProbe>,
     pub checkpoint_probe_error: Option<String>,
+    /// Reader route, checkout saturation, and hold-lifecycle signals.
+    pub reader_contention: ReaderContentionDiagnostics,
     /// Writer-pool and best-effort audit persistence signals.
     pub writer_contention: WriterContentionDiagnostics,
+    pub size_composition: Option<DatabaseSizeComposition>,
+    pub size_composition_error: Option<String>,
     pub graph_edge_integrity: Option<GraphEdgeIntegrity>,
     pub graph_edge_integrity_error: Option<String>,
     /// Current FTS5 segment structure, decoded from each index's documented
@@ -696,11 +1154,16 @@ pub struct DbDiagnostics {
 
 /// Assemble the report for `pool`'s database.
 ///
-/// The probe target is the pool's own configured path — one source of truth,
-/// so the report can never describe a file the pool is not bound to. An
-/// in-memory pool has no path: the counters are still real (they are
-/// process-global), but every file-backed section degrades to an explicit
-/// "unavailable" with a reason rather than being silently omitted.
+/// `db_path` in the returned report is the pool's own configured path, so
+/// the report can never claim to describe a file the pool is not bound to.
+/// Every operational probe — the WAL file, the sidecar, the OS holder census
+/// — instead targets `pool.canonical_path()`, the same value `ConnectionPool`
+/// and the checkpoint sidecar writers key off of; a symlinked or otherwise
+/// aliased configured path would otherwise send those probes looking beside
+/// the alias while the evidence sits beside the canonical file. An in-memory
+/// pool has no path: the counters are still real (they are process-global),
+/// but every file-backed section degrades to an explicit "unavailable" with
+/// a reason rather than being silently omitted.
 ///
 /// The PASSIVE probe goes through the infrastructure-only untracked
 /// standalone open, WITHOUT `SQLITE_OPEN_CREATE`, so a diagnostic request
@@ -773,6 +1236,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
 ) -> StorageResult<DbDiagnostics> {
     crate::ensure_request_read_active("db_diagnostics")?;
     let counters = checkpoint_counters();
+    let reader_contention = ReaderContentionDiagnostics::snapshot(&pool);
     let writer_contention = WriterContentionDiagnostics::snapshot(
         &pool,
         Some(audit_append_failures),
@@ -790,7 +1254,12 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
             checkpoint_probe_error: Some(
                 "in-memory database: no WAL file and no checkpoint to probe".to_string(),
             ),
+            reader_contention,
             writer_contention,
+            size_composition: None,
+            size_composition_error: Some(
+                "in-memory database: no file-backed page composition to inspect".to_string(),
+            ),
             graph_edge_integrity: None,
             graph_edge_integrity_error: Some(
                 "in-memory database: no durable graph-edge ledger to inspect".to_string(),
@@ -814,8 +1283,8 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
     )
     .await?;
     crate::ensure_request_read_active("db_diagnostics")?;
-    let (wal_file, wal_pin) =
-        inspect_file_state_interruptibly(path.clone(), sweep_interval).await?;
+    let canonical = operational_db_path(&pool, &path);
+    let (wal_file, wal_pin) = inspect_file_state_interruptibly(canonical, sweep_interval).await?;
     crate::ensure_request_read_active("db_diagnostics")?;
 
     Ok(DbDiagnostics {
@@ -825,7 +1294,10 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
         checkpoint_probe_error: inspection.checkpoint_probe_error,
+        reader_contention,
         writer_contention,
+        size_composition: inspection.size_composition,
+        size_composition_error: inspection.size_composition_error,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
         fts_segments: inspection.fts_segments,
@@ -833,6 +1305,23 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
         fts_maintenance: crate::fts_maintenance_counters(),
         wal_pin,
     })
+}
+
+/// The path every operational probe (WAL file, sidecar directory, OS holder
+/// census) resolves against for `pool`'s database. The checkpoint sidecar
+/// writers and `ConnectionPool` itself key the WAL and sidecar directory off
+/// `canonical_path()`, not the raw `configured` path — a symlinked or
+/// otherwise aliased configured path would otherwise send every probe below
+/// looking beside the alias while the evidence sits beside the canonical
+/// file. `configured` remains the presentation value the sync and async
+/// collectors put in `db_path`, since that is what the caller configured.
+/// Both `collect_inner` and `collect_with_runtime_audit_metrics_interruptibly`
+/// resolve through this one function so their aliasing behavior cannot drift
+/// apart.
+fn operational_db_path(pool: &ConnectionPool, configured: &Path) -> PathBuf {
+    pool.canonical_path()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| configured.to_path_buf())
 }
 
 fn collect_inner(
@@ -843,6 +1332,7 @@ fn collect_inner(
     runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
 ) -> DbDiagnostics {
     let counters = checkpoint_counters();
+    let reader_contention = ReaderContentionDiagnostics::snapshot(pool);
     let writer_contention = WriterContentionDiagnostics::snapshot(
         pool,
         audit_append_failures,
@@ -859,7 +1349,12 @@ fn collect_inner(
             checkpoint_probe_error: Some(
                 "in-memory database: no WAL file and no checkpoint to probe".to_string(),
             ),
+            reader_contention,
             writer_contention,
+            size_composition: None,
+            size_composition_error: Some(
+                "in-memory database: no file-backed page composition to inspect".to_string(),
+            ),
             graph_edge_integrity: None,
             graph_edge_integrity_error: Some(
                 "in-memory database: no durable graph-edge ledger to inspect".to_string(),
@@ -876,27 +1371,33 @@ fn collect_inner(
     };
 
     let inspection = inspect_pool(pool);
+    let canonical = operational_db_path(pool, &path);
 
     DbDiagnostics {
         build,
         db_path: Some(path.display().to_string()),
-        wal_file: Some(wal_file_state(&path)),
+        wal_file: Some(wal_file_state(&canonical)),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
         checkpoint_probe_error: inspection.checkpoint_probe_error,
+        reader_contention,
         writer_contention,
+        size_composition: inspection.size_composition,
+        size_composition_error: inspection.size_composition_error,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
         fts_segments: inspection.fts_segments,
         fts_segments_error: inspection.fts_segments_error,
         fts_maintenance: crate::fts_maintenance_counters(),
-        wal_pin: wal_pin_attribution(&path, sweep_interval),
+        wal_pin: wal_pin_attribution(&canonical, sweep_interval),
     }
 }
 
 struct PoolInspection {
     checkpoint_probe: Option<CheckpointProbe>,
     checkpoint_probe_error: Option<String>,
+    size_composition: Option<DatabaseSizeComposition>,
+    size_composition_error: Option<String>,
     graph_edge_integrity: Option<GraphEdgeIntegrity>,
     graph_edge_integrity_error: Option<String>,
     fts_segments: Option<crate::FtsSegmentDiagnostics>,
@@ -916,6 +1417,8 @@ fn inspect_pool_interruptibly(
             return Ok(PoolInspection {
                 checkpoint_probe: None,
                 checkpoint_probe_error: Some(reason.clone()),
+                size_composition: None,
+                size_composition_error: Some(reason.clone()),
                 graph_edge_integrity: None,
                 graph_edge_integrity_error: Some(reason.clone()),
                 fts_segments: None,
@@ -946,11 +1449,14 @@ fn inspect_pool_interruptibly(
     }
     scope.ensure_active()?;
 
-    // Preserve ordinary diagnostic degradation while allowing the outer
-    // request cause to escape as a typed timeout.
-    let (integrity, fts_segments) = scope.run(&conn, || {
+    // Install one progress/interrupt guard for all logical reads on this
+    // connection. The scope deliberately refuses double registration, so
+    // keep each query's ordinary SQLite result nested inside one guarded
+    // execution while allowing the outer cancellation cause to remain typed.
+    let (integrity, size_composition, fts_segments) = scope.run(&conn, || {
         Ok((
             graph_edge_integrity(&conn),
+            database_size_composition(&conn),
             crate::fts_maintenance::inspect_fts_segments(&conn),
         ))
     })?;
@@ -966,9 +1472,19 @@ fn inspect_pool_interruptibly(
         Err(error) => (None, Some(error)),
     };
 
+    let (size_composition, size_composition_error) = match size_composition {
+        Ok(composition) => (Some(composition), None),
+        Err(error) => (
+            None,
+            Some(format!("database size composition query failed: {error}")),
+        ),
+    };
+
     Ok(PoolInspection {
         checkpoint_probe,
         checkpoint_probe_error,
+        size_composition,
+        size_composition_error,
         graph_edge_integrity,
         graph_edge_integrity_error,
         fts_segments,
@@ -996,7 +1512,7 @@ impl Drop for StopCensusOnDrop {
 
 async fn inspect_file_state_interruptibly(
     path: PathBuf,
-    _sweep_interval: Duration,
+    sweep_interval: Duration,
 ) -> StorageResult<(WalFileState, WalPinAttribution)> {
     const OPERATION: &str = "db_diagnostics.wal_holder_census";
     crate::ensure_request_read_active(OPERATION)?;
@@ -1018,12 +1534,40 @@ async fn inspect_file_state_interruptibly(
         let attribution = match crate::walpin::census_holders_until(&path, || {
             worker_stopped.load(Ordering::SeqCst)
         }) {
-            Ok(census) => wal_pin_attribution_from_census(census),
+            Ok(census) => {
+                if worker_stopped.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "WAL sidecar inspection cancelled",
+                    ));
+                }
+                if !crate::walpin::sidecar_enabled(true) {
+                    wal_pin_attribution_without_sidecar(census, SIDECAR_DISABLED_REASON.to_string())
+                } else {
+                    let sidecar = crate::walpin::inspect_live(
+                        &crate::walpin::sidecar_dir_for(&path),
+                        sweep_interval,
+                    );
+                    if worker_stopped.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "WAL sidecar inspection cancelled",
+                        ));
+                    }
+                    match sidecar {
+                        Ok(sidecar) => wal_pin_attribution_from_evidence(census, sidecar),
+                        Err(error) => wal_pin_attribution_without_sidecar(
+                            census,
+                            format!("read-only sidecar enumeration failed: {error}"),
+                        ),
+                    }
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Err(error),
             Err(error) => WalPinAttribution::unavailable(format!("census_holders failed: {error}")),
         };
         #[cfg(not(unix))]
-        let attribution = wal_pin_attribution(&path, _sweep_interval);
+        let attribution = wal_pin_attribution(&path, sweep_interval);
         Ok((wal_file, attribution))
     });
 
@@ -1064,6 +1608,8 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
             return PoolInspection {
                 checkpoint_probe: None,
                 checkpoint_probe_error: Some(reason.clone()),
+                size_composition: None,
+                size_composition_error: Some(reason.clone()),
                 graph_edge_integrity: None,
                 graph_edge_integrity_error: Some(reason.clone()),
                 fts_segments: None,
@@ -1086,6 +1632,13 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
             Some(format!("graph-edge integrity query failed: {e}")),
         ),
     };
+    let (size_composition, size_composition_error) = match database_size_composition(&conn) {
+        Ok(composition) => (Some(composition), None),
+        Err(error) => (
+            None,
+            Some(format!("database size composition query failed: {error}")),
+        ),
+    };
     let (fts_segments, fts_segments_error) =
         match crate::fts_maintenance::inspect_fts_segments(&conn) {
             Ok(segments) => (Some(segments), None),
@@ -1095,6 +1648,8 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
     PoolInspection {
         checkpoint_probe,
         checkpoint_probe_error,
+        size_composition,
+        size_composition_error,
         graph_edge_integrity,
         graph_edge_integrity_error,
         fts_segments,
@@ -1425,6 +1980,7 @@ mod tests {
     fn collect_on_a_file_backed_db_carries_build_identity_and_every_counter() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (pool, _path) = seeded_pool(&dir);
+        let reader_admission_capacity = pool.max_readers().max(1);
 
         let report = collect(
             &pool,
@@ -1475,6 +2031,24 @@ mod tests {
         assert_eq!(report.writer_contention.writer_task_acquisitions, 0);
         assert_eq!(report.writer_contention.writer_acquisition_timeouts, 0);
         assert_eq!(
+            report.reader_contention,
+            ReaderContentionDiagnostics {
+                reader_admission_capacity,
+                available_reader_admission_slots: reader_admission_capacity,
+                reader_acquisitions: 0,
+                pooled_reader_checkouts: 0,
+                standalone_reader_opens: 0,
+                infrastructure_standalone_reader_opens: 0,
+                reader_checkout_timeouts: 0,
+                active_pooled_reader_checkouts: 0,
+                peak_active_pooled_reader_checkouts: 0,
+                completed_pooled_reader_checkouts: 0,
+                max_completed_reader_hold_micros: 0,
+                reader_replacement_open_failures: 0,
+            },
+            "the diagnostics probe itself must not masquerade as request reader traffic"
+        );
+        assert_eq!(
             report.graph_edge_integrity,
             Some(GraphEdgeIntegrity {
                 duplicate_edge_id_groups: 0,
@@ -1497,6 +2071,12 @@ mod tests {
             .expect("FTS segment diagnostics serialize");
         assert_eq!(fts_json["entities"]["segment_count"], 1);
         assert!(json.get("fts_maintenance").is_some());
+        assert!(
+            report.size_composition.is_some(),
+            "file-backed diagnostics must include page composition; error was {:?}",
+            report.size_composition_error
+        );
+        assert!(report.size_composition_error.is_none());
         assert!(report.writer_contention.audit_append_failures.is_none());
         assert!(
             report
@@ -1504,6 +2084,56 @@ mod tests {
                 .audit_append_failures_unavailable_reason
                 .is_some(),
             "a direct khive-db snapshot must not fabricate a runtime audit count"
+        );
+    }
+
+    #[test]
+    fn diagnostics_exposes_reader_saturation_and_completed_hold_evidence() {
+        let pool = ConnectionPool::new(PoolConfig {
+            checkout_timeout: Duration::from_millis(2),
+            ..PoolConfig::default()
+        })
+        .expect("in-memory pool");
+        let held = pool.reader().expect("first reader checkout");
+        assert!(
+            pool.reader().is_err(),
+            "the live checkout must exhaust the one-slot degraded reader budget"
+        );
+        drop(held);
+
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("9.9.9", None),
+            Duration::from_secs(30),
+        );
+        let reader = report.reader_contention;
+        assert_eq!(reader.reader_admission_capacity, 1);
+        assert_eq!(reader.available_reader_admission_slots, 1);
+        assert_eq!(reader.reader_acquisitions, 1);
+        assert_eq!(reader.pooled_reader_checkouts, 1);
+        assert_eq!(reader.standalone_reader_opens, 0);
+        assert_eq!(reader.infrastructure_standalone_reader_opens, 0);
+        assert_eq!(reader.reader_checkout_timeouts, 1);
+        assert_eq!(reader.active_pooled_reader_checkouts, 0);
+        assert_eq!(reader.peak_active_pooled_reader_checkouts, 1);
+        assert_eq!(reader.completed_pooled_reader_checkouts, 1);
+        assert!(reader.max_completed_reader_hold_micros > 0);
+
+        let json = serde_json::to_value(&report).expect("report serializes");
+        assert_eq!(
+            json.pointer("/reader_contention/reader_admission_capacity"),
+            Some(&serde_json::json!(1)),
+            "the operator wire payload must expose the reader admission budget"
+        );
+        assert_eq!(
+            json.pointer("/reader_contention/reader_checkout_timeouts"),
+            Some(&serde_json::json!(1)),
+            "the operator wire payload must expose the reader timeout phase"
+        );
+        assert!(
+            json.pointer("/reader_contention/max_completed_reader_hold_micros")
+                .is_some(),
+            "the operator wire payload must expose completed hold-time evidence"
         );
     }
 
@@ -1789,6 +2419,11 @@ mod tests {
             report.wal_pin.census,
             WalPinCensus::Unavailable { .. }
         ));
+        assert!(report.size_composition.is_none());
+        assert!(report
+            .size_composition_error
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no file-backed page composition")));
     }
 
     #[cfg(unix)]
@@ -1857,11 +2492,120 @@ mod tests {
         );
     }
 
-    /// This port's WAL-pin attribution never claims full reconciliation —
-    /// see the module docs on why sidecar enumeration is not wired here.
     #[cfg(unix)]
     #[test]
-    fn wal_pin_attribution_reports_census_but_never_claims_full_attribution() {
+    fn complete_holder_and_read_only_sidecar_evidence_reconcile_to_complete() {
+        let census = crate::walpin::CensusResult {
+            holders: std::collections::HashSet::from([7]),
+            uninspectable_pids: Vec::new(),
+            truncated: false,
+        };
+        let sidecar = crate::walpin::WalpinReport {
+            entries: vec![crate::walpin::WalpinPidHealth::RegisteredSilent { pid: 7 }],
+            sidecar_listing_truncated: false,
+            cleanup_would_reap: 0,
+            orphan_temps_reaped: 0,
+        };
+
+        let pin = wal_pin_attribution_from_evidence(census, sidecar);
+
+        assert_eq!(pin.status, WalPinAttributionStatus::Complete);
+        assert!(pin.available);
+        assert!(pin.fully_attributed);
+        assert!(pin.status_reasons.is_empty());
+        assert_eq!(pin.registered_silent_pids, vec![7]);
+        assert!(pin.census_pids_without_attribution.is_empty());
+        assert_eq!(pin.sidecar_listing_truncated, Some(false));
+        assert_eq!(pin.sidecar_entries_cleanup_would_reap, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_census_with_an_unregistered_holder_is_degraded_not_exonerated() {
+        let census = crate::walpin::CensusResult {
+            holders: std::collections::HashSet::from([7, 41]),
+            uninspectable_pids: Vec::new(),
+            truncated: false,
+        };
+        let sidecar = crate::walpin::WalpinReport {
+            entries: vec![crate::walpin::WalpinPidHealth::RegisteredSilent { pid: 7 }],
+            sidecar_listing_truncated: false,
+            cleanup_would_reap: 0,
+            orphan_temps_reaped: 0,
+        };
+
+        let pin = wal_pin_attribution_from_evidence(census, sidecar);
+
+        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
+        assert!(!pin.available);
+        assert!(!pin.fully_attributed);
+        assert_eq!(pin.census_pids_without_attribution, vec![41]);
+        assert!(pin
+            .status_reasons
+            .iter()
+            .any(|reason| reason.contains("holder(s) have no sidecar attribution")));
+    }
+
+    #[test]
+    fn database_size_composition_reports_tables_indexes_fts_and_vectors_separately() {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT NOT NULL); \
+             CREATE INDEX idx_docs_body ON docs(body); \
+             CREATE TABLE fts_demo_data(id INTEGER PRIMARY KEY, block BLOB); \
+             CREATE TABLE vec_demo_chunks(id INTEGER PRIMARY KEY, vectors BLOB); \
+             CREATE TABLE knowledge_sections(id INTEGER PRIMARY KEY, embedding BLOB); \
+             INSERT INTO docs(body) VALUES (zeroblob(8192)); \
+             INSERT INTO fts_demo_data(block) VALUES (zeroblob(8192)); \
+             INSERT INTO vec_demo_chunks(vectors) VALUES (zeroblob(8192)); \
+             INSERT INTO knowledge_sections(embedding) VALUES (zeroblob(8192));",
+        )
+        .expect("seed size classes");
+
+        let composition = database_size_composition(&conn).expect("dbstat composition");
+        let class_for = |name: &str| {
+            composition
+                .objects
+                .iter()
+                .find(|object| object.name == name)
+                .map(|object| object.storage_class)
+        };
+
+        assert_eq!(class_for("docs"), Some(DatabaseStorageClass::RowTable));
+        assert_eq!(
+            class_for("idx_docs_body"),
+            Some(DatabaseStorageClass::Index)
+        );
+        assert_eq!(
+            class_for("fts_demo_data"),
+            Some(DatabaseStorageClass::FullText)
+        );
+        assert_eq!(
+            class_for("vec_demo_chunks"),
+            Some(DatabaseStorageClass::Vector)
+        );
+        assert_eq!(
+            class_for("knowledge_sections"),
+            Some(DatabaseStorageClass::MixedRowAndEmbedding)
+        );
+        assert!(composition.vector_bytes > 0);
+        assert!(composition.full_text_bytes > 0);
+        assert!(composition.mixed_embedding_bytes > 0);
+        assert_eq!(
+            composition
+                .accounted_bytes
+                .saturating_add(composition.freelist_bytes)
+                .saturating_add(composition.unaccounted_bytes),
+            composition.database_bytes
+        );
+    }
+
+    /// A holder with no sidecar registration remains degraded even though the
+    /// read-only sidecar pass itself completed successfully.
+    #[cfg(unix)]
+    #[test]
+    #[serial(khive_walpin_sidecar_env)]
+    fn wal_pin_attribution_degrades_when_a_holder_has_no_sidecar_registration() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (pool, path) = seeded_pool(&dir);
         let _ = &pool;
@@ -1870,18 +2614,235 @@ mod tests {
 
         assert!(
             !pin.fully_attributed,
-            "sidecar reconciliation is not ported: this must never claim completeness"
+            "the pool's OS holder has no test sidecar registration"
         );
         assert!(
             pin.unavailable_reason.is_some(),
-            "the gap must be explained, not silent: {pin:?}"
+            "the missing holder attribution must be explained: {pin:?}"
         );
         assert!(pin.sidecar_entries.is_empty());
         assert!(pin.reporting.is_empty());
+        assert_eq!(pin.sidecar_listing_truncated, Some(false));
+        assert_eq!(pin.sidecar_entries_cleanup_would_reap, Some(0));
         assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
         assert!(matches!(
             pin.census,
             WalPinCensus::Complete { .. } | WalPinCensus::Incomplete { .. }
         ));
+    }
+
+    /// `sidecar_dir_for` is a purely lexical derivation from whatever path it
+    /// is handed (`pool.rs`'s `sidecar_dir_for_alias_convergence` proves
+    /// this at the primitive level). Diagnostics must feed it
+    /// `pool.canonical_path()` — the same value the checkpoint sidecar
+    /// writers use — never the pool's raw configured path, or a symlinked
+    /// database misses its own sidecar evidence entirely.
+    #[cfg(unix)]
+    #[test]
+    #[serial(khive_walpin_sidecar_env)]
+    fn diagnostics_finds_sidecar_evidence_through_an_aliased_database_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).expect("mkdir real dir");
+        let real_path = real_dir.join("diag.db");
+        std::fs::write(&real_path, b"").expect("create real file");
+        let alias_path = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&real_path, &alias_path).expect("symlink alias");
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(alias_path.clone()),
+            ..PoolConfig::default()
+        })
+        .expect("pool open through symlinked path");
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .expect("seed a write so the WAL file exists");
+        }
+
+        let canonical = pool
+            .canonical_path()
+            .expect("file-backed pool")
+            .to_path_buf();
+        assert_ne!(
+            canonical, alias_path,
+            "the alias must actually differ from the canonical path for this test to mean \
+             anything"
+        );
+
+        let pid = std::process::id();
+        let sidecar_dir = crate::walpin::sidecar_dir_for(&canonical);
+        let beacon = crate::walpin::WalpinBeacon {
+            pid,
+            process_role: "session".to_string(),
+            started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
+            sweep_interval_ms: 5_000,
+        };
+        crate::walpin::write_beacon(&sidecar_dir, &beacon).expect("seed this process's beacon");
+
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+
+        // The wider OS holder census can be legitimately incomplete in a
+        // sandboxed test environment (other, unrelated processes this test
+        // has no permission to inspect) — that variability is orthogonal to
+        // what this test checks. What must hold regardless is that the
+        // sidecar enumeration itself, which is keyed off the canonical
+        // path, actually ran, completed untruncated, and found this
+        // process's own beacon rather than missing it beside the wrong
+        // (aliased) directory.
+        assert_eq!(
+            report.wal_pin.sidecar_listing_truncated,
+            Some(false),
+            "the sidecar enumeration must run to completion: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            report.wal_pin.registered_silent_pids.contains(&pid),
+            "the beacon written beside the canonical path must be found: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            report.wal_pin.census_holder_pids.contains(&pid),
+            "the OS census must find this process holding its own database open: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            !report
+                .wal_pin
+                .census_pids_without_attribution
+                .contains(&pid),
+            "this process's own holder entry must be attributed by its own sidecar evidence, \
+             not left unexplained: {:?}",
+            report.wal_pin
+        );
+    }
+
+    /// The async collector (`collect_with_audit_append_failures_interruptibly`)
+    /// resolves its operational path independently of the sync collector
+    /// (`collect`) — see `operational_db_path`. A regression that reintroduced
+    /// the raw configured path on only the async side would leave the sync
+    /// alias test above green while the async path silently missed its own
+    /// sidecar evidence; this exercises the same aliasing scenario through
+    /// the async entry point.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(khive_walpin_sidecar_env)]
+    async fn diagnostics_finds_sidecar_evidence_through_an_aliased_database_path_async() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).expect("mkdir real dir");
+        let real_path = real_dir.join("diag.db");
+        std::fs::write(&real_path, b"").expect("create real file");
+        let alias_path = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&real_path, &alias_path).expect("symlink alias");
+
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(alias_path.clone()),
+            ..PoolConfig::default()
+        })
+        .expect("pool open through symlinked path");
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .expect("seed a write so the WAL file exists");
+        }
+
+        let canonical = pool
+            .canonical_path()
+            .expect("file-backed pool")
+            .to_path_buf();
+        assert_ne!(
+            canonical, alias_path,
+            "the alias must actually differ from the canonical path for this test to mean \
+             anything"
+        );
+
+        let pid = std::process::id();
+        let sidecar_dir = crate::walpin::sidecar_dir_for(&canonical);
+        let beacon = crate::walpin::WalpinBeacon {
+            pid,
+            process_role: "session".to_string(),
+            started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
+            sweep_interval_ms: 5_000,
+        };
+        crate::walpin::write_beacon(&sidecar_dir, &beacon).expect("seed this process's beacon");
+
+        let pool = Arc::new(pool);
+        let report = collect_with_audit_append_failures_interruptibly(
+            Arc::clone(&pool),
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+            0,
+        )
+        .await
+        .expect("diagnostics succeed");
+
+        // Same rationale as the sync test: the wider OS holder census can be
+        // legitimately incomplete in a sandboxed environment, but the sidecar
+        // enumeration itself — keyed off the canonical path — must run to
+        // completion and find this process's own beacon.
+        assert_eq!(
+            report.wal_pin.sidecar_listing_truncated,
+            Some(false),
+            "the sidecar enumeration must run to completion: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            report.wal_pin.registered_silent_pids.contains(&pid),
+            "the beacon written beside the canonical path must be found: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            report.wal_pin.census_holder_pids.contains(&pid),
+            "the OS census must find this process holding its own database open: {:?}",
+            report.wal_pin
+        );
+        assert!(
+            !report
+                .wal_pin
+                .census_pids_without_attribution
+                .contains(&pid),
+            "this process's own holder entry must be attributed by its own sidecar evidence, \
+             not left unexplained: {:?}",
+            report.wal_pin
+        );
+    }
+
+    /// ADR-091 Amendment 6: an operator who explicitly disables the sidecar
+    /// also disables its collection. Diagnostics must honor that rather than
+    /// running `inspect_live` regardless of the operator's setting.
+    #[cfg(unix)]
+    #[test]
+    #[serial(khive_walpin_sidecar_env)]
+    fn wal_pin_attribution_reports_disabled_when_the_sidecar_is_explicitly_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pool, path) = seeded_pool(&dir);
+        let _ = &pool;
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "0");
+
+        let pin = wal_pin_attribution(&path, Duration::from_secs(30));
+
+        assert!(
+            !pin.available,
+            "an explicitly disabled sidecar can never produce a reconciled answer"
+        );
+        assert!(
+            pin.unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("disabled")),
+            "the reason must name the disabled sidecar, not a generic enumeration failure: \
+             {pin:?}"
+        );
+        assert!(pin.sidecar_entries.is_empty());
+        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
     }
 }

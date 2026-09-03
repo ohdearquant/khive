@@ -32,8 +32,52 @@ use crate::MemoryPack;
 /// engine-failure isolation (ADR-031) without a real ANN or sqlite-vec outage.
 #[cfg(test)]
 pub(super) mod retrieval_failpoints {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct AnnBuildHookState {
+        entered: Notify,
+        release: Notify,
+        completed: Notify,
+    }
+
+    /// RAII guard for one model's detached ANN build. Dropping the guard always
+    /// releases a held task and unregisters the hook so a failed test cannot
+    /// strand later tests in the same process.
+    pub struct AnnBuildHook {
+        model: String,
+        state: Arc<AnnBuildHookState>,
+    }
+
+    impl AnnBuildHook {
+        pub async fn wait_entered(&self) {
+            self.state.entered.notified().await;
+        }
+
+        pub fn release(&self) {
+            self.state.release.notify_one();
+        }
+
+        pub async fn wait_completed(&self) {
+            self.state.completed.notified().await;
+        }
+    }
+
+    impl Drop for AnnBuildHook {
+        fn drop(&mut self) {
+            self.release();
+            let mut hooks = ann_build_hooks().lock().unwrap();
+            let owns_entry = hooks
+                .get(&self.model)
+                .is_some_and(|state| Arc::ptr_eq(state, &self.state));
+            if owns_entry {
+                hooks.remove(&self.model);
+            }
+        }
+    }
 
     fn ann() -> &'static Mutex<HashSet<String>> {
         static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -43,6 +87,42 @@ pub(super) mod retrieval_failpoints {
     fn vec() -> &'static Mutex<HashSet<String>> {
         static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
         S.get_or_init(Default::default)
+    }
+
+    fn ann_build_hooks() -> &'static Mutex<HashMap<String, Arc<AnnBuildHookState>>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Arc<AnnBuildHookState>>>> = OnceLock::new();
+        HOOKS.get_or_init(Default::default)
+    }
+
+    pub fn hold_ann_build(model: &str) -> AnnBuildHook {
+        let state = Arc::new(AnnBuildHookState::default());
+        match ann_build_hooks().lock().unwrap().entry(model.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                panic!("detached ANN build hook already installed for {model}")
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Arc::clone(&state));
+            }
+        }
+        AnnBuildHook {
+            model: model.to_owned(),
+            state,
+        }
+    }
+
+    pub(super) async fn before_ann_build(model: &str) {
+        let hook = ann_build_hooks().lock().unwrap().get(model).cloned();
+        if let Some(hook) = hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+    }
+
+    pub(super) fn after_ann_build(model: &str) {
+        let hook = ann_build_hooks().lock().unwrap().get(model).cloned();
+        if let Some(hook) = hook {
+            hook.completed.notify_one();
+        }
     }
 
     pub fn fail_ann(model: &str) {
@@ -1490,6 +1570,8 @@ async fn collect_model_ann_hits_inner(
             let ann_detached = ann.clone();
             let model_detached = model_name.clone();
             khive_runtime::track_background_task(async move {
+                #[cfg(test)]
+                retrieval_failpoints::before_ann_build(&model_detached).await;
                 let result = ann::ensure_ann_for_model(
                     &rt_detached,
                     &token_detached,
@@ -1497,6 +1579,8 @@ async fn collect_model_ann_hits_inner(
                     &model_detached,
                 )
                 .await;
+                #[cfg(test)]
+                retrieval_failpoints::after_ann_build(&model_detached);
                 let _ = done_tx.send(result);
             });
             match khive_storage::await_request_read_phase(

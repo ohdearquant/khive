@@ -4548,6 +4548,7 @@ mod tests {
         // not cause TRUNCATE to wait — the transaction is required for isomorphism.
         let reader = pool.reader().expect("reader");
         reader
+            .conn()
             .execute_batch("BEGIN DEFERRED; SELECT * FROM t;")
             .expect("begin read tx");
 
@@ -4575,7 +4576,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Commit and release the read snapshot only after checkpoint_once returns.
-        reader.execute_batch("COMMIT;").ok();
+        reader.conn().execute_batch("COMMIT;").ok();
         drop(reader);
 
         // PASSIVE returns without waiting for the reader snapshot. A TRUNCATE
@@ -5658,6 +5659,7 @@ mod tests {
         // reader call site (e.g. `graph_traverse_read`) is expected to carry.
         let reader = pool.reader().expect("reader");
         reader
+            .conn()
             .execute_batch("BEGIN DEFERRED; SELECT * FROM t;")
             .expect("begin read tx");
         let _tx_handle =
@@ -5724,7 +5726,7 @@ mod tests {
             "expected a Stale emission naming the pinning reader, got: {emissions:?}"
         );
 
-        reader.execute_batch("COMMIT;").ok();
+        reader.conn().execute_batch("COMMIT;").ok();
         drop(reader);
         drop(_tx_handle);
     }
