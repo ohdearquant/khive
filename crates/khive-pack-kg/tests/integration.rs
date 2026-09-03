@@ -14699,6 +14699,8 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
     // Option, regardless of whether the caller is the runtime or a direct
     // khive-db user — they come straight off the pool.
     for field in [
+        "writer_task_begin_busy",
+        "writer_task_begin_busy_absorbed",
         "writer_task_request_failures",
         "writer_task_side_effects_unknown",
     ] {

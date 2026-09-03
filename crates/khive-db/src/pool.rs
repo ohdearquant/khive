@@ -1002,10 +1002,16 @@ pub struct WriterAcquisitionSnapshot {
     pub writer_task_acquisitions: u64,
     /// Finite-wait pool writer checkouts that exhausted their deadline.
     pub timeouts: u64,
-    /// Writer-task `BEGIN IMMEDIATE` attempts refused busy or locked. Counted
-    /// separately from `timeouts` because that counter names the pool-mutex
-    /// checkout stage; folding the two would mislabel the stage.
+    /// Every writer-task `BEGIN IMMEDIATE` attempt refused busy or locked,
+    /// including refusals a subsequent bounded retry went on to absorb.
+    /// Counted separately from `timeouts` because that counter names the
+    /// pool-mutex checkout stage; folding the two would mislabel the stage.
     pub writer_task_begin_busy: u64,
+    /// Subset of `writer_task_begin_busy` that a subsequent bounded retry
+    /// absorbed before the request closure ran, so the refusal never
+    /// reached the caller. `writer_task_begin_busy - writer_task_begin_busy_absorbed`
+    /// is the count of refusals a caller actually observed.
+    pub writer_task_begin_busy_absorbed: u64,
     /// Writer-task `BEGIN IMMEDIATE` attempts that failed for a reason other
     /// than busy or locked, and so surface as `StorageError::Pool`.
     pub writer_task_begin_errors: u64,
@@ -1030,6 +1036,7 @@ pub(crate) struct WriterAcquisitionCounters {
     writer_task_acquisitions: AtomicU64,
     pooled_timeouts: AtomicU64,
     writer_task_begin_busy: AtomicU64,
+    writer_task_begin_busy_absorbed: AtomicU64,
     writer_task_begin_errors: AtomicU64,
     writer_task_request_failures: AtomicU64,
     writer_task_side_effects_unknown: AtomicU64,
@@ -1042,13 +1049,22 @@ impl WriterAcquisitionCounters {
     }
 
     /// Records one writer-task `BEGIN IMMEDIATE` refused busy or locked.
-    ///
-    /// Callers classify by matching the value `writer_task_begin_error`
-    /// returned rather than re-testing the `rusqlite::Error`, so the busy
-    /// rule has exactly one home and the counter cannot drift from the
-    /// error the caller is actually told about.
+    /// Called for every such refusal, whether or not a bounded retry goes
+    /// on to absorb it — this is the caller-facing contention count, and it
+    /// alone must equal the number of busy/locked refusals SQLite actually
+    /// returned, independent of retry policy.
     pub(crate) fn record_writer_task_begin_busy(&self) {
         self.writer_task_begin_busy.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one busy or locked `BEGIN IMMEDIATE` refusal hidden from the
+    /// caller by a subsequent bounded retry. This counter moves before the
+    /// next BEGIN attempt, in addition to (never instead of) the
+    /// `writer_task_begin_busy` call for the same refusal; it never implies
+    /// that the request closure ran.
+    pub(crate) fn record_writer_task_begin_busy_absorbed(&self) {
+        self.writer_task_begin_busy_absorbed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records one writer-task `BEGIN IMMEDIATE` that failed for any other
@@ -1089,6 +1105,9 @@ impl WriterAcquisitionCounters {
             writer_task_acquisitions,
             timeouts: self.pooled_timeouts.load(Ordering::Relaxed),
             writer_task_begin_busy: self.writer_task_begin_busy.load(Ordering::Relaxed),
+            writer_task_begin_busy_absorbed: self
+                .writer_task_begin_busy_absorbed
+                .load(Ordering::Relaxed),
             writer_task_begin_errors: self.writer_task_begin_errors.load(Ordering::Relaxed),
             writer_task_request_failures: self.writer_task_request_failures.load(Ordering::Relaxed),
             writer_task_side_effects_unknown: self
@@ -4554,6 +4573,7 @@ mod tests {
                 writer_task_acquisitions: 0,
                 timeouts: 0,
                 writer_task_begin_busy: 0,
+                writer_task_begin_busy_absorbed: 0,
                 writer_task_begin_errors: 0,
                 writer_task_request_failures: 0,
                 writer_task_side_effects_unknown: 0,
@@ -4700,6 +4720,7 @@ mod tests {
                 // writer-task BEGIN counters: separate stages, separate
                 // counters. This is the mislabeling guard in assertion form.
                 writer_task_begin_busy: 0,
+                writer_task_begin_busy_absorbed: 0,
                 writer_task_begin_errors: 0,
                 writer_task_request_failures: 0,
                 writer_task_side_effects_unknown: 0,
@@ -4717,6 +4738,7 @@ mod tests {
                 writer_task_acquisitions: 0,
                 timeouts: 1,
                 writer_task_begin_busy: 0,
+                writer_task_begin_busy_absorbed: 0,
                 writer_task_begin_errors: 0,
                 writer_task_request_failures: 0,
                 writer_task_side_effects_unknown: 0,
