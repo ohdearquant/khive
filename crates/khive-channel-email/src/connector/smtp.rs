@@ -152,6 +152,24 @@ fn classify_smtp_connection_error(is_permanent: bool, message: String) -> Channe
     }
 }
 
+/// Classify the boolean half of lettre's `test_connection` contract. The
+/// transport swallows the NOOP command's own error and reports `Ok(false)`, so
+/// a refused NOOP after a successful connect/AUTH carries no permanence
+/// information. AUTH rejections surface as `Err` from the connection setup and
+/// are classified by [`classify_smtp_connection_error`]; a refused NOOP is a
+/// connection-stage failure of unknown permanence, so it is retried with the
+/// outbound backoff and never proceeds to the per-message send.
+fn classify_smtp_preamble_status(is_connected: bool) -> Result<(), ChannelError> {
+    if is_connected {
+        Ok(())
+    } else {
+        Err(ChannelError::Transport(
+            "SMTP connection preamble refused: server did not acknowledge NOOP after connect/AUTH"
+                .to_string(),
+        ))
+    }
+}
+
 /// Build the outbound RFC 822 message, applying thread-correlation, Message-ID, and
 /// reply-threading headers.
 ///
@@ -270,12 +288,13 @@ impl SmtpConnector for LettreSmtp {
         // rejection of this particular recipient. The transport pools the
         // connection it just opened, so a successful test reuses it for the
         // send below instead of paying for a second handshake.
-        transport.test_connection().await.map_err(|error| {
+        let is_connected = transport.test_connection().await.map_err(|error| {
             classify_smtp_connection_error(
                 error.is_permanent(),
                 format!("SMTP connection/authentication failed: {error}"),
             )
         })?;
+        classify_smtp_preamble_status(is_connected)?;
 
         transport.send(msg).await.map_err(|error| {
             classify_smtp_send_error(error.is_permanent(), format!("SMTP send failed: {error}"))
@@ -436,6 +455,19 @@ mod tests {
             permanent.delivery_failure_class(),
             khive_channel::DeliveryFailureClass::Permanent
         );
+    }
+
+    #[test]
+    fn smtp_preamble_noop_refusal_is_retried_and_never_reaches_send() {
+        assert!(classify_smtp_preamble_status(true).is_ok());
+        let refused = classify_smtp_preamble_status(false).unwrap_err();
+        assert!(
+            matches!(refused, ChannelError::Transport(_)),
+            "a refused NOOP carries no permanence information, so it must be a retryable \
+             connection-stage failure, got {refused:?}"
+        );
+        assert!(!matches!(refused, ChannelError::PermanentTransport(_)));
+        assert!(!matches!(refused, ChannelError::Auth(_)));
     }
 
     #[test]
