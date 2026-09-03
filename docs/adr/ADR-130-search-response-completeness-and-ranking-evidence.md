@@ -798,8 +798,10 @@ implicit.
 
 Arm evidence deliberately does not duplicate an error message or invent a
 second cause taxonomy. On partial and `search_incomplete` responses, the
-bounded per-backend causes remain in `backend_errors`, including Amendment 2's
-closed `timeout | backend_error` vocabulary. `arm_participation` states which
+bounded per-backend causes remain in `backend_errors`, typed with the `kind`
+vocabulary of the serving release: the single constant `backend_error` in
+v0.8.0, and Amendment 2's closed `timeout | backend_error` from v0.9.0 per the
+Compatibility section above. `arm_participation` states which
 selected arms failed to complete; `backend_errors` states why and where the
 backend search failed. Both fields MUST survive presentation and frame-budget
 omission at their normal envelope location.

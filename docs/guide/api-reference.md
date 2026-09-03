@@ -496,8 +496,10 @@ failure surfaces on such a response — `text` still reports `"ran"`. A response
 is `"partial"` (with `missing_backends`/`backend_errors`) only when a whole
 backend's search failed outright — auth, timeout, or a failed text leg — not
 merely one of its arms. On such degraded responses, the bounded reason stays in
-`backend_errors`, whose cause vocabulary is `timeout | backend_error`; arm
-entries do not duplicate those messages. `candidate_count` counts final hits
+`backend_errors`; its `kind` is the single constant `backend_error` in v0.8.0,
+and the two-value `timeout | backend_error` vocabulary of ADR-130 Amendment 2
+ships in v0.9.0. Arm entries do not duplicate those messages. `candidate_count`
+counts final hits
 whose `source` includes the arm, after server filters and the result limit, so a
 `both` hit increments both counts and each count is bounded by `limit`.
 
