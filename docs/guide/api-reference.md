@@ -823,7 +823,13 @@ finite-wait main-pool mutex checkouts, the second counts successful per-operatio
 standalone writer opens, and the third counts dequeued writer-task requests that acquired its
 dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
 `writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
-executes; SQLite `BEGIN`/statement failures are separate stages. `audit_append_failures` counts
+executes; SQLite `BEGIN`/statement failures are separate stages.
+`writer_task_begin_busy` counts every busy/locked `BEGIN IMMEDIATE` refusal, matching its
+pre-retry meaning: a nonzero value reflects total contention regardless of retry policy.
+`writer_task_begin_busy_absorbed` is a subset of it — refusals a bounded pre-execution retry
+absorbed before the request closure ran, so the caller never observed them. A refusal not
+absorbed by a retry also surfaces to the caller as the typed, retryable `writer_task_begin_busy`
+stage. The request closure is never retried. `audit_append_failures` counts
 process-wide best-effort audit appends whose storage error was logged and swallowed —
 pure-observability rows only. An obligation-bearing row's commit failure (a dispatch outcome, an
 unknown-verb row, a `git.digest` receipt, or a gate denial's own audit row) is never counted here:
@@ -1769,17 +1775,31 @@ request(ops="knowledge.get(id=\"rope\", include_sections=true)")
 
 ### `knowledge.list` — Assertive
 
-Paginated listing of atoms or domains.
+Paginated listing of atoms or domains. Offset pages are ordered by
+`created_at DESC, id DESC`. For stable full-store traversal, start cursor mode
+with `after=""`, then reuse each non-null `next_after`; cursor pages are ordered
+by `created_at ASC, id ASC` and are not shifted by concurrent inserts.
 
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `type`   | string  | no       | `atom`\|`domain` (default `atom`). |
-| `limit`  | integer | no       | Default 20, max 500.               |
-| `offset` | integer | no       | Pagination offset.                 |
+| Param            | Type            | Required | Notes                                                                                                                       |
+| ---------------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `type`           | string          | no       | `atom`\|`domain` (default `atom`).                                                                                          |
+| `limit`          | integer         | no       | Default 20, max 500.                                                                                                        |
+| `offset`         | integer         | no       | Legacy offset pagination; mutually exclusive with `after`.                                                                  |
+| `after`          | string          | no       | `""` starts keyset mode; otherwise the full UUID from `next_after`. Missing, wrong-type, and out-of-namespace cursors fail. |
+| `fields`         | array\<string\> | no       | Strict non-empty projection. Use `["id","slug"]` for a key-only walk; unrequested content is not selected from storage.     |
+| `status`         | string/array    | no       | Atom status filter. Reuse it throughout a cursor walk.                                                                      |
+| `exclude_status` | string          | no       | Atom exclusion filter when `status` is absent. Reuse it throughout a cursor walk.                                           |
 
 ```
 request(ops="knowledge.list(type=\"domain\", limit=50)")
+request(ops="knowledge.list(type=\"atom\", fields=[\"id\",\"slug\"], after=\"\", limit=500)")
 ```
+
+Cursor traversal is live, not a snapshot. Inserts behind an issued boundary
+belong to a fresh walk; inserts ahead may extend the current walk. Existing
+rows are not shifted, skipped, or duplicated. Responses include machine-readable
+`order` and, in cursor mode, `next_after`. Stop when `next_after` is null;
+cursor pages carry no `total` (counting is a full scan per page), offset pages do.
 
 ### `knowledge.delete_atoms` — Commissive
 
@@ -1803,11 +1823,17 @@ request(ops="knowledge.stats()")
 
 ### `knowledge.index` — Commissive
 
-Backfill embeddings + FTS for atoms/domains.
+Backfill atom embeddings.
 
 The response includes `truncation_by_model`, keyed by every model that completed embedding work.
-Each value contains `truncated` and `discarded_bytes` counters derived from the actual embedding
-outcomes; atom source content remains complete in SQL and FTS.
+Each truncation value contains `truncated` and `discarded_bytes` counters derived from the actual
+embedding outcomes; atom source content remains complete in SQL and FTS.
+
+This verb does not rebuild the FTS indexes. Rebuilding `fts_knowledge`/`fts_sections` is a
+whole-database operation independent of the caller's namespace, and the ordinary verb has no
+per-caller cost admission to bound it, so that rebuild is reachable only through the
+`kkernel reindex` operator CLI (`--rebuild-fts`), which reports the indexes rebuilt, elapsed
+time, and the rank-1 integrity-check outcome.
 
 | Param         | Type            | Required | Notes                                                   |
 | ------------- | --------------- | -------- | ------------------------------------------------------- |
