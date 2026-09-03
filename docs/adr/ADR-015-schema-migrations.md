@@ -3,7 +3,8 @@
 **Status**: accepted\
 **Date**: 2026-05-23\
 **Authors**: khive maintainers
-**Amended by**: [ADR-062](ADR-062-fts-ann-consolidation.md), which adds schema version 4.
+**Amended by**: [ADR-062](ADR-062-fts-ann-consolidation.md), which adds schema version 4
+and records the indexed FTS record-kind classifier added by schema version 23.
 
 ## Context
 
@@ -126,29 +127,40 @@ The live sequence starts from the consolidated V1 baseline. This table is the
 canonical allocation ledger for databases created at or after v0.2.8; the table
 above remains the historical pre-consolidation record.
 
-| Version | Owning ADR / issue | Migration name                     | Status  |
-| ------: | ------------------ | ---------------------------------- | ------- |
-|      V1 | ADR-015            | initial_schema                     | shipped |
-|      V2 | ADR-051            | narrow_fts_sections_update_trigger | shipped |
-|      V3 | ADR-051            | backfill_domain_mirror_atoms       | shipped |
-|      V4 | ADR-062            | fts_consolidation                  | shipped |
-|      V5 | ADR-056            | unique_comm_message_external_id    | shipped |
-|      V6 | ADR-081            | brain_retune_driver                | shipped |
-|      V7 | #827               | notes_seq                          | shipped |
-|      V8 | #827               | notes_seq_repair                   | shipped |
-|      V9 | ADR-104            | entities_name_ci_index             | shipped |
-|     V10 | ADR-111            | entities_content_ref               | shipped |
-|     V11 | ADR-079            | ann_write_log                      | shipped |
-|     V12 | ADR-118            | ann_write_log_model_seq_index      | shipped |
-|     V13 | #1424 / #1462      | list_cursor_sequences              | shipped |
-|     V14 | #1424 / #1462      | graph_edges_id_unique              | shipped |
-|     V15 | #1597              | serve_ledger_attribution           | shipped |
-|     V16 | ADR-019 / #1474    | gtd_dependency_cycle_guards        | shipped |
-|     V17 | ADR-142 / #1700    | agents_ddl                         | shipped |
-|     V18 | #1479              | ann_consumer_pending               | shipped |
-|     V19 | #1649              | list_cursor_backfill_repair        | shipped |
-|     V20 | ADR-091 / #1850    | blob_gc_claims                     | shipped |
-|     V21 | ADR-121 / ADR-160  | attachments_first_class            | shipped |
+| Version | Owning ADR / issue | Migration name                         | Status  |
+| ------: | ------------------ | -------------------------------------- | ------- |
+|      V1 | ADR-015            | initial_schema                         | shipped |
+|      V2 | ADR-051            | narrow_fts_sections_update_trigger     | shipped |
+|      V3 | ADR-051            | backfill_domain_mirror_atoms           | shipped |
+|      V4 | ADR-062            | fts_consolidation                      | shipped |
+|      V5 | ADR-056            | unique_comm_message_external_id        | shipped |
+|      V6 | ADR-081            | brain_retune_driver                    | shipped |
+|      V7 | #827               | notes_seq                              | shipped |
+|      V8 | #827               | notes_seq_repair                       | shipped |
+|      V9 | ADR-104            | entities_name_ci_index                 | shipped |
+|     V10 | ADR-111            | entities_content_ref                   | shipped |
+|     V11 | ADR-079            | ann_write_log                          | shipped |
+|     V12 | ADR-118            | ann_write_log_model_seq_index          | shipped |
+|     V13 | #1424 / #1462      | list_cursor_sequences                  | shipped |
+|     V14 | #1424 / #1462      | graph_edges_id_unique                  | shipped |
+|     V15 | #1597              | serve_ledger_attribution               | shipped |
+|     V16 | ADR-019 / #1474    | gtd_dependency_cycle_guards            | shipped |
+|     V17 | ADR-142 / #1700    | agents_ddl                             | shipped |
+|     V18 | #1479              | ann_consumer_pending                   | shipped |
+|     V19 | #1649              | list_cursor_backfill_repair            | shipped |
+|     V20 | ADR-091 / #1850    | blob_gc_claims                         | shipped |
+|     V21 | ADR-121 / ADR-160  | attachments_first_class                | shipped |
+|     V22 | #2166              | notes_unread_probe_recipient           | shipped |
+|     V23 | ADR-062 / #1907    | fts_record_kind                        | shipped |
+|     V24 | #2369              | fts_rowid_map                          | shipped |
+|     V25 | #2318              | notes_unread_probe_recipient_direction | shipped |
+|     V26 | #2273              | knowledge_fts_repair                   | shipped |
+
+> **V26 record (2026-08-29)**: `knowledge_fts_repair` recreates atom FTS against
+> the live-row `knowledge_atoms_fts_content` view, installs symmetric lifecycle
+> triggers, and rebuilds both knowledge external-content indexes. This makes
+> rank-1 FTS5 integrity checks meaningful while repairing historical section
+> drift that V2's trigger-only change could not heal.
 
 > **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
 > array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,
@@ -199,6 +211,18 @@ above remains the historical pre-consolidation record.
 > is derived from the marker row's absence, never stored. The V21 ledger row is
 > inserted only in the final transaction that swaps claim fences and drops
 > `entities.content_ref`.
+
+> **V22 record (2026-08-30, #2166)**:
+> `notes_unread_probe_recipient` replaces the recipient-blind unread partial
+> index with a recipient-leading shape used by comm inbox projections.
+
+> **V23 record (2026-08-30, ADR-062 / #1907)**:
+> `fts_record_kind` rebuilds the two shared FTS5 tables with an indexed
+> granular `record_kind` classifier. Existing entity and note rows backfill the
+> classifier from their base-table `kind`; unmatched legacy FTS rows are
+> retained with an empty classifier. Memory recall can therefore intersect
+> `record_kind : "memory"` inside MATCH before ranking while an exact SQL
+> predicate remains the correctness backstop.
 
 > **Phase 4a compatibility record (2026-08-16, ADR-111 / ADR-160)**: the
 > separately deployed GC compatibility epoch gate does not add attachments,

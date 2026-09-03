@@ -516,7 +516,28 @@ async fn dispatch_unbind_removes_binding() {
         )
         .await
         .unwrap();
+    assert_eq!(result["removed"], json!(1u64));
     assert_eq!(result["unbound"], json!(1u64));
+}
+
+#[tokio::test]
+async fn dispatch_unbind_reports_zero_when_selector_matches_nothing() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let result = pack
+        .dispatch(
+            "brain.unbind",
+            json!({"profile_id": "well-formed-but-unbound"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["removed"], json!(0u64));
+    assert_eq!(result["unbound"], json!(0u64));
 }
 
 // ── UE5-H1: brain.profiles lifecycle filter public API ───────────────────
@@ -7503,9 +7524,11 @@ mod event_counts_tests {
     use khive_types::{EventKind, SubstrateKind};
     use serde_json::Value;
 
-    /// Append a synthetic event directly through the `EventStore`, bypassing
-    /// verb dispatch, so the window boundary tests control `created_at` and
-    /// payload precisely instead of relying on wall-clock timing.
+    /// Append a synthetic event through the raw backend fixture seam, bypassing
+    /// verb dispatch, so analytics tests can control actor, `created_at`, and
+    /// payload precisely instead of relying on wall-clock timing. Production
+    /// pack code must use `KhiveRuntime::events`, whose token-scoped decorator
+    /// intentionally seals actor and namespace attribution.
     async fn seed_event(
         rt: &KhiveRuntime,
         token: &NamespaceToken,
@@ -7527,8 +7550,9 @@ mod event_counts_tests {
         if kind == EventKind::SearchExecuted && event.payload.get("result_kind").is_none() {
             event.payload["result_kind"] = json!("note");
         }
-        rt.events(token)
-            .expect("event store")
+        rt.backend()
+            .events_for_namespace(token.namespace().as_str())
+            .expect("trusted fixture event store")
             .append_event(event)
             .await
             .expect("seed event append");

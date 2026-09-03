@@ -11,7 +11,7 @@
 //! See `crates/khive-pack-brain/docs/api/fold-gate.md` for the full mass
 //! invariant, concurrency proof, why the decay math runs in Rust not SQL, and
 //! the scorer-dedup atomicity argument.
-use khive_runtime::RuntimeError;
+use khive_runtime::{EventAttribution, RuntimeError};
 use khive_storage::event::Event;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{SqlAccess, SqlWriter};
@@ -198,6 +198,7 @@ pub enum GateAndAppendOutcome {
 pub async fn apply_fold_gate_and_append_event<F>(
     sql: &dyn SqlAccess,
     namespace: &str,
+    attribution: EventAttribution,
     profile_id: &str,
     target_id: &str,
     gate_mode: FeedbackGateMode,
@@ -220,6 +221,7 @@ where
             apply_gate_and_append_within_tx(
                 writer,
                 &namespace,
+                &attribution,
                 &profile_id,
                 &target_id,
                 gate_mode,
@@ -252,6 +254,7 @@ where
 pub(crate) async fn apply_gate_and_append_within_tx<F>(
     writer: &mut dyn SqlWriter,
     namespace: &str,
+    attribution: &EventAttribution,
     profile_id: &str,
     target_id: &str,
     gate_mode: FeedbackGateMode,
@@ -278,7 +281,7 @@ where
         FeedbackGateMode::ForcedZero => (None, true),
     };
 
-    let event = build_event(fold_outcome.as_ref(), forced_zero);
+    let event = attribution.stamp(build_event(fold_outcome.as_ref(), forced_zero));
 
     khive_db::stores::event::append_event_on_writer(writer, &event)
         .await
@@ -1063,6 +1066,10 @@ mod tests {
 
         let (rt, _dir) = file_backed_runtime("fold-gate-append-failure-rollback.db");
         let sql = rt.sql();
+        let attribution = EventAttribution::from_token(
+            &rt.authorize(khive_runtime::Namespace::local())
+                .expect("authorize event attribution"),
+        );
 
         let namespace = "local";
         let profile_id = "rollback-profile";
@@ -1105,6 +1112,7 @@ mod tests {
         let first_attempt = apply_fold_gate_and_append_event(
             sql.as_ref(),
             namespace,
+            attribution.clone(),
             profile_id,
             target_id,
             FeedbackGateMode::Nominal(weight),
@@ -1193,6 +1201,7 @@ mod tests {
         let retry = apply_fold_gate_and_append_event(
             sql.as_ref(),
             namespace,
+            attribution,
             profile_id,
             target_id,
             FeedbackGateMode::Nominal(weight),
@@ -1200,11 +1209,11 @@ mod tests {
             Some((scorer_run_id, serve_ledger_id)),
             move |_fold_outcome, _forced_zero| {
                 Event::new(
-                    namespace.to_string(),
+                    "forged-namespace".to_string(),
                     "brain.feedback",
                     EventKind::FeedbackExplicit,
                     SubstrateKind::Event,
-                    "brain",
+                    "forged-actor",
                 )
                 .with_target(event_target)
             },
@@ -1302,6 +1311,34 @@ mod tests {
             "exactly one durable event for this target: the retry's — the failed \
              attempt's event insert rolled back with everything else in its transaction"
         );
+
+        let persisted = khive_storage::SqlReader::query_row(
+            reader.as_mut(),
+            SqlStatement {
+                sql: "SELECT namespace, actor FROM events WHERE target_id = ?1".into(),
+                params: vec![SqlValue::Text(event_target.to_string())],
+                label: None,
+            },
+        )
+        .await
+        .expect("read event attribution")
+        .expect("retry event must exist");
+        let persisted_namespace = match persisted.get("namespace") {
+            Some(SqlValue::Text(value)) => value.as_str(),
+            other => panic!("unexpected persisted namespace: {other:?}"),
+        };
+        assert_eq!(
+            persisted_namespace, "local",
+            "the atomic helper must replace a constructor-selected namespace"
+        );
+        let persisted_actor = match persisted.get("actor") {
+            Some(SqlValue::Text(value)) => value.as_str(),
+            other => panic!("unexpected persisted actor: {other:?}"),
+        };
+        assert_eq!(
+            persisted_actor, "anonymous:local",
+            "the atomic helper must replace a constructor-selected actor"
+        );
     }
 
     /// Proves the PR #497 fix: the
@@ -1321,6 +1358,10 @@ mod tests {
 
         let (rt, _dir) = file_backed_runtime("fold-gate-forced-zero-dedup-concurrency.db");
         let sql = rt.sql();
+        let attribution = EventAttribution::from_token(
+            &rt.authorize(khive_runtime::Namespace::local())
+                .expect("authorize event attribution"),
+        );
         const N: usize = 30;
         let now_us: i64 = 1_700_000_000_000_000;
         let scorer_run_id = "forced-zero-scorer-run";
@@ -1330,10 +1371,12 @@ mod tests {
         let mut handles = Vec::with_capacity(N);
         for _ in 0..N {
             let sql = Arc::clone(&sql);
+            let attribution = attribution.clone();
             handles.push(tokio::spawn(async move {
                 apply_fold_gate_and_append_event(
                     sql.as_ref(),
                     "local",
+                    attribution,
                     "forced-zero-profile",
                     "forced-zero-target",
                     FeedbackGateMode::ForcedZero,

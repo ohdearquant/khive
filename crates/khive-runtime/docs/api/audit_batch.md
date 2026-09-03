@@ -41,6 +41,7 @@ then joins the retained supervisor `JoinHandle`.
 Concurrent `submit()` calls that arrive while a driver iteration is draining the queue share the
 same generation and the same `append_events_idempotent()` call — this is the batching payoff.
 Each generation retries transient storage failures (`WriteQueueFull`, `WriterTaskBusy`,
+`WriterTaskRequestFailed{TransactionRolledBack}` and
 `WriterTaskTerminated{NotStarted | TransactionRolledBack | SideEffectsUnknown}`) up to
 `AuditBatchConfig::max_commit_attempts` with `retry_backoff` between attempts
 (`classify_store_error`). `Unsupported("append_events_idempotent")` and any other storage error

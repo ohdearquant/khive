@@ -75,7 +75,7 @@ schemars = "1.2"
 jsonschema = "0.46.10"
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
-lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder", "pool"] }
 async-imap = "0.9"
 async-native-tls = "0.5"
 mail-parser = "0.9"
@@ -94,7 +94,7 @@ dotenvy = "0.15"
 lattice-embed = "=0.9.0"
 lattice-inference = { version = "=0.9.0", default-features = false }
 lattice-fann = "=0.9.0"
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 rand = "0.8"
 rand_distr = "0.4"
 toml = "0.8"
@@ -110,6 +110,9 @@ tempfile = "3"
 lru = "0.18"
 sha2 = "0.10"
 hex = "0.4"
+# lattice-embed 0.9.0 activates `pure` for this shared instance. The measured
+# performance risk is accepted only while 0.9.0 is pinned; evidence and the
+# merged 0.10.0 exit are recorded in docs/benchmarks/blake3-pure-0.9.0.md.
 blake3 = { version = "1", default-features = false }
 # Cross-platform filesystem free-space query for BlobStore's fail-closed
 # floor check (khive#292). Pure Rust (rustix on Unix, windows-sys on

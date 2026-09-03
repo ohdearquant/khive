@@ -1794,9 +1794,10 @@ async fn pooled_entity_read_classifies_exhaustion_and_cancellation_distinctly() 
         .conn()
         .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
         .unwrap();
-    // `is_file_backed = false` over a file pool forces the pooled-reader
-    // branch, so the checkout contends on the single pooled reader held below.
-    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+    // Production-shaped file-backed reads must contend on the same bounded
+    // reader pool. Before ADR-165 Slice 2 they opened a fresh standalone
+    // connection here, silently bypassing the sole pooled reader held below.
+    let store = SqlEntityStore::new(Arc::clone(&pool), true);
     let held_reader = pool.reader().expect("hold the sole pooled reader");
 
     // Admission expiry with no cancellation: `checkout_timeout` runs to
@@ -1810,7 +1811,7 @@ async fn pooled_entity_read_classifies_exhaustion_and_cancellation_distinctly() 
 
     // Cancellation before checkout: must return promptly as the non-retryable
     // Timeout, never AdmissionTimeout, and never wait out `checkout_timeout`.
-    let cancel_store = SqlEntityStore::new(Arc::clone(&pool), false);
+    let cancel_store = SqlEntityStore::new(Arc::clone(&pool), true);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let waiting = tokio::spawn(khive_storage::scope_request_read_cancellation(
         cancel_rx,
@@ -1830,4 +1831,13 @@ async fn pooled_entity_read_classifies_exhaustion_and_cancellation_distinctly() 
     );
 
     drop(held_reader);
+    let reader = pool.reader_acquisition_snapshot();
+    assert_eq!(reader.pooled_checkouts, 1);
+    assert_eq!(reader.checkout_timeouts, 1);
+    assert_eq!(reader.completed_pooled_checkouts, 1);
+    assert_eq!(reader.active_pooled_checkouts, 0);
+    assert_eq!(
+        reader.standalone_opens, 0,
+        "neither saturation nor cancellation may fall back to a standalone reader"
+    );
 }

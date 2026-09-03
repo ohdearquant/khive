@@ -824,3 +824,63 @@ mean the queue never accepted the request. Non-busy/non-locked BEGIN failures
 remain generic pool errors. `comm.send` preserves this typed retryable result
 without adding an outbound delivery probe: `comm.delivered` remains reserved
 for `SideEffectsUnknown`, where a write may already have committed.
+
+## Amendment 5 (2026-08-30): Ordinary proven-rollback finality
+
+This amendment supersedes Amendment 3's statement that a verified rollback after an ordinary
+operation or COMMIT error returns the unwrapped source error, and Amendment 2's flat-MCP-envelope
+claim. The finalizer must retain both facts:
+the original error determines capability and retry policy, while the verified rollback determines
+effect finality.
+
+After an operation error or COMMIT error, `ROLLBACK` success counts only when the same connection is
+back in autocommit mode. That path returns
+`StorageError::WriterTaskRequestFailed { request_state: TransactionRolledBack, source }`, where
+`source` is the original operation error or the `writer_task_commit` pool error. The wrapper is
+non-terminal: the drain loop receives no terminal state, the writer serves the next request, and
+the failed request closure is invoked exactly once. Its classifiers delegate to `source`; a proven
+rollback makes replay safe from duplicate SQLite effects but does not declare every source error
+transient.
+
+An unverified rollback remains `WriterTaskTerminated { request_state: SideEffectsUnknown }`, retires
+the writer seam, and never exposes the original error as though finality were known. Panic handling
+is unchanged: a caught wrapped panic is terminal even when its transaction rolls back.
+
+Runtime exposes the state, source retryability, and task-liveness bit as typed context. MCP emits
+that context under `writer_task_request_failed` or `writer_task_terminated`, with
+`request_state`, `task_terminated`, and `retryable` fields. Events protocol v3 carries a tagged
+request-failed versus task-terminated disposition, so `TransactionRolledBack` cannot be
+reconstructed as a terminal writer error merely because it crossed the daemon socket.
+
+## Amendment 6 (2026-08-29): Bounded pre-execution BEGIN retry
+
+The writer task absorbs a small, bounded number of the retry-safe refusals
+classified by Amendment 4. A transaction-wrapped request makes at most three
+total `BEGIN IMMEDIATE` attempts, with fixed 5 ms and 10 ms backoffs after the
+first two busy/locked refusals. The attempts share one acquisition budget: the
+connection's configured SQLite `busy_timeout`, measured from the first
+attempt. Before each retry the task subtracts the time already spent and
+lowers the connection's `busy_timeout` to the remainder; a busy/locked refusal
+that arrives with no budget left surfaces immediately instead of retrying.
+Persistent contention is therefore bounded to one busy-timeout window plus
+15 ms of explicit backoff, never three windows. When a retry lowered the
+timeout, the configured value is restored on the connection before the next
+request is dequeued. A non-busy BEGIN error is never retried.
+
+The retry loop is immediately around `BEGIN IMMEDIATE`, before the task
+transfers the request's `FnOnce` operation closure to execution. Success runs
+that closure exactly once. Exhaustion runs it zero times and preserves the
+Amendment 4 `StorageError::WriterTaskBusy` result and runtime/MCP fields:
+`writer_task_begin_busy`, `retryable: true`,
+`operation: "writer_task_begin"`, no admission scope, and no admission retry
+hint. Request-body failures, COMMIT, ROLLBACK, top-level operations, and every
+ambiguous or terminal path remain single-pass and are never replayed.
+
+Observability distinguishes absorbed from surfaced refusals without changing
+the existing counter's meaning. `writer_task_begin_busy` keeps counting every
+busy/locked `BEGIN IMMEDIATE` refusal, whether or not another internal attempt
+follows it, so a nonzero value reflects total contention regardless of retry
+policy. `writer_task_begin_busy_absorbed` counts the subset of those refusals
+that was followed by another internal attempt; the refusals surfaced to the
+caller are the difference between the two. Both are published as concrete
+`u64` values under `db_diagnostics.writer_contention`.
