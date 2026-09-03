@@ -1454,9 +1454,12 @@ request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 
 List and page through the caller's filtered inbound messages (default) or sent
 history (`box="sent"`).
-The response keeps the inbox envelope. `unread_count` is the exact mailbox-wide
-unread count for the caller — independent of the page window and of `status`
-and sender filters — and is zero for sent rows.
+The response keeps the inbox envelope and adds explicit bounded-count metadata.
+`unread_count` is the mailbox-wide unread count for the caller — independent of
+the page window and of `status` and sender filters — and is exact below
+`unread_count_cap` (1,000). When `unread_count_saturated` is `true`, the count
+equals the cap and means "at least this many"; `false` means it is exact. Sent
+rows report zero and `false`.
 With `wait_ms`, an initially empty fully filtered page waits for a newly
 committed matching message and otherwise returns at the deadline.
 
@@ -1505,6 +1508,9 @@ are errors. Omit it for the existing full-body response.
 
 Count-only view of the caller's unread inbound messages — the same filter as
 `comm.inbox(status="unread")`, without message payloads. Takes no parameters.
+Returns `{count, count_cap, count_saturated, actor}` with the same 1,000-row
+bound as the inbox metadata: `count_saturated=false` is exact, while `true`
+means `count == count_cap` is a lower bound.
 
 ```
 request(ops="comm.unread()")

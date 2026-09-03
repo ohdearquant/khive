@@ -177,25 +177,53 @@ admits legacy outbound rows without `from_actor`. `to_actor` is an optional
 exact recipient filter for the sent box. Read `status` and sender filters are
 inbox-only and are rejected with `box="sent"`, while `to_actor` is rejected for
 the default inbox, so a misplaced filter cannot silently return the wrong box.
-The existing envelope remains stable. For the default inbox, `unread_count` is
-the exact caller's mailbox-wide unread count — independent of the page window
-and of `status` and sender filters. Its partial-index-backed count is bounded
-by the unread population rather than total mailbox size. It is zero for the
-sent box because outbound rows have no recipient read state.
+The existing envelope fields remain stable. For the default inbox,
+`unread_count` is the caller's mailbox-wide unread count — independent of the
+page window and of `status` and sender filters — and is exact below
+`unread_count_cap` (1,000). `unread_count_saturated=false` means the number is
+exact, including when it equals the cap; `true` means the value is the lower
+bound "at least 1,000". The addressed and legacy-recipient partitions are
+counted through cap-limited subqueries in one storage snapshot, served by
+`idx_notes_unread_probe_recipient_direction` (recipient AND direction are both
+index key columns), so the work is bounded by the cap and the caller's own
+unread inbound population — never by the recipient's own outbound send
+history, which every `comm.send` durably extends but which the direction key
+excludes from the scan. The sent box reports zero and
+`unread_count_saturated=false` because outbound rows have no recipient read
+state.
 
-Every caller is filtered by `to_actor = caller OR to_actor IS NULL`. A
-configured actor therefore sees messages addressed to that actor plus legacy
-rows without `to_actor`. The anonymous `"local"` fallback sees messages
+Every caller is filtered by `to_actor = caller OR to_actor IS NULL`, expressed
+as one `FilterOp::EqOrLegacyIndexed` predicate over the recipient-scoped
+`ifnull(json_extract(properties, '$.to_actor'), '')` expression rather than
+the two-branch `OR` form — see `FilterOp::EqOrLegacyIndexed` in
+`crates/khive-storage/src/note.rs` for why a present-but-empty `to_actor`
+value still excludes the row rather than matching through the legacy branch.
+A configured actor therefore sees messages addressed to that actor plus
+legacy rows without `to_actor`. The anonymous `"local"` fallback sees messages
 addressed to `"local"` plus the same legacy rows; it does not bypass the filter
 or expose messages explicitly addressed to another actor.
 
 `from_actor`/`from_prefix` (#493) sender filters are mutually exclusive.
-Direction + read-status + `to_actor` filters are pushed into SQL so
-`idx_comm_message_direction`/`idx_comm_message_to_actor` are usable; the read
-filter uses `json_type` to match the old `as_bool().unwrap_or(false)` semantics —
-only JSON boolean `true` counts as read, missing/false/string/integer all count as
-unread. Exact `from_actor` and inclusive `since` (`created_at >=`) also stay in
-SQL. `from_prefix`, `exclude_from_actor`, exclusive `before`, and case-insensitive
+Direction + read-status + `to_actor` filters are pushed into SQL. For
+`status="unread"`, `EqOrLegacyIndexed`'s `ifnull(...)` expression matches
+`idx_notes_unread_probe_recipient_direction`'s key, so the listing seeks that
+recipient-scoped partial index the same way the unread count does: work scales
+with the caller's own unread inbound set, never with other actors' backlog or
+the caller's own outbound send history. For `status="read"`/`"all"`, no index
+in the current schema carries that same `ifnull(...)` key outside the
+unread-only partial index — and, measured directly rather than assumed, even
+forcing the general, non-partial `idx_comm_message_to_actor` index (keyed on
+the raw `json_extract(...)` expression, without the `ifnull` wrapper) does not
+yield a recipient-scoped seek for this `OR`-shaped predicate. Both listings
+therefore still fall back to `idx_comm_message_direction` (namespace + kind +
+direction + read only) and scan every inbound, or every, message in the
+namespace regardless of recipient. That gap is unresolved by this change;
+closing it needs a new non-partial `ifnull`-keyed index (a schema/migration
+change), not a `FilterOp` change. The read filter uses `json_type` to match
+the old `as_bool().unwrap_or(false)` semantics — only JSON boolean `true`
+counts as read, missing/false/string/integer all count as unread. Exact
+`from_actor` and inclusive `since` (`created_at >=`) also stay in SQL.
+`from_prefix`, `exclude_from_actor`, exclusive `before`, and case-insensitive
 `subject_contains`/`content_contains` have no corresponding `FilterOp`, so they
 are applied over an unbounded paged scan in Rust.
 
@@ -208,6 +236,11 @@ is inclusive and `before` is exclusive, both RFC 3339 and both evaluated against
 the top-level note `created_at` exposed in the response, not optional transport
 metadata in `properties.sent_at`. Empty substring filters are rejected, and a
 missing/non-string subject does not match `subject_contains`.
+
+Each underlying filtered-note window is count-free: storage runs the limited
+row query only and declines an exact page total. One lookahead row supplies
+`has_more`, so a small inbox page no longer performs a full matching-set
+`COUNT(*)` before reading its rows.
 
 `fields` is the same strict, non-empty projection used by `comm.thread`.
 Omitting it preserves the full message object. The accepted top-level names are

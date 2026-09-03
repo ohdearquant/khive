@@ -119,7 +119,7 @@ async fn require_existing_thread_root(
     };
     let store = runtime.notes(token)?;
     let page = store
-        .query_notes_filtered(
+        .query_notes_filtered_count_free(
             token.namespace().as_str(),
             &filter,
             PageRequest {
@@ -554,7 +554,7 @@ pub(crate) async fn handle_inbox(
     }
 
     if raw_limit == 0 {
-        let unread_count = if mailbox == "inbox" {
+        let unread = if mailbox == "inbox" {
             let store = runtime.notes(token)?;
             count_unread_messages(
                 store.as_ref(),
@@ -563,12 +563,14 @@ pub(crate) async fn handle_inbox(
             )
             .await?
         } else {
-            0
+            UnreadCount::zero()
         };
         return Ok(json!({
             "messages": [],
             "count": 0,
-            "unread_count": unread_count,
+            "unread_count": unread.count,
+            "unread_count_cap": unread.cap,
+            "unread_count_saturated": unread.saturated,
             "offset": offset,
             "next_offset": Value::Null,
             "has_more": false,
@@ -609,11 +611,15 @@ pub(crate) async fn handle_inbox(
     }
 
     if mailbox == "inbox" {
-        // ADR-057 Q3: to_actor filter, EqOrMissing so legacy to_actor-less messages stay
-        // visible; closes the #199 multi-actor read leak for non-"local" callers.
+        // ADR-057 Q3: to_actor filter, legacy to_actor-less messages stay visible;
+        // closes the #199 multi-actor read leak for non-"local" callers.
+        // EqOrLegacyIndexed (not EqOrMissing) so this seeks
+        // idx_notes_unread_probe_recipient_direction on status="unread" instead of
+        // falling back to a namespace-wide direction-only scan; both partitions match
+        // the same rows EqOrMissing would (khive-storage/src/note.rs FilterOp docs).
         property_filters.push(PropertyFilter {
             json_path: "$.to_actor".to_string(),
-            op: FilterOp::EqOrMissing,
+            op: FilterOp::EqOrLegacyIndexed,
             value: SqlValue::Text(caller_actor.clone()),
         });
         if let Some(from_actor) = p.from_actor.as_ref() {
@@ -759,7 +765,7 @@ async fn query_inbox_response(
         let mut db_offset: u64 = 0;
         loop {
             let page = store
-                .query_notes_filtered(
+                .query_notes_filtered_count_free(
                     namespace,
                     filter,
                     PageRequest {
@@ -792,7 +798,7 @@ async fn query_inbox_response(
         collected
     } else {
         let page = store
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 namespace,
                 filter,
                 PageRequest {
@@ -810,10 +816,10 @@ async fn query_inbox_response(
     }
     let count = messages.len();
     // This is a mailbox-wide signal; page and status filters only shape `messages`.
-    let unread_count = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
+    let unread = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
         count_unread_messages(store, namespace, caller_actor).await?
     } else {
-        0
+        UnreadCount::zero()
     };
     let next_offset = if has_more {
         Some(offset.checked_add(count as u64).ok_or_else(|| {
@@ -829,7 +835,9 @@ async fn query_inbox_response(
     Ok(json!({
         "messages": messages,
         "count": count,
-        "unread_count": unread_count,
+        "unread_count": unread.count,
+        "unread_count_cap": unread.cap,
+        "unread_count_saturated": unread.saturated,
         "offset": offset,
         "next_offset": next_offset,
         "has_more": has_more,
@@ -846,17 +854,41 @@ pub(crate) async fn handle_unread(
     let _: UnreadParams = deser(params)?;
     let caller_actor = token.actor().id.clone();
     let store = runtime.notes(token)?;
-    let count =
+    let unread =
         count_unread_messages(store.as_ref(), token.namespace().as_str(), &caller_actor).await?;
 
-    Ok(json!({ "count": count, "actor": caller_actor }))
+    Ok(json!({
+        "count": unread.count,
+        "count_cap": unread.cap,
+        "count_saturated": unread.saturated,
+        "actor": caller_actor,
+    }))
+}
+
+const UNREAD_COUNT_CAP: u32 = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnreadCount {
+    count: u64,
+    cap: u64,
+    saturated: bool,
+}
+
+impl UnreadCount {
+    fn zero() -> Self {
+        Self {
+            count: 0,
+            cap: u64::from(UNREAD_COUNT_CAP),
+            saturated: false,
+        }
+    }
 }
 
 async fn count_unread_messages(
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
     caller_actor: &str,
-) -> Result<u64, RuntimeError> {
+) -> Result<UnreadCount, RuntimeError> {
     let base_filters = vec![
         PropertyFilter {
             json_path: "$.direction".to_string(),
@@ -885,15 +917,22 @@ async fn count_unread_messages(
     };
     // Count the disjoint addressed and legacy-recipient partitions in one
     // storage snapshot. Both predicates retain the recipient key expression
-    // required by idx_notes_unread_probe_recipient; the legacy partition's
-    // empty key includes both absent and explicit JSON-null recipients.
+    // required by idx_notes_unread_probe_recipient_direction, and the
+    // leading `direction = 'inbound'` filter in base_filters retains that
+    // index's direction key column, so the scan never walks the recipient's
+    // own outbound send history (every comm.send leaves a durable outbound
+    // copy addressed to the recipient that is never marked read). Each
+    // limited subquery stops after cap + 1 matches; together they retain the
+    // exact value below the public cap and make saturation explicit above
+    // it.
     let counts = store
-        .count_notes_filtered_in_snapshot(
+        .count_notes_filtered_bounded_in_snapshot(
             namespace,
             &[
                 count_filter(FilterOp::EqOrMissingIndexed),
                 count_filter(FilterOp::JsonTypeMissingOrNullIndexed),
             ],
+            UNREAD_COUNT_CAP,
         )
         .await?;
     let [exact, legacy] = counts.as_slice() else {
@@ -901,7 +940,18 @@ async fn count_unread_messages(
             "comm.unread: storage returned an invalid partition count vector".into(),
         ));
     };
-    Ok(exact + legacy)
+    let cap = u64::from(UNREAD_COUNT_CAP);
+    if exact.cap != cap || legacy.cap != cap {
+        return Err(RuntimeError::Internal(
+            "comm.unread: storage returned an invalid bounded-count cap".into(),
+        ));
+    }
+    let observed = exact.count.saturating_add(legacy.count);
+    Ok(UnreadCount {
+        count: observed.min(cap),
+        cap,
+        saturated: exact.saturated || legacy.saturated || observed > cap,
+    })
 }
 
 /// `read` — mark a message as read.
@@ -1666,7 +1716,7 @@ pub(crate) async fn handle_thread(
     let mut seen_row_ids = HashSet::new();
     loop {
         let page = thread_store
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &thread_filter,
                 PageRequest {
@@ -1993,7 +2043,7 @@ pub(crate) async fn handle_ingest(
                     ..Default::default()
                 };
                 let corr_page = store
-                    .query_notes_filtered(
+                    .query_notes_filtered_count_free(
                         ns,
                         &corr_filter,
                         PageRequest {
@@ -2060,7 +2110,7 @@ pub(crate) async fn handle_ingest(
                         ..Default::default()
                     };
                     let thread_page = store
-                        .query_notes_filtered(
+                        .query_notes_filtered_count_free(
                             ns,
                             &thread_filter,
                             PageRequest {
@@ -2213,7 +2263,7 @@ pub(crate) async fn handle_ingest(
                 ..Default::default()
             };
             let duplicate_page = store
-                .query_notes_filtered(
+                .query_notes_filtered_count_free(
                     ns,
                     &duplicate_filter,
                     PageRequest {
@@ -2727,7 +2777,7 @@ pub(crate) async fn handle_health(
         ..Default::default()
     };
     let page = store
-        .query_notes_filtered(
+        .query_notes_filtered_count_free(
             token.namespace().as_str(),
             &filter,
             PageRequest {
