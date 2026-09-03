@@ -26,6 +26,8 @@ import {
 } from "@/icons";
 import {
   type CSSProperties,
+  type Dispatch,
+  type SetStateAction,
   useEffect,
   useId,
   useMemo,
@@ -74,10 +76,16 @@ type Icon = typeof Network;
 type ModuleMap = Map<string, RepoModule>;
 type AnalysisWindow =
   RepoBundle["aggregates"]["hidden_coupling"]["meta"]["window"];
+type StructureGraphSelection = Readonly<{
+  subtreeId: string;
+  selectedId: string;
+}>;
 type ViewProps = Readonly<{
   bundle: RepoBundle;
   moduleById: ModuleMap;
   selectedModuleId: string | null;
+  structureGraphSelection: StructureGraphSelection;
+  onStructureGraphSelection: Dispatch<SetStateAction<StructureGraphSelection>>;
   onInspectModule: (moduleId: string) => void;
   onExploreStructure: () => void;
 }>;
@@ -494,13 +502,14 @@ function StructureGraph({
   bundle,
   moduleById,
   selectedModuleId,
+  structureGraphSelection,
+  onStructureGraphSelection,
   onInspectModule,
 }: ViewProps) {
   const { graph, capability } = bundle;
   const labels = capability.labels;
-  const [subtreeId, setSubtreeId] = useState(graph.repository.id);
+  const { subtreeId, selectedId } = structureGraphSelection;
   const [zoom, setZoom] = useState(1);
-  const [selectedId, setSelectedId] = useState(graph.repository.id);
   const [lens, setLens] = useState<"structure" | "hidden_coupling">(
     "structure",
   );
@@ -677,8 +686,15 @@ function StructureGraph({
     lens === "hidden_coupling" && focusedModuleIds?.has(id) === true;
   const compactGraphLabels =
     displayedModules.length > DENSE_GRAPH_LABEL_THRESHOLD;
+  const selectGraphNode = (nodeId: string) => {
+    onStructureGraphSelection((current) =>
+      current.subtreeId === subtreeId && current.selectedId === nodeId
+        ? current
+        : { subtreeId, selectedId: nodeId }
+    );
+  };
   const inspectCouplingEndpoint = (moduleId: string) => {
-    setSelectedId(moduleId);
+    selectGraphNode(moduleId);
     onInspectModule(moduleId);
   };
 
@@ -692,8 +708,12 @@ function StructureGraph({
               aria-label={`${labels.node_types.package} · ${capability.views.structure_graph.label}`}
               value={subtreeId}
               onChange={(event) => {
-                setSubtreeId(event.target.value);
-                setSelectedId(event.target.value);
+                const nextId = event.target.value;
+                onStructureGraphSelection((current) =>
+                  current.subtreeId === nextId && current.selectedId === nextId
+                    ? current
+                    : { subtreeId: nextId, selectedId: nextId }
+                );
                 setFocusedPairKey(null);
               }}
             >
@@ -901,7 +921,7 @@ function StructureGraph({
               type="button"
               aria-pressed={selectedId === graph.repository.id}
               onClick={() => {
-                setSelectedId(graph.repository.id);
+                selectGraphNode(graph.repository.id);
                 setFocusedPairKey(null);
               }}
             >
@@ -933,7 +953,7 @@ function StructureGraph({
                   aria-pressed={selectedId === item.id}
                   key={item.id}
                   onClick={() => {
-                    setSelectedId(item.id);
+                    selectGraphNode(item.id);
                     setFocusedPairKey(null);
                   }}
                 >
@@ -969,7 +989,7 @@ function StructureGraph({
                   aria-pressed={selectedId === item.id}
                   key={item.id}
                   onClick={() => {
-                    setSelectedId(item.id);
+                    selectGraphNode(item.id);
                     setFocusedPairKey(null);
                   }}
                 >
@@ -2983,6 +3003,8 @@ function ActiveView({
   bundle,
   moduleById,
   selectedModuleId,
+  structureGraphSelection,
+  onStructureGraphSelection,
   onInspectModule,
   onExploreStructure,
 }: ViewProps & { id: ViewId }) {
@@ -2999,6 +3021,8 @@ function ActiveView({
         bundle={bundle}
         moduleById={moduleById}
         selectedModuleId={selectedModuleId}
+        structureGraphSelection={structureGraphSelection}
+        onStructureGraphSelection={onStructureGraphSelection}
         onInspectModule={onInspectModule}
         onExploreStructure={onExploreStructure}
       />
@@ -3035,6 +3059,12 @@ export function RepoShowcase({
   const [selectedModuleId, setSelectedModuleId] = useState<string | null>(
     defaultModuleId,
   );
+  const [structureGraphSelection, setStructureGraphSelection] = useState<
+    StructureGraphSelection
+  >({
+    subtreeId: bundle.graph.repository.id,
+    selectedId: bundle.graph.repository.id,
+  });
   const [unresolvedModule, setUnresolvedModule] = useState<Readonly<{
     path: string;
     reason: string;
@@ -3050,10 +3080,17 @@ export function RepoShowcase({
   const moduleInspectorRef = useRef<HTMLElement>(null);
   const dashboardRef = useRef<HTMLDivElement>(null);
   const copyLinkRef = useRef<HTMLButtonElement>(null);
+  // Tracks the location this effect last finished applying, so a rerun
+  // triggered only by dependency identity churn (a fresh module list from
+  // the same navigation) can be told apart from an actual location change.
+  const appliedLocationHrefRef = useRef<string | null>(null);
 
   useEffect(() => {
     function restoreLocation(announce = false) {
-      const parsed = parseRepositoryLocation(new URL(window.location.href));
+      const requestHref = window.location.href;
+      const isLocationChange = announce ||
+        appliedLocationHrefRef.current !== requestHref;
+      const parsed = parseRepositoryLocation(new URL(requestHref));
       const requestedPath = parsed.location.modulePath;
       const requestedModuleId = parsed.location.moduleId;
       const messages = parsed.issues.map((issue) => issue.message);
@@ -3106,6 +3143,47 @@ export function RepoShowcase({
       }
 
       setSelectedModuleId(nextModuleId);
+      const restoredModule = resolvedModuleRestore && nextModuleId
+        ? moduleById.get(nextModuleId) ?? null
+        : null;
+      const rootGraphSelection = {
+        subtreeId: bundle.graph.repository.id,
+        selectedId: bundle.graph.repository.id,
+      };
+      const nextGraphSelection = restoredModule
+        ? {
+            subtreeId: restoredModule.package_id,
+            selectedId: restoredModule.id,
+          }
+        : rootGraphSelection;
+      setStructureGraphSelection((current) => {
+        const currentSelectionIsValid =
+          (current.subtreeId === bundle.graph.repository.id ||
+            bundle.graph.packages.items.some((item) =>
+              item.id === current.subtreeId
+            )) &&
+          (current.selectedId === bundle.graph.repository.id ||
+            bundle.graph.packages.items.some((item) =>
+              item.id === current.selectedId
+            ) || moduleById.has(current.selectedId));
+        if (!isLocationChange) {
+          // A rerun triggered only by dependency identity churn (e.g. a
+          // fresh module-list reference for the same bundle) is not a
+          // navigation: keep the user's current graph selection, repairing
+          // it only if it no longer resolves against this bundle.
+          return currentSelectionIsValid ? current : nextGraphSelection;
+        }
+        if (!restoredModule && currentSelectionIsValid) {
+          return current;
+        }
+        if (
+          current.subtreeId === nextGraphSelection.subtreeId &&
+          current.selectedId === nextGraphSelection.selectedId
+        ) {
+          return current;
+        }
+        return nextGraphSelection;
+      });
       setUnresolvedModule(nextUnresolved);
       setActiveView(nextView);
       setCopyStatus("");
@@ -3150,6 +3228,7 @@ export function RepoShowcase({
           `${canonical.pathname}${canonical.search}${canonical.hash}`,
         );
       }
+      appliedLocationHrefRef.current = canonical.href;
     }
 
     const handlePopState = () => restoreLocation(true);
@@ -3158,6 +3237,8 @@ export function RepoShowcase({
     return () => window.removeEventListener("popstate", handlePopState);
   }, [
     capability.views,
+    bundle.graph.packages.items,
+    bundle.graph.repository.id,
     defaultModuleId,
     moduleById,
     modulesBySourcePath,
@@ -3204,13 +3285,28 @@ export function RepoShowcase({
       "",
       `${next.pathname}${next.search}${next.hash}`,
     );
+    // An in-app navigation sets its own state explicitly; a later rerun of
+    // the location-sync effect must treat this location as already applied.
+    appliedLocationHrefRef.current = window.location.href;
   }
 
-  function selectModule(moduleId: string) {
-    if (!moduleById.has(moduleId)) return;
+  function selectModule(
+    moduleId: string,
+    { alignStructureGraph = true }: { alignStructureGraph?: boolean } = {},
+  ) {
+    const selected = moduleById.get(moduleId);
+    if (!selected) return;
     pushLocation(moduleId, activeView);
     setNavigationStatus("");
     setSelectedModuleId(moduleId);
+    if (alignStructureGraph) {
+      setStructureGraphSelection((current) =>
+        current.subtreeId === selected.package_id &&
+          current.selectedId === selected.id
+          ? current
+          : { subtreeId: selected.package_id, selectedId: selected.id }
+      );
+    }
     setUnresolvedModule(null);
     setLocationNotice(null);
     setCopyStatus("");
@@ -3233,16 +3329,22 @@ export function RepoShowcase({
     if (defaultModuleId) inspectModule(defaultModuleId);
   }
 
-  function normalizeCurrentLocation() {
-    const next = locationFor(
-      selectedModuleId,
-      activeView,
-      unresolvedModule?.path ?? null,
-    );
+  // Every in-app replaceState must also mark the new location as applied:
+  // the location-sync effect treats a sentinel that no longer matches the
+  // current href as a real navigation and would re-derive the selection from
+  // the URL, discarding the user's in-graph selection.
+  function replaceLocationAsApplied(next: URL) {
     window.history.replaceState(
       null,
       "",
       `${next.pathname}${next.search}${next.hash}`,
+    );
+    appliedLocationHrefRef.current = window.location.href;
+  }
+
+  function normalizeCurrentLocation() {
+    replaceLocationAsApplied(
+      locationFor(selectedModuleId, activeView, unresolvedModule?.path ?? null),
     );
     setLocationNotice(null);
     setCopyStatus("");
@@ -3272,11 +3374,7 @@ export function RepoShowcase({
       const sourceHref = window.location.href;
       await navigator.clipboard.writeText(share.href);
       if (window.location.href === sourceHref && current.href !== sourceHref) {
-        window.history.replaceState(
-          null,
-          "",
-          `${current.pathname}${current.search}${current.hash}`,
-        );
+        replaceLocationAsApplied(current);
         setLocationNotice(null);
       }
       setCopyStatus("Investigation link copied.");
@@ -3313,6 +3411,12 @@ export function RepoShowcase({
   function inspectModule(moduleId: string) {
     if (!moduleById.has(moduleId)) return;
     selectModule(moduleId);
+    focusAndScrollInspector();
+  }
+
+  function inspectModuleFromGraph(moduleId: string) {
+    if (!moduleById.has(moduleId)) return;
+    selectModule(moduleId, { alignStructureGraph: false });
     focusAndScrollInspector();
   }
   return (
@@ -3463,7 +3567,7 @@ export function RepoShowcase({
                 className={activeView === id ? "active" : ""}
                 aria-current={activeView === id ? "page" : undefined}
                 key={id}
-                onClick={() => selectView(id)}
+                onClick={() => openAnalysis(id)}
               >
                 <Icon aria-hidden="true" />
                 <span>{view.label}</span>
@@ -3487,7 +3591,11 @@ export function RepoShowcase({
             bundle={bundle}
             moduleById={moduleById}
             selectedModuleId={selectedModuleId}
-            onInspectModule={inspectModule}
+            structureGraphSelection={structureGraphSelection}
+            onStructureGraphSelection={setStructureGraphSelection}
+            onInspectModule={activeView === "structure_graph"
+              ? inspectModuleFromGraph
+              : inspectModule}
             onExploreStructure={() => selectView("structure_graph")}
           />
         </section>

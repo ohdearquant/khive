@@ -451,6 +451,7 @@ impl PackRuntime for MemoryPack {
         // population check below is genuinely load-only and remains useful.
         if !self.runtime.is_read_only() {
             crate::ann::warm_existing_memory_indexes(&self.runtime, &self.ann).await;
+            crate::ann::start_rotation_watcher(&self.runtime, &self.ann);
         }
         fts_population_guard(&self.runtime).await;
     }
@@ -570,6 +571,7 @@ mod recall_future_footprint_tests {
     use khive_runtime::{Namespace, VerbRegistryBuilder};
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn deadline_wrapper_does_not_embed_the_recall_pipeline() {
         // Measure on an explicitly roomy stack so the regression reports the
         // historical inline footprint instead of aborting the test process.
@@ -852,6 +854,7 @@ mod ann_route_tests {
     /// See `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_second_call_uses_warm_ann_route() {
         let tmp = tempfile::Builder::new()
             .prefix("khive-memory-ann-route-")
@@ -938,6 +941,82 @@ mod ann_route_tests {
     }
 }
 
+/// Pack-level lifecycle coverage for `start_rotation_watcher`'s production
+/// wiring (issue #2340): the rotation tests in `ann.rs` call the private
+/// `refresh_rotated_segments_once` test helper directly, so nothing
+/// previously asserted that a writable `warm()` actually starts the tracked
+/// watcher, that a repeated `warm()` is idempotent, or that the watcher
+/// exits once its `AnnState` is dropped. Time is paused so the watcher's
+/// 5-second tick can be crossed deterministically instead of by a real
+/// sleep. `#[serial(background_tasks)]` matches every other test in this
+/// crate that reads the process-wide `background_task_count()` counter,
+/// since memory's warm-rebuild chain also tracks through it.
+#[cfg(test)]
+mod rotation_watcher_lifecycle_tests {
+    use super::*;
+
+    use khive_runtime::RuntimeConfig;
+    use serial_test::serial;
+
+    #[tokio::test(start_paused = true)]
+    #[serial(background_tasks)]
+    async fn writable_warm_starts_one_tracked_watcher_idempotently_and_it_exits_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = RuntimeConfig {
+            db_path: Some(dir.path().join("rotation-watcher-lifecycle.db")),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::new(config).expect("writable runtime");
+        let pack = MemoryPack::new(rt);
+        let ann = pack.ann_for_test();
+
+        let before = khive_runtime::background_task_count();
+        pack.warm().await;
+        assert!(
+            crate::ann::rotation_watch_started_for_test(&ann),
+            "a writable warm must start the rotation watcher"
+        );
+        assert_eq!(
+            khive_runtime::background_task_count(),
+            before + 1,
+            "warm must track exactly one rotation watcher task"
+        );
+
+        // A repeated warm must not start a second tracked watcher.
+        pack.warm().await;
+        assert_eq!(
+            khive_runtime::background_task_count(),
+            before + 1,
+            "a repeated warm must be idempotent and not start a second watcher"
+        );
+
+        // The watcher retains only a Weak<AnnState>; dropping every strong
+        // reference lets its next tick observe the failed upgrade and exit.
+        let ann_weak = std::sync::Arc::downgrade(&ann);
+        drop(ann);
+        drop(pack);
+        assert!(
+            ann_weak.upgrade().is_none(),
+            "dropping the pack and the test's own clone must drop the last strong ANN reference"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        for _ in 0..100 {
+            if khive_runtime::background_task_count() == before {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            khive_runtime::background_task_count(),
+            before,
+            "the watcher must exit once its ANN state is dropped"
+        );
+    }
+}
+
 /// Mutation-hook tests assert ANN generation staleness directly after corpus changes.
 /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
 #[cfg(test)]
@@ -1015,6 +1094,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn prune_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1045,6 +1125,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_update_reindex_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1072,6 +1153,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_delete_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1101,6 +1183,7 @@ mod note_mutation_hook_tests {
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_merge_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
