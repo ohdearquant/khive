@@ -624,12 +624,13 @@ mod tests {
     use super::*;
     use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
     use std::sync::atomic::{AtomicU32, Ordering};
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
 
-    fn tmp_db() -> (NamedTempFile, String) {
-        let f = NamedTempFile::new().expect("tempfile");
-        let path = f.path().to_str().expect("utf8 path").to_string();
-        (f, path)
+    fn tmp_db() -> (TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("khive-test.db");
+        let path = path.to_str().expect("utf8 path").to_string();
+        (dir, path)
     }
 
     #[cfg(unix)]
@@ -708,6 +709,22 @@ mod tests {
             restart_delay_ms(u64::MAX, u64::MAX),
             u64::MAX,
             "saturating jitter arithmetic must remain overflow-safe"
+        );
+    }
+
+    #[test]
+    fn tmp_db_guard_removes_database_and_all_sidecars() {
+        let (dir, db_path) = tmp_db();
+        let dir_path = dir.path().to_path_buf();
+        for suffix in ["", "-wal", "-shm", ".khive-blob-gc.lock"] {
+            std::fs::write(format!("{db_path}{suffix}"), b"fixture").expect("write fixture");
+        }
+
+        drop(dir);
+
+        assert!(
+            !dir_path.exists(),
+            "dropping the directory guard must remove the database and every sibling sidecar"
         );
     }
 
