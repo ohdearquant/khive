@@ -6389,6 +6389,7 @@ async fn format_per_op_override_selects_format_per_position() {
 /// the canonical shape. Chain substitution must continue to read canonical
 /// pre-presentation results under both JSON and auto output.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
     use khive_mcp::tools::request::RequestParams;
 

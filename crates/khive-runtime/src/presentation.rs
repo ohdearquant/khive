@@ -23,8 +23,10 @@ use serde_json::{Map, Value};
 /// or rendered to the wire string.
 ///
 /// Default is [`OutputFormat::Json`] on every surface: compact and
-/// machine-walkable. Verbose JSON is lossless; Agent JSON additionally applies
-/// the enumerated redundancy reductions from ADR-078 Amendment 3.
+/// machine-walkable. Verbose JSON is lossless; Agent JSON additionally elides
+/// `namespace="local"` and duplicate `properties` entries (ADR-078 Amendment
+/// 3, Machine scope) but keeps `full_id` — it is the caller's chaining
+/// handle, not a redundant field.
 ///
 /// Note: `Yaml` is a clean follow-up — implemented as a 3-variant enum
 /// (`Json`, `Auto`, `Table`) per ADR-078 §"yaml" which permits omission when
@@ -33,7 +35,8 @@ use serde_json::{Map, Value};
 #[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
     /// Compact JSON (`serde_json::to_string`). Default; lossless in Verbose
-    /// presentation and redundancy-reduced in Agent presentation.
+    /// presentation, Machine-scope redundancy-reduced in Agent presentation
+    /// (`full_id` retained — see [`RedundancyScope`]).
     #[default]
     Json,
     /// Shape-aware: markdown table for homogeneous record arrays (with
@@ -67,10 +70,12 @@ const PROPERTY_HOIST_FIELDS: &[&str] = &["trigger_at", "due", "status"];
 /// them as compact JSON directly (ADR-078 §8.2).
 ///
 /// Agent presentation applies the redundancy-reduction pre-pass (§7) for every
-/// format, including JSON. Auto/table also apply it for Human presentation;
-/// Verbose remains canonical and unreduced. The prepared value is then encoded
-/// as compact JSON or dispatched to the shape-aware renderer. Verbose also
-/// disables cell truncation in the table renderer (§3a).
+/// format, including JSON — at Machine scope for `json` (keeps `full_id`) and
+/// View scope for `auto`/`table` (drops it too, ADR-078 Amendment 3). Auto/table
+/// also apply View scope for Human presentation; Verbose remains canonical and
+/// unreduced. The prepared value is then encoded as compact JSON or dispatched
+/// to the shape-aware renderer. Verbose also disables cell truncation in the
+/// table renderer (§3a).
 pub fn render_format(value: Value, format: OutputFormat, presentation: PresentationMode) -> String {
     let value = prepare_format_value(value, format, presentation);
     match format {
@@ -92,33 +97,68 @@ pub fn prepare_format_value(
     format: OutputFormat,
     presentation: PresentationMode,
 ) -> Value {
-    let reduce = match format {
-        OutputFormat::Json => presentation == PresentationMode::Agent,
-        OutputFormat::Auto | OutputFormat::Table => presentation != PresentationMode::Verbose,
+    let scope = match format {
+        OutputFormat::Json if presentation == PresentationMode::Agent => {
+            Some(RedundancyScope::Machine)
+        }
+        OutputFormat::Json => None,
+        OutputFormat::Auto | OutputFormat::Table if presentation != PresentationMode::Verbose => {
+            Some(RedundancyScope::View)
+        }
+        OutputFormat::Auto | OutputFormat::Table => None,
     };
-    if reduce {
-        apply_redundancy_drop(value)
-    } else {
-        value
+    match scope {
+        Some(scope) => apply_redundancy_drop(value, scope),
+        None => value,
     }
 }
 
-// ── Redundancy-reduction pre-pass (ADR-078 §7) ──────────────────────────────
+// ── Redundancy-reduction pre-pass (ADR-078 §7, Amendment 3) ────────────────
 
-/// Apply the view-only redundancy-reduction pre-pass (ADR-078 §7) to a value.
+/// Which redundancy-reduction rules apply (ADR-078 §7, Amendment 3).
+///
+/// `View` is the rendered-view scope (`auto`/`table`): the caller has opted
+/// into a display form that is never chained on programmatically, so
+/// `full_id` — the caller's stable chaining handle — is safe to drop along
+/// with the other reductions.
+///
+/// `Machine` is the machine-contract scope (Agent `json`): this is the
+/// default MCP response shape, the one a caller chains `$prev` and strict
+/// verb parameters (`memory.feedback(target_id=...)`, `gtd.assign
+/// (context_entity_id=...)`, etc.) from. It applies the `namespace` elision
+/// and the `properties` dedup, but never drops `full_id`, and the
+/// `properties` dedup itself exempts `full_id`/`ROUND_TRIP_FULL_UUID_FIELDS`
+/// keys — a caller reading a strict identifier out of `properties` must see
+/// the same canonical value there as at the top level. Dropping any of
+/// those would return a value the strict verbs that consume it reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedundancyScope {
+    View,
+    Machine,
+}
+
+/// Apply the redundancy-reduction pre-pass (ADR-078 §7, Amendment 3) to a
+/// value at the given [`RedundancyScope`].
 ///
 /// Applies at most ONE pass over the value. This function is the canonical
 /// entry for the pre-pass; the per-record logic lives in `drop_record`.
 ///
-/// Applied for Agent presentation in every format and for non-Verbose
-/// auto/table output. Callers are responsible for checking those conditions;
-/// this function applies unconditionally.
-pub fn apply_redundancy_drop(value: Value) -> Value {
+/// Applied for Agent presentation in every format (`Machine` scope for
+/// `json`, `View` scope for non-Verbose `auto`/`table`). Callers are
+/// responsible for checking those conditions; this function applies
+/// unconditionally.
+pub fn apply_redundancy_drop(value: Value, scope: RedundancyScope) -> Value {
     match value {
-        Value::Object(_) => drop_record(value),
+        Value::Object(_) => drop_record(value, scope),
         Value::Array(arr) => Value::Array(
             arr.into_iter()
-                .map(|v| if v.is_object() { drop_record(v) } else { v })
+                .map(|v| {
+                    if v.is_object() {
+                        drop_record(v, scope)
+                    } else {
+                        v
+                    }
+                })
                 .collect(),
         ),
         other => other,
@@ -126,13 +166,17 @@ pub fn apply_redundancy_drop(value: Value) -> Value {
 }
 
 /// Apply per-record redundancy rules (§7.1, §7.2, §7.3) to a single record object.
-fn drop_record(value: Value) -> Value {
+fn drop_record(value: Value, scope: RedundancyScope) -> Value {
     let Value::Object(mut map) = value else {
         return value;
     };
 
-    // `full_id` is a chaining handle, not needed in view-only output.
-    map.remove("full_id");
+    // `full_id` is a chaining handle. Dropping it is safe only in the View
+    // scope (a rendered auto/table view the caller opted into); the Machine
+    // scope (Agent JSON, the default machine contract) must keep it.
+    if scope == RedundancyScope::View {
+        map.remove("full_id");
+    }
 
     // `"local"` is the common case, so only surface `namespace` when it isn't.
     if map.get("namespace").and_then(Value::as_str) == Some("local") {
@@ -144,11 +188,19 @@ fn drop_record(value: Value) -> Value {
     // columns lives in `hoist_table_scalars`, applied only on the table
     // path: reshaping the compact-JSON fallback would move fields with no
     // column to gain.
+    //
+    // Machine scope exempts `full_id`/`ROUND_TRIP_FULL_UUID_FIELDS`: a caller
+    // that reads the strict identifier out of `properties` (rather than the
+    // top-level convenience mirror) must keep getting the same canonical
+    // value there too. View scope is unaffected — those callers already
+    // opted into a display form, not the strict round-trip contract.
     let props_val = map.remove("properties");
     if let Some(Value::Object(props)) = props_val {
         let mut new_props = Map::new();
         for (k, v) in props {
-            if map.get(&k) == Some(&v) {
+            let strict_round_trip = scope == RedundancyScope::Machine
+                && (k == "full_id" || ROUND_TRIP_FULL_UUID_FIELDS.contains(&k.as_str()));
+            if !strict_round_trip && map.get(&k) == Some(&v) {
                 continue;
             }
             new_props.insert(k, v);
@@ -169,7 +221,7 @@ fn drop_record(value: Value) -> Value {
                     arr.into_iter()
                         .map(|item| {
                             if item.is_object() {
-                                drop_record(item)
+                                drop_record(item, scope)
                             } else {
                                 item
                             }
@@ -1402,7 +1454,10 @@ mod tests {
         assert!(parsed.get("properties").is_some());
     }
 
-    /// (a-agent-json) Agent JSON applies the same view-only redundancy reduction.
+    /// (a-agent-json) Agent JSON applies the Machine-scope redundancy
+    /// reduction: `namespace`/duplicate-`properties` elision, but `full_id`
+    /// is retained — it is the caller's chaining handle, not a view drop
+    /// (ADR-078 Amendment 3, corrected).
     #[test]
     fn format_agent_json_drops_redundancy() {
         let v = json!({
@@ -1414,11 +1469,54 @@ mod tests {
         });
         let rendered = render_format(v, OutputFormat::Json, PresentationMode::Agent);
         let parsed: Value = serde_json::from_str(&rendered).unwrap();
-        assert!(parsed.get("full_id").is_none());
+        assert!(
+            parsed.get("full_id").is_some(),
+            "Agent JSON must keep full_id: it is the machine contract's chaining handle"
+        );
         assert!(parsed.get("namespace").is_none());
         assert_eq!(parsed["status"], json!("next"));
         assert!(parsed["properties"].get("status").is_none());
         assert_eq!(parsed["properties"]["additive"], json!(true));
+    }
+
+    /// Agent JSON (Machine scope) keeps `full_id` while dropping
+    /// `namespace="local"` and duplicate `properties`; Auto (View scope) on
+    /// the same record still drops all three — the view scope is unchanged
+    /// by Amendment 3's correction.
+    #[test]
+    fn agent_json_keeps_full_id_while_auto_still_drops_it() {
+        let v = json!({
+            "full_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "namespace": "local",
+            "title": "test",
+            "properties": {"title": "test", "additive": true}
+        });
+
+        let json_rendered = render_format(v.clone(), OutputFormat::Json, PresentationMode::Agent);
+        let json_parsed: Value = serde_json::from_str(&json_rendered).unwrap();
+        assert!(
+            json_parsed.get("full_id").is_some(),
+            "Agent JSON must keep full_id"
+        );
+        assert!(
+            json_parsed.get("namespace").is_none(),
+            "Agent JSON must elide namespace=\"local\""
+        );
+        assert!(
+            json_parsed["properties"].get("title").is_none(),
+            "Agent JSON must dedupe a duplicate properties entry"
+        );
+        assert_eq!(json_parsed["properties"]["additive"], json!(true));
+
+        let auto_rendered = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
+        assert!(
+            !auto_rendered.contains("full_id"),
+            "Auto (view scope) must still drop full_id: {auto_rendered}"
+        );
+        assert!(
+            !auto_rendered.contains("\"namespace\""),
+            "Auto must still elide namespace=\"local\": {auto_rendered}"
+        );
     }
 
     /// (b1) homogeneous record array → markdown table with header + separator + rows.
@@ -1619,7 +1717,7 @@ mod tests {
                 "status": "pending"
             }
         });
-        let reduced = apply_redundancy_drop(v);
+        let reduced = apply_redundancy_drop(v, RedundancyScope::View);
         assert!(
             reduced.get("trigger_at").is_none() && reduced.get("status").is_none(),
             "the pre-pass must not hoist; the hoist is table-path only"
@@ -1681,7 +1779,7 @@ mod tests {
             "status": "active",
             "properties": {"status": "pending"}
         });
-        let reduced = apply_redundancy_drop(v);
+        let reduced = apply_redundancy_drop(v, RedundancyScope::View);
         assert_eq!(
             reduced.get("status").and_then(Value::as_str),
             Some("active"),
@@ -1764,7 +1862,7 @@ mod tests {
         // `ok`: bypassing it for error envelopes is the caller's job
         // (render_result in server.rs). This only checks the pre-pass itself
         // doesn't lose the error field.
-        let reduced = apply_redundancy_drop(v.clone());
+        let reduced = apply_redundancy_drop(v.clone(), RedundancyScope::View);
         assert!(
             reduced.get("error").is_some(),
             "redundancy drop must preserve error field"
@@ -1787,7 +1885,7 @@ mod tests {
                 "extra": "unique" // not at top level → kept
             }
         });
-        let reduced = apply_redundancy_drop(v);
+        let reduced = apply_redundancy_drop(v, RedundancyScope::View);
         let props = reduced.get("properties").expect("properties must remain");
         assert!(props.get("extra").is_some(), "unique property must be kept");
         assert!(

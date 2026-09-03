@@ -239,24 +239,26 @@ contract is shape-stable. A deployment that wants these reductions on every call
 `default_output_format = "auto"`.
 
 **Superseded by Amendment 3 for `presentation=agent`:** `format=json` under Agent presentation
-now applies these same reductions; only `presentation=verbose` (any format) and Human `format=json`
-keep the unreduced canonical shape. See Amendment 3 for the current contract.
+now applies the `namespace`/`properties` reductions below at Machine scope; `full_id` is retained
+in every JSON presentation. Only `presentation=verbose` (any format) and Human `format=json` keep
+the fully unreduced canonical shape. See Amendment 3 for the current contract.
 
 **7.1. `full_id` suppression**
 
 In `format=auto` and `format=table`, the `full_id` field (the 36-character canonical UUID emitted
 alongside the 8-character `id` shortcode) is omitted from the output. `full_id` is retained in
-`format=json` and in `PresentationMode::Verbose`. **Superseded by Amendment 3:** `format=json`
-under Agent presentation now omits `full_id` too; only `PresentationMode::Verbose` and Human
-`format=json` retain it unconditionally.
+`format=json` and in `PresentationMode::Verbose`. **Amendment 3 does not change this**: `full_id`
+suppression stays scoped to `auto`/`table` (the View scope); `format=json` under Agent presentation
+retains `full_id` unconditionally — it is the caller's machine-contract chaining handle, and Amendment
+3 only extends the `namespace`/`properties` reductions (§7.2, §7.3) to Agent JSON.
 
-**This partially supersedes the P-C1 code rule in `crates/khive-runtime/src/presentation.rs`**, which
-treated `full_id` as a stable chaining handle kept unconditionally in all modes. That rule was
+**This is the P-C1 code rule in `crates/khive-runtime/src/presentation.rs`**, which treats `full_id`
+as a stable chaining handle kept unconditionally in every JSON presentation. That rule was
 introduced as an implementation decision and is in tension with ADR-045 §3, which states that
 `full_id` is "NOT included by default" in Agent mode. ADR-078 resolves the discrepancy by making
-suppression explicit for `auto` and `table`, while preserving `full_id` in `format=json` and
-`Verbose` for any caller that requires the full UUID. **Superseded by Amendment 3** for the
-`format=json` half of that last clause — see above.
+suppression explicit for `auto` and `table` only, while preserving `full_id` in `format=json` and
+`Verbose` unconditionally for any caller that requires the full UUID. Amendment 3 does not disturb
+this clause — see above.
 
 The suppression is safe because ADR-016 short-UUID-prefix resolution handles `$prev.id` chains
 using 8-char shortcodes without requiring the 36-char form. The `format=json` escape hatch remains
@@ -498,8 +500,11 @@ next subsection). Detection precedence:
 
 The §7 reductions (full_id suppression, properties dedup, namespace elision) are applied as a
 pre-format pass on the `serde_json::Value` after the ADR-045 `present_response` transform and
-before shape detection. The pass is skipped entirely when `format=json` or
-`PresentationMode::Verbose` is active.
+before shape detection. **Superseded by Amendment 3:** the pass runs at one of two scopes rather
+than being a single on/off switch. `auto`/`table` under Agent or Human presentation run the View
+scope (all three reductions, including `full_id`). `format=json` under Agent presentation runs the
+Machine scope (properties dedup and namespace elision only — `full_id` is never dropped). The pass
+is skipped entirely only when `PresentationMode::Verbose` is active, or under Human `format=json`.
 
 ### Migration
 
@@ -604,37 +609,55 @@ the view layer honest in the interim rather than lossy.
 
 ## Amendment 3 (2026-08-29): Agent JSON redundancy reduction
 
-**Current contract.** Two axes govern reduction: presentation mode and format.
-`PresentationMode::Verbose` is lossless in every format — JSON, `auto`, and `table` alike — and
-is the sole escape hatch a caller can rely on unconditionally. Under `PresentationMode::Agent`
-or `PresentationMode::Human`, `format=auto` and `format=table` have applied the §7 reductions
-since this ADR's original text; this amendment extends that to `format=json` **for Agent
-presentation only** — Human `format=json` stays unreduced. So: Agent JSON now reduces, Human
-JSON does not, Verbose never does, regardless of format. What a reduced payload removes (§7.1–§7.3):
-the `full_id` field, the `namespace` field when it equals `"local"`, and any `properties` child
-entry that exactly duplicates a top-level sibling. What it keeps: the `id` shortcode, every other
-top-level field, non-`"local"` `namespace` values, and any `properties` entry with no top-level
-duplicate — i.e. the reduction only drops values a caller could already reconstruct from the rest
-of the same record.
+**Current contract.** Two axes govern reduction: presentation mode and format, and the §7
+reductions now apply at one of two scopes. `PresentationMode::Verbose` is lossless in every
+format — JSON, `auto`, and `table` alike — and is the sole escape hatch a caller can rely on
+unconditionally for the *full* set of reductions. Under `PresentationMode::Agent` or
+`PresentationMode::Human`, `format=auto` and `format=table` have applied the full §7 reduction
+set (View scope: `full_id` suppression, `properties` dedup, `namespace` elision) since this ADR's
+original text — unchanged by this amendment. This amendment extends only the `properties`-dedup
+and `namespace`-elision reductions (§7.2, §7.3) to `format=json` **for Agent presentation only**
+(Machine scope) — Human `format=json` stays unreduced.
 
-The default MCP combination, `presentation=agent, format=json`, previously kept
-top-level fields duplicated verbatim inside each record's `properties` object. This
-made the most common machine-readable response materially larger than the equivalent
-`auto` view, especially for GTD listings, without preserving additional information.
+`format=json` is the default MCP response shape and the caller's machine contract: it is what
+`$prev` chains, strict verb parameters (`memory.feedback(target_id=...)`,
+`gtd.assign(context_entity_id=...)`, and the other `ROUND_TRIP_FULL_UUID_FIELDS` consumers), and
+any programmatic caller submit back to a subsequent request. `full_id` is that contract's stable
+chaining handle, so Agent JSON **never** drops it — dropping `full_id` is scoped to the View
+formats (`auto`/`table`), where the caller has opted into a rendered display that is never
+chained on programmatically. This is the one reduction Amendment 3 does **not** extend to JSON.
 
-This amendment supersedes §7's format-only gate: the §7 reductions now apply to every
-Agent-presentation success payload, including JSON. Agent JSON therefore omits
-`full_id`, elides `namespace="local"`, and removes child `properties` entries that
-exactly duplicate top-level siblings. Additive property keys remain. JSON retains its
-machine-walkable type and field-value encoding; only the enumerated view reductions
-apply.
+What a Machine-scope (Agent JSON) reduced payload removes: the `namespace` field when it equals
+`"local"`, and any `properties` child entry that exactly duplicates a top-level sibling. What it
+keeps: `full_id`, the `id` shortcode, every other top-level field, non-`"local"` `namespace`
+values, and any `properties` entry with no top-level duplicate — i.e. the reduction only drops
+values a caller could already reconstruct from the rest of the same record, and never drops the
+one field a caller cannot reconstruct once it is gone. The `properties` dedup itself carries the
+same exemption: a `properties` entry keyed `full_id` or by any `ROUND_TRIP_FULL_UUID_FIELDS` name
+(`context_entity_id`, `thread_id`, `outbound_ref`, `parent_id`, `session_id`, `project_id`) is
+never dropped as a duplicate, even when it exactly matches its top-level sibling — a caller that
+reads the strict identifier out of `properties` instead of the top level must see the same
+canonical value either way.
 
-`presentation=verbose, format=json` remains the canonical lossless escape hatch and
-continues to emit the full handler shape. Human JSON also remains unreduced. Error
-entries are unchanged. `$prev` substitution remains safe because chains resolve from
-canonical handler results before presentation and format preparation at the response
-boundary. In a compounded response, JSON result payloads stay JSON values rather than
-rendered strings; the same reduction policy is applied directly to those values.
+The default MCP combination, `presentation=agent, format=json`, previously kept top-level fields
+duplicated verbatim inside each record's `properties` object. This made the most common
+machine-readable response materially larger than the equivalent `auto` view, especially for GTD
+listings, without preserving additional information.
+
+This amendment supersedes §7's format-only gate for §7.2 and §7.3 only: those two reductions now
+apply to every Agent-presentation success payload, including JSON. Agent JSON therefore elides
+`namespace="local"` and removes child `properties` entries that exactly duplicate top-level
+siblings, but always retains `full_id` (§7.1 is unchanged — see above). Additive property keys
+remain. JSON retains its machine-walkable type and field-value encoding; only the enumerated
+Machine-scope reductions apply.
+
+`presentation=verbose, format=json` remains the canonical lossless escape hatch and continues to
+emit the full handler shape. Human JSON also remains unreduced. Error entries are unchanged.
+`$prev` substitution remains safe because chains resolve from canonical handler results before
+presentation and format preparation at the response boundary, and because `full_id` — the field a
+chain is most likely to need — is never dropped from Agent JSON regardless. In a compounded
+response, JSON result payloads stay JSON values rather than rendered strings; the same
+scope-appropriate reduction policy is applied directly to those values.
 
 ## References
 

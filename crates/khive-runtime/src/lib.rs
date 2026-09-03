@@ -133,7 +133,7 @@ pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};
 pub use presentation::{
     apply_redundancy_drop, micros_to_iso, prepare_format_value, present, render_format,
-    rfc3339_to_utc_micros, OutputFormat, PresentationMode,
+    rfc3339_to_utc_micros, OutputFormat, PresentationMode, RedundancyScope,
 };
 pub use reference_resolution::{resolve_reference, ReferenceCandidate, ReferenceResolution};
 pub use reference_ring::{ReferenceRing, RingEntry};
