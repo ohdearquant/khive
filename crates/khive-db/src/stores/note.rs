@@ -822,6 +822,16 @@ fn build_note_filter_where(
                     "ifnull({expr}, '') = '' AND ({type_expr} IS NULL OR {type_expr} = 'null')"
                 ));
             }
+            FilterOp::EqOrLegacyIndexed => {
+                let expr = json_extract_expr(&pf.json_path);
+                let type_expr = json_type_expr(&pf.json_path);
+                params.push(sql_value_param(&pf.value)?);
+                let n = params.len();
+                conditions.push(format!(
+                    "ifnull({expr}, '') IN (?{n}, '') AND \
+                     ({type_expr} IS NULL OR {type_expr} = 'null' OR ifnull({expr}, '') != '')"
+                ));
+            }
             FilterOp::JsonTypeNeMissing => {
                 let type_expr = json_type_expr(&pf.json_path);
                 // Inlined as a validated literal, NOT a parameter: the
@@ -883,6 +893,7 @@ fn build_note_filter_where(
                     | FilterOp::JsonTypeEq
                     | FilterOp::JsonTypeMissing
                     | FilterOp::JsonTypeMissingOrNullIndexed
+                    | FilterOp::EqOrLegacyIndexed
                     | FilterOp::JsonTypeNeMissing
                     | FilterOp::In(_)
                     | FilterOp::NotInOrMissing(_) => {

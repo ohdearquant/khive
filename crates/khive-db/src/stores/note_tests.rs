@@ -3256,6 +3256,332 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
     );
 }
 
+/// `comm.inbox(status="unread")` builds its `to_actor` predicate at
+/// khive-pack-comm/src/handlers.rs ~613-624: `direction` (`Eq`), `read`
+/// (`JsonTypeNeMissing`), then `to_actor`. Before this test's fix, that last
+/// filter used `FilterOp::EqOrMissing`, whose SQL
+/// (`(json_extract(...) = ? OR json_extract(...) IS NULL)`) is a different
+/// expression than any indexed key in the schema (the recipient-scoped
+/// partial index at `idx_notes_unread_probe_recipient_direction` is keyed on
+/// `ifnull(json_extract(...), '')`, not the raw extract), so the planner
+/// fell back to `idx_comm_message_direction` (namespace, kind, direction,
+/// read — no recipient key at all) and every caller's unread inbox listing
+/// scanned every unread inbound row IN THE NAMESPACE, not just their own.
+/// `idx_comm_message_direction` (khive-pack-comm/src/vocab.rs) is reproduced
+/// here verbatim since khive-db has no dependency on khive-pack-comm to
+/// import it from; it must be present for this test to reflect the real
+/// index landscape a comm-pack-loaded server actually has.
+///
+/// The control section pins the pre-fix `EqOrMissing` shape (still reachable
+/// as a `FilterOp` variant) against the exact regression this closes: it
+/// must NOT seek the recipient index and its scan work must grow with
+/// OTHER actors' unread backlog. The fixed section proves
+/// `FilterOp::EqOrLegacyIndexed` seeks the recipient-scoped partial index
+/// instead and stays flat.
+#[tokio::test]
+async fn inbox_unread_listing_uses_recipient_index_not_direction_blind_scan() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+    use rusqlite::StatementStatus;
+
+    fn listing_filter(to_actor_op: FilterOp) -> NoteFilter {
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters: vec![
+                NotePropFilter {
+                    json_path: "$.direction".to_string(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text("inbound".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.read".to_string(),
+                    op: FilterOp::JsonTypeNeMissing,
+                    value: SqlValue::Text("true".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.to_actor".to_string(),
+                    op: to_actor_op,
+                    value: SqlValue::Text("actor:a".to_string()),
+                },
+            ],
+            order_by: None,
+            ..Default::default()
+        }
+    }
+
+    fn listing_sql_and_params(
+        filter: &NoteFilter,
+    ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        params.push(Box::new(1001_i64));
+        let limit_idx = params.len();
+        (
+            format!(
+                "SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT ?{limit_idx}"
+            ),
+            params,
+        )
+    }
+
+    fn plan(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn measure_list(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> (usize, i32) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows: Vec<String> = stmt
+            .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let steps = stmt.get_status(StatementStatus::VmStep);
+        (rows.len(), steps)
+    }
+
+    fn seed(
+        conn: &rusqlite::Connection,
+        to_actor: &str,
+        direction: &str,
+        n: usize,
+        start_stamp: i64,
+    ) {
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', ?3, 'to_actor', ?4), ?5, ?5)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("{to_actor}-{direction}-{i}"),
+                    direction,
+                    to_actor,
+                    start_stamp + i as i64,
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    fn build_pool_with_comm_indexes() -> Arc<ConnectionPool> {
+        let pool = setup_pool();
+        let writer = pool.writer().unwrap();
+        // Reproduces khive-pack-comm/src/vocab.rs COMM_SCHEMA_PLAN_STMTS's
+        // idx_comm_message_direction verbatim: applied at comm-pack init in
+        // the real system, so this test reflects the actual index landscape
+        // a comm-pack-loaded server has (khive-db cannot depend on
+        // khive-pack-comm to import the constant directly).
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
+                    ON notes(namespace, kind, json_extract(properties, '$.direction'), \
+                    json_extract(properties, '$.read'), created_at DESC) \
+                    WHERE deleted_at IS NULL;",
+            )
+            .unwrap();
+        drop(writer);
+        pool
+    }
+
+    // -- Control: reproduce the pre-fix EqOrMissing shape. --
+    {
+        let pool = build_pool_with_comm_indexes();
+        {
+            let writer = pool.writer().unwrap();
+            seed(writer.conn(), "actor:a", "inbound", 5, 0);
+        }
+        let filter = listing_filter(FilterOp::EqOrMissing);
+        let (sql, params) = listing_sql_and_params(&filter);
+        {
+            let reader = pool.reader().unwrap();
+            let control_plan = plan(reader.conn(), &sql, &params);
+            assert!(
+                !control_plan.contains("idx_notes_unread_probe_recipient_direction"),
+                "control must reproduce the pre-fix shape (no recipient-index seek), got:\n{control_plan}"
+            );
+        }
+        let (_, steps_small) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        {
+            let writer = pool.writer().unwrap();
+            // Another actor's unread backlog: same direction/read shape, disjoint recipient.
+            seed(writer.conn(), "actor:other", "inbound", 3_000, 10_000);
+        }
+        let (rows_after, steps_large) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        assert_eq!(
+            rows_after, 5,
+            "control: still only the caller's own unread rows in the result set"
+        );
+        assert!(
+            steps_large > steps_small.saturating_mul(3),
+            "control instrument did not reproduce the pre-fix growth: \
+             {steps_small} VM steps before vs {steps_large} after seeding another actor's \
+             3,000-row unread backlog (a recipient-blind scan should grow sharply)"
+        );
+    }
+
+    // -- Fixed: EqOrLegacyIndexed seeks the recipient-scoped partial index. --
+    {
+        let pool = build_pool_with_comm_indexes();
+        {
+            let writer = pool.writer().unwrap();
+            seed(writer.conn(), "actor:a", "inbound", 5, 0);
+        }
+        let filter = listing_filter(FilterOp::EqOrLegacyIndexed);
+        let (sql, params) = listing_sql_and_params(&filter);
+        {
+            let reader = pool.reader().unwrap();
+            let fixed_plan = plan(reader.conn(), &sql, &params);
+            assert!(
+                fixed_plan.contains("idx_notes_unread_probe_recipient_direction"),
+                "fixed listing query must be served by the recipient-scoped partial index, got:\n{fixed_plan}"
+            );
+        }
+        let (_, steps_small) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        {
+            let writer = pool.writer().unwrap();
+            seed(writer.conn(), "actor:other", "inbound", 3_000, 10_000);
+        }
+        let (rows_after, steps_large) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        assert_eq!(
+            rows_after, 5,
+            "fixed: still only the caller's own unread rows in the result set"
+        );
+        assert!(
+            steps_large < steps_small.saturating_mul(3),
+            "fixed listing work scaled with another actor's unread backlog: \
+             {steps_small} VM steps before vs {steps_large} after seeding another actor's \
+             3,000-row unread backlog (a recipient-scoped seek should stay flat)"
+        );
+    }
+}
+
+/// `EqOrLegacyIndexed` must match exactly the same rows `EqOrMissing` does,
+/// for every value shape the comm write paths (`comm.send`, `comm.reply`,
+/// `comm.ingest`) can produce: an exact recipient match, a legacy row with
+/// `to_actor` entirely absent, and — the case a naive `ifnull(...) IN (?, '')`
+/// predicate would get wrong — a row where `to_actor` is a present-but-empty
+/// JSON string. None of the three comm write paths can produce that last
+/// shape today (`validate_actor_label` rejects an empty `to` at `send`;
+/// `ingest` rejects an empty `to` before it reaches `to_actor`; `reply`'s
+/// fallback chain bottoms out at a `to`/`from` property pair every write
+/// path always sets non-empty) — but the generic `kg.create` surface is not
+/// comm-validated and can place such a row directly, so this fixes the
+/// value's behavior by construction rather than by unreachability.
+#[tokio::test]
+async fn eq_or_legacy_indexed_matches_eq_or_missing_on_every_write_path_shape() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+    use khive_storage::types::{PageRequest, SqlValue};
+
+    let store = setup_memory_store();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "exact match",
+            serde_json::json!({"to_actor": "actor:a"}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "absent (legacy)",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "explicit null",
+            serde_json::json!({"to_actor": null}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "present empty string",
+            serde_json::json!({"to_actor": ""}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "different recipient",
+            serde_json::json!({"to_actor": "actor:b"}),
+        ))
+        .await
+        .unwrap();
+
+    for op in [FilterOp::EqOrMissing, FilterOp::EqOrLegacyIndexed] {
+        let filter = NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters: vec![PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: op.clone(),
+                value: SqlValue::Text("actor:a".to_string()),
+            }],
+            ..Default::default()
+        };
+        let page = store
+            .query_notes_filtered(
+                "default",
+                &filter,
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let mut contents: Vec<&str> = page.items.iter().map(|n| n.content.as_str()).collect();
+        contents.sort_unstable();
+        assert_eq!(
+            contents,
+            vec!["absent (legacy)", "exact match", "explicit null"],
+            "{op:?}: must match the exact recipient plus absent/null legacy rows, \
+             and exclude the present-empty-string and different-recipient rows"
+        );
+    }
+}
+
 /// The inlined json_type literal admits only SQLite's closed json_type
 /// vocabulary; anything else is rejected rather than interpolated.
 #[tokio::test]

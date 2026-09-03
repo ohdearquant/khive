@@ -464,6 +464,17 @@ pub enum FilterOp {
     /// the index-friendly legacy-recipient partition used with
     /// [`FilterOp::EqOrMissingIndexed`].
     JsonTypeMissingOrNullIndexed,
+    /// Combines the exact-value and legacy-recipient partitions
+    /// (`EqOrMissingIndexed` + `JsonTypeMissingOrNullIndexed`) into one
+    /// predicate over the same indexable `ifnull(json_extract(...), '')`
+    /// expression, so a single index seek serves both partitions instead of
+    /// two separate bounded queries. Matches rows where the field equals the
+    /// value, OR the field is absent/JSON-`null`. A present-but-empty JSON
+    /// string value does NOT match through the legacy branch — the same
+    /// `json_type` guard `JsonTypeMissingOrNullIndexed` uses excludes it —
+    /// so this reproduces `EqOrMissing` exactly, given a non-empty compared
+    /// value.
+    EqOrLegacyIndexed,
     /// Matches rows where a JSON text field equals the value, while treating
     /// every missing or non-text value as that same value. The SQL adapter
     /// emits `CASE WHEN json_type(...) = 'text' THEN json_extract(...) ELSE

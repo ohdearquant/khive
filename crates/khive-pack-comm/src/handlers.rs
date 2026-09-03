@@ -611,11 +611,15 @@ pub(crate) async fn handle_inbox(
     }
 
     if mailbox == "inbox" {
-        // ADR-057 Q3: to_actor filter, EqOrMissing so legacy to_actor-less messages stay
-        // visible; closes the #199 multi-actor read leak for non-"local" callers.
+        // ADR-057 Q3: to_actor filter, legacy to_actor-less messages stay visible;
+        // closes the #199 multi-actor read leak for non-"local" callers.
+        // EqOrLegacyIndexed (not EqOrMissing) so this seeks
+        // idx_notes_unread_probe_recipient_direction on status="unread" instead of
+        // falling back to a namespace-wide direction-only scan; both partitions match
+        // the same rows EqOrMissing would (khive-storage/src/note.rs FilterOp docs).
         property_filters.push(PropertyFilter {
             json_path: "$.to_actor".to_string(),
-            op: FilterOp::EqOrMissing,
+            op: FilterOp::EqOrLegacyIndexed,
             value: SqlValue::Text(caller_actor.clone()),
         });
         if let Some(from_actor) = p.from_actor.as_ref() {
