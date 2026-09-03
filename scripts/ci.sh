@@ -51,6 +51,9 @@ phase_lint() {
 
     echo "=== CI Workflow Contract Tests ==="
     python3 "$SCRIPT_DIR/tests/test_ci_workflows.py"
+
+    echo "=== Binary Resolution Harness Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_binary_resolution.py"
 }
 
 phase_no_stubs_scan() {
