@@ -70,7 +70,7 @@ class SocketTransport(Transport):
                 sock.connect(str(self.path))
                 sock.sendall(struct.pack(">I", len(payload)) + payload)
                 raw = self._read_frame(sock)
-        except (OSError, socket.timeout) as exc:
+        except (TimeoutError, OSError) as exc:
             raise TransportError(f"khived at {self.path}: {exc}") from exc
         try:
             return json.loads(raw.decode("utf-8"))

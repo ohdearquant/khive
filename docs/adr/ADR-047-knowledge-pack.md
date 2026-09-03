@@ -180,8 +180,12 @@ An FTS5 external-content virtual table (`fts_knowledge`) indexes slug, name,
 and content from `knowledge_atoms` via triggers that sync on
 insert/update/delete. The trigram tokenizer enables substring matching.
 
-Soft-deleted atoms (non-null `deleted_at`) are excluded from the FTS index via
-a `WHEN new.deleted_at IS NULL` guard on the insert trigger.
+Soft-deleted atoms (non-null `deleted_at`) are excluded from the FTS index. V26
+names a live-row view (`knowledge_atoms_fts_content`) as the external content
+object, so FTS5's index and its content object cover the same rows. Transition-
+symmetric triggers remove a document only when the old row was live and insert
+one only when the new row is live; soft-delete → hard-delete is therefore a
+no-op at the FTS layer, while resurrection inserts exactly once.
 
 ### 1b. Concept tier: three verbs, no new kinds
 
@@ -277,17 +281,26 @@ Sets `deleted_at` timestamp. FTS trigger automatically removes from search index
 stats() → {atoms: N, domains: N, ...}
 ```
 
-#### `knowledge.index` — backfill embeddings + FTS
+#### `knowledge.index` — backfill embeddings
 
 ```
-index(ids?: [<slug|uuid>], batch_size?: 500, insert_only?: false) → {indexed: N}
+index(ids?: [<slug|uuid>], batch_size?: 500, insert_only?: false,
+      rebuild_ann?: false) → {indexed: N}
 ```
 
-Backfills default-model embedding vectors and FTS content. The knowledge retrieval
+Backfills default-model embedding vectors. The knowledge retrieval
 paths read only the default model, so secondary registered models are not embedded
 until a model-aware or fused knowledge read path exists. When `ids` is omitted,
 indexes the entire corpus in batches. `insert_only` skips the delete-then-reinsert
 cycle for fresh corpus backfill.
+
+This verb does not accept `rebuild_fts`: rebuilding `fts_knowledge` and
+`fts_sections` is a whole-database operation independent of the caller's
+namespace, and the ordinary verb has no per-caller cost admission to bound it.
+That rebuild — which runs each external-content table's rank-1 FTS5 integrity
+check before reporting success — is reachable only through the `kkernel
+reindex` operator CLI (`--rebuild-fts`), whose report names both index names,
+elapsed time, and the integrity-check outcome.
 
 #### `knowledge.fold` — budget-constrained selection
 
