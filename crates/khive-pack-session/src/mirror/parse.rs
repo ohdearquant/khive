@@ -648,7 +648,13 @@ fn extract_block(block: &Value) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             let input = map.get("input").cloned().unwrap_or(Value::Null);
-            let input_str = truncate(&serde_json::to_string(&input).unwrap_or_default(), 500);
+            // Mask the FULL serialized input before truncating: a detector's
+            // terminating span can sit past the 500-char display cap, and a
+            // masker that only sees a truncated prefix cannot recognize a
+            // match it cannot see the end of.
+            let input_json = serde_json::to_string(&input).unwrap_or_default();
+            let masked_input = mask_session_mirror(&input_json);
+            let input_str = truncate(&masked_input, 500);
             Some(format!("[tool_use: {name}] {input_str}"))
         }
         "tool_result" => {
@@ -657,7 +663,8 @@ fn extract_block(block: &Value) -> Option<String> {
                 Value::String(s) => s.clone(),
                 other => serde_json::to_string(other).unwrap_or_default(),
             };
-            Some(format!("[tool_result] {}", truncate(&content_str, 500)))
+            let masked_content = mask_session_mirror(&content_str);
+            Some(format!("[tool_result] {}", truncate(&masked_content, 500)))
         }
         _ => None,
     }
@@ -986,6 +993,82 @@ mod tests {
         assert!(text.contains("I'll run a search."), "text: {text}");
         assert!(text.contains("[tool_use: bash]"), "text: {text}");
         assert!(text.contains("command"), "text: {text}");
+    }
+
+    #[test]
+    fn test_tool_use_input_credential_masked_before_truncation() {
+        // The credential's terminating `@` lands past the 500-character
+        // display cap applied to a tool_use input block. A masker that only
+        // sees the already-truncated prefix can never recognize the span, so
+        // the password marker survives untouched in the stored `text`.
+        let marker = "ToolUseCredMarkerXYZ789";
+        let padding = "z".repeat(600);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.com/db");
+        let input = serde_json::json!({ "url": url });
+        let serialized_input = serde_json::to_string(&input).unwrap();
+        let at_offset = serialized_input
+            .find('@')
+            .expect("fixture must contain '@'");
+        assert!(at_offset > 500);
+
+        let content = serde_json::json!([
+            { "type": "tool_use", "name": "bash", "input": input }
+        ]);
+        let message = serde_json::json!({
+            "uuid": "tool-use-cred",
+            "sessionId": "sess-cred",
+            "type": "assistant",
+            "timestamp": "2026-06-29T10:01:00Z",
+            "message": { "role": "assistant", "content": content }
+        });
+        let line = message.to_string();
+
+        let ev = parse_cc_line(&line).expect("should parse");
+        let text = ev.text.expect("text should be present");
+        assert!(
+            !text.contains(marker),
+            "no fragment of the credential may survive masking: {text}"
+        );
+        assert!(
+            text.contains("***MASKED***"),
+            "MASKED marker must appear in text: {text}"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_content_credential_masked_before_truncation() {
+        // Same shape as the tool_use case above, but for a tool_result
+        // content string whose credential terminator crosses the 500-char cut.
+        let marker = "ToolResultCredMarkerXYZ789";
+        let padding = "z".repeat(600);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.com/db");
+        let at_offset = url.find('@').expect("fixture must contain '@'");
+        assert!(at_offset > 500);
+
+        let content = serde_json::json!([
+            { "type": "tool_result", "content": url }
+        ]);
+        let message = serde_json::json!({
+            "uuid": "tool-result-cred",
+            "sessionId": "sess-cred",
+            "type": "user",
+            "timestamp": "2026-06-29T10:02:00Z",
+            "message": { "role": "user", "content": content }
+        });
+        let line = message.to_string();
+
+        let ev = parse_cc_line(&line).expect("should parse");
+        let text = ev.text.expect("text should be present");
+        assert!(
+            !text.contains(marker),
+            "no fragment of the credential may survive masking: {text}"
+        );
+        assert!(
+            text.contains("***MASKED***"),
+            "MASKED marker must appear in text: {text}"
+        );
     }
 
     #[test]

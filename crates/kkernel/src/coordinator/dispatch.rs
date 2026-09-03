@@ -28,13 +28,20 @@ fn bounded_backend_id_for_log(backend_id: &str) -> String {
     const MAX_OUTPUT_CHARS: usize = 256;
 
     let backend_id_chars = backend_id.chars().count();
-    let bounded_input: String = backend_id.chars().take(MAX_INPUT_CHARS).collect();
-    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
-    let was_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
-    let sanitized = if masked.trim().is_empty() {
+    // Mask the FULL id before any truncation: a detector's terminating span
+    // (e.g. the `@` closing a `scheme://user:pass@host` credential) can sit
+    // past any fixed input window, and a masker that only sees a truncated
+    // prefix cannot recognize a match it cannot see the end of.
+    let masked = khive_runtime::secret_gate::mask_for_redaction_surface(
+        khive_runtime::secret_gate::RedactionSurface::McpDiagnostic,
+        backend_id,
+    );
+    let was_masked = masked.as_ref() != backend_id || masked.trim().is_empty();
+    let masked_input: String = masked.chars().take(MAX_INPUT_CHARS).collect();
+    let sanitized = if masked_input.trim().is_empty() {
         "masked-backend"
     } else {
-        masked.as_ref()
+        masked_input.as_str()
     };
     if !was_masked && backend_id_chars <= MAX_OUTPUT_CHARS {
         return sanitized.to_string();
@@ -58,17 +65,21 @@ pub(super) fn bounded_backend_cause_for_log(message: &str) -> String {
     const MAX_OUTPUT_CHARS: usize = 1_024;
     const MISSING_CAUSE: &str = "backend search failed without diagnostic detail";
 
-    let mut input_chars = message.chars();
-    let bounded_input: String = input_chars.by_ref().take(MAX_INPUT_CHARS).collect();
-    let input_truncated = input_chars.next().is_some();
-    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
+    // Mask the FULL message before any truncation: a detector's terminating
+    // span can sit past any fixed input window, and a masker that only sees
+    // a truncated prefix cannot recognize a match it cannot see the end of.
+    let masked = khive_runtime::secret_gate::mask_for_redaction_surface(
+        khive_runtime::secret_gate::RedactionSurface::McpDiagnostic,
+        message,
+    );
     if masked.trim().is_empty() {
         return MISSING_CAUSE.to_string();
     }
-
-    let mut masked_chars = masked.chars();
+    let masked_input_truncated = masked.chars().nth(MAX_INPUT_CHARS).is_some();
+    let bounded_masked: String = masked.chars().take(MAX_INPUT_CHARS).collect();
+    let mut masked_chars = bounded_masked.chars();
     let mut bounded: String = masked_chars.by_ref().take(MAX_OUTPUT_CHARS).collect();
-    if masked_chars.next().is_some() || input_truncated {
+    if masked_chars.next().is_some() || masked_input_truncated {
         bounded.push('…');
     }
     bounded
@@ -1223,5 +1234,57 @@ mod futures_util {
             }
             results
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mirrors khive-mcp's
+    // backend_error_message_masks_a_url_credential_whose_terminator_crosses_the_input_cap:
+    // the credential's terminating `@` lands past the function's own input
+    // cap, so a masker that only sees the truncated prefix can never
+    // recognize the span and the password prefix would survive untouched.
+
+    #[test]
+    fn backend_cause_for_log_masks_a_url_credential_whose_terminator_crosses_the_input_cap() {
+        const MAX_INPUT_CHARS: usize = 4_096;
+        let marker = "CoordinatorCauseMarkerXYZ789";
+        let padding = "z".repeat(MAX_INPUT_CHARS + 200);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.com/db");
+        let message = format!("backend probe failed: {url}");
+
+        let at_offset = message.find('@').expect("test fixture must contain '@'");
+        assert!(at_offset > MAX_INPUT_CHARS);
+
+        let bounded = bounded_backend_cause_for_log(&message);
+        assert!(
+            !bounded.contains(marker),
+            "no fragment of the credential may survive masking: {bounded}"
+        );
+        assert!(
+            bounded.contains("***MASKED***"),
+            "the redaction marker must be present: {bounded}"
+        );
+    }
+
+    #[test]
+    fn backend_id_for_log_masks_a_url_credential_whose_terminator_crosses_the_input_cap() {
+        const MAX_INPUT_CHARS: usize = 4_096;
+        let marker = "CoordinatorIdMarkerXYZ789";
+        let padding = "z".repeat(MAX_INPUT_CHARS + 200);
+        let password = format!("{marker}{padding}");
+        let backend_id = format!("postgres://svc:{password}@internal-host.example.com/db");
+
+        let at_offset = backend_id.find('@').expect("test fixture must contain '@'");
+        assert!(at_offset > MAX_INPUT_CHARS);
+
+        let bounded = bounded_backend_id_for_log(&backend_id);
+        assert!(
+            !bounded.contains(marker),
+            "no fragment of the credential may survive masking: {bounded}"
+        );
     }
 }

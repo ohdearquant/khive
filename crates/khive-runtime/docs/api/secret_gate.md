@@ -267,9 +267,13 @@ ADR-115 Amendment 2 declares three permanent mask-only surfaces through the publ
   projections — the latter covers every parsed title/slug field (ChatGPT export `title`, Claude Code
   `slug`, claude.ai export `name`/`summary`), not just the message body columns.
 - `McpDiagnostic` returns a bounded masked diagnostic and has no durable stored target. Backend error
-  message masking runs over the full, untruncated message text before the input and output length
-  caps are applied, so a detector match whose terminating span crosses a caller-visible truncation
-  boundary is still found.
+  message masking and backend-id/key masking both run over the full, untruncated text before any
+  input or output length cap is applied, so a detector match whose terminating span crosses a
+  caller-visible truncation boundary is still found. The kkernel coordinator's pre-MCP diagnostic
+  logging (`bounded_backend_cause_for_log`, `bounded_backend_id_for_log` in
+  `crates/kkernel/src/coordinator/dispatch.rs`) is also a named `McpDiagnostic` caller, applying the
+  same mask-then-truncate ordering before the same backend cause/id text reaches a log record ahead
+  of the MCP wire boundary.
 
 Each call site uses `mask_for_redaction_surface`. Every contract has mode `PermanentMaskOnly`, no
 stamp property, and no atomic exemption-success event. The wrapper has no manifest input and cannot

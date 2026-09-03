@@ -233,16 +233,17 @@ fn bounded_backend_error_message(message: &str) -> String {
 
 fn bounded_backend_error_key(backend_id: &str) -> (String, bool, bool, usize) {
     let backend_id_chars = backend_id.chars().count();
-    let bounded_input: String = backend_id
-        .chars()
-        .take(MAX_BACKEND_ERROR_INPUT_CHARS)
-        .collect();
-    let masked = mask_mcp_diagnostic(&bounded_input);
-    let backend_id_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
-    let sanitized = if masked.trim().is_empty() {
+    // Mask the FULL id before any truncation: a detector's terminating span
+    // (e.g. the `@` closing a `scheme://user:pass@host` credential) can sit
+    // past any fixed input window, and a masker that only sees a truncated
+    // prefix cannot recognize a match it cannot see the end of.
+    let masked = mask_mcp_diagnostic(backend_id);
+    let backend_id_masked = masked.as_ref() != backend_id || masked.trim().is_empty();
+    let masked_input: String = masked.chars().take(MAX_BACKEND_ERROR_INPUT_CHARS).collect();
+    let sanitized = if masked_input.trim().is_empty() {
         "masked-backend"
     } else {
-        masked.as_ref()
+        masked_input.as_str()
     };
     if !backend_id_masked && backend_id_chars <= MAX_BACKEND_ERROR_KEY_CHARS {
         return (sanitized.to_string(), false, false, backend_id_chars);
@@ -5811,6 +5812,33 @@ mod tests {
         assert!(
             masked.contains("***MASKED***"),
             "the redaction marker must be present: {masked}"
+        );
+    }
+
+    #[test]
+    fn backend_error_key_masks_a_url_credential_whose_terminator_crosses_the_input_cap() {
+        // Mirrors backend_error_message_masks_a_url_credential_whose_terminator_crosses_the_input_cap:
+        // the backend id itself can carry a credential whose terminating `@`
+        // lands past MAX_BACKEND_ERROR_INPUT_CHARS. A masker that only sees a
+        // truncated prefix of the id can never recognize the span, so the
+        // password prefix survives into both the sanitized key and the
+        // fingerprint suffix input.
+        let marker = "CustomDbPassMarkerXYZ789";
+        let padding = "z".repeat(MAX_BACKEND_ERROR_INPUT_CHARS + 200);
+        let password = format!("{marker}{padding}");
+        let backend_id = format!("postgres://svc:{password}@internal-host.example.com/db");
+
+        let at_offset = backend_id.find('@').expect("test fixture must contain '@'");
+        assert!(at_offset > MAX_BACKEND_ERROR_INPUT_CHARS);
+
+        let (key, backend_id_masked, _truncated, _chars) = bounded_backend_error_key(&backend_id);
+        assert!(
+            !key.contains(marker),
+            "no fragment of the credential may survive masking: {key}"
+        );
+        assert!(
+            backend_id_masked,
+            "backend_id_masked must be true when the id carried a credential"
         );
     }
 

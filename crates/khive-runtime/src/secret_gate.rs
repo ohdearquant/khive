@@ -472,6 +472,16 @@ const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
 /// could forge or visually disguise part of the record. The result is bounded
 /// again for the emitted record. A truncation in either the masking pass or the
 /// output pass appends `…` so the record declares its own incompleteness.
+///
+/// This function, not [`mask_for_redaction_surface`], is the direct
+/// `mask_secrets` caller for general log-text bounding: it is not one of the
+/// three named redact-not-block surfaces (git ingest, session mirror, MCP
+/// diagnostics) that surface owns, and its own mask-then-truncate contract —
+/// with the additional crossing-boundary fallback above — is a strict
+/// superset of what the surface wrapper provides. It lives in this module
+/// specifically so it can stay a direct caller; the call-site census in
+/// `crates/khive-runtime/tests/adr115_redaction_call_site_census.rs` only
+/// requires callers *outside* this file to route through the wrapper.
 pub fn bounded_masked_log_text(text: &str) -> String {
     let mask_input_truncated = text.chars().nth(MAX_LOG_TEXT_MASK_INPUT_CHARS).is_some();
     let bounded_input: std::borrow::Cow<'_, str> = if mask_input_truncated {

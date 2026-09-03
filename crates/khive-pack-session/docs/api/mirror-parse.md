@@ -123,8 +123,12 @@ form of a message `content` value.
 - `"input_text"` / `"output_text"` — Codex user and assistant text blocks
   (same field, `text`, as the Claude Code `"text"` block, hence shared
   extraction logic).
-- `"tool_use"` — tool invocation (name + input JSON, truncated to 500 chars).
-- `"tool_result"` — tool output (content string, truncated to 500 chars).
+- `"tool_use"` — tool invocation (name + input JSON, masked through the `SessionMirror` surface
+  then truncated to 500 chars). Masking runs before truncation: a detector's terminating span can
+  sit past the 500-char cut, and a masker that only sees a truncated prefix cannot recognize a
+  match it cannot see the end of.
+- `"tool_result"` — tool output (content string, masked through the `SessionMirror` surface then
+  truncated to 500 chars, for the same mask-before-truncate reason).
 
 ## `extract_chatgpt_text`
 
