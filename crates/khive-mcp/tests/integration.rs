@@ -211,6 +211,7 @@ async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServe
 /// append beside each canonical result. The same backend still rejects writes.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advisory() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -279,6 +280,7 @@ async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advis
 
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn chmod_read_only_snapshot_default_list_keeps_items_envelope_and_sibling_audit_advisory() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -376,6 +378,32 @@ async fn request_tool_description_contains_dynamic_verb_catalog() -> anyhow::Res
             "request description missing verb {verb:?}: {desc}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_tool_description_declares_comm_read_dependency_contract() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let listed = client.list_tools(None).await?;
+    let request = listed
+        .tools
+        .iter()
+        .find(|t| t.name == "request")
+        .expect("request tool must be present");
+    let desc = request.description.as_deref().unwrap_or("");
+
+    assert!(
+        desc.contains("comm.read") && desc.contains("comm.mark_read"),
+        "the request surface must name state-mutating read acknowledgements: {desc}"
+    );
+    assert!(
+        desc.contains("does not wait for or depend on comm.send/comm.reply"),
+        "the parallel sibling-independence hazard must be explicit: {desc}"
+    );
+    assert!(
+        desc.contains("comm.reply delivers first") && desc.contains("use a chain"),
+        "the contract must give both safe sequencing alternatives: {desc}"
+    );
     Ok(())
 }
 
@@ -1876,6 +1904,20 @@ impl khive_types::Pack for ErrorInjectPack {
             params: &[],
         },
         HandlerDef {
+            name: "writer_task_rolled_back",
+            description: "returns an ordinary writer request error after proven rollback",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "writer_task_side_effects_unknown",
+            description: "returns a terminal writer error with ambiguous side effects",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
             name: "storage_admission_timeout",
             description: "returns a typed storage-admission timeout error",
             visibility: Visibility::Verb,
@@ -1943,6 +1985,24 @@ impl PackRuntime for ErrorInjectPack {
         if verb == "writer_task_busy" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 },
+            ));
+        }
+        if verb == "writer_task_rolled_back" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::WriterTaskRequestFailed {
+                    request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                    source: Box::new(khive_storage::StorageError::Pool {
+                        operation: "writer_task_commit".into(),
+                        message: "commit refused".into(),
+                    }),
+                },
+            ));
+        }
+        if verb == "writer_task_side_effects_unknown" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::WriterTaskTerminated {
+                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                },
             ));
         }
         if verb == "storage_admission_timeout" {
@@ -2179,6 +2239,57 @@ async fn writer_task_busy_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
             "retry_after_ms": serde_json::Value::Null,
         }),
         "BEGIN contention must remain distinguishable and safely retryable"
+    );
+
+    Ok(())
+}
+
+/// Request finality and writer-task liveness are independent. A COMMIT error
+/// followed by verified rollback is safe from duplicate effects and keeps the
+/// writer alive; a failed rollback is terminal and ambiguous. Preserve both
+/// facts as structured MCP fields rather than forcing clients to parse text.
+#[tokio::test]
+async fn writer_task_finality_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+
+    let rolled_back = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "writer_task_rolled_back()"}),
+    )
+    .await?;
+    let rolled_back_body: serde_json::Value = serde_json::from_str(&first_text(&rolled_back))?;
+    assert_eq!(
+        rolled_back_body["results"][0]["error"],
+        serde_json::json!({
+            "kind": "storage",
+            "code": "writer_task_request_failed",
+            "stage": "writer_task_request_failed",
+            "message": "storage: writer task request failed (request_state=transaction_rolled_back): pool failure during writer_task_commit: commit refused",
+            "retryable": true,
+            "request_state": "transaction_rolled_back",
+            "task_terminated": false,
+        })
+    );
+
+    let unknown = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "writer_task_side_effects_unknown()"}),
+    )
+    .await?;
+    let unknown_body: serde_json::Value = serde_json::from_str(&first_text(&unknown))?;
+    assert_eq!(
+        unknown_body["results"][0]["error"],
+        serde_json::json!({
+            "kind": "storage",
+            "code": "writer_task_terminated",
+            "stage": "writer_task_terminated",
+            "message": "storage: writer task terminated (request_state=side_effects_unknown)",
+            "retryable": false,
+            "request_state": "side_effects_unknown",
+            "task_terminated": true,
+        })
     );
 
     Ok(())
@@ -3592,6 +3703,7 @@ async fn subhandler_verbs_are_blocked_at_mcp_boundary() -> anyhow::Result<()> {
 /// when the gate lived in the shared dispatch — every handler had to be
 /// promoted to `Verb` to stay reachable, which is exactly what we are undoing.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
     use khive_mcp::tools::request::RequestParams;
 
@@ -5385,6 +5497,7 @@ async fn brain_feedback_default_agent_response_preserves_full_target_id() -> any
 /// behavior: create → output parses clean; update → output parses clean;
 /// content round-trips byte-identical.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Result<()> {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6015,6 +6128,7 @@ fn compute_config_id_normalizes_absent_and_present_but_empty_git_write_to_same_f
 /// assertion (b) fails (the entity namespace would be `"local"`) and the scoped
 /// list in (c) would be empty.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     use khive_mcp::tools::request::RequestParams;
     use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
@@ -6150,6 +6264,7 @@ fn make_format_server() -> KhiveMcpServer {
 /// ADR-078 §8.2: error envelopes are never passed through auto/table renderers.
 /// ADR-078 §8.4: ok results are rendered per-op.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn format_auto_mixed_ok_error_batch_error_stays_compact() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6210,6 +6325,7 @@ async fn format_auto_mixed_ok_error_batch_error_stays_compact() {
 /// Pins ADR-078 §8.4: a single `format` applies uniformly; `format_per_op`
 /// overrides per position.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn format_per_op_override_selects_format_per_position() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6278,6 +6394,7 @@ async fn format_per_op_override_selects_format_per_position() {
 /// effective presentation, so `full_id`/`namespace`/duplicate-props could
 /// be stripped even when that specific op was verbose.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     use khive_mcp::tools::request::RequestParams;
 
@@ -6397,6 +6514,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
 /// AlwaysVerbose policy into the format-seam presentation. This is the *implicit
 /// policy* sibling of `presentation_per_op_verbose_preserves_*` (explicit override).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override() {
     use khive_mcp::tools::request::RequestParams;
 

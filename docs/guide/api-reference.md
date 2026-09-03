@@ -36,7 +36,15 @@ An always-machine-readable copy of this page is at
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
 `kkernel git-ingest` CLI drive. Its four verbs are `git.digest` (read/ingest) plus three
 write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that shell to system git
-with hardened, allowlisted argv construction.
+with hardened, allowlisted argv construction. A remote `git.digest` source whose initial
+clone or fetch setup fails returns a typed `RemoteFetchError` naming the redacted remote
+to in-process callers; the MCP `request` envelope renders it as a plain error message
+rather than structured fields (ADR-088 Amendment 1, Remote-URL mode, point 5). A
+clone/fetch failure hit later while repairing an already-cached clone surfaces as
+`InvalidInput` only when the bounded refetch-then-reclone repair ultimately fails (a
+successful repair earns one more snapshot attempt, and the digest completes only when
+that attempt succeeds); a source that parses as neither a local path nor a remote URL
+is `InvalidInput` as well.
 
 `workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
 
@@ -783,9 +791,30 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics for the main
-database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal`
-sidecar file size, and a WAL-pin holder census. Takes no parameters.
+Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for the
+main database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the
+`-wal` sidecar file size, page-level database size composition, and a WAL-pin holder census.
+Takes no parameters.
+
+`reader_contention` is scoped to the main `ConnectionPool` and resets only when that pool is
+reconstructed. `reader_admission_capacity` and `available_reader_admission_slots` are the
+configured total budget and its point-in-time availability; pooled reads and the explicit
+raw-SQL deferred-transaction exception share it. `reader_acquisitions` is the sum of
+`pooled_reader_checkouts` and request-path `standalone_reader_opens`, while
+`infrastructure_standalone_reader_opens` is deliberately separate. Ordinary file-backed reads
+must leave `standalone_reader_opens` flat. `reader_checkout_timeouts` counts admission waits that
+exhausted `KHIVE_CHECKOUT_TIMEOUT_SECS` before work began, not cooperative request cancellation.
+`active_pooled_reader_checkouts`, `peak_active_pooled_reader_checkouts`,
+`completed_pooled_reader_checkouts`, and `max_completed_reader_hold_micros` expose concurrency
+and lifecycle evidence; completed hold includes connection reset/replacement before reuse.
+`reader_replacement_open_failures` counts a disqualified pooled-reader return whose replacement
+connection then also failed to open, permanently shrinking the physical pool by one slot below
+`max_readers`; non-zero here means the pool has fewer physical reader connections than
+configured, and each occurrence is also logged at `warn`.
+
+The timeout setting applies to each admission attempt. A verb that issues several sequential
+reads can spend more than one configured timeout in total wall time, but each attempt is bounded
+and saturation never falls back to opening a standalone connection.
 
 `writer_contention` contains monotonic counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
@@ -853,9 +882,21 @@ deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded
 `unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
 `unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
 holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
-`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are cleanup-enumeration
-measurements: this request deliberately does not run that mutating enumeration, so both fields are
-omitted rather than reporting fabricated `false`/`0` values.
+The holder census is reconciled with a separate, bounded, read-only sidecar pass. A complete census
+and conclusive sidecar walk can therefore produce `wal_pin.status: "complete"`; truncated walks,
+unknown sidecar identities, and OS-confirmed holders missing sidecar evidence degrade explicitly.
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are measured by that pass. The
+latter is a forecast: diagnostics never performs the cleanup it reports.
+
+`size_composition` accounts SQLite pages by individual table or index using aggregate `dbstat`.
+It reports file-wide page/freelist/accounted/unaccounted byte totals plus operational class totals
+for ordinary row tables, indexes, FTS storage, vector storage, mixed row-and-embedding tables, and
+SQLite internal objects. A table that stores both ordinary columns and an `embedding BLOB` is kept
+in `mixed_embedding_bytes`: SQLite cannot attribute bytes within a shared page to one column, so
+the field is an upper bound for the embedding-bearing table, not a fabricated pure-vector byte
+count. Object detail is deterministic and capped at 4,096 rows; `objects_truncated` and
+`objects_omitted` make cap pressure explicit while the aggregate class totals still cover every
+object returned by `dbstat`. `size_composition_error` explains an unavailable report.
 
 `graph_edge_integrity` reports `duplicate_edge_id_groups`, `graph_edges_rows`,
 `graph_edges_seq_rows`, and `pre_v14_duplicate_edge_state_detected`. A non-zero duplicate group
@@ -1307,6 +1348,10 @@ Remove rows from the profile resolution table. At least one filter is required.
 ```
 request(ops="brain.unbind(actor=\"role:implementer\")")
 ```
+
+The result includes `removed`, the number of matching bindings deleted. A successful
+request that matched nothing returns `removed: 0`. The legacy `unbound` field carries
+the same count for compatibility.
 
 ### `brain.bindings` — Assertive
 

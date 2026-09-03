@@ -238,6 +238,7 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
 // test's arm against the other's supervisor loop consuming it.
 #[serial]
 #[tokio::test]
+#[serial(config_ledger)]
 async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
@@ -376,6 +377,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
 // test's arm against the other's supervisor loop consuming it.
 #[serial]
 #[tokio::test]
+#[serial(config_ledger)]
 async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
@@ -477,6 +479,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
 /// about the verb name alone.
 #[serial]
 #[tokio::test]
+#[serial(config_ledger)]
 async fn failed_allowlisted_read_does_not_degrade_on_admission_exhaustion() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
@@ -562,6 +565,7 @@ async fn failed_allowlisted_read_does_not_degrade_on_admission_exhaustion() {
 /// counter may move for a `DispatchFailed` producer.
 #[serial]
 #[tokio::test]
+#[serial(config_ledger)]
 async fn failed_allowlisted_read_does_not_degrade_on_admission_deadline_expiry() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
