@@ -857,10 +857,15 @@ reconstructed as a terminal writer error merely because it crossed the daemon so
 The writer task absorbs a small, bounded number of the retry-safe refusals
 classified by Amendment 4. A transaction-wrapped request makes at most three
 total `BEGIN IMMEDIATE` attempts, with fixed 5 ms and 10 ms backoffs after the
-first two busy/locked refusals. Each attempt retains the connection's
-configured SQLite `busy_timeout`; persistent contention is therefore bounded
-to three busy-timeout windows plus 15 ms of explicit backoff. A non-busy BEGIN
-error is never retried.
+first two busy/locked refusals. The attempts share one acquisition budget: the
+connection's configured SQLite `busy_timeout`, measured from the first
+attempt. Before each retry the task subtracts the time already spent and
+lowers the connection's `busy_timeout` to the remainder; a busy/locked refusal
+that arrives with no budget left surfaces immediately instead of retrying.
+Persistent contention is therefore bounded to one busy-timeout window plus
+15 ms of explicit backoff, never three windows. When a retry lowered the
+timeout, the configured value is restored on the connection before the next
+request is dequeued. A non-busy BEGIN error is never retried.
 
 The retry loop is immediately around `BEGIN IMMEDIATE`, before the task
 transfers the request's `FnOnce` operation closure to execution. Success runs
@@ -871,9 +876,11 @@ Amendment 4 `StorageError::WriterTaskBusy` result and runtime/MCP fields:
 hint. Request-body failures, COMMIT, ROLLBACK, top-level operations, and every
 ambiguous or terminal path remain single-pass and are never replayed.
 
-Observability distinguishes every refusal without changing the existing
-counter's meaning. `writer_task_begin_busy_absorbed` increments once for each
-busy/locked refusal followed by another internal BEGIN attempt;
-`writer_task_begin_busy` continues to count only the final refusal surfaced to
-the caller. These counters are disjoint and are published as concrete `u64`
-values under `db_diagnostics.writer_contention`.
+Observability distinguishes absorbed from surfaced refusals without changing
+the existing counter's meaning. `writer_task_begin_busy` keeps counting every
+busy/locked `BEGIN IMMEDIATE` refusal, whether or not another internal attempt
+follows it, so a nonzero value reflects total contention regardless of retry
+policy. `writer_task_begin_busy_absorbed` counts the subset of those refusals
+that was followed by another internal attempt; the refusals surfaced to the
+caller are the difference between the two. Both are published as concrete
+`u64` values under `db_diagnostics.writer_contention`.
