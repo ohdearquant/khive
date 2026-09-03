@@ -56,7 +56,7 @@ fn sink_never_adds_measurable_latency_when_its_writer_is_genuinely_slow() {
     let pool = Arc::new(ConnectionPool::new(cfg).expect("file-backed pool should open"));
     let construct_elapsed = construct_start.elapsed();
     assert!(
-        construct_elapsed < Duration::from_millis(500),
+        construct_elapsed < Duration::from_millis(WRITE_DELAY_MS / 2),
         "pool construction took {construct_elapsed:?} against a {WRITE_DELAY_MS}ms-per-write \
          sink — the sink must never add filesystem-bound latency to pool boot"
     );
@@ -79,7 +79,7 @@ fn sink_never_adds_measurable_latency_when_its_writer_is_genuinely_slow() {
         "a second writer checkout while the first is held must time out"
     );
     assert!(
-        elapsed < Duration::from_millis(250),
+        elapsed < Duration::from_millis(WRITE_DELAY_MS / 2),
         "checkout_timeout was 50ms but writer() took {elapsed:?} against a \
          {WRITE_DELAY_MS}ms-per-write sink — emit_timeout must be a non-blocking enqueue, \
          never blocking on the writer thread's own I/O latency"
