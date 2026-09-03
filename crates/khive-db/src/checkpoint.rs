@@ -1901,25 +1901,30 @@ impl CheckpointConnection {
 /// hundreds of thousands of rows — the same class of blocking work the
 /// WAL-pin beacon writes above already move off the worker via
 /// `tokio::task::spawn_blocking`. `conn` and `state` are moved into the
-/// blocking closure and handed back to the caller regardless of the step's
-/// outcome, so the checkpoint task can restore its dedicated connection and
-/// scheduler state on every path.
+/// blocking closure and handed back to the caller whenever the step returns,
+/// so the checkpoint task can restore its dedicated connection and scheduler
+/// state on every non-panicking path. A panic inside the step surfaces as the
+/// `JoinError`, like the beacon writes above: the connection and scheduler
+/// state moved into the task are gone with it, and the caller reopens both
+/// on the next tick instead of taking the checkpoint task down.
 async fn run_fts_maintenance_off_worker(
     conn: rusqlite::Connection,
     config: crate::fts_maintenance::FtsMaintenanceConfig,
     mut state: crate::fts_maintenance::FtsMaintenanceState,
     now: Instant,
-) -> (
-    rusqlite::Connection,
-    crate::fts_maintenance::FtsMaintenanceState,
-    Result<Option<crate::fts_maintenance::FtsMaintenanceStep>, String>,
-) {
+) -> Result<
+    (
+        rusqlite::Connection,
+        crate::fts_maintenance::FtsMaintenanceState,
+        Result<Option<crate::fts_maintenance::FtsMaintenanceStep>, String>,
+    ),
+    tokio::task::JoinError,
+> {
     tokio::task::spawn_blocking(move || {
         let result = crate::fts_maintenance::run_if_due(&conn, &config, &mut state, now);
         (conn, state, result)
     })
     .await
-    .expect("FTS5 maintenance blocking task panicked")
 }
 
 /// Run the WAL checkpoint background task.
@@ -2101,15 +2106,32 @@ pub async fn run_checkpoint_task(
                     #[cfg(not(unix))]
                     let _ = outcome.sidecar_attribution;
 
-                    let (conn, state, fts_result) = run_fts_maintenance_off_worker(
+                    let fts_result = match run_fts_maintenance_off_worker(
                         conn,
                         fts_maintenance_config.clone(),
                         fts_maintenance_state,
                         Instant::now(),
                     )
-                    .await;
-                    fts_maintenance_state = state;
-                    checkpoint_conn.conn = Some(conn);
+                    .await
+                    {
+                        Ok((conn, state, fts_result)) => {
+                            fts_maintenance_state = state;
+                            checkpoint_conn.conn = Some(conn);
+                            fts_result
+                        }
+                        Err(join_err) => {
+                            // The step panicked on the blocking thread. The
+                            // connection and scheduler state moved into it
+                            // are gone; `ensure_open` reopens the connection
+                            // next tick and the schedule restarts from now.
+                            // The checkpoint pragma itself already succeeded.
+                            fts_maintenance_state =
+                                crate::fts_maintenance::FtsMaintenanceState::new(Instant::now());
+                            Err(format!(
+                                "bounded FTS5 segment maintenance task panicked: {join_err}"
+                            ))
+                        }
+                    };
 
                     match fts_result {
                         Ok(Some(step)) => match step.outcome {
@@ -4239,7 +4261,8 @@ mod tests {
         let wrapped_state = crate::fts_maintenance::FtsMaintenanceState::new(Instant::now());
         let (_conn, _state, wrapped_result) =
             run_fts_maintenance_off_worker(wrapped_conn, config, wrapped_state, Instant::now())
-                .await;
+                .await
+                .expect("maintenance step did not panic");
         let wrapped_step = wrapped_result
             .expect("wrapped maintenance step")
             .expect("fragmented fixture has a due step");
