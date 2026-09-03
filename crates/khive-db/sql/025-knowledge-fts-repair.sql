@@ -1,4 +1,4 @@
--- V23: Repair the knowledge external-content FTS indexes and make atom
+-- V25: Repair the knowledge external-content FTS indexes and make atom
 -- lifecycle transitions symmetric.
 --
 -- fts_knowledge historically named knowledge_atoms as its external content

@@ -152,9 +152,9 @@ above remains the historical pre-consolidation record.
 |     V21 | ADR-121 / ADR-160  | attachments_first_class            | shipped |
 |     V22 | #2166              | notes_unread_probe_recipient       | shipped |
 |     V23 | ADR-062 / #1907    | fts_record_kind                    | shipped |
-|     V24 | #2273              | knowledge_fts_repair               | shipped |
+|     V25 | #2273              | knowledge_fts_repair               | shipped |
 
-> **V24 record (2026-08-29)**: `knowledge_fts_repair` recreates atom FTS against
+> **V25 record (2026-08-29)**: `knowledge_fts_repair` recreates atom FTS against
 > the live-row `knowledge_atoms_fts_content` view, installs symmetric lifecycle
 > triggers, and rebuilds both knowledge external-content indexes. This makes
 > rank-1 FTS5 integrity checks meaningful while repairing historical section

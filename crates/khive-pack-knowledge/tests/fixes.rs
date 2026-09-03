@@ -11,7 +11,7 @@
 
 use khive_pack_kg::KgPack;
 use khive_pack_knowledge::KnowledgePack;
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeError, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use khive_storage::{SqlStatement, SqlValue};
 use serde_json::{json, Value};
 
@@ -3379,10 +3379,10 @@ async fn explicit_domain_ids_compose_includes_draft_member_atoms() {
 
 fn pack_with_events(rt: KhiveRuntime) -> Fixture {
     let rt_clone = rt.clone();
-    let tok = rt.authorize(Namespace::local()).expect("local token");
-    let event_store = rt.events(&tok).expect("event store");
     let mut builder = VerbRegistryBuilder::new();
-    builder.with_event_store(event_store);
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("configure trusted runtime audit store");
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry builds");
@@ -3395,6 +3395,7 @@ fn pack_with_events(rt: KhiveRuntime) -> Fixture {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn stats_total_events_counts_knowledge_verbs() {
     let f = pack_with_events(rt());
 

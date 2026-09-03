@@ -180,7 +180,7 @@ An FTS5 external-content virtual table (`fts_knowledge`) indexes slug, name,
 and content from `knowledge_atoms` via triggers that sync on
 insert/update/delete. The trigram tokenizer enables substring matching.
 
-Soft-deleted atoms (non-null `deleted_at`) are excluded from the FTS index. V23
+Soft-deleted atoms (non-null `deleted_at`) are excluded from the FTS index. V25
 names a live-row view (`knowledge_atoms_fts_content`) as the external content
 object, so FTS5's index and its content object cover the same rows. Transition-
 symmetric triggers remove a document only when the old row was live and insert

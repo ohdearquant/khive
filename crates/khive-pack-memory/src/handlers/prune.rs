@@ -210,6 +210,7 @@ mod prune_recall_visibility_tests {
     /// paths are exercised, not just whichever one a fresh corpus happens to take.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn prune_excludes_pruned_memory_across_fts_vector_and_hybrid_recall() {
         const MODEL: &str = "prune-533-visibility-model";
         const DIMS: usize = 16;
@@ -385,6 +386,7 @@ mod prune_recall_visibility_tests {
     /// three legs exclude it post-prune.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn prune_excludes_pruned_memory_via_default_fusion_recall() {
         const MODEL: &str = "prune-533-visibility-model-default-fusion";
         const DIMS: usize = 16;

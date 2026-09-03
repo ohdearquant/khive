@@ -9,3 +9,7 @@ content) so they're safe to commit to this public repo; they exercise the
 same *shape* of query/content distinction as the private case they mirror
 (e.g. "a query naming specific proper nouns should outrank generic-content
 distractors that don't mention them").
+
+`blake3-feature-compare/` — standalone release-mode harness comparing BLAKE3
+1.8.5 with `std` against the same crate with `std,pure`. It is intentionally
+outside the Rust workspace so the two Cargo feature sets remain isolated.
