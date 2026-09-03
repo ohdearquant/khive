@@ -349,7 +349,7 @@ Optional, with defaults:
   quarantine record instead of dropping it)
 - `KHIVE_EMAIL_INGEST_NAMESPACE` (default `local`; target namespace for
   ingested messages)
-- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `lambda:leo`; inbound actor assigned to
+- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `local`; inbound actor assigned to
   fresh, uncorrelated email messages)
 - `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` (comma-separated outbound allowlist;
   falls back to the maintainer address when unset)

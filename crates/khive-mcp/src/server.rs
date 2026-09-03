@@ -434,8 +434,8 @@ impl DispatchFailure {
 /// Two servers produce the same id iff they can safely share one warm engine:
 /// same pack set (order-independent), same storage target and effective access
 /// mode, same embedders, same backend topology/routing, and same
-/// construction-baked fresh-tail, blob-hydration, outbound, and git-write
-/// policies.
+/// construction-baked fresh-tail, blob-hydration, outbound, caller-enrollment,
+/// and git-write policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
 /// compares this against each forwarded request's `config_id` and rejects
@@ -571,6 +571,11 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         .collect();
     outbound.sort();
     outbound.dedup();
+    let gate = config
+        .gate
+        .configuration_fingerprint()
+        .map(|fingerprint| format!(";gate={fingerprint}"))
+        .unwrap_or_default();
     let mut git_write_hasher = Sha256::new();
     git_write_hasher.update(b"khive.git-write-policy.v1");
     git_write_hasher.update((config.git_write.allowed.len() as u64).to_be_bytes());
@@ -619,7 +624,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // a one-time operational cost that ends when the daemon is restarted, by
     // whoever restarts it.
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}];git_write={};display_tz={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};display_tz={}",
         packs.join(","),
         db,
         primary,
@@ -628,6 +633,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         config.blob_hydration_bytes,
         backend,
         outbound.join(","),
+        gate,
         git_write,
         config.display_timezone.name(),
     );
@@ -1007,6 +1013,146 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
     }
 }
 
+/// Optional idle timeout for a stdio bridge session: when configured, no
+/// request for this long and the session closes (see
+/// [`crate::transport::CancelOnEofTransport`]), releasing its reader-pool
+/// admission and DB connection — a client that comes back simply respawns the
+/// bridge, seamlessly from its perspective.
+/// This closes only a genuinely idle session: an admitted request with a
+/// response still being written — running long, or delivered slowly to a
+/// backpressured reader — defers the close rather than being cancelled out
+/// from under it, up to the separate response-delivery bound documented on
+/// [`stdio_bridge_response_deadline_from_env`].
+///
+/// **Off unless configured, and that is a deliberate reading of existing
+/// repository law rather than caution.** ADR-091 enumerates "kill long-lived
+/// reader sessions" among its rejected alternatives, on the ground that
+/// long-lived stdio sessions are live Claude Code instances and closing them
+/// by age is a worse user experience than bounding what they hold underneath
+/// them. Closing a session after an hour of quiet is that rejected policy
+/// whatever the mechanism, because this transport has no signal that
+/// separates an abandoned pipe from a live client that simply has not been
+/// asked anything. Defaulting it on would reverse an accepted decision from
+/// inside an unrelated change, so the default is off and turning it on is an
+/// operator's explicit act — a supervised deployment, a CI harness, or any
+/// context where session churn is cheap and a pinned WAL connection is not.
+/// Making it the default requires amending ADR-091, not a different number
+/// here.
+///
+/// Set `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS` to a positive number of seconds to
+/// enable it. `0`, absent, and unparsable all leave it disabled; unparsable
+/// falls back rather than panicking, matching this codebase's other
+/// `_from_env` helpers, and it falls back to *disabled* because a typo must
+/// never silently start closing live sessions. 3600 is the suggested value
+/// where it is wanted: long enough that ordinary gaps in a live session never
+/// trip it.
+fn stdio_bridge_idle_timeout_from_env() -> Option<std::time::Duration> {
+    let secs = std::env::var("KHIVE_BRIDGE_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// How long an admitted request whose response has not been written keeps
+/// deferring the idle close.
+///
+/// The idle check must not treat a session with work outstanding as idle, or
+/// it cancels a running handler out from under itself. But rmcp spawns each
+/// request handler and drops the join handle, so a handler that panics never
+/// reaches the response construction that would clear its obligation. Deferring
+/// on an outstanding obligation with no bound therefore hands any panicking
+/// handler the power to disable idle reaping for the life of the session — the
+/// exact unbounded lifetime the idle timeout exists to close, reintroduced
+/// through the guard that protects it.
+///
+/// This bound is separate from the idle window on purpose. Reusing the idle
+/// window would mean a handler that runs longer than one quiet window stops
+/// protecting its own session, which is the guarantee the obligation exists to
+/// provide. It is set far above any real handler and answers a different
+/// question: not "has this session been quiet" but "has this request been
+/// outstanding so long that its handler must be gone".
+///
+/// Overridable via `KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS`; `0` disables the
+/// bound, restoring the unbounded defer. An unparsable value falls back to the
+/// default. Default: 3600s.
+fn stdio_bridge_request_obligation_ttl_from_env() -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 3600;
+    let secs = std::env::var("KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// Maximum number of requests a stdio bridge admits to rmcp while their
+/// responses are still outstanding. A full session is closed before another
+/// handler is spawned, bounding the per-session handler and obligation state.
+///
+/// Overridable via `KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS`. Values must be
+/// positive; `0`, an unparsable value, or a value too large for this platform
+/// falls back to the default. Default: 1024, enough for ordinary concurrent
+/// MCP traffic while keeping a peer that stops reading from growing the
+/// session without limit.
+fn stdio_bridge_max_outstanding_requests_from_env() -> usize {
+    std::env::var("KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(crate::transport::DEFAULT_MAX_OUTSTANDING_REQUESTS)
+}
+
+/// Response-delivery deadline for a stdio bridge session: the longest a
+/// single response write may stay pending before it is abandoned (see
+/// [`crate::transport::CancelOnEofTransport::send`]) and this session is
+/// closed. Independent of the idle timeout above — it bounds an admitted
+/// request's response write directly, rather than the gap between
+/// requests. Without this bound, a peer that admits a request and then
+/// stops reading its response — while leaving the pipe itself open — keeps
+/// that write pending forever, so the idle timeout would defer indefinitely
+/// (an in-flight response always defers idle-close) and the session would
+/// never be reaped.
+///
+/// Overridable via `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`, accepted range
+/// 1..=u64::MAX seconds. Unlike `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`, this bound
+/// cannot be disabled: `0` is a startup error naming the variable, the
+/// rejected value, and the accepted range, rather than a silent opt-out — a
+/// configuration that restores an unbounded pending write restores the
+/// defect this deadline exists to close (see the type doc above). An
+/// unparsable value falls back to the default rather than erroring, matching
+/// this codebase's other `_from_env` helpers. Default: 300s (5 minutes) —
+/// long enough that legitimately slow verbs and ordinary reader backpressure
+/// never trip it, short enough that a peer that has genuinely stopped
+/// reading does not pin the session's reader-pool admission / DB connection
+/// indefinitely.
+fn stdio_bridge_response_deadline_from_env() -> anyhow::Result<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 300;
+    let secs = match std::env::var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => secs,
+            Err(_) => DEFAULT_SECS,
+        },
+        Err(_) => DEFAULT_SECS,
+    };
+    if secs == 0 {
+        anyhow::bail!(
+            "KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 is not accepted: the response-delivery \
+             deadline cannot be disabled (a disabled deadline lets a peer that stops reading \
+             pin the bridge's response write forever). Set it to a positive number of seconds \
+             (accepted range: 1..=u64::MAX, default {DEFAULT_SECS})."
+        );
+    }
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 impl KhiveMcpServer {
     /// Build a server from `runtime.config().packs`. Errors if any pack is unknown or missing deps.
     ///
@@ -1053,10 +1199,8 @@ impl KhiveMcpServer {
         // registry exposes an advisory beside each successful result instead.
         if runtime.is_read_only() {
             builder.with_read_only_audit_store();
-        } else if let Ok(tok) = runtime.authorize(khive_runtime::Namespace::local()) {
-            if let Ok(event_store) = runtime.events(&tok) {
-                builder.with_event_store(event_store);
-            }
+        } else if let Err(error) = builder.with_runtime_event_store(&runtime) {
+            tracing::warn!(%error, "registry audit event store is unavailable");
         }
         if let Err(load_err) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
             let failure = match load_err {
@@ -1421,13 +1565,20 @@ impl KhiveMcpServer {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
         let root = tokio_util::sync::CancellationToken::new();
+        let idle_timeout = stdio_bridge_idle_timeout_from_env();
+        let response_deadline = stdio_bridge_response_deadline_from_env()?;
+        let max_outstanding_requests = stdio_bridge_max_outstanding_requests_from_env();
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
-            crate::transport::CancelOnEofTransport::new(
+            crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
                 crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
                     read, write,
                 )),
                 root,
+                idle_timeout,
+                Some(response_deadline),
+                stdio_bridge_request_obligation_ttl_from_env(),
+                max_outstanding_requests,
             )
         };
 
@@ -1466,10 +1617,16 @@ impl KhiveMcpServer {
 
         let root = tokio_util::sync::CancellationToken::new();
         let (read, write) = stdio();
-        let transport = crate::transport::CancelOnEofTransport::new(
-            AsyncRwTransport::new_server(read, write),
-            root.clone(),
-        );
+        let response_deadline = stdio_bridge_response_deadline_from_env()?;
+        let transport =
+            crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
+                AsyncRwTransport::new_server(read, write),
+                root.clone(),
+                stdio_bridge_idle_timeout_from_env(),
+                Some(response_deadline),
+                stdio_bridge_request_obligation_ttl_from_env(),
+                stdio_bridge_max_outstanding_requests_from_env(),
+            );
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
         Ok(())
@@ -2236,15 +2393,27 @@ fn coordinator_search_visibility(
 }
 
 /// Preserve the established flat-string payload for ordinary runtime errors,
-/// while carrying every typed safe-retry write failure structurally through
-/// every MCP execution mode. Pool checkout and queue saturation happen before
-/// admission; writer-task BEGIN contention happens after queue acceptance but
-/// before the operation closure runs. None can leave a partial side effect.
+/// while carrying typed write admission and writer-request finality through
+/// every MCP execution mode. Finality is independent of retryability: a proven
+/// rollback makes duplicate effects impossible but retains the source error's
+/// transient policy, while an unverified rollback remains terminal and
+/// ambiguous.
 fn runtime_error_value(error: RuntimeError) -> Value {
     match error {
         RuntimeError::Khive(k) => serde_json::to_value(&k)
             .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
         other => {
+            if let Some(context) = other.writer_task_failure_context() {
+                return json!({
+                    "kind": "storage",
+                    "code": context.stage,
+                    "stage": context.stage,
+                    "message": other.to_string(),
+                    "retryable": context.retryable,
+                    "request_state": context.request_state.to_string(),
+                    "task_terminated": context.task_terminated,
+                });
+            }
             let Some(context) = other.retryable_failure_context() else {
                 return json!(other.to_string());
             };
@@ -2661,6 +2830,13 @@ true`, `code: "writer_pool_checkout_timeout"`, `"writer_queue_saturated"`,
 or `"writer_task_begin_busy"`)
 never rolls back a sibling that already committed. Inspect each result
 entry's own `ok` field rather than assuming batch-level atomicity.
+
+`comm.read` and `comm.mark_read` mutate delivery state. In a parallel batch,
+either acknowledgement does not wait for or depend on comm.send/comm.reply, so
+a read mark can commit even when the sibling send fails. When the mark must
+depend on a send, use a chain so a failed send aborts the mark. For the common
+reply-and-read flow, prefer `comm.reply`: comm.reply delivers first, then attempts
+the original message's best-effort read mark.
 
 `search` carries its own per-op `status` ("complete" | "partial") inside that
 op's `result` entry, separate from the top-level batch `status` above. A
@@ -3534,7 +3710,7 @@ fn render_result(
                 .collect();
             let out_map = match daemon_frame_config_id {
                 Some(config_id) => {
-                    fit_rendered_batch_envelope(map, results, out_results, config_id)
+                    fit_rendered_batch_envelope(map, results, out_results, config_id, registry)
                 }
                 None => {
                     let mut out_map = map.clone();
@@ -3618,6 +3794,7 @@ fn fit_rendered_batch_envelope(
     compact_results: &[Value],
     mut out_results: Vec<Value>,
     served_config_id: &str,
+    registry: &VerbRegistry,
 ) -> serde_json::Map<String, Value> {
     let mut out_map = map.clone();
     out_map.insert(
@@ -3669,11 +3846,12 @@ fn fit_rendered_batch_envelope(
         .collect();
     by_size.sort_unstable_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
     for (index, _) in by_size {
-        out_results[index] = frame_budget_omission(&compact_results[index]);
+        out_results[index] = frame_budget_omission(&compact_results[index], registry);
         out_map.insert(
             "results".to_string(),
             serde_json::Value::Array(out_results.clone()),
         );
+        refresh_frame_budget_outcome(&mut out_map);
         if response_value_fits_daemon_frame(
             &serde_json::Value::Object(out_map.clone()),
             served_config_id,
@@ -3684,35 +3862,91 @@ fn fit_rendered_batch_envelope(
     out_map
 }
 
-fn frame_budget_omission(entry: &Value) -> Value {
+fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
     let ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let mut omitted = serde_json::Map::new();
     // `reason` is stable machine metadata, not payload detail. It is tiny and
     // must survive even when a large result/error body is omitted to fit the
     // daemon frame.
-    for key in [
-        "ok",
-        "tool",
-        "usage",
-        "aborted",
-        "reason",
-        "status",
-        "partial",
-        "missing_backends",
-        "backend_errors",
-        "backend_errors_truncated",
-        "backend_errors_omitted",
-        "advisories",
-    ] {
+    for key in ["ok", "tool", "usage", "aborted", "reason", "advisories"] {
         if let Some(value) = entry.get(key) {
             omitted.insert(key.to_string(), value.clone());
         }
     }
     if ok {
-        omitted.insert(
-            "result_omitted".to_string(),
-            json!("operation succeeded; result omitted because the response frame budget was exceeded"),
-        );
+        // Once the result is discarded, the operation is not a usable
+        // success. In particular, a pager must not interpret the missing
+        // payload as an empty terminal page. Surface a small, typed error
+        // and tell the caller what to actually do about it: reissue with a
+        // narrower request, or read the already-committed outcome back.
+        //
+        // This decision runs after `run_parsed` has already dispatched the
+        // operation (and, in a chain, every operation after it) — the frame
+        // budget is checked at render time, once the full envelope is known.
+        // A frame-budget overflow is never a transient, pace-and-retry
+        // condition: reissuing the identical request exceeds the identical
+        // budget identically. `retryable` therefore always stays `false`
+        // here — ADR-130 §2/§4 tie a `true` value to a published
+        // `retry_after_ms`/backoff/breaker contract this failure class does
+        // not have — and `recoverable` carries the actual guidance instead.
+        // A `Directive`/`Commissive`/`Declaration` verb (or an unregistered/
+        // unknown tool name, which cannot be proven side-effect-free)
+        // already committed its effect before the transport discovered the
+        // response was too large, so it fails closed to `read_outcome`; an
+        // `Assertive` verb with nothing to duplicate is told
+        // `reduce_result_size` instead. `is_retry_safe_after_frame_omission`
+        // (`khive-runtime`) additionally excludes a short, audited list of
+        // `Assertive` verbs that schedule a persisted write on every
+        // dispatch (`memory.recall`'s serve ledger, `search`'s
+        // `SearchExecuted` telemetry) — see its doc comment and
+        // `VerbCategory`'s doc comment in `khive-types`.
+        omitted.insert("ok".to_string(), Value::Bool(false));
+        let tool = entry.get("tool").and_then(Value::as_str);
+        let retry_safe = tool.is_some_and(|verb| registry.is_retry_safe_after_frame_omission(verb));
+        let (message, recoverable) = if retry_safe {
+            (
+                "operation result exceeded the daemon response frame budget; reduce limit \
+                 or result size and reissue the request",
+                "reduce_result_size",
+            )
+        } else {
+            omitted.insert("executed".to_string(), Value::Bool(true));
+            (
+                "operation completed but its result exceeded the daemon response frame \
+                 budget; read the outcome back instead of reissuing the operation",
+                "read_outcome",
+            )
+        };
+        let mut error = serde_json::Map::from_iter([
+            ("kind".to_string(), json!("response_frame_budget_exceeded")),
+            ("code".to_string(), json!("response_frame_budget_exceeded")),
+            ("message".to_string(), json!(message)),
+            ("retryable".to_string(), json!(false)),
+            ("recoverable".to_string(), json!(recoverable)),
+            (
+                "max_frame_bytes".to_string(),
+                json!(khive_runtime::daemon::MAX_FRAME_BYTES),
+            ),
+        ]);
+        // ADR-130 defines `status`/`partial`/`missing_backends`/`backend_errors*`
+        // only on a successful search entry. Once `ok` flips to false here
+        // they no longer belong at the top level; fold any that were present
+        // into `error.search` instead of dropping the diagnostic outright.
+        let search_fields: serde_json::Map<String, Value> = [
+            "status",
+            "partial",
+            "missing_backends",
+            "backend_errors",
+            "backend_errors_truncated",
+            "backend_errors_omitted",
+        ]
+        .into_iter()
+        .filter_map(|key| entry.get(key).map(|value| (key.to_string(), value.clone())))
+        .collect();
+        if !search_fields.is_empty() {
+            error.insert("search".to_string(), Value::Object(search_fields));
+        }
+        omitted.insert("error".to_string(), Value::Object(error));
     } else {
         // ADR-130 §Compatibility (MCP envelope builder): `search_incomplete`
         // is small and typed — it must survive omission untransformed rather
@@ -3735,6 +3969,37 @@ fn frame_budget_omission(entry: &Value) -> Value {
         }
     }
     Value::Object(omitted)
+}
+
+/// Rebuild aggregate outcome fields after the transport layer turns one or
+/// more oversized successes into explicit failures.
+fn refresh_frame_budget_outcome(map: &mut serde_json::Map<String, Value>) {
+    let Some(results) = map.get("results").and_then(Value::as_array) else {
+        return;
+    };
+    let total = results.len();
+    let succeeded = results
+        .iter()
+        .filter(|entry| entry.get("ok").and_then(Value::as_bool) == Some(true))
+        .count();
+    let aborted = results
+        .iter()
+        .filter(|entry| {
+            entry.get("ok").and_then(Value::as_bool) == Some(false)
+                && entry.get("aborted").and_then(Value::as_bool) == Some(true)
+        })
+        .count();
+    let failed = total.saturating_sub(succeeded + aborted);
+    map.insert(
+        "summary".to_string(),
+        json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "aborted": aborted,
+        }),
+    );
+    map.insert("status".to_string(), json!(batch_status(failed, aborted)));
 }
 
 fn serialized_response_len(value: &Value) -> usize {
@@ -3899,6 +4164,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn wire_dispatch_retains_raw_one_mib_input_limit() {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
@@ -3956,6 +4222,7 @@ mod tests {
     ///   records `None` instead of `Some(vec!["kg", "gtd"])`.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn restricted_registry_pack_list_reaches_forward_seam() {
         thread_local! {
             static SPY_CAPTURED_PACKS: std::cell::RefCell<Option<Option<Vec<String>>>> =
@@ -4027,6 +4294,7 @@ mod tests {
     /// adapter's `packs.as_deref()` argument to `None` reddens this test.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn restricted_registry_pack_list_reaches_real_adapter_boundary() {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
@@ -4071,6 +4339,7 @@ mod tests {
     /// must never share one warm daemon even when every `RuntimeConfig` field
     /// is otherwise identical.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_ann_fresh_tail_policy_differs() {
         let config = RuntimeConfig::no_embeddings();
 
@@ -4081,11 +4350,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn config_id_differs_when_caller_enrollment_policy_differs() {
+        let base = RuntimeConfig::no_embeddings();
+        let enrolled = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(
+                vec!["lambda:enrolled".to_string()],
+                false,
+            )),
+            ..base.clone()
+        };
+        let revoked = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(Vec::new(), false)),
+            ..base
+        };
+
+        assert_ne!(
+            compute_config_id_with_runtime_policies(&enrolled, None, true, false),
+            compute_config_id_with_runtime_policies(&revoked, None, true, false),
+            "different caller-enrollment policies must not share one warm daemon"
+        );
+    }
+
     /// `gtd.assign` anchors a date-only `due` through `display_timezone` and
     /// PERSISTS the resulting instant, so a warm daemon reused across two
     /// runtimes differing only in that field writes an instant wrong by the
     /// offset between the zones. Identity must separate them.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_display_timezone_differs() {
         // One base, cloned, for the reason spelled out on the test below — and
         // it matters MORE here. This assertion is `assert_ne!`, so the shared
@@ -4116,6 +4408,7 @@ mod tests {
     /// The other direction, so the assertion above cannot pass for an
     /// incidental reason: identical zones must still collapse to one identity.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_matches_when_display_timezone_matches() {
         // ONE base, cloned — not two constructor calls. `RuntimeConfig::default`
         // reads `HOME` to build `db_path`, and `db_path` is folded into the id,
@@ -4148,6 +4441,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_treats_absent_and_explicit_default_blob_hydration_budget_as_equivalent() {
         use khive_runtime::engine_config::RuntimeSectionConfig;
         use khive_runtime::{runtime_config_from_khive_config, KhiveConfig};
@@ -4172,6 +4466,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_resolved_blob_hydration_budget_differs() {
         let config = RuntimeConfig::no_embeddings();
         let mut changed = config.clone();
@@ -4215,13 +4510,38 @@ mod tests {
         const NAME: &'static str = "large-result-test";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
-            name: "large_result",
-            description: "returns a caller-sized test result",
-            visibility: khive_runtime::Visibility::Verb,
-            category: khive_runtime::VerbCategory::Assertive,
-            params: &[],
-        }];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "large_result",
+                description: "returns a caller-sized test result",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "large_write",
+                description: "returns a caller-sized test result for a state-changing verb",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Commissive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "record_write",
+                description: "records a small committed write, for chain-ordering tests",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Commissive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "memory.recall",
+                description: "test double matching the real memory.recall verb's name and \
+                               Assertive category, to exercise the qualified pack.verb name \
+                               through the real registry lookup",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
     }
 
     #[async_trait::async_trait]
@@ -4244,11 +4564,17 @@ mod tests {
 
         async fn dispatch(
             &self,
-            _verb: &str,
+            verb: &str,
             params: Value,
             _registry: &VerbRegistry,
             _token: &khive_runtime::NamespaceToken,
         ) -> Result<Value, RuntimeError> {
+            if verb == "record_write" {
+                return Ok(json!({
+                    "committed": true,
+                    "marker": params.get("marker").cloned().unwrap_or(Value::Null),
+                }));
+            }
             if let Some(bytes) = params
                 .get("table_bytes")
                 .and_then(Value::as_u64)
@@ -4360,6 +4686,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn canonical_request_deadline_wrapper_does_not_embed_dispatch_pipeline() {
         // Construct the generators on an explicitly roomy stack so this
         // regression reports their footprint instead of reproducing the LLVM
@@ -4427,6 +4754,7 @@ mod tests {
     // the canonical scope reached the database; the test below independently
     // pins absolute Tokio-deadline ordering.
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
     async fn local_exec_dispatch_installs_the_default_request_read_deadline() {
         let server = slow_sql_read_test_server();
         let expected = request_read_timeout();
@@ -4450,6 +4778,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
     async fn replay_dispatch_installs_the_default_request_read_deadline() {
         let server = slow_sql_read_test_server();
         let expected = request_read_timeout();
@@ -4474,6 +4803,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial(config_ledger)]
     async fn canonical_dispatch_preserves_an_earlier_outer_deadline() {
         let server = slow_sql_read_test_server();
         let outer = Duration::from_millis(50);
@@ -4523,6 +4853,7 @@ mod tests {
                 param_type: "string",
                 required: true,
                 description: "distinguishes reports in one request group",
+                resolution_mode: khive_types::IdResolutionMode::NotApplicable,
             }],
         }];
     }
@@ -4656,6 +4987,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn duplicate_digest_batch_and_chain_share_request_group_but_keep_distinct_receipts() {
         assert_request_group_receipts(
             r#"[git.digest(marker="first"), git.digest(marker="second")]"#,
@@ -4696,6 +5028,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn typed_serial_dispatch_retains_full_batch_write_conflict_preflight() {
         let ops = vec![
             typed_test_op("update", json!({"id": "same-id", "name": "new"})),
@@ -4746,6 +5079,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn typed_serial_dispatch_retains_one_aggregate_response_budget() {
         let result_bytes = BATCH_RESPONSE_BUDGET_BYTES / 3 - 4096;
         let ops: Vec<TypedJsonOp> = (0..12)
@@ -4814,6 +5148,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_preserves_input_order() {
         let count = MAX_BATCH_CONCURRENCY + 3;
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -4841,6 +5176,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_enforces_aggregate_response_budget() {
         assert_eq!(
             BATCH_RESPONSE_BUDGET_BYTES,
@@ -4922,6 +5258,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn save_to_writes_full_results_without_inline_response_budgeting() {
         let server = large_result_test_server();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4966,6 +5303,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn local_dispatch_returns_result_larger_than_daemon_frame() {
         let server = large_result_test_server();
         let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
@@ -4995,7 +5333,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_dispatch_degrades_result_larger_than_frame() {
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_dispatch_marks_oversized_read_result_reducible_and_not_retryable() {
         let server = large_result_test_server();
         let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
         let response = dispatch_large_result_through_daemon(
@@ -5006,16 +5345,142 @@ mod tests {
         .await;
 
         let envelope: Value = serde_json::from_str(&response).expect("response envelope");
-        assert_eq!(envelope["results"][0]["ok"], true);
+        assert_eq!(envelope["results"][0]["ok"], false);
         assert!(envelope["results"][0].get("result").is_none());
-        assert!(envelope["results"][0].get("result_omitted").is_some());
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        // A frame-budget overflow is never a pace-and-retry condition —
+        // reissuing the identical request overflows identically — so
+        // `retryable` stays false even for a side-effect-free `Assertive`
+        // verb; `recoverable` carries the actual guidance.
+        assert_eq!(envelope["results"][0]["error"]["retryable"], false);
+        assert_eq!(
+            envelope["results"][0]["error"]["recoverable"],
+            "reduce_result_size"
+        );
+        assert!(envelope["results"][0].get("executed").is_none());
+        assert_eq!(envelope["summary"]["succeeded"], 0);
+        assert_eq!(envelope["summary"]["failed"], 1);
+        assert_eq!(envelope["status"], "partial");
         assert!(rendered_response_fits_daemon_frame(
             &response,
             &server.config_id
         ));
     }
 
+    #[tokio::test]
+    async fn daemon_dispatch_marks_oversized_side_effecting_assertive_verb_non_retryable_and_executed(
+    ) {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!("memory.recall(bytes={result_bytes})"),
+            None,
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        assert_eq!(envelope["results"][0]["ok"], false);
+        assert!(envelope["results"][0].get("result").is_none());
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        // `memory.recall` is declared `Assertive`, but every dispatch
+        // schedules a persisted `brain.record_serve` write
+        // (`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`); a lost response
+        // must not be advertised as safe to reissue, or a caller acting on
+        // that advice duplicates the serve-ledger write. This also proves
+        // the omission decision resolves a qualified `pack.verb` name
+        // (containing a `.`) through the same registry lookup as a bare
+        // verb name.
+        assert_eq!(envelope["results"][0]["error"]["retryable"], false);
+        assert_eq!(
+            envelope["results"][0]["error"]["recoverable"],
+            "read_outcome"
+        );
+        assert_eq!(envelope["results"][0]["executed"], true);
+        assert!(rendered_response_fits_daemon_frame(
+            &response,
+            &server.config_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_dispatch_marks_oversized_write_result_non_retryable_and_executed() {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!("large_write(bytes={result_bytes})"),
+            None,
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        assert_eq!(envelope["results"][0]["ok"], false);
+        assert!(envelope["results"][0].get("result").is_none());
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        // `large_write` is Commissive: it already committed its change before
+        // the transport discovered the response was too large to return, so
+        // a caller must not be told it is safe to reissue the operation.
+        assert_eq!(envelope["results"][0]["error"]["retryable"], false);
+        assert_eq!(
+            envelope["results"][0]["error"]["recoverable"],
+            "read_outcome"
+        );
+        assert_eq!(envelope["results"][0]["executed"], true);
+        assert!(rendered_response_fits_daemon_frame(
+            &response,
+            &server.config_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_chain_reports_later_write_truthfully_after_earlier_frame_budget_omission() {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!(r#"large_write(bytes={result_bytes}) | record_write(marker="second")"#),
+            None,
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        // The frame-budget decision is made at render time, after `run_parsed`
+        // has already dispatched every chain operation — `record_write` really
+        // ran and committed. Its entry must report that real outcome, not a
+        // fabricated `aborted: true`, even though the sibling entry before it
+        // is reported as failed.
+        assert_eq!(envelope["results"][0]["ok"], false);
+        assert_eq!(envelope["results"][0]["executed"], true);
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        assert_eq!(envelope["results"][1]["ok"], true);
+        assert_eq!(envelope["results"][1]["tool"], "record_write");
+        assert!(envelope["results"][1].get("aborted").is_none());
+        assert_eq!(envelope["results"][1]["result"]["committed"], true);
+        assert_eq!(envelope["results"][1]["result"]["marker"], "second");
+        assert_eq!(envelope["summary"]["total"], 2);
+        assert_eq!(envelope["summary"]["succeeded"], 1);
+        assert_eq!(envelope["summary"]["failed"], 1);
+        assert_eq!(envelope["summary"]["aborted"], 0);
+        // `batch_status` only distinguishes success/partial; a frame-budget
+        // omission must not be reported as an abort trigger.
+        assert_eq!(envelope["status"], "partial");
+    }
+
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn read_only_audit_advisory_decorates_success_but_not_help_or_error() {
         let mut builder = VerbRegistryBuilder::new();
         builder.with_read_only_audit_store();
@@ -5051,40 +5516,130 @@ mod tests {
         assert!(response["results"][2].get("advisories").is_none());
         assert!(response["results"][3].get("advisories").is_none());
 
-        let omitted = frame_budget_omission(&response["results"][0]);
+        let omitted = frame_budget_omission(&response["results"][0], &registry);
         assert!(
             omitted.get("advisories").is_some(),
             "frame-budget degradation must preserve the warning"
         );
     }
 
-    #[test]
-    fn frame_budget_omission_preserves_search_degradation_advisory() {
-        let omitted = frame_budget_omission(&json!({
-            "ok": true,
-            "tool": "search",
-            "result": "oversized",
-            "status": "partial",
-            "partial": true,
-            "missing_backends": ["archive"],
-            "backend_errors": {
-                "archive": {
-                    "kind": "backend_error",
-                    "message": "storage unavailable"
-                }
-            },
-        }));
+    /// Registry carrying just the verb categories the `frame_budget_omission`
+    /// unit tests below need to resolve: `search` (Assertive, matches the KG
+    /// pack) and `create` (Commissive, matches the KG pack).
+    struct FrameBudgetCategoryTestPack;
 
-        assert_eq!(omitted["ok"], json!(true));
-        assert_eq!(omitted["status"], json!("partial"));
-        assert_eq!(omitted["partial"], json!(true));
-        assert_eq!(omitted["missing_backends"], json!(["archive"]));
+    impl khive_types::Pack for FrameBudgetCategoryTestPack {
+        const NAME: &'static str = "frame-budget-category-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "search",
+                description: "test double matching the KG pack's Assertive search category",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "create",
+                description: "test double matching the KG pack's Commissive create category",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Commissive,
+                params: &[],
+            },
+        ];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for FrameBudgetCategoryTestPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({}))
+        }
+    }
+
+    fn frame_budget_category_test_registry() -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(FrameBudgetCategoryTestPack);
+        builder
+            .build()
+            .expect("frame-budget category test registry")
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn frame_budget_omission_preserves_search_degradation_advisory() {
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "search",
+                "result": "oversized",
+                "status": "partial",
+                "partial": true,
+                "missing_backends": ["archive"],
+                "backend_errors": {
+                    "archive": {
+                        "kind": "backend_error",
+                        "message": "storage unavailable"
+                    }
+                },
+            }),
+            &registry,
+        );
+
+        assert_eq!(omitted["ok"], json!(false));
+        // ADR-130 defines `status`/`partial`/`missing_backends`/`backend_errors`
+        // only on a successful search entry; once `ok` flips to false they no
+        // longer appear at the top level, but the diagnostic survives under
+        // `error.search`.
+        assert!(omitted.get("status").is_none());
+        assert!(omitted.get("partial").is_none());
+        assert!(omitted.get("missing_backends").is_none());
+        assert!(omitted.get("backend_errors").is_none());
+        assert_eq!(omitted["error"]["search"]["status"], json!("partial"));
+        assert_eq!(omitted["error"]["search"]["partial"], json!(true));
         assert_eq!(
-            omitted["backend_errors"]["archive"]["message"],
+            omitted["error"]["search"]["missing_backends"],
+            json!(["archive"])
+        );
+        assert_eq!(
+            omitted["error"]["search"]["backend_errors"]["archive"]["message"],
             json!("storage unavailable")
         );
         assert!(omitted.get("result").is_none());
-        assert!(omitted.get("result_omitted").is_some());
+        assert_eq!(
+            omitted["error"]["kind"],
+            json!("response_frame_budget_exceeded")
+        );
+        // `search` is Assertive, but the kg pack's real handler schedules a
+        // best-effort `SearchExecuted` telemetry event on every dispatch
+        // with no dedup key (`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`),
+        // so a lost response must not be advertised as safe to reissue.
+        assert_eq!(omitted["error"]["retryable"], json!(false));
+        assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
+        assert_eq!(omitted["executed"], json!(true));
     }
 
     #[test]
@@ -5115,6 +5670,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn backend_error_evidence_has_aggregate_budget_and_exact_key_parity() {
         fn degraded_result(reverse: bool) -> CoordSearchResult {
             let mut per_backend: Vec<crate::coordinator::BackendSearchResult> = (0
@@ -5195,6 +5751,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn backend_id_credentials_are_absent_from_wire_and_warning() {
         let secret = format!("archive auth token sk_live_{}", "c".repeat(32));
         let result = CoordSearchResult {
@@ -5239,25 +5796,37 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn frame_budget_omission_preserves_complete_search_status() {
-        let omitted = frame_budget_omission(&json!({
-            "ok": true,
-            "tool": "search",
-            "result": "oversized",
-            "status": "complete",
-        }));
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "search",
+                "result": "oversized",
+                "status": "complete",
+            }),
+            &registry,
+        );
 
-        assert_eq!(omitted["ok"], json!(true));
-        assert_eq!(omitted["status"], json!("complete"));
+        assert_eq!(omitted["ok"], json!(false));
+        assert!(omitted.get("status").is_none());
         assert!(omitted.get("partial").is_none());
         assert!(omitted.get("result").is_none());
+        assert_eq!(omitted["error"]["search"]["status"], json!("complete"));
+        assert_eq!(
+            omitted["error"]["code"],
+            json!("response_frame_budget_exceeded")
+        );
     }
 
     /// ADR-130 §Compatibility: the `search_incomplete` error is small and
     /// typed — it must survive frame-budget omission untransformed, not
     /// collapse to the generic omitted-error string.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn frame_budget_omission_preserves_search_incomplete_error_untransformed() {
+        let registry = frame_budget_category_test_registry();
         let error = json!({
             "kind": "search_incomplete",
             "message": "no-match was not established because selected backends failed",
@@ -5272,23 +5841,31 @@ mod tests {
             "backend_errors_truncated": true,
             "backend_errors_omitted": 2,
         });
-        let omitted = frame_budget_omission(&json!({
-            "ok": false,
-            "tool": "search",
-            "error": error,
-        }));
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": false,
+                "tool": "search",
+                "error": error,
+            }),
+            &registry,
+        );
 
         assert_eq!(omitted["ok"], json!(false));
         assert_eq!(omitted["error"], error);
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn frame_budget_omission_still_collapses_other_large_errors() {
-        let omitted = frame_budget_omission(&json!({
-            "ok": false,
-            "tool": "create",
-            "error": { "kind": "invalid_input", "message": "x".repeat(10_000) },
-        }));
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": false,
+                "tool": "create",
+                "error": { "kind": "invalid_input", "message": "x".repeat(10_000) },
+            }),
+            &registry,
+        );
 
         assert_eq!(omitted["ok"], json!(false));
         assert_eq!(
@@ -5299,7 +5876,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn frame_budget_omission_marks_commissive_verb_non_retryable() {
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "create",
+                "result": "oversized",
+            }),
+            &registry,
+        );
+
+        assert_eq!(omitted["ok"], json!(false));
+        assert_eq!(omitted["executed"], json!(true));
+        assert_eq!(omitted["error"]["retryable"], json!(false));
+        assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
+        assert_eq!(
+            omitted["error"]["kind"],
+            json!("response_frame_budget_exceeded")
+        );
+    }
+
+    #[test]
+    fn frame_budget_omission_marks_unknown_verb_non_retryable() {
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "some_future_unregistered_verb",
+                "result": "oversized",
+            }),
+            &registry,
+        );
+
+        assert_eq!(omitted["ok"], json!(false));
+        assert_eq!(omitted["executed"], json!(true));
+        assert_eq!(omitted["error"]["retryable"], json!(false));
+        assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
+    }
+
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn daemon_batch_keeps_rendered_result_when_compact_result_exceeds_frame() {
         let server = large_result_test_server();
         let row_bytes = khive_runtime::daemon::MAX_FRAME_BYTES / 2;
@@ -5324,6 +5942,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn daemon_frame_fitting_preserves_reason_when_error_body_is_omitted() {
         let entry = json!({
             "ok": false,
@@ -5332,11 +5951,13 @@ mod tests {
             "reason": "gate-refusal",
         });
         let envelope = parallel_batch_envelope(vec![entry.clone()]);
+        let registry = frame_budget_category_test_registry();
         let fitted = fit_rendered_batch_envelope(
             envelope.as_object().expect("batch envelope object"),
             std::slice::from_ref(&entry),
             vec![entry.clone()],
             "test-config",
+            &registry,
         );
         let fitted = Value::Object(fitted);
 
@@ -5349,6 +5970,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn auto_rendered_batch_stays_within_daemon_frame_cap() {
         // Auto renders a single record as compact JSON, so a lone object can
         // no longer balloon past its compact form (the kv-block renderer is
@@ -5426,6 +6048,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_op_error_does_not_abort_siblings() {
         let count = 5;
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -5462,6 +6085,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_never_exceeds_concurrency_limit() {
         let count = MAX_BATCH_CONCURRENCY * 3;
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -5505,6 +6129,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn single_pack_verbs_unchanged() {
         let catalog = build_verb_catalog([
             t("kg", "create", "Create an entity or note."),
@@ -5517,6 +6142,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn duplicate_verb_concatenates_descriptions_with_pack_attribution() {
         let catalog = build_verb_catalog([
             t("kg", "create", "Create an entity or note."),
@@ -5540,6 +6166,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn catalog_is_sorted_alphabetically() {
         let catalog = build_verb_catalog([
             t("kg", "search", "Search."),
@@ -5571,6 +6198,7 @@ mod tests {
     /// token's namespace identical, so the signal lands on the active slot
     /// instead of the cold-namespace queue.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn brain_dispatch_hook_updates_state_visible_through_same_instance() {
         let config = RuntimeConfig {
             db_path: None,
@@ -5628,6 +6256,7 @@ mod tests {
     /// fail without it (occupancy false; forged value survives) and pass
     /// with it restored.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn single_runtime_boot_installs_note_write_validator() {
         let config = RuntimeConfig {
             db_path: None,
@@ -5707,6 +6336,7 @@ mod tests {
     /// serving or writing the wrong project's data.
     #[test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     fn config_id_does_not_collide_across_projects_with_same_relative_backend_path() {
         use khive_runtime::{BackendId, BackendKind, KhiveConfig, Namespace};
 
@@ -5759,6 +6389,7 @@ mod tests {
     /// - read-only `/.../archive.db`
     /// - writable `/.../archive.db:read_only`
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_does_not_confuse_read_only_mode_with_a_path_suffix() {
         use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
 
@@ -5817,6 +6448,7 @@ mod tests {
     /// identity, avoiding an unnecessary one-time fallback/restart for the
     /// overwhelmingly common configuration shape.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_preserves_legacy_topology_spelling_when_delimiter_free() {
         use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
 
@@ -5864,6 +6496,7 @@ mod tests {
     /// embedding policy it does not implement. Absent/false keeps the
     /// pre-existing spelling so already-deployed configs keep their id.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_pack_no_embed_differs() {
         use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
 
@@ -5911,6 +6544,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_separates_effective_read_only_storage_modes() {
         use khive_runtime::{BackendId, BackendKind, KhiveConfig, Namespace};
 
@@ -5964,6 +6598,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_auto_detects_chmod_read_only_single_backend() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -5997,6 +6632,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn runtime_owned_config_id_keeps_captured_writable_mode_after_post_open_chmod() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -6063,6 +6699,7 @@ mod tests {
     /// project serve requests meant for the other's database.
     #[test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     fn config_id_does_not_collide_across_projects_with_same_relative_db_override() {
         use khive_runtime::Namespace;
 
@@ -6319,6 +6956,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn chain_with_deep_accumulated_prev_result_errors_cleanly() {
         // Real end-to-end reproduction: chain N `create` ops where each step's
         // `properties.inner` embeds the previous op's full `properties` via
@@ -6397,6 +7035,7 @@ mod tests {
     // ── request-boundary regression: raw controls survive wire decoding ─────
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_boundary_raw_control_bytes_reach_handler() {
         // Simulates the actual MCP wire: a JSON-RPC client sends the tool's
         // `ops` argument as a JSON string using the standard JSON `\n`
@@ -6494,6 +7133,7 @@ mod tests {
     /// the caller supplied none.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn wire_daemon_frame_forwards_request_id() {
         let server = make_daemon_save_to_test_server();
 
@@ -6543,6 +7183,7 @@ mod tests {
     /// daemon-forward path.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_no_daemon_fallback_preserves_request_id_in_audit_event() {
         clear_daemon_env();
         std::env::set_var("KHIVE_NO_DAEMON", "1");
@@ -6551,11 +7192,11 @@ mod tests {
         server
             .request(
                 Parameters(RequestParams {
-                    // Explicit `namespace="local"` so the write lands in the
+                    // Explicit `namespace="test"` so the write lands in the
                     // same namespace the server's audit `EventStore` handle is
-                    // scoped to at construction (`Namespace::local()`), matching
+                    // scoped to at construction, matching
                     // `find_audit_event_with_request_id`'s read scope.
-                    ops: "stats(namespace=\"local\")".to_string(),
+                    ops: "stats(namespace=\"test\")".to_string(),
                     request_id: Some(9001),
                     ..Default::default()
                 }),
@@ -6582,6 +7223,7 @@ mod tests {
     /// survives that path too.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_save_to_bypass_preserves_request_id_in_audit_event() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6592,7 +7234,7 @@ mod tests {
         server
             .request(
                 Parameters(RequestParams {
-                    ops: "stats(namespace=\"local\")".to_string(),
+                    ops: "stats(namespace=\"test\")".to_string(),
                     save_to: Some(sink_path.to_string_lossy().to_string()),
                     request_id: Some(9002),
                     ..Default::default()
@@ -6641,6 +7283,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_save_to_bypasses_daemon_forwarding_and_writes_manifest() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6706,6 +7349,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_parse_error_stays_typed_with_warm_daemon_available() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6773,6 +7417,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_returns_ambiguous_forward_error_without_local_double_dispatch() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6889,6 +7534,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_strict_fallback_lands_as_failed_op_envelope_not_rpc_error() {
         clear_daemon_env();
         crate::daemon::reset_fallback_counters();
@@ -7078,6 +7724,7 @@ mod tests {
     /// genuine no-match and a populated result — with no possible "partial"
     /// state for a lone backend. Other verbs must not gain a `status` field.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn single_backend_search_reports_status_complete() {
         let server = in_memory_kg_server();
 
@@ -7157,6 +7804,7 @@ mod tests {
     /// `visible_namespaces`, widened with `local` — mirrors the normal
     /// registry dispatch path's default-case widening.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn coordinator_search_visibility_widens_to_registry_defaults_when_no_identity() {
         let registry =
             registry_with_visible_namespaces(vec![
@@ -7177,6 +7825,7 @@ mod tests {
     /// baked defaults entirely (ADR-096 Fork 1) — the registry's "tenant-a"
     /// must NOT leak into a request identity scoped to "tenant-b" only.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn coordinator_search_visibility_widens_to_identity_visible_namespaces() {
         let registry =
             registry_with_visible_namespaces(vec![
@@ -7208,6 +7857,7 @@ mod tests {
     /// the caller's full `visible_namespaces` set, silently overriding the
     /// caller's intended narrowing.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn coordinator_search_visibility_narrows_to_empty_when_namespace_explicit() {
         let registry =
             registry_with_visible_namespaces(vec![
@@ -7227,6 +7877,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn unknown_verb_with_invalid_namespace_is_not_classified_as_verb_refused() {
         let server = in_memory_kg_server();
         let response = server
@@ -7250,6 +7901,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_status_is_success_when_every_op_in_batch_succeeds() {
         let server = in_memory_kg_server();
         let resp = server
@@ -7275,6 +7927,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_status_is_partial_when_a_batch_op_fails() {
         let server = in_memory_kg_server();
         // The second op targets an unknown kind and fails; the first succeeds.
@@ -7305,6 +7958,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_status_is_partial_when_a_chain_op_is_aborted() {
         let server = in_memory_kg_server();
         let resp = server
@@ -7366,6 +8020,7 @@ mod request_read_cancellation_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn stdio_eof_cancels_root_and_request_read_before_rmcp_drain() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use tokio::io::AsyncWriteExt;
@@ -7379,9 +8034,12 @@ mod request_read_cancellation_tests {
         let root = tokio_util::sync::CancellationToken::new();
         let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
         let (read, write) = tokio::io::split(server_io);
-        let transport = crate::transport::CancelOnEofTransport::new(
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(read, write),
             root.clone(),
+            None,
+            None,
+            Some(Duration::from_secs(3600)),
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7417,7 +8075,447 @@ mod request_read_cancellation_tests {
         );
     }
 
+    /// An idle stdio bridge — pipe still open, no request sent — must
+    /// be reaped the same way a real EOF is, not held open indefinitely.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stdio_idle_timeout_cancels_root_without_eof() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let probe = EofProbeServer {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            Some(Duration::from_millis(50)),
+            None,
+            Some(Duration::from_secs(3600)),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        // Deliberately never write anything and never drop `client_io`: the
+        // pipe stays open exactly like an abandoned bridge's client — this
+        // must still be reaped once the idle timeout elapses.
+        // Observe the cancellation BEFORE consuming the service, and it has to
+        // be in this order. `RunningService` holds a `dg: DropGuard`
+        // (rmcp 1.8.0, `src/service.rs:712`) and `waiting(mut self)` consumes
+        // `self`, so the guard cancels this very token as `waiting` returns
+        // whatever the transport did. Asserting `root.is_cancelled()` after
+        // that await therefore passes even with the adapter's cancel deleted:
+        // it measures rmcp's drop guard, not the idle path. Awaiting
+        // `root.cancelled()` while the service is still alive is the only
+        // ordering that can tell the two apart.
+        tokio::time::timeout(Duration::from_secs(2), root.cancelled())
+            .await
+            .expect("idle timeout must cancel the exact root token passed into rmcp");
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), running.waiting())
+            .await
+            .expect("idle timeout never closed the session")
+            .expect("rmcp service task panicked");
+        assert!(
+            matches!(
+                reason,
+                rmcp::service::QuitReason::Closed | rmcp::service::QuitReason::Cancelled
+            ),
+            "unexpected rmcp quit reason after idle timeout: {reason:?}"
+        );
+        drop(client_io);
+    }
+
+    #[derive(Clone)]
+    struct SlowProbeServer {
+        started: Arc<tokio::sync::Notify>,
+        delay: Duration,
+    }
+
+    impl rmcp::ServerHandler for SlowProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let started = self.started.clone();
+            let delay = self.delay;
+            async move {
+                started.notify_one();
+                tokio::time::sleep(delay).await;
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// Regression: two outstanding obligations under one request id are
+    /// refused, not resolved by guessing.
+    ///
+    /// Retirement matches on request id, so two live entries sharing an id
+    /// make it ambiguous which one a completing response discharges — and both
+    /// resolutions are wrong in opposite directions. Removing the first match
+    /// can leave a *completed* request's instant as the newest entry, so the
+    /// freshness check defers past the older obligation's TTL: the unbounded
+    /// session this whole mechanism exists to close. Removing the last match
+    /// can leave the older instant, so the session closes out from under a
+    /// live handler. The transport cannot tell the two apart, so it refuses
+    /// the second admission instead.
+    ///
+    /// Idle reaping is off and the pipe is deliberately never closed, so the
+    /// refusal is the only thing that can end this session. A build that
+    /// admitted the duplicate would leave `root` uncancelled and this test
+    /// would exhaust its bound.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stdio_refuses_a_second_outstanding_obligation_under_one_request_id() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let first_admitted = Arc::new(tokio::sync::Notify::new());
+        let probe = OutOfOrderProbeServer {
+            first_admitted: first_admitted.clone(),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // No idle timer: only the duplicate-id refusal can close this.
+            None,
+            None,
+            Some(Duration::from_secs(3600)),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (_client_read, mut client_write) = tokio::io::split(client_io);
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
+                        \"params\":{\"name\":\"probe\",\"arguments\":{}}}\n";
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the first request");
+        tokio::time::timeout(Duration::from_secs(2), first_admitted.notified())
+            .await
+            .expect("rmcp never admitted the first request");
+
+        // Premise: id 1 is genuinely still outstanding. Without this the second
+        // request would just be a reuse after retirement, which is legitimate
+        // and not what this test is about.
+        assert_eq!(
+            obligations.lock().expect("obligation queue poisoned").len(),
+            1,
+            "fixture premise: the first request must still be outstanding when the duplicate \
+             arrives, otherwise nothing is ambiguous"
+        );
+        assert!(
+            !root.is_cancelled(),
+            "fixture premise: a single outstanding request must not have closed the session"
+        );
+
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the duplicate-id request");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "a second outstanding obligation under an id that already has one must close the \
+             session; admitting it leaves retirement to pick an entry arbitrarily, which \
+             corrupts the freshness check in one direction or the other"
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: an id whose obligation has gone STALE is still a duplicate.
+    ///
+    /// Staleness is a statement about the freshness check, not about the
+    /// handler: rmcp keeps a spawned handler alive independently of this
+    /// receive loop, so an entry past its TTL routinely names a request that
+    /// is still running and has simply not answered yet. If the staleness drop
+    /// runs before the duplicate scan, that entry is gone by the time the scan
+    /// looks, the reused id is admitted as a fresh obligation, and the first of
+    /// the two eventual responses retires the NEW entry by id match — leaving
+    /// the older live handler untracked and the idle branch free to close out
+    /// from under it. Scanning before pruning refuses the reuse instead.
+    ///
+    /// This is the arm the earlier ordering passed: the plain duplicate test
+    /// above uses an hour-long TTL, so its entry is never stale and the two
+    /// orderings are indistinguishable there.
+    ///
+    /// Idle reaping is off and the pipe is never closed, so the refusal is the
+    /// only thing that can end this session.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stdio_refuses_a_reused_id_whose_obligation_is_already_stale() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const OBLIGATION_TTL: Duration = Duration::from_millis(100);
+
+        let first_admitted = Arc::new(tokio::sync::Notify::new());
+        let probe = OutOfOrderProbeServer {
+            first_admitted: first_admitted.clone(),
+            // Parks forever on the first call: the handler outlives its TTL.
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // No idle timer: only the duplicate-id refusal can close this.
+            None,
+            None,
+            Some(OBLIGATION_TTL),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (_client_read, mut client_write) = tokio::io::split(client_io);
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
+                        \"params\":{\"name\":\"probe\",\"arguments\":{}}}\n";
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the first request");
+        tokio::time::timeout(Duration::from_secs(2), first_admitted.notified())
+            .await
+            .expect("rmcp never admitted the first request");
+
+        tokio::time::sleep(OBLIGATION_TTL * 3).await;
+
+        // Premise, asserted rather than assumed: the entry is still in the
+        // queue AND the transport's own freshness rule already calls it stale.
+        // Both halves matter — a test that only slept would pass against a
+        // build that pruned the entry, since an empty queue also admits the
+        // reuse without closing, which is the very defect under test.
+        {
+            let queue = obligations.lock().expect("obligation queue poisoned");
+            let (id, admitted_at) = queue
+                .front()
+                .expect(
+                    "fixture premise: the unanswered obligation must still be queued when the \
+                     reused id arrives; an empty queue means something pruned it and this test \
+                     can no longer distinguish the orderings",
+                )
+                .clone();
+            assert_eq!(
+                id,
+                rmcp::model::NumberOrString::Number(1),
+                "fixture premise: the queued entry must be the request under test"
+            );
+            assert!(
+                admitted_at.elapsed() >= OBLIGATION_TTL,
+                "fixture premise: the entry must already be STALE by the transport's own rule, \
+                 otherwise this is just the plain duplicate case"
+            );
+        }
+        assert!(
+            !root.is_cancelled(),
+            "fixture premise: a single outstanding request must not have closed the session"
+        );
+
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the request reusing the stale id");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "reusing an id whose obligation is stale but whose handler is still alive must close \
+             the session. Admitting it lets the first response retire the wrong entry, which \
+             leaves a live handler untracked and the idle close free to fire under it."
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: the obligation queue must not grow without bound.
+    ///
+    /// Retirement is keyed by request id, so it only ever removes the entry
+    /// whose response was actually written. A request that never produces one
+    /// — a handler that panics, a request the peer cancels — leaves its entry
+    /// behind. Under the earlier oldest-first retirement any completion
+    /// removed *some* entry, so the queue tracked admissions minus
+    /// completions; keying by id means an unanswered request now holds its
+    /// slot for the life of the session unless something drops it.
+    ///
+    /// Nothing here waits on the idle timer: it is disabled, so the only thing
+    /// that can bound this queue is the staleness drop.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stdio_obligation_queue_drops_entries_past_their_ttl() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const OBLIGATION_TTL: Duration = Duration::from_millis(100);
+        // Longer than the TTL, so every earlier admission is already stale by
+        // the time the next one arrives and the queue can never hold two.
+        const ADMISSION_GAP: Duration = Duration::from_millis(150);
+        const ADMISSIONS: u32 = 4;
+
+        let probe = SlowProbeServer {
+            started: Arc::new(tokio::sync::Notify::new()),
+            // Never answers, so nothing is ever retired by id.
+            delay: Duration::from_secs(3600),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // Idle reaping off: this test is about the queue, not the timer.
+            None,
+            None,
+            Some(OBLIGATION_TTL),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        for id in 1..=ADMISSIONS {
+            client_io
+                .write_all(
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\
+                         \"params\":{{\"name\":\"probe\",\"arguments\":{{}}}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            tokio::time::sleep(ADMISSION_GAP).await;
+        }
+
+        let outstanding = obligations.lock().expect("obligation queue poisoned").len();
+        assert!(
+            outstanding <= 1,
+            "an unanswered request must not hold its obligation slot past the TTL: after \
+             {ADMISSIONS} admissions spaced {}ms apart against a {}ms TTL the queue holds \
+             {outstanding} entries. Without the staleness drop it would hold {ADMISSIONS}, one \
+             per admission, and would keep growing for as long as the session lives.",
+            ADMISSION_GAP.as_millis(),
+            OBLIGATION_TTL.as_millis(),
+        );
+
+        drop(client_io);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: a peer that keeps sending requests without consuming
+    /// responses cannot make the transport's outstanding state grow without
+    /// limit. The third request is rejected before rmcp can spawn its handler.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stdio_closes_when_outstanding_request_limit_is_reached() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const MAX_OUTSTANDING: usize = 2;
+        let probe = SlowProbeServer {
+            started: Arc::new(tokio::sync::Notify::new()),
+            delay: Duration::from_secs(3600),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport =
+            crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
+                AsyncRwTransport::new_server(server_read, server_write),
+                root.clone(),
+                None,
+                None,
+                Some(Duration::from_secs(3600)),
+                MAX_OUTSTANDING,
+            );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        for id in 1..=MAX_OUTSTANDING + 1 {
+            let request = format!(
+                "{}\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {"name": "probe", "arguments": {}}
+                })
+            );
+            client_io
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), root.cancelled())
+            .await
+            .expect("the transport must close after reaching its admission limit");
+        assert_eq!(
+            obligations.lock().expect("obligation queue poisoned").len(),
+            MAX_OUTSTANDING,
+            "the rejected request must not enter the outstanding tracker"
+        );
+
+        drop(client_io);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Parks forever on the first call and answers every later one promptly,
+    /// so a test can produce out-of-order response completion: the request
+    /// admitted first stays outstanding while a later one completes.
+    #[derive(Clone)]
+    struct OutOfOrderProbeServer {
+        first_admitted: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl rmcp::ServerHandler for OutOfOrderProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let first_admitted = self.first_admitted.clone();
+            let calls = self.calls.clone();
+            async move {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    first_admitted.notify_one();
+                    // Never answers. This is the older obligation, and it is
+                    // the one whose TTL must govern when the session closes.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// Distinguishes handler behavior by tool name: `"slow"` blocks for
+    /// `slow_delay` (keeping `in_flight` above zero across several idle
+    /// windows), `"quick"` (or anything else) completes immediately — used
+    /// to admit a second request while the first is still running.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn rmcp_cancellation_token_reaches_request_read_scope() {
         let token = tokio_util::sync::CancellationToken::new();
         let token_for_scope = token.clone();
@@ -7439,6 +8537,7 @@ mod request_read_cancellation_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn already_cancelled_rmcp_token_is_visible_without_yielding() {
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
@@ -7456,6 +8555,7 @@ mod request_read_cancellation_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_tool_path_honors_an_already_cancelled_rmcp_token() {
         std::env::set_var("KHIVE_NO_DAEMON", "1");
         let runtime = KhiveRuntime::new(RuntimeConfig {
@@ -7498,5 +8598,488 @@ mod request_read_cancellation_tests {
                 );
             }
         }
+    }
+
+    // ── KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 must not disable the bound ──
+
+    /// The response-delivery deadline used to treat `0` as "disable
+    /// the bound", mirroring `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS=0`. Unlike the
+    /// idle timeout, an unbounded response-delivery deadline restores the
+    /// exact defect this deadline exists to close (a peer that admits a
+    /// request and stops reading pins the bridge's response write forever)
+    /// — so `0` is now a hard startup error instead of a supported opt-out.
+    #[test]
+    #[serial_test::serial]
+    fn response_deadline_from_env_rejects_zero() {
+        std::env::set_var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS", "0");
+        let result = stdio_bridge_response_deadline_from_env();
+        std::env::remove_var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS");
+
+        let error = result.expect_err(
+            "KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 must be rejected, not silently accepted \
+             as \"disable the bound\"",
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS"),
+            "error must name the offending variable: {rendered}"
+        );
+        assert!(
+            rendered.contains("=0"),
+            "error must name the rejected value: {rendered}"
+        );
+        assert!(
+            rendered.contains("1..=u64::MAX"),
+            "error must state the accepted range: {rendered}"
+        );
+    }
+
+    /// The response-delivery deadline had no test that ever let it elapse:
+    /// the only coverage rejected `0` at startup, which exercises the parser
+    /// and not the bound. A bound whose expiry is never observed is a claim,
+    /// so this drives a real write against a peer that has stopped reading.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn response_write_past_its_deadline_is_abandoned_and_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        // A 16-byte pipe that nobody reads. `_client_io` is held, not dropped,
+        // so this is a peer that is present and simply not reading — the case
+        // the deadline exists for. Dropping it would produce a broken pipe
+        // instead, which is a different failure and already handled.
+        let (server_io, _client_io) = tokio::io::duplex(16);
+        let (read, write) = tokio::io::split(server_io);
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            None,
+            Some(Duration::from_millis(50)),
+            None,
+        );
+
+        // An error response is a response for this purpose: `send` bounds
+        // `Response` and `Error` alike, because either one can leave the write
+        // pinned.
+        let message = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("x".repeat(4096), None),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("the deadline must resolve the write; it hung instead")
+            .expect_err("a write that outlived its deadline must not report success");
+
+        assert!(
+            error.to_string().contains("deadline"),
+            "the error must name the deadline that abandoned the write: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "a peer that stops reading must close the session, not just fail one write"
+        );
+    }
+
+    /// Discriminating arm for the test above. Without this, that test would
+    /// also pass against a deadline that fired on every response regardless of
+    /// whether the peer was reading.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn response_write_inside_its_deadline_succeeds_and_leaves_the_session_open() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+        use tokio::io::AsyncReadExt;
+
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        // This peer reads.
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let _ = client_io.read(&mut buf).await;
+            buf
+        });
+
+        let message = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("read by the peer", None),
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a reading peer must not hit the 2s test bound")
+            .expect("a write to a reading peer must succeed");
+
+        assert!(
+            !root.is_cancelled(),
+            "a response delivered inside its deadline must not close the session"
+        );
+        let _ = reader.await;
+    }
+
+    /// The deadline bounds a write left PENDING. It says nothing about a write
+    /// that fails immediately, which is what a half-closed peer produces: one
+    /// that closes the side it reads from while keeping the side it writes to
+    /// open. rmcp does not close the session for us there — the response-send
+    /// task logs the error and returns (`rmcp-1.8.0` `src/service.rs:1105-1112`)
+    /// — the receive loop stays pending on the still-open read side, and idle
+    /// reaping is off by default, so before this the session outlived the
+    /// peer's ability to receive anything from it.
+    ///
+    /// Two independent pipes, because a single `duplex` cannot be half-closed:
+    /// dropping either end closes both directions, and `tokio::io::split`
+    /// keeps the stream alive until both halves drop. Separate pipes for the
+    /// read source and the write sink are what let the peer close exactly one.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn response_write_that_fails_fast_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        // peer -> server: held open and silent, so the receive side would stay
+        // pending forever. This is what makes the missing cancel a leak rather
+        // than a race with EOF.
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        // server -> peer: the peer has closed the side it reads from, so every
+        // write fails with BrokenPipe.
+        let (server_write, peer_read_side) = tokio::io::duplex(1024);
+        drop(peer_read_side);
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            // Long enough that the deadline cannot be what resolves this
+            // write. If the fix were the deadline rather than the error path,
+            // the 2s bound below would trip instead of the assertion.
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let message = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("peer closed its read side", None),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a closed pipe must fail fast, not wait out its deadline")
+            .expect_err("a write to a closed pipe must not report success");
+
+        assert!(
+            !error.to_string().contains("deadline"),
+            "this must exercise the error path, not the deadline path: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "a response that could not be written must close the session; rmcp only logs it"
+        );
+    }
+
+    /// A failed NOTIFICATION write closes the session too, and this test used
+    /// to assert the opposite. The rule was scoped to responses on the ground
+    /// that rmcp carried its own accounting for server-initiated messages. It
+    /// does carry accounting and the accounting does not close anything: a
+    /// failed notification send delivers `ServiceError::TransportSend` to the
+    /// notification's own responder (`rmcp-1.8.0` `src/service.rs:1074-1093`)
+    /// and a failed request send does the same to the caller's responder
+    /// (`:1066-1073`), while the serve loop's only exits are receive EOF, token
+    /// cancellation, and a send-task join error (`:1028-1062`). So the same
+    /// broken writer strands the session whatever class of message hit it.
+    ///
+    /// The discriminating arm is now
+    /// `notification_write_to_a_reading_peer_leaves_the_session_open`: without
+    /// it, this test would pass against a transport that cancelled on every
+    /// write, successful ones included.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn notification_write_that_fails_fast_also_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let (server_write, peer_read_side) = tokio::io::duplex(1024);
+        drop(peer_read_side);
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let message = rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            notification: rmcp::model::ServerNotification::ProgressNotification(
+                rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                    progress_token: rmcp::model::ProgressToken(
+                        rmcp::model::NumberOrString::Number(1),
+                    ),
+                    progress: 1.0,
+                    total: None,
+                    message: None,
+                }),
+            ),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a closed pipe must fail fast, not wait out its deadline")
+            .expect_err("a write to a closed pipe must not report success");
+
+        assert!(
+            !error.to_string().contains("deadline"),
+            "this must exercise the error path, not the deadline path: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "a notification that could not be written must close the session; rmcp hands the \
+             error to the notification's own responder and never breaks the serve loop"
+        );
+    }
+
+    /// Discriminating arm for the two fail-fast tests above. Without it, both
+    /// would pass against a transport that cancelled on every write rather than
+    /// on every FAILED write, which is a far worse rule than either.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn notification_write_to_a_reading_peer_leaves_the_session_open() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+        use tokio::io::AsyncReadExt;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let (server_write, mut peer_read_side) = tokio::io::duplex(16 * 1024);
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        // This peer reads.
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let _ = peer_read_side.read(&mut buf).await;
+            buf
+        });
+
+        let message = rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            notification: rmcp::model::ServerNotification::ProgressNotification(
+                rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                    progress_token: rmcp::model::ProgressToken(
+                        rmcp::model::NumberOrString::Number(1),
+                    ),
+                    progress: 1.0,
+                    total: None,
+                    message: None,
+                }),
+            ),
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a reading peer must not hit the 2s test bound")
+            .expect("a write to a reading peer must succeed");
+
+        assert!(
+            !root.is_cancelled(),
+            "a delivered notification must not close the session"
+        );
+        let _ = reader.await;
+    }
+
+    /// A writer whose first flush is interrupted and which works from then on.
+    ///
+    /// This is the shape Tokio's blocking stdout adapter presents on EINTR: it
+    /// restores its idle state and puts the writer back before returning the
+    /// flush error (`tokio-1.52.4/src/io/blocking.rs:146-176`), and its
+    /// `uninterruptibly!` retry macro (`:183-192`) is not applied to that
+    /// branch. Writes are accepted and discarded, because what this arm asserts
+    /// is the session's fate, not the bytes.
+    struct InterruptOnceWriter {
+        interrupted_yet: bool,
+    }
+
+    impl tokio::io::AsyncWrite for InterruptOnceWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.interrupted_yet {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.interrupted_yet = true;
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "flush interrupted by a signal",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The exception to "every failed outbound write closes the session", and
+    /// it is narrower than the writer's health alone.
+    ///
+    /// An interrupted flush leaves the writer usable, so closing on it would
+    /// trade a lost message for a lost session. The second send is what makes
+    /// that claim rather than assuming it: if the transport were dead the
+    /// assertion could not distinguish a correct decision from a lucky one.
+    ///
+    /// This arm uses a NOTIFICATION because the exception is scoped to the
+    /// classes whose loss someone can observe. See
+    /// `an_interrupted_response_still_closes_the_session` for the other side of
+    /// that boundary, which is the arm that would go red if the scope were
+    /// dropped.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn an_interrupted_write_leaves_the_session_open_and_the_writer_usable() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let writer = InterruptOnceWriter {
+            interrupted_yet: false,
+        };
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, writer),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let notification = || {
+            rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
+                jsonrpc: rmcp::model::JsonRpcVersion2_0,
+                notification: rmcp::model::ServerNotification::ProgressNotification(
+                    rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                        progress_token: rmcp::model::ProgressToken(
+                            rmcp::model::NumberOrString::Number(1),
+                        ),
+                        progress: 1.0,
+                        total: None,
+                        message: None,
+                    }),
+                ),
+            })
+        };
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(notification()))
+            .await
+            .expect("an interrupted flush must resolve, not hang")
+            .expect_err("an interrupted flush must be reported as an error");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "this arm must exercise the interrupted class, not some other failure: {error}"
+        );
+        assert!(
+            !root.is_cancelled(),
+            "an interrupted write must not close the session; the writer is still usable"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), transport.send(notification()))
+            .await
+            .expect("the second write must resolve, not hang")
+            .expect("the writer is usable after an interrupted flush, so the next write succeeds");
+        assert!(
+            !root.is_cancelled(),
+            "a successful write after an interrupted one must leave the session open"
+        );
+    }
+
+    /// The boundary of that exception: a usable writer is not enough when the
+    /// message was a RESPONSE.
+    ///
+    /// The interrupted flush leaves the writer able to carry the next message,
+    /// exactly as in the notification arm, so this test differs from that one
+    /// in the message class and nothing else. The outcome differs because rmcp
+    /// treats the classes differently. A failed notification or server-initiated
+    /// request send reaches a local responder (`rmcp-1.8.0`
+    /// `src/service.rs:1074-1093` and `:1066-1073`), so something in the process
+    /// learns the message was lost. A failed response send is only logged
+    /// (`:1095-1112`): nothing goes to the peer, no local caller is waiting, and
+    /// the serve loop keeps running. The client that asked the question would
+    /// wait on an answer that is not coming and could not tell that from a slow
+    /// one. Closing is what turns that into an EOF it can act on.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn an_interrupted_response_still_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let writer = InterruptOnceWriter {
+            interrupted_yet: false,
+        };
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, writer),
+            root.clone(),
+            None,
+            // Long enough that the deadline cannot be what resolves this write,
+            // so a pass here cannot come from the timeout path.
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let response = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("answering a request", None),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(response))
+            .await
+            .expect("an interrupted flush must resolve, not hang")
+            .expect_err("an interrupted flush must be reported as an error");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "this arm must exercise the interrupted class, not some other failure: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "an interrupted RESPONSE must still close the session: the writer's health does not \
+             help a peer that is waiting on an answer rmcp will only log the loss of"
+        );
     }
 }

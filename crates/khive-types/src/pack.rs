@@ -39,7 +39,22 @@ pub enum Visibility {
 /// use the category of their parent verb or `Assertive` as a sensible default.
 ///
 /// The category is a documentation / introspection tag. It is NOT used for
-/// permission checking, transport routing, or return-shape selection.
+/// permission checking. It is one input — never the sole proof — to two
+/// narrow, sanctioned runtime decisions, both in `khive-runtime`'s
+/// `VerbRegistry`:
+/// - `admission_degrade_safe` treats `Assertive` as a necessary condition
+///   for letting a dispatch's own audit row degrade under transient
+///   admission pressure, combined with an explicit per-verb allowlist.
+/// - `is_retry_safe_after_frame_omission` treats `Assertive` as a necessary
+///   condition for telling a caller that a response lost to the MCP
+///   daemon's frame budget is safe to re-issue, combined with an explicit
+///   exclusion list.
+///
+/// Both combine the category with an audited list rather than trusting it
+/// alone, because several `Assertive` handlers schedule their own persisted
+/// or accounting-bearing side effect on every dispatch (`memory.recall`'s
+/// serve ledger, `search`'s `SearchExecuted` telemetry) that the speech-act
+/// classification cannot see.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerbCategory {
     /// Speaker represents a state of affairs — retrieves and presents facts.
@@ -55,6 +70,50 @@ pub enum VerbCategory {
     /// Examples: `update`, `delete`, `merge`, `complete`.
     Declaration,
     // `Expressive` is intentionally absent — no verb currently uses it.
+}
+
+/// How a `uuid` or `array of uuid` parameter resolves a caller-supplied
+/// identifier — full UUID and short hex-prefix acceptance, and whether
+/// either form is checked against a namespace. This is a property of the
+/// handler's own resolution code, declared explicitly per parameter so
+/// `VerbRegistry::describe_verb`'s rendered contract can never drift from
+/// what the handler actually does (see khive-runtime's `pack.rs`
+/// `IdResolutionMode` rendering table for the exact wording per variant).
+///
+/// Every variant here must correspond to a resolver function that actually
+/// exists in the codebase — this is not a place to guess. When a new `uuid`
+/// parameter is added, its handler must be read to determine which existing
+/// variant matches (or whether a new one is needed); the parameter name
+/// alone never determines the mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum IdResolutionMode {
+    /// Not a UUID-typed identifier parameter — no resolver contract applies.
+    #[default]
+    NotApplicable,
+    /// ADR-007 Rev 6 by-ID contract: a full UUID and a short hex prefix both
+    /// resolve with no namespace predicate at all. The Gate, not
+    /// storage-layer filtering, is the authorization seam. Used by `get`,
+    /// `update`, `delete`, `merge`, `link`'s endpoint parameters, GTD's
+    /// lifecycle `id` parameters, and brain's feedback `target_id`.
+    UnscopedById,
+    /// A full UUID resolves as given, with no namespace check performed by
+    /// the resolver. A short hex prefix is resolved by searching only the
+    /// caller's primary namespace. Used by graph-read anchors
+    /// (`neighbors`/`traverse`) and citation targets.
+    PrefixScopedToPrimary,
+    /// Both a full UUID and a short hex prefix are validated against the
+    /// caller's primary namespace: a record that exists but belongs to a
+    /// different namespace resolves as not found.
+    FullAndPrefixScopedToPrimary,
+    /// Only a full UUID is accepted — a short hex prefix is rejected
+    /// outright — and the UUID is validated against the caller's own
+    /// (primary) namespace.
+    FullUuidOnlyScopedToPrimary,
+    /// Only a full UUID is accepted — a short hex prefix is rejected
+    /// outright — and no namespace check is performed by the resolver
+    /// itself (any namespace scoping comes from the enclosing operation,
+    /// not from this parameter).
+    UnscopedFullUuidOnly,
 }
 
 /// Parameter type for `help=true` schema envelopes.
@@ -76,6 +135,10 @@ pub struct ParamDef {
     pub required: bool,
     /// One-line human-readable description.
     pub description: &'static str,
+    /// Identifier-resolution mode for `param_type` `"uuid"` or `"array of
+    /// uuid"` parameters; [`IdResolutionMode::NotApplicable`] for every
+    /// other parameter type.
+    pub resolution_mode: IdResolutionMode,
 }
 
 /// Handler metadata for discovery and documentation.

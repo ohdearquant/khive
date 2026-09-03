@@ -15,8 +15,10 @@
 //!    secret keys, URL userinfo (`scheme://user:pass@`).
 //! 2. **High-entropy token heuristic** — base64/hex/base64url runs ≥ 24 chars
 //!    near a trigger word (key, secret, password, credential, bearer, auth,
-//!    apikey, api_key, access_key, private_key). The word `token` alone is
-//!    NOT a trigger, to avoid blocking `tokenizer_*`, `token_count`, etc.
+//!    apikey, api_key, access_key, private_key). A standalone `token` still
+//!    triggers opaque entropy detection, but does not by itself label a UUID
+//!    as a credential; compound identifiers such as `tokenizer_*` and
+//!    `token_count` remain excluded.
 //!
 //! Credential-shaped labels and assignments dominate the allowlist below.
 //! Public VCS revisions and plausible file paths remain exempt in ordinary
@@ -196,6 +198,18 @@ fn scan_json_value(value: &serde_json::Value) -> RuntimeResult<()> {
 /// Marker substituted for a detected secret span by [`mask_secrets`].
 const REDACTION_MARKER: &str = "***MASKED***";
 
+/// Maximum cumulative suffix bytes submitted to the per-pass detector sweeps while masking
+/// one input. Entropy tokens are materialized once per masking call, so this budget covers
+/// the repeated suffix scans that remain after each confirmed match. It permits two full-size
+/// passes over the 1 MiB ASCII log-input case; the first pass is always allowed for larger or
+/// multibyte callers. Once exhausted, the remainder is redacted wholesale.
+const MAX_MASK_SCAN_WORK_BYTES: usize = MAX_LOG_TEXT_MASK_INPUT_CHARS * 2;
+
+#[cfg(test)]
+thread_local! {
+    static ENTROPY_TOKENIZATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Return the LEFTMOST secret in `text` as `(matched_slice, detector)`.
 ///
 /// The matched slice borrows from `text`, so the caller can recover its byte
@@ -208,7 +222,8 @@ const REDACTION_MARKER: &str = "***MASKED***";
 /// lower-priority detector (e.g. an `sk-ant-` key sitting to the left of a
 /// `ghp_` token). Both detector layers are folded through [`keep_leftmost`].
 fn scan_match(text: &str) -> Option<(&str, &'static str)> {
-    scan_from(text, 0)
+    let tokens = tokenize_entropy_tokens(text);
+    scan_from(text, 0, &tokens)
 }
 
 /// Like [`scan_match`], but only returns secrets whose span starts at or after
@@ -217,8 +232,13 @@ fn scan_match(text: &str) -> Option<(&str, &'static str)> {
 /// entropy token is detected even when its only trigger word sits to the left of
 /// an already-redacted earlier secret. Layer-1 known patterns are context-free,
 /// so scanning the `&text[from..]` suffix is equivalent; offsets recovered via
-/// pointer arithmetic against the original `text` base stay absolute.
-fn scan_from(text: &str, from: usize) -> Option<(&str, &'static str)> {
+/// pointer arithmetic against the original `text` base stay absolute. The
+/// pre-tokenized entropy view is shared by all passes.
+fn scan_from<'a>(
+    text: &'a str,
+    from: usize,
+    tokens: &[(usize, &'a str)],
+) -> Option<(&'a str, &'static str)> {
     let base = text.as_ptr() as usize;
     // Layer 1: known prefix / shape patterns. Context-free → suffix scan; the
     // returned slice still borrows from the same allocation, so its absolute
@@ -227,7 +247,8 @@ fn scan_from(text: &str, from: usize) -> Option<(&str, &'static str)> {
     // Layer 2: entropy heuristic on long tokens near trigger words. Evaluated
     // over the full text (so left-of-`from` trigger words count) but only tokens
     // at offset >= from are returned; kept only if left of the best known match.
-    keep_leftmost(&mut best, check_entropy_heuristic(text, from), base);
+    // The token vector is shared by every masking pass.
+    keep_leftmost(&mut best, check_entropy_heuristic(text, from, tokens), base);
     best
 }
 
@@ -271,17 +292,51 @@ fn scan(text: &str) -> Option<SecretMatch> {
 /// an allocation. Spans are discovered left to right against the ORIGINAL text,
 /// always evaluating trigger context over the full input — a high-entropy value
 /// whose only trigger word sits to the left of an earlier-redacted secret is
-/// still detected. See `docs/api/secret_gate.md#mask_secrets` for the scan-cursor
-/// mechanics.
+/// still detected. Cumulative suffix-scan work is capped; when dense input
+/// exhausts the cap after a match, that match is extended through the remaining
+/// text so unscanned credentials cannot survive. See
+/// `docs/api/secret_gate.md#mask_secrets` for the scan-cursor mechanics.
 pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
+    let (spans, _scan_work_bytes) = collect_mask_spans(text);
+    if spans.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in spans {
+        // Spans are non-overlapping and ascending (each starts at/after the prior
+        // `end`); `max(cursor)` is a defensive guard, never load-bearing.
+        let start = start.max(cursor);
+        out.push_str(&text[cursor..start]);
+        out.push_str(REDACTION_MARKER);
+        cursor = end.max(cursor);
+    }
+    out.push_str(&text[cursor..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Collect absolute byte spans to redact and report cumulative suffix bytes scanned.
+/// Exhausting the work budget extends the last confirmed secret span through the input tail.
+fn collect_mask_spans(text: &str) -> (Vec<(usize, usize)>, usize) {
     let base = text.as_ptr() as usize;
+    let tokens = tokenize_entropy_tokens(text);
     // Collect every secret span (absolute byte offsets into `text`) before
     // writing any output, so trigger-context detection always sees the original
     // string rather than the suffix after the previous redaction.
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut from = 0;
+    let mut scan_work_bytes = 0usize;
     while from < text.len() {
-        match scan_from(text, from) {
+        let suffix_len = text.len() - from;
+        let next_scan_work = scan_work_bytes.saturating_add(suffix_len);
+        if scan_work_bytes > 0 && next_scan_work > MAX_MASK_SCAN_WORK_BYTES {
+            // Every previous sweep ended at a confirmed match; extending that
+            // redaction through the remaining tail is fail-closed.
+            spans.last_mut().expect("a prior scan found a span").1 = text.len();
+            break;
+        }
+        scan_work_bytes = next_scan_work;
+        match scan_from(text, from, &tokens) {
             Some((sub, _detector)) => {
                 let start = sub.as_ptr() as usize - base;
                 // The prefix detectors return whitespace-delimited tokens, so a
@@ -303,21 +358,7 @@ pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
             None => break,
         }
     }
-    if spans.is_empty() {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for (start, end) in spans {
-        // Spans are non-overlapping and ascending (each starts at/after the prior
-        // `end`); `max(cursor)` is a defensive guard, never load-bearing.
-        let start = start.max(cursor);
-        out.push_str(&text[cursor..start]);
-        out.push_str(REDACTION_MARKER);
-        cursor = end.max(cursor);
-    }
-    out.push_str(&text[cursor..]);
-    std::borrow::Cow::Owned(out)
+    (spans, scan_work_bytes)
 }
 
 /// Maximum characters of raw error text admitted to the masking pass.
@@ -494,20 +535,21 @@ const PREFIX_DETECTORS: &[(&str, &str, usize)] = &[
     ("aws-access-key-id", "ASIA", 20),
     // GitHub tokens: personal-access (ghp_), OAuth (gho_), GitHub App
     // user-to-server (ghu_), server-to-server (ghs_), refresh (ghr_), and the
-    // fine-grained PAT (github_pat_). All but github_pat_ share the gh*_ + 36+
-    // base62 shape.
+    // fine-grained PAT (github_pat_). The gh*_ formats carry a 36-character
+    // payload; fine-grained PATs carry an 82-character payload.
     ("github-token", "ghp_", 36),
     ("github-token", "gho_", 36),
     ("github-token", "ghu_", 36),
     ("github-token", "ghs_", 36),
     ("github-token", "ghr_", 36),
-    ("github-token", "github_pat_", 20),
-    // OpenAI
-    ("openai-api-key", "sk-proj-", 40),
-    // NOTE: bare "sk-" also matches Anthropic/Stripe below; put it last so
-    // the more-specific detectors fire first when both would match.
+    ("github-token", "github_pat_", 93),
+    // OpenAI project keys carry at least an 80-character payload.
+    ("openai-api-key", "sk-proj-", 88),
+    // NOTE: bare "sk-" also matches the more-specific prefixes below. Those
+    // prefixes retain ownership of their candidates so the generic fallback
+    // cannot bypass a vendor-specific minimum.
     // Anthropic
-    ("anthropic-api-key", "sk-ant-", 20),
+    ("anthropic-api-key", "sk-ant-", 108),
     // Stripe live keys
     ("stripe-secret-key", "sk_live_", 30),
     ("stripe-restricted-key", "rk_live_", 30),
@@ -550,10 +592,8 @@ fn check_known_patterns(text: &str) -> Option<(&str, &'static str)> {
 
     // --- Bare `sk-` (after all more-specific sk- detectors above) ---
     // Require length ≥ 30 AND exclude known safe scikit/library compound words.
-    if let Some(token) = find_prefix_token(text, "sk-", 30) {
-        if !SK_SAFE_PREFIXES.iter().any(|safe| token.starts_with(safe)) {
-            keep_leftmost(&mut best, Some((token, "openai-api-key")), base);
-        }
+    if let Some(token) = find_bare_sk_token(text) {
+        keep_leftmost(&mut best, Some((token, "openai-api-key")), base);
     }
 
     // --- Fly.io FlyV1 token: "FlyV1 <base64-payload>" ---
@@ -635,6 +675,30 @@ fn find_prefix_token<'a>(text: &'a str, needle: &str, min_len: usize) -> Option<
             }
         }
         start = abs + needle.len().max(1);
+    }
+    None
+}
+
+/// Locate a generic `sk-` token without reclassifying a registered vendor
+/// prefix that did not meet its own minimum length.
+fn find_bare_sk_token(text: &str) -> Option<&str> {
+    let base = text.as_ptr() as usize;
+    let mut from = 0;
+    while from < text.len() {
+        let token = find_prefix_token(&text[from..], "sk-", 30)?;
+        let belongs_to_specific_detector = PREFIX_DETECTORS
+            .iter()
+            .any(|&(_, needle, _)| needle.starts_with("sk-") && token.starts_with(needle));
+        let is_safe_compound = SK_SAFE_PREFIXES.iter().any(|safe| token.starts_with(safe));
+        if !belongs_to_specific_detector && !is_safe_compound {
+            return Some(token);
+        }
+
+        let token_start = token.as_ptr() as usize - base;
+        // Suppress only this `sk-` occurrence. The same whitespace-delimited
+        // token may contain a later generic key glued after punctuation, and
+        // advancing past the whole token would hide it from the fallback.
+        from = token_start + "sk-".len();
     }
     None
 }
@@ -836,25 +900,41 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
     i
 }
 
-/// `from` restricts which tokens may be RETURNED (only those starting at or
-/// after `from`), but the trigger-context window is still computed over the full
-/// `text`. This lets [`mask_secrets`] advance past an earlier redaction without
-/// losing a trigger word that sat to the left of it.
-fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static str)> {
+/// Tokenize the full input once for the entropy detector. The returned offsets
+/// are absolute offsets into `text` and remain valid for every scan cursor.
+fn tokenize_entropy_tokens(text: &str) -> Vec<(usize, &str)> {
+    #[cfg(test)]
+    ENTROPY_TOKENIZATION_COUNT.with(|count| count.set(count.get() + 1));
+
     // Tokenize into maximal ASCII non-whitespace runs; non-ASCII chars are also
     // delimiters (see docs/api/secret_gate.md#module-level-detection-algorithm,
     // "non-ASCII token delimiting"). Identical to `split_ascii_whitespace` on
     // pure-ASCII input.
-    let tokens: Vec<(usize, &str)> = text
-        .split(|c: char| c.is_ascii_whitespace() || !c.is_ascii())
+    text.split(|c: char| c.is_ascii_whitespace() || !c.is_ascii())
         .filter(|t| !t.is_empty())
         .map(|t| {
             let offset = t.as_ptr() as usize - text.as_ptr() as usize;
             (offset, t)
         })
-        .collect();
+        .collect()
+}
 
-    for (idx, &(tok_offset, raw_token)) in tokens.iter().enumerate() {
+/// `from` restricts which tokens may be RETURNED (only those starting at or
+/// after `from`), but the trigger-context window is still computed over the full
+/// `text`. This lets [`mask_secrets`] advance past an earlier redaction without
+/// losing a trigger word that sat to the left of it.
+fn check_entropy_heuristic<'a>(
+    text: &'a str,
+    from: usize,
+    tokens: &[(usize, &'a str)],
+) -> Option<(&'a str, &'static str)> {
+    let first_token = tokens.partition_point(|&(_, raw_token)| {
+        let token = strip_delimiters(raw_token);
+        let token_offset = token.as_ptr() as usize - text.as_ptr() as usize;
+        token_offset < from
+    });
+
+    for (idx, &(tok_offset, raw_token)) in tokens.iter().enumerate().skip(first_token) {
         // Strip common delimiters that wrap the actual value.
         let token = strip_delimiters(raw_token);
         // Only RETURN tokens at or after `from` (already-redacted spans lie
@@ -875,7 +955,8 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // `shannon_entropy` over its bytes is a true per-character entropy.
 
         // Compute the trigger window before any shape-based allowlist decision.
-        // UUID and base64 content-hash exemptions remain trigger-sensitive.
+        // UUIDs require credential-label context rather than a generic mention
+        // of `token`; base64 content-hash exemptions remain trigger-sensitive.
         // VCS revisions and file paths use narrower syntactic context below.
         let window_start = floor_char_boundary(text, tok_offset.saturating_sub(TRIGGER_WINDOW));
         let window_end = floor_char_boundary(text, tok_offset + raw_token.len() + TRIGGER_WINDOW);
@@ -889,17 +970,26 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         let near_trigger = contains_trigger(&window[..raw_start])
             || contains_trigger(&window[raw_end..])
             || has_inline_credential_trigger(raw_token);
+        let uuid_near_credential_label = contains_credential_label_trigger(&window[..raw_start])
+            || contains_credential_label_trigger(&window[raw_end..])
+            || has_inline_credential_trigger(raw_token);
 
-        // Step 1 (see doc: per-token flagging sequence). UUID/content-hash checks fall
-        // through to detection near a trigger rather than being silently passed —
-        // hex-shaped entropy alone (<=4.0 bits/char) can never reach ENTROPY_THRESHOLD.
-        if near_trigger && value_candidates(token).any(is_uuid_canonical) {
+        // Step 1 (see doc: per-token flagging sequence). UUIDs fall through only
+        // beside an explicit credential label; the generic word `token` remains
+        // trigger context for opaque values but is common in design prose. Content
+        // hashes retain the broader trigger rule. Hex-shaped entropy alone (<=4.0
+        // bits/char) can never reach ENTROPY_THRESHOLD.
+        let has_uuid_candidate = value_candidates(token).any(is_uuid_canonical);
+        if uuid_near_credential_label && has_uuid_candidate {
             return Some((token, "uuid-near-trigger"));
         }
         if near_trigger && value_candidates(token).any(is_base64_content_hash) {
             return Some((token, "content-hash-near-trigger"));
         }
-        if !near_trigger && (is_uuid_canonical(token) || is_base64_content_hash(token)) {
+        if !uuid_near_credential_label && is_uuid_canonical(token) {
+            continue;
+        }
+        if !near_trigger && is_base64_content_hash(token) {
             continue;
         }
 
@@ -976,7 +1066,7 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             // docs/api/secret_gate.md#check_entropy_heuristic--per-token-flagging-sequence
             // for the exact guarantee and its accepted residual (same-uid-host) limits.
             if !vcs_reference_exempt && tokens.len() > 1 {
-                let fragments = bridge_fragment_chain(&tokens, text, idx);
+                let fragments = bridge_fragment_chain(tokens, text, idx);
                 if fragments.len() > 1 {
                     let hex_probe = fragments.join(" ");
                     if contains_normalized_hex_credential(&hex_probe) {
@@ -1686,6 +1776,19 @@ fn contains_trigger(text: &str) -> bool {
         || has_assignment_credential_trigger(&low)
 }
 
+/// UUID-shaped values need an explicit credential label. A standalone mention
+/// of `token` is intentionally omitted because it is common design language;
+/// assignment forms such as `token=<uuid>` remain authoritative.
+fn contains_credential_label_trigger(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    TRIGGER_WORDS
+        .iter()
+        .any(|tw| contains_bounded_word(&low, tw))
+        || contains_compound_trigger(&low)
+        || has_token_assignment(&low)
+        || has_assignment_credential_trigger(&low)
+}
+
 /// Detect a credential-bearing assignment label before an `=` or `:`.
 ///
 /// The separator may be preceded by whitespace or a JSON quote. Compound
@@ -2058,6 +2161,18 @@ fn build_match(detector: &'static str, candidate: &str) -> SecretMatch {
 mod tests {
     use super::*;
 
+    fn github_fine_grained_pat_fixture() -> String {
+        format!("github_pat_{}", "A".repeat(82))
+    }
+
+    fn openai_project_key_fixture() -> String {
+        format!("sk-proj-{}", "A".repeat(80))
+    }
+
+    fn anthropic_api_key_fixture() -> String {
+        format!("sk-ant-api03-{}AA", "A".repeat(93))
+    }
+
     #[test]
     fn blocks_aws_akia() {
         // FAKE key: prefix is real shape, 16-char suffix invented.
@@ -2096,8 +2211,8 @@ mod tests {
 
     #[test]
     fn blocks_github_pat() {
-        let fake = "github_pat_AAAAAABBBBBBCCCCCC";
-        assert!(scan(fake).is_some(), "github_pat_ must be caught");
+        let fake = github_fine_grained_pat_fixture();
+        assert!(scan(&fake).is_some(), "github_pat_ must be caught");
     }
 
     #[test]
@@ -2108,9 +2223,79 @@ mod tests {
 
     #[test]
     fn blocks_anthropic_sk_ant() {
-        let fake = "sk-ant-api03-AAAAAAAAAAAAAAA";
-        assert!(scan(fake).is_some(), "sk-ant- must be caught");
-        assert_eq!(scan(fake).unwrap().detector, "anthropic-api-key");
+        let fake = anthropic_api_key_fixture();
+        assert!(scan(&fake).is_some(), "sk-ant- must be caught");
+        assert_eq!(scan(&fake).unwrap().detector, "anthropic-api-key");
+    }
+
+    #[test]
+    fn vendor_prefix_minimums_allow_short_documentation_fragments() {
+        let fragments = [
+            "github_pat_[A-Za-z0-9_]{82}".to_owned(),
+            "sk-proj-[A-Za-z0-9_-]{80,}".to_owned(),
+            "sk-ant-api03-[A-Za-z0-9_-]{93}AA".to_owned(),
+            "github_pat_FAKE_CANARY".to_owned(),
+            "sk-ant-api03-FAKE_CANARY".to_owned(),
+            format!("github_pat_{}", "A".repeat(81)),
+            format!("sk-proj-{}", "A".repeat(79)),
+            format!("sk-ant-api03-{}AA", "A".repeat(92)),
+        ];
+
+        for fragment in fragments {
+            assert!(
+                check(&fragment).is_ok(),
+                "short documentation fragment must pass: {fragment}, got {:?}",
+                scan(&fragment)
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_prefix_minimums_keep_plausible_keys_blocked() {
+        let github = github_fine_grained_pat_fixture();
+        let openai = openai_project_key_fixture();
+        let anthropic = anthropic_api_key_fixture();
+
+        for (candidate, detector) in [
+            (github.as_str(), "github-token"),
+            (openai.as_str(), "openai-api-key"),
+            (anthropic.as_str(), "anthropic-api-key"),
+        ] {
+            let matched = scan(candidate).expect("plausible-length vendor key must remain blocked");
+            assert_eq!(matched.detector, detector);
+        }
+    }
+
+    #[test]
+    fn short_specialized_sk_prefix_does_not_hide_later_generic_key() {
+        let short_vendor_fragment = format!("sk-proj-{}", "A".repeat(79));
+        let generic_key = format!("sk-{}", "A1".repeat(20));
+        let content = format!("{short_vendor_fragment} {generic_key}");
+
+        let (matched, detector) =
+            scan_match(&content).expect("later generic sk key must remain detectable");
+        assert_eq!(matched, generic_key);
+        assert_eq!(detector, "openai-api-key");
+    }
+
+    #[test]
+    fn glued_short_specialized_prefix_does_not_hide_later_generic_key() {
+        let generic_key = format!("sk-{}A", "A1".repeat(21));
+        let content = format!("sk-proj-X,{generic_key}");
+
+        assert!(
+            check(&content).is_err(),
+            "a generic key after a rejected vendor prefix must remain blocked"
+        );
+        let masked = mask_secrets(&content).into_owned();
+        assert!(
+            !masked.contains(&generic_key),
+            "the later generic key must not survive masking: {masked}"
+        );
+        assert!(
+            masked.contains(REDACTION_MARKER),
+            "the later generic key must be replaced: {masked}"
+        );
     }
 
     #[test]
@@ -2150,9 +2335,9 @@ mod tests {
 
     #[test]
     fn prefix_detectors_allow_lowercase_source_filenames() {
-        let filename_body = "provider_integration_monitoring_adapter_configuration.py";
-
         for &(_, needle, min_len) in PREFIX_DETECTORS {
+            let padding_len = min_len.saturating_sub(needle.len() + "provider_.py".len());
+            let filename_body = format!("provider_{}.py", "a".repeat(padding_len));
             let candidate = format!("{needle}{filename_body}");
             assert!(
                 candidate.len() >= min_len,
@@ -2590,12 +2775,12 @@ mod tests {
         // preceding ideograph was not treated as a delimiter.  These credentials
         // must be caught with no nearby ASCII trigger word, on the left side too.
         let cases = [
-            "数据AKIAIOSFODNN7EXAMPLE",             // gitleaks:allow
-            "令牌github_pat_11ABCDEFG0HIJKLMNOPQR", // gitleaks:allow
-            "密钥sk-ant-api03-AAAAAAAAAAAAAAAAAA",  // gitleaks:allow
-            "配置FlyV1 fm2_AAAABBBBCCCCDDDD",       // gitleaks:allow
+            "数据AKIAIOSFODNN7EXAMPLE".to_owned(), // gitleaks:allow
+            format!("令牌{}", github_fine_grained_pat_fixture()),
+            format!("密钥{}", anthropic_api_key_fixture()),
+            "配置FlyV1 fm2_AAAABBBBCCCCDDDD".to_owned(), // gitleaks:allow
         ];
-        for content in cases {
+        for content in &cases {
             assert!(
                 check(content).is_err(),
                 "known-prefix secret glued after CJK must be blocked: {content:?}"
@@ -2692,7 +2877,9 @@ mod tests {
 
     #[test]
     fn check_json_blocks_secret_in_nested_object() {
-        let props = serde_json::json!({ "credentials": { "token": "sk-proj-FAKEKEY00000000000000000000000000000000" } }); // gitleaks:allow
+        let props = serde_json::json!({
+            "credentials": { "token": openai_project_key_fixture() }
+        });
         assert!(
             check_json(&props).is_err(),
             "secret in nested properties object must be blocked"
@@ -2836,9 +3023,9 @@ mod tests {
     #[test]
     fn blocks_openai_sk_proj_not_confused_with_sk_learn() {
         // Real OpenAI key shape must still be caught.
-        let fake = "sk-proj-FAKEKEY00000000000000000000000000000000"; // gitleaks:allow
+        let fake = openai_project_key_fixture();
         assert!(
-            scan(fake).is_some(),
+            scan(&fake).is_some(),
             "sk-proj- key must still be caught after sk-learn exemption"
         );
     }
@@ -3910,11 +4097,11 @@ mod tests {
             "🇺🇸",       // 8-byte emoji flag (two surrogate-like scalars)
         ];
         let secrets = [
-            "AKIAFAKEKEY00000000000000",
-            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "sk-ant-api03-AAAAAAAAAAAAAAA",
-            "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1",
-            "FlyV1 fm2_AAAABBBBCCCCDDDDEEEEFFFF",
+            "AKIAFAKEKEY00000000000000".to_owned(),
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            anthropic_api_key_fixture(),
+            "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1".to_owned(),
+            "FlyV1 fm2_AAAABBBBCCCCDDDDEEEEFFFF".to_owned(),
         ];
         for mb in &multibyte_items {
             for secret in &secrets {
@@ -4257,10 +4444,10 @@ mod tests {
         // These are exactly the detectors the session mirror's previous local
         // regex did NOT cover, which is why it now shares this masker.
         let cases = [
-            "key: sk-proj-FAKEKEY00000000000000000000000000000000", // gitleaks:allow
-            "cred ASIAFAKEKEY00000000000",                          // gitleaks:allow
-            "stripe sk_live_FAKESTRIPE0000000000000",               // gitleaks:allow
-            "db postgresql://dbuser:S3cr3tP4ss@db.example.com/db",  // gitleaks:allow
+            format!("key: {}", openai_project_key_fixture()),
+            "cred ASIAFAKEKEY00000000000".to_owned(), // gitleaks:allow
+            "stripe sk_live_FAKESTRIPE0000000000000".to_owned(), // gitleaks:allow
+            "db postgresql://dbuser:S3cr3tP4ss@db.example.com/db".to_owned(), // gitleaks:allow
         ];
         for c in &cases {
             let masked = mask_secrets(c);
@@ -4273,9 +4460,11 @@ mod tests {
 
     #[test]
     fn mask_secrets_redacts_every_span_and_keeps_prose() {
-        let line =
-            "first sk-ant-api03-AAAAAAAAAAAAAAA then ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end";
-        let masked = mask_secrets(line);
+        let line = format!(
+            "first {} then ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end",
+            anthropic_api_key_fixture()
+        );
+        let masked = mask_secrets(&line);
         assert!(
             !masked.contains("sk-ant-api03") && !masked.contains("ghp_AAAA"),
             "no secret may survive: {masked}"
@@ -4287,6 +4476,57 @@ mod tests {
         );
         assert!(masked.starts_with("first "), "prose preserved: {masked}");
         assert!(masked.ends_with(" end"), "prose preserved: {masked}");
+    }
+
+    #[test]
+    fn mask_secrets_public_api_redacts_unscanned_dense_tail() {
+        let token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let segment = format!("{token} keep ");
+        // Keep this fixture independent of implementation-only constants: the
+        // pre-bound implementation must compile with the test present.
+        let line = segment.repeat(512);
+        assert!(
+            line.len() >= 20_000,
+            "fixture must exceed the cumulative scan-work threshold"
+        );
+
+        let masked = mask_secrets(&line);
+        assert!(
+            !masked.contains(token),
+            "no credential may survive fail-closed tail redaction"
+        );
+        assert!(
+            masked.matches("***MASKED***").count() < line.matches(token).count(),
+            "the public masker must redact the unscanned tail wholesale"
+        );
+        assert!(
+            masked.ends_with("***MASKED***"),
+            "the fail-closed tail redaction must reach the end of the public result"
+        );
+    }
+
+    // White-box complement only: the public test above is the independent
+    // guard for the fail-closed work bound.
+    #[test]
+    fn mask_secrets_tokenizes_concentrated_tail_once() {
+        let token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let prefix = "clean ".repeat(1_000_000 / "clean ".len());
+        let tail: String = (0..200).map(|_| format!("{token} ")).collect();
+        let line = format!("{prefix}{tail}");
+        assert_eq!(line.matches(token).count(), 200);
+
+        ENTROPY_TOKENIZATION_COUNT.with(|count| count.set(0));
+        let masked = mask_secrets(&line);
+        let tokenization_count = ENTROPY_TOKENIZATION_COUNT.with(|count| count.get());
+
+        assert!(
+            !masked.contains(token),
+            "the public masker must redact every concentrated-tail credential"
+        );
+        assert_eq!(
+            tokenization_count, 1,
+            "the full input token vector must be built once, not once per tail credential"
+        );
     }
 
     #[test]
@@ -5075,6 +5315,37 @@ mod tests {
              (not a genuine 'auth' mention) must now pass; got {:?}",
             scan(content)
         );
+    }
+
+    #[test]
+    fn allows_uuid_on_line_after_benign_token_contract_title() {
+        let content = "Design language and token contract\n550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            check(content).is_ok(),
+            "a generic token-contract title must not make a next-line UUID look like a secret; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn generic_token_uuid_exemption_keeps_strong_credential_controls() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let cases = [
+            (format!("service token {opaque}"), "high-entropy-token"),
+            (format!("token={opaque}"), "high-entropy-token"),
+            (format!("token={uuid}"), "uuid-near-trigger"),
+            (format!("api_key {uuid}"), "uuid-near-trigger"),
+        ];
+
+        for (content, detector) in cases {
+            assert_eq!(
+                scan(&content).map(|matched| matched.detector),
+                Some(detector),
+                "credential-shaped control must remain blocked: {content:?}"
+            );
+        }
     }
 
     // ── UUID/hash value extraction from assignment and wrapper syntax ───────

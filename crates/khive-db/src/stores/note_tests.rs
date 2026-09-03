@@ -593,6 +593,121 @@ async fn note_page_count_and_items_share_one_snapshot_during_concurrent_insert()
 }
 
 #[tokio::test]
+async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note-filter-count-snapshot.db");
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+
+    let store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
+    let namespace = format!("count-snapshot-{}", Uuid::new_v4().simple());
+    let mut note = make_note_with_props(
+        &namespace,
+        "message",
+        "addressed before concurrent update",
+        serde_json::json!({
+            "direction": "inbound",
+            "read": false,
+            "to_actor": "actor:a",
+        }),
+    );
+    note.created_at = 1;
+    let note_id = note.id;
+    store.upsert_note(note).await.unwrap();
+
+    let base_filters = vec![
+        NotePropFilter {
+            json_path: "$.direction".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text("inbound".to_string()),
+        },
+        NotePropFilter {
+            json_path: "$.read".to_string(),
+            op: FilterOp::JsonTypeNeMissing,
+            value: SqlValue::Text("true".to_string()),
+        },
+    ];
+    let partition_filter = |op| {
+        let mut property_filters = base_filters.clone();
+        property_filters.push(NotePropFilter {
+            json_path: "$.to_actor".to_string(),
+            op,
+            value: SqlValue::Text("actor:a".to_string()),
+        });
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters,
+            ..NoteFilter::default()
+        }
+    };
+    let filters = vec![
+        partition_filter(FilterOp::EqOrMissingIndexed),
+        partition_filter(FilterOp::JsonTypeMissingOrNullIndexed),
+    ];
+
+    let (reached_rx, proceed_tx) =
+        page_snapshot_seam::install("count_notes_filtered_in_snapshot", namespace.clone());
+    let query_task = {
+        let store = Arc::clone(&store);
+        let namespace = namespace.clone();
+        let filters = filters.clone();
+        tokio::spawn(async move {
+            store
+                .count_notes_filtered_in_snapshot(&namespace, &filters)
+                .await
+        })
+    };
+
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .expect("waiting for the count snapshot seam must not panic")
+        .expect("count query must reach the seam after its first partition");
+
+    let writer = pool.writer().unwrap();
+    writer
+        .conn()
+        .execute(
+            "UPDATE notes SET properties = json_object('direction', 'inbound', 'read', 0) \
+             WHERE id = ?1",
+            [note_id.to_string()],
+        )
+        .unwrap();
+
+    proceed_tx
+        .send(())
+        .expect("count query must still be waiting at the production seam");
+    let counts = query_task
+        .await
+        .expect("count query task must not panic")
+        .expect("count query must succeed");
+    page_snapshot_seam::uninstall();
+
+    assert_eq!(counts, vec![1, 0], "both partitions must use one snapshot");
+
+    let after = store
+        .count_notes_filtered_in_snapshot(&namespace, &filters)
+        .await
+        .unwrap();
+    assert_eq!(
+        after,
+        vec![0, 1],
+        "the committed update must appear afterward"
+    );
+}
+
+#[tokio::test]
 async fn test_soft_delete_sets_status_deleted() {
     let pool = setup_pool();
     let store = SqlNoteStore::new(Arc::clone(&pool), false);
@@ -850,8 +965,14 @@ async fn atomic_note_property_patch_rolls_back_when_one_target_is_ineligible() {
         .await
         .expect_err("an ineligible target must abort the atomic patch");
     assert!(
-        matches!(&error, StorageError::Conflict { message, .. }
-            if message.contains(&ineligible_id.to_string())),
+        matches!(
+            &error,
+            StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            } if matches!(source.as_ref(), StorageError::Conflict { message, .. }
+                if message.contains(&ineligible_id.to_string()))
+        ),
         "the conflict must name the first failing id {ineligible_id}; got {error:?}"
     );
     assert!(!error.is_retryable(), "a precondition conflict is terminal");
@@ -956,8 +1077,14 @@ async fn atomic_note_property_patch_writer_task_commits_and_rolls_back() {
         .await
         .expect_err("a later ineligible row must abort the writer-task transaction");
     assert!(
-        matches!(&error, StorageError::Conflict { message, .. }
-            if message.contains(&ineligible_id.to_string())),
+        matches!(
+            &error,
+            StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            } if matches!(source.as_ref(), StorageError::Conflict { message, .. }
+                if message.contains(&ineligible_id.to_string()))
+        ),
         "the conflict must name the first failing id {ineligible_id}; got {error:?}"
     );
     assert_eq!(
@@ -1015,6 +1142,57 @@ fn make_note_with_props(
     props: serde_json::Value,
 ) -> Note {
     Note::new(namespace, kind, content).with_properties(props)
+}
+
+#[tokio::test]
+async fn eq_or_missing_does_not_match_present_empty_string() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+    use khive_storage::types::{PageRequest, SqlValue};
+
+    let store = setup_memory_store();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "present empty",
+            serde_json::json!({"to_actor": ""}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "absent",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op: FilterOp::EqOrMissing,
+            value: SqlValue::Text("actor:a".to_string()),
+        }],
+        ..Default::default()
+    };
+    let page = store
+        .query_notes_filtered(
+            "default",
+            &filter,
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.total, Some(1));
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].content, "absent");
 }
 
 #[tokio::test]
@@ -1537,7 +1715,11 @@ async fn pooled_transaction_commit_failure_with_verified_rollback_keeps_writer_u
     assert!(
         matches!(
             &result,
-            Err(StorageError::Pool { operation, .. }) if operation == "test_pooled_commit"
+            Err(StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            }) if matches!(source.as_ref(), StorageError::Pool { operation, .. }
+                if operation == "test_pooled_commit")
         ),
         "a denied COMMIT followed by a verified rollback must report the commit error: {result:?}"
     );
@@ -2122,4 +2304,360 @@ fn transactional_write_refreshes_writer_task_after_construction_outside_runtime(
                 "transactional note write bypassed the queue after construction cached no handle"
             );
         });
+}
+
+// -- unread-probe partial index tests --
+
+/// The comm unread probe (badge count + inbox unread listing) must be served
+/// by `idx_notes_unread_probe_recipient`, so its work scales with the unread set, not
+/// total mailbox size. The assertions below are the actual discriminator: the
+/// generated WHERE SQL contains the literal form and `JsonTypeNeMissing` contributes
+/// no bind parameter. The plan before and after dropping the index is only an
+/// index-presence control. This does not cover portability to SQLite builds where a
+/// bound predicate blocks partial-index implication.
+#[tokio::test]
+async fn unread_probe_query_uses_partial_index() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+
+    let pool = setup_pool();
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
+
+    for i in 0..5 {
+        let unread = make_note_with_props(
+            "default",
+            "message",
+            &format!("unread {i}"),
+            serde_json::json!({"direction": "inbound", "to_actor": "actor:a"}),
+        );
+        store.upsert_note(unread).await.unwrap();
+        let read = make_note_with_props(
+            "default",
+            "message",
+            &format!("read {i}"),
+            serde_json::json!({"direction": "inbound", "to_actor": "actor:a", "read": true}),
+        );
+        store.upsert_note(read).await.unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrMissingIndexed,
+                value: SqlValue::Text("actor:a".to_string()),
+            },
+        ],
+        order_by: None,
+        ..Default::default()
+    };
+
+    // Behavior: only the unread rows come back.
+    let rows = store
+        .query_notes_filtered_bounded("default", &filter, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 5, "exactly the unread rows must match");
+
+    // Plan: the same WHERE the store generates is served by the partial
+    // index.
+    let (where_sql, params) = build_note_filter_where("default", &filter).unwrap();
+    let sql =
+        format!("SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT 1001");
+
+    // The partial-index implication depends on this operand being an SQL
+    // literal, not a bound value. Assert the generated statement and its
+    // bind list directly; a plan assertion alone can pass on SQLite builds
+    // that replan after binding.
+    assert!(
+        where_sql.contains("json_type(properties, '$.read') != 'true'"),
+        "JsonTypeNeMissing must inline the validated json_type literal, got:\n{where_sql}"
+    );
+    let mut filter_without_json_type = filter.clone();
+    filter_without_json_type
+        .property_filters
+        .retain(|property| !matches!(property.op, FilterOp::JsonTypeNeMissing));
+    let (_, params_without_json_type) =
+        build_note_filter_where("default", &filter_without_json_type).unwrap();
+    assert_eq!(
+        params.len(),
+        params_without_json_type.len(),
+        "JsonTypeNeMissing must not add a bind parameter"
+    );
+
+    let reader = pool.reader().unwrap();
+    let plan = |sql: &str, params: &[Box<dyn rusqlite::types::ToSql>]| -> String {
+        let mut stmt = reader
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let details: Vec<String> = stmt
+            .query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(!details.is_empty(), "EXPLAIN returned no plan rows");
+        details.join("\n")
+    };
+    let indexed_plan = plan(&sql, &params);
+    assert!(
+        indexed_plan.contains("idx_notes_unread_probe_recipient"),
+        "unread probe must be served by the partial index, got plan:\n{indexed_plan}"
+    );
+
+    // Control proving the assertion above is falsifiable: with the partial
+    // index dropped, the same query cannot name it. (A bound-parameter
+    // variant is NOT a usable control here: the bundled SQLite replans after
+    // binding and can then prove the implication from the bound value, so
+    // the parameterized form is also index-served in this build. The literal
+    // inlining stays because that replan behavior is build-dependent, while
+    // a literal is provable at prepare time everywhere.)
+    reader
+        .conn()
+        .execute_batch("DROP INDEX idx_notes_unread_probe_recipient")
+        .unwrap();
+    let control_plan = plan(&sql, &params);
+    assert!(
+        !control_plan.contains("idx_notes_unread_probe_recipient"),
+        "control: dropped index must vanish from the plan, got:\n{control_plan}"
+    );
+}
+
+/// The legacy-recipient partition includes absent and explicit JSON-null
+/// recipients but excludes a present empty string, and remains recipient-keyed
+/// so the unread probe can use the partial index.
+#[tokio::test]
+async fn unread_probe_legacy_partition_includes_null_and_uses_partial_index() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::types::SqlValue;
+
+    let pool = setup_pool();
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
+
+    for (label, recipient) in [
+        ("missing", None),
+        ("null", Some(serde_json::Value::Null)),
+        ("empty", Some(serde_json::Value::String(String::new()))),
+        ("other", Some(serde_json::json!("actor:z"))),
+    ] {
+        let mut properties = serde_json::json!({
+            "direction": "inbound",
+            "read": false,
+        });
+        if let Some(recipient) = recipient {
+            properties["to_actor"] = recipient;
+        }
+        store
+            .upsert_note(make_note_with_props(
+                "default", "message", label, properties,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::JsonTypeMissingOrNullIndexed,
+                value: SqlValue::Text("actor:a".to_string()),
+            },
+        ],
+        ..NoteFilter::default()
+    };
+
+    let rows = store
+        .query_notes_filtered_bounded("default", &filter, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "only missing and JSON-null recipients match");
+
+    let (where_sql, params) = build_note_filter_where("default", &filter).unwrap();
+    let sql =
+        format!("SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT 1001");
+    let reader = pool.reader().unwrap();
+    let mut stmt = reader
+        .conn()
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let plan: Vec<String> = stmt
+        .query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let plan = plan.join("\n");
+    assert!(
+        plan.contains("idx_notes_unread_probe_recipient"),
+        "legacy recipient partition must use the partial index, got plan:\n{plan}"
+    );
+}
+
+/// The unread probe's work must scale with the CALLER's unread set, not
+/// with other recipients' backlog: the recipient key column on
+/// `idx_notes_unread_probe_recipient` (the exact `ifnull(...)` expression
+/// EqOrMissingIndexed generates) lets the planner exclude other actors' rows
+/// inside the index. Grow an irrelevant recipient's unread backlog 10x and
+/// assert the probe's VM step count stays flat — a recipient-blind scan
+/// (the shape this test pins against) grows those steps roughly 10x.
+#[tokio::test]
+async fn unread_probe_work_is_bounded_by_callers_own_unread_rows() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+    use rusqlite::StatementStatus;
+
+    let pool = setup_pool();
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
+
+    for i in 0..5 {
+        let mine = make_note_with_props(
+            "default",
+            "message",
+            &format!("mine {i}"),
+            serde_json::json!({"direction": "inbound", "to_actor": "actor:a"}),
+        );
+        store.upsert_note(mine).await.unwrap();
+    }
+    let seed_other = |n: usize| {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        // Strictly NEWER than everything already present: the worst case for
+        // the probe is the caller's unread sitting under a mountain of newer
+        // irrelevant rows, so a created_at DESC scan must wade through all of
+        // them before reaching the caller. (An earlier draft stamped scenery
+        // with second-truncated timestamps, which made the caller's
+        // microsecond-stamped rows the NEWEST — every plan then found them
+        // in a handful of steps and the recipient-blind mutant stayed green.)
+        let base: i64 = conn
+            .query_row("SELECT ifnull(max(created_at), 0) FROM notes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..n {
+            let stamp = base + 1 + i as i64;
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', 'inbound', 'to_actor', 'actor:z'), \
+                         ?3, ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("other {i}"),
+                    stamp
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    };
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrMissingIndexed,
+                value: SqlValue::Text("actor:a".to_string()),
+            },
+        ],
+        order_by: None,
+        ..Default::default()
+    };
+    let (where_sql, params) = build_note_filter_where("default", &filter).unwrap();
+    let sql = format!("SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT 2");
+    let measure = || -> (usize, i32) {
+        let reader = pool.reader().unwrap();
+        let mut stmt = reader.conn().prepare(&sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows: Vec<String> = stmt
+            .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        (rows.len(), stmt.get_status(StatementStatus::VmStep))
+    };
+
+    seed_other(200);
+    let (rows_small, steps_small) = measure();
+    assert_eq!(rows_small, 2, "probe must still see the caller's rows");
+    assert!(
+        steps_small > 0,
+        "instrument control: VM steps must register"
+    );
+
+    seed_other(1_800); // total irrelevant backlog: 2_000 (10x)
+    let (rows_large, steps_large) = measure();
+    assert_eq!(rows_large, 2, "probe must still see the caller's rows");
+    assert!(
+        steps_large < steps_small.saturating_mul(3),
+        "unread probe scanned other recipients' backlog: \
+         {steps_small} VM steps at 200 irrelevant rows vs {steps_large} at 2000 \
+         (a recipient-scoped probe stays flat; a blind scan grows ~10x)"
+    );
+}
+
+/// The inlined json_type literal admits only SQLite's closed json_type
+/// vocabulary; anything else is rejected rather than interpolated.
+#[tokio::test]
+async fn json_type_ne_missing_rejects_non_vocabulary_value() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![NotePropFilter {
+            json_path: "$.read".to_string(),
+            op: FilterOp::JsonTypeNeMissing,
+            value: SqlValue::Text("true' OR '1'='1".to_string()),
+        }],
+        order_by: None,
+        ..Default::default()
+    };
+    let err = store
+        .query_notes_filtered_bounded("default", &filter, 10)
+        .await
+        .expect_err("non-vocabulary json_type value must be rejected");
+    assert!(
+        err.to_string().contains("json_type"),
+        "rejection must name the json_type vocabulary, got: {err}"
+    );
 }

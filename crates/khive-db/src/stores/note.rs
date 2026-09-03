@@ -296,16 +296,16 @@ pub fn note_hard_delete_statement(id: Uuid) -> SqlStatement {
 /// A NoteStore backed by SQLite. Namespace is the caller's responsibility.
 ///
 /// UUID is globally unique — get/delete by ID alone. Query/count use the
-/// namespace parameter as passed. The store is just a pool + is_file_backed.
+/// namespace parameter as passed. Read routing is always pool-backed; the
+/// constructor's legacy file-backed flag is retained for API compatibility.
 pub struct SqlNoteStore {
     pool: Arc<ConnectionPool>,
-    is_file_backed: bool,
     writer_task: Option<WriterTaskHandle>,
 }
 
 impl SqlNoteStore {
     /// Create a new store.
-    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+    pub fn new(pool: Arc<ConnectionPool>, _is_file_backed: bool) -> Self {
         // Enabled by default for file-backed pools; explicit off/degraded
         // fallback remains possible (ADR-067 Component A, mirrors
         // entity.rs policy): a missing writer task — explicitly disabled,
@@ -314,11 +314,7 @@ impl SqlNoteStore {
         // re-resolves it and applies strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
-        Self {
-            pool,
-            is_file_backed,
-            writer_task,
-        }
+        Self { pool, writer_task }
     }
 
     fn current_writer_task(
@@ -435,36 +431,13 @@ impl SqlNoteStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Notes,
-                op,
-                move |scope| {
-                    scope.ensure_active()?;
-                    let conn = pool
-                        .open_standalone_reader()
-                        .map_err(|error| map_sqlite_err(error, op))?;
-                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        } else {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Notes,
-                op,
-                move |scope| {
-                    let mut guard = pool.resolve_reader_checkout(
-                        StorageCapability::Notes,
-                        op,
-                        pool.reader_until(|| scope.should_stop()),
-                    )?;
-                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        }
+        super::run_pooled_store_read(
+            Arc::clone(&self.pool),
+            StorageCapability::Notes,
+            op,
+            move |conn| f(conn).map_err(|error| map_err(error, op)),
+        )
+        .await
     }
 }
 
@@ -715,6 +688,24 @@ fn json_type_expr(path: &str) -> String {
     format!("json_type(properties, '{path}')")
 }
 
+/// Validate a value destined for inline comparison against `json_type()`.
+/// The only admissible values are SQLite's own json_type result strings —
+/// a closed vocabulary — so a validated value can be inlined into SQL text
+/// without any injection surface. Anything else is a caller bug, rejected
+/// rather than parameterized.
+fn json_type_literal(value: &SqlValue) -> Result<&str, rusqlite::Error> {
+    const JSON_TYPES: [&str; 8] = [
+        "true", "false", "integer", "real", "text", "array", "object", "null",
+    ];
+    match value {
+        SqlValue::Text(s) if JSON_TYPES.contains(&s.as_str()) => Ok(s.as_str()),
+        other => Err(rusqlite::Error::InvalidParameterName(format!(
+            "json_type comparison value must be one of SQLite's json_type strings \
+             ({JSON_TYPES:?}), got {other:?}"
+        ))),
+    }
+}
+
 fn sql_value_param(value: &SqlValue) -> Result<Box<dyn rusqlite::types::ToSql>, rusqlite::Error> {
     Ok(match value {
         SqlValue::Null => Box::new(Option::<String>::None),
@@ -777,6 +768,11 @@ fn build_note_filter_where(
                     n = params.len()
                 ));
             }
+            FilterOp::EqOrMissingIndexed => {
+                let expr = json_extract_expr(&pf.json_path);
+                params.push(sql_value_param(&pf.value)?);
+                conditions.push(format!("ifnull({expr}, '') = ?{}", params.len()));
+            }
             FilterOp::TextEqOrNonText => {
                 let expr = json_extract_expr(&pf.json_path);
                 let type_expr = json_type_expr(&pf.json_path);
@@ -791,11 +787,32 @@ fn build_note_filter_where(
                 params.push(sql_value_param(&pf.value)?);
                 conditions.push(format!("{type_expr} = ?{}", params.len()));
             }
+            FilterOp::JsonTypeMissing => {
+                let type_expr = json_type_expr(&pf.json_path);
+                conditions.push(format!("{type_expr} IS NULL"));
+            }
+            FilterOp::JsonTypeMissingOrNullIndexed => {
+                let expr = json_extract_expr(&pf.json_path);
+                let type_expr = json_type_expr(&pf.json_path);
+                conditions.push(format!(
+                    "ifnull({expr}, '') = '' AND ({type_expr} IS NULL OR {type_expr} = 'null')"
+                ));
+            }
             FilterOp::JsonTypeNeMissing => {
                 let type_expr = json_type_expr(&pf.json_path);
-                params.push(sql_value_param(&pf.value)?);
-                let n = params.len();
-                conditions.push(format!("({type_expr} IS NULL OR {type_expr} != ?{n})"));
+                // Inlined as a validated literal, NOT a parameter: the
+                // partial unread index (`idx_notes_unread_probe_recipient`) carries
+                // this exact predicate in its WHERE clause, and SQLite can
+                // only prove a query implies an index predicate when the
+                // compared value is known at plan time — a bound parameter
+                // defeats the index and the scan degrades to
+                // mailbox-proportional work. The value domain is SQLite's
+                // closed json_type vocabulary, so inlining is injection-safe
+                // by construction.
+                let literal = json_type_literal(&pf.value)?;
+                conditions.push(format!(
+                    "({type_expr} IS NULL OR {type_expr} != '{literal}')"
+                ));
             }
             FilterOp::In(values) => {
                 let expr = json_extract_expr(&pf.json_path);
@@ -837,8 +854,11 @@ fn build_note_filter_where(
                     FilterOp::Gt => ">",
                     FilterOp::Gte => ">=",
                     FilterOp::EqOrMissing
+                    | FilterOp::EqOrMissingIndexed
                     | FilterOp::TextEqOrNonText
                     | FilterOp::JsonTypeEq
+                    | FilterOp::JsonTypeMissing
+                    | FilterOp::JsonTypeMissingOrNullIndexed
                     | FilterOp::JsonTypeNeMissing
                     | FilterOp::In(_)
                     | FilterOp::NotInOrMissing(_) => {
@@ -1414,6 +1434,45 @@ impl NoteStore for SqlNoteStore {
                 &data_sql,
                 &data_params,
             )
+        })
+        .await
+    }
+
+    async fn count_notes_filtered_in_snapshot(
+        &self,
+        namespace: &str,
+        filters: &[NoteFilter],
+    ) -> Result<Vec<u64>, StorageError> {
+        for filter in filters {
+            for pf in &filter.property_filters {
+                validate_json_path(&pf.json_path)?;
+            }
+        }
+
+        let namespace = namespace.to_string();
+        let filters = filters.to_vec();
+        self.with_reader("count_notes_filtered_in_snapshot", move |conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Deferred,
+            )?;
+            let mut counts = Vec::with_capacity(filters.len());
+            for filter in filters.iter() {
+                #[cfg(test)]
+                if !counts.is_empty() {
+                    tests::page_snapshot_seam::hook("count_notes_filtered_in_snapshot", &namespace);
+                }
+
+                let (where_sql, params) = build_note_filter_where(&namespace, filter)?;
+                let sql = format!("SELECT COUNT(*) FROM notes{where_sql}");
+                let mut stmt = tx.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|param| param.as_ref()).collect();
+                let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+                counts.push(count as u64);
+            }
+            tx.commit()?;
+            Ok(counts)
         })
         .await
     }

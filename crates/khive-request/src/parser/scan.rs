@@ -19,7 +19,7 @@ pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslErro
             _ => i += 1,
         }
     }
-    Err(DslError::UnclosedString)
+    Err(DslError::UnclosedString { start })
 }
 
 /// A control byte (U+0000-U+001F) that survives verbatim into

@@ -3107,13 +3107,18 @@ mod tests {
     /// Build the canonical completed V21 schema used by transactional-GC
     /// tests. Phase 4b owns the real cutover now, so tests exercise its schema
     /// instead of retaining Phase 4a's synthetic future-schema fixture.
+    ///
+    /// This stages through V21 explicitly rather than calling `run_migrations`,
+    /// because the GC gate admits exactly V21: running the whole chain would
+    /// hand these tests whatever the latest version happens to be, which the
+    /// gate then rejects. The assert below is what catches a drift here.
     fn prepare_completed_v21_gc_fixture(conn: &mut rusqlite::Connection) {
-        let version = crate::run_migrations(conn).expect("prepare canonical completed V21");
-        // Pinned to the V21 epoch, NOT to the moving latest version: the GC
-        // gate admits exactly V21, so the day a V22 migration lands this
-        // assert fails LOUDLY here — telling that migration's author to give
-        // these tests a fixture built explicitly through V21 — instead of
-        // silently handing every GC test a ledger the gate rejects.
+        prepare_v20_gc_fixture(conn);
+        crate::migrations::stage_attachment_cutover(conn).expect("stage canonical completed V21");
+        crate::migrations::finalize_attachment_cutover(conn)
+            .expect("finalize canonical completed V21");
+        let version = crate::migrations::read_schema_version(conn)
+            .expect("read canonical completed V21 ledger");
         assert_eq!(
             version,
             crate::migrations::ATTACHMENT_CUTOVER_VERSION,
@@ -5049,8 +5054,15 @@ mod tests {
         .await
         .expect_err("the probe must refuse when an id it would delete already names a row");
         assert!(
-            matches!(error, StorageError::Unsupported { .. }),
-            "expected StorageError::Unsupported, got {error:?}"
+            matches!(
+                &error,
+                StorageError::WriterTaskRequestFailed {
+                    request_state:
+                        khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                    source,
+                } if matches!(source.as_ref(), StorageError::Unsupported { .. })
+            ),
+            "expected a proven-rollback wrapper retaining StorageError::Unsupported, got {error:?}"
         );
 
         let reader = backend.pool().reader().unwrap();
@@ -6439,7 +6451,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transactional_orphan_sweep_walk_ignores_a_leaf_swapped_for_an_outside_symlink_mid_scan(
     ) {
-        // Regression for the PR #2201 review finding: the sweep's candidate
+        // Regression for #2201: the sweep's candidate
         // walk and grace-period mtime read used to be two separate,
         // path-based passes (`walk_blob_files` then `within_publish_grace`
         // via `fs::metadata(path)`), neither pinned to the retained

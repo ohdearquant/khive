@@ -172,6 +172,14 @@ Use `comm.mark_read(ids=[...])` as the canonical bulk mutation. It reuses the
 same best-effort behavior by default. Pass `atomic=true` when every unique
 validated target must be marked inside one transaction or none may change.
 
+At the MCP request layer, a parallel batch makes every operation independent.
+Putting `comm.send` beside `comm.read` or `comm.mark_read` does not condition the
+read mark on delivery: the acknowledgement may commit even if the send fails.
+Use a `send | mark_read` chain when that dependency is required. For replying to
+one inbound message, prefer `comm.reply`; it commits delivery before attempting
+the original message's best-effort read mark, so a delivery failure cannot mark
+the original read.
+
 This is the residual scope of #1387 after the 0.7.0 release: #1572 already
 shipped bulk best-effort `comm.read(ids=[...])`, and ADR-057 superseded the
 issue's original namespace and legacy-recipient acceptance assumptions with

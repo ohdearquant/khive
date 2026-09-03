@@ -9,12 +9,12 @@ use serde_json::{json, Value};
 
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{
-    micros_to_iso, DispatchHook, EventView, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
-    VerbRegistry,
+    micros_to_iso, DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace,
+    NamespaceToken, RuntimeError, VerbRegistry,
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
-use khive_types::HandlerDef;
+use khive_types::{HandlerDef, IdResolutionMode};
 
 use crate::event::interpret;
 use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
@@ -55,6 +55,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: false,
             description: "Specific parameter to query: \"recall::relevance_weight\" | \"recall::salience_weight\" | \"recall::temporal_weight\". Omit to return all.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -67,6 +68,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "integer",
             required: false,
             description: "Maximum events to return (default 20, max 100).",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -113,12 +115,14 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Window start, ISO-8601/RFC-3339 datetime (e.g. \"2026-07-01T00:00:00Z\"). Inclusive. A date-only value (\"2026-07-01\") anchors to that day's earliest instant in the configured display timezone.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "until",
                 param_type: "string",
                 required: false,
                 description: "Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now. A date-only value covers the whole named day: it anchors to the NEXT day's earliest instant in the configured display timezone.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "actor",
@@ -128,12 +132,14 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                     (e.g. \"actor:lambda:khive\"); pass either the bare seat form \
                     (\"lambda:khive\") or the stored prefixed form — both match. Omit for all \
                     actors.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "kind",
                 param_type: "string",
                 required: false,
                 description: "Filter to a single EventKind (e.g. \"recall_executed\", \"feedback_explicit\"). Omit for all kinds.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "exhaustive",
@@ -147,6 +153,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                     / audit-style queries over large windows. Windows above the 2,000,000-event \
                     exhaustive limit are rejected; narrow since/until or add filters. Default \
                     false.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -160,6 +167,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: false,
             description: "Filter profiles by lifecycle state: \"active\" | \"inactive\" | \"archived\". Omit to return all.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -172,6 +180,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: true,
             description: "Profile ID string (e.g. \"balanced-recall-v1\"). NOT a UUID — use the string identifier. Alias: id.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -185,18 +194,21 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Verb or operation type the caller is about to perform (e.g. \"recall\").",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "actor",
                 param_type: "string",
                 required: false,
                 description: "Caller actor identifier. Defaults to the caller's dispatch identity; anonymous callers match only wildcard bindings. Pass explicitly to query another identity.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
                 description: "Namespace for binding resolution. Defaults to \"*\" wildcard match.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -211,6 +223,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: true,
             description: "Profile ID to activate (e.g. \"balanced-recall-v1\").",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -223,6 +236,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: true,
             description: "Profile ID to deactivate.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -235,6 +249,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: true,
             description: "Profile ID to archive.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -247,6 +262,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: false,
             description: "Profile ID to reset (must exist and be active). Defaults to \"balanced-recall-v1\". Use brain.profiles() to list profiles.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -262,42 +278,49 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 description: "Complete UUID or globally unique 8+ hex prefix of the memory note \
                               or entity the feedback applies to. Prefix resolution is \
                               namespace-unfiltered under ADR-007.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             khive_types::ParamDef {
                 name: "signal",
                 param_type: "string",
                 required: true,
                 description: "Feedback signal: \"useful\" | \"not_useful\" | \"wrong\" | \"explicit_positive\" | \"explicit_negative\" | \"implicit_positive\" | \"implicit_negative\" | \"correction\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "served_by_profile_id",
                 param_type: "string",
                 required: false,
                 description: "Profile ID that served the result being rated. Recorded in the event payload.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_attribution",
                 param_type: "string",
                 required: false,
                 description: "Serve-time attribution state: \"profile\" | \"unattributed\" | \"unspecified\". Unattributed implicit feedback is forced to zero weight; explicit/correction feedback is rejected. It never falls back to a binding/default profile.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "section_signals",
                 param_type: "object",
                 required: false,
                 description: "Per-section feedback signals: {\"section_name\": \"useful\"|\"not_useful\"|\"wrong\"}. For knowledge_compose profiles.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "scorer_run_id",
                 param_type: "string",
                 required: false,
                 description: "ADR-081: scorer pass identifier, half of the (scorer_run_id, serve_ledger_id) dedup key. Must be supplied together with serve_ledger_id.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_ledger_id",
                 param_type: "string",
                 required: false,
                 description: "ADR-081: id of the brain_serve_ledger row being graded. Must be supplied together with scorer_run_id; backfills the row's grade and gates dedup.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -315,54 +338,63 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Recall query that produced the results.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "results",
                 param_type: "array",
                 required: true,
                 description: "Recall result objects retained as candidate context. No result is credited by rank position.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "target_id",
                 param_type: "string",
                 required: false,
                 description: "Exact full UUID or compact id value of the one result being judged. Required when signal is supplied and must occur exactly once in results.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "signal",
                 param_type: "string",
                 required: false,
                 description: "Feedback signal. Omission means abstain: no FeedbackExplicit event or posterior update.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "served_by_profile_id",
                 param_type: "string",
                 required: false,
                 description: "Profile ID that served the recall. Defaults like brain.feedback.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_attribution",
                 param_type: "string",
                 required: false,
                 description: "Serve-time attribution state. Top-level attribution fields form one pair; when neither is supplied, both are copied from the selected recall result.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "scorer_run_id",
                 param_type: "string",
                 required: false,
                 description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with serve_ledger_id.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_ledger_id",
                 param_type: "string",
                 required: false,
                 description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with scorer_run_id.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
                 description: "Exact feedback namespace override (ADR-007 Rev 6 escape hatch). The event and posterior fold are scoped to exactly this namespace; the default namespace state is unchanged. Invalid values are rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -379,30 +411,35 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Consumer kind that served these results, e.g. \"recall\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "served_by_profile_id",
                 param_type: "string",
                 required: false,
                 description: "Profile ID resolved at serve time. Omitted when unresolved.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "target_ids",
                 param_type: "array",
                 required: true,
                 description: "Note/entity ids that were served; one ledger row per id.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "query_raw",
                 param_type: "string",
                 required: true,
                 description: "Raw query text; query_class is derived from this deterministically.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "served_at",
                 param_type: "integer",
                 required: false,
                 description: "Serve timestamp in epoch microseconds. Defaults to now.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -425,6 +462,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             description: "Free-form label for this unit of work (e.g. \"wake\", \"turn\"), \
                 recorded in the event payload's `phase` field for debugging. Does not affect \
                 the work_class grouping, which stays fixed at \"actor_turn\".",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     // ── Declaration verbs ─────────────────────────────────────────────────
@@ -439,30 +477,35 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Profile ID to bind (must exist).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "actor",
                 param_type: "string",
                 required: false,
                 description: "Actor identifier to match. Default \"*\" (all actors). Cannot contain \"*\" inside a real value.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
                 description: "Namespace to match. Default \"*\" (all namespaces).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "consumer_kind",
                 param_type: "string",
                 required: false,
                 description: "Registered brain consumer kind to match. Default \"*\" (all kinds). Unknown kinds are rejected with the loaded valid set.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "priority",
                 param_type: "integer",
                 required: false,
                 description: "Binding priority; higher wins when multiple bindings match (default 0).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -477,24 +520,28 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Remove bindings for this profile ID. All filters use AND semantics. At least one filter is required.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "actor",
                 param_type: "string",
                 required: false,
                 description: "Remove bindings for this actor.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
                 description: "Remove bindings for this namespace.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "consumer_kind",
                 param_type: "string",
                 required: false,
                 description: "Remove bindings for this consumer_kind.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -509,24 +556,28 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Filter bindings by profile ID.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "actor",
                 param_type: "string",
                 required: false,
                 description: "Filter bindings by actor.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
                 description: "Filter bindings by namespace.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "consumer_kind",
                 param_type: "string",
                 required: false,
                 description: "Filter bindings by consumer_kind.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -541,24 +592,28 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Profile ID / name (alphanumeric, hyphens allowed, e.g. \"my-profile-v1\"). Must be unique.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "description",
                 param_type: "string",
                 required: false,
                 description: "Human-readable description for this profile.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "consumer_kind",
                 param_type: "string",
                 required: false,
                 description: "Operation kind this profile targets (e.g. \"recall\"). Default \"recall\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "seed_priors",
                 param_type: "object",
                 required: false,
                 description: "Seed priors object. For knowledge_compose: {\"section_posteriors\": {\"overview\": {\"alpha\": 2.0, \"beta\": 2.0}, ...}}. For recall: {\"relevance\": {\"alpha\": 7.0, \"beta\": 3.0}, ...}.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -574,24 +629,28 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Stable identifier for the adapter (used as the entity name).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "content_hash",
                 param_type: "string",
                 required: true,
                 description: "Content hash of the adapter weights for integrity verification.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "base_model_revision",
                 param_type: "string",
                 required: true,
                 description: "Base model revision the adapter was trained against. Must match the active revision or registration is rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "metadata",
                 param_type: "object",
                 required: false,
                 description: "Optional additional metadata merged into entity properties.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -609,18 +668,21 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 description: "Complete UUID or globally unique 8+ hex prefix of the record the \
                               feedback applies to. Prefix resolution is namespace-unfiltered \
                               under ADR-007.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             khive_types::ParamDef {
                 name: "signal",
                 param_type: "string",
                 required: true,
                 description: "Feedback signal: \"useful\" | \"not_useful\" | \"wrong\". Deprecated: use brain.feedback instead.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "served_by_profile_id",
                 param_type: "string",
                 required: false,
                 description: "Profile ID that served the result.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -1867,12 +1929,14 @@ impl BrainPack {
                 .as_ref()
                 .map(|(scorer, ledger)| (scorer.as_str(), ledger.as_str()));
             let namespace = token.namespace().as_str().to_string();
+            let attribution = EventAttribution::from_token(token);
             // Forced-zero unattributed events do not touch the mass table, so
             // this sentinel is an atomic-unit routing key only and can never be
             // mistaken for a registered serving profile.
             let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
                 sql.as_ref(),
                 &namespace,
+                attribution,
                 "__unattributed__",
                 &target_id,
                 gate_mode,
@@ -2433,7 +2497,12 @@ impl BrainPack {
                 });
 
                 let removed = before - state.bindings.len();
-                Ok(json!({ "unbound": removed }))
+                // `removed` is the canonical mutation count. Keep `unbound`
+                // as a compatibility alias for existing callers and smoke
+                // tests. In particular, both fields remain present at zero so
+                // a successful no-op cannot be mistaken for a confirmed
+                // removal.
+                Ok(json!({ "removed": removed, "unbound": removed }))
             },
         )
         .await
