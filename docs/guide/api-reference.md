@@ -823,7 +823,13 @@ finite-wait main-pool mutex checkouts, the second counts successful per-operatio
 standalone writer opens, and the third counts dequeued writer-task requests that acquired its
 dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
 `writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
-executes; SQLite `BEGIN`/statement failures are separate stages. `audit_append_failures` counts
+executes; SQLite `BEGIN`/statement failures are separate stages.
+`writer_task_begin_busy` counts every busy/locked `BEGIN IMMEDIATE` refusal, matching its
+pre-retry meaning: a nonzero value reflects total contention regardless of retry policy.
+`writer_task_begin_busy_absorbed` is a subset of it — refusals a bounded pre-execution retry
+absorbed before the request closure ran, so the caller never observed them. A refusal not
+absorbed by a retry also surfaces to the caller as the typed, retryable `writer_task_begin_busy`
+stage. The request closure is never retried. `audit_append_failures` counts
 process-wide best-effort audit appends whose storage error was logged and swallowed —
 pure-observability rows only. An obligation-bearing row's commit failure (a dispatch outcome, an
 unknown-verb row, a `git.digest` receipt, or a gate denial's own audit row) is never counted here:
