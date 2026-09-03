@@ -3377,6 +3377,7 @@ mod tests {
     /// invocation (`crates/kkernel/src/exec.rs`'s spy seam proves the exec
     /// side hands the path over; this side proves it reaches `argv`).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_config_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3406,6 +3407,7 @@ mod tests {
     /// (or `--pack`-flag, or config-file `[runtime].packs`) selection when it
     /// spawns a fresh daemon (khive-oss#1941).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_pack_flags_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3434,6 +3436,7 @@ mod tests {
     /// at all — the spawned daemon falls through to its own env/config
     /// resolution exactly as before this fix.
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_omits_pack_flags_when_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3461,6 +3464,7 @@ mod tests {
     /// would bind the config's declared persistent backend files, the exact
     /// inversion of the operator's ephemeral invocation.
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_memory_db_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3500,6 +3504,7 @@ mod tests {
     /// the frame's fingerprint has already been normalized to the
     /// no-override anchor (`normalize_redundant_db_override_with_source`).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_forwards_concrete_db_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3527,6 +3532,7 @@ mod tests {
     /// seam retries only ExecutableFileBusy, so holding this file open for
     /// writing forces the exact failure class reported by coverage CI.
     #[test]
+    #[serial]
     fn spawn_daemon_retries_a_transient_executable_file_busy_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let exe = daemon_script_fixture(&dir, "temporarily-busy.sh", "#!/bin/sh\nexit 0\n");
@@ -3544,6 +3550,220 @@ mod tests {
         release.join().expect("fixture writer release thread");
         let status = child.wait().expect("wait for executable fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
+    }
+
+    /// Blank out `"..."` string-literal contents (escapes and
+    /// backslash-newline continuations included) so a spawn-seam name
+    /// mentioned in an error message or doc comment can never read as a
+    /// call.
+    fn strip_string_literals_for_census(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut in_string = false;
+        for line in text.lines() {
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                if in_string {
+                    if c == '\\' {
+                        out.push(' ');
+                        if chars.next().is_some() {
+                            out.push(' ');
+                        }
+                        continue;
+                    }
+                    if c == '"' {
+                        in_string = false;
+                        out.push('"');
+                    } else {
+                        out.push(' ');
+                    }
+                } else {
+                    if c == '"' {
+                        in_string = true;
+                    }
+                    out.push(c);
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// `true` if `text` contains a call to `name` — `name` immediately
+    /// followed by `(` (optional whitespace between, including newlines —
+    /// `rustfmt` is free to break a long call onto its own line), a
+    /// non-identifier character (or start of text) before it, and not
+    /// inside a string literal. Anchoring both boundaries matters here
+    /// specifically because `spawn_daemon_with_exe(` is a prefix-shaped
+    /// substring of `spawn_daemon_with_exe_and_config(` up to the
+    /// `_and_config` suffix — a plain `contains` check would still tell
+    /// them apart by luck (the character after `exe` differs), but a
+    /// boundary check makes that non-collision load-bearing instead of
+    /// incidental.
+    fn calls_name_for_census(text: &str, name: &str) -> bool {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let text = strip_string_literals_for_census(text);
+        let bytes = text.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(name) {
+            let idx = search_from + rel;
+            let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+            let after = idx + name.len();
+            let mut j = after;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let after_ok = j < bytes.len() && bytes[j] == b'(';
+            let is_definition = text[..idx].ends_with("fn ");
+            if before_ok && after_ok && !is_definition {
+                return true;
+            }
+            search_from = idx + 1;
+        }
+        false
+    }
+
+    /// Regression for a scanner that only tolerated a space/tab between a
+    /// seam name and its `(` — see the identical fix and rationale for
+    /// `khive-runtime`'s `calls_name`.
+    #[test]
+    fn calls_name_for_census_matches_across_a_newline_before_the_parenthesis() {
+        let text = "fn wraps_it() {\n    spawn_daemon_with_exe\n        (exe)\n}";
+        assert!(calls_name_for_census(text, "spawn_daemon_with_exe"));
+    }
+
+    /// The name of the function whose signature starts at `sig_line`
+    /// (already stripped of leading whitespace), if any.
+    fn fn_name_from_signature_for_census(sig_line: &str) -> Option<&str> {
+        let mut rest = sig_line;
+        for prefix in ["pub(crate) ", "pub(super) ", "pub "] {
+            if let Some(stripped) = rest.strip_prefix(prefix) {
+                rest = stripped;
+            }
+        }
+        let rest = rest
+            .strip_prefix("async fn ")
+            .or_else(|| rest.strip_prefix("fn "))?;
+        Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest))
+    }
+
+    /// Recursively collect every `.rs` file under `dir` into `out`.
+    fn collect_rust_files_for_census(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_files_for_census(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// `spawn_daemon_with_exe_and_config` and its thin wrapper
+    /// `spawn_daemon_with_exe` are both module-private — visible only
+    /// inside `daemon.rs` and its descendant modules — so unlike the
+    /// config-ledger seam (`with_event_store`, `pub` and reachable from any
+    /// crate in the workspace), the real population for this census is
+    /// bounded to this file plus the `daemon/` submodule directory, not the
+    /// whole workspace. This walks that directory explicitly instead of
+    /// hard-coding "just this file" so a future submodule under `daemon/`
+    /// is covered without anyone remembering to widen the scan.
+    fn daemon_module_sources() -> Vec<(std::path::PathBuf, String)> {
+        let this_file = std::path::PathBuf::from(file!());
+        let daemon_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon.rs");
+        let daemon_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon");
+        let mut files = vec![daemon_rs];
+        if daemon_dir.is_dir() {
+            collect_rust_files_for_census(&daemon_dir, &mut files);
+        }
+        let _ = this_file; // `file!()` is relative; CARGO_MANIFEST_DIR-joined paths are the source of truth.
+        files
+            .into_iter()
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((path, text))
+            })
+            .collect()
+    }
+
+    /// Every direct test caller of the spawn seam — `daemon.rs` and its
+    /// `daemon/` submodules, the only places `spawn_daemon_with_exe[_and_
+    /// config]` are visible from — mutates the process-wide `SPAWN_COUNT`,
+    /// so it must share the default serial group with tests that reset and
+    /// assert that counter.
+    #[test]
+    fn direct_spawn_seam_test_callers_are_serialized() {
+        let sources = daemon_module_sources();
+        assert!(
+            !sources.is_empty(),
+            "the daemon-module source scan found no .rs files under \
+             crates/khive-mcp/src/daemon.rs or src/daemon/; the census's own file walk \
+             is broken, not the population it walks"
+        );
+
+        let spawn_calls = ["spawn_daemon_with_exe_and_config", "spawn_daemon_with_exe"];
+        let mut candidate_count = 0usize;
+        let mut offenders = Vec::new();
+
+        for (path, text) in &sources {
+            let lines: Vec<&str> = text.lines().collect();
+            let test_starts: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let trimmed = line.trim();
+                    trimmed == "#[test]" || trimmed.starts_with("#[tokio::test")
+                })
+                .map(|(index, _)| index)
+                .collect();
+
+            for (index, start) in test_starts.iter().copied().enumerate() {
+                let end = test_starts.get(index + 1).copied().unwrap_or(lines.len());
+                let span = &lines[start..end];
+                let span_text = span.join("\n");
+                let matched = spawn_calls
+                    .iter()
+                    .find(|seam| calls_name_for_census(&span_text, seam));
+                let Some(matched) = matched else {
+                    continue;
+                };
+                candidate_count += 1;
+
+                if !span.iter().any(|line| line.trim() == "#[serial]") {
+                    let signature_offset = span
+                        .iter()
+                        .position(|line| {
+                            fn_name_from_signature_for_census(line.trim_start()).is_some()
+                        })
+                        .expect("test span has a function signature");
+                    let name =
+                        fn_name_from_signature_for_census(span[signature_offset].trim_start())
+                            .unwrap_or("<unknown>");
+                    offenders.push(format!(
+                        "{}:{name} (reaches the spawn seam via `{matched}`)",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            candidate_count > 0,
+            "census found zero direct spawn-seam test candidates under the daemon \
+             module ({} source files) — the scan is broken, not the population it \
+             should have found (this file's own argv-forwarding tests are known \
+             direct callers)",
+            sources.len()
+        );
+        assert!(
+            offenders.is_empty(),
+            "tests that directly call the SPAWN_COUNT-mutating spawn seam must use \
+             #[serial]; offenders: {offenders:?}"
+        );
     }
 
     /// The helper behind the retry above must actually retry the exact
@@ -3940,6 +4160,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn daemon_round_trip_dispatches_and_enforces_config_id() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4544,6 +4765,7 @@ mod tests {
     // override machinery introduced for daemon-forwarded requests.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn local_dispatch_without_identity_context_uses_baked_actor() {
         clear_daemon_env();
 
@@ -4840,6 +5062,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn try_forward_inner_returns_parse_failure_when_daemon_closes_without_response() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5482,6 +5705,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn recovery_path_dispatches_real_request_exactly_once() {
         clear_daemon_env();
         reset_counters();
@@ -6543,6 +6767,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn ambiguous_write_never_retries_against_freshly_spawned_daemon() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
