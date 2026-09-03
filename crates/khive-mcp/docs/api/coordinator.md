@@ -42,7 +42,7 @@ operation is successful but its operation envelope also carries:
   "missing_backends": ["archive"],
   "backend_errors": {
     "archive": {
-      "kind": "backend_error",
+      "kind": "timeout",
       "message": "backend search timed out after 5000ms"
     }
   }
@@ -69,6 +69,32 @@ through `backend_errors_truncated` and `backend_errors_omitted`. Backend ids and
 messages are credential-masked before exposure; changed backend ids carry a
 stable hash suffix and `backend_id_masked: true`, ids are capped at 256 Unicode
 scalar values, and messages are capped at 1,024 Unicode scalar values.
+Each retained cause is typed as `timeout` for coordinator and typed runtime
+deadline failures, or `backend_error` otherwise. A degraded-empty
+`search_incomplete` error reports `retryable: true` only when every failed leg
+is a timeout; any mixed or non-timeout failure keeps it false. This policy is
+computed before diagnostic truncation, so an omitted cause cannot change the
+classification. Every `retryable: true` error also carries `retry_after_ms`.
+The server computes that pace from the full pre-truncation failure set as
+2,000ms plus 250ms for each failed backend after the first, capped at 10,000ms.
+
+A conforming client that acts on `retryable: true` uses this published policy:
+
+- At most three total attempts per logical request (the first attempt plus no
+  more than two reissues).
+- Before reissue number _n_ (starting at 1), wait a base of
+  `max(retry_after_ms, 2000) * 2^(n - 1)` milliseconds plus nonnegative random
+  jitter of at most half that base. Jitter must never shorten the server-named
+  delay.
+- Key a circuit breaker by the failed backend set. Open it after three
+  consecutive all-timeout `search_incomplete` outcomes for that same set,
+  suppressing first attempts as well as retries for 30 seconds. Then admit one
+  half-open probe: a successful search closes the breaker; another all-timeout
+  outcome reopens it for 30 seconds.
+
+The server publishes and names this pace but cannot enforce client-side
+admission. Clients that do not implement the complete budget, backoff, and
+breaker policy must not act on `retryable: true` automatically.
 
 ## `t6d` — malformed `tags` must reject, not silently drop the filter
 

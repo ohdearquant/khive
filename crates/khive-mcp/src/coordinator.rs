@@ -62,13 +62,54 @@ impl From<CoordError> for khive_runtime::RuntimeError {
     }
 }
 
+/// Stable classification for a failed fan-out backend leg.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendSearchFailureKind {
+    /// The backend operation failed for a non-timeout reason.
+    BackendError,
+    /// The backend exceeded the coordinator's per-request deadline.
+    Timeout,
+}
+
+impl BackendSearchFailureKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendError => "backend_error",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Typed failure for one fan-out backend leg.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendSearchFailure {
+    pub kind: BackendSearchFailureKind,
+    pub message: String,
+}
+
+impl BackendSearchFailure {
+    pub fn backend(message: impl Into<String>) -> Self {
+        Self {
+            kind: BackendSearchFailureKind::BackendError,
+            message: message.into(),
+        }
+    }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            kind: BackendSearchFailureKind::Timeout,
+            message: message.into(),
+        }
+    }
+}
+
 /// Per-backend contribution to a fan-out search.
 pub struct BackendSearchResult {
     pub backend_id: BackendId,
     pub entity_hits: Vec<SearchHit>,
     pub note_hits: Vec<NoteSearchHit>,
     /// Populated when this backend errored during the fan-out.
-    pub error: Option<String>,
+    pub error: Option<BackendSearchFailure>,
 }
 
 /// Merged fan-out search result.
@@ -331,7 +372,7 @@ pub(crate) mod tests {
                         backend_id,
                         entity_hits: vec![],
                         note_hits: vec![],
-                        error: Some("injected search failure".to_string()),
+                        error: Some(BackendSearchFailure::backend("injected search failure")),
                     })
                     .collect(),
                 partial: self.failed_backend.is_some(),
