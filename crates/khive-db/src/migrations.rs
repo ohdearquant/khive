@@ -150,6 +150,8 @@ const V23_UP: &str = include_str!("../sql/023-fts-record-kind.sql");
 
 const V24_UP: &str = include_str!("../sql/024-fts-rowid-map.sql");
 
+const V25_UP: &str = include_str!("../sql/025-notes-unread-probe-recipient-direction.sql");
+
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
 const V21_ATTACHMENT_FENCES_UP: &str = include_str!("../sql/021-attachments-b-claim-fences.sql");
@@ -324,6 +326,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 24,
         name: "fts_rowid_map",
         up: V24_UP,
+    },
+    VersionedMigration {
+        version: 25,
+        name: "notes_unread_probe_recipient_direction",
+        up: V25_UP,
     },
 ];
 

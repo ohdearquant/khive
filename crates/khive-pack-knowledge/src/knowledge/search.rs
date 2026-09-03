@@ -3546,6 +3546,7 @@ mod tests {
             is_domain: false,
             status: None,
             score: 1.0,
+            provenance: ScoreProvenance::ann(),
         })
         .collect();
 
