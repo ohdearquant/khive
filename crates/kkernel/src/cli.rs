@@ -1474,10 +1474,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_migrate_preflights_soft_deleted_secondary_before_advancing_main() {
-        use khive_db::migrations::{
-            attachment_cutover_status, read_schema_version, AttachmentCutoverStatus,
-            ATTACHMENT_CUTOVER_VERSION,
-        };
+        use khive_db::migrations::{AttachmentCutoverStatus, ATTACHMENT_CUTOVER_VERSION};
 
         let tmp = TempDir::new().expect("temp dir");
         let main = tmp.path().join("main.db");
@@ -1502,17 +1499,15 @@ mod tests {
 
         let main_backend =
             khive_db::StorageBackend::sqlite(&main).expect("inspect blocked main backend");
-        let main_conn = main_backend.pool().reader().expect("inspect blocked main");
         assert_eq!(
-            read_schema_version(main_conn.conn()).unwrap(),
+            main_backend.schema_version().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1,
             "main must remain V20 when secondary inventory fails"
         );
         assert_eq!(
-            attachment_cutover_status(main_conn.conn()).unwrap(),
+            main_backend.attachment_cutover_status().unwrap(),
             AttachmentCutoverStatus::Pending
         );
-        drop(main_conn);
         drop(main_backend);
 
         let secondary_backend =
@@ -1539,13 +1534,12 @@ mod tests {
         for path in [&secondary, &main] {
             let backend =
                 khive_db::StorageBackend::sqlite(path).expect("inspect completed topology backend");
-            let conn = backend.pool().reader().expect("inspect completed topology");
             assert_eq!(
-                read_schema_version(conn.conn()).unwrap(),
+                backend.schema_version().unwrap(),
                 khive_db::migrations::latest_schema_version()
             );
             assert_eq!(
-                attachment_cutover_status(conn.conn()).unwrap(),
+                backend.attachment_cutover_status().unwrap(),
                 AttachmentCutoverStatus::Complete
             );
         }
@@ -1553,7 +1547,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_migrate_named_secondary_does_not_advance_main() {
-        use khive_db::migrations::{read_schema_version, ATTACHMENT_CUTOVER_VERSION};
+        use khive_db::migrations::ATTACHMENT_CUTOVER_VERSION;
 
         let tmp = TempDir::new().expect("temp dir");
         let main = tmp.path().join("main.db");
@@ -1576,14 +1570,12 @@ mod tests {
 
         let main_backend = khive_db::StorageBackend::sqlite(&main).unwrap();
         let secondary_backend = khive_db::StorageBackend::sqlite(&secondary).unwrap();
-        let main_conn = main_backend.pool().reader().unwrap();
-        let secondary_conn = secondary_backend.pool().reader().unwrap();
         assert_eq!(
-            read_schema_version(main_conn.conn()).unwrap(),
+            main_backend.schema_version().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1
         );
         assert_eq!(
-            read_schema_version(secondary_conn.conn()).unwrap(),
+            secondary_backend.schema_version().unwrap(),
             khive_db::migrations::latest_schema_version()
         );
     }
@@ -1614,8 +1606,6 @@ mod tests {
 
     #[tokio::test]
     async fn db_migrate_one_declared_main_uses_its_configured_path() {
-        use khive_db::migrations::read_schema_version;
-
         let tmp = TempDir::new().expect("temp dir");
         let main = tmp.path().join("declared-main.db");
         create_v20_fixture(&main, None);
@@ -1632,9 +1622,8 @@ mod tests {
         .await
         .expect("one declared main must use topology path");
         let backend = khive_db::StorageBackend::sqlite(&main).unwrap();
-        let conn = backend.pool().reader().unwrap();
         assert_eq!(
-            read_schema_version(conn.conn()).unwrap(),
+            backend.schema_version().unwrap(),
             khive_db::migrations::latest_schema_version()
         );
     }

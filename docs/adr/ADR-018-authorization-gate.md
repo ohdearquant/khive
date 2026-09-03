@@ -10,13 +10,16 @@ fail-closed verb class; proposed [ADR-068](ADR-068-process-isolation-topology.md
 would replace the deployment-topology clause.\
 **Authors**: khive maintainers
 
-> **Implementation status (2026-08-08):** The `Gate` trait, hard `Deny`
-> enforcement, and explicit programmatic `AllowAllGate` are implemented. The
-> accepted ADR-129 default flip and ADR-143 store-held caller-grant model are
-> not yet implemented; the current runtime default remains `AllowAllGate`.
-> Operator configuration therefore rejects every `[gate]` table instead of
-> accepting an enrollment policy that this build would not enforce. This note
-> records implementation state only and does not amend the accepted decisions.
+> **Implementation status (2026-08-30):** The `Gate` trait, hard `Deny`
+> enforcement, explicit programmatic `AllowAllGate`, and the optional static
+> `[gate]` caller-enrollment policy are implemented. The table's
+> `granted_actors` exact allowlist and independent `grant_unattributed` flag
+> are enforced at the authorization seam; unknown table keys fail startup.
+> The accepted ADR-129 default flip and ADR-143 store-held caller-grant model
+> are not yet implemented, and the current runtime default remains
+> `AllowAllGate` when `[gate]` is absent. The configuration policy is live on
+> every boot rather than ADR-143's one-time import. This note records
+> implementation state only and does not amend the accepted decisions.
 
 ## Context
 
