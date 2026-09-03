@@ -300,7 +300,16 @@ pub(crate) fn parse_structure_record(bytes: &[u8]) -> Result<FtsIndexStructure, 
             let _segment_id = read_varint(bytes, &mut cursor)?;
             let first_leaf = read_varint(bytes, &mut cursor)?;
             let last_leaf = read_varint(bytes, &mut cursor)?;
-            if first_leaf == 0 || last_leaf < first_leaf {
+            // first_leaf == 0 alone is not corrupt: fts5TrimSegments sets both
+            // first_leaf and last_leaf to 0 on a merge input segment once all
+            // of its data has been consumed by an in-progress incremental
+            // merge (see fts5SegIterInit's pgnoFirst==0 handling in the
+            // vendored SQLite source), and the segment stays in the structure
+            // record — counted in this level's segment_count and merge input
+            // count — until the merge step that finishes it removes it.
+            // SQLite's own decoder (fts5StructureDecode) rejects only
+            // pgnoLast < pgnoFirst; mirror that exactly.
+            if last_leaf < first_leaf {
                 return Err(format!(
                     "FTS5 level {level} has invalid leaf range {first_leaf}..={last_leaf}"
                 ));
@@ -700,6 +709,60 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_trimmed_merge_input_segment() {
+        // One level, two segments, both inputs to an active two-segment
+        // merge. The first has been fully "trimmed" by fts5TrimSegments
+        // (first_leaf == last_leaf == 0, exactly as SQLite writes it once an
+        // input segment's data has all been transferred to the merge output
+        // but the merge step has not yet finished); the second still has
+        // live leaf pages. Expected: this decodes and reports an active
+        // merge, matching SQLite's own fts5StructureDecode, which rejects
+        // only pgnoLast < pgnoFirst and never checks pgnoFirst == 0.
+        let mut bytes = vec![0, 0, 0, 0];
+        push_varint(1, &mut bytes); // level_count
+        push_varint(2, &mut bytes); // segment_count
+        push_varint(5, &mut bytes); // write_counter
+        push_varint(2, &mut bytes); // level 0 merge_input_segments
+        push_varint(2, &mut bytes); // level 0 level_segments
+        push_varint(1, &mut bytes); // segment 1 id
+        push_varint(0, &mut bytes); // segment 1 first_leaf (trimmed)
+        push_varint(0, &mut bytes); // segment 1 last_leaf (trimmed)
+        push_varint(2, &mut bytes); // segment 2 id
+        push_varint(5, &mut bytes); // segment 2 first_leaf
+        push_varint(9, &mut bytes); // segment 2 last_leaf
+
+        let parsed =
+            parse_structure_record(&bytes).expect("a trimmed input segment must not be corrupt");
+
+        assert_eq!(parsed.levels[0].segment_count, 2);
+        assert_eq!(parsed.levels[0].merge_input_segments, 2);
+        assert!(has_active_merge(&parsed));
+    }
+
+    #[test]
+    fn rejects_last_leaf_before_first_leaf() {
+        // Control for the trimmed-segment acceptance above: a segment whose
+        // last_leaf is less than a nonzero first_leaf is still corrupt, the
+        // one case SQLite's own decoder rejects.
+        let mut bytes = vec![0, 0, 0, 0];
+        push_varint(1, &mut bytes); // level_count
+        push_varint(1, &mut bytes); // segment_count
+        push_varint(2, &mut bytes); // write_counter
+        push_varint(0, &mut bytes); // level 0 merge_input_segments
+        push_varint(1, &mut bytes); // level 0 level_segments
+        push_varint(1, &mut bytes); // segment id
+        push_varint(5, &mut bytes); // first_leaf
+        push_varint(3, &mut bytes); // last_leaf < first_leaf
+
+        let error = parse_structure_record(&bytes)
+            .expect_err("last_leaf below first_leaf must still be rejected");
+        assert!(
+            error.contains("invalid leaf range"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn segment_diagnostics_use_one_structure_row_and_never_scan_the_idx_table() {
         let conn = Connection::open_in_memory().expect("in-memory sqlite");
         create_fts_tables(&conn);
@@ -771,6 +834,14 @@ mod tests {
 
         let after = inspect_fts_segments(&conn).expect("inspect optimized fixture");
         assert_eq!(after.notes.segment_count, 1);
+        assert!(
+            !has_active_merge(&after.notes),
+            "convergence must leave no active merge behind"
+        );
+        assert!(
+            !state.table_in_progress("fts_notes"),
+            "convergence must clear the in-progress bookkeeping"
+        );
         let actual_rows: Vec<String> = conn
             .prepare("SELECT subject_id FROM fts_notes WHERE fts_notes MATCH 'production recall' ORDER BY subject_id")
             .unwrap()
