@@ -1015,9 +1015,12 @@ fn v22_upgrades_pre_index_database_for_read_only_open() {
         stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
         finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
         assert_eq!(read_schema_version(&conn).expect("read V21 ledger"), 21);
-        conn.execute("DROP INDEX idx_notes_unread_probe_recipient", [])
+        conn.execute("DROP INDEX idx_notes_unread_probe_recipient_direction", [])
             .expect("simulate pre-index V21 database");
-        assert!(!index_exists(&conn, "idx_notes_unread_probe_recipient"));
+        assert!(!index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
     }
 
     {
@@ -1026,12 +1029,70 @@ fn v22_upgrades_pre_index_database_for_read_only_open() {
             run_migrations(&mut conn).expect("apply V22 unread probe migration"),
             latest_schema_version()
         );
-        assert!(index_exists(&conn, "idx_notes_unread_probe_recipient"));
+        assert!(index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
     }
 
     let read_only = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .expect("open migrated database read-only");
-    assert!(index_exists(&read_only, "idx_notes_unread_probe_recipient"));
+    assert!(index_exists(
+        &read_only,
+        "idx_notes_unread_probe_recipient_direction"
+    ));
+    validate_schema_is_current(&read_only).expect("migrated read-only schema validates");
+}
+
+#[test]
+fn v25_upgrades_direction_blind_recipient_index_for_read_only_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pre-direction-index.db");
+
+    {
+        let mut conn = Connection::open(&path).expect("create pre-direction database");
+        migrate_through(&mut conn, 20);
+        stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+        finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+        assert_eq!(read_schema_version(&conn).expect("read V21 ledger"), 21);
+        conn.execute("DROP INDEX idx_notes_unread_probe_recipient_direction", [])
+            .expect("drop the direction-aware index installed by the V1 baseline");
+        conn.execute_batch(
+            "CREATE INDEX idx_notes_unread_probe_recipient
+                 ON notes(namespace, kind,
+                          ifnull(json_extract(properties, '$.to_actor'), ''),
+                          created_at DESC, id ASC)
+                 WHERE (json_type(properties, '$.read') IS NULL
+                        OR json_type(properties, '$.read') != 'true')
+                   AND deleted_at IS NULL;",
+        )
+        .expect("simulate a pre-V25 recipient index without the direction key");
+        assert!(index_exists(&conn, "idx_notes_unread_probe_recipient"));
+        assert!(!index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
+    }
+
+    {
+        let mut conn = Connection::open(&path).expect("reopen writable database");
+        assert_eq!(
+            run_migrations(&mut conn).expect("apply V25 direction-aware unread probe migration"),
+            latest_schema_version()
+        );
+        assert!(index_exists(
+            &conn,
+            "idx_notes_unread_probe_recipient_direction"
+        ));
+        assert!(!index_exists(&conn, "idx_notes_unread_probe_recipient"));
+    }
+
+    let read_only = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open migrated database read-only");
+    assert!(index_exists(
+        &read_only,
+        "idx_notes_unread_probe_recipient_direction"
+    ));
     validate_schema_is_current(&read_only).expect("migrated read-only schema validates");
 }
 
@@ -1922,10 +1983,10 @@ fn seed_malformed_legacy_fts_state(conn: &Connection, fts_table: &str, map_table
     .expect("seed the stale wrong-key map row stealing B's rowid");
 }
 
-// ── V25: knowledge FTS repair tests ──────────────────────────────────────────
+// ── V26: knowledge FTS repair tests ──────────────────────────────────────────
 
 #[test]
-fn v25_repairs_knowledge_fts_and_makes_atom_lifecycle_symmetric() {
+fn v26_repairs_knowledge_fts_and_makes_atom_lifecycle_symmetric() {
     let mut conn = open_memory();
     migrate_through(&mut conn, 20);
     stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
@@ -1969,7 +2030,7 @@ fn v25_repairs_knowledge_fts_and_makes_atom_lifecycle_symmetric() {
                      1, 1); \
          UPDATE knowledge_atoms SET deleted_at = 9 WHERE id = 'soft-hard';",
     )
-    .expect("seed pre-V25 knowledge rows");
+    .expect("seed pre-V26 knowledge rows");
 
     // Emulate a historical base-table write that bypassed the section trigger.
     // V2 restored the narrow trigger but never rebuilt rows already divergent.
@@ -2006,19 +2067,19 @@ fn v25_repairs_knowledge_fts_and_makes_atom_lifecycle_symmetric() {
     );
 
     assert_eq!(
-        run_migrations(&mut conn).expect("apply V25 knowledge FTS repair"),
+        run_migrations(&mut conn).expect("apply V26 knowledge FTS repair"),
         latest_schema_version()
     );
     conn.execute(
         "INSERT INTO fts_knowledge(fts_knowledge, rank) VALUES('integrity-check', 1)",
         [],
     )
-    .expect("atom FTS must match the live-row content view after V25");
+    .expect("atom FTS must match the live-row content view after V26");
     conn.execute(
         "INSERT INTO fts_sections(fts_sections, rank) VALUES('integrity-check', 1)",
         [],
     )
-    .expect("section FTS must be rebuilt after V25");
+    .expect("section FTS must be rebuilt after V26");
 
     let content_ddl: String = conn
         .query_row(

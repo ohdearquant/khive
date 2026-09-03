@@ -119,6 +119,7 @@ path   = "~/.khive/agent.db"   # tilde is expanded to $HOME at boot
 name   = "records"
 kind   = "sqlite"
 path   = "~/.khive/records.db"
+served_kinds = ["entity", "note"] # optional closed dispatch declaration
 
 # ── Per-pack routing ───────────────────────────────────────────────────────────
 # Packs not listed here fall back to "main".
@@ -141,12 +142,20 @@ backend = "records"
 
 Fields on `[[backends]]`:
 
-| Field       | Type    | Required | Description                                            |
-| ----------- | ------- | -------- | ------------------------------------------------------ |
-| `name`      | string  | yes      | Unique name; referenced by `[packs.*].backend`.        |
-| `kind`      | string  | no       | `"sqlite"` (default) or `"memory"` (testing only).     |
-| `path`      | path    | sqlite   | Filesystem path; tilde expanded. Created if absent.    |
-| `read_only` | boolean | no       | Open read-only. Writes return an error. Default false. |
+| Field          | Type         | Required | Description                                              |
+| -------------- | ------------ | -------- | -------------------------------------------------------- |
+| `name`         | string       | yes      | Unique name; referenced by `[packs.*].backend`.          |
+| `kind`         | string       | no       | `"sqlite"` (default) or `"memory"` (testing only).       |
+| `path`         | path         | sqlite   | Filesystem path; tilde expanded. Created if absent.      |
+| `served_kinds` | string array | no       | Nonempty subset of `entity`, `note`, `event`; see below. |
+| `read_only`    | boolean      | no       | Open read-only. Writes return an error. Default false.   |
+
+`served_kinds` is registration metadata for coordinator fan-out. When omitted,
+the backend is conservatively eligible for every substrate, preserving legacy
+configuration behavior. When present, it must be a nonempty subset of the
+closed substrate vocabulary (`entity`, `note`, `event`); an empty array or an
+unknown value rejects startup. The declaration limits coordinator dispatch but
+does not trim the backend schema or infer capabilities from stored rows.
 
 `cache_mb` and `journal_mode` fields are parsed but immediately rejected at
 startup:
@@ -472,7 +481,12 @@ does not claim those durability guarantees.
 Cross-backend `link` operations work: the coordinator stores the edge on the
 source's backend with a `target_backend` column naming the target's backend.
 Federated `search(kind=entity)` and `search(kind=note)` fan out across all
-backends hosting that substrate kind and fuse results with unweighted RRF.
+backends whose `served_kinds` declaration includes that substrate and fuse
+results with unweighted RRF. Backends without a declaration remain included
+conservatively. Filtering occurs before a backend search task is created; an
+explicit declaration that excludes the requested substrate therefore receives
+zero dispatches. Changing this metadata also changes the warm-daemon
+`config_id`, so the new topology cannot reuse a daemon serving the old policy.
 
 ### Deferred operations
 

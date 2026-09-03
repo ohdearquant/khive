@@ -127,35 +127,36 @@ The live sequence starts from the consolidated V1 baseline. This table is the
 canonical allocation ledger for databases created at or after v0.2.8; the table
 above remains the historical pre-consolidation record.
 
-| Version | Owning ADR / issue | Migration name                     | Status  |
-| ------: | ------------------ | ---------------------------------- | ------- |
-|      V1 | ADR-015            | initial_schema                     | shipped |
-|      V2 | ADR-051            | narrow_fts_sections_update_trigger | shipped |
-|      V3 | ADR-051            | backfill_domain_mirror_atoms       | shipped |
-|      V4 | ADR-062            | fts_consolidation                  | shipped |
-|      V5 | ADR-056            | unique_comm_message_external_id    | shipped |
-|      V6 | ADR-081            | brain_retune_driver                | shipped |
-|      V7 | #827               | notes_seq                          | shipped |
-|      V8 | #827               | notes_seq_repair                   | shipped |
-|      V9 | ADR-104            | entities_name_ci_index             | shipped |
-|     V10 | ADR-111            | entities_content_ref               | shipped |
-|     V11 | ADR-079            | ann_write_log                      | shipped |
-|     V12 | ADR-118            | ann_write_log_model_seq_index      | shipped |
-|     V13 | #1424 / #1462      | list_cursor_sequences              | shipped |
-|     V14 | #1424 / #1462      | graph_edges_id_unique              | shipped |
-|     V15 | #1597              | serve_ledger_attribution           | shipped |
-|     V16 | ADR-019 / #1474    | gtd_dependency_cycle_guards        | shipped |
-|     V17 | ADR-142 / #1700    | agents_ddl                         | shipped |
-|     V18 | #1479              | ann_consumer_pending               | shipped |
-|     V19 | #1649              | list_cursor_backfill_repair        | shipped |
-|     V20 | ADR-091 / #1850    | blob_gc_claims                     | shipped |
-|     V21 | ADR-121 / ADR-160  | attachments_first_class            | shipped |
-|     V22 | #2166              | notes_unread_probe_recipient       | shipped |
-|     V23 | ADR-062 / #1907    | fts_record_kind                    | shipped |
-|     V24 | #2369              | fts_rowid_map                      | shipped |
-|     V25 | #2273              | knowledge_fts_repair               | shipped |
+| Version | Owning ADR / issue | Migration name                         | Status  |
+| ------: | ------------------ | -------------------------------------- | ------- |
+|      V1 | ADR-015            | initial_schema                         | shipped |
+|      V2 | ADR-051            | narrow_fts_sections_update_trigger     | shipped |
+|      V3 | ADR-051            | backfill_domain_mirror_atoms           | shipped |
+|      V4 | ADR-062            | fts_consolidation                      | shipped |
+|      V5 | ADR-056            | unique_comm_message_external_id        | shipped |
+|      V6 | ADR-081            | brain_retune_driver                    | shipped |
+|      V7 | #827               | notes_seq                              | shipped |
+|      V8 | #827               | notes_seq_repair                       | shipped |
+|      V9 | ADR-104            | entities_name_ci_index                 | shipped |
+|     V10 | ADR-111            | entities_content_ref                   | shipped |
+|     V11 | ADR-079            | ann_write_log                          | shipped |
+|     V12 | ADR-118            | ann_write_log_model_seq_index          | shipped |
+|     V13 | #1424 / #1462      | list_cursor_sequences                  | shipped |
+|     V14 | #1424 / #1462      | graph_edges_id_unique                  | shipped |
+|     V15 | #1597              | serve_ledger_attribution               | shipped |
+|     V16 | ADR-019 / #1474    | gtd_dependency_cycle_guards            | shipped |
+|     V17 | ADR-142 / #1700    | agents_ddl                             | shipped |
+|     V18 | #1479              | ann_consumer_pending                   | shipped |
+|     V19 | #1649              | list_cursor_backfill_repair            | shipped |
+|     V20 | ADR-091 / #1850    | blob_gc_claims                         | shipped |
+|     V21 | ADR-121 / ADR-160  | attachments_first_class                | shipped |
+|     V22 | #2166              | notes_unread_probe_recipient           | shipped |
+|     V23 | ADR-062 / #1907    | fts_record_kind                        | shipped |
+|     V24 | #2369              | fts_rowid_map                          | shipped |
+|     V25 | #2318              | notes_unread_probe_recipient_direction | shipped |
+|     V26 | #2273              | knowledge_fts_repair                   | shipped |
 
-> **V25 record (2026-08-29)**: `knowledge_fts_repair` recreates atom FTS against
+> **V26 record (2026-08-29)**: `knowledge_fts_repair` recreates atom FTS against
 > the live-row `knowledge_atoms_fts_content` view, installs symmetric lifecycle
 > triggers, and rebuilds both knowledge external-content indexes. This makes
 > rank-1 FTS5 integrity checks meaningful while repairing historical section

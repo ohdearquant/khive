@@ -149,7 +149,10 @@ def test_learn_happy_path(proc):
     # Shape: 8-char short id + full UUID
     assert len(result["id"]) == 8, f"expected 8-char short id: {result['id']}"
     assert "-" in result["full_id"], f"expected UUID in full_id: {result['full_id']}"
-    assert result["namespace"] is not None
+    # Agent JSON elides namespace="local" (ADR-078 Amendment 3); a namespace that
+    # survives elision must be a non-local string.
+    namespace = result.get("namespace")
+    assert namespace is None or (isinstance(namespace, str) and namespace != "local"), result
     print("  [ok] learn happy path")
 
 

@@ -2795,7 +2795,7 @@ async fn build_registry_for_multi_backend_inner(
             }
         };
         let mut rt_config = base_config.clone();
-        rt_config.backend_id = BackendId::new(backend_name);
+        rt_config.backend_id = BackendId::parse(backend_name)?;
         if no_embed {
             // `[packs.<name>] no_embed = true`: this pack's runtime gets zero
             // embedders — pack-owned writes are FTS + metadata only. Clear
@@ -4376,6 +4376,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("/data/main.db")),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             },
             BackendConfig {
@@ -4386,6 +4387,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("/data/ignored-stray.db")),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             },
         ];
@@ -4416,6 +4418,7 @@ mod tests {
             path: Some(std::path::PathBuf::from("/data/main.db")),
             cache_mb: None,
             journal_mode: None,
+            served_kinds: None,
             read_only: false,
         }];
         let line = resolved_database_disclosure(None, &backends);
@@ -5580,6 +5583,7 @@ id = "lambda:project-actor"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -5588,6 +5592,7 @@ id = "lambda:project-actor"
                     path: Some(secondary_path),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -5637,6 +5642,7 @@ id = "lambda:project-actor"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -5645,6 +5651,7 @@ id = "lambda:project-actor"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -5744,6 +5751,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -5881,6 +5889,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -5993,6 +6002,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -6059,6 +6069,7 @@ id = "lambda:project-actor"
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -6092,6 +6103,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -6192,6 +6204,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             storage: StorageSectionConfig {
@@ -6470,6 +6483,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             storage: StorageSectionConfig {
@@ -6513,6 +6527,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             storage: StorageSectionConfig {
@@ -6723,6 +6738,7 @@ region = "us-east-1"
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: true,
             }],
             storage: StorageSectionConfig {
@@ -6788,6 +6804,7 @@ region = "us-east-1"
                 path: Some(main_path),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: true,
             }],
             ..KhiveConfig::default()
@@ -6843,6 +6860,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -6851,6 +6869,7 @@ region = "us-east-1"
                     path: Some(archive_path),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: true,
                 },
             ],
@@ -6906,6 +6925,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: true,
                 },
                 BackendConfig {
@@ -6914,6 +6934,7 @@ region = "us-east-1"
                     path: Some(blob_db),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -6971,6 +6992,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -6979,6 +7001,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -7054,6 +7077,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -7062,6 +7086,7 @@ region = "us-east-1"
                     path: Some(real_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -7070,6 +7095,7 @@ region = "us-east-1"
                     path: Some(alias_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -7153,6 +7179,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -7161,6 +7188,7 @@ region = "us-east-1"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -7211,6 +7239,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -7219,6 +7248,7 @@ region = "us-east-1"
                     path: Some(secondary_path),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -7599,6 +7629,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -7607,6 +7638,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -7681,6 +7713,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -7689,6 +7722,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -7779,6 +7813,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             packs: std::collections::HashMap::new(),
@@ -7820,6 +7855,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             packs: {
@@ -7880,6 +7916,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             packs: {
@@ -7964,6 +8001,7 @@ region = "us-east-1"
             path: Some(db_path.clone()),
             cache_mb: None,
             journal_mode: None,
+            served_kinds: None,
             read_only: true,
         };
 
@@ -8010,6 +8048,7 @@ region = "us-east-1"
             path: Some(db_path),
             cache_mb: None,
             journal_mode: None,
+            served_kinds: None,
             read_only: false,
         };
         let error = match open_backend(&config) {
@@ -8038,6 +8077,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only,
                 },
                 BackendConfig {
@@ -8046,6 +8086,7 @@ region = "us-east-1"
                     path: Some(comm_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only,
                 },
             ],
@@ -8152,6 +8193,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: main_read_only,
                 },
                 BackendConfig {
@@ -8160,6 +8202,7 @@ region = "us-east-1"
                     path: Some(comm_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: comm_read_only,
                 },
             ],
@@ -8278,6 +8321,7 @@ region = "us-east-1"
                     path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -8286,6 +8330,7 @@ region = "us-east-1"
                     path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -8316,6 +8361,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -8324,6 +8370,7 @@ region = "us-east-1"
                     path: Some(aliased.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: true,
                 },
                 BackendConfig {
@@ -8332,6 +8379,7 @@ region = "us-east-1"
                     path: Some(aliased.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -8366,6 +8414,7 @@ region = "us-east-1"
                     path: Some(main.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -8374,6 +8423,7 @@ region = "us-east-1"
                     path: Some(main),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -8382,6 +8432,7 @@ region = "us-east-1"
                     path: Some(secondary),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -8427,6 +8478,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -8631,6 +8683,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -8639,6 +8692,7 @@ region = "us-east-1"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -8698,6 +8752,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -8706,6 +8761,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -8805,6 +8861,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -8813,6 +8870,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -8874,6 +8932,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -8882,6 +8941,7 @@ region = "us-east-1"
                     path: Some(second_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -10786,6 +10846,7 @@ backend = "kg-backend"
                         path: Some(main_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        served_kinds: None,
                         read_only: false,
                     },
                     BackendConfig {
@@ -10794,6 +10855,7 @@ backend = "kg-backend"
                         path: Some(kg_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        served_kinds: None,
                         read_only: false,
                     },
                 ],
@@ -10923,6 +10985,7 @@ backend = "kg-backend"
                         path: Some(dir.path().join("main.db")),
                         cache_mb: None,
                         journal_mode: None,
+                        served_kinds: None,
                         read_only: false,
                     },
                     BackendConfig {
@@ -10931,6 +10994,7 @@ backend = "kg-backend"
                         path: Some(dir.path().join("comm.db")),
                         cache_mb: None,
                         journal_mode: None,
+                        served_kinds: None,
                         read_only: false,
                     },
                 ],
@@ -11034,6 +11098,7 @@ backend = "kg-backend"
                         path: Some(main_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        served_kinds: None,
                         read_only: false,
                     },
                     BackendConfig {
@@ -11042,6 +11107,7 @@ backend = "kg-backend"
                         path: Some(comm_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        served_kinds: None,
                         read_only: false,
                     },
                 ],
