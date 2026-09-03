@@ -487,7 +487,7 @@ Each arm status is `ran`, `skipped`, or `error`. `ran` with zero candidates
 means that arm completed but contributed no final hit; `skipped` means it was
 not selected (for example, vector search without a configured embedding model);
 and `error` means that arm itself failed on at least one backend where it was
-selected — including a backend whose *other* arm completed normally. A backend
+selected — including a backend whose _other_ arm completed normally. A backend
 whose text leg completes and whose vector leg alone fails is therefore not
 "missing": it still contributed usable text hits, so it does not appear in
 `missing_backends` or `backend_errors`, and the response keeps

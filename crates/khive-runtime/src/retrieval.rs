@@ -705,7 +705,7 @@ impl KhiveRuntime {
     }
 
     /// Coordinator fan-out variant of [`Self::hybrid_search`]: the text arm
-    /// still fails loud (propagated through [`Self::hybrid_search_inner`]'s
+    /// still fails loud (propagated through `hybrid_search_inner`'s
     /// `tolerate_vector_error=false` semantics for that leg), but a
     /// vector-arm failure after a successful text leg is captured instead of
     /// discarding the text hits. Reserved for

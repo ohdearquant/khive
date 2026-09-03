@@ -847,7 +847,7 @@ both fields from their normal top-level location to `error.search` on the
 omitted envelope (the operation's `ok` flips to `false` once its result is
 discarded, so the two fields move under the synthesized `error` object rather
 than staying beside a `result` that no longer exists). They still survive
-omission; they do not survive at the *same* location.
+omission; they do not survive at the _same_ location.
 
 ## References
 
