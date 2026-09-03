@@ -599,6 +599,39 @@ async fn advance_ann_test_deadline_after_round(completed_rounds: usize) {
     }
 }
 
+/// Test-only fault injection for a single refill round's hydration call,
+/// modeling a hydration query timing out mid-refill (issue #2312): every
+/// shell in that round is dropped, exactly like `hydrate_empty_hits`'s own
+/// reader-acquisition-failure branch, without needing a real storage-layer
+/// fault. Scoped the same way as `ANN_TEST_DEADLINE_ADVANCE`.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct HydrationTestFault {
+    on_round: usize,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static HYDRATION_TEST_FAULT: HydrationTestFault;
+}
+
+#[cfg(test)]
+pub(crate) async fn scope_hydration_test_fault<F>(on_round: usize, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    HYDRATION_TEST_FAULT
+        .scope(HydrationTestFault { on_round }, future)
+        .await
+}
+
+#[cfg(test)]
+fn hydration_test_fault_due(round: usize) -> bool {
+    HYDRATION_TEST_FAULT
+        .try_with(|control| control.on_round == round)
+        .unwrap_or(false)
+}
+
 fn is_timeout(e: &khive_storage::StorageError) -> bool {
     matches!(e, khive_storage::StorageError::Timeout { .. })
 }
@@ -1454,7 +1487,17 @@ async fn search_eligible_ann_with_refill(
             })
             .collect();
 
-        let hydration_failures = hydrate_empty_hits(runtime, ctx.ns, &mut hits).await;
+        #[cfg(test)]
+        let faulted_this_round = hydration_test_fault_due(completed_rounds + 1);
+        #[cfg(not(test))]
+        let faulted_this_round = false;
+        let hydration_failures = if faulted_this_round {
+            let failed = hits.len();
+            hits.clear();
+            failed
+        } else {
+            hydrate_empty_hits(runtime, ctx.ns, &mut hits).await
+        };
         #[cfg(test)]
         {
             completed_rounds += 1;
@@ -1466,10 +1509,28 @@ async fn search_eligible_ann_with_refill(
         filter_hits_by_type(&mut hits, ctx.type_filter);
 
         if deadline_expired {
+            // A hydration timeout on this round may have stripped shells this
+            // round even hydrated fine in `last_round`. Union the two sets —
+            // `last_round` takes precedence for duplicate ids since it is a
+            // fully completed, already-vetted round — so a late-round
+            // hydration timeout never discards eligible hits a prior round
+            // already produced (issue #2312).
+            let mut merged = last_round.hits;
+            let carried_over: HashSet<String> = merged.iter().map(|hit| hit.id.clone()).collect();
+            merged.extend(
+                hits.into_iter()
+                    .filter(|hit| !carried_over.contains(&hit.id)),
+            );
+            merged.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            merged.truncate(target_eligible);
             return EligibleAnnSearchState {
-                hits,
+                hits: merged,
                 availability: Some(availability),
-                hydration_failures,
+                hydration_failures: hydration_failures + last_round.hydration_failures,
                 timed_out: true,
             };
         }
@@ -3387,6 +3448,203 @@ mod tests {
                 .iter()
                 .map(|a| a.slug.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // Minimal embedder returning a fixed unit vector for every text — only
+    // `knowledge.index` needs a real embedder configured to run; the ANN
+    // query vector below is supplied directly, so the actual vector values
+    // are irrelevant to this test.
+    const REFILL_TEST_DIM: usize = 384;
+    const REFILL_TEST_MODEL_KEY: &str = "all-minilm-l6-v2";
+
+    struct ConstantEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for ConstantEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|_| vec![1.0f32 / (REFILL_TEST_DIM as f32).sqrt(); REFILL_TEST_DIM])
+                .collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "constant-refill-test"
+        }
+    }
+
+    struct ConstantEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for ConstantEmbeddingProvider {
+        fn name(&self) -> &str {
+            REFILL_TEST_MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            REFILL_TEST_DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(std::sync::Arc::new(ConstantEmbeddingService))
+        }
+    }
+
+    fn runtime_with_constant_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
+            db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        rt.register_embedder(ConstantEmbeddingProvider);
+        rt
+    }
+
+    /// A hydration timeout on a later refill round must not discard eligible
+    /// hits an earlier round already completed and hydrated (issue #2312).
+    ///
+    /// Round 1 requests the full known corpus (4 vectors) and hydrates 2 of
+    /// them; the other 2 ids are stale ANN entries (their canonical rows were
+    /// deleted after the Vamana snapshot was built), so hydration drops them
+    /// and round 1 falls short of `target_eligible`, forcing a second round.
+    /// Round 2 re-requests the same 4 stale/live ids but its hydration call
+    /// is faulted (`scope_hydration_test_fault`), simulating the hydration
+    /// query itself timing out: every shell in that round is dropped,
+    /// including the 2 that hydrated fine last round. The read deadline is
+    /// then expired deterministically (`scope_ann_test_deadline_advance`)
+    /// right after round 2's hydration call returns.
+    ///
+    /// Expected (pre-fix) failure mode: the deadline branch returned round
+    /// 2's own (fully-faulted, empty) hit set instead of round 1's, so this
+    /// assertion would see 0 hits, not 2.
+    #[tokio::test(start_paused = true)]
+    async fn ann_refill_deadline_timeout_keeps_prior_round_hits() {
+        let runtime = runtime_with_constant_embedder();
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local token");
+
+        KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            json!({
+                "atoms": [
+                    {"slug": "refill-keep-a", "name": "Refill Keep A", "finalized": true, "content": "refill regression corpus entry keep alpha padding words to satisfy the minimum content length validation rule enforced for every atom record"},
+                    {"slug": "refill-keep-b", "name": "Refill Keep B", "finalized": true, "content": "refill regression corpus entry keep beta padding words to satisfy the minimum content length validation rule enforced for every atom record"},
+                    {"slug": "refill-stale-c", "name": "Refill Stale C", "finalized": true, "content": "refill regression corpus entry stale gamma padding words to satisfy the minimum content length validation rule enforced for every atom"},
+                    {"slug": "refill-stale-d", "name": "Refill Stale D", "finalized": true, "content": "refill regression corpus entry stale delta padding words to satisfy the minimum content length validation rule enforced for every atom"},
+                ]
+            }),
+        )
+        .await
+        .expect("upsert atoms");
+
+        let ann = vamana::new_shared();
+        KnowledgeHandlers::index(&runtime, &token, json!({"rebuild_ann": true}), &ann, None)
+            .await
+            .expect("build ann index");
+
+        // Drop 2 of the 4 canonical rows after the snapshot was built, so
+        // their ANN vectors are now stale entries — hydration will find no
+        // row for them, exactly like a real "stale ANN id" (see
+        // `hydrate_empty_hits`'s doc comment).
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "DELETE FROM knowledge_atoms WHERE slug IN \
+                          ('refill-stale-c', 'refill-stale-d')"
+                        .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("delete stale rows");
+        }
+
+        let key = vamana::AnnKey::new("local", runtime.default_embedder_name());
+        let query_embedding = vec![1.0f32 / (REFILL_TEST_DIM as f32).sqrt(); REFILL_TEST_DIM];
+        let statuses: Vec<String> = Vec::new();
+        let exclude_statuses: Vec<&str> = Vec::new();
+        let w = Weights::default();
+        let ctx = SearchCtx {
+            runtime: &runtime,
+            ns: "local",
+            role: None,
+            type_filter: None,
+            min_score: 0.0,
+            w: &w,
+            fetch_limit: 10,
+            statuses: &statuses,
+            exclude_statuses: &exclude_statuses,
+        };
+
+        let deadline = std::time::Duration::from_millis(200);
+        let result = khive_storage::scope_request_read_deadline(
+            deadline,
+            scope_hydration_test_fault(
+                2,
+                scope_ann_test_deadline_advance(
+                    2,
+                    deadline * 2,
+                    search_eligible_ann_with_refill(
+                        &ctx,
+                        &token,
+                        &ann,
+                        &key,
+                        &query_embedding,
+                        4,
+                        4,
+                    ),
+                ),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.timed_out,
+            "the forced deadline expiry after round 2 must be reported"
+        );
+        assert_eq!(
+            result.hits.len(),
+            2,
+            "round 1's 2 completed, hydrated hits must survive round 2's \
+             hydration timeout instead of being discarded: {:?}",
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let slugs: HashSet<&str> = result.hits.iter().map(|hit| hit.slug.as_str()).collect();
+        assert!(
+            slugs.contains("refill-keep-a") && slugs.contains("refill-keep-b"),
+            "the surviving hits must be round 1's real, hydrated atoms: {slugs:?}"
         );
     }
 
