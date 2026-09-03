@@ -197,8 +197,10 @@ pub struct ReindexArgs {
     /// for an unrestricted full-corpus run (no explicit `--namespace` /
     /// `KHIVE_NAMESPACE`, and neither `--sections-only` nor `--no-sections`
     /// narrowed the knowledge pass) and OFF for any scoped run. Passing this
-    /// flag forces it on regardless of scope.
-    #[arg(long)]
+    /// flag forces it on regardless of scope. The rebuild runs inside the
+    /// knowledge pass, so it conflicts with `--no-knowledge` rather than
+    /// silently doing nothing under it.
+    #[arg(long, conflicts_with = "no_knowledge")]
     pub rebuild_fts: bool,
 
     /// Print human-readable output instead of JSON.
@@ -2039,6 +2041,19 @@ mod tests {
             !should_rebuild_fts(false, false, true, false),
             "--no-sections (do_sections=false) must default the rebuild OFF"
         );
+    }
+
+    #[test]
+    fn rebuild_fts_conflicts_with_no_knowledge() {
+        // The rebuild lives inside the knowledge pass; skipping that pass
+        // while asking for the rebuild must be refused at parse time instead
+        // of accepted and ignored.
+        let err = ReindexArgs::try_parse_from(["reindex", "--rebuild-fts", "--no-knowledge"])
+            .expect_err("--rebuild-fts with --no-knowledge must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let ok = ReindexArgs::try_parse_from(["reindex", "--rebuild-fts"])
+            .expect("--rebuild-fts alone parses");
+        assert!(ok.rebuild_fts);
     }
 
     #[test]

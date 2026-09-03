@@ -1804,12 +1804,12 @@ per-caller cost admission to bound it, so that rebuild is reachable only through
 `kkernel reindex` operator CLI (`--rebuild-fts`), which reports the indexes rebuilt, elapsed
 time, and the rank-1 integrity-check outcome.
 
-| Param         | Type            | Required | Notes                                                           |
-| ------------- | --------------- | -------- | --------------------------------------------------------------- |
-| `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.                     |
-| `batch_size`  | integer         | no       | Default 500, max 1000.                                          |
-| `insert_only` | bool            | no       | Deprecated no-op, accepted for API compatibility only.          |
-| `rebuild_ann` | bool            | no       | Rebuild the in-memory Vamana ANN index (default false).         |
+| Param         | Type            | Required | Notes                                                   |
+| ------------- | --------------- | -------- | ------------------------------------------------------- |
+| `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.             |
+| `batch_size`  | integer         | no       | Default 500, max 1000.                                  |
+| `insert_only` | bool            | no       | Deprecated no-op, accepted for API compatibility only.  |
+| `rebuild_ann` | bool            | no       | Rebuild the in-memory Vamana ANN index (default false). |
 
 ```
 request(ops="knowledge.index(rebuild_ann=true)")
