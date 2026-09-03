@@ -18,13 +18,31 @@ an embedder and index can supply it.
 
 `knowledge.search` adds backward-compatible provenance fields:
 
-- Top-level `candidate_provenance.lexical` is `matched`, `no_match`, `filtered`,
+- Top-level `candidate_provenance.lexical` is `matched`, `exact_name`, `no_match`, `filtered`,
   `partial_timeout`, or `timed_out`.
 - Top-level `candidate_provenance.fallback` is `ann` only when the returned set has ANN
   evidence and no returned result has lexical evidence; otherwise it is `none`.
+- Top-level `candidate_provenance.terms_truncated` is `true` when the query supplied more
+  distinct scoreable terms than the per-request FTS fan-out bound; the candidate set only
+  reflects the first terms up to that bound.
 - Each result adds `score_provenance` with a stable-order `sources` subset of `lexical` and
   `ann`, `embedding_rerank` (whether a successful dense rerank transformed the score),
   `normalization: "s_over_s_plus_1"`, and `calibrated: false`.
+
+A query whose every token falls below the minimum scoreable term length (e.g. "AI") never
+reaches FTS as anything but the raw phrase, which the trigram tokenizer cannot match below
+three characters. `exact_name` covers this case: an indexed probe against the unique
+`(namespace, slug)` index, using the query normalized through the pack's own slug convention,
+recovers the atom when FTS could not. A caller-chosen slug that departs from that convention
+stays outside this probe's reach — it is a narrower guarantee than a name index would give, not
+a general substring match.
+
+The lexical stage bounds the number of distinct scoreable terms that each issue their own FTS
+`MATCH` statement, independent of the per-term row cap the 2026-06 candidate-refill work
+introduced. Without this bound, a query with many distinct terms turns one request into a
+proportionally unbounded number of index probes and retained-row memory, checked only by the
+request read deadline. A query at or under the bound sees identical candidate generation and
+ranking to the unbounded behavior; a query over the bound reports `terms_truncated: true`.
 
 Search scores are request-relative ranking values. After lexical/ANN fusion and optional
 embedding rerank, the score is monotonically squashed with `s / (s + 1)` and receives the

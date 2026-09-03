@@ -1731,10 +1731,16 @@ with `KHIVE_PACKS=kg,knowledge`.
 
 Bulk insert or update knowledge atoms by slug.
 
-| Param        | Type            | Required | Notes                                                             |
-| ------------ | --------------- | -------- | ----------------------------------------------------------------- |
-| `atoms`      | array\<object\> | yes      | `{slug, name, content, tags?, properties?, finalized?}` per atom. |
-| `chunk_size` | integer         | no       | Client-side chunking hint, max 5000.                              |
+| Param        | Type            | Required | Notes                                                                                        |
+| ------------ | --------------- | -------- | -------------------------------------------------------------------------------------------- |
+| `atoms`      | array\<object\> | yes      | `{slug, name, content, tags?, properties?, source_uri?, source_type?, finalized?}` per atom. |
+| `chunk_size` | integer         | no       | Client-side chunking hint, max 5000.                                                         |
+
+On an existing atom, `source_uri`, `source_type`, and `finalized` are patch fields with three
+wire states: an omitted key preserves the stored value, JSON `null` clears it (`finalized: null`
+resets to `false`), and a present non-null value replaces it. On insert, an omitted or null
+source field stores SQL NULL, and an omitted or null `finalized` creates a non-finalized `draft`
+atom. See [ADR-047](../adr/ADR-047-knowledge-pack.md) for the full patch contract.
 
 ```
 request(ops="[{\"tool\":\"knowledge.upsert_atoms\",\"args\":{\"atoms\":[{\"slug\":\"rope\",\"name\":\"RoPE\",\"content\":\"Rotary position embedding...\"}]}}]")
@@ -1864,6 +1870,8 @@ The response is `{results, total, candidate_provenance, ...}`. A genuine FTS mis
 not scan or rank the newest corpus rows. `candidate_provenance.lexical` reports one of:
 
 - `matched`: eligible lexical candidates were found.
+- `exact_name`: no query term was scoreable (every token below the minimum length), and an
+  indexed exact-slug probe found the atom where FTS could not.
 - `no_match`: FTS found no lexical match.
 - `filtered`: FTS matched, but kind/status eligibility removed every lexical candidate.
 - `partial_timeout`: part of a lexical/decomposed candidate stage completed before the
@@ -1872,7 +1880,9 @@ not scan or rank the newest corpus rows. `candidate_provenance.lexical` reports 
 
 `candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and
 no returned result has lexical evidence; it is otherwise `none`, including for an empty
-result. Each result includes `score_provenance`:
+result. `candidate_provenance.terms_truncated` is `true` when the query supplied more
+distinct scoreable terms than the per-request FTS fan-out bound; the lexical candidate set
+only reflects terms up to that bound. Each result includes `score_provenance`:
 
 ```json
 {

@@ -21,6 +21,7 @@ use super::scoring::{
     compute_idf, exact_name_bonus, expand_terms, load_candidates_from_atoms, score_candidate,
     Candidate, Weights,
 };
+use super::sections::to_slug;
 use super::util::{
     atom_embed_text, atom_from_row, compose_item_char_cost, deser, domain_from_row,
     estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_i64, row_str,
@@ -447,20 +448,35 @@ fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
 /// never to the size of the full match set.
 const FTS_TERM_LIMIT: usize = 500;
 
+/// Bound on the number of distinct scoreable terms that issue their own
+/// `MATCH` query. Without this cap a caller-controlled query with many
+/// distinct terms turns one request into an unbounded number of index
+/// probes plus proportional retained-row memory (each bounded only by
+/// `FTS_TERM_LIMIT`), with the request read deadline as the only backstop.
+/// Terms beyond the cap are dropped after dedup/expansion, in the same
+/// deterministic order `fts5_candidate_terms` produces, so a query at or
+/// under the cap sees byte-for-byte identical candidate generation and
+/// ranking to the uncapped behavior.
+const FTS_TERM_COUNT_LIMIT: usize = 32;
+
 /// Outcome of the bounded lexical candidate fetch.
 ///
 /// `state` distinguishes a real lexical miss from a match removed by public
 /// eligibility and from the two fail-open timeout outcomes. Any non-timeout
 /// storage error (including a genuine FTS5 syntax/parser error) still surfaces
-/// as an `Err`.
+/// as an `Err`. `terms_truncated` reports whether the query supplied more
+/// distinct scoreable terms than `FTS_TERM_COUNT_LIMIT`, so a caller can tell
+/// a bounded candidate generation stage from a full one.
 struct FtsFetchOutcome {
     atoms: Vec<Atom>,
     state: LexicalCandidateState,
+    terms_truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LexicalCandidateState {
     Matched,
+    ExactName,
     NoMatch,
     Filtered,
     PartialTimeout,
@@ -471,6 +487,7 @@ impl LexicalCandidateState {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Matched => "matched",
+            Self::ExactName => "exact_name",
             Self::NoMatch => "no_match",
             Self::Filtered => "filtered",
             Self::PartialTimeout => "partial_timeout",
@@ -499,6 +516,9 @@ impl LexicalCandidateState {
         }
         if states.contains(&Self::Matched) {
             return Self::Matched;
+        }
+        if states.contains(&Self::ExactName) {
+            return Self::ExactName;
         }
         if states.contains(&Self::Filtered) {
             return Self::Filtered;
@@ -530,6 +550,21 @@ async fn advance_fts_test_deadline_after_term(completed_terms: usize) {
     if let Some(advance_by) = advance_by {
         tokio::time::advance(advance_by).await;
     }
+}
+
+// Counts per-term `MATCH` statements actually issued by the loop below, so a
+// test can prove the fan-out is bounded by `FTS_TERM_COUNT_LIMIT` rather
+// than trusting the cap's arithmetic alone.
+#[cfg(test)]
+tokio::task_local! {
+    static FTS_TEST_TERM_QUERY_COUNT: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
+#[cfg(test)]
+fn count_fts_test_term_query() {
+    let _ = FTS_TEST_TERM_QUERY_COUNT.try_with(|counter| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 fn is_timeout(e: &khive_storage::StorageError) -> bool {
@@ -569,12 +604,15 @@ async fn fetch_fts_candidates(
             return Ok(FtsFetchOutcome {
                 atoms: Vec::new(),
                 state: LexicalCandidateState::TimedOut,
+                terms_truncated: false,
             });
         }
         Err(e) => return Err(sql_err("search fts reader", e)),
     };
 
-    let terms = fts5_candidate_terms(raw_query);
+    let mut terms = fts5_candidate_terms(raw_query);
+    let terms_truncated = terms.len() > FTS_TERM_COUNT_LIMIT;
+    terms.truncate(FTS_TERM_COUNT_LIMIT);
     let type_clause = type_eligibility_sql(type_filter, "a");
     let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 4);
     let per_term_limit = if terms.len() == 1 {
@@ -635,7 +673,10 @@ async fn fetch_fts_candidates(
 
         per_term_rows.push(rows.iter().filter_map(atom_from_row).collect());
         #[cfg(test)]
-        advance_fts_test_deadline_after_term(per_term_rows.len()).await;
+        {
+            count_fts_test_term_query();
+            advance_fts_test_deadline_after_term(per_term_rows.len()).await;
+        }
     }
 
     let max_term_rows = per_term_rows.iter().map(Vec::len).max().unwrap_or(0);
@@ -661,6 +702,7 @@ async fn fetch_fts_candidates(
         return Ok(FtsFetchOutcome {
             atoms: combined,
             state,
+            terms_truncated,
         });
     }
 
@@ -668,6 +710,7 @@ async fn fetch_fts_candidates(
         return Ok(FtsFetchOutcome {
             atoms: combined,
             state: LexicalCandidateState::Matched,
+            terms_truncated,
         });
     }
 
@@ -692,6 +735,7 @@ async fn fetch_fts_candidates(
             return Ok(FtsFetchOutcome {
                 atoms: Vec::new(),
                 state: LexicalCandidateState::TimedOut,
+                terms_truncated,
             });
         }
         Err(e) => return Err(sql_err("search fts eligibility probe", e)),
@@ -700,6 +744,7 @@ async fn fetch_fts_candidates(
         return Ok(FtsFetchOutcome {
             atoms: Vec::new(),
             state: LexicalCandidateState::Filtered,
+            terms_truncated,
         });
     }
 
@@ -709,7 +754,49 @@ async fn fetch_fts_candidates(
     Ok(FtsFetchOutcome {
         atoms: Vec::new(),
         state: LexicalCandidateState::NoMatch,
+        terms_truncated,
     })
+}
+
+/// Indexed exact-name fallback for a query with no scoreable term (every
+/// token shorter than `MIN_TERM_LEN`, e.g. "AI"). The trigram FTS tokenizer
+/// cannot match a phrase that short, so [`fetch_fts_candidates`] always
+/// misses for such a query and the atom would otherwise be unreachable
+/// without ANN. `knowledge_atoms` carries no index on `name`, but the unique
+/// `(namespace, slug)` index does exist, so this probes it with the query
+/// normalized through the same ASCII-lowercase-hyphenate convention this
+/// pack's own import path uses ([`to_slug`]). A caller-chosen slug that does
+/// not follow that convention stays outside this probe's reach.
+async fn fetch_exact_name_candidate(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    raw_query: &str,
+) -> Result<Option<Atom>, RuntimeError> {
+    let slug = to_slug(raw_query);
+    if slug.is_empty() {
+        return Ok(None);
+    }
+    let sql = runtime.sql();
+    let mut reader = match sql.reader().await {
+        Ok(reader) => reader,
+        Err(e) if is_timeout(&e) => return Ok(None),
+        Err(e) => return Err(sql_err("search exact-name reader", e)),
+    };
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT * FROM knowledge_atoms \
+                  WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1"
+                .to_string(),
+            params: vec![SqlValue::Text(ns.to_owned()), SqlValue::Text(slug)],
+            label: None,
+        })
+        .await;
+    match row {
+        Ok(Some(row)) => Ok(atom_from_row(&row)),
+        Ok(None) => Ok(None),
+        Err(e) if is_timeout(&e) => Ok(None),
+        Err(e) => Err(sql_err("search exact-name query", e)),
+    }
 }
 
 // ─── search context ───────────────────────────────────────────────────────────
@@ -734,6 +821,7 @@ struct SearchCtx<'a> {
 struct SearchCoreOutcome {
     hits: Vec<ScoredHit>,
     lexical_state: LexicalCandidateState,
+    terms_truncated: bool,
 }
 
 async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutcome, RuntimeError> {
@@ -749,6 +837,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
             lexical_state: LexicalCandidateState::NoMatch,
+            terms_truncated: false,
         });
     }
 
@@ -779,7 +868,11 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     // fall through to exact-name-bonus-only scoring rather than returning early.
     let terms_only_exact = terms.is_empty();
 
-    let FtsFetchOutcome { atoms, state } = fetch_fts_candidates(
+    let FtsFetchOutcome {
+        atoms,
+        state,
+        terms_truncated,
+    } = fetch_fts_candidates(
         runtime,
         ns,
         &raw_query,
@@ -790,9 +883,41 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     )
     .await?;
     if atoms.is_empty() {
+        // A query with no scoreable term (e.g. "AI") never reaches FTS as
+        // anything but the raw phrase, which the trigram tokenizer cannot
+        // match below three characters. Fall back to the indexed slug probe
+        // rather than leaving a short exact name unreachable without ANN.
+        if terms_only_exact && !state.timed_out() {
+            if let Some(atom) = fetch_exact_name_candidate(runtime, ns, &raw_query).await? {
+                let candidates =
+                    load_candidates_from_atoms(std::slice::from_ref(&atom), type_filter);
+                if let Some(cand) = candidates.first() {
+                    let base = w.w_exact_name;
+                    if base >= min_score {
+                        return Ok(SearchCoreOutcome {
+                            hits: vec![ScoredHit {
+                                id: cand.id.clone(),
+                                slug: cand.slug.clone(),
+                                name: cand.name_raw.clone(),
+                                content: cand.content_raw.clone(),
+                                tags: cand.tags_raw.clone(),
+                                status: cand.status_raw.clone(),
+                                finalized: cand.finalized,
+                                is_domain: cand.is_domain,
+                                score: base,
+                                provenance: ScoreProvenance::lexical(),
+                            }],
+                            lexical_state: LexicalCandidateState::ExactName,
+                            terms_truncated,
+                        });
+                    }
+                }
+            }
+        }
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
             lexical_state: state,
+            terms_truncated,
         });
     }
 
@@ -801,6 +926,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
             lexical_state: state,
+            terms_truncated,
         });
     }
 
@@ -853,6 +979,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
             })
             .collect(),
         lexical_state: state,
+        terms_truncated,
     })
 }
 
@@ -876,6 +1003,7 @@ async fn search_decomposed(
     let SearchCoreOutcome {
         hits: full,
         lexical_state: full_state,
+        terms_truncated: full_truncated,
     } = search_core(ctx, query).await?;
     let sub_ctx1 = SearchCtx {
         runtime: ctx.runtime,
@@ -891,12 +1019,15 @@ async fn search_decomposed(
     let SearchCoreOutcome {
         hits: s1,
         lexical_state: s1_state,
+        terms_truncated: s1_truncated,
     } = search_core(&sub_ctx1, &sub_q1).await?;
     let SearchCoreOutcome {
         hits: s2,
         lexical_state: s2_state,
+        terms_truncated: s2_truncated,
     } = search_core(&sub_ctx1, &sub_q2).await?;
     let lexical_state = LexicalCandidateState::merge(&[full_state, s1_state, s2_state]);
+    let terms_truncated = full_truncated || s1_truncated || s2_truncated;
 
     let mut scores: HashMap<String, f32> = HashMap::new();
     let mut data: HashMap<String, ScoredHit> = HashMap::new();
@@ -948,6 +1079,7 @@ async fn search_decomposed(
     Ok(SearchCoreOutcome {
         hits: ranked,
         lexical_state,
+        terms_truncated,
     })
 }
 
@@ -2080,6 +2212,7 @@ impl KnowledgeHandlers {
         let SearchCoreOutcome {
             mut hits,
             lexical_state,
+            terms_truncated,
         } = if do_decompose && non_stop_count >= decompose_threshold {
             search_decomposed(&ctx, &raw_query, intersection_bonus).await?
         } else {
@@ -2171,6 +2304,7 @@ impl KnowledgeHandlers {
             "candidate_provenance": {
                 "lexical": lexical_state.as_str(),
                 "fallback": fallback,
+                "terms_truncated": terms_truncated,
             },
         });
         if ann_unavailable {
@@ -2285,6 +2419,7 @@ impl KnowledgeHandlers {
         let SearchCoreOutcome {
             mut hits,
             lexical_state,
+            terms_truncated: _,
         } = search_core(&ctx, &raw_query).await?;
         let lexical_timed_out = lexical_state.timed_out();
 
@@ -3278,6 +3413,193 @@ mod tests {
         assert_eq!(first["score_provenance"]["calibrated"], false);
     }
 
+    /// Issue: `MIN_TERM_LEN=3` drops every token of a query like "AI" before
+    /// FTS ever sees it, and the trigram tokenizer cannot match a phrase that
+    /// short either, so the atom was unreachable without ANN. The indexed
+    /// slug probe in `search_core` must restore discoverability for both the
+    /// atom's exact-case name and a case-insensitive spelling, while a query
+    /// that matches no slug at all must still report a genuine miss.
+    #[tokio::test]
+    async fn short_exact_name_is_discoverable_without_ann() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '93000000-0000-0000-0000-000000000001', 'local', \
+                              'ai', 'AI', \
+                              'artificial intelligence overview content for the corpus', '[]', \
+                              NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed short-name atom");
+        }
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+
+        let exact_case = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "AI", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("exact-case short-name search must not error");
+        assert_eq!(exact_case["total"], 1);
+        assert_eq!(exact_case["results"][0]["slug"], "ai");
+        assert_eq!(exact_case["candidate_provenance"]["lexical"], "exact_name");
+
+        let lower_case = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "ai", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("lower-case short-name search must not error");
+        assert_eq!(lower_case["total"], 1);
+        assert_eq!(lower_case["results"][0]["slug"], "ai");
+        assert_eq!(lower_case["candidate_provenance"]["lexical"], "exact_name");
+
+        let miss = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "zz", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("non-matching short query must not error");
+        assert_eq!(miss["total"], 0);
+        assert_eq!(miss["candidate_provenance"]["lexical"], "no_match");
+    }
+
+    /// The indexed exact-name probe must use the unique `(namespace, slug)`
+    /// index, never a full-namespace scan on `name` — no such index exists.
+    /// Same `EXPLAIN QUERY PLAN` style as
+    /// `crud::get_prefix_query_plan_uses_primary_key_range_seeks`.
+    #[tokio::test]
+    async fn exact_name_probe_query_plan_uses_slug_index() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut reader = runtime.sql().reader().await.expect("exact-name reader");
+        let rows = reader
+            .explain(SqlStatement {
+                sql: "SELECT * FROM knowledge_atoms \
+                      WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text("local".to_string()),
+                    SqlValue::Text("ai".to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("explain exact-name probe");
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("SEARCH knowledge_atoms") && d.contains("USING INDEX")),
+            "exact-name probe must use an index seek, not a table scan: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.contains("SCAN knowledge_atoms")),
+            "exact-name probe must never full-scan knowledge_atoms: {details:?}"
+        );
+    }
+
+    /// Issue: a caller can supply a query with an unbounded number of
+    /// distinct scoreable terms, turning one request into one `MATCH`
+    /// statement per term with no bound but the request read deadline. The
+    /// per-term loop must stop at `FTS_TERM_COUNT_LIMIT` regardless of how
+    /// many distinct terms the query carries, and report the truncation.
+    #[tokio::test]
+    async fn distinct_term_fan_out_is_bounded_and_reports_truncation() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+
+        let over_cap_query: String = (0..(FTS_TERM_COUNT_LIMIT * 2))
+            .map(|i| format!("distinctterm{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let full_terms = fts5_candidate_terms(&over_cap_query);
+        assert!(
+            full_terms.len() > FTS_TERM_COUNT_LIMIT,
+            "test setup must exceed the cap: got {} terms",
+            full_terms.len()
+        );
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outcome = FTS_TEST_TERM_QUERY_COUNT
+            .scope(
+                counter.clone(),
+                fetch_fts_candidates(
+                    &runtime,
+                    "local",
+                    &over_cap_query,
+                    None,
+                    &[],
+                    &[],
+                    CANDIDATE_POOL,
+                ),
+            )
+            .await
+            .expect("bounded fan-out fetch must not error");
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            FTS_TERM_COUNT_LIMIT,
+            "a query with more distinct terms than the cap must issue exactly \
+             FTS_TERM_COUNT_LIMIT MATCH statements, never one per term"
+        );
+        assert!(
+            outcome.terms_truncated,
+            "the outcome must report that the term set was truncated"
+        );
+
+        // Control: a query at or under the cap sees byte-for-byte identical
+        // candidate generation — no truncation, one statement per term.
+        let under_cap_query = "alpha beta gamma";
+        let under_cap_terms = fts5_candidate_terms(under_cap_query);
+        assert!(under_cap_terms.len() <= FTS_TERM_COUNT_LIMIT);
+
+        let control_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control_outcome = FTS_TEST_TERM_QUERY_COUNT
+            .scope(
+                control_counter.clone(),
+                fetch_fts_candidates(
+                    &runtime,
+                    "local",
+                    under_cap_query,
+                    None,
+                    &[],
+                    &[],
+                    CANDIDATE_POOL,
+                ),
+            )
+            .await
+            .expect("under-cap fetch must not error");
+        assert_eq!(
+            control_counter.load(std::sync::atomic::Ordering::Relaxed),
+            under_cap_terms.len()
+        );
+        assert!(!control_outcome.terms_truncated);
+    }
+
     #[tokio::test]
     async fn lexical_candidate_state_distinguishes_filtered_match() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -3892,6 +4214,133 @@ mod tests {
             healthy.and_then(|counts| counts.get(&atom_ids[0]).copied()),
             Some(0),
             "control: without a deadline the lookup returns real counts"
+        );
+    }
+
+    // ── deterministic embedder for the rerank-provenance test ────────────
+
+    const RERANK_TEST_MODEL_KEY: &str = "all-minilm-l6-v2";
+    const RERANK_TEST_DIM: usize = 384;
+
+    struct RerankTestEmbedService;
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for RerankTestEmbedService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            // Distinct, non-degenerate unit vectors per text position so
+            // cosine similarity is well-defined and never uniform, the same
+            // shape `ann_degrade_tests::FakeDimService` uses.
+            Ok(texts
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let v = (i + 1) as f32;
+                    let norm = (RERANK_TEST_DIM as f32 * v * v).sqrt();
+                    vec![v / norm; RERANK_TEST_DIM]
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "rerank-test-embed"
+        }
+    }
+
+    struct RerankTestEmbedProvider;
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for RerankTestEmbedProvider {
+        fn name(&self) -> &str {
+            RERANK_TEST_MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            RERANK_TEST_DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(std::sync::Arc::new(RerankTestEmbedService))
+        }
+    }
+
+    fn runtime_with_deterministic_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
+            db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime with embedder config");
+        rt.register_embedder(RerankTestEmbedProvider);
+        rt
+    }
+
+    /// Existing coverage only asserts `score_provenance.embedding_rerank ==
+    /// false` (no embedder configured); the mutation at
+    /// `rerank_with_embeddings` that sets it `true` on a successful rerank
+    /// had no test that would fail if it were deleted. This pins the `true`
+    /// case under a deterministic embedder.
+    #[tokio::test]
+    async fn embedding_rerank_provenance_is_true_when_rerank_runs() {
+        let runtime = runtime_with_deterministic_embedder();
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '94000000-0000-0000-0000-000000000001', 'local', \
+                              'rerank-target', 'Rerank Target', \
+                              'content that the lexical stage must match for the rerank pass', \
+                              '[]', NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed rerank target atom");
+        }
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+        let out = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "rerank target content", "rerank": true}),
+            &ann,
+        )
+        .await
+        .expect("rerank-enabled search must not error");
+
+        assert_eq!(out["total"], 1);
+        assert_eq!(
+            out["results"][0]["score_provenance"]["embedding_rerank"], true,
+            "a successful embedding rerank must record embedding_rerank: true; got {out:?}"
         );
     }
 }
