@@ -31,6 +31,22 @@ pub struct IngestInclude {
     pub pull_requests: bool,
 }
 
+/// Whether `run_ingest_inner` may fall back to the command working
+/// directory's configured `origin` remote to derive a GitHub repository
+/// identity when the parsed source carries none of its own. A remote
+/// issues/pull-requests-only pass has no repository checkout that `origin`
+/// could even name (see the remote branch in
+/// `crates/khive-pack-git/src/handlers.rs`) -- deriving from it there would
+/// silently borrow whatever repository the daemon process happens to be
+/// running inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OriginIdentity {
+    /// Fall back to the working directory's `origin` remote.
+    DeriveFromCwd,
+    /// Never consult `origin`; an absent source identity is a hard failure.
+    Never,
+}
+
 impl Default for IngestInclude {
     fn default() -> Self {
         Self {
@@ -346,7 +362,15 @@ pub async fn run_ingest(
     registry: &VerbRegistry,
     opts: IngestOptions,
 ) -> Result<IngestReport> {
-    run_ingest_inner(runtime, token, registry, opts, true, |_repo, _err| Ok(None)).await
+    run_ingest_inner(
+        runtime,
+        token,
+        registry,
+        opts,
+        OriginIdentity::DeriveFromCwd,
+        |_repo, _err| Ok(None),
+    )
+    .await
 }
 
 /// Run a remote issues/pull-requests-only pass without consulting the
@@ -365,9 +389,14 @@ pub(crate) async fn run_remote_api_ingest(
             "remote API-only ingest cannot include commit history"
         ));
     }
-    run_ingest_inner(runtime, token, registry, opts, false, |_repo, _err| {
-        Ok(None)
-    })
+    run_ingest_inner(
+        runtime,
+        token,
+        registry,
+        opts,
+        OriginIdentity::Never,
+        |_repo, _err| Ok(None),
+    )
     .await
 }
 
@@ -382,7 +411,15 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     opts: IngestOptions,
     recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send,
 ) -> Result<IngestReport> {
-    run_ingest_inner(runtime, token, registry, opts, true, recover).await
+    run_ingest_inner(
+        runtime,
+        token,
+        registry,
+        opts,
+        OriginIdentity::DeriveFromCwd,
+        recover,
+    )
+    .await
 }
 
 async fn run_ingest_inner(
@@ -390,7 +427,7 @@ async fn run_ingest_inner(
     token: &NamespaceToken,
     registry: &VerbRegistry,
     opts: IngestOptions,
-    derive_github_repo_from_origin: bool,
+    origin_identity: OriginIdentity,
     mut recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send,
 ) -> Result<IngestReport> {
     let mut report = IngestReport {
@@ -434,7 +471,7 @@ async fn run_ingest_inner(
         let gh_probe = probe_gh_repository(
             &opts.repo,
             opts.expected_github_repo.as_deref(),
-            derive_github_repo_from_origin,
+            origin_identity,
         );
         if let Ok(gh_repo) = &gh_probe {
             report.gh_available = Some(true);
@@ -858,12 +895,14 @@ async fn link_references(
 fn probe_gh_repository(
     repo: &Path,
     expected: Option<&str>,
-    derive_from_origin: bool,
+    origin_identity: OriginIdentity,
 ) -> std::result::Result<String, &'static str> {
-    let expected = match expected {
-        Some(expected) => validate_owner_repo(expected)?,
-        None if derive_from_origin => github_repository_from_origin(repo)?,
-        None => return Err("remote source has no usable github.com repository identity"),
+    let expected = match (expected, origin_identity) {
+        (Some(expected), _) => validate_owner_repo(expected)?,
+        (None, OriginIdentity::DeriveFromCwd) => github_repository_from_origin(repo)?,
+        (None, OriginIdentity::Never) => {
+            return Err("remote source has no usable github.com repository identity")
+        }
     };
     let output = Command::new("gh")
         .args([

@@ -53,9 +53,12 @@ const STAGING_LOCK_FILE: &str = ".khive-staging.lock";
 /// `REAP_THROTTLE_INTERVAL` instead of on every cache mutation.
 const REAP_SWEEP_MARKER: &str = ".khive-last-swept";
 const REAP_THROTTLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// A clone's partial pack normally grows in a handful of large files, so a
-/// short polling interval bounds overshoot without putting a recursive walk
-/// in git's hot path continuously.
+/// Floor for the clone-size poll interval (see `poll_sleep_duration`). The
+/// walk that measures a clone's on-disk size costs O(entries in the partial
+/// tree): on a small/cheap clone the loop sleeps this long between polls, and
+/// on an entry-heavy or slow one it sleeps at least four times the previous
+/// walk's own wall-clock cost, bounding the walk to at most a fifth of the
+/// loop's total time no matter how large the tree grows.
 const CLONE_SIZE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Belt-and-suspenders fallback for a staging entry that crashed before it
 /// could write its own lock file (the brief mkdir-then-open-lock gap at the
@@ -856,6 +859,185 @@ mod unix_fd {
     }
 }
 
+/// A Win32 job object that kills every process it contains when the handle
+/// closes, standing in for the Unix process-group kill (`terminate_clone`)
+/// `Command` has no cross-platform equivalent for. `git clone` on Windows
+/// can spawn a transport helper (`git-remote-https`) as a child of `git`;
+/// `TerminateProcess` on the `git` PID alone leaves that helper running and
+/// still writing into the destination past the cap. A job object with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` reaches the whole tree in one call.
+#[cfg(windows)]
+mod windows_job {
+    use super::CacheError;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    /// `dwCreationFlags` value for `CommandExt::creation_flags`: the child's
+    /// primary thread starts suspended so `CloneJob::create_and_adopt` can
+    /// assign the process to the job before any of the child's own code --
+    /// including code that could spawn a transport grandchild -- runs.
+    pub(super) const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+    pub(super) struct CloneJob(HANDLE);
+
+    // SAFETY: a job object HANDLE has no thread affinity; the kernel object
+    // it names is safe to signal (`TerminateJobObject`) from any thread.
+    unsafe impl Send for CloneJob {}
+
+    impl Drop for CloneJob {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a live handle this struct owns exclusively.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    impl CloneJob {
+        /// Create a kill-on-close job object, assign `child` (spawned with
+        /// [`CREATE_SUSPENDED`]) to it, and resume its primary thread.
+        ///
+        /// Assignment must land before the process runs any code, or a
+        /// fast-spawning transport child could start -- inheriting no job
+        /// membership -- before this call takes effect. `std::process::Child`
+        /// does not expose the primary-thread handle `CreateProcessW`
+        /// returns (the standard library closes it, having no use for it
+        /// itself), so resuming re-finds that thread by PID through a
+        /// toolhelp snapshot instead of the handle Win32 handed back at
+        /// creation. A suspended process has not executed any code yet --
+        /// not even CRT startup -- so it owns exactly one thread; the
+        /// snapshot for this PID cannot return more than one entry.
+        pub(super) fn create_and_adopt(child: &std::process::Child) -> Result<Self, CacheError> {
+            // SAFETY: both arguments are optional-by-null per the Win32
+            // contract (no security attributes, anonymous job).
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return Err(CacheError::Git(format!(
+                    "creating clone job object: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let job = CloneJob(handle);
+
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `info` is a fully initialized (zeroed then patched)
+            // JOBOBJECT_EXTENDED_LIMIT_INFORMATION; its size matches the
+            // struct `JobObjectExtendedLimitInformation` documents.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                return Err(CacheError::Git(format!(
+                    "configuring clone job kill-on-close: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+
+            let process_handle = child.as_raw_handle() as HANDLE;
+            // SAFETY: `process_handle` is the live handle `std::process::Child`
+            // holds for the child it just spawned suspended; it stays valid
+            // for the lifetime of `child`, which outlives this call.
+            let ok = unsafe { AssignProcessToJobObject(job.0, process_handle) };
+            if ok == 0 {
+                return Err(CacheError::Git(format!(
+                    "assigning clone process to job: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+
+            resume_suspended_primary_thread(child.id())?;
+            Ok(job)
+        }
+
+        pub(super) fn terminate(&self) -> Result<(), CacheError> {
+            // SAFETY: `self.0` is a live job handle owned by this struct.
+            let ok = unsafe { TerminateJobObject(self.0, 1) };
+            if ok == 0 {
+                return Err(CacheError::Git(format!(
+                    "terminating clone job: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    fn resume_suspended_primary_thread(pid: u32) -> Result<(), CacheError> {
+        // SAFETY: `TH32CS_SNAPTHREAD` with a zero size snapshots every
+        // thread on the system; the handle is closed below.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(CacheError::Git(format!(
+                "snapshotting threads to resume clone process {pid}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut thread_id = None;
+        // SAFETY: `entry` is sized and zeroed per the Win32 contract for the
+        // first `Thread32First` call; `snapshot` is the live handle above.
+        let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+        while has_entry {
+            if entry.th32OwnerProcessID == pid {
+                thread_id = Some(entry.th32ThreadID);
+                break;
+            }
+            // SAFETY: `entry`/`snapshot` as above.
+            has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+        }
+        // SAFETY: `snapshot` is a live handle owned by this function.
+        unsafe {
+            CloseHandle(snapshot);
+        }
+
+        let thread_id = thread_id.ok_or_else(|| {
+            CacheError::Git(format!(
+                "resuming clone process {pid}: its primary thread was not found in the snapshot"
+            ))
+        })?;
+
+        // SAFETY: `thread_id` was just read from a live snapshot entry
+        // owned by `pid`.
+        let thread_handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+        if thread_handle.is_null() {
+            return Err(CacheError::Git(format!(
+                "opening clone process {pid} primary thread {thread_id}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: `thread_handle` was just opened with THREAD_SUSPEND_RESUME.
+        let result = unsafe { ResumeThread(thread_handle) };
+        let last_error = std::io::Error::last_os_error();
+        // SAFETY: closing the handle opened above.
+        unsafe {
+            CloseHandle(thread_handle);
+        }
+        if result == u32::MAX {
+            return Err(CacheError::Git(format!(
+                "resuming clone process {pid} primary thread {thread_id}: {last_error}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Retries `remove_dir_all` a few times before giving up — see
 /// crates/khive-pack-git/docs/api/cache.md#remove_dir_all_retrying.
 fn remove_dir_all_retrying(path: &Path) -> std::io::Result<()> {
@@ -873,6 +1055,26 @@ fn remove_dir_all_retrying(path: &Path) -> std::io::Result<()> {
     }
     Err(last_err.expect("loop always sets last_err before exiting"))
 }
+
+/// How long the clone-size monitor sleeps between polls, given how long the
+/// previous `dir_size` walk itself took. Never shorter than
+/// `CLONE_SIZE_POLL_INTERVAL`, and long enough that the walk cannot occupy
+/// more than a fifth of the loop's wall-clock time on a large or entry-heavy
+/// clone tree.
+fn poll_sleep_duration(walk_elapsed: Duration) -> Duration {
+    CLONE_SIZE_POLL_INTERVAL.max(walk_elapsed.saturating_mul(4))
+}
+
+/// Cross-platform handle for whatever isolation mechanism keeps a clone's
+/// transport/`index-pack` descendants reachable from a single stop signal.
+/// Unix isolates via `process_group`, so `child.id()` alone is enough to
+/// reach the whole tree (see `terminate_clone`) and this carries nothing.
+/// Windows has no process-group equivalent for `Command`, so this carries
+/// the job object every descendant is assigned into (`windows_job`).
+#[cfg(windows)]
+type CloneIsolation = windows_job::CloneJob;
+#[cfg(not(windows))]
+type CloneIsolation = ();
 
 /// `-c maintenance.auto=false` on every clone/fetch into a cache slot: git
 /// can otherwise spawn a detached background maintenance child that mutates
@@ -915,16 +1117,40 @@ fn clone(url: &str, dest: &Path, cap: u64) -> Result<(), CacheError> {
         // the cap can stop the entire transfer, not merely its direct shell.
         command.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Held suspended until `CloneIsolation::adopt_suspended` assigns the
+        // process to a job object -- see that function's doc comment for why
+        // a plain post-spawn assignment races a fast-spawning transport
+        // child.
+        command.creation_flags(windows_job::CREATE_SUSPENDED);
+    }
 
     let mut child = command
         .spawn()
         .map_err(|e| CacheError::Git(format!("spawning git clone: {e}")))?;
+
+    #[cfg(windows)]
+    let isolation = match windows_job::CloneJob::create_and_adopt(&child) {
+        Ok(job) => job,
+        Err(e) => {
+            // The child is still suspended and has run no code; a plain kill
+            // (no job needed, since nothing was assigned to one) is enough.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    #[cfg(not(windows))]
+    let isolation: CloneIsolation = ();
+
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(e) => {
-                terminate_clone(&mut child)?;
+                terminate_clone(&mut child, &isolation)?;
                 return Err(CacheError::Git(format!(
                     "waiting for git clone {:?}: {e}",
                     redact_repo_url(url)
@@ -932,21 +1158,23 @@ fn clone(url: &str, dest: &Path, cap: u64) -> Result<(), CacheError> {
             }
         }
 
+        let walk_start = std::time::Instant::now();
         let size = match dir_size(dest) {
             Ok(size) => size,
             // Git creates the destination itself; it is legitimately absent
             // for the first few polls after spawn.
             Err(CacheError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => {
-                terminate_clone(&mut child)?;
+                terminate_clone(&mut child, &isolation)?;
                 return Err(e);
             }
         };
+        let walk_elapsed = walk_start.elapsed();
         if size > cap {
-            terminate_clone(&mut child)?;
+            terminate_clone(&mut child, &isolation)?;
             return Err(CacheError::CloneTooLarge { bytes: size, cap });
         }
-        std::thread::sleep(CLONE_SIZE_POLL_INTERVAL);
+        std::thread::sleep(poll_sleep_duration(walk_elapsed));
     };
     if !status.success() {
         return Err(CacheError::Git(format!(
@@ -959,7 +1187,13 @@ fn clone(url: &str, dest: &Path, cap: u64) -> Result<(), CacheError> {
 
 /// Stop and reap an in-flight clone. On Unix the child is its own process
 /// group, so the signal also reaches transport and index-pack descendants.
-fn terminate_clone(child: &mut std::process::Child) -> Result<(), CacheError> {
+/// On Windows `isolation` is the job object every descendant was assigned
+/// into at spawn time; closing it (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`)
+/// reaches the same tree the process-group signal reaches on Unix.
+fn terminate_clone(
+    child: &mut std::process::Child,
+    #[cfg_attr(not(windows), allow(unused_variables))] isolation: &CloneIsolation,
+) -> Result<(), CacheError> {
     #[cfg(unix)]
     let kill_result = {
         let pid = child.id();
@@ -978,7 +1212,9 @@ fn terminate_clone(child: &mut std::process::Child) -> Result<(), CacheError> {
             }
         }
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let kill_result = isolation.terminate();
+    #[cfg(not(any(unix, windows)))]
     let kill_result = child.kill();
 
     // Always attempt to reap, including when the process exited between the
@@ -1844,6 +2080,39 @@ mod tests {
         assert!(
             fresh_trash.is_dir(),
             "fresh trash residue is protected by the age fence"
+        );
+    }
+
+    /// A cheap walk (well under the floor) must not shrink the sleep below
+    /// `CLONE_SIZE_POLL_INTERVAL` -- a fast `dir_size` on a small clone keeps
+    /// polling at the same cadence it always has.
+    #[test]
+    fn poll_sleep_duration_floors_at_the_configured_interval() {
+        assert_eq!(
+            poll_sleep_duration(Duration::from_micros(1)),
+            CLONE_SIZE_POLL_INTERVAL
+        );
+        assert_eq!(
+            poll_sleep_duration(Duration::ZERO),
+            CLONE_SIZE_POLL_INTERVAL
+        );
+    }
+
+    /// Once the walk itself costs more than a quarter of the floor, the
+    /// sleep must grow past the floor and scale with the walk -- this is the
+    /// duty-cycle bound: the walk stays at or under a fifth of total loop
+    /// time even as the tree it measures grows arbitrarily large.
+    #[test]
+    fn poll_sleep_duration_grows_with_a_slow_walk() {
+        assert_eq!(
+            poll_sleep_duration(Duration::from_millis(100)),
+            Duration::from_millis(400)
+        );
+        let slower = poll_sleep_duration(Duration::from_millis(200));
+        let faster = poll_sleep_duration(Duration::from_millis(100));
+        assert!(
+            slower > faster,
+            "a slower previous walk must yield a longer next sleep: {slower:?} vs {faster:?}"
         );
     }
 

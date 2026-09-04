@@ -40,6 +40,41 @@ fn list_items(response: &Value) -> &[Value] {
         .expect("list response must contain an items array")
 }
 
+/// The exact value a logged `gh` invocation line passed after `--repo`, or
+/// `None` if the line has no `--repo` flag. Whitespace-tokenized rather than
+/// substring-matched: `line.contains("--repo fixture/repository")` also
+/// matches `--repo fixture/repository-evil` or `--repo
+/// not-fixture/repository`, so a probe that silently widened past the
+/// pinned repository would still read as passing.
+fn repo_flag_value(line: &str) -> Option<&str> {
+    let mut tokens = line.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--repo" {
+            return tokens.next();
+        }
+    }
+    None
+}
+
+#[test]
+fn repo_flag_value_rejects_a_value_that_merely_contains_the_pinned_repo() {
+    assert_eq!(
+        repo_flag_value("pr list --repo fixture/repository --state all"),
+        Some("fixture/repository")
+    );
+    assert_ne!(
+        repo_flag_value("pr list --repo fixture/repository-evil --state all"),
+        Some("fixture/repository"),
+        "a --repo value that merely contains the pinned repo string must not read as a match"
+    );
+    assert_ne!(
+        repo_flag_value("pr list --repo not-fixture/repository --state all"),
+        Some("fixture/repository"),
+        "a --repo value containing the pinned repo string as a suffix must not read as a match"
+    );
+    assert_eq!(repo_flag_value("pr list --state all"), None);
+}
+
 /// `PATH` (and, transitively, which `gh`/`git` binaries `Command::new` resolves
 /// to) is process-global state. Every test that calls `run_ingest` — whether
 /// or not it installs a fake `gh` fixture — must serialize on this mutex, or a
@@ -6822,11 +6857,11 @@ esac
         "the probe must never delegate repository selection to gh: {lines:?}"
     );
     for line in lines.iter().skip(1) {
-        assert!(
-            line.contains("--repo fixture/repository"),
-            "every list call must retain the source-bound repo: {line:?}"
+        assert_eq!(
+            repo_flag_value(line),
+            Some("fixture/repository"),
+            "every list call must retain the source-bound repo, exactly: {line:?}"
         );
-        assert!(!line.contains("alternate/wrong-repository"), "{line:?}");
     }
 }
 

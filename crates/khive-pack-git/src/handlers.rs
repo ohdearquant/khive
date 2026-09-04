@@ -158,10 +158,25 @@ impl GitPack {
             DigestSource::Local(p) => (p.clone(), None),
             DigestSource::Remote { canonical, gh_slug } => {
                 let repo = if include.commits {
-                    cache::ensure_clone(canonical).map_err(|e| RuntimeError::RemoteFetchError {
-                        remote: redact_repo_url(canonical),
-                        message: e.to_string(),
-                    })?
+                    // `ensure_clone` shells out to `git clone`/`git fetch` and
+                    // blocks the calling thread on the clone-size monitor
+                    // loop (`cache::clone`) for as long as the transfer runs
+                    // -- on a Tokio worker thread that starves every other
+                    // task scheduled there, so the blocking span moves to a
+                    // dedicated thread (same pattern as
+                    // `source::local_origin_remote_url`).
+                    let redacted = redact_repo_url(canonical);
+                    let canonical = canonical.clone();
+                    tokio::task::spawn_blocking(move || cache::ensure_clone(&canonical))
+                        .await
+                        .map_err(|e| RuntimeError::RemoteFetchError {
+                            remote: redacted.clone(),
+                            message: format!("clone task panicked or was cancelled: {e}"),
+                        })?
+                        .map_err(|e| RuntimeError::RemoteFetchError {
+                            remote: redacted,
+                            message: e.to_string(),
+                        })?
                 } else {
                     std::env::current_dir().map_err(|e| {
                         RuntimeError::InvalidInput(format!(
