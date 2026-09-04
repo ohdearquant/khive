@@ -2574,6 +2574,14 @@ pub fn validate_reindex_db_target_with_source(
             continue;
         };
         if canonical_path_no_side_effects(&khive_runtime::expand_tilde(path))? == target {
+            if backend.read_only {
+                anyhow::bail!(
+                    "kkernel reindex database target {db_target:?} matches declared backend \
+                     {name:?}, which is read_only; reindex always writes, so a read-only \
+                     backend cannot be reindexed.{source_suffix}",
+                    name = backend.name,
+                );
+            }
             return Ok(());
         }
     }

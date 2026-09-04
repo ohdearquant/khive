@@ -1412,6 +1412,36 @@ path = "{}"
         (config, main, knowledge)
     }
 
+    /// One writable `main` backend plus one `read_only = true` `archive`
+    /// backend, so a reindex validator test can assert the read-only path is
+    /// refused while the writable path (the control) still passes.
+    fn write_read_only_backend_test_config(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        let main = dir.join("main.db");
+        let archive = dir.join("archive.db");
+        let config = dir.join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "archive"
+kind = "sqlite"
+path = "{}"
+read_only = true
+"#,
+                main.display(),
+                archive.display(),
+            ),
+        )
+        .expect("write read-only-backend config");
+        (config, main, archive)
+    }
+
     #[test]
     fn allocation_free_embedding_eligibility_matches_canonical_text() {
         let entities = [
@@ -2148,6 +2178,31 @@ path = "{}"
         let message = error.to_string();
         assert!(message.contains("is not a path declared in [[backends]]"));
         assert!(message.contains(&config.display().to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn read_only_declared_backend_is_refused_as_reindex_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, main, archive) = write_read_only_backend_test_config(dir.path());
+
+        // Expected before the fix: the read-only path passes the validator,
+        // since it only matched declared paths and never inspected
+        // `read_only` — reindex always writes, so that is wrong.
+        let error = validate_declared_reindex_target(archive.to_str(), Some(&config))
+            .expect_err("a backend declared read_only must never be reindexed");
+        let message = error.to_string();
+        assert!(message.contains(&archive.display().to_string()));
+        assert!(message.contains("read_only"));
+
+        // Control: the writable backend in the same config still passes.
+        validate_declared_reindex_target(main.to_str(), Some(&config))
+            .expect("a writable declared backend remains a valid reindex target");
+
+        // Control: an undeclared path is still refused as before.
+        let wrong = dir.path().join("typo.db");
+        validate_declared_reindex_target(wrong.to_str(), Some(&config))
+            .expect_err("an undeclared target must never be reindexed");
     }
 
     #[test]

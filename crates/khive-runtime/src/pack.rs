@@ -3380,6 +3380,28 @@ impl std::fmt::Display for PackLoadError {
 
 impl std::error::Error for PackLoadError {}
 
+/// Reject a declared pack whose runtime contributes no [`Visibility::Verb`]
+/// handlers unless its factory explicitly opts out via
+/// [`PackFactory::intentionally_verbless`].
+fn check_pack_has_public_verbs(
+    factory: &dyn PackFactory,
+    install: &PackInstall,
+    name: &str,
+) -> Result<(), PackLoadError> {
+    if !factory.intentionally_verbless()
+        && !install
+            .runtime
+            .handlers()
+            .iter()
+            .any(|handler| matches!(handler.visibility, Visibility::Verb))
+    {
+        return Err(PackLoadError::NoPublicVerbs {
+            pack: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Registry of pack factories discovered via `inventory` at link time.
 ///
 /// No instance is needed — all methods are associated functions that walk the
@@ -3446,15 +3468,7 @@ impl PackRegistry {
         for name in names {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
             let install = factory.create_install(runtime.clone());
-            if !factory.intentionally_verbless()
-                && !install
-                    .runtime
-                    .handlers()
-                    .iter()
-                    .any(|handler| matches!(handler.visibility, Visibility::Verb))
-            {
-                return Err(PackLoadError::NoPublicVerbs { pack: name.clone() });
-            }
+            check_pack_has_public_verbs(factory, &install, name)?;
             if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
                 install
                     .runtime
@@ -3519,15 +3533,7 @@ impl PackRegistry {
                 .cloned()
                 .unwrap_or_else(|| default_runtime.clone());
             let install = factory.create_install(runtime);
-            if !factory.intentionally_verbless()
-                && !install
-                    .runtime
-                    .handlers()
-                    .iter()
-                    .any(|handler| matches!(handler.visibility, Visibility::Verb))
-            {
-                return Err(PackLoadError::NoPublicVerbs { pack: name.clone() });
-            }
+            check_pack_has_public_verbs(factory, &install, name)?;
             if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
                 install
                     .runtime
