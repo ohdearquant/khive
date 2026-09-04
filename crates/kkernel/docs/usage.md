@@ -278,20 +278,20 @@ kkernel reindex --db ~/.khive/khive.db --namespace khive
 kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only section embeddings
 ```
 
-| Flag               | Effect                                                                          |
-| ------------------ | ------------------------------------------------------------------------------- |
+| Flag               | Effect                                                                              |
+| ------------------ | ----------------------------------------------------------------------------------- |
 | `--db <path>`      | database (env `KHIVE_DB`); with `[[backends]]`, must match one declared SQLite path |
-| `--config <path>`  | khive TOML config (env `KHIVE_CONFIG`) — resolves engines like `kkernel mcp`    |
-| `--knowledge-only` | only the knowledge corpus (skip entities/notes)                                 |
-| `--no-knowledge`   | only entities/notes (skip knowledge)                                            |
-| `--no-sections`    | within the knowledge pass, embed atoms but skip section embeddings (ADR-051)    |
-| `--sections-only`  | embed only knowledge sections (skip entities/notes and atoms)                   |
-| `--model <name>`   | entities/notes use this single engine instead of fanning out                    |
-| `--keep-existing`  | skip records already embedded (incremental top-up) instead of replacing them    |
-| `--batch-size <n>` | records per embedding batch (default 128, max 500)                              |
-| `--best-effort`    | downgrade partial failures to a warning and still exit 0 (default fails closed) |
-| `--rebuild-fts`    | rebuild + rank-1 integrity-check both global knowledge FTS indexes (see below)  |
-| `--human`          | readable report instead of JSON                                                 |
+| `--config <path>`  | khive TOML config (env `KHIVE_CONFIG`) — resolves engines like `kkernel mcp`        |
+| `--knowledge-only` | only the knowledge corpus (skip entities/notes)                                     |
+| `--no-knowledge`   | only entities/notes (skip knowledge)                                                |
+| `--no-sections`    | within the knowledge pass, embed atoms but skip section embeddings (ADR-051)        |
+| `--sections-only`  | embed only knowledge sections (skip entities/notes and atoms)                       |
+| `--model <name>`   | entities/notes use this single engine instead of fanning out                        |
+| `--keep-existing`  | skip records already embedded (incremental top-up) instead of replacing them        |
+| `--batch-size <n>` | records per embedding batch (default 128, max 500)                                  |
+| `--best-effort`    | downgrade partial failures to a warning and still exit 0 (default fails closed)     |
+| `--rebuild-fts`    | rebuild + rank-1 integrity-check both global knowledge FTS indexes (see below)      |
+| `--human`          | readable report instead of JSON                                                     |
 
 There is no `--embeds-only`, `--ids`, or `--dry-run` mode. `--keep-existing` narrows
 vector work to missing records, but the selected graph pass still backfills FTS.
