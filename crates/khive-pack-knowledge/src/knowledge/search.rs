@@ -599,15 +599,21 @@ async fn advance_ann_test_deadline_after_round(completed_rounds: usize) {
     }
 }
 
-/// Test-only fault injection for a single refill round's hydration call,
-/// modeling a hydration query timing out mid-refill (issue #2312): every
-/// shell in that round is dropped, exactly like `hydrate_empty_hits`'s own
-/// reader-acquisition-failure branch, without needing a real storage-layer
-/// fault. Scoped the same way as `ANN_TEST_DEADLINE_ADVANCE`.
+/// Test-only fault injection for the hydrator's storage read, modeling a
+/// hydration query timing out mid-refill (issue #2312). Scoped the same way
+/// as `ANN_TEST_DEADLINE_ADVANCE`, and consulted from inside
+/// `hydrate_empty_hits` itself rather than the refill loop: the fault
+/// substitutes a synthetic `StorageError::Timeout` for the reader
+/// acquisition, so the failure count and the shell-stripping a real
+/// reader-acquisition failure would produce come from that function's own
+/// error-handling branch, not a duplicate of it. `on_or_after_call` is a
+/// threshold, not a single round: once the fault activates it stays active
+/// for every later call in the same scope, so a test can model a hydration
+/// fault that keeps recurring across the remaining refill rounds.
 #[cfg(test)]
-#[derive(Clone, Copy)]
 struct HydrationTestFault {
-    on_round: usize,
+    on_or_after_call: usize,
+    calls: std::cell::Cell<usize>,
 }
 
 #[cfg(test)]
@@ -616,19 +622,31 @@ tokio::task_local! {
 }
 
 #[cfg(test)]
-pub(crate) async fn scope_hydration_test_fault<F>(on_round: usize, future: F) -> F::Output
+pub(crate) async fn scope_hydration_test_fault<F>(on_or_after_call: usize, future: F) -> F::Output
 where
     F: std::future::Future,
 {
     HYDRATION_TEST_FAULT
-        .scope(HydrationTestFault { on_round }, future)
+        .scope(
+            HydrationTestFault {
+                on_or_after_call,
+                calls: std::cell::Cell::new(0),
+            },
+            future,
+        )
         .await
 }
 
+/// Called once per `hydrate_empty_hits` invocation with non-empty ids, in
+/// call order. Returns whether this call should fail.
 #[cfg(test)]
-fn hydration_test_fault_due(round: usize) -> bool {
+fn hydration_test_fault_due_this_call() -> bool {
     HYDRATION_TEST_FAULT
-        .try_with(|control| control.on_round == round)
+        .try_with(|control| {
+            let call = control.calls.get() + 1;
+            control.calls.set(call);
+            call >= control.on_or_after_call
+        })
         .unwrap_or(false)
 }
 
@@ -1234,7 +1252,18 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
     }
 
     let sql = runtime.sql();
-    let mut reader = match sql.reader().await {
+    #[cfg(test)]
+    let reader_result = if hydration_test_fault_due_this_call() {
+        Err(khive_storage::StorageError::Timeout {
+            operation: "knowledge candidate hydration (test fault)".into(),
+        })
+    } else {
+        sql.reader().await
+    };
+    #[cfg(not(test))]
+    let reader_result = sql.reader().await;
+
+    let mut reader = match reader_result {
         Ok(r) => r,
         Err(error) => {
             tracing::warn!(
@@ -1447,22 +1476,28 @@ async fn search_eligible_ann_with_refill(
     let target_eligible = target_eligible.max(1);
     let mut request_k = initial_k.max(target_eligible).max(1);
 
-    // Carries the most recently completed round's eligible hits so a
-    // deadline expiry mid-refill can return them instead of discarding
-    // real, already-computed results (issue #2312).
-    let mut last_round = EligibleAnnSearchState {
-        hits: Vec::new(),
-        availability: None,
-        hydration_failures: 0,
-        timed_out: false,
-    };
+    // Every hit that has hydrated successfully in ANY completed round so
+    // far, keyed by id. A round whose hydration fails for a reason other
+    // than the deadline (a faulted or genuinely errored storage read, a
+    // stale ANN id) contributes no entries here and therefore can never
+    // evict an id an earlier round already placed in the accumulator — only
+    // a fresh hydration of the same id overwrites its predecessor (issue
+    // #2312). The deadline branch below is the only reader; the
+    // target-reached and source-exhausted branches keep returning that
+    // round's own hits, unaffected by this bookkeeping.
+    let mut accumulated_hits: HashMap<String, ScoredHit> = HashMap::new();
+    let mut accumulated_hydration_failures = 0usize;
     #[cfg(test)]
     let mut completed_rounds = 0usize;
 
     loop {
         if khive_storage::ensure_request_read_active("knowledge.search").is_err() {
-            last_round.timed_out = true;
-            return last_round;
+            return finalize_timed_out_refill(
+                accumulated_hits,
+                None,
+                accumulated_hydration_failures,
+                target_eligible,
+            );
         }
         let AnnSearchState {
             hits: raw_hits,
@@ -1487,17 +1522,7 @@ async fn search_eligible_ann_with_refill(
             })
             .collect();
 
-        #[cfg(test)]
-        let faulted_this_round = hydration_test_fault_due(completed_rounds + 1);
-        #[cfg(not(test))]
-        let faulted_this_round = false;
-        let hydration_failures = if faulted_this_round {
-            let failed = hits.len();
-            hits.clear();
-            failed
-        } else {
-            hydrate_empty_hits(runtime, ctx.ns, &mut hits).await
-        };
+        let hydration_failures = hydrate_empty_hits(runtime, ctx.ns, &mut hits).await;
         #[cfg(test)]
         {
             completed_rounds += 1;
@@ -1508,31 +1533,22 @@ async fn search_eligible_ann_with_refill(
         filter_hits_by_status(&mut hits, ctx.statuses, ctx.exclude_statuses);
         filter_hits_by_type(&mut hits, ctx.type_filter);
 
+        // On a duplicate id the most recently hydrated round wins: ids are
+        // re-read from the canonical store every round, so a later round's
+        // copy is the freshest metadata for that id (ANN scores are
+        // deterministic per id, so ranking is unaffected either way).
+        for hit in &hits {
+            accumulated_hits.insert(hit.id.clone(), hit.clone());
+        }
+        accumulated_hydration_failures += hydration_failures;
+
         if deadline_expired {
-            // A hydration timeout on this round may have stripped shells this
-            // round even hydrated fine in `last_round`. Union the two sets —
-            // `last_round` takes precedence for duplicate ids since it is a
-            // fully completed, already-vetted round — so a late-round
-            // hydration timeout never discards eligible hits a prior round
-            // already produced (issue #2312).
-            let mut merged = last_round.hits;
-            let carried_over: HashSet<String> = merged.iter().map(|hit| hit.id.clone()).collect();
-            merged.extend(
-                hits.into_iter()
-                    .filter(|hit| !carried_over.contains(&hit.id)),
+            return finalize_timed_out_refill(
+                accumulated_hits,
+                Some(availability),
+                accumulated_hydration_failures,
+                target_eligible,
             );
-            merged.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            merged.truncate(target_eligible);
-            return EligibleAnnSearchState {
-                hits: merged,
-                availability: Some(availability),
-                hydration_failures: hydration_failures + last_round.hydration_failures,
-                timed_out: true,
-            };
         }
 
         if hits.len() >= target_eligible || source_exhausted {
@@ -1545,24 +1561,65 @@ async fn search_eligible_ann_with_refill(
             };
         }
 
-        last_round = EligibleAnnSearchState {
-            hits,
-            availability: Some(availability),
-            hydration_failures,
-            timed_out: false,
-        };
-
         // The live vector-store count is not a sound upper bound for a serving
         // bridge: a fresh delete removes the canonical vector before its tail
         // tombstone is merged into that older bridge. Widen until the ANN
         // source itself proves exhaustion.
         let next_k = request_k.saturating_mul(2);
         if next_k == request_k {
-            last_round.hits.truncate(target_eligible);
-            return last_round;
+            hits.truncate(target_eligible);
+            return EligibleAnnSearchState {
+                hits,
+                availability: Some(availability),
+                hydration_failures,
+                timed_out: false,
+            };
         }
         request_k = next_k;
     }
+}
+
+/// Build the deadline-expiry return value for `search_eligible_ann_with_refill`
+/// from every hit accumulated across all completed rounds.
+fn finalize_timed_out_refill(
+    accumulated_hits: HashMap<String, ScoredHit>,
+    availability: Option<AnnAvailability>,
+    hydration_failures: usize,
+    target_eligible: usize,
+) -> EligibleAnnSearchState {
+    let hits = top_n_by_score(accumulated_hits.into_values().collect(), target_eligible);
+    EligibleAnnSearchState {
+        hits,
+        availability,
+        hydration_failures,
+        timed_out: true,
+    }
+}
+
+/// Select the top `n` hits by descending score without sorting the whole
+/// batch (issue #2312): `select_nth_unstable_by` partitions the top `n` in
+/// O(len) average instead of the O(len log len) a full sort would cost, and
+/// only the kept prefix — at most `n` elements — is sorted afterward, so the
+/// discarded tail never pays for either comparison or allocation beyond the
+/// initial partition.
+fn top_n_by_score(mut hits: Vec<ScoredHit>, n: usize) -> Vec<ScoredHit> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if hits.len() > n {
+        hits.select_nth_unstable_by(n - 1, |a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(n);
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits
 }
 
 /// Run the query-embedding and eligible ANN candidate leg with the handler's
@@ -3524,6 +3581,89 @@ mod tests {
         rt
     }
 
+    // Embedder for the 3-round accumulator test below: content containing
+    // `KEEP_ANCHOR_MARKER` embeds to exactly the query vector (similarity 1.0),
+    // everything else embeds to a vector with zero dot product against it
+    // (similarity 0.0). This keeps the 2 "keep" atoms deterministically ahead
+    // of every "noise" atom in ANN rank regardless of corpus size or widening
+    // round, which a shared constant embedding cannot guarantee once a round
+    // requests fewer than the full corpus.
+    const KEEP_ANCHOR_MARKER: &str = "keep-anchor-marker";
+
+    struct MarkerEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for MarkerEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if text.contains(KEEP_ANCHOR_MARKER) {
+                        vec![1.0f32; REFILL_TEST_DIM]
+                    } else {
+                        (0..REFILL_TEST_DIM)
+                            .map(|i| if i % 2 == 0 { 1.0f32 } else { -1.0f32 })
+                            .collect()
+                    }
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "marker-refill-test"
+        }
+    }
+
+    struct MarkerEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for MarkerEmbeddingProvider {
+        fn name(&self) -> &str {
+            REFILL_TEST_MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            REFILL_TEST_DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(std::sync::Arc::new(MarkerEmbeddingService))
+        }
+    }
+
+    fn runtime_with_marker_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
+            db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        rt.register_embedder(MarkerEmbeddingProvider);
+        rt
+    }
+
     /// A hydration timeout on a later refill round must not discard eligible
     /// hits an earlier round already completed and hydrated (issue #2312).
     ///
@@ -3645,6 +3785,222 @@ mod tests {
         assert!(
             slugs.contains("refill-keep-a") && slugs.contains("refill-keep-b"),
             "the surviving hits must be round 1's real, hydrated atoms: {slugs:?}"
+        );
+        // Round 1's 2 stale ids plus round 2's 4 faulted shells (the hook
+        // fails the whole hydrator call, not just the previously-unresolved
+        // ids) — asserted here because the fault now runs through
+        // `hydrate_empty_hits`'s own reader-acquisition-failure branch
+        // (issue #2312) and this is that branch's own failure count.
+        assert_eq!(
+            result.hydration_failures, 6,
+            "expected round 1's 2 stale-id failures plus round 2's 4 \
+             fault-injected failures, got {}",
+            result.hydration_failures
+        );
+    }
+
+    /// A non-deadline hydration failure sandwiched between two rounds must
+    /// not evict a hit an earlier round already accumulated, even when a
+    /// *third* round is the one that finally hits the deadline (issue
+    /// #2312). This is the scenario the single-round-back `last_round` fix
+    /// missed: round 1 hydrates 2 real hits; round 2's hydration fails for a
+    /// reason unrelated to the deadline (the fault hook, sticky from this
+    /// call onward — see `HydrationTestFault`); round 3 also fails hydration
+    /// and is the round whose read the deadline expires under. Only the
+    /// accumulator carried across all 3 rounds can supply round 1's hits at
+    /// that point, since round 2 and round 3 both contribute nothing.
+    ///
+    /// Pre-fix, `last_round` is overwritten by round 2's own (empty) state
+    /// before round 3 ever runs, so the deadline branch has nothing left to
+    /// union with round 3's (also empty) hits: this assertion would see 0
+    /// hits, not 2.
+    #[tokio::test(start_paused = true)]
+    async fn ann_refill_survives_a_non_deadline_failure_between_two_good_rounds() {
+        let runtime = runtime_with_marker_embedder();
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local token");
+
+        let mut atoms = vec![
+            json!({
+                "slug": "refill3-keep-a",
+                "name": "Refill3 Keep A",
+                "finalized": true,
+                "content": format!(
+                    "{KEEP_ANCHOR_MARKER} refill regression corpus entry keep alpha padding \
+                     words to satisfy the minimum content length validation rule enforced \
+                     for every atom record in this suite"
+                ),
+            }),
+            json!({
+                "slug": "refill3-keep-b",
+                "name": "Refill3 Keep B",
+                "finalized": true,
+                "content": format!(
+                    "{KEEP_ANCHOR_MARKER} refill regression corpus entry keep beta padding \
+                     words to satisfy the minimum content length validation rule enforced \
+                     for every atom record in this suite"
+                ),
+            }),
+        ];
+        for i in 0..10 {
+            atoms.push(json!({
+                "slug": format!("refill3-noise-{i:02}"),
+                "name": format!("Refill3 Noise {i:02}"),
+                "finalized": true,
+                "content": format!(
+                    "refill regression corpus entry noise number {i} padding words to \
+                     satisfy the minimum content length validation rule enforced for every \
+                     atom record in this suite"
+                ),
+            }));
+        }
+        KnowledgeHandlers::upsert_atoms(&runtime, &token, json!({"atoms": atoms}))
+            .await
+            .expect("upsert atoms");
+
+        let ann = vamana::new_shared();
+        KnowledgeHandlers::index(&runtime, &token, json!({"rebuild_ann": true}), &ann, None)
+            .await
+            .expect("build ann index");
+
+        // The 10 noise atoms are stale ANN entries from round 1 onward — the
+        // 2 keep atoms are left live throughout, since the fault hook (not
+        // DB state) is what fails hydration for rounds 2 and 3.
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "DELETE FROM knowledge_atoms WHERE slug LIKE 'refill3-noise-%'"
+                        .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("delete noise rows");
+        }
+
+        let key = vamana::AnnKey::new("local", runtime.default_embedder_name());
+        let query_embedding = vec![1.0f32; REFILL_TEST_DIM];
+        let statuses: Vec<String> = Vec::new();
+        let exclude_statuses: Vec<&str> = Vec::new();
+        let w = Weights::default();
+        let ctx = SearchCtx {
+            runtime: &runtime,
+            ns: "local",
+            role: None,
+            type_filter: None,
+            min_score: 0.0,
+            w: &w,
+            fetch_limit: 10,
+            statuses: &statuses,
+            exclude_statuses: &exclude_statuses,
+        };
+
+        // target_eligible=6 can never actually be met (only 2 atoms are ever
+        // eligible), so the loop keeps widening — request_k goes 6 -> 12 -> 24
+        // across rounds 1-3 — until the fault-forced deadline stops it.
+        let deadline = std::time::Duration::from_millis(200);
+        let result = khive_storage::scope_request_read_deadline(
+            deadline,
+            scope_hydration_test_fault(
+                2,
+                scope_ann_test_deadline_advance(
+                    3,
+                    deadline * 2,
+                    search_eligible_ann_with_refill(
+                        &ctx,
+                        &token,
+                        &ann,
+                        &key,
+                        &query_embedding,
+                        6,
+                        4,
+                    ),
+                ),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.timed_out,
+            "the forced deadline expiry after round 3 must be reported"
+        );
+        assert_eq!(
+            result.hits.len(),
+            2,
+            "round 1's 2 hydrated hits must survive rounds 2 and 3 both \
+             failing hydration for a non-deadline reason: {:?}",
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let slugs: HashSet<&str> = result.hits.iter().map(|hit| hit.slug.as_str()).collect();
+        assert!(
+            slugs.contains("refill3-keep-a") && slugs.contains("refill3-keep-b"),
+            "the surviving hits must be round 1's real, hydrated atoms: {slugs:?}"
+        );
+    }
+
+    /// Control: with no hydration failures and no deadline expiry, the
+    /// refill loop must still return exactly the hits a single successful
+    /// round produces (issue #2312 changed the accumulation bookkeeping but
+    /// must not change this outcome).
+    #[tokio::test]
+    async fn ann_refill_with_no_failures_matches_pre_accumulator_result() {
+        let runtime = runtime_with_constant_embedder();
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local token");
+
+        KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            json!({
+                "atoms": [
+                    {"slug": "refill-nofail-a", "name": "Refill Nofail A", "finalized": true, "content": "refill regression corpus entry nofail alpha padding words to satisfy the minimum content length validation rule enforced for every atom record"},
+                    {"slug": "refill-nofail-b", "name": "Refill Nofail B", "finalized": true, "content": "refill regression corpus entry nofail beta padding words to satisfy the minimum content length validation rule enforced for every atom record"},
+                ]
+            }),
+        )
+        .await
+        .expect("upsert atoms");
+
+        let ann = vamana::new_shared();
+        KnowledgeHandlers::index(&runtime, &token, json!({"rebuild_ann": true}), &ann, None)
+            .await
+            .expect("build ann index");
+
+        let key = vamana::AnnKey::new("local", runtime.default_embedder_name());
+        let query_embedding = vec![1.0f32 / (REFILL_TEST_DIM as f32).sqrt(); REFILL_TEST_DIM];
+        let statuses: Vec<String> = Vec::new();
+        let exclude_statuses: Vec<&str> = Vec::new();
+        let w = Weights::default();
+        let ctx = SearchCtx {
+            runtime: &runtime,
+            ns: "local",
+            role: None,
+            type_filter: None,
+            min_score: 0.0,
+            w: &w,
+            fetch_limit: 10,
+            statuses: &statuses,
+            exclude_statuses: &exclude_statuses,
+        };
+
+        let result =
+            search_eligible_ann_with_refill(&ctx, &token, &ann, &key, &query_embedding, 2, 2).await;
+
+        assert!(!result.timed_out, "no deadline was ever set");
+        assert_eq!(result.hydration_failures, 0);
+        let slugs: HashSet<&str> = result.hits.iter().map(|hit| hit.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            HashSet::from(["refill-nofail-a", "refill-nofail-b"]),
+            "a failure-free refill must still return both real hits: {slugs:?}"
         );
     }
 
@@ -4121,6 +4477,57 @@ mod tests {
         for (a, b) in after.iter().zip(before.iter()) {
             assert_eq!(a.score, b.score);
         }
+    }
+
+    /// `top_n_by_score`'s partition-then-sort selection (issue #2312) must
+    /// pick the identical top set, in the identical order, as sorting the
+    /// whole batch and truncating — for a batch much larger than `n`, so the
+    /// partition step actually discards a majority of the input.
+    #[test]
+    fn top_n_by_score_matches_a_full_sort_then_truncate() {
+        let build = || -> Vec<ScoredHit> {
+            // Deterministic, non-monotonic score order so neither the input
+            // order nor a naive front-truncate could pass this by accident.
+            (0..500u32)
+                .map(|i| {
+                    let score = (i.wrapping_mul(2654435761) % 10_000) as f32 / 10_000.0;
+                    make_hit(&format!("atom-{i}"), None, score)
+                })
+                .collect()
+        };
+
+        let n = 7;
+        let expected = {
+            let mut all = build();
+            all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            all.truncate(n);
+            all.into_iter().map(|h| (h.id, h.score)).collect::<Vec<_>>()
+        };
+
+        let actual: Vec<(String, f32)> = top_n_by_score(build(), n)
+            .into_iter()
+            .map(|h| (h.id, h.score))
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "top_n_by_score must return the same top-{n} set in the same \
+             order as a full sort followed by truncate"
+        );
+    }
+
+    /// `n >= len` is the common case (small candidate pools): the whole
+    /// input survives, just sorted.
+    #[test]
+    fn top_n_by_score_with_n_at_least_len_sorts_everything() {
+        let hits = vec![
+            make_hit("low", None, 0.2),
+            make_hit("high", None, 0.9),
+            make_hit("mid", None, 0.5),
+        ];
+        let result = top_n_by_score(hits, 10);
+        let ids: Vec<&str> = result.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["high", "mid", "low"]);
     }
 
     /// Body-line metadata is best-effort: a read-deadline timeout during the
