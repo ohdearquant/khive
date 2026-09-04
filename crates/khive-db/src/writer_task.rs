@@ -58,6 +58,15 @@ use khive_storage::error::{StorageError, WriterTaskRequestState};
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, WriterAcquisitionCounters};
 
+/// Retry delays after a busy/locked `BEGIN IMMEDIATE` refusal. The operation
+/// closure remains owned by the request until one BEGIN succeeds, so these
+/// are the only retries this path may perform. Persistent contention is
+/// bounded to three total BEGIN attempts and 15 ms of explicit backoff, and
+/// the attempts together share one configured `busy_timeout` acquisition
+/// budget rather than each waiting out a full window of their own.
+const WRITER_BEGIN_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(5), Duration::from_millis(10)];
+
 /// Closure signature for a write operation executed against the writer
 /// task's dedicated connection.
 ///
@@ -375,9 +384,12 @@ where
                 }
                 Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
                     RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
-                        result: Err(StorageError::Pool {
-                            operation: commit_operation.into(),
-                            message: commit_error.to_string(),
+                        result: Err(StorageError::WriterTaskRequestFailed {
+                            request_state: WriterTaskRequestState::TransactionRolledBack,
+                            source: Box::new(StorageError::Pool {
+                                operation: commit_operation.into(),
+                                message: commit_error.to_string(),
+                            }),
                         }),
                         terminal_state: None,
                         body,
@@ -398,7 +410,10 @@ where
         Ok(Err(operation_error)) => {
             match rollback_after_failure(conn, "request operation failure") {
                 RollbackDisposition::RolledBack => ProfiledWrappedTransaction {
-                    result: Err(operation_error),
+                    result: Err(StorageError::WriterTaskRequestFailed {
+                        request_state: WriterTaskRequestState::TransactionRolledBack,
+                        source: Box::new(operation_error),
+                    }),
                     terminal_state: None,
                     body,
                     commit: Duration::ZERO,
@@ -887,9 +902,9 @@ async fn close_and_fail_queued_requests(rx: &mut mpsc::Receiver<Box<dyn AnyWrite
 }
 
 /// Drain loop: the sole caller of `BEGIN IMMEDIATE` for write traffic routed
-/// through the channel. A `BEGIN IMMEDIATE` failure replies the request's
-/// error via [`AnyWriteRequest::reply_error`] without invoking the
-/// request's closure; no retry — the connection tries fresh next request.
+/// through the channel. Busy/locked `BEGIN IMMEDIATE` refusals receive the
+/// bounded retry above before a final failure replies the request's error via
+/// [`AnyWriteRequest::reply_error`] without invoking the request's closure.
 ///
 /// A request-operation panic is contained inside the concrete
 /// [`WriteRequest<R>`] so its typed reply survives. A panic, failed rollback,
@@ -948,8 +963,76 @@ async fn run_writer_task(
                     origin,
                 );
                 let transaction_acquire_started = Instant::now();
-                let begin_outcome = conn.execute_batch("BEGIN IMMEDIATE");
+                let mut begin_attempt = 1_u32;
+                let mut retry_delays = WRITER_BEGIN_RETRY_DELAYS.into_iter();
+                let mut busy_timeout_lowered = false;
+                let begin_outcome = loop {
+                    match conn.execute_batch("BEGIN IMMEDIATE") {
+                        Ok(()) => break Ok(()),
+                        Err(error) if crate::timeout_sink::is_busy_or_locked(&error) => {
+                            // Every busy/locked refusal is counted here,
+                            // whether or not it goes on to be retried: this
+                            // is the pre-PR meaning of the counter, and the
+                            // outer match below no longer counts the final
+                            // refusal a second time.
+                            acquisition_counters.record_writer_task_begin_busy();
+                            let Some(delay) = retry_delays.next() else {
+                                break Err(error);
+                            };
+                            // The whole retry sequence shares one
+                            // `busy_timeout` budget: each SQLite attempt is
+                            // itself bounded by `busy_timeout`, so without a
+                            // shrinking budget three attempts could each
+                            // wait out a full window and multiply the
+                            // serialized writer's contention window instead
+                            // of bounding it.
+                            let remaining_budget =
+                                busy_timeout.saturating_sub(transaction_acquire_started.elapsed());
+                            if remaining_budget.is_zero() {
+                                break Err(error);
+                            }
+                            // This refusal remains pre-execution: the request
+                            // still owns its FnOnce closure and no DML has run.
+                            // Count it before sleeping so diagnostics expose
+                            // contention even while the retry is pending.
+                            acquisition_counters.record_writer_task_begin_busy_absorbed();
+                            tracing::debug!(
+                                attempt = begin_attempt,
+                                backoff_ms = delay.as_millis() as u64,
+                                budget_remaining_ms = remaining_budget.as_millis() as u64,
+                                "writer task: BEGIN IMMEDIATE refused busy; retrying before \
+                                 request execution"
+                            );
+                            if let Err(set_err) = conn.busy_timeout(remaining_budget) {
+                                tracing::warn!(
+                                    error = %set_err,
+                                    "writer task: failed to lower busy_timeout for BEGIN \
+                                     retry; retrying with the previous timeout"
+                                );
+                            } else {
+                                busy_timeout_lowered = true;
+                            }
+                            std::thread::sleep(delay);
+                            begin_attempt = begin_attempt.saturating_add(1);
+                        }
+                        Err(error) => break Err(error),
+                    }
+                };
                 let transaction_acquire = transaction_acquire_started.elapsed();
+                // Restore the pool-configured busy_timeout only if a retry
+                // actually lowered it, so the common uncontended request
+                // never pays for an extra pragma write; the next request
+                // dequeued on this same connection must still start from
+                // the full configured budget.
+                if busy_timeout_lowered {
+                    if let Err(restore_err) = conn.busy_timeout(busy_timeout) {
+                        tracing::warn!(
+                            error = %restore_err,
+                            "writer task: failed to restore busy_timeout after a BEGIN retry \
+                             sequence"
+                        );
+                    }
+                }
                 match begin_outcome {
                     Ok(()) => {
                         acquisition_counters.record_writer_task_acquisition();
@@ -969,6 +1052,7 @@ async fn run_writer_task(
                         // failed.
                         tracing::warn!(
                             error = %e,
+                            attempts = begin_attempt,
                             "writer task: BEGIN IMMEDIATE failed; replying an \
                              error without running the request's operation"
                         );
@@ -977,18 +1061,15 @@ async fn run_writer_task(
                         // it before waking the caller for the same reply-side
                         // lifecycle guarantee as successful requests (#1790).
                         drop(tx_span);
-                        // Count the refusal the caller is about to be told
-                        // about. Classify by matching the value the shared
-                        // classifier returned, never by re-testing `e`: a
-                        // second copy of the busy rule here could drift from
-                        // the error actually replied, and the counter would
-                        // then disagree with the caller's own experience.
+                        // A busy/locked refusal was already counted inside
+                        // the retry loop above, including this final one —
+                        // classifying and counting it again here would
+                        // double it. Only a non-busy BEGIN failure (which
+                        // never enters the retry loop's busy arm) still
+                        // needs its counter recorded at this seam.
                         let begin_error = writer_task_begin_error(e, busy_timeout);
-                        match &begin_error {
-                            StorageError::WriterTaskBusy { .. } => {
-                                acquisition_counters.record_writer_task_begin_busy()
-                            }
-                            _ => acquisition_counters.record_writer_task_begin_error(),
+                        if !matches!(&begin_error, StorageError::WriterTaskBusy { .. }) {
+                            acquisition_counters.record_writer_task_begin_error();
                         }
                         sealed::Sealed::reply_error_after_begin(
                             request,
@@ -1072,7 +1153,7 @@ mod tests {
     }
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Wake, Waker};
@@ -1387,14 +1468,100 @@ mod tests {
 
     // `#[serial(tx_registry)]`: same rationale as
     // `begin_immediate_failure_replies_error_without_running_op`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(tx_registry)]
+    async fn transient_begin_contention_clears_within_budget_and_op_runs_once() {
+        // Hold a real SQLite write lock for a fixed, short delay — well
+        // inside the configured busy_timeout — so SQLite's own internal
+        // busy-handler wait absorbs the contention transparently within a
+        // single `BEGIN IMMEDIATE` call. This is the common case the
+        // shared retry budget (exercised by
+        // `begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention`
+        // below) must not regress: recovery inside one busy_timeout window
+        // should never touch the Rust-level retry loop or its counters.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_begin_transient_contention.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            busy_timeout: Duration::from_millis(500),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+        let lock_holder = pool.try_writer().unwrap();
+        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let op_runs = Arc::new(AtomicUsize::new(0));
+        let op_runs_in_request = Arc::clone(&op_runs);
+        let send_future = handle.send(move |conn| {
+            op_runs_in_request.fetch_add(1, Ordering::SeqCst);
+            conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                .map_err(|error| StorageError::Pool {
+                    operation: "test_insert_after_transient_contention".into(),
+                    message: error.to_string(),
+                })
+        });
+        let release_future = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+        };
+        let (result, ()) = tokio::join!(send_future, release_future);
+
+        assert_eq!(
+            result.expect("BEGIN IMMEDIATE succeeds once the transient lock clears"),
+            1
+        );
+        assert_eq!(
+            op_runs.load(Ordering::SeqCst),
+            1,
+            "the FnOnce request closure must execute exactly once"
+        );
+
+        let settled = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            settled.writer_task_begin_busy, 0,
+            "contention absorbed inside SQLite's own busy_timeout wait must never \
+             surface as a Rust-level refusal"
+        );
+        assert_eq!(settled.writer_task_begin_busy_absorbed, 0);
+        let reader = pool.reader().unwrap();
+        let rows: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "exactly one closure execution commits one row");
+    }
+
+    // `#[serial(tx_registry)]`: same rationale as
+    // `begin_immediate_failure_replies_error_without_running_op`.
     #[tokio::test]
     #[serial(tx_registry)]
-    async fn contended_begin_increments_its_own_failure_counter() {
-        // Real contention, same construction as the test above: a refused
-        // write must be COUNTED, not merely reported to its caller. Before
-        // this counter, `db_diagnostics` showed a clean writer while requests
-        // were being refused after a full busy timeout, so an operator could
-        // not distinguish this daemon from one that had never refused a write.
+    async fn contended_begin_exhaustion_separates_absorbed_and_surfaced_refusals() {
+        // Real contention: a refused write must be COUNTED, not merely
+        // reported to its caller. Before this counter, `db_diagnostics`
+        // showed a clean writer while requests were being refused after a
+        // full busy timeout, so an operator could not distinguish this
+        // daemon from one that had never refused a write.
+        //
+        // The lock is held continuously for the whole request, so SQLite's
+        // own busy handler already spends the entire configured
+        // `busy_timeout` internally before this call returns BUSY — the
+        // shared retry budget introduced to bound total acquisition time to
+        // one window (see `begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention`)
+        // is therefore already spent the instant this first refusal
+        // surfaces, and no further attempt is retried. Real, sustained
+        // contention against a single busy_timeout window can only ever
+        // produce exactly one busy refusal and zero absorbed ones; a
+        // multi-refusal absorbed sequence requires a refusal shape that
+        // returns before the timeout elapses (for example SQLITE_LOCKED),
+        // which this integration test cannot reproduce deterministically.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_task_begin_busy_counter.db");
         let cfg = PoolConfig {
@@ -1418,6 +1585,7 @@ mod tests {
             before.writer_task_begin_busy, 0,
             "baseline: nothing has been refused yet"
         );
+        assert_eq!(before.writer_task_begin_busy_absorbed, 0);
 
         let lock_holder = pool.try_writer().unwrap();
         lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -1439,7 +1607,12 @@ mod tests {
         let after = pool.writer_acquisition_snapshot();
         assert_eq!(
             after.writer_task_begin_busy, 1,
-            "the refusal the caller was told about must appear in the counters"
+            "the single refusal the caller was told about must still be counted"
+        );
+        assert_eq!(
+            after.writer_task_begin_busy_absorbed, 0,
+            "a refusal that already spent the whole shared budget waiting out \
+             SQLite's own busy handler must not be retried, so nothing is absorbed"
         );
         assert_eq!(
             after.writer_task_begin_errors, 0,
@@ -1472,10 +1645,82 @@ mod tests {
             settled.writer_task_begin_busy, 1,
             "a successful request must leave the refusal counter untouched"
         );
+        assert_eq!(
+            settled.writer_task_begin_busy_absorbed, 0,
+            "an uncontended request must not move the absorbed counter"
+        );
         assert!(
             settled.writer_task_acquisitions > after.writer_task_acquisitions,
             "and it must still register as a success"
         );
+    }
+
+    // `#[serial(tx_registry)]`: same rationale as
+    // `begin_immediate_failure_replies_error_without_running_op`.
+    #[tokio::test]
+    #[serial(tx_registry)]
+    async fn begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention() {
+        // Before this fix, three BEGIN attempts each ran under their own
+        // full `busy_timeout`, so persistent contention could hold the
+        // serialized writer for roughly three windows plus the 15 ms of
+        // explicit backoff. A held writer lock that is never released for
+        // the life of this test reproduces that persistent contention:
+        // total time from send to the final refusal must stay within one
+        // busy_timeout window plus the sleeps, not three.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_begin_retry_budget.db");
+        let busy_timeout = Duration::from_millis(150);
+        let cfg = PoolConfig {
+            path: Some(path),
+            busy_timeout,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+
+        let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
+        let lock_holder = pool.try_writer().unwrap();
+        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let result = handle
+            .send(|conn| {
+                conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_insert".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await;
+
+        assert!(
+            matches!(&result, Err(StorageError::WriterTaskBusy { .. })),
+            "precondition: the request must actually be refused busy, got {result:?}"
+        );
+        // Against a lock that is never released, SQLite's busy handler spends
+        // the whole configured window inside the first `BEGIN IMMEDIATE`, so
+        // the shared budget is exhausted the moment that refusal surfaces:
+        // exactly one attempt is made and nothing is absorbed. Three
+        // unbounded attempts would have recorded two absorbed refusals and
+        // waited roughly three windows. The attempt count is the bound's
+        // deterministic signature; wall-clock time is not asserted because
+        // scheduler delay on a loaded host dwarfs a 150 ms window.
+        let counters = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            counters.writer_task_begin_busy, 1,
+            "one busy refusal must surface after the shared budget is spent"
+        );
+        assert_eq!(
+            counters.writer_task_begin_busy_absorbed, 0,
+            "a refusal that already consumed the whole budget must not be retried"
+        );
+
+        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
     }
 
     // `#[serial(tx_registry)]`: shares the key with the checkpoint
@@ -1810,7 +2055,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(tx_registry)]
-    async fn operation_failure_with_successful_rollback_preserves_error_and_writer_continues() {
+    async fn operation_failure_with_successful_rollback_reports_finality_once_and_continues() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_task_operation_rollback.db");
         let pool = file_pool(&path);
@@ -1823,8 +2068,11 @@ mod tests {
         }
         let handle = spawn(&pool, 8).expect("writer task spawn");
 
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executions_in_op = Arc::clone(&executions);
         let original_error = handle
-            .send(|conn| -> Result<(), StorageError> {
+            .send(move |conn| -> Result<(), StorageError> {
+                executions_in_op.fetch_add(1, Ordering::SeqCst);
                 conn.execute("INSERT INTO t (id, v) VALUES (1, 'rolled-back')", [])
                     .map_err(|e| StorageError::Pool {
                         operation: "test_operation_error_insert".into(),
@@ -1835,13 +2083,23 @@ mod tests {
                 ))
             })
             .await;
-        assert!(
-            matches!(
-                &original_error,
-                Err(StorageError::Internal(message))
-                    if message == "intentional operation failure"
+        match &original_error {
+            Err(StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            }) => assert!(
+                matches!(source.as_ref(), StorageError::Internal(message)
+                    if message == "intentional operation failure"),
+                "the proven-rollback wrapper must retain the typed operation error: {source:?}"
             ),
-            "a confirmed rollback must preserve the operation error, got {original_error:?}"
+            other => panic!(
+                "a confirmed rollback must carry TransactionRolledBack and preserve the operation error, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "finality propagation must not replay the request closure"
         );
 
         let affected = handle
@@ -1855,6 +2113,11 @@ mod tests {
             .await
             .expect("the writer must continue after a confirmed rollback");
         assert_eq!(affected, 1);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "serving a follow-up request must not replay the rolled-back closure"
+        );
 
         let reader = pool.reader().expect("reader");
         let rolled_back: i64 = reader
@@ -1871,7 +2134,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(tx_registry)]
-    async fn commit_failure_with_successful_rollback_preserves_error_and_writer_continues() {
+    async fn commit_failure_with_successful_rollback_reports_finality_once_and_continues() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_task_commit_rollback.db");
         let pool = file_pool(&path);
@@ -1884,8 +2147,11 @@ mod tests {
         }
         let handle = spawn(&pool, 8).expect("writer task spawn");
 
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executions_in_op = Arc::clone(&executions);
         let commit_error = handle
-            .send(|conn| -> Result<usize, StorageError> {
+            .send(move |conn| -> Result<usize, StorageError> {
+                executions_in_op.fetch_add(1, Ordering::SeqCst);
                 let affected = conn
                     .execute("INSERT INTO t (id, v) VALUES (1, 'rolled-back')", [])
                     .map_err(|e| StorageError::Pool {
@@ -1900,14 +2166,19 @@ mod tests {
                 Ok(affected)
             })
             .await;
-        assert!(
-            matches!(
-                &commit_error,
-                Err(StorageError::Pool { operation, .. })
-                    if operation == "writer_task_commit"
+        match &commit_error {
+            Err(StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            }) => assert!(
+                matches!(source.as_ref(), StorageError::Pool { operation, .. }
+                    if operation == "writer_task_commit"),
+                "the proven-rollback wrapper must retain the typed COMMIT error: {source:?}"
             ),
-            "a confirmed rollback must preserve the commit error, got {commit_error:?}"
-        );
+            other => panic!(
+                "a confirmed rollback must carry TransactionRolledBack and preserve the COMMIT error, got {other:?}"
+            ),
+        }
         assert!(
             commit_error
                 .as_ref()
@@ -1915,6 +2186,11 @@ mod tests {
                 .is_retryable(),
             "the existing retryable commit-error contract must remain unchanged after a \
              confirmed rollback"
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "finality propagation must not replay the request closure"
         );
 
         let affected = handle
@@ -1933,6 +2209,11 @@ mod tests {
             .await
             .expect("the writer must continue after the failed COMMIT is rolled back");
         assert_eq!(affected, 1);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "serving a follow-up request must not replay the rolled-back closure"
+        );
 
         let reader = pool.reader().expect("reader");
         let rolled_back: i64 = reader
@@ -1995,9 +2276,12 @@ mod tests {
         let conn = Connection::open_in_memory().expect("in-memory connection");
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
             .unwrap();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executions_in_op = Arc::clone(&executions);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let request = WriteRequest {
-            op: Box::new(|conn| -> Result<usize, StorageError> {
+            op: Box::new(move |conn| -> Result<usize, StorageError> {
+                executions_in_op.fetch_add(1, Ordering::SeqCst);
                 let affected = conn
                     .execute("INSERT INTO t (id) VALUES (1)", [])
                     .map_err(|e| StorageError::Pool {
@@ -2031,6 +2315,7 @@ mod tests {
             .try_recv()
             .expect("active request must receive a typed terminal reply");
         assert_writer_task_terminal_state(reply, WriterTaskRequestState::SideEffectsUnknown);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
         assert!(
             !conn.is_autocommit(),
             "the denied COMMIT and ROLLBACK must leave the test connection poisoned"
@@ -2137,9 +2422,12 @@ mod tests {
         let conn = Connection::open_in_memory().expect("in-memory connection");
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
             .unwrap();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executions_in_op = Arc::clone(&executions);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let request = WriteRequest {
-            op: Box::new(|conn| -> Result<(), StorageError> {
+            op: Box::new(move |conn| -> Result<(), StorageError> {
+                executions_in_op.fetch_add(1, Ordering::SeqCst);
                 conn.authorizer(Some(deny_rollback))
                     .map_err(|e| StorageError::Pool {
                         operation: "test_install_authorizer".into(),
@@ -2169,6 +2457,7 @@ mod tests {
             .try_recv()
             .expect("active request must receive a typed terminal reply");
         assert_writer_task_terminal_state(reply, WriterTaskRequestState::SideEffectsUnknown);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
         assert!(
             !conn.is_autocommit(),
             "the denied ROLLBACK must leave the test connection poisoned"

@@ -179,6 +179,28 @@ frozen `until`; temporary absence is not evidence that the pass failed or commit
 4. Cleanup on eviction uses directory removal of the scratch path only (never touches
    user-owned paths).
 
+5. Failure contract (2026-09-02). When the initial clone or fetch that establishes a
+   cache entry (step 1) fails, it returns the typed `RemoteFetchError { remote, message }`
+   in-process rather than a generic error: `remote` is the canonical URL with any embedded
+   credentials and query string redacted, and `message` is the cache/setup error text: a
+   synthesized exit-status summary for a failed git invocation, or the I/O, size-cap, or
+   unsafe-replace guard message for a non-git cache failure; none of these retain git's
+   own stderr. This typed variant reaches in-process `VerbRegistry::dispatch` callers; the
+   MCP `request` envelope has no dedicated wire encoding for it and falls back to
+   rendering the plain error message, so an MCP caller still has to read that text to tell
+   it apart from `InvalidInput`. Because `remote` is redacted before the error is built,
+   the rendered message, in-process or on the wire, never contains the credential or
+   query material stripped from it. A clone/fetch failure hit later, while repairing a
+   missing object during commit walking against an already-cached clone (a bounded
+   refetch-then-reclone attempt), is not raised as `RemoteFetchError`. A git-level refetch
+   failure is followed by the one guarded reclone, and each successful repair earns exactly
+   one more snapshot attempt: the ingest completes normally only when that attempt
+   succeeds. When the bounded repair ultimately fails (a non-git refetch failure, a failed
+   reclone, or a snapshot that still fails after the reclone) the failure is wrapped as a
+   plain error that reaches the caller as `InvalidInput`; no third repair is attempted. A
+   source that cannot be parsed as a local path or a remote URL also stays `InvalidInput`,
+   and storage failures keep their existing error types.
+
 ### Accepted cache crash-residue rider (2026-08-09)
 
 The staging-then-rename design can clean every ordinary error return, but no

@@ -587,7 +587,7 @@ mod tests {
 
         let mut config = khive_runtime::RuntimeConfig::no_embeddings();
         config.packs = vec!["kg".to_string()];
-        config.backend_id = khive_runtime::BackendId::new("knowledge");
+        config.backend_id = khive_runtime::BackendId::parse("knowledge").expect("valid backend id");
 
         KhiveRuntime::from_backend(knowledge_backend, config).with_core_backend(main_backend)
     }

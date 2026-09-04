@@ -5054,8 +5054,15 @@ mod tests {
         .await
         .expect_err("the probe must refuse when an id it would delete already names a row");
         assert!(
-            matches!(error, StorageError::Unsupported { .. }),
-            "expected StorageError::Unsupported, got {error:?}"
+            matches!(
+                &error,
+                StorageError::WriterTaskRequestFailed {
+                    request_state:
+                        khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                    source,
+                } if matches!(source.as_ref(), StorageError::Unsupported { .. })
+            ),
+            "expected a proven-rollback wrapper retaining StorageError::Unsupported, got {error:?}"
         );
 
         let reader = backend.pool().reader().unwrap();
@@ -6444,7 +6451,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transactional_orphan_sweep_walk_ignores_a_leaf_swapped_for_an_outside_symlink_mid_scan(
     ) {
-        // Regression for the PR #2201 review finding: the sweep's candidate
+        // Regression for #2201: the sweep's candidate
         // walk and grace-period mtime read used to be two separate,
         // path-based passes (`walk_blob_files` then `within_publish_grace`
         // via `fs::metadata(path)`), neither pinned to the retained

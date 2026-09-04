@@ -17,7 +17,7 @@
 //! fallback chain and the file-size/module-coupling rationale.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use khive_runtime::ann_registry::{self, CompactionScope, WatermarkAuthority};
@@ -33,11 +33,18 @@ use uuid::Uuid;
 pub(crate) struct AnnBridge {
     index: VamanaIndex,
     id_map: Vec<Uuid>,
+    /// Digest of the v2 commit record this mmap bridge loaded. New
+    /// checkpoints carry a per-publication nonce, including semantically
+    /// identical rotations, so this identifies the mapped file generation.
+    commit_digest: Option<[u8; 32]>,
     /// Namespace write-generation this build's corpus scan started at or after
     /// (issue #770). Stamped just before install; `install_if_fresher` uses it
     /// to reject a late-arriving build whose scan predates a `clear_namespace`
     /// invalidation that landed while it was still running.
     generation: u64,
+    /// Test-only proof that replacing this bridge drops its mmap owner.
+    #[cfg(test)]
+    drop_probe: Option<Arc<()>>,
 }
 
 /// Cache key for a per-{namespace, model} ANN index slot.
@@ -147,6 +154,22 @@ pub(crate) struct AnnState {
     /// runtimes additionally take the directory lock for cross-process safety;
     /// pathless runtimes need this lock to linearize raise-then-install.
     checkpoint_locks: std::sync::Mutex<HashMap<AnnKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Idempotence guard for the pack-lifetime file-generation watcher.
+    rotation_watch_started: AtomicBool,
+    /// Test-only rendezvous for `finish_warm`'s Ready publish (issue #2340
+    /// regression coverage) — see `run_finish_warm_ready_test_hook`.
+    #[cfg(test)]
+    test_finish_warm_ready_hook: std::sync::Mutex<Option<Arc<FinishWarmReadyTestHook>>>,
+}
+
+/// Test-only hook installed on an `AnnState` to drive a concurrent eviction
+/// attempt from inside `finish_warm`'s Ready critical section. See
+/// `run_finish_warm_ready_test_hook`.
+#[cfg(test)]
+pub(crate) struct FinishWarmReadyTestHook {
+    pub(crate) incumbent_digest: [u8; 32],
+    pub(crate) generation: u64,
+    pub(crate) handle_tx: tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>,
 }
 
 pub(crate) type SharedAnn = Arc<AnnState>;
@@ -160,6 +183,9 @@ pub(crate) fn new_shared() -> SharedAnn {
         unavailable: std::sync::Mutex::new(HashMap::new()),
         force_rebuild: std::sync::Mutex::new(HashSet::new()),
         checkpoint_locks: std::sync::Mutex::new(HashMap::new()),
+        rotation_watch_started: AtomicBool::new(false),
+        #[cfg(test)]
+        test_finish_warm_ready_hook: std::sync::Mutex::new(None),
     })
 }
 
@@ -400,33 +426,80 @@ fn finish_warm_state(permit: &mut AnnWarmPermit, next: AnnWarmState) {
 /// Finish a normally-returning warm from the worker's explicit outcome. A
 /// `Ready` outcome is still verified against the attempt's generation before
 /// publication into the lifecycle state.
+///
+/// The Ready decision and its publication into `warm_states` share one
+/// `indexes` read-lock critical section (issue #2340): the guard acquired
+/// below stays held across the `warm_states` transition, so a concurrent
+/// rotation eviction — which takes `indexes` write then `warm_states` under
+/// `evict_bridge_and_ready_state` — cannot run between the decision and the
+/// publish. Either the eviction's write-lock acquisition blocks until this
+/// guard drops (so it sees the just-published Ready state and can clean it
+/// up), or the eviction has already completed and removed the bridge before
+/// this guard is taken (so the decision below observes its absence and
+/// publishes Failed instead of a dangling Ready).
 async fn finish_warm(mut permit: AnnWarmPermit, outcome: AnnWarmOutcome) {
-    let next = match outcome {
-        AnnWarmOutcome::Ready => match permit
-            .ann
-            .indexes
-            .read()
-            .await
-            .get(&permit.key)
-            .map(|bridge| bridge.generation)
-            .filter(|generation| *generation >= permit.generation)
-        {
-            Some(generation) => AnnWarmState::Ready { generation },
-            None => AnnWarmState::Failed {
+    match outcome {
+        AnnWarmOutcome::Ready => {
+            let ann = permit.ann.clone();
+            let idxs = ann.indexes.read().await;
+            let next = match idxs
+                .get(&permit.key)
+                .map(|bridge| bridge.generation)
+                .filter(|generation| *generation >= permit.generation)
+            {
+                Some(generation) => AnnWarmState::Ready { generation },
+                None => AnnWarmState::Failed {
+                    generation: permit.generation,
+                    error: AnnWarmFailure::Operational,
+                },
+            };
+            #[cfg(test)]
+            run_finish_warm_ready_test_hook(&ann, &permit.key).await;
+            finish_warm_state(&mut permit, next);
+            drop(idxs);
+        }
+        AnnWarmOutcome::Empty => {
+            let next = AnnWarmState::Failed {
+                generation: permit.generation,
+                error: AnnWarmFailure::EmptyCorpus,
+            };
+            finish_warm_state(&mut permit, next);
+        }
+        AnnWarmOutcome::Failed => {
+            let next = AnnWarmState::Failed {
                 generation: permit.generation,
                 error: AnnWarmFailure::Operational,
-            },
-        },
-        AnnWarmOutcome::Empty => AnnWarmState::Failed {
-            generation: permit.generation,
-            error: AnnWarmFailure::EmptyCorpus,
-        },
-        AnnWarmOutcome::Failed => AnnWarmState::Failed {
-            generation: permit.generation,
-            error: AnnWarmFailure::Operational,
-        },
+            };
+            finish_warm_state(&mut permit, next);
+        }
+    }
+}
+
+/// Test-only seam (issue #2340): if a hook is installed on `ann`, spawn the
+/// eviction helper against `key` and hand its `JoinHandle` back to the test,
+/// all while the caller (`finish_warm`) still holds its `indexes` read
+/// guard. Lets a test drive the exact interleaving the fix closes: the
+/// spawned eviction task cannot acquire the `indexes` write lock until
+/// `finish_warm` finishes publishing and drops its guard.
+#[cfg(test)]
+async fn run_finish_warm_ready_test_hook(ann: &SharedAnn, key: &AnnKey) {
+    let hook = ann
+        .test_finish_warm_ready_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(hook) = hook else {
+        return;
     };
-    finish_warm_state(&mut permit, next);
+    let ann = ann.clone();
+    let key = key.clone();
+    let incumbent_digest = hook.incumbent_digest;
+    let generation = hook.generation;
+    let handle = tokio::spawn(async move {
+        evict_bridge_and_ready_state(&ann, &key, incumbent_digest, generation).await;
+    });
+    let _ = hook.handle_tx.send(handle);
+    tokio::task::yield_now().await;
 }
 
 impl Drop for AnnWarmPermit {
@@ -615,6 +688,11 @@ pub(crate) async fn wait_ready(
 pub(crate) const ANN_WARM_WAIT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const ANN_WARM_WAIT_POLL_MS: u64 = 50;
 
+/// File-generation polling cadence for mmap bridges. Unchanged ticks read
+/// only the small v2 commit record; segment files are reopened only after a
+/// distinct publication identity appears.
+const ROTATION_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 // ── Test-only seam: override the ANN warm-wait timeout ───────────────────────
 //
 // Zero means use the production default (ANN_WARM_WAIT_TIMEOUT_MS).
@@ -669,7 +747,10 @@ impl AnnBridge {
         Ok(Self {
             index,
             id_map,
+            commit_digest: None,
             generation: 0,
+            #[cfg(test)]
+            drop_probe: None,
         })
     }
 
@@ -813,7 +894,10 @@ impl AnnBridge {
         Ok(Self {
             index,
             id_map,
+            commit_digest: None,
             generation: 0,
+            #[cfg(test)]
+            drop_probe: None,
         })
     }
 
@@ -912,7 +996,10 @@ impl AnnBridge {
         Ok(Self {
             index,
             id_map,
+            commit_digest: Some(commit_digest),
             generation: 0,
+            #[cfg(test)]
+            drop_probe: None,
         })
     }
 }
@@ -970,9 +1057,17 @@ pub(crate) fn snapshot_key(namespace: &str, model: &str) -> String {
 /// `decode_ann_dir_name`. Returns `None` for in-memory backends.
 fn ann_segment_dir(rt: &KhiveRuntime, ns: &str, model: &str) -> Option<std::path::PathBuf> {
     let ann_root = rt.backend_ann_root()?;
+    Some(ann_segment_dir_from_root(&ann_root, ns, model))
+}
+
+fn ann_segment_dir_from_root(
+    ann_root: &std::path::Path,
+    ns: &str,
+    model: &str,
+) -> std::path::PathBuf {
     let key = snapshot_key(ns, model);
     let hex: String = key.bytes().map(|b| format!("{b:02x}")).collect();
-    Some(ann_root.join(hex))
+    ann_root.join(hex)
 }
 
 /// Decode a hex-encoded ann directory name back to `(namespace, model)`.
@@ -2645,6 +2740,212 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
     }
 }
 
+/// Whether `start_rotation_watcher` has claimed its one-shot guard for `ann`.
+#[cfg(test)]
+pub(crate) fn rotation_watch_started_for_test(ann: &SharedAnn) -> bool {
+    ann.rotation_watch_started.load(Ordering::Acquire)
+}
+
+/// Start one pack-lifetime watcher that releases mmap generations after peer
+/// checkpoints rotate their files. The task retains only a weak ANN reference
+/// between ticks and also exits immediately on daemon shutdown.
+pub(crate) fn start_rotation_watcher(rt: &KhiveRuntime, ann: &SharedAnn) {
+    let Some(ann_root) = rt.backend_ann_root() else {
+        return;
+    };
+    if ann
+        .rotation_watch_started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let ann = Arc::downgrade(ann);
+    let shutdown = khive_runtime::daemon_shutdown_token();
+    khive_runtime::track_background_task(async move {
+        let start = tokio::time::Instant::now() + ROTATION_WATCH_INTERVAL;
+        let mut ticks = tokio::time::interval_at(start, ROTATION_WATCH_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticks.tick() => {}
+            }
+            let Some(ann) = ann.upgrade() else {
+                break;
+            };
+            refresh_rotated_segments_in_root(&ann_root, &ann).await;
+        }
+    });
+}
+
+/// Poll the commit identities of currently installed mmap bridges once.
+#[cfg(test)]
+async fn refresh_rotated_segments_once(rt: &KhiveRuntime, ann: &SharedAnn) {
+    let Some(ann_root) = rt.backend_ann_root() else {
+        return;
+    };
+    refresh_rotated_segments_in_root(&ann_root, ann).await;
+}
+
+async fn refresh_rotated_segments_in_root(ann_root: &std::path::Path, ann: &SharedAnn) {
+    let installed: Vec<(AnnKey, [u8; 32])> = ann
+        .indexes
+        .read()
+        .await
+        .iter()
+        .filter_map(|(key, bridge)| bridge.commit_digest.map(|digest| (key.clone(), digest)))
+        .collect();
+
+    for (key, expected) in installed {
+        let dir = ann_segment_dir_from_root(ann_root, &key.namespace, &key.model);
+        match segment_commit_digest(&dir) {
+            Ok(Some(observed)) if observed != expected => {
+                refresh_rotated_segment(ann, &key, expected, dir).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    namespace = %key.namespace,
+                    model = %key.model,
+                    "knowledge ANN rotation check failed; retaining the installed generation"
+                );
+            }
+        }
+    }
+}
+
+/// Evict `key`'s bridge if it is still the one identified by
+/// `incumbent_digest`, and clear a `Ready` warm state at the same
+/// `generation`, under one `indexes` write-lock critical section.
+///
+/// Keeping both mutations inside one critical section closes the split-lock
+/// race with `finish_warm`'s Ready publish (issue #2340): `finish_warm`
+/// decides Ready and publishes it to `warm_states` while still holding the
+/// `indexes` read guard it used for the decision, so whichever side's
+/// critical section runs second observes the other's completed effect —
+/// never a half-applied state where `warm_states` says `Ready` and no
+/// bridge is installed. Keying the state cleanup on the evicted bridge's own
+/// generation (not "any Ready") leaves an unrelated build's state alone.
+async fn evict_bridge_and_ready_state(
+    ann: &SharedAnn,
+    key: &AnnKey,
+    incumbent_digest: [u8; 32],
+    generation: u64,
+) -> bool {
+    let mut indexes = ann.indexes.write().await;
+    if indexes
+        .get(key)
+        .is_none_or(|bridge| bridge.commit_digest != Some(incumbent_digest))
+    {
+        return false;
+    }
+    indexes.remove(key);
+    // Only a Ready state at the evicted bridge's own generation describes it.
+    // A Warming state belongs to an in-flight warm whose permit still owns
+    // the single-flight slot; removing it would let a second warm start
+    // alongside the first, and a Ready state at a different generation
+    // belongs to a later build this eviction has nothing to say about.
+    let mut states = warm_states_guard(&ann.warm_states);
+    if matches!(
+        states.get(key),
+        Some(AnnWarmState::Ready { generation: state_generation }) if *state_generation == generation
+    ) {
+        states.remove(key);
+    }
+    true
+}
+
+/// Adopt one changed publication under the same lock order as checkpoint
+/// writers: process-local key lock, then cross-process bridge lock. A changed
+/// but invalid publication evicts the predecessor because its files have
+/// already been unlinked; the next search may retry the ordinary warm path.
+async fn refresh_rotated_segment(
+    ann: &SharedAnn,
+    key: &AnnKey,
+    expected: [u8; 32],
+    dir: std::path::PathBuf,
+) {
+    let local_lock = checkpoint_lock(ann, key);
+    let _local_guard = local_lock.lock().await;
+
+    let incumbent = ann.indexes.read().await.get(key).map(|bridge| {
+        (
+            bridge.commit_digest,
+            bridge.generation,
+            bridge.index.last_applied_seq().unwrap_or(0),
+        )
+    });
+    let Some((Some(incumbent_digest), generation, incumbent_seq)) = incumbent else {
+        return;
+    };
+    if incumbent_digest != expected {
+        return;
+    }
+
+    let _publication_guard = match acquire_bridge_checkpoint_lock_async(dir.clone()).await {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                namespace = %key.namespace,
+                model = %key.model,
+                "knowledge ANN rotation reload could not acquire the publication lock"
+            );
+            return;
+        }
+    };
+    let observed = match segment_commit_digest(&dir) {
+        Ok(Some(digest)) if digest != incumbent_digest => digest,
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                namespace = %key.namespace,
+                model = %key.model,
+                "knowledge ANN rotated commit identity could not be read"
+            );
+            return;
+        }
+    };
+
+    let replacement = AnnBridge::load(&dir).and_then(|bridge| {
+        if bridge.commit_digest != Some(observed) {
+            return Err("commit identity changed during locked rotation reload".to_string());
+        }
+        let replacement_seq = bridge.index.last_applied_seq().unwrap_or(0);
+        if replacement_seq < incumbent_seq {
+            return Err(format!(
+                "rotated segment watermark {replacement_seq} regressed below installed {incumbent_seq}"
+            ));
+        }
+        Ok(bridge.with_generation(generation))
+    });
+
+    match replacement {
+        Ok(bridge) => {
+            if install_replacing(ann, key, bridge).await {
+                tracing::debug!(
+                    namespace = %key.namespace,
+                    model = %key.model,
+                    "knowledge ANN adopted rotated mmap generation and released its predecessor"
+                );
+            }
+        }
+        Err(error) => {
+            evict_bridge_and_ready_state(ann, key, incumbent_digest, generation).await;
+            tracing::warn!(
+                error = %error,
+                namespace = %key.namespace,
+                model = %key.model,
+                "knowledge ANN rotated generation failed validation; released predecessor and will rebuild on demand"
+            );
+        }
+    }
+}
+
 /// Spawn one per-key background warm and return immediately. Current-generation
 /// `Warming`/`Ready` states suppress duplicates; `Failed` remains retryable by
 /// the next search.
@@ -3784,9 +4085,9 @@ mod tests {
         mark_unavailable(&ann, &key, current_generation(&ann, "local"));
 
         let start = std::time::Instant::now();
-        // Timeout is generous (5s, matching production ANN_WARM_WAIT_TIMEOUT_MS)
+        // Timeout is generous (matching production ANN_WARM_WAIT_TIMEOUT_MS)
         // to prove the short-circuit fires rather than the deadline.
-        let ready = wait_ready(&ann, &key, 5_000, 50).await;
+        let ready = wait_ready(&ann, &key, ANN_WARM_WAIT_TIMEOUT_MS, 50).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -3794,7 +4095,7 @@ mod tests {
             "must return false for a key marked unavailable at the current generation"
         );
         assert!(
-            elapsed < std::time::Duration::from_millis(200),
+            elapsed < std::time::Duration::from_millis(ANN_WARM_WAIT_TIMEOUT_MS / 2),
             "terminal unavailable outcome must short-circuit, not poll out the timeout: {elapsed:?}"
         );
     }
@@ -4082,6 +4383,229 @@ mod tests {
         }
         let bridge = AnnBridge::build(vectors, dim, ids.clone()).expect("build test bridge");
         (bridge, ids)
+    }
+
+    /// A peer rotation must be observed without a search request. The two
+    /// checkpoints below have identical vector/graph/lifecycle bytes; their
+    /// UUID sidecars differ, which also proves the replacement mapping is the
+    /// one served after the watcher tick (#2081).
+    #[tokio::test]
+    async fn rotation_tick_releases_predecessor_and_adopts_identical_peer_checkpoint() {
+        let temp = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(temp.path().join("rotation.db"));
+        let ann = new_shared();
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let segment_dir =
+            ann_segment_dir(&rt, "local", WARM_TEST_MODEL).expect("file-backed segment directory");
+
+        let (first, first_ids) = build_test_bridge(4, 2);
+        first
+            .save_atomic(&segment_dir)
+            .expect("persist first generation");
+        let mut loaded = AnnBridge::load(&segment_dir)
+            .expect("load first mmap generation")
+            .with_generation(7);
+        let probe = Arc::new(());
+        let dropped = Arc::downgrade(&probe);
+        loaded.drop_probe = Some(probe);
+        assert!(install_replacing(&ann, &key, loaded).await);
+        let first_digest = ann
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .and_then(|bridge| bridge.commit_digest)
+            .expect("loaded bridge identity");
+
+        let (second, second_ids) = build_test_bridge(4, 2);
+        assert_ne!(first_ids, second_ids, "fixture sidecars must differ");
+        second
+            .save_atomic(&segment_dir)
+            .expect("rotate identical checkpoint");
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        assert!(
+            dropped.upgrade().is_none(),
+            "replacing the cache entry must drop the predecessor mmap owner"
+        );
+        let installed = ann.indexes.read().await;
+        let bridge = installed.get(&key).expect("rotated bridge installed");
+        assert_ne!(bridge.commit_digest, Some(first_digest));
+        assert_eq!(
+            bridge.search(&[1.0, 0.0, 0.0, 0.0], 1)[0].0,
+            second_ids[0],
+            "the rotated UUID sidecar must be the served mapping"
+        );
+        assert_eq!(bridge.generation, 7, "local generation fence is preserved");
+    }
+
+    async fn install_generation_then_publish_invalid_rotation(
+        temp: &TempDir,
+    ) -> (KhiveRuntime, SharedAnn, AnnKey) {
+        let rt = file_rt_with_embedder(temp.path().join("rotation.db"));
+        let ann = new_shared();
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let segment_dir =
+            ann_segment_dir(&rt, "local", WARM_TEST_MODEL).expect("file-backed segment directory");
+
+        let (first, _) = build_test_bridge(4, 2);
+        first
+            .save_atomic(&segment_dir)
+            .expect("persist first generation");
+        let loaded = AnnBridge::load(&segment_dir)
+            .expect("load first mmap generation")
+            .with_generation(7);
+        assert!(install_replacing(&ann, &key, loaded).await);
+
+        // A peer publishes a changed commit whose UUID sidecar is missing, so
+        // the rotated generation fails validation and the incumbent is evicted.
+        let (second, _) = build_test_bridge(4, 2);
+        second.save_atomic(&segment_dir).expect("rotate checkpoint");
+        std::fs::remove_file(segment_dir.join("external_ids.bin")).expect("remove sidecar");
+
+        (rt, ann, key)
+    }
+
+    #[tokio::test]
+    async fn invalid_rotation_keeps_in_flight_warming_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let (rt, ann, key) = install_generation_then_publish_invalid_rotation(&temp).await;
+
+        // A concurrent request owns the single-flight slot for this key.
+        warm_states_guard(&ann.warm_states).insert(
+            key.clone(),
+            AnnWarmState::Warming {
+                attempt_id: 41,
+                generation: 7,
+                started_at: std::time::Instant::now(),
+            },
+        );
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        assert!(
+            ann.indexes.read().await.get(&key).is_none(),
+            "an invalid rotated generation must evict the incumbent"
+        );
+        assert!(
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Warming { attempt_id: 41, .. })
+            ),
+            "eviction must not clear a warm state owned by an in-flight permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_rotation_clears_ready_state_of_evicted_bridge() {
+        let temp = TempDir::new().expect("tempdir");
+        let (rt, ann, key) = install_generation_then_publish_invalid_rotation(&temp).await;
+
+        warm_states_guard(&ann.warm_states)
+            .insert(key.clone(), AnnWarmState::Ready { generation: 7 });
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        assert!(
+            ann.indexes.read().await.get(&key).is_none(),
+            "an invalid rotated generation must evict the incumbent"
+        );
+        assert!(
+            warm_states_guard(&ann.warm_states).get(&key).is_none(),
+            "the Ready state described the evicted bridge and must go with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_rotation_does_not_clear_a_newer_builds_ready_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let (rt, ann, key) = install_generation_then_publish_invalid_rotation(&temp).await;
+
+        // A later build's permit already published Ready for this key at a
+        // newer generation than the one this eviction is evicting; sharing
+        // the key must not make the cleanup sweep it up too.
+        warm_states_guard(&ann.warm_states)
+            .insert(key.clone(), AnnWarmState::Ready { generation: 8 });
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        assert!(
+            ann.indexes.read().await.get(&key).is_none(),
+            "an invalid rotated generation must still evict the incumbent"
+        );
+        assert!(
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Ready { generation: 8 })
+            ),
+            "eviction must not clear a later build's Ready state sharing the key"
+        );
+    }
+
+    /// Regression for issue #2340: `finish_warm`'s Ready decision (read
+    /// `indexes`, check the bridge's generation) and its publication into
+    /// `warm_states` used to be two separate critical sections, so a
+    /// rotation eviction could run its own two-step remove-then-cleanup in
+    /// between, observe the state still `Warming`, and skip the cleanup —
+    /// leaving `warm_states` say `Ready` for a key `indexes` no longer has a
+    /// bridge for. The invariant under test: `finish_warm` holds the
+    /// `indexes` read guard from its Ready decision through the publication
+    /// into `warm_states`, so an eviction spawned in between (here through
+    /// `run_finish_warm_ready_test_hook`) cannot complete before the publish
+    /// and the two maps never disagree.
+    #[tokio::test]
+    async fn finish_warm_ready_publish_is_atomic_with_concurrent_eviction() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_rt, ann, key) = install_generation_then_publish_invalid_rotation(&temp).await;
+
+        let incumbent_digest = ann
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .and_then(|bridge| bridge.commit_digest)
+            .expect("incumbent bridge installed with a commit identity");
+
+        let permit = begin_warm(&ann, key.clone()).expect("a fresh key grants a warm permit");
+
+        let (handle_tx, mut handle_rx) = tokio::sync::mpsc::unbounded_channel();
+        *ann.test_finish_warm_ready_hook.lock().unwrap() =
+            Some(Arc::new(FinishWarmReadyTestHook {
+                incumbent_digest,
+                generation: 7,
+                handle_tx,
+            }));
+
+        // Drives finish_warm's Ready publish. Its test hook spawns
+        // `evict_bridge_and_ready_state` — the same critical section the
+        // rotation watcher's `Err` arm uses — against the identical
+        // incumbent bridge while finish_warm still holds the `indexes` read
+        // guard it used for the Ready decision.
+        finish_warm(permit, AnnWarmOutcome::Ready).await;
+
+        let evict_handle = handle_rx
+            .recv()
+            .await
+            .expect("the ready hook spawns the eviction task");
+        evict_handle.await.expect("eviction task completes");
+
+        // Invariant: a Ready state for the key implies a bridge is
+        // installed for the key. The two sides of the race can settle
+        // either way — the eviction's write lock was blocked until
+        // finish_warm published and can then see and clear the Ready state
+        // it just orphaned — but never in the inconsistent middle: Ready
+        // with no bridge.
+        let is_ready = matches!(
+            warm_states_guard(&ann.warm_states).get(&key),
+            Some(AnnWarmState::Ready { .. })
+        );
+        if is_ready {
+            assert!(
+                ann.indexes.read().await.get(&key).is_some(),
+                "a Ready warm state must not describe a bridge the rotation watcher evicted"
+            );
+        }
     }
 
     #[test]
@@ -5608,11 +6132,12 @@ mod tests {
         ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
         let seg_dir = ann_segment_dir(&rt, "local", WARM_TEST_MODEL).expect("seg_dir");
 
-        // Truncate the 41-byte extended trailer: the record parses at the base
-        // length — a legitimate pre-amendment commit with no watermark.
+        // Truncate the 41-byte watermark/codes trailer plus the 16-byte
+        // publication nonce: the record parses at the base length — a
+        // legitimate pre-amendment commit with no watermark.
         let meta_path = seg_dir.join("metadata.bin");
         let bytes = std::fs::read(&meta_path).expect("read metadata.bin");
-        std::fs::write(&meta_path, &bytes[..bytes.len() - 41]).expect("truncate trailer");
+        std::fs::write(&meta_path, &bytes[..bytes.len() - 57]).expect("truncate trailer");
         let info = read_commit_info(&seg_dir)
             .expect("read_commit_info")
             .expect("base-length record must still parse");
@@ -5757,13 +6282,13 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        let ready = wait_ready(&ann, &key, 5_000, 50).await;
+        let ready = wait_ready(&ann, &key, ANN_WARM_WAIT_TIMEOUT_MS, 50).await;
         let elapsed = start.elapsed();
 
         assert!(!ready, "empty corpus must never become ready");
         assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "the terminal unavailable outcome must short-circuit the 5s warm-wait: {elapsed:?}"
+            elapsed < std::time::Duration::from_millis(ANN_WARM_WAIT_TIMEOUT_MS / 2),
+            "the terminal unavailable outcome must short-circuit the warm-wait: {elapsed:?}"
         );
     }
 
