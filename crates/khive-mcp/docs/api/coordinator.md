@@ -68,7 +68,18 @@ causes and one per-operation wire budget are retained; truncation is explicit
 through `backend_errors_truncated` and `backend_errors_omitted`. Backend ids and
 messages are credential-masked before exposure; changed backend ids carry a
 stable hash suffix and `backend_id_masked: true`, ids are capped at 256 Unicode
-scalar values, and messages are capped at 1,024 Unicode scalar values.
+scalar values, and messages are capped at 1,024 Unicode scalar values. Both
+message and backend-id masking go through `secret_gate::mask_bounded`: the
+masker's own input is capped to `MASK_WINDOW_CHARS` (4,096 chars) BEFORE
+masking runs, not the full, untruncated text — cost scales with the window,
+never with the caller's raw input length. A token straddling the window
+boundary (e.g. the `@` closing a `scheme://user:pass@host` credential) is
+dropped whole rather than echoed unmasked, including every fragment of a
+multi-fragment bridged credential chained to it near the boundary — see
+`crates/khive-runtime/docs/api/secret_gate.md#bounded-masking` for the full
+mechanism and why no forward lookahead past the window can substitute for it.
+This is the permanent mask-only `McpDiagnostic` surface from ADR-115 Amendment 2: it has no durable
+stored target, manifest admission, posture stamp, or exemption-success event.
 
 ## `t6d` — malformed `tags` must reject, not silently drop the filter
 

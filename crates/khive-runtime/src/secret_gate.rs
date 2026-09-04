@@ -279,14 +279,215 @@ fn scan(text: &str) -> Option<SecretMatch> {
     scan_match(text).map(|(slice, detector)| build_match(detector, slice))
 }
 
+/// A named redact-not-block surface whose contract is intentionally separate
+/// from manifest-backed write admission (ADR-115 Amendment 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactionSurface {
+    /// Git ingestion stores only masked commit, issue, and pull-request text.
+    GitIngest,
+    /// Session mirroring stores only masked `text` and `raw` projections.
+    SessionMirror,
+    /// MCP diagnostics are bounded caller-visible transport data, not records.
+    McpDiagnostic,
+}
+
+/// Whether a redaction surface can consume a secret-gate exemption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactionSurfaceMode {
+    /// Always apply the canonical masker; never synthesize a stamp or event.
+    PermanentMaskOnly,
+}
+
+/// Machine-readable contract for a named redaction surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedactionSurfaceContract {
+    pub mode: RedactionSurfaceMode,
+    /// Durable target containing the masked result, if this is a write surface.
+    pub final_stored_target: Option<&'static str>,
+    /// Reserved stamp location; absent for permanent mask-only surfaces.
+    pub stamp_property: Option<&'static str>,
+    /// Atomic exemption-success event; absent when admission cannot occur.
+    pub atomic_success_event: Option<&'static str>,
+}
+
+/// Final stored target for [`RedactionSurface::GitIngest`] — see
+/// [`redaction_surface_contract`].
+pub const GIT_INGEST_STORED_TARGET: &str = "final git-ingest entity/note fields";
+
+/// Final stored target for [`RedactionSurface::SessionMirror`] — see
+/// [`redaction_surface_contract`]. Names every column the session mirror
+/// writes a masked provider-export projection into, not just the message
+/// body columns. `cwd`/`git_branch` live only on `sessions`, keyed per
+/// session — `session_messages` carries no such columns of its own (see the
+/// `session_messages` DDL in `khive-pack-session`).
+pub const SESSION_MIRROR_STORED_TARGET: &str =
+    "session_messages.text, session_messages.raw, sessions.cwd, sessions.git_branch, \
+     and sessions.slug";
+
+/// Return the closed contract for a named redact-not-block surface.
+pub const fn redaction_surface_contract(surface: RedactionSurface) -> RedactionSurfaceContract {
+    let final_stored_target = match surface {
+        RedactionSurface::GitIngest => Some(GIT_INGEST_STORED_TARGET),
+        RedactionSurface::SessionMirror => Some(SESSION_MIRROR_STORED_TARGET),
+        RedactionSurface::McpDiagnostic => None,
+    };
+
+    RedactionSurfaceContract {
+        mode: RedactionSurfaceMode::PermanentMaskOnly,
+        final_stored_target,
+        stamp_property: None,
+        atomic_success_event: None,
+    }
+}
+
+/// Apply the canonical detector to a named permanent mask-only surface.
+///
+/// This wrapper makes the non-admission decision executable at each call site:
+/// it has no manifest input, cannot return an exemption outcome, and cannot
+/// synthesize the runtime-owned `khive:secret_gate` property or success event.
+pub fn mask_for_redaction_surface(
+    surface: RedactionSurface,
+    text: &str,
+) -> std::borrow::Cow<'_, str> {
+    match redaction_surface_contract(surface).mode {
+        RedactionSurfaceMode::PermanentMaskOnly => mask_secrets(text),
+    }
+}
+
+/// Upper bound on how many characters of a diagnostic-boundary input the
+/// canonical masker is ever asked to scan, regardless of a caller's own
+/// output cap. Chosen comfortably larger than the largest output cap among
+/// the callers of [`mask_bounded`] (1,024, `khive-mcp`'s
+/// `MAX_BACKEND_ERROR_MESSAGE_CHARS`) so a credential's terminating span
+/// remains inside the window for any message that is itself smaller than the
+/// window. Masking cost scales with this constant, never with a caller's raw
+/// input length. Shared by every diagnostic-boundary redaction site so the
+/// window cannot drift between them independently.
+pub const MASK_WINDOW_CHARS: usize = 4_096;
+
+/// Result of [`mask_bounded`]: masked, window- and output-bounded text plus
+/// the flags a caller needs to finish assembling a caller-visible
+/// diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedMask {
+    /// Masked text, never longer than `output_cap_chars` plus one trailing
+    /// truncation-marker character. May be the bare truncation marker alone
+    /// when the retained window held a single token longer than the window.
+    pub text: String,
+    /// True when `text` is not the complete masked input: the raw input
+    /// exceeded `window_chars`, the masked window exceeded `output_cap_chars`,
+    /// or the window held one token longer than the window that had to be
+    /// dropped whole.
+    pub truncated: bool,
+    /// True when the canonical masker replaced a span inside the retained
+    /// window, or the window's only content was dropped whole for being an
+    /// oversized single token. A caller that decides whether raw content is
+    /// safe to echo back verbatim on this flag must also treat `truncated`
+    /// as reason enough on its own — content the window never retained is
+    /// exactly as unverified as content the masker redacted.
+    pub redacted: bool,
+}
+
+/// Bound a diagnostic-boundary masking call to at most `window_chars` of
+/// `text` before the canonical masker ever runs, then cap the masked result
+/// to `output_cap_chars`. Bounding happens BEFORE masking — not after, as a
+/// truncate-then-mask policy would — so scan cost is bounded by
+/// `window_chars` regardless of the caller's input length.
+///
+/// A window cut mid-token would let a masker that never saw the token's
+/// terminating shape (e.g. the `@` closing `scheme://user:pass@host`) emit
+/// the token's visible prefix unmasked — the exact split-secret hole a prior
+/// mask-the-full-input-first policy existed to close, at the cost of
+/// unbounded scan work. This function closes the hole without re-widening
+/// the window to the input's full length: any token straddling the window
+/// boundary is dropped in its entirety (back to the last whitespace inside
+/// the window) rather than masked, because a masker can only vouch for a
+/// token it saw whole. A single token that is itself longer than the window
+/// has no earlier whitespace to fall back to inside the window and is
+/// replaced by the truncation marker alone.
+///
+/// The same drop applies to a chain of bridged fragments straddling the
+/// boundary, not just the one partial token touching it: see
+/// `trailing_bridge_fragment_cut` (private to this module) for why a
+/// forward lookahead cannot bound this instead, and for the backward walk
+/// that closes it purely from data already inside the window.
+///
+/// `window_chars` must be at least `output_cap_chars`; debug builds assert
+/// this so a misconfigured call site fails loudly instead of silently
+/// capping tighter than it windows, and the cap is additionally clamped to
+/// `window_chars` in every build so a misconfigured call site cannot cap
+/// tighter than it windows even outside debug assertions.
+pub fn mask_bounded(
+    surface: RedactionSurface,
+    text: &str,
+    window_chars: usize,
+    output_cap_chars: usize,
+) -> BoundedMask {
+    debug_assert!(
+        window_chars >= output_cap_chars,
+        "the input window must stay at least as large as the output cap"
+    );
+    let output_cap_chars = output_cap_chars.min(window_chars);
+
+    let input_truncated = text.chars().nth(window_chars).is_some();
+    let mut window: String = text.chars().take(window_chars).collect();
+
+    if input_truncated {
+        match window
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+        {
+            // Keep the whitespace itself; drop only the partial token after it.
+            Some((idx, ch)) => window.truncate(idx + ch.len_utf8()),
+            // A single token spans the whole window: nothing can be shown
+            // whole, so show nothing at all.
+            None => window.clear(),
+        }
+    }
+
+    if input_truncated && !window.is_empty() {
+        if let Some(cut) = trailing_bridge_fragment_cut(&window) {
+            window.truncate(cut);
+        }
+    }
+
+    if input_truncated && window.is_empty() {
+        return BoundedMask {
+            text: TRUNCATION_MARKER.to_string(),
+            truncated: true,
+            redacted: true,
+        };
+    }
+
+    debug_assert!(window.chars().count() <= window_chars);
+    let masked = mask_for_redaction_surface(surface, &window);
+    let redacted = masked.as_ref() != window.as_str();
+
+    let mut chars = masked.chars();
+    let mut bounded: String = chars.by_ref().take(output_cap_chars).collect();
+    let output_capped = chars.next().is_some();
+    if output_capped || input_truncated {
+        bounded.push_str(TRUNCATION_MARKER);
+    }
+
+    BoundedMask {
+        text: bounded,
+        truncated: input_truncated || output_capped,
+        redacted,
+    }
+}
+
+const TRUNCATION_MARKER: &str = "…";
+
 /// Redact every detected secret span in `text`, replacing each with
 /// `***MASKED***`.
 ///
 /// This is the masking counterpart to [`check`]: where `check` hard-blocks a
-/// write on the first match, `mask_secrets` is for content that must be STORED
-/// with credentials stripped (the session mirror). It reuses the SAME
-/// canonical detector set as `check`/`scan`, so callers must never maintain a
-/// second, weaker masker.
+/// write on the first match, `mask_secrets` is for content that must be emitted
+/// or stored with credentials stripped. Named Git/session/MCP callers enter it
+/// through [`mask_for_redaction_surface`]. It reuses the SAME canonical detector
+/// set as `check`/`scan`, so callers must never maintain a second, weaker masker.
 ///
 /// Returns `Cow::Borrowed` when no secret is present (the common case), avoiding
 /// an allocation. Spans are discovered left to right against the ORIGINAL text,
@@ -400,6 +601,16 @@ const MAX_LOG_TEXT_OUTPUT_CHARS: usize = 1_024;
 /// could forge or visually disguise part of the record. The result is bounded
 /// again for the emitted record. A truncation in either the masking pass or the
 /// output pass appends `…` so the record declares its own incompleteness.
+///
+/// This function, not [`mask_for_redaction_surface`], is the direct
+/// `mask_secrets` caller for general log-text bounding: it is not one of the
+/// three named redact-not-block surfaces (git ingest, session mirror, MCP
+/// diagnostics) that surface owns, and its own mask-then-truncate contract —
+/// with the additional crossing-boundary fallback above — is a strict
+/// superset of what the surface wrapper provides. It lives in this module
+/// specifically so it can stay a direct caller; the call-site census in
+/// `crates/khive-runtime/tests/adr115_redaction_call_site_census.rs` only
+/// requires callers *outside* this file to route through the wrapper.
 pub fn bounded_masked_log_text(text: &str) -> String {
     let mask_input_truncated = text.chars().nth(MAX_LOG_TEXT_MASK_INPUT_CHARS).is_some();
     let bounded_input: std::borrow::Cow<'_, str> = if mask_input_truncated {
@@ -1701,6 +1912,84 @@ fn bridge_fragment_chain<'a>(
         .map(|&(_, raw)| strip_delimiters(raw))
         .filter(|stripped| !is_delimiter_only_token(stripped))
         .collect()
+}
+
+/// Extra backward truncation [`mask_bounded`] applies after it drops the
+/// token straddling the window boundary.
+///
+/// `bridge_fragment_chain` can reconstruct a credential from up to
+/// [`MAX_BRIDGE_FRAGMENTS`] whitespace-separated pieces, each individually
+/// too short or low-entropy on its own to be recognized. The gap between two
+/// fragments is deliberately unbounded in byte length
+/// (`adjacent_gap_is_bridgeable`), so there is no finite forward lookahead
+/// past the window boundary that could guarantee seeing every fragment of a
+/// chain straddling the cut — a chain can be padded arbitrarily far past the
+/// window by a single long glue token, which still counts as only one hop
+/// against [`MAX_BRIDGE_GLUE_TOKENS`]. Rather than scan past the boundary,
+/// this walks BACKWARD from it — data already read into the window, so the
+/// extra work stays bounded by `window_chars` alone and needs no lookahead —
+/// dropping every further bridge-fragment-shaped token chained to the
+/// fragment [`mask_bounded`] already removed, spending the same
+/// fragment-count and glue-token budgets [`bridge_fragment_chain`] would
+/// spend walking outward from an anchor.
+///
+/// Runs unconditionally on every truncated window, regardless of whether the
+/// window itself carries trigger-word context. `collect_mask_spans` step 6
+/// admits trigger context from EITHER side of a fragment chain (a credential
+/// like `<frag> <frag> <frag> is the api key for ...` is reconstructed by the
+/// unbounded masker even though the trigger sits after the fragments), so a
+/// trigger word that would justify keeping this window's tail may sit past
+/// the window boundary — data this function, by construction, cannot see.
+/// Gating the walk on an in-window trigger check would leave exactly that
+/// case unprotected: the window carries no visible trigger, the walk would
+/// never run, and any whole fragments already read into the window would
+/// leak. The walk cannot distinguish a genuine chained fragment from an
+/// unrelated fragment-shaped word sitting at the tail of an untriggered
+/// window either; the trade this makes is dropping that word too rather than
+/// risking a leaked credential fragment. The cost is bounded: at most
+/// `MAX_BRIDGE_FRAGMENTS - 1` tokens of a tail that mask_bounded has already
+/// decided to truncate.
+///
+/// Returns the byte offset to truncate `window` to, or `None` when nothing
+/// beyond the already-trimmed token needs to go.
+fn trailing_bridge_fragment_cut(window: &str) -> Option<usize> {
+    let tokens = tokenize_entropy_tokens(window);
+    let mut idx = tokens.len().checked_sub(1)?;
+    let mut fragment_budget = MAX_BRIDGE_FRAGMENTS - 1;
+    let mut glue_budget = MAX_BRIDGE_GLUE_TOKENS;
+    let mut cut_at = None;
+
+    loop {
+        let (offset, raw) = tokens[idx];
+        let candidate = strip_delimiters(raw);
+        if is_bridge_fragment_shape(candidate) {
+            if fragment_budget == 0 {
+                break;
+            }
+            fragment_budget -= 1;
+            glue_budget = MAX_BRIDGE_GLUE_TOKENS;
+            cut_at = Some(offset);
+        } else if is_delimiter_only_token(candidate) {
+            if glue_budget == 0 {
+                break;
+            }
+            glue_budget -= 1;
+        } else {
+            break;
+        }
+
+        if idx == 0 {
+            break;
+        }
+        let (prev_offset, prev_raw) = tokens[idx - 1];
+        let gap_start = prev_offset + prev_raw.len();
+        if !adjacent_gap_is_bridgeable(window, gap_start, offset) {
+            break;
+        }
+        idx -= 1;
+    }
+
+    cut_at
 }
 
 /// Returns `true` when `low_window` contains `needle` as a standalone word —
@@ -4437,6 +4726,422 @@ mod tests {
             "clean text must not allocate"
         );
         assert_eq!(masked, clean);
+    }
+
+    #[test]
+    fn named_redaction_surfaces_are_permanently_mask_only() {
+        let contracts = [
+            (RedactionSurface::GitIngest, Some(GIT_INGEST_STORED_TARGET)),
+            (
+                RedactionSurface::SessionMirror,
+                Some(SESSION_MIRROR_STORED_TARGET),
+            ),
+            (RedactionSurface::McpDiagnostic, None),
+        ];
+
+        for (surface, expected_target) in contracts {
+            let contract = redaction_surface_contract(surface);
+            assert_eq!(contract.mode, RedactionSurfaceMode::PermanentMaskOnly);
+            assert_eq!(contract.final_stored_target, expected_target);
+            assert_eq!(contract.stamp_property, None);
+            assert_eq!(contract.atomic_success_event, None);
+        }
+    }
+
+    #[test]
+    fn named_redaction_surfaces_mask_without_exemption_admission() {
+        let content = format!("credential: {}", openai_project_key_fixture());
+
+        for surface in [
+            RedactionSurface::GitIngest,
+            RedactionSurface::SessionMirror,
+            RedactionSurface::McpDiagnostic,
+        ] {
+            let masked = mask_for_redaction_surface(surface, &content);
+            assert!(masked.contains(REDACTION_MARKER));
+            assert!(check(masked.as_ref()).is_ok());
+        }
+    }
+
+    #[test]
+    fn mask_bounded_matches_unbounded_masking_when_input_fits_the_window() {
+        let content = format!("credential: {}", openai_project_key_fixture());
+        let expected = mask_for_redaction_surface(RedactionSurface::McpDiagnostic, &content);
+        let result = mask_bounded(RedactionSurface::McpDiagnostic, &content, 4_096, 1_024);
+        assert_eq!(result.text, expected.as_ref());
+        assert!(!result.truncated);
+        assert!(result.redacted);
+    }
+
+    #[test]
+    fn mask_bounded_masks_a_credential_whose_terminator_sits_inside_the_window() {
+        // The window is far larger than the message, and the credential's
+        // terminating `@` sits well inside it — the ordinary case where the
+        // masker sees the whole token and can recognize its shape.
+        let password = format!("PlainPassMarker{}", "q".repeat(24));
+        let url = format!("postgres://svc:{password}@internal-host.example.test/db");
+        let message = format!("backend probe failed: {url}");
+        assert!(message.chars().count() < 200, "fixture must fit the window");
+
+        let result = mask_bounded(RedactionSurface::McpDiagnostic, &message, 200, 100);
+        assert!(
+            !result.text.contains("PlainPassMarker"),
+            "credential must be masked: {}",
+            result.text
+        );
+        assert!(result.text.contains("***MASKED***"));
+        assert!(result.redacted);
+    }
+
+    #[test]
+    fn mask_bounded_drops_a_token_straddling_the_window_boundary_without_partial_leak() {
+        // Constructed so the credential token starts before the window ends
+        // but its terminating `@` lands well past it — a masker restricted
+        // to the window can never observe that `@`, so a truncate-then-mask
+        // policy (the pre-fix behavior at this call site) would recognize no
+        // span and let the visible prefix, including the marker below,
+        // survive untouched in the output. Bounding the input before
+        // masking must not reopen that hole: since the token has no internal
+        // whitespace, the fix drops it whole rather than emitting any
+        // fragment of it.
+        let window_chars = 200;
+        let marker = "StraddleMarkerXYZ789";
+        let padding = "q".repeat(window_chars + 100);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.test/db");
+        let message = format!("benign leading prose here {url}");
+
+        let at_offset = message.find('@').expect("fixture must contain '@'");
+        assert!(
+            at_offset > window_chars,
+            "credential must straddle the window"
+        );
+
+        let result = mask_bounded(RedactionSurface::McpDiagnostic, &message, window_chars, 100);
+        assert!(
+            !result.text.contains(marker),
+            "no fragment of the credential may survive: {}",
+            result.text
+        );
+        assert!(
+            !result.text.contains("postgres://"),
+            "the straddling token must be dropped whole, not partially echoed: {}",
+            result.text
+        );
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn mask_bounded_replaces_a_single_oversized_token_with_the_truncation_marker_alone() {
+        // One token (no whitespace anywhere) longer than the window: there is
+        // no earlier whitespace to fall back to, so nothing from the window
+        // can be shown safely.
+        let window_chars = 50;
+        let text = "q".repeat(window_chars * 4);
+
+        let result = mask_bounded(RedactionSurface::McpDiagnostic, &text, window_chars, 20);
+        assert_eq!(result.text, "…");
+        assert!(result.truncated);
+        assert!(result.redacted);
+    }
+
+    #[test]
+    fn mask_bounded_bounds_output_to_the_window_regardless_of_input_size() {
+        // Several megabytes of benign, whitespace-separated text. A
+        // truncate-then-mask or mask-then-truncate policy alike would still
+        // need to allocate and scan the full input before this function ever
+        // gets to cap the *output*; the point of `mask_bounded` is that the
+        // *masker* itself only ever sees `window_chars`. That is asserted
+        // here as a length invariant (never by wall-clock): the returned
+        // text can never exceed the window, no matter how large the input.
+        let window_chars = 4_096;
+        let huge = "benign word ".repeat(500_000);
+        assert!(huge.len() > 5_000_000, "fixture must be several megabytes");
+
+        let result = mask_bounded(RedactionSurface::McpDiagnostic, &huge, window_chars, 500);
+        assert!(result.truncated);
+        assert!(result.text.chars().count() <= 501);
+    }
+
+    /// A 40-hex-char credential (the SHA-1/git-SHA-doubled shape) built at
+    /// test time by cycling a short literal, never committed whole.
+    fn forty_char_hex_fixture() -> String {
+        "a1b2c3d4e5f6".chars().cycle().take(40).collect()
+    }
+
+    #[test]
+    fn mask_bounded_masks_a_bridged_credential_whose_fragments_straddle_the_window_boundary() {
+        // A 40-char hex credential split into two whitespace-separated
+        // fragments, each individually too short (20 chars) to be
+        // recognized as hex-credential-shaped or high-entropy on its own —
+        // recoverable only by bridging the two fragments together. Expected
+        // arm: before the fix, the window cut lands inside the second
+        // fragment, the existing partial-token drop removes only that
+        // fragment's remnant, and the first fragment (alone, unrecognizable)
+        // survives visible in the bounded output.
+        let hex = forty_char_hex_fixture();
+        let (frag1, frag2) = hex.split_at(20);
+        let message = format!("credential: {frag1} {frag2}");
+
+        // Control: the unbounded masker sees both fragments and masks the
+        // reconstructed credential.
+        let full = mask_for_redaction_surface(RedactionSurface::McpDiagnostic, &message);
+        assert!(
+            !full.contains(frag1) && !full.contains(frag2),
+            "control: unbounded masking must reconstruct and mask the split credential: {full}"
+        );
+
+        // Land the window a few characters into frag2, so the existing
+        // partial-token drop removes only frag2's remnant.
+        let window_chars = "credential: ".len() + frag1.len() + 1 + 5;
+        assert!(
+            window_chars < message.len(),
+            "fixture must exceed the window"
+        );
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            &message,
+            window_chars,
+            window_chars,
+        );
+        assert!(result.truncated);
+        assert!(
+            !result.text.contains(frag1),
+            "no fragment of a bridged credential may survive a window cut mid-chain: {:?}",
+            result.text
+        );
+        assert!(result.redacted);
+    }
+
+    #[test]
+    fn mask_bounded_masks_a_bridged_credential_entirely_inside_the_window() {
+        // Control: both fragments AND the rest of the message fit inside the
+        // window — ordinary in-window bridge reconstruction, unaffected by
+        // the boundary-drop logic.
+        let hex = forty_char_hex_fixture();
+        let (frag1, frag2) = hex.split_at(20);
+        let message = format!("credential: {frag1} {frag2} trailing prose after the secret");
+        let window_chars = message.chars().count() + 10;
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            &message,
+            window_chars,
+            window_chars,
+        );
+        assert!(!result.truncated);
+        assert!(!result.text.contains(frag1));
+        assert!(!result.text.contains(frag2));
+    }
+
+    #[test]
+    fn mask_bounded_never_reveals_a_bridged_credential_entirely_outside_the_window() {
+        // Control: the window cut lands well before the credential even
+        // starts, so neither fragment is ever read into the window.
+        let hex = forty_char_hex_fixture();
+        let (frag1, frag2) = hex.split_at(20);
+        let prefix = "benign leading prose that pads well past the cut point here ";
+        let message = format!("{prefix}credential: {frag1} {frag2}");
+        let window_chars = prefix.chars().count() - 10;
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            &message,
+            window_chars,
+            window_chars,
+        );
+        assert!(!result.text.contains(frag1));
+        assert!(!result.text.contains(frag2));
+    }
+
+    #[test]
+    fn mask_bounded_masks_a_bridged_credential_whose_trigger_follows_the_window() {
+        // Three-way split (14/13/13 chars) of a 40-char hex credential, each
+        // fragment individually too short to be recognized alone. The only
+        // trigger word sits AFTER the last fragment ("... is the api key
+        // for ..."), never inside the truncated window. Expected arm
+        // (pre-fix): `trailing_bridge_fragment_cut` gated its backward walk
+        // on `contains_trigger(window)`, and the window here carries no
+        // trigger at all — the walk never ran, so frag1 and frag2 (both
+        // read whole into the window) survived the partial-token drop and
+        // leaked.
+        let hex = forty_char_hex_fixture();
+        let (frag1, rest) = hex.split_at(14);
+        let (frag2, frag3) = rest.split_at(13);
+        let message = format!("values: {frag1} {frag2} {frag3} is the api key for the service");
+
+        // Control: the unbounded masker sees the trigger after the
+        // fragments and still reconstructs and masks the whole credential.
+        let full = mask_for_redaction_surface(RedactionSurface::McpDiagnostic, &message);
+        assert!(
+            !full.contains(frag1) && !full.contains(frag2) && !full.contains(frag3),
+            "control: unbounded masking must reconstruct and mask the split \
+             credential even though its trigger word comes after the \
+             fragments: {full}"
+        );
+
+        // Land the window a few characters into frag3, so the existing
+        // partial-token drop removes only frag3's remnant and leaves frag1
+        // and frag2 whole in the window; the trigger word stays entirely
+        // outside the window.
+        let window_chars = "values: ".len() + frag1.len() + 1 + frag2.len() + 1 + 5;
+        assert!(
+            window_chars < message.len(),
+            "fixture must exceed the window"
+        );
+        assert!(
+            !contains_trigger(&message[..window_chars]),
+            "fixture must carry no trigger word inside the window"
+        );
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            &message,
+            window_chars,
+            window_chars,
+        );
+        assert!(result.truncated);
+        assert!(
+            !result.text.contains(frag1) && !result.text.contains(frag2),
+            "no fragment of a bridged credential may survive a window cut \
+             mid-chain, even when the credential's only trigger word lies \
+             past the window boundary: {:?}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn mask_bounded_keeps_a_non_fragment_tail_of_an_untriggered_truncated_window() {
+        // No trigger word anywhere in the message, and the tokens at the
+        // tail of the truncated window are ordinary short words (each under
+        // `MIN_BRIDGE_FRAGMENT_LEN`) rather than fragment-shaped. The
+        // unconditional backward walk must still leave them alone: nothing
+        // at the tail looks like a bridged credential fragment.
+        let prefix = "benign status update about the lazy owls and cats over ";
+        let message = format!("{prefix}here while more prose keeps going past the window");
+        assert!(
+            !contains_trigger(&message),
+            "fixture must carry no trigger word"
+        );
+        let window_chars = prefix.chars().count() + 2;
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            &message,
+            window_chars,
+            window_chars,
+        );
+        assert!(result.truncated);
+        assert_eq!(result.text, format!("{prefix}{TRUNCATION_MARKER}"));
+    }
+
+    #[test]
+    fn mask_bounded_drops_a_fragment_shaped_tail_of_an_untriggered_truncated_window() {
+        // No trigger word anywhere in the message. A single fragment-shaped
+        // identifier (alphanumeric, >= MIN_BRIDGE_FRAGMENT_LEN) sits whole
+        // in the window, followed by a short word that gets cut mid-token by
+        // the boundary. Documents the trade the unconditional walk makes:
+        // the walk cannot tell this lone identifier apart from a genuine
+        // bridged fragment, so it drops it too even though nothing is
+        // actually chained to it and no trigger word is anywhere nearby.
+        let prefix = "an ordinary status line about the current build before ";
+        let identifier = "deadbeefcafefeed01234567";
+        let message = format!("{prefix}{identifier} zzzzzzzzzz");
+        assert!(
+            !contains_trigger(&message),
+            "fixture must carry no trigger word"
+        );
+        assert!(identifier.len() >= MIN_BRIDGE_FRAGMENT_LEN);
+
+        let window_chars = prefix.chars().count() + identifier.chars().count() + 1 + 3;
+        assert!(
+            window_chars < message.len(),
+            "fixture must exceed the window"
+        );
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            &message,
+            window_chars,
+            window_chars,
+        );
+        assert!(result.truncated);
+        assert!(
+            !result.text.contains(identifier),
+            "a lone fragment-shaped tail token is dropped even without a \
+             chained neighbor or a trigger word: {:?}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn mask_bounded_keeps_the_whole_token_prefix_of_an_untriggered_sentence_cut_mid_word() {
+        // No trigger word anywhere in the message: the boundary-drop must
+        // never fire, so the existing partial-token-drop behavior is
+        // unchanged and nothing extra is dropped.
+        let prefix = "the quick brown fox jumps over the lazy ";
+        let message = format!("{prefix}dogs while writing documentation");
+        assert!(
+            !contains_trigger(&message),
+            "fixture must carry no trigger word"
+        );
+        let window_chars = prefix.chars().count() + 2;
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            &message,
+            window_chars,
+            window_chars,
+        );
+        assert!(result.truncated);
+        assert_eq!(result.text, format!("{prefix}{TRUNCATION_MARKER}"));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "the input window must stay at least as large as the output cap")]
+    fn mask_bounded_debug_asserts_when_window_is_smaller_than_output_cap() {
+        let _ = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            "some diagnostic text",
+            10,
+            50,
+        );
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn mask_bounded_clamps_output_cap_to_window_chars_outside_debug_assertions() {
+        // Inverted pair (window_chars < output_cap_chars): outside debug
+        // assertions this must not panic, and the returned text must
+        // respect window_chars as the effective cap, never the larger
+        // output_cap_chars a misconfigured call site passed in. Uses a
+        // degenerate `scheme://user:pass@host` short enough (9 chars) that
+        // its `***MASKED***` replacement (12 chars) GROWS past window_chars
+        // — the one case where an uncapped `output_cap_chars` would let the
+        // returned text exceed the window it was supposed to be bounded by.
+        let window_chars = 9;
+        let output_cap_chars = 500;
+        let text = "a://b:c@d"; // scheme=a, user=b, pass=c, host=d — 9 chars, fits the window whole
+        assert_eq!(
+            text.len(),
+            window_chars,
+            "fixture must exactly fill the window"
+        );
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            text,
+            window_chars,
+            output_cap_chars,
+        );
+        assert!(
+            result.text.chars().count() <= window_chars + 1,
+            "output must never exceed the window (plus one truncation-marker char) \
+             even when output_cap_chars is misconfigured larger than window_chars: {:?}",
+            result.text
+        );
     }
 
     #[test]

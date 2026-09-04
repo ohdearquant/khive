@@ -282,7 +282,8 @@ For `MaskedCommitFields`: `sha`/`short_sha`/`committed_at`/`parents` are
 git-computed hashes and an RFC3339 timestamp — not attacker-authored free
 text — so they pass through unchanged. `author`, `author_email`,
 `subject`, and `body` are git-config- and commit-message-controlled prose
-and go through the same `mask_secrets` gate `content` already used —
+and go through the typed `GitIngest` permanent mask-only surface backed by the same canonical
+detector `content` already used —
 closing the gap where the commit note `name` (built from the raw subject)
 and its `author`/`author_email` properties skipped masking entirely.
 
@@ -292,7 +293,9 @@ text) and pass through unchanged. `updated_at` is special because it crosses
 the paging cursor/argv boundary: it is parsed and canonicalized before page
 sorting, and an invalid value is dropped with a value-free warning. `title`,
 `body`, the author login, and both ref names are contributor-controlled prose
-and go through the same `mask_secrets` gate.
+and go through the same typed `GitIngest` mask-only surface. Per ADR-115 Amendment 2 this surface
+cannot consume a manifest exemption, write a `khive:secret_gate` stamp, or emit an exemption-success
+event; the final entity/note fields contain only the masked values.
 
 `StateReasonField` is the classified outcome of parsing a raw `stateReason`
 string against the governed enum (`hook::ISSUE_STATE_REASONS`, ADR-088 §3)

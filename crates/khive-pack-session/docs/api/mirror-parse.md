@@ -32,7 +32,10 @@ that don't change as the DFS walks the mapping tree: `mapping`,
 `current_path` (the current-node root-to-tip set), `session_id`,
 `conv_created_at_micros` (conversation-level `create_time` in micros, 0 if
 absent — the fallback used when a message's own `create_time` is
-null/absent), and `slug`.
+null/absent), and `slug`. The conversation `title` is passed through the same
+`SessionMirror` permanent mask-only surface as `text` and `raw` before it
+becomes `slug`, both on the per-event projection and on the `sessions.slug`
+column it feeds — a credential-bearing title cannot reach storage unmasked.
 
 ## `parse_claude_ai_export` — `chat_messages` and active branches
 
@@ -56,9 +59,11 @@ unknown internal blocks are not display text. The parser then appends a
 distinct top-level `text` value because agent turns can carry tool blocks and
 a separate final answer at the same time; when `text` exactly duplicates a
 text block it is emitted only once. Older exports that use `role` instead of
-`sender` retain the same user/assistant normalization. Every extracted text
-and serialized raw message is passed through the canonical secret masker
-before it becomes a `ParsedEvent`.
+`sender` retain the same user/assistant normalization. Every extracted text and serialized raw
+message is passed through the typed `SessionMirror` permanent mask-only surface before it becomes a
+`ParsedEvent`. Per ADR-115 Amendment 2 the final stored targets are `session_messages.text` and
+`session_messages.raw`; the surface has no exemption lookup, posture stamp, or atomic
+exemption-success event.
 Malformed conversations are skipped individually; invalid JSON or a non-array
 top level returns `None` so the ingest cursor cannot advance.
 
@@ -118,8 +123,12 @@ form of a message `content` value.
 - `"input_text"` / `"output_text"` — Codex user and assistant text blocks
   (same field, `text`, as the Claude Code `"text"` block, hence shared
   extraction logic).
-- `"tool_use"` — tool invocation (name + input JSON, truncated to 500 chars).
-- `"tool_result"` — tool output (content string, truncated to 500 chars).
+- `"tool_use"` — tool invocation (name + input JSON, masked through the `SessionMirror` surface
+  then truncated to 500 chars). Masking runs before truncation: a detector's terminating span can
+  sit past the 500-char cut, and a masker that only sees a truncated prefix cannot recognize a
+  match it cannot see the end of.
+- `"tool_result"` — tool output (content string, masked through the `SessionMirror` surface then
+  truncated to 500 chars, for the same mask-before-truncate reason).
 
 ## `extract_chatgpt_text`
 

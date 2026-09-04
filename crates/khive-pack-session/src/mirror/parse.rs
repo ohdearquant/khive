@@ -9,6 +9,25 @@ use chrono::DateTime;
 use khive_runtime::secret_gate;
 use serde_json::{Map, Value};
 
+fn mask_session_mirror(text: &str) -> std::borrow::Cow<'_, str> {
+    secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::SessionMirror, text)
+}
+
+/// Bound the masker's own input window (see `secret_gate::mask_bounded`)
+/// before capping display text to `output_cap_chars`, rather than masking
+/// the full, unbounded text: cost stays proportional to the shared window
+/// regardless of input length, and a token straddling the window is dropped
+/// whole rather than echoed unmasked.
+fn mask_session_mirror_bounded(text: &str, output_cap_chars: usize) -> String {
+    secret_gate::mask_bounded(
+        secret_gate::RedactionSurface::SessionMirror,
+        text,
+        secret_gate::MASK_WINDOW_CHARS,
+        output_cap_chars,
+    )
+    .text
+}
+
 /// A single parsed event, source-agnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedEvent {
@@ -36,9 +55,9 @@ pub struct ParsedEvent {
     pub raw: String,
     /// Source timestamp as microseconds since the Unix epoch; 0 if absent or unparseable.
     pub created_at_micros: i64,
-    /// `cwd` if present.
+    /// `cwd` if present, secrets masked.
     pub cwd: Option<String>,
-    /// `gitBranch` (CC) or `payload.git.branch` (Codex) if present.
+    /// `gitBranch` (CC) or `payload.git.branch` (Codex) if present, secrets masked.
     pub git_branch: Option<String>,
     /// `slug` if present (CC: project slug; ChatGPT/Claude.ai export:
     /// conversation title; Codex files carry no slug concept).
@@ -117,14 +136,20 @@ pub fn parse_cc_line(line: &str) -> Option<ParsedEvent> {
         .unwrap_or("unknown")
         .to_string();
 
-    let cwd = map.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
+    let cwd = map
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|s| mask_session_mirror(s).into_owned());
 
     let git_branch = map
         .get("gitBranch")
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(|s| mask_session_mirror(s).into_owned());
 
-    let slug = map.get("slug").and_then(|v| v.as_str()).map(str::to_string);
+    let slug = map
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .map(|s| mask_session_mirror(s).into_owned());
 
     let created_at_micros = map
         .get("timestamp")
@@ -146,8 +171,8 @@ pub fn parse_cc_line(line: &str) -> Option<ParsedEvent> {
     // Apply masking to the raw line and the extracted text, reusing the
     // canonical write-time secret detector (khive-runtime) — never a second,
     // weaker masker.
-    let raw = secret_gate::mask_secrets(trimmed).into_owned();
-    let text = text.map(|t| secret_gate::mask_secrets(&t).into_owned());
+    let raw = mask_session_mirror(trimmed).into_owned();
+    let text = text.map(|t| mask_session_mirror(&t).into_owned());
 
     Some(ParsedEvent {
         uuid,
@@ -215,17 +240,17 @@ pub fn parse_codex_line(line: &str, session_id: &str, abs_byte_offset: u64) -> O
             let cwd = payload
                 .and_then(|p| p.get("cwd"))
                 .and_then(|v| v.as_str())
-                .map(str::to_string);
+                .map(|s| mask_session_mirror(s).into_owned());
 
             let git_branch = payload
                 .and_then(|p| p.get("git"))
                 .and_then(|g| g.as_object())
                 .and_then(|g| g.get("branch"))
                 .and_then(|v| v.as_str())
-                .map(str::to_string);
+                .map(|s| mask_session_mirror(s).into_owned());
 
             let uuid = format!("{session_id}:{abs_byte_offset}");
-            let raw = secret_gate::mask_secrets(trimmed).into_owned();
+            let raw = mask_session_mirror(trimmed).into_owned();
 
             Some(ParsedEvent {
                 uuid,
@@ -256,13 +281,10 @@ pub fn parse_codex_line(line: &str, session_id: &str, abs_byte_offset: u64) -> O
                 .map(str::to_string);
 
             let text = extract_text(payload.get("content"));
-            let text = text.map(|t| {
-                let masked = secret_gate::mask_secrets(&t).into_owned();
-                truncate(&masked, 500)
-            });
+            let text = text.map(|t| mask_session_mirror_bounded(&t, 500));
 
             let uuid = format!("{session_id}:{abs_byte_offset}");
-            let raw = secret_gate::mask_secrets(trimmed).into_owned();
+            let raw = mask_session_mirror(trimmed).into_owned();
 
             Some(ParsedEvent {
                 uuid,
@@ -398,7 +420,7 @@ fn parse_claude_ai_conversation(
                 .and_then(Value::as_str)
                 .filter(|summary| !summary.is_empty())
         })
-        .map(|title| secret_gate::mask_secrets(title).into_owned());
+        .map(|title| mask_session_mirror(title).into_owned());
     let conversation_created_at_micros = conversation
         .get("created_at")
         .and_then(parse_rfc3339_micros)
@@ -552,8 +574,8 @@ fn build_claude_ai_event(
         is_sidechain: !current_path.contains(&uuid),
         role,
         msg_type: "message".to_string(),
-        text: Some(secret_gate::mask_secrets(&text).into_owned()),
-        raw: secret_gate::mask_secrets(&raw_json).into_owned(),
+        text: Some(mask_session_mirror(&text).into_owned()),
+        raw: mask_session_mirror(&raw_json).into_owned(),
         created_at_micros,
         cwd: None,
         git_branch: None,
@@ -641,7 +663,8 @@ fn extract_block(block: &Value) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             let input = map.get("input").cloned().unwrap_or(Value::Null);
-            let input_str = truncate(&serde_json::to_string(&input).unwrap_or_default(), 500);
+            let input_json = serde_json::to_string(&input).unwrap_or_default();
+            let input_str = mask_session_mirror_bounded(&input_json, 500);
             Some(format!("[tool_use: {name}] {input_str}"))
         }
         "tool_result" => {
@@ -650,20 +673,12 @@ fn extract_block(block: &Value) -> Option<String> {
                 Value::String(s) => s.clone(),
                 other => serde_json::to_string(other).unwrap_or_default(),
             };
-            Some(format!("[tool_result] {}", truncate(&content_str, 500)))
+            Some(format!(
+                "[tool_result] {}",
+                mask_session_mirror_bounded(&content_str, 500)
+            ))
         }
         _ => None,
-    }
-}
-
-/// Truncate a string to at most `max_chars` characters, appending `…` if truncated.
-fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max_chars).collect();
-        out.push('…');
-        out
     }
 }
 
@@ -700,7 +715,7 @@ fn parse_conversation(conv: &Value, out: &mut Vec<ParsedEvent>) {
         .get("title")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        .map(|title| mask_session_mirror(title).into_owned());
 
     let conv_created_at_micros = conv_obj
         .get("create_time")
@@ -834,8 +849,8 @@ fn build_chatgpt_event(
     let is_sidechain = !ctx.current_path.contains(node_id);
 
     let raw_json = serde_json::to_string(node).unwrap_or_default();
-    let raw = secret_gate::mask_secrets(&raw_json).into_owned();
-    let text = secret_gate::mask_secrets(&text).into_owned();
+    let raw = mask_session_mirror(&raw_json).into_owned();
+    let text = mask_session_mirror(&text).into_owned();
 
     Some(ParsedEvent {
         uuid,
@@ -953,6 +968,51 @@ mod tests {
     }
 
     #[test]
+    fn test_cc_line_masks_secret_bearing_slug() {
+        let secret = format!("{}{}", "AKIA", "FAKEKEY1234567890");
+        let line = make_line(
+            "aaaa-bbbb",
+            "sess-1111",
+            "user",
+            &format!(
+                r#","message":{{"role":"user","content":"Hello world"}},"slug":"prod creds {secret}""#
+            ),
+        );
+        let ev = parse_cc_line(&line).expect("should parse");
+        let slug = ev.slug.as_deref().expect("slug");
+        assert!(!slug.contains(&secret));
+        assert!(slug.contains("***MASKED***"));
+    }
+
+    #[test]
+    fn test_cc_line_masks_secret_bearing_cwd_and_git_branch() {
+        let marker = "CwdCredMarkerXYZ789";
+        let cwd = format!("/repo?token=postgres://svc:{marker}q@internal-host.example.test/db");
+        let branch = format!("feature/postgres://svc:{marker}q@internal-host.example.test/db");
+        let line = make_line(
+            "aaaa-cwd1",
+            "sess-1111",
+            "user",
+            &format!(
+                r#","message":{{"role":"user","content":"Hello world"}},"cwd":"{cwd}","gitBranch":"{branch}""#
+            ),
+        );
+        let ev = parse_cc_line(&line).expect("should parse");
+        let stored_cwd = ev.cwd.as_deref().expect("cwd");
+        let stored_branch = ev.git_branch.as_deref().expect("git_branch");
+        assert!(!stored_cwd.contains(marker), "cwd: {stored_cwd}");
+        assert!(stored_cwd.contains("***MASKED***"), "cwd: {stored_cwd}");
+        assert!(
+            !stored_branch.contains(marker),
+            "git_branch: {stored_branch}"
+        );
+        assert!(
+            stored_branch.contains("***MASKED***"),
+            "git_branch: {stored_branch}"
+        );
+    }
+
+    #[test]
     fn test_assistant_with_text_and_tool_use_blocks() {
         let line = r#"{"uuid":"cccc-dddd","sessionId":"sess-1111","type":"assistant","timestamp":"2026-06-29T10:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"I'll run a search."},{"type":"tool_use","name":"bash","input":{"command":"ls"}}]}}"#
             .to_string();
@@ -962,6 +1022,82 @@ mod tests {
         assert!(text.contains("I'll run a search."), "text: {text}");
         assert!(text.contains("[tool_use: bash]"), "text: {text}");
         assert!(text.contains("command"), "text: {text}");
+    }
+
+    #[test]
+    fn test_tool_use_input_credential_masked_before_truncation() {
+        // The credential's terminating `@` lands past the 500-character
+        // display cap applied to a tool_use input block. A masker that only
+        // sees the already-truncated prefix can never recognize the span, so
+        // the password marker survives untouched in the stored `text`.
+        let marker = "ToolUseCredMarkerXYZ789";
+        let padding = "z".repeat(600);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.com/db");
+        let input = serde_json::json!({ "url": url });
+        let serialized_input = serde_json::to_string(&input).unwrap();
+        let at_offset = serialized_input
+            .find('@')
+            .expect("fixture must contain '@'");
+        assert!(at_offset > 500);
+
+        let content = serde_json::json!([
+            { "type": "tool_use", "name": "bash", "input": input }
+        ]);
+        let message = serde_json::json!({
+            "uuid": "tool-use-cred",
+            "sessionId": "sess-cred",
+            "type": "assistant",
+            "timestamp": "2026-06-29T10:01:00Z",
+            "message": { "role": "assistant", "content": content }
+        });
+        let line = message.to_string();
+
+        let ev = parse_cc_line(&line).expect("should parse");
+        let text = ev.text.expect("text should be present");
+        assert!(
+            !text.contains(marker),
+            "no fragment of the credential may survive masking: {text}"
+        );
+        assert!(
+            text.contains("***MASKED***"),
+            "MASKED marker must appear in text: {text}"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_content_credential_masked_before_truncation() {
+        // Same shape as the tool_use case above, but for a tool_result
+        // content string whose credential terminator crosses the 500-char cut.
+        let marker = "ToolResultCredMarkerXYZ789";
+        let padding = "z".repeat(600);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.com/db");
+        let at_offset = url.find('@').expect("fixture must contain '@'");
+        assert!(at_offset > 500);
+
+        let content = serde_json::json!([
+            { "type": "tool_result", "content": url }
+        ]);
+        let message = serde_json::json!({
+            "uuid": "tool-result-cred",
+            "sessionId": "sess-cred",
+            "type": "user",
+            "timestamp": "2026-06-29T10:02:00Z",
+            "message": { "role": "user", "content": content }
+        });
+        let line = message.to_string();
+
+        let ev = parse_cc_line(&line).expect("should parse");
+        let text = ev.text.expect("text should be present");
+        assert!(
+            !text.contains(marker),
+            "no fragment of the credential may survive masking: {text}"
+        );
+        assert!(
+            text.contains("***MASKED***"),
+            "MASKED marker must appear in text: {text}"
+        );
     }
 
     #[test]
@@ -1115,6 +1251,27 @@ mod tests {
         // Synthetic uuid: "{session_id}:{offset}".
         assert_eq!(ev.uuid, format!("{CDX_SID}:0"));
         assert!(ev.created_at_micros > 0);
+    }
+
+    #[test]
+    fn test_codex_session_meta_masks_secret_bearing_cwd_and_branch() {
+        let marker = "CodexCwdCredMarkerXYZ789";
+        let cwd = format!("/repo?token=postgres://svc:{marker}q@internal-host.example.test/db");
+        let branch = format!("feature/postgres://svc:{marker}q@internal-host.example.test/db");
+        let line = codex_meta(&cwd, &branch);
+        let ev = parse_codex_line(&line, CDX_SID, 0).expect("session_meta should parse");
+        let stored_cwd = ev.cwd.as_deref().expect("cwd");
+        let stored_branch = ev.git_branch.as_deref().expect("git_branch");
+        assert!(!stored_cwd.contains(marker), "cwd: {stored_cwd}");
+        assert!(stored_cwd.contains("***MASKED***"), "cwd: {stored_cwd}");
+        assert!(
+            !stored_branch.contains(marker),
+            "git_branch: {stored_branch}"
+        );
+        assert!(
+            stored_branch.contains("***MASKED***"),
+            "git_branch: {stored_branch}"
+        );
     }
 
     #[test]
@@ -1536,6 +1693,42 @@ mod tests {
         assert_eq!(events[1].text.as_deref(), Some("Hi there"));
         assert_eq!(events[1].parent_uuid.as_deref(), Some("msg-user"));
         assert!(!events[1].is_sidechain);
+    }
+
+    #[test]
+    fn test_chatgpt_export_masks_secret_bearing_title() {
+        let secret = format!("{}{}", "AKIA", "FAKEKEY1234567890");
+        let export = serde_json::json!([{
+            "id": "conv-secret-title",
+            "title": format!("prod creds {secret}"),
+            "current_node": "msg-user",
+            "create_time": 1_700_000_000.0,
+            "mapping": {
+                "root": {
+                    "id": "root",
+                    "message": null,
+                    "parent": null,
+                    "children": ["msg-user"]
+                },
+                "msg-user": {
+                    "id": "msg-user",
+                    "parent": "root",
+                    "children": [],
+                    "message": {
+                        "id": "msg-user",
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": ["Hello"]}
+                    }
+                }
+            }
+        }]);
+        let content = serde_json::to_string(&export).unwrap();
+
+        let events = parse_chatgpt_export(&content).expect("valid export must parse");
+        assert_eq!(events.len(), 1);
+        let slug = events[0].slug.as_deref().expect("event slug");
+        assert!(!slug.contains(&secret));
+        assert!(slug.contains("***MASKED***"));
     }
 
     #[test]

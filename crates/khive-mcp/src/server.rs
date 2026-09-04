@@ -50,7 +50,6 @@ use crate::tools::request::RequestParams;
 const MAX_BACKEND_ERROR_ENTRIES: usize = 16;
 const MAX_BACKEND_ERROR_KEY_CHARS: usize = 256;
 const MAX_BACKEND_ERROR_MESSAGE_CHARS: usize = 1_024;
-const MAX_BACKEND_ERROR_INPUT_CHARS: usize = MAX_BACKEND_ERROR_MESSAGE_CHARS * 4;
 /// A legal request carries at most `MAX_OPS` operation envelopes. Reserving a
 /// quarter of the daemon frame for their mandatory diagnostic metadata leaves
 /// another quarter for JSON escaping and half for fixed envelope fields.
@@ -347,37 +346,40 @@ fn search_arm_participation_value(participation: SearchArmParticipation) -> Valu
 }
 
 fn bounded_backend_error_message(message: &str) -> String {
-    let bounded_input: String = message
-        .chars()
-        .take(MAX_BACKEND_ERROR_INPUT_CHARS)
-        .collect();
-    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
-    if masked.trim().is_empty() {
+    // Bound the masker's own input window (see `secret_gate::mask_bounded`)
+    // rather than masking the full, unbounded message: cost stays
+    // proportional to the shared window regardless of message length, and a
+    // token straddling the window is dropped whole rather than echoed
+    // unmasked.
+    let result = khive_runtime::secret_gate::mask_bounded(
+        khive_runtime::secret_gate::RedactionSurface::McpDiagnostic,
+        message,
+        khive_runtime::secret_gate::MASK_WINDOW_CHARS,
+        MAX_BACKEND_ERROR_MESSAGE_CHARS,
+    );
+    if result.text.trim().is_empty() {
         return MISSING_BACKEND_ERROR_MESSAGE.to_string();
     }
-    let mut chars = masked.chars();
-    let mut bounded: String = chars
-        .by_ref()
-        .take(MAX_BACKEND_ERROR_MESSAGE_CHARS)
-        .collect();
-    if chars.next().is_some() || message.chars().nth(MAX_BACKEND_ERROR_INPUT_CHARS).is_some() {
-        bounded.push('…');
-    }
-    bounded
+    result.text
 }
 
 fn bounded_backend_error_key(backend_id: &str) -> (String, bool, bool, usize) {
     let backend_id_chars = backend_id.chars().count();
-    let bounded_input: String = backend_id
-        .chars()
-        .take(MAX_BACKEND_ERROR_INPUT_CHARS)
-        .collect();
-    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
-    let backend_id_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
-    let sanitized = if masked.trim().is_empty() {
+    // Bound the masker's own input window (see `secret_gate::mask_bounded`)
+    // rather than masking the full, unbounded id. The window doubles as the
+    // output cap here — this function applies its own further prefix +
+    // fingerprint bounding below.
+    let result = khive_runtime::secret_gate::mask_bounded(
+        khive_runtime::secret_gate::RedactionSurface::McpDiagnostic,
+        backend_id,
+        khive_runtime::secret_gate::MASK_WINDOW_CHARS,
+        khive_runtime::secret_gate::MASK_WINDOW_CHARS,
+    );
+    let backend_id_masked = result.redacted || result.truncated || result.text.trim().is_empty();
+    let sanitized = if result.text.trim().is_empty() {
         "masked-backend"
     } else {
-        masked.as_ref()
+        result.text.as_str()
     };
     if !backend_id_masked && backend_id_chars <= MAX_BACKEND_ERROR_KEY_CHARS {
         return (sanitized.to_string(), false, false, backend_id_chars);
@@ -6794,6 +6796,77 @@ mod tests {
         assert_eq!(
             bounded_backend_error_message(" \t\n"),
             MISSING_BACKEND_ERROR_MESSAGE
+        );
+    }
+
+    #[test]
+    fn backend_error_message_drops_a_url_credential_whose_terminator_crosses_the_window() {
+        // The credential's `scheme://user:` opens well inside the shared
+        // MASK_WINDOW_CHARS window (and well inside the visible
+        // MAX_BACKEND_ERROR_MESSAGE_CHARS output window), but the password is
+        // padded long enough that the terminating `@` lands past the window.
+        // A masker restricted to the window can never observe that `@`, so a
+        // truncate-then-mask policy could never recognize the span and the
+        // password prefix — including this marker — would survive untouched.
+        // `mask_bounded` closes that hole a different way: since the whole
+        // `postgres://...` token has no internal whitespace, it is dropped
+        // in its entirety (back to the space before it) rather than passed
+        // to the masker partially — so no fragment of it, marked or not,
+        // reaches the output. The padding character is repeated so the run
+        // stays low-entropy and cannot be caught by the entropy heuristic
+        // instead of the url-userinfo detector this test used to target.
+        let marker = "CustomDbPassMarkerXYZ789";
+        let padding = "z".repeat(khive_runtime::secret_gate::MASK_WINDOW_CHARS + 200);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.com/db");
+        let message = format!("backend probe failed: {url}");
+
+        let at_offset = message.find('@').expect("test fixture must contain '@'");
+        assert!(at_offset > khive_runtime::secret_gate::MASK_WINDOW_CHARS);
+        let marker_offset = message
+            .find(marker)
+            .expect("test fixture must contain marker");
+        assert!(marker_offset < MAX_BACKEND_ERROR_MESSAGE_CHARS);
+
+        let masked = bounded_backend_error_message(&message);
+        assert!(
+            !masked.contains(marker),
+            "no fragment of the credential may survive: {masked}"
+        );
+        assert!(
+            !masked.contains("postgres://"),
+            "the straddling token must be dropped whole, not partially echoed: {masked}"
+        );
+        assert!(
+            masked.starts_with("backend probe failed:"),
+            "the untruncated prose before the dropped token must survive: {masked}"
+        );
+        assert!(masked.ends_with('…'));
+    }
+
+    #[test]
+    fn backend_error_key_masks_a_url_credential_whose_terminator_crosses_the_window() {
+        // Mirrors backend_error_message_drops_a_url_credential_whose_terminator_crosses_the_window:
+        // the backend id itself can carry a credential whose terminating `@`
+        // lands past MASK_WINDOW_CHARS. Unlike the message case there is no
+        // leading prose to fall back to, so the whole id is dropped and the
+        // fingerprint path takes over.
+        let marker = "CustomDbPassMarkerXYZ789";
+        let padding = "z".repeat(khive_runtime::secret_gate::MASK_WINDOW_CHARS + 200);
+        let password = format!("{marker}{padding}");
+        let backend_id = format!("postgres://svc:{password}@internal-host.example.com/db");
+
+        let at_offset = backend_id.find('@').expect("test fixture must contain '@'");
+        assert!(at_offset > khive_runtime::secret_gate::MASK_WINDOW_CHARS);
+
+        let (key, backend_id_masked, _truncated, _chars) = bounded_backend_error_key(&backend_id);
+        assert!(
+            !key.contains(marker),
+            "no fragment of the credential may survive masking: {key}"
+        );
+        assert!(
+            backend_id_masked,
+            "backend_id_masked must be true when the id carried a credential"
         );
     }
 

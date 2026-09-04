@@ -470,6 +470,9 @@ presentation and response-frame compaction. If no hit survives filtering, the
 operation is `ok: false` with `error.kind="search_incomplete"`; the structured
 error carries the same diagnostics. `backend_errors_truncated` plus
 `backend_errors_omitted` explicitly report causes omitted by safety bounds.
+The masking uses ADR-115 Amendment 2's permanent `McpDiagnostic` surface. Diagnostics are response
+data rather than durable records and can neither consume a manifest exemption nor produce a secret
+gate stamp or exemption-success event.
 
 Every successful KG search also carries `arm_participation` beside `result`;
 `search_incomplete` carries the same object inside `error`:

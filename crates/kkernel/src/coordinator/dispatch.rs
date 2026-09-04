@@ -24,17 +24,24 @@ use super::registry::BackendRegistry;
 /// on [`BackendSearchResult`] for internal routing; the MCP boundary applies
 /// the same canonical secret masker before exposing it on the wire.
 fn bounded_backend_id_for_log(backend_id: &str) -> String {
-    const MAX_INPUT_CHARS: usize = 4_096;
     const MAX_OUTPUT_CHARS: usize = 256;
 
     let backend_id_chars = backend_id.chars().count();
-    let bounded_input: String = backend_id.chars().take(MAX_INPUT_CHARS).collect();
-    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
-    let was_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
-    let sanitized = if masked.trim().is_empty() {
+    // Bound the masker's own input window (see `secret_gate::mask_bounded`)
+    // rather than masking the full, unbounded id. The window doubles as the
+    // output cap here — this function applies its own further prefix +
+    // fingerprint bounding below.
+    let result = khive_runtime::secret_gate::mask_bounded(
+        khive_runtime::secret_gate::RedactionSurface::McpDiagnostic,
+        backend_id,
+        khive_runtime::secret_gate::MASK_WINDOW_CHARS,
+        khive_runtime::secret_gate::MASK_WINDOW_CHARS,
+    );
+    let was_masked = result.redacted || result.truncated || result.text.trim().is_empty();
+    let sanitized = if result.text.trim().is_empty() {
         "masked-backend"
     } else {
-        masked.as_ref()
+        result.text.as_str()
     };
     if !was_masked && backend_id_chars <= MAX_OUTPUT_CHARS {
         return sanitized.to_string();
@@ -54,24 +61,24 @@ fn bounded_backend_id_for_log(backend_id: &str) -> String {
 /// mirrors the MCP wire boundary so the earlier coordinator diagnostic cannot
 /// leak a credential that the response would later redact.
 pub(super) fn bounded_backend_cause_for_log(message: &str) -> String {
-    const MAX_INPUT_CHARS: usize = 4_096;
     const MAX_OUTPUT_CHARS: usize = 1_024;
     const MISSING_CAUSE: &str = "backend search failed without diagnostic detail";
 
-    let mut input_chars = message.chars();
-    let bounded_input: String = input_chars.by_ref().take(MAX_INPUT_CHARS).collect();
-    let input_truncated = input_chars.next().is_some();
-    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
-    if masked.trim().is_empty() {
+    // Bound the masker's own input window (see `secret_gate::mask_bounded`)
+    // rather than masking the full, unbounded message: cost stays
+    // proportional to the shared window regardless of message length, and a
+    // token straddling the window is dropped whole rather than echoed
+    // unmasked.
+    let result = khive_runtime::secret_gate::mask_bounded(
+        khive_runtime::secret_gate::RedactionSurface::McpDiagnostic,
+        message,
+        khive_runtime::secret_gate::MASK_WINDOW_CHARS,
+        MAX_OUTPUT_CHARS,
+    );
+    if result.text.trim().is_empty() {
         return MISSING_CAUSE.to_string();
     }
-
-    let mut masked_chars = masked.chars();
-    let mut bounded: String = masked_chars.by_ref().take(MAX_OUTPUT_CHARS).collect();
-    if masked_chars.next().is_some() || input_truncated {
-        bounded.push('…');
-    }
-    bounded
+    result.text
 }
 
 /// Result of a single backend's entity-search contribution to a fan-out.
@@ -1244,5 +1251,59 @@ mod futures_util {
             }
             results
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mirrors khive-mcp's
+    // backend_error_message_drops_a_url_credential_whose_terminator_crosses_the_window:
+    // the credential's terminating `@` lands past the shared masking window,
+    // so a masker restricted to the window can never recognize the span. The
+    // whole straddling token — having no internal whitespace — is dropped
+    // rather than partially echoed, so no fragment of it survives even
+    // though it is never marked as masked.
+
+    #[test]
+    fn backend_cause_for_log_drops_a_url_credential_whose_terminator_crosses_the_window() {
+        let marker = "CoordinatorCauseMarkerXYZ789";
+        let padding = "z".repeat(khive_runtime::secret_gate::MASK_WINDOW_CHARS + 200);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.com/db");
+        let message = format!("backend probe failed: {url}");
+
+        let at_offset = message.find('@').expect("test fixture must contain '@'");
+        assert!(at_offset > khive_runtime::secret_gate::MASK_WINDOW_CHARS);
+
+        let bounded = bounded_backend_cause_for_log(&message);
+        assert!(
+            !bounded.contains(marker),
+            "no fragment of the credential may survive: {bounded}"
+        );
+        assert!(
+            !bounded.contains("postgres://"),
+            "the straddling token must be dropped whole, not partially echoed: {bounded}"
+        );
+        assert!(bounded.starts_with("backend probe failed:"));
+        assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn backend_id_for_log_drops_a_url_credential_whose_terminator_crosses_the_window() {
+        let marker = "CoordinatorIdMarkerXYZ789";
+        let padding = "z".repeat(khive_runtime::secret_gate::MASK_WINDOW_CHARS + 200);
+        let password = format!("{marker}{padding}");
+        let backend_id = format!("postgres://svc:{password}@internal-host.example.com/db");
+
+        let at_offset = backend_id.find('@').expect("test fixture must contain '@'");
+        assert!(at_offset > khive_runtime::secret_gate::MASK_WINDOW_CHARS);
+
+        let bounded = bounded_backend_id_for_log(&backend_id);
+        assert!(
+            !bounded.contains(marker),
+            "no fragment of the credential may survive: {bounded}"
+        );
     }
 }
