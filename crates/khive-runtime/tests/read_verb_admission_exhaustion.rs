@@ -12,8 +12,13 @@
 //! not reliable. A dedicated binary with no unrelated concurrent tests
 //! removes that source of flakiness.
 //!
-//! Requires `--features fault-injection,test-internals` (same as
-//! `tests/adr133_audit_batch.rs`).
+//! Gated on `--features fault-injection,test-internals` (same as
+//! `tests/adr133_audit_batch.rs`), but this crate's own `[dev-dependencies]`
+//! entry on itself (`crates/khive-runtime/Cargo.toml`) already requests both
+//! features, so plain `cargo test -p khive-runtime` builds and runs this
+//! file with no extra flags — the `#![cfg]` below is what makes the file a
+//! no-op for anyone building khive-runtime as a plain dependency, not an
+//! opt-in a caller of `cargo test -p khive-runtime` has to remember.
 
 #![cfg(all(feature = "fault-injection", feature = "test-internals"))]
 
@@ -38,11 +43,28 @@ use khive_types::pack::{Pack, Visibility};
 use khive_types::{EventKind, EventOutcome, SubstrateKind, VerbCategory};
 use serial_test::serial;
 
+/// khive#2331 cap-shedding coverage: per-call release gates, keyed by
+/// arrival order, each holding the sender half of a oneshot pair the call
+/// itself created and is awaiting the receiver half of. Lets a test release
+/// one specific blocked `append_events_idempotent` call while an earlier
+/// one stays blocked — a single shared `Notify`/`Semaphore` always wakes its
+/// oldest waiter first, which cannot express "release the newest blocked
+/// call while an older one stays blocked".
+type CallGates = Arc<std::sync::Mutex<Vec<Option<tokio::sync::oneshot::Sender<()>>>>>;
+
+fn release_call_gate(gates: &CallGates, index: usize) {
+    let tx = gates.lock().unwrap()[index]
+        .take()
+        .expect("call gate exists and has not already been released");
+    let _ = tx.send(());
+}
+
 #[derive(Default)]
 struct MemoryEventStore {
     events: std::sync::Mutex<Vec<Event>>,
     append_started: Option<Arc<tokio::sync::Notify>>,
     append_release: Option<Arc<tokio::sync::Notify>>,
+    call_gates: Option<CallGates>,
 }
 
 #[async_trait]
@@ -89,7 +111,11 @@ impl EventStore for MemoryEventStore {
         if let Some(started) = &self.append_started {
             started.notify_one();
         }
-        if let Some(release) = &self.append_release {
+        if let Some(gates) = &self.call_gates {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            gates.lock().unwrap().push(Some(tx));
+            let _ = rx.await;
+        } else if let Some(release) = &self.append_release {
             release.notified().await;
         }
         let mut store = self.events.lock().unwrap();
@@ -802,9 +828,217 @@ async fn normal_append_inside_driver_deadline_is_unaffected() {
     );
 }
 
-// Every test in this file arms `fault_injection`'s process-global
+/// khive#2331: `driver_append_deadline` alone stops the driver from holding
+/// one stalled generation forever, but it does not cap how many detached
+/// appends can be outstanding at once — a store whose append never returns
+/// would otherwise mint one detached task per `driver_append_deadline`
+/// indefinitely, and each retains up to `max_rows_per_generation` events
+/// until it (maybe) finally returns.
+/// `AuditBatchConfig::max_abandoned_appends` caps the outstanding count:
+/// once reached, further generations are shed with
+/// `AuditTerminalReason::StoreWedged` without ever calling the store, and
+/// the driver resumes attempting real appends as soon as an outstanding one
+/// returns and the count drops back below the cap.
+///
+/// Red before the fix: there is no cap, `outstanding_abandoned_appends` does
+/// not exist on the snapshot, and all five generations below resolve
+/// `DriverAppendAbandoned` after their own `driver_append_deadline` instead
+/// of the last three shedding immediately as `StoreWedged`.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn driver_sheds_generations_once_the_abandoned_append_cap_is_reached() {
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let call_gates: CallGates = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = Arc::new(MemoryEventStore {
+        append_started: Some(Arc::clone(&append_started)),
+        call_gates: Some(Arc::clone(&call_gates)),
+        ..MemoryEventStore::default()
+    });
+    // Generous relative to `admission_deadline` so the state-polling below
+    // (a handful of lock/notify round trips) never races a caller's own
+    // bounded wait; the mechanism under test is driven entirely off
+    // `test_snapshot()`/`health_metrics()`, never off a `submit()` call's
+    // own return value, for exactly that reason.
+    let resolution_deadline = std::time::Duration::from_millis(100);
+    // Mirrors `driver_append_deadline()` in `audit_batch.rs` (3x
+    // `resolution_deadline`); that function is private, so this is a
+    // parallel derivation, not a call into it.
+    let driver_append_deadline = resolution_deadline.saturating_mul(3);
+    let batch = AuditBatch::new(
+        store,
+        AuditBatchConfig {
+            admission_deadline: std::time::Duration::from_millis(80),
+            resolution_deadline,
+            max_abandoned_appends: std::num::NonZeroUsize::new(2).unwrap(),
+            ..AuditBatchConfig::default()
+        },
+    );
+
+    // Generation 1: submitted and immediately blocked on call gate index 0.
+    // The caller's own bounded `submit()` may give up at `admission_deadline`
+    // before the driver's own, much larger bound — that is expected and
+    // irrelevant here (its `JoinHandle` is dropped, unawaited), because the
+    // row itself is left with the driver regardless (documented non-removal
+    // contract) and this test observes the driver's behavior directly
+    // through `test_snapshot()`, not through the caller's wait.
+    let b = batch.clone();
+    let g1 = tokio::spawn(async move {
+        b.submit(PreparedAuditRow {
+            event: mk_event("kg.g1"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("generation 1 reaches the blocking store");
+    drop(g1);
+
+    // Generation 1 must abandon (past driver_append_deadline) before the
+    // driver loops back to drain generation 2.
+    wait_until(driver_append_deadline * 2, || {
+        batch.test_snapshot().outstanding_abandoned_appends >= 1
+    })
+    .await;
+
+    // Generation 2: submitted once generation 1 has abandoned, so it forms
+    // its own generation (outstanding == 1 < cap == 2, not shed) and blocks
+    // on call gate index 1.
+    let b = batch.clone();
+    let g2 = tokio::spawn(async move {
+        b.submit(PreparedAuditRow {
+            event: mk_event("kg.g2"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("generation 2 reaches the blocking store");
+    drop(g2);
+
+    // Generation 2 must also abandon before the cap (2) is reached.
+    wait_until(driver_append_deadline * 2, || {
+        batch.test_snapshot().outstanding_abandoned_appends >= 2
+    })
+    .await;
+    let snap = batch.test_snapshot();
+    let abandoned = snap
+        .per_generation
+        .iter()
+        .filter(|g| g.terminal_reason == Some(AuditTerminalReason::DriverAppendAbandoned))
+        .count();
+    assert_eq!(
+        abandoned, 2,
+        "exactly generations 1 and 2 must have abandoned before the cap takes effect: {:?}",
+        snap.per_generation
+    );
+
+    // (a): with the cap reached, three more generations shed immediately —
+    // no store call is ever attempted (the call-gate count stays at 2),
+    // well under `driver_append_deadline`.
+    for i in 0..3 {
+        let start = std::time::Instant::now();
+        let result = batch
+            .submit(PreparedAuditRow {
+                event: mk_event(&format!("kg.wedged{i}")),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            Err(AuditTerminalReason::StoreWedged),
+            "generation must shed once the abandoned-append cap is reached"
+        );
+        assert!(
+            elapsed < driver_append_deadline / 2,
+            "a shed generation must resolve without waiting anywhere near \
+             driver_append_deadline: took {elapsed:?}"
+        );
+    }
+    assert_eq!(
+        call_gates.lock().unwrap().len(),
+        2,
+        "shedding must never attempt a real append: the store must never see a third call"
+    );
+    assert_eq!(
+        batch.test_snapshot().outstanding_abandoned_appends,
+        2,
+        "shedding must not spawn or retain any additional detached appends"
+    );
+
+    // (d): admission capacity was never at risk — `pending` stayed far below
+    // `max_pending_rows`, and every submission above resolved to either
+    // `DriverAppendAbandoned` (observed via the snapshot) or `StoreWedged`
+    // (asserted directly), never `QueueAdmissionExhausted`.
+    assert!(
+        batch.test_snapshot().pending_rows < AuditBatchConfig::default().max_pending_rows.get(),
+        "pending must never approach max_pending_rows while generations are being shed"
+    );
+
+    // (b): recovery. Releasing generation 1's call gate (index 0) lets that
+    // append finally return a commit, dropping the outstanding count to 1 —
+    // below the cap. `notify_one`/a shared `Semaphore` would instead always
+    // wake the OLDEST blocked call first, which is exactly why this test
+    // uses per-call gates: generation 2's call (index 1) must stay blocked
+    // and untouched by this release.
+    release_call_gate(&call_gates, 0);
+    wait_until(std::time::Duration::from_secs(5), || {
+        batch.test_snapshot().outstanding_abandoned_appends == 1
+    })
+    .await;
+    assert_eq!(
+        batch.health_metrics().late_append_commits,
+        1,
+        "the released append must be recorded as a late commit, proving the wedged \
+         store later drained"
+    );
+
+    // Below the cap again (1 < 2), a fresh generation attempts a real
+    // append — no timer needed for recovery.
+    let before_recovery = batch.test_snapshot().per_generation.len();
+    let recovered = batch.clone();
+    let recovered_task = tokio::spawn(async move {
+        recovered
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.recovered"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("recovery generation attempts a real append, proving it was not shed");
+    wait_until(std::time::Duration::from_secs(5), || {
+        call_gates.lock().unwrap().len() == 3
+    })
+    .await;
+    release_call_gate(&call_gates, 2);
+    drop(recovered_task);
+
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snap = batch.test_snapshot();
+        snap.per_generation.len() > before_recovery
+            && snap.per_generation[before_recovery..]
+                .iter()
+                .any(|g| g.terminal_reason.is_none() && g.committed_rows >= 1)
+    })
+    .await;
+    assert_eq!(
+        batch.test_snapshot().outstanding_abandoned_appends,
+        1,
+        "the recovery generation must commit inline (never detach); generation 2's \
+         still-blocked append remains the only outstanding one"
+    );
+}
+
+// Every test below this point arms `fault_injection`'s process-global
 // `SUPERVISOR_SLEEP_BEFORE_SPAWN` flag; running them concurrently races one
-// test's arm against another supervisor loop consuming it.
+// test's arm against another supervisor loop consuming it. (The
+// `MemoryEventStore`-driven tests above this comment never arm it — their
+// unnamed `#[serial]` is not for this reason.)
 #[serial]
 #[tokio::test]
 #[serial(config_ledger)]
@@ -1158,9 +1392,6 @@ async fn cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlis
 /// above does not: `AdmissionDeadlineExpired` on a row that was already
 /// enqueued (`state.pending`), rather than `QueueAdmissionExhausted` before
 /// enqueue.
-// Both tests in this file arm `fault_injection`'s process-global
-// `SUPERVISOR_SLEEP_BEFORE_SPAWN` flag; running them concurrently races one
-// test's arm against the other's supervisor loop consuming it.
 #[serial]
 #[tokio::test]
 #[serial(config_ledger)]

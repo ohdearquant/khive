@@ -465,7 +465,13 @@ instrumentation cannot see the population this record shrinks.
   silent: the generation snapshot carries `terminal_reason = DriverAppendAbandoned` with
   `committed_rows = 0`, `flush_failures` increments, and pure producers record degradation. An
   operator reads that snapshot as a store that stopped answering for longer than the bound, not as
-  a write-path defect, and treats the snapshot's row count as the upper bound on what was lost.
+  a write-path defect, and treats the snapshot's row count as the upper bound on what was lost. The
+  same amendment's cap on outstanding abandoned appends (`max_abandoned_appends`) adds a second,
+  same-family sub-path rather than a third exception: once that many appends are already
+  outstanding, a further generation is shed without an append ever being attempted, so its rows are
+  lost with certainty rather than merely possibly, upon the same non-silent surfacing —
+  `terminal_reason = StoreWedged`, `flush_failures` increments, and pure producers record
+  degradation exactly as they do for `DriverAppendAbandoned`.
 - **INV-2 (D5).** An unclassified input resolves to the stricter handling — commit failure fails
   the dispatch — enforced by exhaustive matching without a wildcard.
 - **INV-3.** Batch accumulation is bounded and never blocks dispatch indefinitely; a full batch
@@ -814,5 +820,16 @@ task that drives it to completion and discards whatever it eventually returns; n
 listening for that result. As with `ResolutionDeadlineExpired`, the caller's already-committed
 domain effect is never retried and the row is never re-enqueued. Under a store that never returns,
 this mints one detached task per `driver_append_deadline` (90 s at the defaults: a 5 s
-`admission_deadline`, 6x for `resolution_deadline`, 3x again for the driver): bounded in rate,
-unbounded in count, and each such task holds its stalled append until the process exits.
+`admission_deadline`, 6x for `resolution_deadline`, 3x again for the driver) — but only up to
+`AuditBatchConfig::max_abandoned_appends` (default 4) may be outstanding at once. Before spawning a
+generation's child, `supervisor_loop` reads the current count of still-running
+`DriverAppendAbandoned` appends; at or above the cap, the store is treated as wedged and this
+generation is shed instead of attempted: no child task is spawned and no store call is made, every
+waiter resolves immediately with the new `AuditTerminalReason::StoreWedged`, `flush_failures`
+increments, and the loop continues straight to the next `pending` drain. A shed generation costs no
+store work at all. Recovery needs no timer of its own: as soon as one outstanding append returns —
+commit or failure, each recorded on a dedicated counter so an operator can see that a store recorded
+as wedged later drained — the count drops back below the cap and the next generation attempts a
+real append again. This bounds the retained-buffer growth a wedged store can cause to
+`max_abandoned_appends * max_rows_per_generation` rows, in place of the fully unbounded growth this
+amendment originally left.

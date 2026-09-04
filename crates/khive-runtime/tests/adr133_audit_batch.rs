@@ -585,6 +585,7 @@ async fn audit_delta_rejects_regressed_counters() {
         committed_rows: 5,
         store_batch_calls: 1,
         per_generation: vec![],
+        outstanding_abandoned_appends: 0,
     };
     let mut after = before.clone();
     after.submitted_rows = 4;

@@ -179,6 +179,20 @@ pub enum AuditTerminalReason {
     /// domain effect (if any already committed before this row was
     /// enqueued) is never retried, and the row is never re-enqueued.
     DriverAppendAbandoned,
+    /// Before spawning a generation's child, the driver found
+    /// `AuditBatchConfig::max_abandoned_appends` detached appends already
+    /// outstanding from prior [`Self::DriverAppendAbandoned`] generations
+    /// (khive#2331). The store is treated as wedged: this generation's rows
+    /// are shed without ever attempting an append — no child task is
+    /// spawned, no store call is made, and every waiter resolves with this
+    /// reason immediately, well inside `driver_append_deadline`. Same
+    /// non-retry contract as [`Self::DriverAppendAbandoned`]: any
+    /// already-committed domain effect is not retried and the row is never
+    /// re-enqueued, and pure-observability producers record degradation.
+    /// The driver reattempts an append on the next generation as soon as an
+    /// outstanding append returns (commit or failure) and the count drops
+    /// back below the cap — recovery needs no timer of its own.
+    StoreWedged,
 }
 
 /// One row accepted for batching: the immutable event identity plus the
@@ -210,6 +224,16 @@ pub struct AuditBatchHealthMetrics {
     pub flush_failures: u64,
     pub degraded_rows: u64,
     pub degraded: bool,
+    /// Detached [`AuditTerminalReason::DriverAppendAbandoned`] appends that
+    /// eventually returned a commit, after their generation had already
+    /// resolved every waiter with `DriverAppendAbandoned`. Lets an operator
+    /// see that a store recorded as wedged later drained.
+    pub late_append_commits: u64,
+    /// Detached [`AuditTerminalReason::DriverAppendAbandoned`] appends that
+    /// eventually returned a failure (store error, panic, or cancellation),
+    /// after their generation had already resolved every waiter with
+    /// `DriverAppendAbandoned`.
+    pub late_append_failures: u64,
 }
 
 /// Tunables for the batch seam. Defaults are conservative; every field is
@@ -237,6 +261,21 @@ pub struct AuditBatchConfig {
     /// admission for every later caller, not just the one already waiting
     /// on the stuck row. See [`AuditTerminalReason::DriverAppendAbandoned`].
     pub resolution_deadline: Duration,
+    /// Caps how many [`AuditTerminalReason::DriverAppendAbandoned`] appends
+    /// may be outstanding (handed to a detached task, still running) at
+    /// once. Each outstanding append retains up to
+    /// `max_rows_per_generation` events until it finally returns, so the
+    /// retained-buffer bound this places on a wedged store is
+    /// `max_abandoned_appends * max_rows_per_generation` rows — without it,
+    /// a store whose append never returns mints one such task per
+    /// `driver_append_deadline` with no cap, and both the live task count
+    /// and the retained event batches inside them grow until the process
+    /// exits (khive#2331). Once the cap is reached, `supervisor_loop` sheds
+    /// further generations with [`AuditTerminalReason::StoreWedged`] instead
+    /// of attempting another append; it resumes attempting appends as soon
+    /// as an outstanding one returns and the count drops back below the
+    /// cap. Defaults to 4.
+    pub max_abandoned_appends: std::num::NonZeroUsize,
 }
 
 impl Default for AuditBatchConfig {
@@ -249,6 +288,7 @@ impl Default for AuditBatchConfig {
             retry_backoff: Duration::from_millis(20),
             admission_deadline,
             resolution_deadline: admission_deadline * 6,
+            max_abandoned_appends: std::num::NonZeroUsize::new(4).unwrap(),
         }
     }
 }
@@ -302,6 +342,14 @@ struct State {
     flush_failures: u64,
     degraded_rows: u64,
     degraded: bool,
+    /// Detached `DriverAppendAbandoned` appends currently still running,
+    /// bounded by `AuditBatchConfig::max_abandoned_appends`. Incremented
+    /// when `supervisor_loop` abandons a generation and hands its child to a
+    /// detached task; decremented by that task once the child finally
+    /// returns.
+    outstanding_abandoned_appends: usize,
+    late_append_commits: u64,
+    late_append_failures: u64,
 }
 
 impl State {
@@ -319,6 +367,9 @@ impl State {
             flush_failures: 0,
             degraded_rows: 0,
             degraded: false,
+            outstanding_abandoned_appends: 0,
+            late_append_commits: 0,
+            late_append_failures: 0,
         }
     }
 
@@ -482,6 +533,18 @@ enum GenerationResult {
 /// resolution_deadline` guarantees it can never resolve a still-waiting
 /// caller's row with `DriverAppendAbandoned` ahead of that caller's own,
 /// more specific `ResolutionDeadlineExpired` reason.
+///
+/// This bound alone only stops the driver from holding one stalled
+/// generation forever — a store whose append never returns still mints one
+/// detached append per `driver_append_deadline` with nothing capping how
+/// many run at once. `AuditBatchConfig::max_abandoned_appends` closes that:
+/// once that many detached appends are outstanding, further generations are
+/// shed with [`AuditTerminalReason::StoreWedged`] instead of attempting
+/// another append. Combined, the two bounds guarantee at most
+/// `max_abandoned_appends` live detached appends at any time, at most that
+/// many retained event batches, and a shed generation costs no store work
+/// at all — it resolves inside this function's caller without ever calling
+/// `run_generation`.
 fn driver_append_deadline(config: &AuditBatchConfig) -> Duration {
     config.resolution_deadline.saturating_mul(3)
 }
@@ -558,6 +621,8 @@ impl AuditBatch {
             flush_failures: state.flush_failures,
             degraded_rows: state.degraded_rows,
             degraded: state.degraded,
+            late_append_commits: state.late_append_commits,
+            late_append_failures: state.late_append_failures,
         }
     }
 
@@ -682,7 +747,7 @@ async fn supervisor_loop(
     config: Arc<AuditBatchConfig>,
 ) {
     loop {
-        let waiting = {
+        let (waiting, wedged_generation_id) = {
             let mut state = inner.state.lock();
             if matches!(state.lifecycle, Lifecycle::Failed(_)) {
                 state.driver_active = false;
@@ -699,9 +764,45 @@ async fn supervisor_loop(
             let waiting: Vec<Waiting> = state.pending.drain(..take_n).collect();
             let generation_id = state.next_generation_id;
             state.next_generation_id += 1;
-            state.in_flight_generation = Some(generation_id);
-            waiting
+            // khive#2331: a store whose append never returns must not mint
+            // an unbounded number of detached appends. Before committing to
+            // spawning this generation's child, check whether the cap is
+            // already saturated by prior abandoned generations still
+            // running in the background — if so, this generation is shed
+            // below instead of ever calling the store.
+            if state.outstanding_abandoned_appends >= config.max_abandoned_appends.get() {
+                (waiting, Some(generation_id))
+            } else {
+                state.in_flight_generation = Some(generation_id);
+                (waiting, None)
+            }
         };
+
+        if let Some(generation_id) = wedged_generation_id {
+            tracing::warn!(
+                generation_id,
+                max_abandoned_appends = config.max_abandoned_appends.get(),
+                "audit store treated as wedged: max_abandoned_appends detached appends are \
+                 already outstanding; shedding this generation without attempting an append"
+            );
+            let submitted = waiting.len() as u64;
+            {
+                let mut state = inner.state.lock();
+                state.flush_failures += 1;
+                state.generations.push(AuditGenerationSnapshot {
+                    generation_id,
+                    submitted_rows: submitted,
+                    committed_rows: 0,
+                    store_batch_calls: 0,
+                    terminal_reason: Some(AuditTerminalReason::StoreWedged),
+                });
+            }
+            for w in waiting {
+                record_degradation_if_pure(&inner, w.producer);
+                let _ = w.responder.send(Err(AuditTerminalReason::StoreWedged));
+            }
+            continue;
+        }
 
         #[cfg(any(test, feature = "fault-injection"))]
         if fault::SUPERVISOR_PANIC.swap(false, Ordering::SeqCst) {
@@ -763,6 +864,7 @@ async fn supervisor_loop(
                     let mut state = inner.state.lock();
                     state.in_flight_generation = None;
                     state.flush_failures += 1;
+                    state.outstanding_abandoned_appends += 1;
                     let generation_id = state.next_generation_id.saturating_sub(1);
                     state.generations.push(AuditGenerationSnapshot {
                         generation_id,
@@ -778,8 +880,17 @@ async fn supervisor_loop(
                         .responder
                         .send(Err(AuditTerminalReason::DriverAppendAbandoned));
                 }
+                let reaper_inner = inner.clone();
                 tokio::spawn(async move {
-                    let _ = child.await;
+                    let result = child.await;
+                    let mut state = reaper_inner.state.lock();
+                    state.outstanding_abandoned_appends =
+                        state.outstanding_abandoned_appends.saturating_sub(1);
+                    match result {
+                        Ok(GenerationResult::Committed(_)) => state.late_append_commits += 1,
+                        Ok(GenerationResult::Failed(_) | GenerationResult::FakedInconsistent)
+                        | Err(_) => state.late_append_failures += 1,
+                    }
                 });
                 continue;
             }
@@ -978,6 +1089,9 @@ mod test_internals {
         pub committed_rows: u64,
         pub store_batch_calls: u64,
         pub per_generation: Vec<AuditGenerationSnapshot>,
+        /// Live count of detached `DriverAppendAbandoned` appends still
+        /// running, bounded by `AuditBatchConfig::max_abandoned_appends`.
+        pub outstanding_abandoned_appends: usize,
     }
 
     impl AuditBatchSnapshot {
@@ -991,6 +1105,8 @@ mod test_internals {
         pub flush_failures: u64,
         pub degraded_rows: u64,
         pub degraded: bool,
+        pub late_append_commits: u64,
+        pub late_append_failures: u64,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -1019,6 +1135,7 @@ mod test_internals {
                 committed_rows: state.committed_rows,
                 store_batch_calls: state.store_batch_calls,
                 per_generation: state.generations.clone(),
+                outstanding_abandoned_appends: state.outstanding_abandoned_appends,
             }
         }
 
@@ -1028,6 +1145,8 @@ mod test_internals {
                 flush_failures: state.flush_failures,
                 degraded_rows: state.degraded_rows,
                 degraded: state.degraded,
+                late_append_commits: state.late_append_commits,
+                late_append_failures: state.late_append_failures,
             }
         }
 
