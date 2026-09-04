@@ -402,6 +402,142 @@ tokio::task_local! {
 }
 
 #[cfg(test)]
+pub(crate) async fn scope_fts_test_deadline_advance<F>(
+    after_completed_terms: usize,
+    by: std::time::Duration,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    FTS_TEST_DEADLINE_ADVANCE
+        .scope(
+            FtsTestDeadlineAdvance {
+                after_completed_terms,
+                by,
+            },
+            future,
+        )
+        .await
+}
+
+/// Recorded in the true execution order of the four checkpoints below,
+/// independent of `tokio::sync::Notify`'s single-stored-permit semantics
+/// (a `notify_one()` fired before anyone awaits `notified()` is still
+/// delivered to the next waiter, so a signal alone cannot distinguish
+/// "happened concurrently" from "happened earlier and is only observed
+/// later"). Tests that need to prove genuine overlap — not just that both
+/// checkpoints were eventually reached — read this log's positions instead.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CandidateStageEvent {
+    AnnStarted,
+    LexicalStarted,
+    AnnFinished,
+    LexicalFinished,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CandidateStageTestControl {
+    pub(crate) ann_started: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) ann_release: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) ann_finished: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) lexical_started: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) lexical_release: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) lexical_finished: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) events: std::sync::Arc<std::sync::Mutex<Vec<CandidateStageEvent>>>,
+    block_ann: bool,
+    block_lexical: bool,
+}
+
+#[cfg(test)]
+impl CandidateStageTestControl {
+    pub(crate) fn new(block_ann: bool, block_lexical: bool) -> Self {
+        Self {
+            ann_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            ann_release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            ann_finished: std::sync::Arc::new(tokio::sync::Notify::new()),
+            lexical_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            lexical_release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            lexical_finished: std::sync::Arc::new(tokio::sync::Notify::new()),
+            events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            block_ann,
+            block_lexical,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum CandidateStage {
+    Ann,
+    Lexical,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CANDIDATE_STAGE_TEST_CONTROL: CandidateStageTestControl;
+}
+
+#[cfg(test)]
+pub(crate) async fn scope_candidate_stage_test_control<F>(
+    control: CandidateStageTestControl,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CANDIDATE_STAGE_TEST_CONTROL.scope(control, future).await
+}
+
+#[cfg(test)]
+async fn candidate_stage_test_start(stage: CandidateStage) {
+    let control = CANDIDATE_STAGE_TEST_CONTROL.try_with(Clone::clone).ok();
+    let Some(control) = control else {
+        return;
+    };
+    match stage {
+        CandidateStage::Ann => {
+            control
+                .events
+                .lock()
+                .unwrap()
+                .push(CandidateStageEvent::AnnStarted);
+            control.ann_started.notify_one();
+            if control.block_ann {
+                control.ann_release.notified().await;
+            }
+        }
+        CandidateStage::Lexical => {
+            control
+                .events
+                .lock()
+                .unwrap()
+                .push(CandidateStageEvent::LexicalStarted);
+            control.lexical_started.notify_one();
+            if control.block_lexical {
+                control.lexical_release.notified().await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn candidate_stage_test_finish(stage: CandidateStage) {
+    let _ = CANDIDATE_STAGE_TEST_CONTROL.try_with(|control| {
+        control.events.lock().unwrap().push(match stage {
+            CandidateStage::Ann => CandidateStageEvent::AnnFinished,
+            CandidateStage::Lexical => CandidateStageEvent::LexicalFinished,
+        });
+        match stage {
+            CandidateStage::Ann => control.ann_finished.notify_one(),
+            CandidateStage::Lexical => control.lexical_finished.notify_one(),
+        }
+    });
+}
+
+#[cfg(test)]
 async fn advance_fts_test_deadline_after_term(completed_terms: usize) {
     let advance_by = FTS_TEST_DEADLINE_ADVANCE
         .try_with(|control| {
@@ -414,17 +550,108 @@ async fn advance_fts_test_deadline_after_term(completed_terms: usize) {
     }
 }
 
-fn is_timeout(e: &khive_storage::StorageError) -> bool {
-    matches!(e, khive_storage::StorageError::Timeout { .. })
+/// ANN-refill counterpart of `FtsTestDeadlineAdvance`: advances paused Tokio
+/// time exactly between two ANN refill rounds (deterministic instead of a
+/// wall-clock race), so a test can prove a completed round's hits survive a
+/// deadline that expires before the next round is allowed to start.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct AnnTestDeadlineAdvance {
+    after_completed_rounds: usize,
+    by: std::time::Duration,
 }
 
-/// Same check, for the `RuntimeError` shape `?`-propagated storage timeouts
-/// arrive in at the handler layer.
-fn is_read_timeout(e: &RuntimeError) -> bool {
-    matches!(
-        e,
-        RuntimeError::Storage(khive_storage::StorageError::Timeout { .. })
-    )
+#[cfg(test)]
+tokio::task_local! {
+    static ANN_TEST_DEADLINE_ADVANCE: AnnTestDeadlineAdvance;
+}
+
+#[cfg(test)]
+pub(crate) async fn scope_ann_test_deadline_advance<F>(
+    after_completed_rounds: usize,
+    by: std::time::Duration,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    ANN_TEST_DEADLINE_ADVANCE
+        .scope(
+            AnnTestDeadlineAdvance {
+                after_completed_rounds,
+                by,
+            },
+            future,
+        )
+        .await
+}
+
+#[cfg(test)]
+async fn advance_ann_test_deadline_after_round(completed_rounds: usize) {
+    let advance_by = ANN_TEST_DEADLINE_ADVANCE
+        .try_with(|control| {
+            (completed_rounds == control.after_completed_rounds).then_some(control.by)
+        })
+        .ok()
+        .flatten();
+    if let Some(advance_by) = advance_by {
+        tokio::time::advance(advance_by).await;
+    }
+}
+
+/// Test-only fault injection for the hydrator's storage read, modeling a
+/// hydration query timing out mid-refill (issue #2312). Scoped the same way
+/// as `ANN_TEST_DEADLINE_ADVANCE`, and consulted from inside
+/// `hydrate_empty_hits` itself rather than the refill loop: the fault
+/// substitutes a synthetic `StorageError::Timeout` for the reader
+/// acquisition, so the failure count and the shell-stripping a real
+/// reader-acquisition failure would produce come from that function's own
+/// error-handling branch, not a duplicate of it. `on_or_after_call` is a
+/// threshold, not a single round: once the fault activates it stays active
+/// for every later call in the same scope, so a test can model a hydration
+/// fault that keeps recurring across the remaining refill rounds.
+#[cfg(test)]
+struct HydrationTestFault {
+    on_or_after_call: usize,
+    calls: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static HYDRATION_TEST_FAULT: HydrationTestFault;
+}
+
+#[cfg(test)]
+pub(crate) async fn scope_hydration_test_fault<F>(on_or_after_call: usize, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    HYDRATION_TEST_FAULT
+        .scope(
+            HydrationTestFault {
+                on_or_after_call,
+                calls: std::cell::Cell::new(0),
+            },
+            future,
+        )
+        .await
+}
+
+/// Called once per `hydrate_empty_hits` invocation with non-empty ids, in
+/// call order. Returns whether this call should fail.
+#[cfg(test)]
+fn hydration_test_fault_due_this_call() -> bool {
+    HYDRATION_TEST_FAULT
+        .try_with(|control| {
+            let call = control.calls.get() + 1;
+            control.calls.set(call);
+            call >= control.on_or_after_call
+        })
+        .unwrap_or(false)
+}
+
+fn is_timeout(e: &khive_storage::StorageError) -> bool {
+    matches!(e, khive_storage::StorageError::Timeout { .. })
 }
 
 /// Fetch a bounded lexical candidate pool.
@@ -1025,7 +1252,18 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
     }
 
     let sql = runtime.sql();
-    let mut reader = match sql.reader().await {
+    #[cfg(test)]
+    let reader_result = if hydration_test_fault_due_this_call() {
+        Err(khive_storage::StorageError::Timeout {
+            operation: "knowledge candidate hydration (test fault)".into(),
+        })
+    } else {
+        sql.reader().await
+    };
+    #[cfg(not(test))]
+    let reader_result = sql.reader().await;
+
+    let mut reader = match reader_result {
         Ok(r) => r,
         Err(error) => {
             tracing::warn!(
@@ -1164,6 +1402,21 @@ fn attach_lexical_timeout_degradation(out: &mut Value) {
     out["degraded"]["lexical_timeout"] = json!(true);
 }
 
+/// Flag that the ANN candidate leg hit the request read deadline. Reported
+/// beside `lexical_timeout` rather than folded into it: the two legs time
+/// out independently, and a late ANN timeout after the lexical leg already
+/// succeeded degrades the response the same way a lexical timeout does — it
+/// never fails the verb outright.
+fn attach_ann_timeout_degradation(out: &mut Value) {
+    if !out
+        .get("degraded")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        out["degraded"] = json!({});
+    }
+    out["degraded"]["ann_timeout"] = json!(true);
+}
+
 /// Flag that the best-effort body-line aggregate hit the request read
 /// deadline after the search itself completed. The ranked hits are kept and
 /// their atom rows report `body_lines: null`; the timeout degrades metadata,
@@ -1180,8 +1433,26 @@ fn attach_body_lines_timeout_degradation(out: &mut Value) {
 
 struct EligibleAnnSearchState {
     hits: Vec<ScoredHit>,
-    availability: AnnAvailability,
+    /// `None` only when the request read deadline expired before any ANN
+    /// round completed — no round means no observed availability.
+    availability: Option<AnnAvailability>,
     hydration_failures: usize,
+    /// Set when the request read deadline expired mid-refill. `hits` still
+    /// carries whatever the most recently completed round produced; the
+    /// caller must not discard them just because the deadline is spent.
+    timed_out: bool,
+}
+
+#[derive(Default)]
+struct AnnCandidateOutcome {
+    hits: Vec<ScoredHit>,
+    availability: Option<AnnAvailability>,
+    hydration_failures: usize,
+    /// Set only when the ANN leg itself hit the shared request read
+    /// deadline. `availability` stays `None` on this path — it is only
+    /// known once the eligible search actually ran — so callers must check
+    /// this field, not infer a timeout from an absent availability.
+    timed_out: bool,
 }
 
 /// Retrieve an ANN pool whose bounded, rank-preserving truncation happens only
@@ -1200,13 +1471,34 @@ async fn search_eligible_ann_with_refill(
     query_embedding: &[f32],
     target_eligible: usize,
     initial_k: usize,
-) -> Result<EligibleAnnSearchState, RuntimeError> {
+) -> EligibleAnnSearchState {
     let runtime = ctx.runtime;
     let target_eligible = target_eligible.max(1);
     let mut request_k = initial_k.max(target_eligible).max(1);
 
+    // Every hit that has hydrated successfully in ANY completed round so
+    // far, keyed by id. A round whose hydration fails for a reason other
+    // than the deadline (a faulted or genuinely errored storage read, a
+    // stale ANN id) contributes no entries here and therefore can never
+    // evict an id an earlier round already placed in the accumulator — only
+    // a fresh hydration of the same id overwrites its predecessor (issue
+    // #2312). The deadline branch below is the only reader; the
+    // target-reached and source-exhausted branches keep returning that
+    // round's own hits, unaffected by this bookkeeping.
+    let mut accumulated_hits: HashMap<String, ScoredHit> = HashMap::new();
+    let mut accumulated_hydration_failures = 0usize;
+    #[cfg(test)]
+    let mut completed_rounds = 0usize;
+
     loop {
-        khive_storage::ensure_request_read_active("knowledge.search")?;
+        if khive_storage::ensure_request_read_active("knowledge.search").is_err() {
+            return finalize_timed_out_refill(
+                accumulated_hits,
+                None,
+                accumulated_hydration_failures,
+                target_eligible,
+            );
+        }
         let AnnSearchState {
             hits: raw_hits,
             availability,
@@ -1231,17 +1523,42 @@ async fn search_eligible_ann_with_refill(
             .collect();
 
         let hydration_failures = hydrate_empty_hits(runtime, ctx.ns, &mut hits).await;
-        khive_storage::ensure_request_read_active("knowledge.search")?;
+        #[cfg(test)]
+        {
+            completed_rounds += 1;
+            advance_ann_test_deadline_after_round(completed_rounds).await;
+        }
+        let deadline_expired =
+            khive_storage::ensure_request_read_active("knowledge.search").is_err();
         filter_hits_by_status(&mut hits, ctx.statuses, ctx.exclude_statuses);
         filter_hits_by_type(&mut hits, ctx.type_filter);
 
+        // On a duplicate id the most recently hydrated round wins: ids are
+        // re-read from the canonical store every round, so a later round's
+        // copy is the freshest metadata for that id (ANN scores are
+        // deterministic per id, so ranking is unaffected either way).
+        for hit in &hits {
+            accumulated_hits.insert(hit.id.clone(), hit.clone());
+        }
+        accumulated_hydration_failures += hydration_failures;
+
+        if deadline_expired {
+            return finalize_timed_out_refill(
+                accumulated_hits,
+                Some(availability),
+                accumulated_hydration_failures,
+                target_eligible,
+            );
+        }
+
         if hits.len() >= target_eligible || source_exhausted {
             hits.truncate(target_eligible);
-            return Ok(EligibleAnnSearchState {
+            return EligibleAnnSearchState {
                 hits,
-                availability,
+                availability: Some(availability),
                 hydration_failures,
-            });
+                timed_out: false,
+            };
         }
 
         // The live vector-store count is not a sound upper bound for a serving
@@ -1251,14 +1568,129 @@ async fn search_eligible_ann_with_refill(
         let next_k = request_k.saturating_mul(2);
         if next_k == request_k {
             hits.truncate(target_eligible);
-            return Ok(EligibleAnnSearchState {
+            return EligibleAnnSearchState {
                 hits,
-                availability,
+                availability: Some(availability),
                 hydration_failures,
-            });
+                timed_out: false,
+            };
         }
         request_k = next_k;
     }
+}
+
+/// Build the deadline-expiry return value for `search_eligible_ann_with_refill`
+/// from every hit accumulated across all completed rounds.
+fn finalize_timed_out_refill(
+    accumulated_hits: HashMap<String, ScoredHit>,
+    availability: Option<AnnAvailability>,
+    hydration_failures: usize,
+    target_eligible: usize,
+) -> EligibleAnnSearchState {
+    let hits = top_n_by_score(accumulated_hits.into_values().collect(), target_eligible);
+    EligibleAnnSearchState {
+        hits,
+        availability,
+        hydration_failures,
+        timed_out: true,
+    }
+}
+
+/// Select the top `n` hits by descending score without sorting the whole
+/// batch (issue #2312): `select_nth_unstable_by` partitions the top `n` in
+/// O(len) average instead of the O(len log len) a full sort would cost, and
+/// only the kept prefix — at most `n` elements — is sorted afterward, so the
+/// discarded tail never pays for either comparison or allocation beyond the
+/// initial partition.
+fn top_n_by_score(mut hits: Vec<ScoredHit>, n: usize) -> Vec<ScoredHit> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if hits.len() > n {
+        hits.select_nth_unstable_by(n - 1, |a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(n);
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits
+}
+
+/// Run the query-embedding and eligible ANN candidate leg with the handler's
+/// established fail-open policy. Read-deadline expiry and embedding failures
+/// produce an empty ANN outcome; other runtime failures remain hard errors.
+async fn search_ann_candidates(
+    phase: &'static str,
+    ctx: &SearchCtx<'_>,
+    token: &NamespaceToken,
+    ann: &vamana::SharedAnn,
+    raw_query: &str,
+    target_eligible: usize,
+    initial_k: usize,
+) -> Result<AnnCandidateOutcome, RuntimeError> {
+    #[cfg(test)]
+    candidate_stage_test_start(CandidateStage::Ann).await;
+
+    let outcome =
+        match khive_storage::await_request_read_phase(phase, ctx.runtime.embed_query(raw_query))
+            .await
+        {
+            Ok(Ok(query_emb)) => {
+                let key = vamana::AnnKey::new(ctx.ns, ctx.runtime.default_embedder_name());
+                let EligibleAnnSearchState {
+                    hits,
+                    availability,
+                    hydration_failures,
+                    timed_out,
+                } = search_eligible_ann_with_refill(
+                    ctx,
+                    token,
+                    ann,
+                    &key,
+                    &query_emb,
+                    target_eligible,
+                    initial_k,
+                )
+                .await;
+                Ok(AnnCandidateOutcome {
+                    hits,
+                    availability,
+                    hydration_failures,
+                    timed_out,
+                })
+            }
+            Ok(Err(_)) => Ok(AnnCandidateOutcome::default()),
+            Err(e) if is_timeout(&e) => Ok(AnnCandidateOutcome {
+                timed_out: true,
+                ..Default::default()
+            }),
+            Err(e) => Err(e.into()),
+        };
+
+    #[cfg(test)]
+    candidate_stage_test_finish(CandidateStage::Ann);
+
+    outcome
+}
+
+/// Poll the independent ANN and lexical candidate legs together while keeping
+/// them attached to the caller task. This preserves task-local read deadlines
+/// and cancellation and guarantees both legs settle before fusion.
+async fn join_candidate_stages<AnnFuture, LexicalFuture>(
+    ann_future: AnnFuture,
+    lexical_future: LexicalFuture,
+) -> (AnnFuture::Output, LexicalFuture::Output)
+where
+    AnnFuture: std::future::Future,
+    LexicalFuture: std::future::Future,
+{
+    tokio::join!(ann_future, lexical_future)
 }
 
 // ─── compose helpers ──────────────────────────────────────────────────────────
@@ -1940,57 +2372,51 @@ impl KnowledgeHandlers {
         // Trigger background warm — never block search on the ANN rebuild.
         vamana::ensure_ann_background(runtime, token, ann);
 
-        // Fetch ANN candidates BEFORE the lexical stage. The lexical fetch is
-        // now bounded (issue #1930) but still non-zero cost; running ANN
-        // first means a lexical read-deadline timeout afterward cannot
-        // discard ANN results that were already safely computed — the
-        // degraded arm below can then report ANN-backed results instead of
-        // erroring the whole verb. A read timeout in this ANN stage itself
-        // is likewise fail-open, never propagated as a verb-level error.
-        let mut ann_hits: Vec<ScoredHit> = Vec::new();
-        let mut ann_availability: Option<AnnAvailability> = None;
-        let mut hydration_failures = 0usize;
+        // ANN and lexical candidates are independent until fusion. Poll both
+        // under the same absolute request deadline so ANN latency cannot spend
+        // the lexical leg's entire budget. Structured joining keeps both legs
+        // attached to this task, preserving request-scoped cancellation and
+        // allowing either leg's timeout to fail open to the other's results.
         let ann_k = fetch_limit.max(20);
-        match khive_storage::await_request_read_phase(
+        let ann_future = search_ann_candidates(
             "knowledge.search",
-            runtime.embed_query(&raw_query),
-        )
-        .await
-        {
-            Ok(Ok(query_emb)) => {
-                let model = runtime.default_embedder_name();
-                let key = vamana::AnnKey::new(&ns, model);
-                match search_eligible_ann_with_refill(
-                    &ctx, token, ann, &key, &query_emb, ann_k, ann_k,
-                )
-                .await
-                {
-                    Ok(EligibleAnnSearchState {
-                        hits,
-                        availability,
-                        hydration_failures: ann_hydration_failures,
-                    }) => {
-                        hydration_failures += ann_hydration_failures;
-                        ann_hits = hits;
-                        ann_availability = Some(availability);
-                    }
-                    Err(e) if is_read_timeout(&e) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(Err(_)) => {}
-            Err(e) if is_timeout(&e) => {}
-            Err(e) => return Err(e.into()),
-        }
-
+            &ctx,
+            token,
+            ann,
+            &raw_query,
+            ann_k,
+            ann_k,
+        );
+        let lexical_future = async {
+            #[cfg(test)]
+            candidate_stage_test_start(CandidateStage::Lexical).await;
+            let outcome = if do_decompose && non_stop_count >= decompose_threshold {
+                search_decomposed(&ctx, &raw_query, intersection_bonus).await
+            } else {
+                search_core(&ctx, &raw_query).await
+            };
+            #[cfg(test)]
+            candidate_stage_test_finish(CandidateStage::Lexical);
+            outcome
+        };
+        let (ann_result, lexical_result) = join_candidate_stages(ann_future, lexical_future).await;
+        // Preserve the pre-concurrency hard-error precedence: ANN was awaited
+        // first before #1996, so inspect its result first after both legs settle.
+        let AnnCandidateOutcome {
+            hits: ann_hits,
+            availability: ann_availability,
+            hydration_failures,
+            timed_out: ann_timed_out,
+        } = ann_result?;
         let SearchCoreOutcome {
             mut hits,
             lexical_timed_out,
-        } = if do_decompose && non_stop_count >= decompose_threshold {
-            search_decomposed(&ctx, &raw_query, intersection_bonus).await?
-        } else {
-            search_core(&ctx, &raw_query).await?
-        };
+        } = lexical_result?;
+        // A late ANN timeout — the deadline already spent by the time the ANN
+        // leg gives up — must fail open exactly like a lexical timeout: the
+        // reads below would otherwise observe the same expired deadline and
+        // turn a successful lexical search into a verb-level error.
+        let candidates_degraded = lexical_timed_out || ann_timed_out;
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -2012,11 +2438,11 @@ impl KnowledgeHandlers {
         filter_hits_by_status(&mut hits, &requested_statuses, &effective_exclude_statuses);
         filter_hits_by_type(&mut hits, type_filter);
 
-        // See `suggest`'s matching guard: a lexical-stage timeout means the
-        // request read deadline is already spent, so skip the further
-        // embedding read rather than let it convert a degraded-but-ok
-        // response into a verb-level error.
-        if do_rerank && !hits.is_empty() && !lexical_timed_out {
+        // See `suggest`'s matching guard: a lexical-stage or ANN-stage
+        // timeout means the request read deadline is already spent, so skip
+        // the further embedding read rather than let it convert a
+        // degraded-but-ok response into a verb-level error.
+        if do_rerank && !hits.is_empty() && !candidates_degraded {
             rerank_with_embeddings(runtime, &raw_query, &mut hits, rerank_alpha).await?;
         }
 
@@ -2030,7 +2456,7 @@ impl KnowledgeHandlers {
             .map(|hit| hit.id.clone())
             .collect();
         let mut body_lines_timed_out = false;
-        let body_line_counts = if lexical_timed_out {
+        let body_line_counts = if candidates_degraded {
             None
         } else {
             match load_atom_body_line_counts(runtime, &ns, &atom_ids).await? {
@@ -2075,14 +2501,18 @@ impl KnowledgeHandlers {
         if lexical_timed_out {
             attach_lexical_timeout_degradation(&mut out);
         }
+        if ann_timed_out {
+            attach_ann_timeout_degradation(&mut out);
+        }
         if body_lines_timed_out {
             attach_body_lines_timeout_degradation(&mut out);
         }
         attach_hydration_degradation(&mut out, hydration_failures);
-        // A lexical-stage or body-line-stage timeout already committed this
-        // call to a degraded response (never a verb-level error, issue #1930)
-        // — re-checking the same expired deadline here would discard it.
-        if !lexical_timed_out && !body_lines_timed_out {
+        // A lexical-stage, ANN-stage, or body-line-stage timeout already
+        // committed this call to a degraded response (never a verb-level
+        // error, issue #1930) — re-checking the same expired deadline here
+        // would discard it.
+        if !candidates_degraded && !body_lines_timed_out {
             khive_storage::ensure_request_read_active("knowledge.search")?;
         }
         Ok(out)
@@ -2127,61 +2557,47 @@ impl KnowledgeHandlers {
             exclude_statuses: SUGGEST_EXCLUDE,
         };
 
-        // Fetch ANN candidates BEFORE the lexical stage — same rationale as
-        // `search`: the lexical fetch is bounded (issue #1930) but still
-        // non-zero cost, so computing ANN first means a lexical read-deadline
-        // timeout afterward cannot discard ANN results already in hand.
+        // ANN and lexical candidates are independent until fusion. Poll them
+        // concurrently under the same absolute deadline, as in `search`.
         vamana::ensure_ann_background(runtime, token, ann);
-        let mut ann_hits: Vec<ScoredHit> = Vec::new();
-        let mut ann_availability: Option<AnnAvailability> = None;
-        let mut hydration_failures = 0usize;
         // Over-fetch aggressively: the corpus is ~27% domains / ~73% atoms, so
         // limit*3 would return mostly atoms that all get dropped after type filtering.
         // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
         // top ANN neighbors before the type gate discards atom hits.
         let ann_k = (limit * 50).max(200);
-        match khive_storage::await_request_read_phase(
+        let ann_future = search_ann_candidates(
             "knowledge.suggest",
-            runtime.embed_query(&raw_query),
-        )
-        .await
-        {
-            Ok(Ok(query_emb)) => {
-                let model = runtime.default_embedder_name();
-                let key = vamana::AnnKey::new(&ns, model);
-                match search_eligible_ann_with_refill(
-                    &ctx,
-                    token,
-                    ann,
-                    &key,
-                    &query_emb,
-                    ctx.fetch_limit,
-                    ann_k,
-                )
-                .await
-                {
-                    Ok(EligibleAnnSearchState {
-                        hits,
-                        availability,
-                        hydration_failures: ann_hydration_failures,
-                    }) => {
-                        hydration_failures += ann_hydration_failures;
-                        ann_hits = hits;
-                        ann_availability = Some(availability);
-                    }
-                    Err(e) if is_read_timeout(&e) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(Err(_)) => {}
-            Err(e) if is_timeout(&e) => {}
-            Err(e) => return Err(e.into()),
-        }
-
+            &ctx,
+            token,
+            ann,
+            &raw_query,
+            ctx.fetch_limit,
+            ann_k,
+        );
+        let lexical_future = async {
+            #[cfg(test)]
+            candidate_stage_test_start(CandidateStage::Lexical).await;
+            let outcome = search_core(&ctx, &raw_query).await;
+            #[cfg(test)]
+            candidate_stage_test_finish(CandidateStage::Lexical);
+            outcome
+        };
+        let (ann_result, lexical_result) = join_candidate_stages(ann_future, lexical_future).await;
+        let AnnCandidateOutcome {
+            hits: ann_hits,
+            availability: ann_availability,
+            hydration_failures,
+            timed_out: ann_timed_out,
+        } = ann_result?;
         let SearchCoreOutcome {
             mut hits,
             lexical_timed_out,
-        } = search_core(&ctx, &raw_query).await?;
+        } = lexical_result?;
+        // A late ANN timeout — the deadline already spent by the time the ANN
+        // leg gives up — must fail open exactly like a lexical timeout: the
+        // reads below would otherwise observe the same expired deadline and
+        // turn a successful lexical search into a verb-level error.
+        let candidates_degraded = lexical_timed_out || ann_timed_out;
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -2196,11 +2612,11 @@ impl KnowledgeHandlers {
         filter_hits_by_status(&mut hits, &[], SUGGEST_EXCLUDE);
         filter_hits_by_type(&mut hits, Some("domain"));
 
-        // A lexical-stage timeout already committed this call to a degraded,
-        // ANN-backed response — the request read deadline is spent, so
-        // skip further reads/embedding calls rather than let them convert
-        // this into a verb-level error.
-        let fresh_rerank_applied = if lexical_timed_out {
+        // A lexical-stage or ANN-stage timeout already committed this call
+        // to a degraded, ANN-backed response — the request read deadline is
+        // spent, so skip further reads/embedding calls rather than let them
+        // convert this into a verb-level error.
+        let fresh_rerank_applied = if candidates_degraded {
             false
         } else {
             rerank_with_embeddings(runtime, &raw_query, &mut hits, D_SUGGEST_RERANK_ALPHA).await?
@@ -2211,12 +2627,12 @@ impl KnowledgeHandlers {
         hits.truncate(limit);
 
         let domain_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
-        let member_token_sizes = if lexical_timed_out {
+        let member_token_sizes = if candidates_degraded {
             HashMap::new()
         } else {
             load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?
         };
-        if !lexical_timed_out {
+        if !candidates_degraded {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
 
@@ -2279,8 +2695,11 @@ impl KnowledgeHandlers {
         if lexical_timed_out {
             attach_lexical_timeout_degradation(&mut out);
         }
+        if ann_timed_out {
+            attach_ann_timeout_degradation(&mut out);
+        }
         attach_hydration_degradation(&mut out, hydration_failures);
-        if !lexical_timed_out {
+        if !candidates_degraded {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
         Ok(out)
@@ -3089,6 +3508,502 @@ mod tests {
         );
     }
 
+    // Minimal embedder returning a fixed unit vector for every text — only
+    // `knowledge.index` needs a real embedder configured to run; the ANN
+    // query vector below is supplied directly, so the actual vector values
+    // are irrelevant to this test.
+    const REFILL_TEST_DIM: usize = 384;
+    const REFILL_TEST_MODEL_KEY: &str = "all-minilm-l6-v2";
+
+    struct ConstantEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for ConstantEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|_| vec![1.0f32 / (REFILL_TEST_DIM as f32).sqrt(); REFILL_TEST_DIM])
+                .collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "constant-refill-test"
+        }
+    }
+
+    struct ConstantEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for ConstantEmbeddingProvider {
+        fn name(&self) -> &str {
+            REFILL_TEST_MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            REFILL_TEST_DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(std::sync::Arc::new(ConstantEmbeddingService))
+        }
+    }
+
+    fn runtime_with_constant_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
+            db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        rt.register_embedder(ConstantEmbeddingProvider);
+        rt
+    }
+
+    // Embedder for the 3-round accumulator test below: content containing
+    // `KEEP_ANCHOR_MARKER` embeds to exactly the query vector (similarity 1.0),
+    // everything else embeds to a vector with zero dot product against it
+    // (similarity 0.0). This keeps the 2 "keep" atoms deterministically ahead
+    // of every "noise" atom in ANN rank regardless of corpus size or widening
+    // round, which a shared constant embedding cannot guarantee once a round
+    // requests fewer than the full corpus.
+    const KEEP_ANCHOR_MARKER: &str = "keep-anchor-marker";
+
+    struct MarkerEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for MarkerEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if text.contains(KEEP_ANCHOR_MARKER) {
+                        vec![1.0f32; REFILL_TEST_DIM]
+                    } else {
+                        (0..REFILL_TEST_DIM)
+                            .map(|i| if i % 2 == 0 { 1.0f32 } else { -1.0f32 })
+                            .collect()
+                    }
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "marker-refill-test"
+        }
+    }
+
+    struct MarkerEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for MarkerEmbeddingProvider {
+        fn name(&self) -> &str {
+            REFILL_TEST_MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            REFILL_TEST_DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(std::sync::Arc::new(MarkerEmbeddingService))
+        }
+    }
+
+    fn runtime_with_marker_embedder() -> KhiveRuntime {
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
+            db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        rt.register_embedder(MarkerEmbeddingProvider);
+        rt
+    }
+
+    /// A hydration timeout on a later refill round must not discard eligible
+    /// hits an earlier round already completed and hydrated (issue #2312).
+    ///
+    /// Round 1 requests the full known corpus (4 vectors) and hydrates 2 of
+    /// them; the other 2 ids are stale ANN entries (their canonical rows were
+    /// deleted after the Vamana snapshot was built), so hydration drops them
+    /// and round 1 falls short of `target_eligible`, forcing a second round.
+    /// Round 2 re-requests the same 4 stale/live ids but its hydration call
+    /// is faulted (`scope_hydration_test_fault`), simulating the hydration
+    /// query itself timing out: every shell in that round is dropped,
+    /// including the 2 that hydrated fine last round. The read deadline is
+    /// then expired deterministically (`scope_ann_test_deadline_advance`)
+    /// right after round 2's hydration call returns.
+    ///
+    /// Expected (pre-fix) failure mode: the deadline branch returned round
+    /// 2's own (fully-faulted, empty) hit set instead of round 1's, so this
+    /// assertion would see 0 hits, not 2.
+    #[tokio::test(start_paused = true)]
+    async fn ann_refill_deadline_timeout_keeps_prior_round_hits() {
+        let runtime = runtime_with_constant_embedder();
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local token");
+
+        KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            json!({
+                "atoms": [
+                    {"slug": "refill-keep-a", "name": "Refill Keep A", "finalized": true, "content": "refill regression corpus entry keep alpha padding words to satisfy the minimum content length validation rule enforced for every atom record"},
+                    {"slug": "refill-keep-b", "name": "Refill Keep B", "finalized": true, "content": "refill regression corpus entry keep beta padding words to satisfy the minimum content length validation rule enforced for every atom record"},
+                    {"slug": "refill-stale-c", "name": "Refill Stale C", "finalized": true, "content": "refill regression corpus entry stale gamma padding words to satisfy the minimum content length validation rule enforced for every atom"},
+                    {"slug": "refill-stale-d", "name": "Refill Stale D", "finalized": true, "content": "refill regression corpus entry stale delta padding words to satisfy the minimum content length validation rule enforced for every atom"},
+                ]
+            }),
+        )
+        .await
+        .expect("upsert atoms");
+
+        let ann = vamana::new_shared();
+        KnowledgeHandlers::index(&runtime, &token, json!({"rebuild_ann": true}), &ann, None)
+            .await
+            .expect("build ann index");
+
+        // Drop 2 of the 4 canonical rows after the snapshot was built, so
+        // their ANN vectors are now stale entries — hydration will find no
+        // row for them, exactly like a real "stale ANN id" (see
+        // `hydrate_empty_hits`'s doc comment).
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "DELETE FROM knowledge_atoms WHERE slug IN \
+                          ('refill-stale-c', 'refill-stale-d')"
+                        .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("delete stale rows");
+        }
+
+        let key = vamana::AnnKey::new("local", runtime.default_embedder_name());
+        let query_embedding = vec![1.0f32 / (REFILL_TEST_DIM as f32).sqrt(); REFILL_TEST_DIM];
+        let statuses: Vec<String> = Vec::new();
+        let exclude_statuses: Vec<&str> = Vec::new();
+        let w = Weights::default();
+        let ctx = SearchCtx {
+            runtime: &runtime,
+            ns: "local",
+            role: None,
+            type_filter: None,
+            min_score: 0.0,
+            w: &w,
+            fetch_limit: 10,
+            statuses: &statuses,
+            exclude_statuses: &exclude_statuses,
+        };
+
+        let deadline = std::time::Duration::from_millis(200);
+        let result = khive_storage::scope_request_read_deadline(
+            deadline,
+            scope_hydration_test_fault(
+                2,
+                scope_ann_test_deadline_advance(
+                    2,
+                    deadline * 2,
+                    search_eligible_ann_with_refill(
+                        &ctx,
+                        &token,
+                        &ann,
+                        &key,
+                        &query_embedding,
+                        4,
+                        4,
+                    ),
+                ),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.timed_out,
+            "the forced deadline expiry after round 2 must be reported"
+        );
+        assert_eq!(
+            result.hits.len(),
+            2,
+            "round 1's 2 completed, hydrated hits must survive round 2's \
+             hydration timeout instead of being discarded: {:?}",
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let slugs: HashSet<&str> = result.hits.iter().map(|hit| hit.slug.as_str()).collect();
+        assert!(
+            slugs.contains("refill-keep-a") && slugs.contains("refill-keep-b"),
+            "the surviving hits must be round 1's real, hydrated atoms: {slugs:?}"
+        );
+        // Round 1's 2 stale ids plus round 2's 4 faulted shells (the hook
+        // fails the whole hydrator call, not just the previously-unresolved
+        // ids) — asserted here because the fault now runs through
+        // `hydrate_empty_hits`'s own reader-acquisition-failure branch
+        // (issue #2312) and this is that branch's own failure count.
+        assert_eq!(
+            result.hydration_failures, 6,
+            "expected round 1's 2 stale-id failures plus round 2's 4 \
+             fault-injected failures, got {}",
+            result.hydration_failures
+        );
+    }
+
+    /// A non-deadline hydration failure sandwiched between two rounds must
+    /// not evict a hit an earlier round already accumulated, even when a
+    /// *third* round is the one that finally hits the deadline (issue
+    /// #2312). This is the scenario the single-round-back `last_round` fix
+    /// missed: round 1 hydrates 2 real hits; round 2's hydration fails for a
+    /// reason unrelated to the deadline (the fault hook, sticky from this
+    /// call onward — see `HydrationTestFault`); round 3 also fails hydration
+    /// and is the round whose read the deadline expires under. Only the
+    /// accumulator carried across all 3 rounds can supply round 1's hits at
+    /// that point, since round 2 and round 3 both contribute nothing.
+    ///
+    /// Pre-fix, `last_round` is overwritten by round 2's own (empty) state
+    /// before round 3 ever runs, so the deadline branch has nothing left to
+    /// union with round 3's (also empty) hits: this assertion would see 0
+    /// hits, not 2.
+    #[tokio::test(start_paused = true)]
+    async fn ann_refill_survives_a_non_deadline_failure_between_two_good_rounds() {
+        let runtime = runtime_with_marker_embedder();
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local token");
+
+        let mut atoms = vec![
+            json!({
+                "slug": "refill3-keep-a",
+                "name": "Refill3 Keep A",
+                "finalized": true,
+                "content": format!(
+                    "{KEEP_ANCHOR_MARKER} refill regression corpus entry keep alpha padding \
+                     words to satisfy the minimum content length validation rule enforced \
+                     for every atom record in this suite"
+                ),
+            }),
+            json!({
+                "slug": "refill3-keep-b",
+                "name": "Refill3 Keep B",
+                "finalized": true,
+                "content": format!(
+                    "{KEEP_ANCHOR_MARKER} refill regression corpus entry keep beta padding \
+                     words to satisfy the minimum content length validation rule enforced \
+                     for every atom record in this suite"
+                ),
+            }),
+        ];
+        for i in 0..10 {
+            atoms.push(json!({
+                "slug": format!("refill3-noise-{i:02}"),
+                "name": format!("Refill3 Noise {i:02}"),
+                "finalized": true,
+                "content": format!(
+                    "refill regression corpus entry noise number {i} padding words to \
+                     satisfy the minimum content length validation rule enforced for every \
+                     atom record in this suite"
+                ),
+            }));
+        }
+        KnowledgeHandlers::upsert_atoms(&runtime, &token, json!({"atoms": atoms}))
+            .await
+            .expect("upsert atoms");
+
+        let ann = vamana::new_shared();
+        KnowledgeHandlers::index(&runtime, &token, json!({"rebuild_ann": true}), &ann, None)
+            .await
+            .expect("build ann index");
+
+        // The 10 noise atoms are stale ANN entries from round 1 onward — the
+        // 2 keep atoms are left live throughout, since the fault hook (not
+        // DB state) is what fails hydration for rounds 2 and 3.
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "DELETE FROM knowledge_atoms WHERE slug LIKE 'refill3-noise-%'"
+                        .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("delete noise rows");
+        }
+
+        let key = vamana::AnnKey::new("local", runtime.default_embedder_name());
+        let query_embedding = vec![1.0f32; REFILL_TEST_DIM];
+        let statuses: Vec<String> = Vec::new();
+        let exclude_statuses: Vec<&str> = Vec::new();
+        let w = Weights::default();
+        let ctx = SearchCtx {
+            runtime: &runtime,
+            ns: "local",
+            role: None,
+            type_filter: None,
+            min_score: 0.0,
+            w: &w,
+            fetch_limit: 10,
+            statuses: &statuses,
+            exclude_statuses: &exclude_statuses,
+        };
+
+        // target_eligible=6 can never actually be met (only 2 atoms are ever
+        // eligible), so the loop keeps widening — request_k goes 6 -> 12 -> 24
+        // across rounds 1-3 — until the fault-forced deadline stops it.
+        let deadline = std::time::Duration::from_millis(200);
+        let result = khive_storage::scope_request_read_deadline(
+            deadline,
+            scope_hydration_test_fault(
+                2,
+                scope_ann_test_deadline_advance(
+                    3,
+                    deadline * 2,
+                    search_eligible_ann_with_refill(
+                        &ctx,
+                        &token,
+                        &ann,
+                        &key,
+                        &query_embedding,
+                        6,
+                        4,
+                    ),
+                ),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.timed_out,
+            "the forced deadline expiry after round 3 must be reported"
+        );
+        assert_eq!(
+            result.hits.len(),
+            2,
+            "round 1's 2 hydrated hits must survive rounds 2 and 3 both \
+             failing hydration for a non-deadline reason: {:?}",
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let slugs: HashSet<&str> = result.hits.iter().map(|hit| hit.slug.as_str()).collect();
+        assert!(
+            slugs.contains("refill3-keep-a") && slugs.contains("refill3-keep-b"),
+            "the surviving hits must be round 1's real, hydrated atoms: {slugs:?}"
+        );
+    }
+
+    /// Control: with no hydration failures and no deadline expiry, the
+    /// refill loop must still return exactly the hits a single successful
+    /// round produces (issue #2312 changed the accumulation bookkeeping but
+    /// must not change this outcome).
+    #[tokio::test]
+    async fn ann_refill_with_no_failures_matches_pre_accumulator_result() {
+        let runtime = runtime_with_constant_embedder();
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local token");
+
+        KnowledgeHandlers::upsert_atoms(
+            &runtime,
+            &token,
+            json!({
+                "atoms": [
+                    {"slug": "refill-nofail-a", "name": "Refill Nofail A", "finalized": true, "content": "refill regression corpus entry nofail alpha padding words to satisfy the minimum content length validation rule enforced for every atom record"},
+                    {"slug": "refill-nofail-b", "name": "Refill Nofail B", "finalized": true, "content": "refill regression corpus entry nofail beta padding words to satisfy the minimum content length validation rule enforced for every atom record"},
+                ]
+            }),
+        )
+        .await
+        .expect("upsert atoms");
+
+        let ann = vamana::new_shared();
+        KnowledgeHandlers::index(&runtime, &token, json!({"rebuild_ann": true}), &ann, None)
+            .await
+            .expect("build ann index");
+
+        let key = vamana::AnnKey::new("local", runtime.default_embedder_name());
+        let query_embedding = vec![1.0f32 / (REFILL_TEST_DIM as f32).sqrt(); REFILL_TEST_DIM];
+        let statuses: Vec<String> = Vec::new();
+        let exclude_statuses: Vec<&str> = Vec::new();
+        let w = Weights::default();
+        let ctx = SearchCtx {
+            runtime: &runtime,
+            ns: "local",
+            role: None,
+            type_filter: None,
+            min_score: 0.0,
+            w: &w,
+            fetch_limit: 10,
+            statuses: &statuses,
+            exclude_statuses: &exclude_statuses,
+        };
+
+        let result =
+            search_eligible_ann_with_refill(&ctx, &token, &ann, &key, &query_embedding, 2, 2).await;
+
+        assert!(!result.timed_out, "no deadline was ever set");
+        assert_eq!(result.hydration_failures, 0);
+        let slugs: HashSet<&str> = result.hits.iter().map(|hit| hit.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            HashSet::from(["refill-nofail-a", "refill-nofail-b"]),
+            "a failure-free refill must still return both real hits: {slugs:?}"
+        );
+    }
+
     #[tokio::test]
     async fn missing_ann_hydration_is_dropped_and_reported() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -3333,42 +4248,14 @@ mod tests {
         assert!(hits.iter().any(|hit| hit.slug == "local-two"));
     }
 
-    // ── embed-intent regression ───────────────────────────────────────────────
-    // Guard that the ANN query paths in `search` and `suggest` use the
-    // query-intent embedding call, not the generic `runtime.embed(...)`.
-    // Uses include_str! so the assertion runs on the actual source bytes,
-    // but splits the needle to avoid matching the needle itself in test source.
-    #[test]
-    fn knowledge_ann_query_paths_use_query_intent_embed() {
-        let src = include_str!("search.rs");
-        // Build needle at runtime to avoid self-match in include_str.
-        let generic_needle: String = [".embed(", "&raw_query)"].concat();
-        let generic_count = src
-            .lines()
-            // Skip lines that are part of this test body (contain "concat" or "needle").
-            .filter(|l| !l.contains("concat") && !l.contains("needle"))
-            .filter(|l| l.contains(&generic_needle))
-            .count();
-        assert_eq!(
-            generic_count, 0,
-            "ANN query paths must not call generic {generic_needle}; \
-             found {generic_count} occurrence(s) — use embed_query instead"
-        );
-        // Confirm the query-intent call is present for both search and suggest.
-        let query_intent_needle: String = [".embed_query(", "&raw_query)"].concat();
-        let query_intent_count = src
-            .lines()
-            .filter(|l| !l.contains("concat"))
-            .filter(|l| l.contains(&query_intent_needle))
-            .count();
-        // 3 sites: knowledge.search ANN path, knowledge.suggest ANN path,
-        // and the section-scoring query embed (search.rs:~1291).
-        assert_eq!(
-            query_intent_count, 3,
-            "expected exactly 3 {query_intent_needle} calls \
-             (search ANN + suggest ANN + section query), found {query_intent_count}"
-        );
-    }
+    // The embed-intent regression that used to live here asserted on this
+    // file's literal source text (exact call-site spellings and occurrence
+    // counts) instead of on behaviour. It is replaced by
+    // `ann_candidate_query_embeds_under_query_role_not_generic_embed` in
+    // `ann_degrade_tests` (issue #2312), which drives `search` and `suggest`
+    // through a fake embedder that returns different vectors for the query
+    // role vs. the generic role and asserts on which candidate wins the
+    // fused ranking.
 
     // ── filter_by_excluded_statuses ───────────────────────────────────────────
 
@@ -3590,6 +4477,57 @@ mod tests {
         for (a, b) in after.iter().zip(before.iter()) {
             assert_eq!(a.score, b.score);
         }
+    }
+
+    /// `top_n_by_score`'s partition-then-sort selection (issue #2312) must
+    /// pick the identical top set, in the identical order, as sorting the
+    /// whole batch and truncating — for a batch much larger than `n`, so the
+    /// partition step actually discards a majority of the input.
+    #[test]
+    fn top_n_by_score_matches_a_full_sort_then_truncate() {
+        let build = || -> Vec<ScoredHit> {
+            // Deterministic, non-monotonic score order so neither the input
+            // order nor a naive front-truncate could pass this by accident.
+            (0..500u32)
+                .map(|i| {
+                    let score = (i.wrapping_mul(2654435761) % 10_000) as f32 / 10_000.0;
+                    make_hit(&format!("atom-{i}"), None, score)
+                })
+                .collect()
+        };
+
+        let n = 7;
+        let expected = {
+            let mut all = build();
+            all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            all.truncate(n);
+            all.into_iter().map(|h| (h.id, h.score)).collect::<Vec<_>>()
+        };
+
+        let actual: Vec<(String, f32)> = top_n_by_score(build(), n)
+            .into_iter()
+            .map(|h| (h.id, h.score))
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "top_n_by_score must return the same top-{n} set in the same \
+             order as a full sort followed by truncate"
+        );
+    }
+
+    /// `n >= len` is the common case (small candidate pools): the whole
+    /// input survives, just sorted.
+    #[test]
+    fn top_n_by_score_with_n_at_least_len_sorts_everything() {
+        let hits = vec![
+            make_hit("low", None, 0.2),
+            make_hit("high", None, 0.9),
+            make_hit("mid", None, 0.5),
+        ];
+        let result = top_n_by_score(hits, 10);
+        let ids: Vec<&str> = result.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["high", "mid", "low"]);
     }
 
     /// Body-line metadata is best-effort: a read-deadline timeout during the
