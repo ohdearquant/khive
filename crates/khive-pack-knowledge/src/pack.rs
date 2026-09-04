@@ -732,12 +732,18 @@ mod tests {
             "dropping the pack must drop its last strong ANN reference"
         );
 
+        // The watcher builds its interval on its first poll, which can land
+        // after this advance; under paused time `sleep` auto-advances the
+        // clock once every task is idle, so the tick is reached by virtual
+        // time rather than by a fixed yield budget.
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
-        for _ in 0..100 {
-            if khive_runtime::background_task_count() == before {
-                break;
-            }
-            tokio::task::yield_now().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while khive_runtime::background_task_count() != before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the watcher must exit once its ANN state is dropped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(
             khive_runtime::background_task_count(),

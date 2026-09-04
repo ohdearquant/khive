@@ -2520,6 +2520,164 @@ pub fn reject_conflicting_db_override_with_source(
     Err(DatabaseOverrideConflict::new(other, backends.len(), config_source).into())
 }
 
+/// Filesystem identity of a reindex target, captured so a symlink retargeted
+/// or a file replaced in place between validation and open can be told apart
+/// from the declared file validation actually checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(FileIdentity {
+            device: meta.dev(),
+            inode: meta.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        // The standard library exposes no stable file-identity accessor off
+        // unix (the Windows volume-serial and file-index accessors are
+        // unstable), so the pre-open re-check degrades to path-level
+        // validation there. This crate's non-unix lane is compile-checked
+        // only.
+        let _ = path;
+        None
+    }
+}
+
+/// The `kkernel reindex` database target as
+/// [`validate_reindex_db_target_with_source`] resolved it: the canonical path
+/// reindex must open, plus the filesystem identity observed at validation
+/// time (`None` when the file did not exist yet).
+///
+/// [`reverify_reindex_target_identity`] re-derives this identity immediately
+/// before open so a symlink retargeted, or the declared file replaced in
+/// place, after validation is refused instead of silently followed.
+#[derive(Debug, Clone)]
+pub struct ValidatedReindexTarget {
+    /// Canonical path reindex must open — never the raw `--db`/`KHIVE_DB`
+    /// string, which may still name a symlink.
+    pub path: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
+/// Re-stat a validated reindex target and refuse if its filesystem identity
+/// no longer matches what validation observed.
+///
+/// This is what actually binds the checked identity to the file reindex
+/// opens: a symlink retargeted after validation still resolves `target.path`
+/// to the same canonical (already symlink-free) path, so pinning the open to
+/// `target.path` defeats that redirect by construction; a declared file
+/// replaced in place (e.g. another database renamed over it) keeps the same
+/// path string but changes `(device, inode)`, which this call catches.
+///
+/// The gap this does not close: a parent directory replaced in the sliver of
+/// time between this call returning and the underlying SQLite `open()`
+/// syscall. No API the sqlite binding used here exposes reaches an
+/// already-open file descriptor's identity, so that final window stays open.
+pub fn reverify_reindex_target_identity(target: &ValidatedReindexTarget) -> anyhow::Result<()> {
+    let observed = file_identity(&target.path);
+    if observed != target.identity {
+        anyhow::bail!(
+            "kkernel reindex target {} changed identity between validation and open \
+             (validated {:?}, now {:?}); refusing to open a file that may no longer be \
+             the declared backend",
+            target.path.display(),
+            target.identity,
+            observed,
+        );
+    }
+    Ok(())
+}
+
+/// Validate the single database selected by `kkernel reindex` against a
+/// declared multi-backend topology.
+///
+/// Unlike MCP/exec's override guard, reindex is deliberately a one-database
+/// maintenance command and may target any declared SQLite backend, not only
+/// `main`. Once `[[backends]]` exists it must name that target explicitly:
+/// falling through to the ordinary single-backend default can rebuild an
+/// unrelated file while leaving the intended backend's indexes stale.
+///
+/// Returns `None` when no `[[backends]]` are declared — reindex keeps its
+/// ordinary single-backend `--db` behavior and there is no declared identity
+/// to bind. Returns `Some` with the canonical path and filesystem identity of
+/// the matched backend otherwise; the caller must open exactly that path and
+/// call [`reverify_reindex_target_identity`] immediately before doing so.
+pub fn validate_reindex_db_target_with_source(
+    db_target: Option<&str>,
+    backends: &[BackendConfig],
+    config_source: Option<&std::path::Path>,
+) -> anyhow::Result<Option<ValidatedReindexTarget>> {
+    if backends.is_empty() {
+        return Ok(None);
+    }
+
+    let declared_targets = backends
+        .iter()
+        .filter_map(|backend| {
+            (backend.kind == BackendKind::Sqlite)
+                .then_some(backend.path.as_ref())
+                .flatten()
+                .map(|path| format!("{}={}", backend.name, path.display()))
+        })
+        .collect::<Vec<_>>();
+    let declared_summary = if declared_targets.is_empty() {
+        "<none>".to_string()
+    } else {
+        declared_targets.join(", ")
+    };
+    let source_suffix = config_source
+        .map(|path| format!(" The selected config is {}.", path.display()))
+        .unwrap_or_default();
+
+    let Some(db_target) = db_target.filter(|target| *target != ":memory:") else {
+        anyhow::bail!(
+            "kkernel reindex requires an explicit persistent --db / KHIVE_DB target when \
+             [[backends]] is declared; choose one declared SQLite backend path \
+             ({declared_summary}).{source_suffix}"
+        );
+    };
+
+    let target = canonical_path_no_side_effects(&khive_runtime::expand_tilde(
+        std::path::Path::new(db_target),
+    ))?;
+    for backend in backends {
+        if backend.kind != BackendKind::Sqlite {
+            continue;
+        }
+        let Some(path) = backend.path.as_ref() else {
+            continue;
+        };
+        if canonical_path_no_side_effects(&khive_runtime::expand_tilde(path))? == target {
+            if backend.read_only {
+                anyhow::bail!(
+                    "kkernel reindex database target {db_target:?} matches declared backend \
+                     {name:?}, which is read_only; reindex always writes, so a read-only \
+                     backend cannot be reindexed.{source_suffix}",
+                    name = backend.name,
+                );
+            }
+            return Ok(Some(ValidatedReindexTarget {
+                identity: file_identity(&target),
+                path: target,
+            }));
+        }
+    }
+
+    anyhow::bail!(
+        "kkernel reindex database target {db_target:?} is not a path declared in \
+         [[backends]]; refusing to rebuild an unowned file. Declared SQLite backend \
+         paths: {declared_summary}.{source_suffix}"
+    )
+}
+
 /// Validate a database override and normalize a redundant concrete override
 /// to the same fingerprint anchor used when no override is supplied.
 ///
@@ -11892,8 +12050,7 @@ backend = "kg-backend"
                 Ok(khive_storage::BatchWriteSummary {
                     attempted: n,
                     affected: n,
-                    failed: 0,
-                    first_error: String::new(),
+                    ..khive_storage::BatchWriteSummary::default()
                 })
             }
 

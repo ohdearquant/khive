@@ -80,8 +80,7 @@ impl EventStore for GateEventStore {
         Ok(BatchWriteSummary {
             attempted: n,
             affected: n,
-            failed: 0,
-            first_error: String::new(),
+            ..BatchWriteSummary::default()
         })
     }
     async fn get_event(&self, id: uuid::Uuid) -> StorageResult<Option<Event>> {
@@ -173,7 +172,11 @@ async fn db_diagnostics_verb_reports_real_admission_refused_obligations() {
         max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
         ..AuditBatchConfig::default()
     });
-    builder.register(KgPack::new(rt));
+    // The real composition root registers built-in packs through the trusted
+    // path; this test stands in for it, so `whoami` keeps its best-effort
+    // audit obligation under admission pressure. The ordinary `register`
+    // path is untrusted and would hard-fail the read instead.
+    builder.register_trusted(KgPack::new(rt));
     let registry = builder.build().expect("registry builds");
     let audit_batch = registry
         .audit_batch_handle()

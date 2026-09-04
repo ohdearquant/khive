@@ -850,3 +850,27 @@ The revised sections above (principle 5, the dispatch sketch, §"Gate `Err`: fai
 the pack-policy rule, the rationale, the consequences bullet, and Amendment 2's context)
 were updated in the same change that landed the behaviour, per ADR-129 Stage 1a's
 documentation requirement.
+
+---
+
+## Amendment 4 (2026-08-30) — Direct bulk-ingest writes cross the dispatch gate seam
+
+Issue #2048 closes the remaining direct-store authorization gap. A non-dry-run
+`kkernel code-ingest` findings batch is an intercepted operation with the stable
+gate verb `code.findings_ingest`. Its gate arguments disclose only the input kind
+and entity/note/edge counts. The normal registry interception seam performs the
+check, structured trace, persistent best-effort audit, deny/error classification,
+and post-operation outcome accounting. A deny or gate outage returns before the
+runtime setup closure and before any entity, note, or edge write. Dry runs perform
+no writes and therefore do not claim an operation admission or emit this check.
+
+The admin path retains its direct storage implementation because deterministic
+explicit record IDs have no public create-verb equivalent. Direct storage is not
+authorization bypass: the whole batch is gated once, and namespace token minting
+remains a separate defense-in-depth check inside the admitted operation.
+
+`kkernel git-ingest` already takes the other permitted shape from this amendment:
+each logical create/link write goes through `VerbRegistry` dispatch, so its
+canonical gate request and audit lifecycle are inherited per write. A generic
+`authorize` consultation only governs namespace-token minting and is never treated
+as a replacement for either the batch-level or per-write operation check.

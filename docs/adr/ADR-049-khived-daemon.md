@@ -997,3 +997,56 @@ Every other state's disposition and exit code, the class rule itself, the
 precedence order, the three withdrawn-premise facts, and all of Amendments 1
 through 5. This amendment changes one exit code, one disposition string, and the
 reserved set.
+
+## Amendment 8 (2026-08-30): cancellation preserves admitted request outcomes
+
+Amendment 5 made client cancellation close the warm-daemon stream so daemon
+read scopes could observe peer loss. That is safe for read work, but wrong for
+a composed request that has crossed the write boundary: independent operations
+may already have committed, and closing the stream discards the only response
+that distinguishes those successes from validation failures. The MCP wrapper
+then reported a bare `request cancelled`, inviting a blind retry of
+non-idempotent operations. This amendment supersedes Amendment 5's client-side
+stream-close rule while retaining its daemon-shutdown and read-interrupt rules.
+
+Every agent-facing MCP request now has one request-group correlation id before
+dispatch. A caller-supplied `request_id` is preserved; otherwise the bridge
+mints an opaque nonzero `u64`. The daemon echoes that value and every operation
+audit row stores it. The id is an observability label, not an operation id and
+not a cross-attempt idempotency key.
+
+Cancellation has one boundary:
+
+1. If the cancellation signal is already visible before daemon admission, the
+   bridge starts neither daemon forwarding nor local dispatch and reports a
+   not-dispatched cancellation.
+2. Once the bridge spawns the owned forwarding task, cancellation does not drop
+   or abort it. A live MCP handler waits for the daemon's real terminal response
+   and returns its ordinary per-operation envelope, including `status=partial`
+   and the actual successes and failures. Dropping the handler detaches from
+   the forwarding task; the task still completes, and the correlated audit rows
+   remain the terminal observation.
+3. If the forward returns the pre-write `None` outcome after cancellation, the
+   bridge refuses local fallback. Cancellation cannot turn an unattempted
+   daemon request into fresh local side effects.
+
+The spawned forwarding future owns its request frame and pack list. This
+ownership is the mechanical guarantee: its lifetime no longer borrows the MCP
+handler, and dropping the handler's `JoinHandle` cannot drop the socket
+exchange. A panic in that forwarding task is classified as outcome-unknown and
+non-retryable, with the request id included when available.
+
+This amendment does not promise exactly-once execution across process crashes,
+irrecoverable transport loss, or a separately submitted retry. Those remain
+outcome-unknown. It closes the cooperative-cancellation seam where the bridge
+is alive and capable of preserving the daemon result, and it makes a vanished
+handler's admitted work correlatable in the audit substrate.
+
+### Test obligations (cancellation and bridge request ids)
+
+- A cancellation delivered while a delayed daemon forward is in flight returns
+  that forward's real partial envelope, including the original per-op failure.
+- Aborting the outer handler after the forward begins does not prevent the owned
+  forwarding future from reaching completion.
+- An omitted request id is replaced with a nonzero bridge id exactly once per
+  admitted attempt; an explicit caller value is unchanged.

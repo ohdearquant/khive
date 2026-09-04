@@ -43,6 +43,15 @@ pub struct SearchHit {
     pub snippet: Option<String>,
 }
 
+/// Result of [`KhiveRuntime::hybrid_search_outcome`]: the fused hits — text
+/// hits alone when the vector arm failed — plus the vector arm's error, if
+/// any.
+#[derive(Clone, Debug)]
+pub struct HybridSearchOutcome {
+    pub hits: Vec<SearchHit>,
+    pub vector_error: Option<String>,
+}
+
 /// Which retrieval path(s) contributed to a hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchSource {
@@ -644,18 +653,21 @@ impl KhiveRuntime {
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
     ) -> RuntimeResult<Vec<SearchHit>> {
-        self.hybrid_search_inner(
-            token,
-            query_text,
-            query_vector,
-            limit,
-            entity_kind,
-            entity_type,
-            tags_any,
-            properties_filter,
-            None,
-        )
-        .await
+        let (hits, _vector_error) = self
+            .hybrid_search_inner(
+                token,
+                query_text,
+                query_vector,
+                limit,
+                entity_kind,
+                entity_type,
+                tags_any,
+                properties_filter,
+                None,
+                false,
+            )
+            .await?;
+        Ok(hits)
     }
 
     /// `vector_similarity_floor` is a cosine-similarity value in `[-1.0,
@@ -675,18 +687,58 @@ impl KhiveRuntime {
         properties_filter: Option<&serde_json::Value>,
         vector_similarity_floor: f64,
     ) -> RuntimeResult<Vec<SearchHit>> {
-        self.hybrid_search_inner(
-            token,
-            query_text,
-            query_vector,
-            limit,
-            entity_kind,
-            entity_type,
-            tags_any,
-            properties_filter,
-            Some(vector_similarity_floor),
-        )
-        .await
+        let (hits, _vector_error) = self
+            .hybrid_search_inner(
+                token,
+                query_text,
+                query_vector,
+                limit,
+                entity_kind,
+                entity_type,
+                tags_any,
+                properties_filter,
+                Some(vector_similarity_floor),
+                false,
+            )
+            .await?;
+        Ok(hits)
+    }
+
+    /// Coordinator fan-out variant of [`Self::hybrid_search`]: the text arm
+    /// still fails loud (propagated through `hybrid_search_inner`'s
+    /// `tolerate_vector_error=false` semantics for that leg), but a
+    /// vector-arm failure after a successful text leg is captured instead of
+    /// discarding the text hits. Reserved for
+    /// `SubstrateCoordinator::fan_out_search_with_visibility` — every other
+    /// caller keeps the fail-loud [`Self::hybrid_search`] contract, so a
+    /// single backend's vector-store outage does not misreport that
+    /// backend's text arm as failed too.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hybrid_search_outcome(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        limit: u32,
+        entity_kind: Option<&str>,
+        entity_type: Option<&str>,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+    ) -> RuntimeResult<HybridSearchOutcome> {
+        let (hits, vector_error) = self
+            .hybrid_search_inner(
+                token,
+                query_text,
+                None,
+                limit,
+                entity_kind,
+                entity_type,
+                tags_any,
+                properties_filter,
+                None,
+                true,
+            )
+            .await?;
+        Ok(HybridSearchOutcome { hits, vector_error })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -701,7 +753,8 @@ impl KhiveRuntime {
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
         vector_similarity_floor: Option<f64>,
-    ) -> RuntimeResult<Vec<SearchHit>> {
+        tolerate_vector_error: bool,
+    ) -> RuntimeResult<(Vec<SearchHit>, Option<String>)> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
         let visible_ns: Vec<String> = token
@@ -735,15 +788,25 @@ impl KhiveRuntime {
             query_text,
         )?;
 
+        let mut vector_error: Option<String> = None;
         let mut vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
-            self.vector_search(
-                token,
-                query_vector,
-                Some(query_text),
-                candidates,
-                Some(SubstrateKind::Entity),
-            )
-            .await?
+            match self
+                .vector_search(
+                    token,
+                    query_vector,
+                    Some(query_text),
+                    candidates,
+                    Some(SubstrateKind::Entity),
+                )
+                .await
+            {
+                Ok(hits) => hits,
+                Err(e) if tolerate_vector_error => {
+                    vector_error = Some(e.to_string());
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             Vec::new()
         };
@@ -813,7 +876,7 @@ impl KhiveRuntime {
         }
 
         fused.truncate(limit as usize);
-        Ok(fused)
+        Ok((fused, vector_error))
     }
 
     /// Exact KNN over the full namespace's vector store.
@@ -1388,10 +1451,138 @@ fn rrf_fuse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::runtime::{KhiveRuntime, NamespaceToken, RuntimeConfig};
     use khive_storage::types::{TextSearchHit, VectorSearchHit};
     use khive_types::namespace::Namespace;
-    use lattice_embed::EmbeddingModel;
+    use lattice_embed::{EmbedError, EmbeddingModel};
+
+    /// An `EmbeddingService` that always fails — used to drive a real
+    /// vector-arm failure (as opposed to an `Unconfigured` short-circuit)
+    /// through `embed_query_for_token` without loading actual model weights.
+    struct FailingEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for FailingEmbeddingService {
+        async fn embed(
+            &self,
+            _texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Err(EmbedError::ModelInitialization(
+                "injected vector-arm failure".to_string(),
+            ))
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "hybrid-search-test-failing-embedding"
+        }
+    }
+
+    struct FailingEmbedderProvider {
+        name: String,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for FailingEmbedderProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(FailingEmbeddingService))
+        }
+    }
+
+    /// Swap the runtime's registered embedder for the always-failing one,
+    /// re-keyed under the same model name so `hybrid_search`'s vector leg
+    /// (which resolves the embedder by the runtime's configured model name)
+    /// picks it up. `EmbedderRegistry::register` overwrites by name and
+    /// resets the provider's build cache, so this takes effect on the next
+    /// embed call without needing a fresh runtime.
+    fn break_vector_arm(runtime: &KhiveRuntime) {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        runtime.register_embedder(FailingEmbedderProvider {
+            name: model.to_string(),
+            dimensions: model.dimensions(),
+        });
+    }
+
+    /// An `EmbeddingService` that always succeeds with a fixed vector — used
+    /// to exercise a genuinely healthy vector leg without loading real model
+    /// weights.
+    struct ConstantEmbeddingService {
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for ConstantEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "hybrid-search-test-constant-embedding"
+        }
+    }
+
+    struct ConstantEmbedderProvider {
+        name: String,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for ConstantEmbedderProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(ConstantEmbeddingService {
+                dimensions: self.dimensions,
+            }))
+        }
+    }
+
+    /// A runtime configured with a healthy (constant, non-failing) embedder —
+    /// the vector leg genuinely runs and succeeds.
+    fn runtime_with_constant_embeddings() -> KhiveRuntime {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(model),
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("in-memory runtime");
+        runtime.register_embedder(ConstantEmbedderProvider {
+            name: model.to_string(),
+            dimensions: model.dimensions(),
+        });
+        runtime
+    }
 
     #[test]
     fn bounded_embedding_input_reserves_prefix_and_preserves_utf8() {
@@ -1671,6 +1862,116 @@ mod tests {
             .block_on(rt.embed_batch(&texts));
         let embeddings = result.unwrap();
         assert_eq!(embeddings[0].len(), model.dimensions());
+    }
+
+    // ---- hybrid_search_outcome: vector-arm failure must not discard text hits ----
+
+    /// Baseline (red without the fix): the fail-loud `hybrid_search` must
+    /// still propagate a vector-arm failure as a whole-call error, even
+    /// though the text leg found a match — proving `break_vector_arm`
+    /// genuinely exercises the vector leg and that `hybrid_search_outcome`'s
+    /// tolerance below is a real behavioral difference, not a no-op.
+    #[tokio::test]
+    async fn hybrid_search_still_fails_loud_on_vector_arm_error() {
+        let rt = runtime_with_constant_embeddings();
+        let tok = NamespaceToken::local();
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "FlashAttention",
+            Some("IO-aware exact attention using tiling"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        break_vector_arm(&rt);
+
+        let result = rt
+            .hybrid_search(&tok, "FlashAttention", None, 10, None, None, &[], None)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the fail-loud entry point must still propagate a vector-arm failure, got {result:?}"
+        );
+    }
+
+    /// Green: the coordinator-only outcome variant preserves the text hit and
+    /// reports the vector failure separately instead of discarding the whole
+    /// call.
+    #[tokio::test]
+    async fn hybrid_search_outcome_preserves_text_hits_on_vector_arm_error() {
+        let rt = runtime_with_constant_embeddings();
+        let tok = NamespaceToken::local();
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "FlashAttention",
+            Some("IO-aware exact attention using tiling"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        break_vector_arm(&rt);
+
+        let outcome = rt
+            .hybrid_search_outcome(&tok, "FlashAttention", 10, None, None, &[], None)
+            .await
+            .expect("text leg must still succeed");
+
+        assert!(
+            !outcome.hits.is_empty(),
+            "text arm's hit must survive a vector-arm failure"
+        );
+        assert!(
+            outcome.hits[0]
+                .title
+                .as_deref()
+                .unwrap_or_default()
+                .contains("FlashAttention"),
+            "surviving hit must be the text match"
+        );
+        let vector_error = outcome
+            .vector_error
+            .expect("vector arm failure must be reported");
+        assert!(
+            vector_error.contains("injected vector-arm failure"),
+            "vector_error must carry the underlying cause, got {vector_error:?}"
+        );
+    }
+
+    /// A healthy vector arm still leaves `vector_error` `None` — the outcome
+    /// variant does not manufacture a failure where there is none.
+    #[tokio::test]
+    async fn hybrid_search_outcome_has_no_vector_error_when_vector_arm_healthy() {
+        let rt = runtime_with_constant_embeddings();
+        let tok = NamespaceToken::local();
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "FlashAttention",
+            Some("IO-aware exact attention using tiling"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let outcome = rt
+            .hybrid_search_outcome(&tok, "FlashAttention", 10, None, None, &[], None)
+            .await
+            .expect("hybrid search must succeed");
+
+        assert!(!outcome.hits.is_empty(), "should find the entity");
+        assert!(
+            outcome.vector_error.is_none(),
+            "a healthy vector arm must not report an error"
+        );
     }
 
     // ---- hybrid_search enrichment ----

@@ -530,6 +530,17 @@ Rejected.
    optimization over the weight space? The infrastructure is in place; the training signal
    is the open question.
 
+## 2026-08-30 operational clarification: named completed-recall stage timing
+
+The unconditional slow-completion warning is part of the pipeline's operator
+contract. Every completed recall at or above the ten-second threshold reports
+`embed_ms`, `fts_ms`, `ann_ms`, `fresh_tail_ms`, and `hydrate_ms` alongside
+its total/result shape. These are attributed wall times, not an additive
+critical path: FTS and vector retrieval overlap; concurrent models contribute
+the maximum ANN/fresh-tail time; sequential candidate-widening and hydration
+rounds accumulate. This observability does not change fusion, score, result
+ordering, or the opt-in `KHIVE_RECALL_PROFILE` stream.
+
 ## References
 
 - [ADR-006](ADR-006-deterministic-scoring.md) — `DeterministicScore` for reproducible ordering

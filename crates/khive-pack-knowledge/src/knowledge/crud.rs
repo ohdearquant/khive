@@ -1212,14 +1212,24 @@ impl KnowledgeHandlers {
         let sql = runtime.sql();
         let mut reader = sql.reader().await.map_err(|e| sql_err("stats reader", e))?;
 
-        let atom_count = reader
-            .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'".into(),
+        // Atom totals and finalized coverage share the same expensive
+        // namespace/live/non-domain predicate. Keep them in one aggregate so
+        // large corpora pay for a single table pass and one request-deadline
+        // slice rather than two sequential scans (#2218).
+        let atom_stats = reader
+            .query_row(SqlStatement {
+                sql: "SELECT COUNT(*) AS total_atoms, \
+                             COALESCE(SUM(CASE WHEN finalized = 1 THEN 1 ELSE 0 END), 0) \
+                                 AS finalized_atoms \
+                      FROM knowledge_atoms \
+                      WHERE namespace = ?1 AND deleted_at IS NULL \
+                        AND tags NOT LIKE '%type:domain%'"
+                    .into(),
                 params: vec![SqlValue::Text(ns.clone())],
-                label: None,
+                label: Some("knowledge.stats.atom_aggregates".into()),
             })
             .await
-            .map_err(|e| sql_err("stats atoms", e))?;
+            .map_err(|e| sql_err("stats atom aggregates", e))?;
 
         let domain_count = reader
             .query_scalar(SqlStatement {
@@ -1229,15 +1239,6 @@ impl KnowledgeHandlers {
             })
             .await
             .map_err(|e| sql_err("stats domains", e))?;
-
-        let finalized_count = reader
-            .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND finalized = 1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'".into(),
-                params: vec![SqlValue::Text(ns.clone())],
-                label: None,
-            })
-            .await
-            .map_err(|e| sql_err("stats finalized", e))?;
 
         let event_count = reader
             .query_scalar(SqlStatement {
@@ -1269,18 +1270,18 @@ impl KnowledgeHandlers {
             .await
             .map_err(|e| sql_err("stats latest eval run", e))?;
 
-        let total_atoms = match atom_count {
-            Some(SqlValue::Integer(n)) => n,
-            _ => 0,
-        };
+        let total_atoms = atom_stats
+            .as_ref()
+            .and_then(|row| row_i64(row, "total_atoms"))
+            .unwrap_or(0);
         let total_domains = match domain_count {
             Some(SqlValue::Integer(n)) => n,
             _ => 0,
         };
-        let finalized = match finalized_count {
-            Some(SqlValue::Integer(n)) => n,
-            _ => 0,
-        };
+        let finalized = atom_stats
+            .as_ref()
+            .and_then(|row| row_i64(row, "finalized_atoms"))
+            .unwrap_or(0);
         let total_events = match event_count {
             Some(SqlValue::Integer(n)) => n,
             _ => 0,

@@ -21,15 +21,45 @@ import json
 import subprocess
 import sys
 import os
+import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from documented_verb_counts import validate_documented_counts
+from kkernel_binary import resolve_binary_path
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
+BINARY = resolve_binary_path()
+
+DEFAULT_PACKS = frozenset(
+    {
+        "kg",
+        "gtd",
+        "memory",
+        "brain",
+        "comm",
+        "schedule",
+        "knowledge",
+        "session",
+        "git",
+        "code",
+        "workspace",
+        "blob",
+    }
 )
+_SMOKE_HOME = tempfile.TemporaryDirectory(prefix="khive-smoke-home-")
+
+
+def smoke_child_env(source=None) -> dict[str, str]:
+    """Environment for a smoke child: every KHIVE_* setting of the parent is
+    dropped (config, packs, namespace, actor, output format alike), so the
+    child resolves its own defaults; a test that needs a KHIVE_* value sets
+    it on the returned mapping."""
+    base = os.environ if source is None else source
+    env = {k: v for k, v in base.items() if not k.startswith("KHIVE_")}
+    env["HOME"] = _SMOKE_HOME.name
+    env["KHIVE_NO_DAEMON"] = "1"
+    return env
+
 
 request_id = 0
 
@@ -100,7 +130,7 @@ def main():
     print(f"Binary: {BINARY}")
     assert os.path.exists(BINARY), f"Binary not found: {BINARY}"
 
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    env = smoke_child_env()
     proc = subprocess.Popen(
         [BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error"],
         stdin=subprocess.PIPE,
@@ -209,9 +239,10 @@ def main():
         # its values sum to the unfiltered total. `workspace` is the default
         # set's zero-verb pack: its presence at 0 is the tripwire proving
         # pack_counts enumerates packs rather than surviving verbs.
-        assert len(verbs_result["pack_counts"]) == 12, (
-            f"default config loads 12 packs; pack_counts must name each once: "
-            f"{sorted(verbs_result['pack_counts'])}"
+        actual_packs = frozenset(verbs_result["pack_counts"])
+        assert actual_packs == DEFAULT_PACKS, (
+            f"default config pack set mismatch; expected {sorted(DEFAULT_PACKS)}, "
+            f"got {sorted(actual_packs)}"
         )
         assert verbs_result["pack_counts"].get("workspace") == 0, (
             f"zero-verb workspace pack must appear in pack_counts with count 0: "
@@ -552,7 +583,7 @@ def main():
 
 def gtd_smoke():
     """Optional smoke test for the gtd pack — only runs if KHIVE_PACKS=...,gtd."""
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    env = smoke_child_env()
     proc = subprocess.Popen(
         [
             BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
@@ -647,7 +678,7 @@ def gtd_smoke():
 
 def memory_smoke():
     """Optional smoke test for the memory pack — exercises remember and recall."""
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    env = smoke_child_env()
     proc = subprocess.Popen(
         [
             BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
@@ -758,7 +789,7 @@ def formal_smoke():
     operations.rs:231-234 (substrate=="entity" && kind==k && entity_type==Some(t))
     permits it.
     """
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    env = smoke_child_env()
     proc = subprocess.Popen(
         [
             BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
@@ -847,7 +878,7 @@ def epistemic_smoke():
     Direction: source = evidence, target = claim. NOT symmetric.
     (ADR-055 §"Direction and symmetry")
     """
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    env = smoke_child_env()
     proc = subprocess.Popen(
         [BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error"],
         stdin=subprocess.PIPE,
@@ -1015,7 +1046,7 @@ def epistemic_smoke():
 
 def brain_smoke():
     """Optional smoke test for the brain pack -- profile lifecycle, feedback, and bindings."""
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    env = smoke_child_env()
     proc = subprocess.Popen(
         [
             BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
@@ -1155,7 +1186,7 @@ def brain_smoke():
 
 def comm_smoke():
     """Optional smoke test for the comm pack -- send, inbox, read, reply, and thread."""
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    env = smoke_child_env()
     proc = subprocess.Popen(
         [
             BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
@@ -1252,7 +1283,7 @@ def schedule_smoke():
         datetime.now(timezone.utc) + timedelta(days=30)
     ).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    env = smoke_child_env()
 
     # Without comm loaded, schedule.remind must be rejected before any
     # scheduled_event note is persisted -- fail fast, not silently degrade.

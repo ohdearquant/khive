@@ -13119,3 +13119,131 @@ async fn sent_box_long_poll_wakes_after_concurrent_send() {
     );
     assert_eq!(sent["messages"][0]["direction"].as_str(), Some("outbound"));
 }
+
+/// khive#2390: `query_inbox_response`'s `has_post_filter` branch (any of
+/// `from_prefix` / `exclude_from_actor` / `before` / `subject_contains` /
+/// `content_contains`) used to re-issue its internal store fetch with a
+/// growing `OFFSET` on every iteration, re-walking every earlier row on
+/// every page. It now carries a `(created_at, id)` keyset cursor between
+/// iterations instead. 300 messages, one in six rejected by `from_prefix`,
+/// forces at least two internal 200-row store fetches to collect the 250
+/// accepted matches, exercising the cursor handoff across that boundary.
+/// This pins the observable contract the rewrite must not change: the same
+/// rows, in the same order, with the same `has_more`/`next_offset`
+/// bookkeeping a naive offset scan would have produced.
+#[tokio::test]
+async fn i2390_inbox_post_filter_keyset_paging_matches_offset_semantics_beyond_page_cap() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let base_micros = chrono::DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
+        .unwrap()
+        .timestamp_micros();
+
+    // Every 6th sequence is rejected by `from_prefix`; the rest match. Newer
+    // (higher) sequences get a later `created_at`, so the default
+    // `created_at DESC` order lists sequence 300 first (if accepted) down to 1.
+    let mut expected_accepted_desc: Vec<u32> = Vec::new();
+    for sequence in 1..=300u32 {
+        let accepted = sequence % 6 != 0;
+        let from_actor = if accepted {
+            format!("team:accept:{sequence}")
+        } else {
+            format!("team:reject:{sequence}")
+        };
+        insert_i1422_message(
+            &runtime,
+            sequence,
+            base_micros + i64::from(sequence) * 1_000_000,
+            &from_actor,
+            "lambda:reader",
+            None,
+            &format!("message {sequence}"),
+        )
+        .await;
+        if accepted {
+            expected_accepted_desc.push(sequence);
+        }
+    }
+    expected_accepted_desc.reverse();
+    assert_eq!(expected_accepted_desc.len(), 250);
+
+    let expected_id = |sequence: u32| {
+        uuid::Uuid::from_u128((u128::from(sequence) << 96) | u128::from(sequence)).to_string()
+    };
+
+    let expected_all: Vec<String> = expected_accepted_desc
+        .iter()
+        .map(|s| expected_id(*s))
+        .collect();
+
+    // One call at the caller-visible limit cap (200) forces the internal
+    // loop to fetch a full PAGE_SIZE=200 batch of raw rows -- containing a
+    // mix of accepted and rejected messages -- and keep going past it to
+    // fill the requested 200 accepted matches, exercising the cursor
+    // handoff between store fetches. This alone would have caught an
+    // off-by-one there.
+    let all = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 200, "from_prefix": "team:accept:" }),
+        )
+        .await
+        .expect("wide post-filtered inbox succeeds");
+    let all_ids: Vec<String> = all["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .map(|m| m["full_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        all_ids,
+        expected_all[..200],
+        "post-filtered listing must return exactly the accepted rows, in created_at DESC order"
+    );
+    assert_eq!(all["has_more"], true);
+    assert_eq!(all["next_offset"], 200);
+
+    // Now the same population, paged externally in chunks of 100, must
+    // reproduce the identical partition an offset-based scan would have
+    // produced -- including the exact `has_more` boundary.
+    let mut collected: Vec<String> = Vec::new();
+    let mut offset: u64 = 0;
+    loop {
+        let page = registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({
+                    "status": "all",
+                    "limit": 100,
+                    "from_prefix": "team:accept:",
+                    "offset": offset,
+                }),
+            )
+            .await
+            .expect("paged post-filtered inbox succeeds");
+        let page_ids: Vec<String> = page["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| m["full_id"].as_str().unwrap().to_string())
+            .collect();
+        let expected_slice = &expected_all[collected.len()..(collected.len() + page_ids.len())];
+        assert_eq!(
+            page_ids, expected_slice,
+            "page at offset={offset} must match the corresponding offset-paging slice"
+        );
+        assert_eq!(page["offset"], offset);
+        collected.extend(page_ids);
+
+        let has_more = page["has_more"].as_bool().expect("has_more is a bool");
+        if !has_more {
+            assert!(page["next_offset"].is_null());
+            break;
+        }
+        offset = page["next_offset"].as_u64().expect("next_offset present");
+    }
+    assert_eq!(
+        collected, expected_all,
+        "paging in 100-row chunks must reassemble the exact same total order as one wide call"
+    );
+}

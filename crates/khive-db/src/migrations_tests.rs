@@ -1097,6 +1097,77 @@ fn v25_upgrades_direction_blind_recipient_index_for_read_only_open() {
 }
 
 #[test]
+fn v27_adds_hot_property_indexes_to_a_pre_v27_database() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pre-hot-property-indexes.db");
+
+    const NEW_INDEXES: [&str; 2] = ["idx_notes_task_status", "idx_notes_task_assignee"];
+
+    {
+        let mut conn = Connection::open(&path).expect("create pre-V27 database");
+        migrate_through(&mut conn, 20);
+        stage_attachment_cutover(&mut conn).expect("stage empty attachment cutover");
+        finalize_attachment_cutover(&mut conn).expect("finalize empty attachment cutover");
+        assert_eq!(read_schema_version(&conn).expect("read V21 ledger"), 21);
+        // `migrate_through` runs today's `sql/schema.sql` for V1, which
+        // already carries these indexes (a fresh install gets them
+        // immediately rather than waiting for V27 to replay) -- drop them to
+        // reproduce a database actually created before this change, the
+        // same technique the V22/V25 unread-probe-index migration tests use.
+        for name in NEW_INDEXES {
+            conn.execute(&format!("DROP INDEX {name}"), [])
+                .unwrap_or_else(|e| panic!("simulate pre-V27 database missing {name}: {e}"));
+        }
+        for name in NEW_INDEXES {
+            assert!(
+                !index_exists(&conn, name),
+                "{name} must not exist before V27 applies"
+            );
+        }
+    }
+
+    {
+        let mut conn = Connection::open(&path).expect("reopen writable database");
+        assert_eq!(
+            run_migrations(&mut conn).expect("apply V27 hot-property-index migration"),
+            latest_schema_version()
+        );
+        for name in NEW_INDEXES {
+            assert!(index_exists(&conn, name), "{name} must exist after V27");
+        }
+    }
+
+    let read_only = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open migrated database read-only");
+    for name in NEW_INDEXES {
+        assert!(index_exists(&read_only, name));
+    }
+    validate_schema_is_current(&read_only).expect("migrated read-only schema validates");
+}
+
+#[test]
+fn latest_schema_version_matches_the_newest_migrations_entry() {
+    assert_eq!(
+        MIGRATIONS.last().map(|m| m.version),
+        Some(latest_schema_version()),
+        "latest_schema_version() must equal the version of the newest MIGRATIONS entry"
+    );
+}
+
+#[test]
+fn migration_versions_advance_by_exactly_one() {
+    for pair in MIGRATIONS.windows(2) {
+        assert_eq!(
+            pair[1].version,
+            pair[0].version + 1,
+            "migration versions must be strictly sequential with no gaps: {} -> {}",
+            pair[0].version,
+            pair[1].version
+        );
+    }
+}
+
+#[test]
 fn v23_backfills_indexed_record_kinds_and_preserves_unmatched_fts_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("pre-record-kind.db");

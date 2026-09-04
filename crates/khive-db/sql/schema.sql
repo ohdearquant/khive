@@ -242,6 +242,20 @@ CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient_direction
            OR json_type(properties, '$.read') != 'true')
       AND deleted_at IS NULL;
 
+-- Kept in sync with notes-ddl.sql: hot property-path indexes for GTD task
+-- listing (status/assignee) (sql/027-notes-hot-property-indexes.sql).
+CREATE INDEX IF NOT EXISTS idx_notes_task_status
+    ON notes(namespace, kind,
+             json_extract(properties, '$.status'),
+             created_at DESC, id ASC)
+    WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_notes_task_assignee
+    ON notes(namespace, kind,
+             json_extract(properties, '$.assignee'),
+             created_at DESC, id ASC)
+    WHERE deleted_at IS NULL;
+
 CREATE INDEX IF NOT EXISTS idx_events_namespace ON events(namespace);
 CREATE INDEX IF NOT EXISTS idx_events_verb ON events(verb);
 CREATE INDEX IF NOT EXISTS idx_events_substrate ON events(substrate);
