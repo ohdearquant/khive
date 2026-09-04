@@ -40,6 +40,41 @@ fn list_items(response: &Value) -> &[Value] {
         .expect("list response must contain an items array")
 }
 
+/// The exact value a logged `gh` invocation line passed after `--repo`, or
+/// `None` if the line has no `--repo` flag. Whitespace-tokenized rather than
+/// substring-matched: `line.contains("--repo fixture/repository")` also
+/// matches `--repo fixture/repository-evil` or `--repo
+/// not-fixture/repository`, so a probe that silently widened past the
+/// pinned repository would still read as passing.
+fn repo_flag_value(line: &str) -> Option<&str> {
+    let mut tokens = line.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--repo" {
+            return tokens.next();
+        }
+    }
+    None
+}
+
+#[test]
+fn repo_flag_value_rejects_a_value_that_merely_contains_the_pinned_repo() {
+    assert_eq!(
+        repo_flag_value("pr list --repo fixture/repository --state all"),
+        Some("fixture/repository")
+    );
+    assert_ne!(
+        repo_flag_value("pr list --repo fixture/repository-evil --state all"),
+        Some("fixture/repository"),
+        "a --repo value that merely contains the pinned repo string must not read as a match"
+    );
+    assert_ne!(
+        repo_flag_value("pr list --repo not-fixture/repository --state all"),
+        Some("fixture/repository"),
+        "a --repo value containing the pinned repo string as a suffix must not read as a match"
+    );
+    assert_eq!(repo_flag_value("pr list --state all"), None);
+}
+
 /// `PATH` (and, transitively, which `gh`/`git` binaries `Command::new` resolves
 /// to) is process-global state. Every test that calls `run_ingest` — whether
 /// or not it installs a fake `gh` fixture — must serialize on this mutex, or a
@@ -3606,8 +3641,9 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
             line.contains("--state all"),
             "every gh pr/issue list invocation must request --state all: {line:?}"
         );
-        assert!(
-            line.contains("--repo fixture/repository"),
+        assert_eq!(
+            repo_flag_value(line),
+            Some("fixture/repository"),
             "every gh pr/issue list invocation must explicitly pin the probed repo: {line:?}"
         );
     }
@@ -6557,6 +6593,90 @@ async fn digest_verb_local_cursor_read_failure_is_not_remote_listing_skip() {
 /// Presence on PATH is insufficient: an installed but unauthenticated (or
 /// repo-incompatible) `gh` reports `gh_available:false`, skips requested
 /// remote sources, never starts a walker, and does not echo probe stderr.
+#[cfg(unix)]
+#[tokio::test]
+async fn digest_remote_issues_only_never_invokes_git_clone() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin_dir = dir.path().join("bin");
+    let scratch = dir.path().join("scratch");
+    let git_log = dir.path().join("git-args.log");
+    let gh_log = dir.path().join("gh-args.log");
+    std::fs::create_dir_all(&bin_dir).expect("bin dir");
+
+    let git_script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 97\n",
+        git_log.display()
+    );
+    let gh_script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1 $2" in
+  "repo view")
+    echo '{{"nameWithOwner":"fixture/repository","url":"https://github.com/fixture/repository"}}'
+    ;;
+  "issue list")
+    echo '[]'
+    ;;
+  *)
+    exit 98
+    ;;
+esac
+"#,
+        gh_log.display()
+    );
+    for (name, script) in [("git", git_script), ("gh", gh_script)] {
+        let path = bin_dir.join(name);
+        std::fs::write(&path, script).expect("write command stub");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path)
+            .expect("stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod stub");
+    }
+
+    let _path_guard = PathGuard::install(&bin_dir);
+    std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", &scratch);
+    let result = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": "https://github.com/fixture/repository",
+                "include": ["issues"]
+            }),
+        )
+        .await;
+    std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+
+    let response = result.expect("issues-only remote digest must not require a clone");
+    assert_eq!(response["gh_available"], true, "{response}");
+    assert_eq!(response["history_exhausted"], true, "{response}");
+    assert_eq!(response["sources"]["issues"]["state"], "completed");
+    assert!(response["sources"]["commits"].is_null(), "{response}");
+    assert!(
+        !git_log.exists(),
+        "issues-only remote digest must never invoke git: {}",
+        std::fs::read_to_string(&git_log).unwrap_or_default()
+    );
+    let gh_invocations = std::fs::read_to_string(gh_log).expect("gh invocation log");
+    let lines: Vec<&str> = gh_invocations.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("repo view fixture/repository --json nameWithOwner,url"),
+        "the probe must never delegate repository selection to gh: {lines:?}"
+    );
+    for line in lines.iter().skip(1) {
+        assert_eq!(
+            repo_flag_value(line),
+            Some("fixture/repository"),
+            "every issue list call must retain the source-bound repo, exactly: {line:?}"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_verb_installed_but_unusable_gh_is_reported_false_without_leaking_stderr() {
@@ -6745,11 +6865,11 @@ esac
         "the probe must never delegate repository selection to gh: {lines:?}"
     );
     for line in lines.iter().skip(1) {
-        assert!(
-            line.contains("--repo fixture/repository"),
-            "every list call must retain the source-bound repo: {line:?}"
+        assert_eq!(
+            repo_flag_value(line),
+            Some("fixture/repository"),
+            "every list call must retain the source-bound repo, exactly: {line:?}"
         );
-        assert!(!line.contains("alternate/wrong-repository"), "{line:?}");
     }
 }
 
