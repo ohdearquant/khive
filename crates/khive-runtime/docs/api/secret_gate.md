@@ -309,12 +309,21 @@ past the window can guarantee seeing every fragment of a chain that starts befor
 of scanning past the boundary, `mask_bounded` walks BACKWARD from it — over data already inside the
 window, so this adds no lookahead and stays bounded by `window_chars` alone — dropping every further
 bridge-fragment-shaped token chained to the one already removed, within the same
-`MAX_BRIDGE_FRAGMENTS`/`MAX_BRIDGE_GLUE_TOKENS` budgets `bridge_fragment_chain` itself uses. This is
-scoped to windows carrying trigger-word context (the same gate the entropy detector requires before
-it attempts bridge reconstruction at all), so ordinary untriggered prose cut mid-sentence is left
-untouched; a fragment-shaped word that merely sits at the tail of a triggered window, with nothing
-actually chained to it past the boundary, is a false positive this trade accepts in exchange for
-never leaking a real fragment.
+`MAX_BRIDGE_FRAGMENTS`/`MAX_BRIDGE_GLUE_TOKENS` budgets `bridge_fragment_chain` itself uses.
+
+This walk runs on every truncated window, regardless of whether the window itself carries
+trigger-word context. The entropy detector's own bridge reconstruction (see
+[Bridge fragment reconstruction](#bridge-fragment-reconstruction)) admits a trigger word from either
+side of a fragment chain, so a credential such as `<frag> <frag> <frag> is the api key for ...` is
+reconstructed and masked by the unbounded masker even though its only trigger sits after the last
+fragment. A window cut inside that fragment chain may never contain the trigger at all — it can sit
+past the boundary, in text `mask_bounded` has already decided to discard — so gating the backward
+walk on an in-window trigger check leaves exactly that case unprotected: no visible trigger, no
+walk, and any whole fragments already read into the window leak. The walk cannot distinguish a
+genuine chained fragment from an unrelated fragment-shaped word sitting at the tail of an
+untriggered window either; the trade this makes is dropping that word too rather than risking a
+leaked credential fragment. The cost is bounded: at most `MAX_BRIDGE_FRAGMENTS - 1` tokens of a tail
+that `mask_bounded` has already decided to truncate.
 
 ## mask_secrets
 

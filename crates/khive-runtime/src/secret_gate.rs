@@ -1931,22 +1931,28 @@ fn bridge_fragment_chain<'a>(
 /// dropping every further bridge-fragment-shaped token chained to the
 /// fragment [`mask_bounded`] already removed, spending the same
 /// fragment-count and glue-token budgets [`bridge_fragment_chain`] would
-/// spend walking outward from an anchor. Scoped to windows carrying
-/// trigger-word context (the same gate `collect_mask_spans` requires before
-/// it attempts bridge reconstruction at all — see step 6 there) so ordinary
-/// untriggered prose is never touched.
+/// spend walking outward from an anchor.
 ///
-/// Because the walk cannot see past the boundary, it cannot distinguish a
-/// genuine chained fragment from an unrelated fragment-shaped word that
-/// merely sits at the tail of a triggered window; the trade this makes is
-/// dropping that word too rather than risking a leaked credential fragment.
+/// Runs unconditionally on every truncated window, regardless of whether the
+/// window itself carries trigger-word context. `collect_mask_spans` step 6
+/// admits trigger context from EITHER side of a fragment chain (a credential
+/// like `<frag> <frag> <frag> is the api key for ...` is reconstructed by the
+/// unbounded masker even though the trigger sits after the fragments), so a
+/// trigger word that would justify keeping this window's tail may sit past
+/// the window boundary — data this function, by construction, cannot see.
+/// Gating the walk on an in-window trigger check would leave exactly that
+/// case unprotected: the window carries no visible trigger, the walk would
+/// never run, and any whole fragments already read into the window would
+/// leak. The walk cannot distinguish a genuine chained fragment from an
+/// unrelated fragment-shaped word sitting at the tail of an untriggered
+/// window either; the trade this makes is dropping that word too rather than
+/// risking a leaked credential fragment. The cost is bounded: at most
+/// `MAX_BRIDGE_FRAGMENTS - 1` tokens of a tail that mask_bounded has already
+/// decided to truncate.
+///
 /// Returns the byte offset to truncate `window` to, or `None` when nothing
 /// beyond the already-trimmed token needs to go.
 fn trailing_bridge_fragment_cut(window: &str) -> Option<usize> {
-    if !contains_trigger(window) {
-        return None;
-    }
-
     let tokens = tokenize_entropy_tokens(window);
     let mut idx = tokens.len().checked_sub(1)?;
     let mut fragment_budget = MAX_BRIDGE_FRAGMENTS - 1;
@@ -4947,6 +4953,126 @@ mod tests {
         );
         assert!(!result.text.contains(frag1));
         assert!(!result.text.contains(frag2));
+    }
+
+    #[test]
+    fn mask_bounded_masks_a_bridged_credential_whose_trigger_follows_the_window() {
+        // Three-way split (14/13/13 chars) of a 40-char hex credential, each
+        // fragment individually too short to be recognized alone. The only
+        // trigger word sits AFTER the last fragment ("... is the api key
+        // for ..."), never inside the truncated window. Expected arm
+        // (pre-fix): `trailing_bridge_fragment_cut` gated its backward walk
+        // on `contains_trigger(window)`, and the window here carries no
+        // trigger at all — the walk never ran, so frag1 and frag2 (both
+        // read whole into the window) survived the partial-token drop and
+        // leaked.
+        let hex = forty_char_hex_fixture();
+        let (frag1, rest) = hex.split_at(14);
+        let (frag2, frag3) = rest.split_at(13);
+        let message = format!("values: {frag1} {frag2} {frag3} is the api key for the service");
+
+        // Control: the unbounded masker sees the trigger after the
+        // fragments and still reconstructs and masks the whole credential.
+        let full = mask_for_redaction_surface(RedactionSurface::McpDiagnostic, &message);
+        assert!(
+            !full.contains(frag1) && !full.contains(frag2) && !full.contains(frag3),
+            "control: unbounded masking must reconstruct and mask the split \
+             credential even though its trigger word comes after the \
+             fragments: {full}"
+        );
+
+        // Land the window a few characters into frag3, so the existing
+        // partial-token drop removes only frag3's remnant and leaves frag1
+        // and frag2 whole in the window; the trigger word stays entirely
+        // outside the window.
+        let window_chars = "values: ".len() + frag1.len() + 1 + frag2.len() + 1 + 5;
+        assert!(
+            window_chars < message.len(),
+            "fixture must exceed the window"
+        );
+        assert!(
+            !contains_trigger(&message[..window_chars]),
+            "fixture must carry no trigger word inside the window"
+        );
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            &message,
+            window_chars,
+            window_chars,
+        );
+        assert!(result.truncated);
+        assert!(
+            !result.text.contains(frag1) && !result.text.contains(frag2),
+            "no fragment of a bridged credential may survive a window cut \
+             mid-chain, even when the credential's only trigger word lies \
+             past the window boundary: {:?}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn mask_bounded_keeps_a_non_fragment_tail_of_an_untriggered_truncated_window() {
+        // No trigger word anywhere in the message, and the tokens at the
+        // tail of the truncated window are ordinary short words (each under
+        // `MIN_BRIDGE_FRAGMENT_LEN`) rather than fragment-shaped. The
+        // unconditional backward walk must still leave them alone: nothing
+        // at the tail looks like a bridged credential fragment.
+        let prefix = "benign status update about the lazy owls and cats over ";
+        let message = format!("{prefix}here while more prose keeps going past the window");
+        assert!(
+            !contains_trigger(&message),
+            "fixture must carry no trigger word"
+        );
+        let window_chars = prefix.chars().count() + 2;
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            &message,
+            window_chars,
+            window_chars,
+        );
+        assert!(result.truncated);
+        assert_eq!(result.text, format!("{prefix}{TRUNCATION_MARKER}"));
+    }
+
+    #[test]
+    fn mask_bounded_drops_a_fragment_shaped_tail_of_an_untriggered_truncated_window() {
+        // No trigger word anywhere in the message. A single fragment-shaped
+        // identifier (alphanumeric, >= MIN_BRIDGE_FRAGMENT_LEN) sits whole
+        // in the window, followed by a short word that gets cut mid-token by
+        // the boundary. Documents the trade the unconditional walk makes:
+        // the walk cannot tell this lone identifier apart from a genuine
+        // bridged fragment, so it drops it too even though nothing is
+        // actually chained to it and no trigger word is anywhere nearby.
+        let prefix = "an ordinary status line about the current build before ";
+        let identifier = "deadbeefcafefeed01234567";
+        let message = format!("{prefix}{identifier} zzzzzzzzzz");
+        assert!(
+            !contains_trigger(&message),
+            "fixture must carry no trigger word"
+        );
+        assert!(identifier.len() >= MIN_BRIDGE_FRAGMENT_LEN);
+
+        let window_chars = prefix.chars().count() + identifier.chars().count() + 1 + 3;
+        assert!(
+            window_chars < message.len(),
+            "fixture must exceed the window"
+        );
+
+        let result = mask_bounded(
+            RedactionSurface::McpDiagnostic,
+            &message,
+            window_chars,
+            window_chars,
+        );
+        assert!(result.truncated);
+        assert!(
+            !result.text.contains(identifier),
+            "a lone fragment-shaped tail token is dropped even without a \
+             chained neighbor or a trigger word: {:?}",
+            result.text
+        );
     }
 
     #[test]
