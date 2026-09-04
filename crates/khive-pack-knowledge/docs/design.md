@@ -120,11 +120,14 @@
   any domain could be measured. A single `query_all` call has no partial-completion state, so one
   flag covers every domain in the batch; a genuinely zero-member domain and an unmeasured one are
   otherwise indistinguishable in the plain map. `suggest` never serializes `size: 0` for an
-  unmeasured domain — it serializes `null` and lists the domain under
-  `degraded.member_sizing_timeout.domain_ids`. `FoldCandidate::size` (`knowledge.fold`) is a
-  non-optional `usize`, so a caller that feeds `suggest`'s `results` straight into a `fold` call
-  gets a hard parse error on a `null` size instead of `fold` silently admitting an unpriced domain
-  as a free item — the intended fail-closed behavior.
+  unmeasured domain, and it does not serialize a `null` size either: the domain is withheld from
+  `results` entirely and listed instead under `degraded.member_sizing_timeout.excluded` as
+  `{id, name, rank, score}`, so the caller still sees which ranked hit was withheld and why.
+  `FoldCandidate::size` (`knowledge.fold`) is a non-optional `usize`, so a `null` size would turn
+  one unmeasured domain into a hard parse error for a caller that feeds `suggest`'s `results`
+  straight into a `fold` call (issue #105's documented passthrough contract). Withholding the
+  unpriced domain from `results` keeps that passthrough valid while still refusing to let an
+  unpriced domain enter a budgeted fold selection for free.
 
 ### Schema Ownership (ADR-015, ADR-028)
 

@@ -802,7 +802,10 @@ async fn suggest_flags_degraded_no_match_when_hits_empty() {
 /// stage precisely so they survive a lexical timeout (see `search.rs`'s
 /// `search`/`suggest` handlers); a real (unwarmed, no snapshot) `SharedAnn`
 /// still serves via the fresh-tail vector-store scan, so this exercises the
-/// production code path, not a mock.
+/// production code path, not a mock. When the expired deadline also leaves
+/// member sizing unrun, the survivor is reported under
+/// `degraded.member_sizing_timeout.excluded` instead of being served with a
+/// fabricated size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
     let rt = rt_with_fake_embedder();
@@ -851,23 +854,44 @@ async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
         result["degraded"]["lexical_timeout"], true,
         "suggest must flag degraded.lexical_timeout when the lexical fetch times out; got: {result}"
     );
-    assert!(
-        result["total"].as_u64().unwrap_or(0) > 0,
-        "ANN candidates fetched before the lexical stage must still produce results; got: {result}"
-    );
+    // The ANN survivor is never dropped silently: it is served in `results`
+    // when its member size was measured, and reported under
+    // `degraded.member_sizing_timeout.excluded` (rank and score intact, no
+    // fabricated size) when the expired request deadline left sizing unrun.
+    let surfaced: Vec<&str> = result["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            result["degraded"]["member_sizing_timeout"]["excluded"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .filter_map(|hit| hit["name"].as_str())
+        .collect();
     assert_eq!(
-        result["results"][0]["name"], "Degrade Lexical Timeout Domain",
-        "the only vector-backed candidate must be the seeded domain; got: {result}"
+        surfaced,
+        vec!["Degrade Lexical Timeout Domain"],
+        "the only vector-backed candidate must be surfaced exactly once, served or withheld; got: {result}"
     );
+    for hit in result["results"].as_array().into_iter().flatten() {
+        assert!(
+            hit["size"].is_u64(),
+            "every served result carries a measured size; got: {result}"
+        );
+    }
 }
 
-/// Issue #2396 fix 3: same outer-deadline shape as the test above, but the
-/// seeded domain has a real member atom, so a real (non-zero) size would be
-/// computed if member sizing ran. The expired ambient deadline skips member
-/// sizing entirely (the same `request_read_is_cancelled()` guard that skips
-/// the embedding rerank), and that must be reported as `size: null` plus a
-/// `degraded.member_sizing_timeout` entry — never `size: 0`, which would let
-/// a caller pass this domain into `knowledge.fold` as a free item.
+/// Issue #2396 fix 3 (revised): same outer-deadline shape as the test above,
+/// but the seeded domain has a real member atom, so a real (non-zero) size
+/// would be computed if member sizing ran. The expired ambient deadline
+/// skips member sizing entirely (the same `request_read_is_cancelled()`
+/// guard that skips the embedding rerank), and that domain must be withheld
+/// from `results` and reported under `degraded.member_sizing_timeout.excluded`
+/// instead — never left in `results` with `size: 0` (which would let a
+/// caller pass it into `knowledge.fold` as a free item) or `size: null`
+/// (which breaks the documented suggest -> fold passthrough, issue #105).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lexical_timeout_reports_member_sizing_as_unmeasured_not_zero() {
     let rt = rt_with_fake_embedder();
@@ -923,18 +947,116 @@ async fn lexical_timeout_reports_member_sizing_as_unmeasured_not_zero() {
 
     assert_eq!(result["degraded"]["lexical_timeout"], true, "got: {result}");
     assert!(
-        result["results"][0]["size"].is_null(),
-        "an unmeasured domain's size must serialize as null, never 0; got: {result}"
+        result["results"].as_array().is_some_and(Vec::is_empty),
+        "an unmeasured domain must be withheld from `results` entirely, never \
+         left in with size 0 or null; got: {result}"
     );
-    let unmeasured = result["degraded"]["member_sizing_timeout"]["domain_ids"]
+    let excluded = result["degraded"]["member_sizing_timeout"]["excluded"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     assert_eq!(
-        unmeasured.len(),
+        excluded.len(),
         1,
-        "the degradation entry must list the unmeasured domain; got: {result}"
+        "the degradation entry must list the excluded domain; got: {result}"
     );
+    assert_eq!(excluded[0]["rank"], 1, "got: {result}");
+    assert!(
+        excluded[0]["id"].is_string()
+            && excluded[0]["name"].is_string()
+            && excluded[0]["score"].is_number()
+            && excluded[0].get("size").is_none(),
+        "an excluded entry must carry id/name/rank/score for reference, and no \
+         size; got: {result}"
+    );
+
+    registry
+        .dispatch(
+            "knowledge.fold",
+            json!({ "candidates": result["results"].clone(), "budget": 10_000 }),
+        )
+        .await
+        .expect(
+            "suggest's results must feed fold unmodified even when a domain was \
+             excluded for an unmeasured size (issue #105 passthrough)",
+        );
+}
+
+/// Issue #2396 follow-up: `suggest`'s documented contract (issue #105) is
+/// that a caller feeds its `results` straight into `knowledge.fold`'s
+/// `candidates` unmodified. A member-sizing timeout must not break that
+/// passthrough — the unpriced domain is withheld from `results` (and
+/// reported under `degraded.member_sizing_timeout.excluded`), never left in
+/// `results` with a `size` that `FoldCandidate`'s non-optional `usize`
+/// cannot parse. Before the fix, this test's `fold` dispatch failed with a
+/// parse error on the degraded domain's `size: null`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suggest_results_under_a_member_sizing_timeout_still_pass_through_fold() {
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "degrade-sizing-passthrough-atom",
+                    "name": "Degrade Sizing Passthrough Atom",
+                    "finalized": true,
+                    "content": "enough body content to price a non-zero token size for the owning domain if member sizing ever ran to completion"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert member atom");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [{
+                "slug": "degrade-sizing-passthrough-domain",
+                "name": "Degrade Sizing Passthrough Domain",
+                "description": "a domain with a real member atom, so a real (non-zero) size would be computed if member sizing ran, proving a timeout is reported as unmeasured rather than a coincidental zero",
+                "members": ["degrade-sizing-passthrough-atom"]
+            }]}),
+        )
+        .await
+        .expect("upsert domain");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    // Seeded after indexing, like the sibling tests above, so these 200K
+    // rows are never embedded — only the lexical stage's own read pays for
+    // scanning them, long enough to exceed the outer deadline below.
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+
+    let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    let deadline = std::time::Duration::from_millis(200);
+    let result = khive_storage::scope_request_read_deadline(
+        deadline,
+        KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+    )
+    .await
+    .expect("suggest must not Err on a lexical-stage read timeout");
+
+    assert!(
+        result["degraded"]["member_sizing_timeout"]["excluded"]
+            .as_array()
+            .is_some_and(|excluded| !excluded.is_empty()),
+        "the degraded scenario must produce at least one excluded domain; got: {result}"
+    );
+
+    registry
+        .dispatch(
+            "knowledge.fold",
+            json!({ "candidates": result["results"].clone(), "budget": 10_000 }),
+        )
+        .await
+        .expect("suggest's results must feed fold unmodified (issue #105 passthrough)");
 }
 
 /// Issue #1930 Amendment 2: a lexical-stage-*only* timeout (its own narrow

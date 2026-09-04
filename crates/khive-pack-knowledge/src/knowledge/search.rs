@@ -1563,15 +1563,17 @@ fn attach_body_lines_timeout_degradation(out: &mut Value) {
 }
 
 /// Flag that member-token sizing hit the request read deadline before it
-/// could measure any domain in this response (issue #2396 fix 3). Every
-/// affected result's `size` field is `null`, never `0` — a caller that feeds
-/// `suggest`'s `results` straight into `knowledge.fold`'s `candidates`
-/// (`FoldCandidate::size` is a non-optional `usize`) gets a hard parse error
-/// on any of these domains instead of silently admitting an unpriced item
-/// for free, which is the fail-closed behavior this degradation exists to
-/// force.
-fn attach_member_sizing_timeout_degradation(out: &mut Value, unmeasured_domain_ids: &[String]) {
-    if unmeasured_domain_ids.is_empty() {
+/// could measure any domain in this response (issue #2396 fix 3, revised).
+/// Every affected domain is withheld from `results` — never left in with a
+/// `size` the caller cannot price — and listed here instead, as
+/// `{id, name, rank, score}`, so the caller sees exactly which ranked hits
+/// were excluded and why. `suggest`'s documented contract (issue #105) is
+/// that `results` feeds `knowledge.fold`'s `candidates` unmodified;
+/// withholding the unpriced domain keeps that passthrough valid instead of
+/// turning one unmeasured domain into a hard parse error for the whole fold
+/// request.
+fn attach_member_sizing_timeout_degradation(out: &mut Value, excluded: &[Value]) {
+    if excluded.is_empty() {
         return;
     }
 
@@ -1582,12 +1584,12 @@ fn attach_member_sizing_timeout_degradation(out: &mut Value, unmeasured_domain_i
         out["degraded"] = json!({});
     }
     out["degraded"]["member_sizing_timeout"] = json!({
-        "domain_ids": unmeasured_domain_ids,
-        "note": "member-token sizing did not complete for these domains; their \
-                 `size` is null, not 0. Do not pass them to knowledge.fold \
-                 without measuring size separately — a null size is rejected \
-                 by fold's candidate schema rather than silently admitted as \
-                 free.",
+        "excluded": excluded,
+        "note": "member-token sizing did not complete for these domains, so they \
+                 were withheld from `results` — their cost is unknown and a \
+                 budgeted knowledge.fold selection cannot safely admit an unpriced \
+                 item. Each entry keeps its id/name/rank/score for reference; \
+                 measure size separately before folding one of these in.",
     });
 }
 
@@ -2747,32 +2749,54 @@ impl KnowledgeHandlers {
         if !khive_storage::request_read_is_cancelled() {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
-        let unmeasured_domain_ids: Vec<String> = if member_sizing_timed_out {
-            domain_ids.clone()
-        } else {
-            Vec::new()
-        };
+        // A domain the sizing pass returned no row for is unmeasured as well:
+        // a missing entry never defaults to a fabricated zero.
+        let unmeasured_domain_ids: HashSet<&str> = domain_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| member_sizing_timed_out || !member_token_sizes.contains_key(*id))
+            .collect();
 
         // Price the member atom bodies that compose expands, not the much smaller
         // domain mirror description used for retrieval. The batched join keeps the
         // suggest -> fold budget in compose's estimated-token unit without an N+1
-        // hydration pass. `size` is `null`, never `0`, for a domain whose members
-        // were not measured — `0` would silently pass through `knowledge.fold`'s
-        // budget as a genuinely free item (issue #2396 fix 3); `null` is rejected
-        // by `FoldCandidate::size`'s non-optional `usize`, so a straight pass-
-        // through of these `results` into a `fold` call fails closed instead.
+        // hydration pass. A domain whose members were not measured is withheld
+        // from `results` entirely and reported under
+        // `degraded.member_sizing_timeout.excluded` instead — `suggest`'s
+        // documented contract (issue #105) is that `results` feeds
+        // `knowledge.fold`'s `candidates` unmodified, and `FoldCandidate::size`
+        // is a non-optional `usize`, so leaving an unpriced item in `results`
+        // (as `size: null`, issue #2396 fix 3) turned one unmeasured domain into
+        // a hard parse error for the whole fold request. Exclusion keeps the
+        // passthrough valid while still refusing to let an unpriced domain enter
+        // a budgeted fold selection for free.
         let results: Vec<Value> = hits
             .iter()
-            .map(|h| {
-                json!({
+            .filter(|h| !unmeasured_domain_ids.contains(h.id.as_str()))
+            .filter_map(|h| {
+                let size = member_token_sizes.get(&h.id).copied()?;
+                Some(json!({
                     "id": h.id,
                     "name": h.name,
                     "score": h.score,
-                    "size": member_token_sizes.get(&h.id).copied(),
-                })
+                    "size": size,
+                }))
             })
             .collect();
         let count = results.len();
+        let excluded: Vec<Value> = hits
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| unmeasured_domain_ids.contains(h.id.as_str()))
+            .map(|(i, h)| {
+                json!({
+                    "id": h.id,
+                    "name": h.name,
+                    "rank": i + 1,
+                    "score": h.score,
+                })
+            })
+            .collect();
 
         let mut out = json!({ "results": results, "total": count });
         if ann_unavailable {
@@ -2817,7 +2841,7 @@ impl KnowledgeHandlers {
             attach_lexical_timeout_degradation(&mut out);
         }
         attach_hydration_degradation(&mut out, hydration_failures);
-        attach_member_sizing_timeout_degradation(&mut out, &unmeasured_domain_ids);
+        attach_member_sizing_timeout_degradation(&mut out, &excluded);
         // The lexical stage's own budget no longer implies the request
         // deadline is spent (issue #1930 Amendment 2), so this last check
         // re-reads the live ambient deadline rather than the stage-local
