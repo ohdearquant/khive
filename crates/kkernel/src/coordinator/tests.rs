@@ -83,6 +83,133 @@ fn memory_runtime_denied_with(cause: String) -> Arc<KhiveRuntime> {
     )
 }
 
+/// An `EmbeddingService` that always succeeds with a fixed vector — used to
+/// stand up a runtime whose vector arm can later be broken independently of
+/// entity creation (which also embeds).
+struct ConstantEmbeddingService {
+    dimensions: usize,
+}
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for ConstantEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "coordinator-test-constant-embedding"
+    }
+}
+
+struct ConstantEmbedderProvider {
+    name: String,
+    dimensions: usize,
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for ConstantEmbedderProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    async fn build(
+        &self,
+    ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
+        Ok(Arc::new(ConstantEmbeddingService {
+            dimensions: self.dimensions,
+        }))
+    }
+}
+
+/// An `EmbeddingService` that always fails — drives a real vector-arm
+/// failure (not an `Unconfigured` short-circuit) through the coordinator's
+/// fan-out.
+struct FailingEmbeddingService;
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for FailingEmbeddingService {
+    async fn embed(
+        &self,
+        _texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Err(lattice_embed::EmbedError::ModelInitialization(
+            "injected vector-arm failure".to_string(),
+        ))
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "coordinator-test-failing-embedding"
+    }
+}
+
+struct FailingEmbedderProvider {
+    name: String,
+    dimensions: usize,
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for FailingEmbedderProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    async fn build(
+        &self,
+    ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
+        Ok(Arc::new(FailingEmbeddingService))
+    }
+}
+
+/// A runtime configured with a healthy (constant) embedder — entity creation
+/// and search both work until [`break_vector_arm`] swaps the provider out.
+fn memory_runtime_with_constant_embeddings() -> Arc<KhiveRuntime> {
+    let model = lattice_embed::EmbeddingModel::AllMiniLmL6V2;
+    let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        embedding_model: Some(model),
+        packs: vec!["kg".to_string()],
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime");
+    runtime.register_embedder(ConstantEmbedderProvider {
+        name: model.to_string(),
+        dimensions: model.dimensions(),
+    });
+    Arc::new(runtime)
+}
+
+/// Swap the runtime's registered embedder for the always-failing one, keyed
+/// under the same model name so the vector leg picks it up on the next
+/// embed call — `EmbedderRegistry::register` overwrites by name.
+fn break_vector_arm(runtime: &KhiveRuntime) {
+    let model = lattice_embed::EmbeddingModel::AllMiniLmL6V2;
+    runtime.register_embedder(FailingEmbedderProvider {
+        name: model.to_string(),
+        dimensions: model.dimensions(),
+    });
+}
+
 fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
     SearchHit {
         entity_id,
@@ -430,6 +557,245 @@ async fn fan_out_search_single_backend_returns_hits() {
     assert!(!hits.is_empty(), "should find the entity");
     assert_eq!(per_backend.len(), 1, "single backend report");
     assert!(per_backend[0].error.is_none(), "no error");
+}
+
+/// A vector-arm failure after a successful text leg must not discard the
+/// text hit or mark the backend as whole-backend-failed: `hits` still
+/// carries the text match, `error` stays `None`, and `vector_error` alone
+/// reports the vector-arm cause. Single-backend early-return path.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn fan_out_search_single_backend_preserves_text_hits_on_vector_arm_error() {
+    let runtime = memory_runtime_with_constant_embeddings();
+    let coord = SubstrateCoordinator::single(Arc::clone(&runtime));
+    let ns = Namespace::local();
+
+    let token = runtime.authorize(ns.clone()).unwrap();
+    runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "FlashAttention",
+            Some("IO-aware exact attention"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    break_vector_arm(&runtime);
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "FlashAttention",
+        "limit": 10,
+    }));
+    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert!(
+        !hits.is_empty(),
+        "text arm's hit must survive a vector-arm failure"
+    );
+    assert_eq!(per_backend.len(), 1, "single backend report");
+    assert!(
+        per_backend[0].error.is_none(),
+        "vector-arm-only failure must not read as a whole-backend error: {:?}",
+        per_backend[0].error
+    );
+    let vector_error = per_backend[0]
+        .vector_error
+        .as_deref()
+        .expect("vector arm failure must be reported");
+    assert!(
+        vector_error.contains("injected vector-arm failure"),
+        "vector_error must carry the underlying cause, got {vector_error:?}"
+    );
+}
+
+/// Positive control: proves the note vector leg genuinely runs and fails when
+/// exercised through the fail-loud `search_notes` entry point, establishing
+/// that `break_vector_arm` is a real behavioral trigger for the note
+/// substrate too — the note-substrate twin of
+/// `hybrid_search_still_fails_loud_on_vector_arm_error` for entities.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn search_notes_still_fails_loud_on_vector_arm_error() {
+    let runtime = memory_runtime_with_constant_embeddings();
+    let ns = Namespace::local();
+    let token = runtime.authorize(ns).unwrap();
+    runtime
+        .create_note(
+            &token,
+            "observation",
+            Some("FlashAttentionNote"),
+            "IO-aware exact attention observation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    break_vector_arm(&runtime);
+
+    let result = runtime
+        .search_notes(
+            &token,
+            "FlashAttentionNote",
+            None,
+            10,
+            None,
+            false,
+            &[],
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "the fail-loud search_notes entry point must still propagate a vector-arm failure, got {result:?}"
+    );
+}
+
+/// Note-substrate twin of
+/// `fan_out_search_single_backend_preserves_text_hits_on_vector_arm_error`: a
+/// vector-arm failure after a successful note text leg must not discard the
+/// note's text hit or mark the backend as whole-backend-failed.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn fan_out_search_single_backend_preserves_note_text_hits_on_vector_arm_error() {
+    let runtime = memory_runtime_with_constant_embeddings();
+    let coord = SubstrateCoordinator::single(Arc::clone(&runtime));
+    let ns = Namespace::local();
+
+    let token = runtime.authorize(ns.clone()).unwrap();
+    runtime
+        .create_note(
+            &token,
+            "observation",
+            Some("FlashAttentionNote"),
+            "IO-aware exact attention observation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    break_vector_arm(&runtime);
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "note",
+        "query": "FlashAttentionNote",
+        "limit": 10,
+    }));
+    let (_hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert!(
+        !note_hits.is_empty(),
+        "text arm's note hit must survive a vector-arm failure"
+    );
+    assert_eq!(per_backend.len(), 1, "single backend report");
+    assert!(
+        per_backend[0].error.is_none(),
+        "vector-arm-only failure must not read as a whole-backend error: {:?}",
+        per_backend[0].error
+    );
+    let vector_error = per_backend[0]
+        .vector_error
+        .as_deref()
+        .expect("vector arm failure must be reported");
+    assert!(
+        vector_error.contains("injected vector-arm failure"),
+        "vector_error must carry the underlying cause, got {vector_error:?}"
+    );
+}
+
+/// Same guarantee as the single-backend test above, but for the spawned
+/// multi-backend fan-out path: a healthy sibling backend must not be
+/// affected by another backend's vector-arm-only failure.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn fan_out_search_multi_backend_vector_arm_failure_isolated_to_its_backend() {
+    let mut registry = BackendRegistry::new();
+    let rt_broken = memory_runtime_with_constant_embeddings();
+    let rt_healthy = memory_runtime();
+    registry.register(backend_id("broken"), Arc::clone(&rt_broken));
+    registry.register(backend_id("healthy"), Arc::clone(&rt_healthy));
+    let coord = SubstrateCoordinator::new(registry);
+    let ns = Namespace::local();
+
+    let tok_broken = rt_broken.authorize(ns.clone()).unwrap();
+    rt_broken
+        .create_entity(
+            &tok_broken,
+            "concept",
+            None,
+            "LoRA",
+            Some("Low-rank adaptation"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create on broken backend");
+    break_vector_arm(&rt_broken);
+
+    let tok_healthy = rt_healthy.authorize(ns.clone()).unwrap();
+    rt_healthy
+        .create_entity(
+            &tok_healthy,
+            "concept",
+            None,
+            "QLoRA",
+            Some("Quantised LoRA"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create on healthy backend");
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "LoRA",
+        "limit": 10,
+    }));
+    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert_eq!(per_backend.len(), 2, "both backends in report");
+    assert!(
+        !merged_hits.is_empty(),
+        "merged results must still include the broken backend's text hit"
+    );
+
+    let broken_report = per_backend
+        .iter()
+        .find(|r| r.backend_id.as_str() == "broken")
+        .expect("broken backend reported");
+    assert!(
+        broken_report.error.is_none(),
+        "broken backend's text arm succeeded — must not be a whole-backend error: {:?}",
+        broken_report.error
+    );
+    assert!(
+        !broken_report.hits.is_empty(),
+        "broken backend's text hit must survive"
+    );
+    assert!(
+        broken_report
+            .vector_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("injected vector-arm failure"),
+        "broken backend must report its vector_error, got {:?}",
+        broken_report.vector_error
+    );
+
+    let healthy_report = per_backend
+        .iter()
+        .find(|r| r.backend_id.as_str() == "healthy")
+        .expect("healthy backend reported");
+    assert!(
+        healthy_report.error.is_none() && healthy_report.vector_error.is_none(),
+        "healthy sibling must be unaffected: {healthy_report:?}"
+    );
 }
 
 #[tokio::test]
@@ -3138,6 +3504,80 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
             "T7b: only concept hits expected, got entity_kind={kind:?} in: {hit}"
         );
     }
+}
+
+/// `SubstrateCoordinatorService::fan_out_search`'s per-backend mapping
+/// (`service.rs`'s `vector_error: r.vector_error` join line) must carry a
+/// real vector-arm failure all the way to the rendered JSON envelope:
+/// `arm_participation.vector.status == "error"`,
+/// `arm_participation.text.status == "ran"`, and the text arm's
+/// `candidate_count` equal to the number of text-sourced hits. Two backends
+/// are required so the coordinator path is actually taken instead of falling
+/// through to the single-backend registry dispatch (`is_single_backend()`
+/// short-circuit in `khive-mcp/src/server.rs`).
+#[tokio::test]
+async fn coordinator_service_search_reports_vector_arm_error_in_json_envelope() {
+    let rt_broken = memory_runtime_with_constant_embeddings();
+    let rt_healthy = memory_runtime();
+    let ns = Namespace::local();
+
+    let token = rt_broken.authorize(ns).unwrap();
+    rt_broken
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "FlashAttention",
+            Some("IO-aware exact attention"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    break_vector_arm(&rt_broken);
+
+    let server = two_backend_server(Arc::clone(&rt_broken), Arc::clone(&rt_healthy));
+
+    let result_str = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            ops: r#"search(kind="concept", query="FlashAttention")"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("dispatch");
+
+    let response: serde_json::Value =
+        serde_json::from_str(&result_str).expect("parse response JSON");
+    let op = &response["results"][0];
+    assert_eq!(
+        op["ok"].as_bool(),
+        Some(true),
+        "search op must succeed: {op}"
+    );
+
+    let hits = op["result"].as_array().expect("result must be array");
+    let text_hit_count = hits.iter().filter(|hit| hit["source"] == "text").count();
+
+    assert_eq!(
+        op["arm_participation"]["vector"]["status"],
+        serde_json::json!("error"),
+        "vector arm must report error, got: {op}"
+    );
+    assert_eq!(
+        op["arm_participation"]["text"]["status"],
+        serde_json::json!("ran"),
+        "text arm must report ran, got: {op}"
+    );
+    assert_eq!(
+        op["arm_participation"]["text"]["candidate_count"].as_u64(),
+        Some(text_hit_count as u64),
+        "text candidate_count must equal the number of text-sourced hits, got: {op}"
+    );
 }
 
 /// T7c: `min_score` floor filters out low-scoring hits.
