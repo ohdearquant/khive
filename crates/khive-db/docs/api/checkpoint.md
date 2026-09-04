@@ -121,7 +121,8 @@ that pause.
 Operator overrides are `KHIVE_FTS_MERGE_ENABLED`,
 `KHIVE_FTS_MERGE_INTERVAL_SECS`, `KHIVE_FTS_MERGE_PAGES`, and
 `KHIVE_FTS_MERGE_MIN_SEGMENTS`. Invalid values warn and retain conservative
-compiled defaults. `db_diagnostics.fts_maintenance` exposes checks, attempts,
+compiled defaults; `KHIVE_FTS_MERGE_PAGES` accepts `1..=2147483647`, the range
+the FTS5 `merge` command carries as a 32-bit integer in either sign. `db_diagnostics.fts_maintenance` exposes checks, attempts,
 progress/no-op/threshold/busy/error outcomes, and cumulative requested pages.
 `db_diagnostics.fts_segments` decodes the documented structure record at
 `%_data.id = 10` for both indexes; it does not count or scan `%_idx` rows.

@@ -14,6 +14,14 @@ use serde::Serialize;
 
 const DEFAULT_MERGE_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_MERGE_PAGES: u32 = 500;
+/// Largest page budget the FTS5 `merge` command can carry. SQLite reads the
+/// bound `rank` value as a 32-bit integer, and the starter form of the command
+/// negates the budget, so both `+pages` and `-pages` must fit an `i32`. A
+/// larger value wraps inside SQLite (2147483648 arrives as `INT_MIN`, which
+/// FTS5 treats as its largest-int32 sentinel, and larger values can wrap
+/// positive), turning a bounded step into an unbounded optimize or flipping
+/// the start/continue meaning of the sign.
+const MAX_MERGE_PAGES: u32 = i32::MAX as u32;
 const DEFAULT_MINIMUM_SEGMENTS: u64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -117,12 +125,14 @@ impl FtsMaintenanceConfig {
             }
         }
         if let Ok(value) = std::env::var("KHIVE_FTS_MERGE_PAGES") {
-            match value.parse::<u32>() {
-                Ok(pages) if pages > 0 => config.merge_pages = pages,
-                _ => tracing::warn!(
+            match parse_merge_pages(&value) {
+                Some(pages) => config.merge_pages = pages,
+                None => tracing::warn!(
                     value,
                     fallback_pages = config.merge_pages,
-                    "invalid KHIVE_FTS_MERGE_PAGES; using compiled default"
+                    max_pages = MAX_MERGE_PAGES,
+                    "invalid KHIVE_FTS_MERGE_PAGES (expected 1..=max_pages); using compiled \
+                     default"
                 ),
             }
         }
@@ -394,6 +404,30 @@ fn is_busy(error: &rusqlite::Error) -> bool {
     )
 }
 
+/// Parse an operator-supplied merge page budget, accepting only
+/// `1..=MAX_MERGE_PAGES` so the value survives SQLite's 32-bit narrowing of
+/// the `merge` command's argument in either sign.
+fn parse_merge_pages(value: &str) -> Option<u32> {
+    value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pages| (1..=MAX_MERGE_PAGES).contains(pages))
+}
+
+/// Signed page budget handed to the FTS5 `merge` command: negative starts a
+/// new incremental optimize, positive continues a persisted one. Clamped to
+/// `1..=MAX_MERGE_PAGES` here as well as at parse time, so a config built in
+/// code cannot hand SQLite a value that wraps.
+fn merge_page_budget(config: &FtsMaintenanceConfig, merge_in_progress: bool) -> i64 {
+    let page_budget = i64::from(config.merge_pages.clamp(1, MAX_MERGE_PAGES));
+    if merge_in_progress {
+        page_budget
+    } else {
+        -page_budget
+    }
+}
+
 fn run_merge_statement(
     conn: &Connection,
     table: FtsTable,
@@ -475,12 +509,7 @@ pub(crate) fn run_if_due(
         }));
     }
 
-    let page_budget = i64::from(config.merge_pages);
-    let requested_pages = if merge_in_progress {
-        page_budget
-    } else {
-        -page_budget
-    };
+    let requested_pages = merge_page_budget(config, merge_in_progress);
     let outcome = run_merge_statement(conn, table, requested_pages)?;
     if outcome == FtsMaintenanceOutcome::Busy {
         return Ok(Some(FtsMaintenanceStep {
@@ -953,5 +982,45 @@ mod tests {
             "a busy initial step must retry the negative starter next cadence"
         );
         writer.execute_batch("ROLLBACK").expect("release writer");
+    }
+
+    #[test]
+    fn merge_pages_override_must_fit_the_fts5_int32_argument() {
+        assert_eq!(parse_merge_pages("500"), Some(500));
+        assert_eq!(parse_merge_pages(" 1 "), Some(1));
+        assert_eq!(parse_merge_pages("2147483647"), Some(i32::MAX as u32));
+        // One past i32::MAX parses as a u32 but would arrive at SQLite as
+        // INT_MIN; the override must fall back to the compiled default.
+        assert_eq!(parse_merge_pages("2147483648"), None);
+        assert_eq!(parse_merge_pages("4294967295"), None);
+        assert_eq!(parse_merge_pages("0"), None);
+        assert_eq!(parse_merge_pages("-5"), None);
+        assert_eq!(parse_merge_pages("many"), None);
+    }
+
+    #[test]
+    fn merge_page_budget_fits_the_fts5_int32_argument_in_either_sign() {
+        let oversized = FtsMaintenanceConfig {
+            merge_pages: u32::MAX,
+            ..FtsMaintenanceConfig::default()
+        };
+        let start = merge_page_budget(&oversized, false);
+        let resume = merge_page_budget(&oversized, true);
+        assert_eq!(start, -i64::from(i32::MAX));
+        assert_eq!(resume, i64::from(i32::MAX));
+        assert!(i32::try_from(start).is_ok() && i32::try_from(resume).is_ok());
+
+        let zero = FtsMaintenanceConfig {
+            merge_pages: 0,
+            ..FtsMaintenanceConfig::default()
+        };
+        assert_eq!(merge_page_budget(&zero, false), -1);
+
+        let ordinary = FtsMaintenanceConfig {
+            merge_pages: 8,
+            ..FtsMaintenanceConfig::default()
+        };
+        assert_eq!(merge_page_budget(&ordinary, false), -8);
+        assert_eq!(merge_page_budget(&ordinary, true), 8);
     }
 }
