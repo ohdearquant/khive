@@ -46,6 +46,11 @@ unicode-general-category = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Self-dependency to enable `fault-injection` for integration tests under
+# `tests/`: those link the lib as an external crate, so `#[cfg(test)]` items
+# gated `any(test, feature = "fault-injection")` (e.g. `run_daemon_in_process_test`)
+# are otherwise unreachable from there.
+khive-runtime = { path = ".", features = ["fault-injection"] }
 khive-gate-rego = { version = "0.8.0", path = "../khive-gate-rego" }
 khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
