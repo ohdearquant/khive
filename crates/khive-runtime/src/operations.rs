@@ -290,6 +290,15 @@ pub struct NoteSearchHit {
     pub snippet: Option<String>,
 }
 
+/// Result of [`KhiveRuntime::search_notes_outcome`]: the fused hits — text
+/// hits alone when the vector arm failed — plus the vector arm's error, if
+/// any. Mirrors [`crate::HybridSearchOutcome`] for the note substrate.
+#[derive(Clone, Debug)]
+pub struct NoteSearchOutcome {
+    pub hits: Vec<NoteSearchHit>,
+    pub vector_error: Option<String>,
+}
+
 /// Re-insert hyphens at canonical UUID positions (8-4-4-4-12) into a
 /// hyphen-free hex prefix, so a `LIKE '<pattern>%'` scan against the
 /// hyphenated `id` column matches correctly. Prefixes that already
@@ -4111,6 +4120,68 @@ impl KhiveRuntime {
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
+        let (hits, _vector_error) = self
+            .search_notes_inner(
+                token,
+                query_text,
+                query_vector,
+                limit,
+                note_kind,
+                include_superseded,
+                tags_any,
+                properties_filter,
+                false,
+            )
+            .await?;
+        Ok(hits)
+    }
+
+    /// Coordinator fan-out variant of [`Self::search_notes`]: the text arm
+    /// still fails loud, but a vector-arm failure after a successful text leg
+    /// is captured instead of discarding the text hits — mirrors
+    /// [`Self::hybrid_search_outcome`]'s contract for the entity substrate.
+    /// Reserved for `SubstrateCoordinator::fan_out_search_with_visibility`;
+    /// every other caller keeps the fail-loud [`Self::search_notes`] contract.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_notes_outcome(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        limit: u32,
+        note_kind: Option<&str>,
+        include_superseded: bool,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+    ) -> RuntimeResult<NoteSearchOutcome> {
+        let (hits, vector_error) = self
+            .search_notes_inner(
+                token,
+                query_text,
+                None,
+                limit,
+                note_kind,
+                include_superseded,
+                tags_any,
+                properties_filter,
+                true,
+            )
+            .await?;
+        Ok(NoteSearchOutcome { hits, vector_error })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_notes_inner(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        limit: u32,
+        note_kind: Option<&str>,
+        include_superseded: bool,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+        tolerate_vector_error: bool,
+    ) -> RuntimeResult<(Vec<NoteSearchHit>, Option<String>)> {
         const RRF_K: usize = 60;
         let candidates = limit.saturating_mul(4).max(limit);
         let visible_ns: Vec<String> = token
@@ -4176,15 +4247,25 @@ impl KhiveRuntime {
         )?;
 
         // Vector search filtered to notes.
+        let mut vector_error: Option<String> = None;
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
-            self.vector_search(
-                token,
-                query_vector,
-                Some(query_text),
-                candidates,
-                Some(SubstrateKind::Note),
-            )
-            .await?
+            match self
+                .vector_search(
+                    token,
+                    query_vector,
+                    Some(query_text),
+                    candidates,
+                    Some(SubstrateKind::Note),
+                )
+                .await
+            {
+                Ok(hits) => hits,
+                Err(e) if tolerate_vector_error => {
+                    vector_error = Some(e.to_string());
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             vec![]
         };
@@ -4199,7 +4280,7 @@ impl KhiveRuntime {
 
         let candidate_ids: Vec<Uuid> = fused.iter().map(|hit| hit.entity_id).collect();
         if candidate_ids.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], vector_error));
         }
 
         // Fetch each candidate note individually to get salience and apply
@@ -4294,7 +4375,7 @@ impl KhiveRuntime {
 
         hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.note_id.cmp(&b.note_id)));
         hits.truncate(limit as usize);
-        Ok(hits)
+        Ok((hits, vector_error))
     }
 
     /// Resolve a short UUID prefix (8+ hex chars) to a full UUID.
