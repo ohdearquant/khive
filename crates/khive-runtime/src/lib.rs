@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod error;
+mod event_store_guard;
 pub mod events_split;
 pub mod fusion;
 pub mod graph_traversal;
@@ -80,7 +81,8 @@ pub use daemon::{
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
     config_from_env, BackendConfig, BackendKind, BlobConfig, ConfigError, EngineConfig,
-    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, StorageSectionConfig,
+    GateSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig,
+    StorageSectionConfig,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, ChannelIngestFailureClass, GuardedWriteFailure,
@@ -88,6 +90,7 @@ pub use error::{
     WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
     WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
+pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use khive_db::{
@@ -95,8 +98,8 @@ pub use khive_db::{
     CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
-    ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
-    GateRef, GateRequest, Obligation,
+    ActorRef, AllowAllGate, AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext,
+    GateDecision, GateError, GateRef, GateRequest, Obligation,
 };
 pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
@@ -129,8 +132,8 @@ pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};
 pub use presentation::{
-    apply_redundancy_drop, micros_to_iso, present, render_format, rfc3339_to_utc_micros,
-    OutputFormat, PresentationMode,
+    apply_redundancy_drop, micros_to_iso, prepare_format_value, present, render_format,
+    rfc3339_to_utc_micros, OutputFormat, PresentationMode, RedundancyScope,
 };
 pub use reference_resolution::{resolve_reference, ReferenceCandidate, ReferenceResolution};
 pub use reference_ring::{ReferenceRing, RingEntry};

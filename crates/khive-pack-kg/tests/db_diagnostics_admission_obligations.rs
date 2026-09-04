@@ -80,8 +80,7 @@ impl EventStore for GateEventStore {
         Ok(BatchWriteSummary {
             attempted: n,
             affected: n,
-            failed: 0,
-            first_error: String::new(),
+            ..BatchWriteSummary::default()
         })
     }
     async fn get_event(&self, id: uuid::Uuid) -> StorageResult<Option<Event>> {
@@ -163,6 +162,7 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn db_diagnostics_verb_reports_real_admission_refused_obligations() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
     let store = Arc::new(GateEventStore::default());

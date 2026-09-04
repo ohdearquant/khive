@@ -178,9 +178,12 @@
 ### Gate Authorization (ADR-029)
 
 - `RuntimeConfig::gate` defaults to `AllowAllGate`; production deployments plug in a policy-backed impl
-- Operator `[gate]` configuration is reserved and rejected until ADR-143's
-  store-held caller grants ship; an unenforced enrollment policy must not be
-  accepted silently
+- An optional operator `[gate]` table installs `CallerEnrollmentGate`: exact
+  resolved actor ids come from `granted_actors`, while `grant_unattributed`
+  independently governs the anonymous/local caller; an explicit empty table
+  denies all and unknown table keys fail startup
+- This is a live static policy, not ADR-143's still-unimplemented store-held
+  grant and one-time-import model
 
 ### Layered Retrieval Architecture (ADR-030)
 

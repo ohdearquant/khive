@@ -14,7 +14,7 @@ use khive_runtime::{
 };
 use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
-use khive_types::namespace::Namespace;
+use khive_types::{namespace::Namespace, SubstrateKind};
 
 use super::locator::LocatorCache;
 use super::registry::BackendRegistry;
@@ -568,6 +568,11 @@ impl SubstrateCoordinator {
         extra_visible: &[Namespace],
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
         let search_notes = request.substrate() == SearchSubstrate::Note;
+        let requested_substrate = if search_notes {
+            SubstrateKind::Note
+        } else {
+            SubstrateKind::Entity
+        };
         let search_limit = rrf_fanout_search_limit(request);
         let limit = request.limit();
         let props_filter_owned = request.properties().cloned();
@@ -579,6 +584,7 @@ impl SubstrateCoordinator {
         let entries: Vec<(BackendId, Arc<KhiveRuntime>)> = self
             .registry
             .iter()
+            .filter(|entry| entry.serves(requested_substrate))
             .map(|e| (e.id.clone(), Arc::clone(&e.runtime)))
             .collect();
 

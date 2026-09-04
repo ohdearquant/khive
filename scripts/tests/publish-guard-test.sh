@@ -44,7 +44,7 @@ else
 fi
 
 echo "--- case 3: publish=false crate never appears as missing, even from an empty ladder ---"
-if check_crates_ladder "$FIXTURE" 2>"$STDERR_CAPTURE"; then
+if check_crates_ladder "$FIXTURE" __empty_ladder_sentinel__ 2>"$STDERR_CAPTURE"; then
     echo "FAIL: guard passed with an empty ladder (should have flagged crate-a, crate-b)" >&2
     exit 1
 fi
@@ -98,6 +98,19 @@ while IFS= read -r crate; do
         exit 1
     fi
 done < <(grep -v '^[[:space:]]*#' "$SEMVER_EXCLUDES_FILE" | grep -v '^[[:space:]]*$')
+echo "PASS"
+
+echo "--- case 6: local SemVer gate reports tool compatibility and evaluated work ---"
+SEMVER_HELPER="$SCRIPT_DIR/lib/semver_gate.py"
+if [[ ! -f "$SEMVER_HELPER" ]] ||
+    ! grep -q 'semver_gate.py.*check-version' "$PUBLISH_SCRIPT" ||
+    ! grep -q 'semver_gate.py.*summarize' "$PUBLISH_SCRIPT" ||
+    ! grep -q 'CARGO_TERM_COLOR=never cargo semver-checks' "$PUBLISH_SCRIPT" ||
+    ! grep -q 'set -o pipefail' "$PUBLISH_SCRIPT" ||
+    ! grep -q 'SEMVER_STATUS=${PIPESTATUS\[0\]}' "$PUBLISH_SCRIPT"; then
+    echo "FAIL: publish.sh must validate, capture, preserve, and summarize the SemVer gate" >&2
+    exit 1
+fi
 echo "PASS"
 
 echo ""

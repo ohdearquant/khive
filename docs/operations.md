@@ -81,7 +81,7 @@ effect of listing backends.
   `~/.khive`").
 - **Config / namespace resolution parity with `kkernel mcp`**: `reindex` calls the exact same
   `khive_mcp::serve::resolve_runtime_config` function that `kkernel mcp` uses to build its
-  `RuntimeConfig` (`reindex.rs:450-465`, `khive-mcp/src/serve.rs:1259-1266`, the doc comment on
+  `RuntimeConfig` (`reindex.rs:498-525`, `khive-mcp/src/serve.rs:1259-1266`, the doc comment on
   that function states it was "extracted from `build_server` so `kkernel reindex` reuses the exact
   engine and db resolution, otherwise an admin reindex writes vectors for the default/env model
   set while the MCP server serves recall from the config-file `[[engines]]` set"). The precedence
@@ -446,8 +446,12 @@ binary.
 `kkernel reindex` rebuilds embedding vectors and FTS documents for entities, notes, and (unless
 excluded) the knowledge corpus. The graph entity/note pass fans out across every embedding engine
 registered in the resolved config; knowledge atoms and sections use the default engine that their
-read paths query. Engine resolution is the same one `kkernel mcp` uses (§1). Full flag reference
-(`reindex.rs:134-194`):
+read paths query. The knowledge pass rebuilds `fts_knowledge` and `fts_sections` from their
+external content, and requires both FTS5 rank-1 integrity checks to pass before reporting success,
+only when `--rebuild-fts` is in effect — see below; both indexes are global, not scoped to
+`--namespace`, so this is opt-in rather than an unconditional part of every knowledge pass.
+Engine resolution is the same one `kkernel mcp` uses (§1). Full flag reference
+(`reindex.rs:137-207`):
 
 | Flag                              | Default                                     | Effect                                                                                  |
 | --------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------- |
@@ -462,20 +466,22 @@ read paths query. Engine resolution is the same one `kkernel mcp` uses (§1). Fu
 | `--sections-only`                 | off                                         | Narrowest scope: skip the graph pass AND atom re-embedding, only knowledge sections run |
 | `--no-sections`                   | off                                         | Skip knowledge sections, still re-embed atoms                                           |
 | `--best-effort`                   | off                                         | See below                                                                               |
+| `--rebuild-fts`                   | off                                         | Rebuild + rank-1 integrity-check both global knowledge FTS indexes                      |
 | `--human`                         | off                                         | Human-readable summary instead of JSON                                                  |
 
 `--knowledge-only`/`--no-knowledge`, `--sections-only`/`--no-knowledge`, and
 `--no-sections`/`--sections-only` are declared as clap `conflicts_with` pairs, so invalid
 combinations are rejected at parse time, before any of the scope logic below runs
-(`reindex.rs:169-188`).
+(`reindex.rs:172-191`).
 
 If the selected config declares `[[backends]]`, reindex refuses to infer a
 target from the single-backend default. The operator must pass a persistent
 `--db` / `KHIVE_DB` path that matches any declared SQLite backend; this permits
 an intentional secondary-backend rebuild while catching an omitted or mistyped
-path before the runtime opens it.
+path before the runtime opens it. A backend declared `read_only = true` is
+never accepted as a reindex target, since reindex always writes.
 
-**Actual scope derivation** (`reindex.rs:478-481`):
+**Actual scope derivation** (`reindex.rs:551-554`):
 
 ```rust
 let do_graph     = !args.knowledge_only && !args.sections_only;
@@ -510,7 +516,7 @@ didn't complete, Vamana ANN build/persist failure, and knowledge section failure
 `--best-effort`, any of these causes `run_reindex` to `bail!`: "reindex completed with failures;
 recall/search state may be stale. Re-run, or pass `--best-effort` to accept a partial rebuild."
 With `--best-effort`, the same conditions only print a stderr warning and the process still exits
-0 (`reindex.rs:741-758`). **All eight categories are treated uniformly**; there is no failure
+0 (`reindex.rs:888-905`). **All eight categories are treated uniformly**; there is no failure
 class that's exempt from `--best-effort` on one side or immune to it on the other. A failed
 completion epoch bump is the eighth category. What
 `--best-effort` cannot paper over are structural/setup failures that occur _before_ a report even
@@ -524,12 +530,22 @@ prints but FTS backfill for entities and notes still runs. Knowledge atoms and s
 the default model because every knowledge-search vector path reads only that model. `--model`
 still restricts only the graph pass.
 
+**`--rebuild-fts` scoping** (`reindex.rs:202`, `reindex.rs:820-829`): `fts_knowledge` and
+`fts_sections` are global tables, not scoped to `--namespace`, while every reindex run targets one
+namespace (an omitted `--namespace` resolves to the configured one), so no run shape implies the
+rebuild: it is off unless `--rebuild-fts` is passed. The rebuild goes through the operator entry
+point `khive_pack_knowledge::rebuild_knowledge_fts_indexes`, which takes no namespace token; the
+namespace-scoped `reindex_knowledge` options do not offer it, so holding a namespace token never
+grants a whole-database cost. It runs only after a clean knowledge pass. When it runs, the
+report carries a `knowledge_fts_rebuild` object naming both index names, elapsed milliseconds, and
+the rank-1 integrity-check outcome; the field is absent when the rebuild did not run.
+
 **When to reindex** (genuine in-code rationale, not doc-comment fluff): after relabeling a
 namespace (vector rows would otherwise be stranded under the wrong namespace on next write,
-`reindex.rs:239-250`); after adding or removing a graph embedding model in config (so entity/note
-vectors match the currently configured engine set, `reindex.rs:483-490`); and to force a stale
+`reindex.rs:288-300`); after adding or removing a graph embedding model in config (so entity/note
+vectors match the currently configured engine set, `reindex.rs:543-556`); and to force a stale
 Vamana ANN snapshot rebuild, since reindex explicitly invalidates ANN snapshots so the next
-warm-load rebuilds against the freshly re-embedded vectors (`reindex.rs:627-636`).
+warm-load rebuilds against the freshly re-embedded vectors (`reindex.rs:699-703`).
 
 ### `kkernel engine`: read-only inspection only, today
 

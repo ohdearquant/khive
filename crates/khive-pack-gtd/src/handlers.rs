@@ -1549,7 +1549,7 @@ impl GtdPack {
         let page = self
             .runtime()
             .notes(token)?
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
@@ -1593,7 +1593,7 @@ impl GtdPack {
             let terminal_page = self
                 .runtime()
                 .notes(token)?
-                .query_notes_filtered(
+                .query_notes_filtered_count_free(
                     token.namespace().as_str(),
                     &terminal_filter,
                     PageRequest {
