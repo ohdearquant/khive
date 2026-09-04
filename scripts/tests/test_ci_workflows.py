@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -167,6 +168,117 @@ class BenchTrackWorkflowTests(unittest.TestCase):
         self.assertEqual(len(quick_commands), 1)
         self.assertIn("--benches", quick_commands[0])
         self.assertIn("--criterion-dir crates/target/criterion", workflow)
+
+
+class HarnessEnvironmentTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tests_dir = str(REPO_ROOT / "tests")
+        sys.path.insert(0, tests_dir)
+        try:
+            import kkernel_binary
+            import smoke_test
+        finally:
+            sys.path.remove(tests_dir)
+        cls.kkernel_binary = kkernel_binary
+        cls.smoke = smoke_test
+
+    def test_contract_binary_honors_cargo_target_dir_and_explicit_override(self):
+        resolve = self.kkernel_binary.resolve_binary_path
+        absolute_target = REPO_ROOT / ".test-target"
+        self.assertEqual(
+            pathlib.Path(resolve({"CARGO_TARGET_DIR": str(absolute_target)})),
+            absolute_target / "release" / "kkernel",
+        )
+        self.assertEqual(
+            pathlib.Path(resolve({"CARGO_TARGET_DIR": "custom-target"})),
+            REPO_ROOT / "crates" / "custom-target" / "release" / "kkernel",
+        )
+        self.assertEqual(
+            resolve(
+                {
+                    "CARGO_TARGET_DIR": str(absolute_target),
+                    "KKERNEL_BINARY": "/explicit/kkernel",
+                }
+            ),
+            "/explicit/kkernel",
+        )
+
+    def test_ci_sh_binary_resolver_matches_python_module(self):
+        # ci.sh runs each phase as its own process on CI (release, contract-tests,
+        # smoke-tests, vector-smoke, and contract-suite are separate workflow
+        # steps), so the shell resolver and the Python resolver each phase's
+        # harness uses must agree without relying on an inherited export.
+        ci_sh = REPO_ROOT / "scripts" / "ci.sh"
+        absolute_target = REPO_ROOT / ".test-target-abs"
+        cases = [
+            {"CARGO_TARGET_DIR": str(absolute_target)},
+            {"CARGO_TARGET_DIR": "custom-target-rel"},
+            {},
+        ]
+        for extra_env in cases:
+            env = os.environ.copy()
+            env.pop("KKERNEL_BINARY", None)
+            env.pop("CARGO_TARGET_DIR", None)
+            env.update(extra_env)
+            completed = subprocess.run(
+                ["sh", str(ci_sh), "--print-binary-path"],
+                cwd=REPO_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            shell_path = os.path.normpath(completed.stdout.strip())
+            python_path = os.path.normpath(self.kkernel_binary.resolve_binary_path(env))
+            self.assertEqual(shell_path, python_path, f"mismatch for env {extra_env}")
+
+    def test_smoke_child_environment_removes_pack_override(self):
+        child = self.smoke.smoke_child_env(
+            {"KHIVE_PACKS": "kg,formal", "PRESERVED": "yes"}
+        )
+        self.assertNotIn("KHIVE_PACKS", child)
+        self.assertEqual(child["PRESERVED"], "yes")
+        self.assertEqual(child["KHIVE_NO_DAEMON"], "1")
+        self.assertTrue(pathlib.Path(child["HOME"]).is_dir())
+        self.assertEqual(
+            self.smoke.DEFAULT_PACKS,
+            {
+                "kg",
+                "gtd",
+                "memory",
+                "brain",
+                "comm",
+                "schedule",
+                "knowledge",
+                "session",
+                "git",
+                "code",
+                "workspace",
+                "blob",
+            },
+        )
+
+    def test_full_ci_reports_failed_and_skipped_phases(self):
+        # Run the real run_all loop with CI_SH_TEST_FAIL_PHASE forcing the first
+        # phase to fail without executing it, and assert on the actual reported
+        # output rather than on source text that could drift from behavior.
+        ci_sh = REPO_ROOT / "scripts" / "ci.sh"
+        env = os.environ.copy()
+        env["CI_SH_TEST_FAIL_PHASE"] = "no-stubs-scan"
+        completed = subprocess.run(
+            ["sh", str(ci_sh)],
+            cwd=REPO_ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Failed phase: no-stubs-scan (exit 1)", completed.stderr)
+        self.assertIn("Skipped phases:", completed.stderr)
+        self.assertIn("lockfile", completed.stderr)
+        self.assertIn("contract-suite", completed.stderr)
 
 
 class NpmReleaseWorkflowTests(unittest.TestCase):
