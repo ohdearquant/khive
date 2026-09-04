@@ -3641,8 +3641,9 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
             line.contains("--state all"),
             "every gh pr/issue list invocation must request --state all: {line:?}"
         );
-        assert!(
-            line.contains("--repo fixture/repository"),
+        assert_eq!(
+            repo_flag_value(line),
+            Some("fixture/repository"),
             "every gh pr/issue list invocation must explicitly pin the probed repo: {line:?}"
         );
     }
