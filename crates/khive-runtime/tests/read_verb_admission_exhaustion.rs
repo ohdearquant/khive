@@ -111,10 +111,15 @@ impl EventStore for MemoryEventStore {
 /// takes the admission-degrade path (khive#2228 M1): only a *successful*
 /// dispatch of an allowlisted read may degrade its audit obligation, never a
 /// `DispatchFailed` one.
+///
+/// `Pack::NAME` is `"kg"`, matching `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`'s
+/// `("kg", "get")` entry: admission-degrade eligibility is bound to the
+/// owning pack, not the verb name alone, so a stand-in pack under any other
+/// name would make `get` ineligible regardless of category.
 struct BetaPack;
 
 impl Pack for BetaPack {
-    const NAME: &'static str = "beta";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -155,10 +160,14 @@ impl PackRuntime for BetaPack {
 
 /// Minimal pack exercising one read (`list`, `Assertive`) and one write
 /// (`create`, `Commissive`) verb, neither doing any real domain work.
+///
+/// `Pack::NAME` is `"kg"`, matching `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`'s
+/// `("kg", "list")` entry — see `BetaPack`'s doc for why this must match
+/// exactly.
 struct AlphaPack;
 
 impl Pack for AlphaPack {
-    const NAME: &'static str = "alpha";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[
@@ -200,7 +209,120 @@ impl PackRuntime for AlphaPack {
         _registry: &khive_runtime::pack::VerbRegistry,
         _token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
+        Ok(serde_json::json!({ "pack": "kg", "verb": verb }))
+    }
+}
+
+/// Rogue-pack probe: declares Assertive handlers under the verb names of
+/// several *other* real packs' allowlisted reads (`gtd.tasks`, `gtd.next`,
+/// `comm.inbox`) alongside the known-incidental-write names
+/// (`memory.recall`, `db_diagnostics`, `knowledge.*`), all under a pack name
+/// (`cross-pack-census-probe`) that matches none of
+/// `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`'s `(pack, verb)` entries.
+///
+/// This is exactly the shape of pack that admission-degrade eligibility must
+/// reject: a verb name alone is not a sound key, because any pack registered
+/// through the same `VerbRegistryBuilder` path can declare a handler under a
+/// name that collides with an allowlisted one while actually performing a
+/// durable write of its own. Binding eligibility to `(pack, verb)` — not
+/// `verb` alone — means every handler here must stay fail-closed regardless
+/// of verb name, proven by
+/// `cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlist`
+/// below. The handlers are deliberately no-ops: this test exercises the
+/// registry's reviewed name/category/pack classification under a forced
+/// audit refusal, not real domain behavior (which the source census in
+/// `khive-runtime/src/pack.rs`'s `mod tests` audits separately).
+struct CrossPackCensusProbe;
+
+impl Pack for CrossPackCensusProbe {
+    const NAME: &'static str = "cross-pack-census-probe";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[
+        HandlerDef {
+            name: "gtd.tasks",
+            description: "reported side-effect-free GTD read",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "gtd.next",
+            description: "reported side-effect-free GTD read",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "comm.inbox",
+            description: "reported side-effect-free comm read",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "memory.recall",
+            description: "Assertive handler with serve-accounting writes",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "db_diagnostics",
+            description: "Assertive handler with PASSIVE checkpoint I/O",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "knowledge.search",
+            description: "Assertive handler with ANN maintenance",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "knowledge.suggest",
+            description: "Assertive handler with ANN maintenance",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "knowledge.compose",
+            description: "Assertive handler that can invoke ANN maintenance",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+    ];
+}
+
+#[async_trait]
+impl PackRuntime for CrossPackCensusProbe {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+    fn note_kinds(&self) -> &'static [&'static str] {
+        Self::NOTE_KINDS
+    }
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        Self::ENTITY_KINDS
+    }
+    fn handlers(&self) -> &'static [HandlerDef] {
+        Self::HANDLERS
+    }
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: Value,
+        _registry: &khive_runtime::pack::VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        Ok(serde_json::json!({
+            "pack": "cross-pack-census-probe",
+            "verb": verb,
+        }))
     }
 }
 
@@ -232,16 +354,21 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
     }
 }
 
-// Both tests in this file arm `fault_injection`'s process-global
+// Every test in this file arms `fault_injection`'s process-global
 // `SUPERVISOR_SLEEP_BEFORE_SPAWN` flag; running them concurrently races one
-// test's arm against the other's supervisor loop consuming it.
+// test's arm against another supervisor loop consuming it.
 #[serial]
 #[tokio::test]
 #[serial(config_ledger)]
 async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(AlphaPack);
+    // `register_trusted` stands in for the real composition root
+    // (`PackRegistry::register_packs`, which registers only
+    // `inventory`-discovered factories): this test's whole point is
+    // eligibility for a pack the registry actually vouches for, so it must
+    // not use the untrusted `register` path.
+    builder.register_trusted(AlphaPack);
     builder.with_event_store(store);
     builder.with_audit_batch_config(AuditBatchConfig {
         max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
@@ -306,10 +433,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
         .dispatch("list", Value::Null)
         .await
         .expect("a read verb must not fail on audit-lane admission exhaustion");
-    assert_eq!(
-        result,
-        serde_json::json!({ "pack": "alpha", "verb": "list" })
-    );
+    assert_eq!(result, serde_json::json!({ "pack": "kg", "verb": "list" }));
     assert_eq!(
         audit_admission_refused_obligation_count(),
         before_refused + 1,
@@ -363,6 +487,221 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
     drop(filler);
 }
 
+/// khive-oss#2311: `pack.name()` is a value the `PackRuntime` trait object
+/// reports about itself, not something the registry verifies — so before
+/// this fix, any pack registered through the ordinary, untrusted
+/// `VerbRegistryBuilder::register` path could self-report an allowlisted
+/// pack name (`AlphaPack` here claims `"kg"`, exactly like the previous
+/// test) and inherit admission-degrade eligibility it never earned, as long
+/// as the real `kg` pack was not also loaded (verb names are unique per
+/// registry, so this is the only shape in which an impostor's same-named
+/// handler is reachable at all). This is the exact mirror of the previous
+/// test — same pack type, same verb, same admission-pressure harness — with
+/// the one load-bearing difference being the registration path: `register`
+/// here instead of `register_trusted`. Before the fix, `admission_degrade_safe_probe`
+/// returned `true` for this registration and the read below degraded
+/// successfully instead of hard-failing.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn allowlisted_read_stays_strict_when_pack_is_registered_untrusted() {
+    let store = Arc::new(MemoryEventStore::default());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(AlphaPack);
+    builder.with_event_store(store);
+    builder.with_audit_batch_config(AuditBatchConfig {
+        max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("registry builds");
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("event store configured, so the batch seam is too");
+
+    assert!(
+        !registry.admission_degrade_safe_probe("list"),
+        "AlphaPack's \"list\" is Assertive and (\"kg\", \"list\") is allowlisted, but \
+         AlphaPack was registered through the untrusted `register` path — it must not read \
+         as admission-degrade-safe regardless of its self-reported pack name"
+    );
+
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let occupant_batch = audit_batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.occupant"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snap = audit_batch.test_snapshot();
+        snap.pending_rows == 0 && snap.in_flight_generation.is_some()
+    })
+    .await;
+
+    let filler_batch = audit_batch.clone();
+    let filler = tokio::spawn(async move {
+        filler_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.filler"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        audit_batch.test_snapshot().pending_rows == 1
+    })
+    .await;
+
+    // Unlike the trusted-registration test above, "list" must now hard-fail
+    // exactly like "create" (a real write) already does when the audit lane
+    // is saturated — it is no longer eligible to drop its own audit row.
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
+    let error = registry.dispatch("list", Value::Null).await.expect_err(
+        "an untrusted-registration read must hard-fail under audit-lane admission \
+             exhaustion, the same as a write",
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("audit obligation commit failed")
+            && message.contains("QueueAdmissionExhausted"),
+        "expected the strict obligation-failure path, got: {message}"
+    );
+    assert_eq!(
+        audit_admission_refused_obligation_count(),
+        before_refused,
+        "an untrusted-pack read must never take the counted admission-degrade path"
+    );
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved,
+        "an untrusted-pack read must never move the deadline-expiry counter either"
+    );
+
+    drop(occupant);
+    drop(filler);
+}
+
+/// Admission-degrade eligibility is bound to `(pack, verb)`, not `verb`
+/// alone: every handler `CrossPackCensusProbe` declares is `Assertive` and
+/// several of its names (`gtd.tasks`, `gtd.next`, `comm.inbox`) are on
+/// `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`, but the pack that declares
+/// them here (`cross-pack-census-probe`) matches none of the allowlist's
+/// `(pack, verb)` pairs. Every handler must therefore stay fail-closed under
+/// a forced `QueueAdmissionExhausted` outcome — the previously-"safe" names
+/// included, since a bare name match without pack verification is exactly
+/// the gap this binding closes. Before the fix, the first three names in
+/// this test's loop degraded successfully (accepted as `true` by
+/// `admission_degrade_safe`), which is the failure mode the direct probe
+/// assertion below reproduces.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlist() {
+    let store = Arc::new(MemoryEventStore::default());
+    let mut builder = VerbRegistryBuilder::new();
+    // Trusted registration isolates pack-identity mismatch as the sole
+    // cause of ineligibility here — untrusted registration would reject
+    // these handlers too, but for the different reason this test does not
+    // exercise (see `allowlisted_read_stays_strict_when_pack_is_registered_untrusted`).
+    builder.register_trusted(CrossPackCensusProbe);
+    builder.with_event_store(store);
+    builder.with_audit_batch_config(AuditBatchConfig {
+        max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("registry builds");
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("event store configured, so the batch seam is too");
+
+    // Direct white-box check, independent of the audit-pressure mechanics
+    // below: a handler named like an allowlisted verb but declared by the
+    // wrong pack must never read as admission-degrade-safe.
+    for verb in ["gtd.tasks", "gtd.next", "comm.inbox"] {
+        assert!(
+            !registry.admission_degrade_safe_probe(verb),
+            "{verb} is on ADMISSION_DEGRADE_SAFE_VERBS under a different pack; \
+             cross-pack-census-probe's handler of the same name must not inherit \
+             its degrade-safety"
+        );
+    }
+
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let occupant_batch = audit_batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("census.occupant"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snap = audit_batch.test_snapshot();
+        snap.pending_rows == 0 && snap.in_flight_generation.is_some()
+    })
+    .await;
+
+    let filler_batch = audit_batch.clone();
+    let filler = tokio::spawn(async move {
+        filler_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("census.filler"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        audit_batch.test_snapshot().pending_rows == 1
+    })
+    .await;
+
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
+    for verb in [
+        "gtd.tasks",
+        "gtd.next",
+        "comm.inbox",
+        "memory.recall",
+        "db_diagnostics",
+        "knowledge.search",
+        "knowledge.suggest",
+        "knowledge.compose",
+    ] {
+        let error = match registry.dispatch(verb, Value::Null).await {
+            Ok(result) => panic!(
+                "{verb} must stay fail-closed under forced audit admission refusal — its \
+                 owning pack here does not match the allowlist's entry for this verb name; \
+                 unexpected result: {result}"
+            ),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("audit obligation commit failed")
+                && message.contains("QueueAdmissionExhausted"),
+            "{verb} must fail for the saturated audit obligation, got: {message}"
+        );
+    }
+    assert_eq!(
+        audit_admission_refused_obligation_count(),
+        before_refused,
+        "a pack-identity mismatch must never take the counted admission-degrade path"
+    );
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved,
+        "forced queue refusal must not move the deadline-expiry counter"
+    );
+
+    drop(occupant);
+    drop(filler);
+}
+
 /// khive#2117/khive#2208 + khive#2147/khive#2217 combined: a read dispatch
 /// must also survive its own audit row's admission *deadline* elapsing, not
 /// just an immediate queue-full refusal — the two `AuditTerminalReason`
@@ -380,7 +719,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
 async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(AlphaPack);
+    builder.register_trusted(AlphaPack);
     builder.with_event_store(store);
     builder.with_audit_batch_config(AuditBatchConfig {
         // Room for the occupant row plus this test's own "list" row, so the
@@ -428,10 +767,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
         .dispatch("list", Value::Null)
         .await
         .expect("a read verb must not fail when its own audit row's admission deadline elapses");
-    assert_eq!(
-        result,
-        serde_json::json!({ "pack": "alpha", "verb": "list" })
-    );
+    assert_eq!(result, serde_json::json!({ "pack": "kg", "verb": "list" }));
     assert_eq!(
         audit_admission_unresolved_obligation_count(),
         before_unresolved + 1,
@@ -482,7 +818,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
 async fn failed_allowlisted_read_does_not_degrade_on_admission_exhaustion() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(BetaPack);
+    builder.register_trusted(BetaPack);
     builder.with_event_store(store);
     builder.with_audit_batch_config(AuditBatchConfig {
         max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
@@ -568,7 +904,7 @@ async fn failed_allowlisted_read_does_not_degrade_on_admission_exhaustion() {
 async fn failed_allowlisted_read_does_not_degrade_on_admission_deadline_expiry() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(BetaPack);
+    builder.register_trusted(BetaPack);
     builder.with_event_store(store);
     builder.with_audit_batch_config(AuditBatchConfig {
         max_pending_rows: std::num::NonZeroUsize::new(4).unwrap(),
