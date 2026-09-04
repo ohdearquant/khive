@@ -23,7 +23,7 @@ use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_pack_code::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions};
 use khive_runtime::{
     entity_fts_document, note_fts_document, secret_gate, GateRef, InterceptedDispatchResult,
-    KhiveRuntime, Namespace, PackRegistry, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+    KhiveRuntime, Namespace, PackRegistry, RuntimeError, VerbRegistry,
 };
 use khive_storage::{SqlStatement, SqlValue, SubstrateKind};
 
@@ -150,20 +150,11 @@ where
 }
 
 fn build_code_ingest_registry(runtime: &KhiveRuntime) -> Result<VerbRegistry> {
-    let mut builder = VerbRegistryBuilder::new();
-    builder.with_gate(runtime.config().gate.clone());
-    builder.with_default_namespace(runtime.config().default_namespace.as_str());
-    builder.with_visible_namespaces(runtime.config().visible_namespaces.clone());
-    builder.with_actor_id(runtime.config().actor_id.clone());
-    PackRegistry::register_packs(
-        &runtime.config().packs.clone(),
-        runtime.clone(),
-        &mut builder,
-    )
-    .map_err(|e| anyhow::anyhow!("pack registration failed: {e:?}"))?;
-    let registry = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-    runtime.install_edge_rules(registry.all_edge_rules());
-    Ok(registry)
+    // Shared with `kkernel git-ingest` (`git_ingest.rs`); `true` requests the
+    // same event-store attachment `KhiveMcpServer::with_packs` gives its own
+    // registry, so a gate consultation on this path persists an audit event
+    // (ADR-018 Amendment 4) exactly like a live MCP server would.
+    PackRegistry::build_ingest_registry(runtime, true).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 async fn code_ingest_batch_with_config_and_runtime_setup<F>(
@@ -874,6 +865,21 @@ mod tests {
         path
     }
 
+    /// Like [`write_empty_test_config`] but names the pack set explicitly, so
+    /// the resolved config does not fall through to an ambient `KHIVE_PACKS`
+    /// environment variable a concurrently running test may have set.
+    fn write_test_config_with_packs(dir: &Path, packs: &[&str]) -> PathBuf {
+        let path = dir.join("packs-khive-config.toml");
+        let list = packs
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(&path, format!("[runtime]\npacks = [{list}]\n"))
+            .expect("write isolated pack-scoped config");
+        path
+    }
+
     async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
         let config = write_empty_test_config(
             args.findings
@@ -930,6 +936,24 @@ mod tests {
         path
     }
 
+    /// The full production pack set, named explicitly so gate-path tests do
+    /// not depend on an ambient `KHIVE_PACKS` environment variable that a
+    /// concurrently running test may have set (or unset).
+    const ALL_PACKS: &[&str] = &[
+        "kg",
+        "gtd",
+        "memory",
+        "brain",
+        "comm",
+        "schedule",
+        "knowledge",
+        "session",
+        "git",
+        "code",
+        "workspace",
+        "blob",
+    ];
+
     #[derive(Debug, Default)]
     struct DenyFindingsIngestGate {
         requests: Mutex<Vec<GateRequest>>,
@@ -953,13 +977,91 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct AllowFindingsIngestGate;
+
+    impl Gate for AllowFindingsIngestGate {
+        fn check(&self, _request: &GateRequest) -> std::result::Result<GateDecision, GateError> {
+            Ok(GateDecision::allow())
+        }
+
+        fn impl_name(&self) -> &'static str {
+            "AllowFindingsIngestGate"
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ErroringFindingsIngestGate;
+
+    impl Gate for ErroringFindingsIngestGate {
+        fn check(&self, request: &GateRequest) -> std::result::Result<GateDecision, GateError> {
+            if request.verb == CODE_FINDINGS_INGEST_GATE_VERB {
+                Err(GateError::Internal(
+                    "test gate backend unreachable".to_string(),
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+
+        fn impl_name(&self) -> &'static str {
+            "ErroringFindingsIngestGate"
+        }
+    }
+
+    /// The single `code.findings_ingest` audit event persisted for this
+    /// batch, read back through a freshly opened runtime onto `db` (the
+    /// production function drops its own runtime, and with it its
+    /// `EventStore` handle, before returning).
+    ///
+    /// Resolves through [`resolve_runtime_config`] exactly like the ingest
+    /// path itself rather than opening `db` directly: ADR-170 routes event
+    /// persistence to a sidecar database beside the main store, so a raw
+    /// `StorageBackend::sqlite(db).events()` read (the main store's own,
+    /// pre-ADR-170 event table) silently finds nothing.
+    async fn only_findings_ingest_event(db: &Path, config: &Path) -> khive_storage::Event {
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(db.to_str().expect("utf8 path")),
+            config: Some(config),
+            namespace: Namespace::parse("local").expect("valid namespace"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve runtime config for event read-back");
+        let runtime = KhiveRuntime::new(cfg).expect("open runtime for event read-back");
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("valid namespace"))
+            .expect("authorize local namespace for event read-back");
+        let events = runtime.events(&token).expect("events store handle");
+        let page = events
+            .query_events(
+                khive_storage::EventFilter {
+                    verbs: vec![CODE_FINDINGS_INGEST_GATE_VERB.to_string()],
+                    ..Default::default()
+                },
+                khive_storage::PageRequest::default(),
+            )
+            .await
+            .expect("query code.findings_ingest audit events");
+        assert_eq!(
+            page.items.len(),
+            1,
+            "expected exactly one code.findings_ingest audit event, got {:?}",
+            page.items
+        );
+        page.items.into_iter().next().expect("checked len == 1")
+    }
+
     #[serial]
     #[tokio::test]
     async fn code_ingest_batch_gate_denial_precedes_setup_and_record_writes() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("gate-denied.db");
-        let config = write_empty_test_config(tmp.path());
+        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
         let gate = Arc::new(DenyFindingsIngestGate::default());
         let setup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let setup_called_in_closure = Arc::clone(&setup_called);
@@ -1016,6 +1118,95 @@ mod tests {
                 "gate denial must leave {table} empty, got {count:?}"
             );
         }
+
+        let event = only_findings_ingest_event(&db, &config).await;
+        assert_eq!(event.outcome, khive_storage::EventOutcome::Denied);
+        assert_eq!(event.verb, CODE_FINDINGS_INGEST_GATE_VERB);
+        assert_eq!(event.payload["decision"], "deny");
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_batch_gate_allow_persists_success_audit_event() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("gate-allowed.db");
+        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let gate = Arc::new(AllowFindingsIngestGate);
+
+        let report = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+            base_args(findings, db.clone()),
+            Some(&config),
+            Some(gate as GateRef),
+            |_| Ok(()),
+        )
+        .await
+        .expect("an allowing gate must let the batch proceed");
+
+        assert_eq!(report.entities_created, 1);
+        assert_eq!(report.notes_created, 1);
+        assert_eq!(report.edges_created, 1);
+
+        let event = only_findings_ingest_event(&db, &config).await;
+        assert_eq!(event.outcome, khive_storage::EventOutcome::Success);
+        assert_eq!(event.verb, CODE_FINDINGS_INGEST_GATE_VERB);
+        assert_eq!(event.payload["decision"], "allow");
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_batch_gate_error_precedes_setup_and_record_writes() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("gate-errored.db");
+        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let gate = Arc::new(ErroringFindingsIngestGate);
+        let setup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setup_called_in_closure = Arc::clone(&setup_called);
+
+        let err = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+            base_args(findings, db.clone()),
+            Some(&config),
+            Some(gate as GateRef),
+            move |_| {
+                setup_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a gate backend failure must refuse the direct-store batch");
+
+        assert!(
+            err.to_string().contains(CODE_FINDINGS_INGEST_GATE_VERB),
+            "gate-unavailable refusal must name the governed batch operation: {err}"
+        );
+        assert!(
+            !setup_called.load(std::sync::atomic::Ordering::SeqCst),
+            "gate error must occur before the direct-write section begins"
+        );
+
+        let backend = StorageBackend::sqlite(&db).expect("open errored-ingest database");
+        let sql = backend.sql();
+        let mut reader = sql.reader().await.expect("acquire errored-ingest reader");
+        for table in ["entities", "notes", "graph_edges"] {
+            let count = reader
+                .query_scalar(SqlStatement {
+                    sql: format!("SELECT COUNT(*) FROM {table}"),
+                    params: vec![],
+                    label: Some(format!("count errored-ingest {table}")),
+                })
+                .await
+                .expect("count errored-ingest rows");
+            assert!(
+                matches!(count, Some(SqlValue::Integer(0))),
+                "gate unavailability must leave {table} empty, got {count:?}"
+            );
+        }
+
+        let event = only_findings_ingest_event(&db, &config).await;
+        assert_eq!(event.outcome, khive_storage::EventOutcome::Error);
+        assert_eq!(event.verb, CODE_FINDINGS_INGEST_GATE_VERB);
+        assert_eq!(event.payload["decision"], "gate_unavailable");
     }
 
     const TOMBSTONE_WITNESS: i64 = 1_772_812_800_000_000;

@@ -3441,6 +3441,54 @@ impl PackRegistry {
         Ok(())
     }
 
+    /// Build a `VerbRegistry` from `runtime`'s own configuration: gate,
+    /// default namespace, visible namespaces, actor id, and the configured
+    /// pack set, then install the registry's aggregated edge rules back onto
+    /// `runtime`. This is the wiring shared by every one-shot CLI ingest path
+    /// (`kkernel code-ingest`, `kkernel git-ingest`) that needs a real
+    /// registry to dispatch through outside of a live MCP server.
+    ///
+    /// `attach_event_store` mirrors `KhiveMcpServer::with_packs`
+    /// (`khive-mcp/src/server.rs`): when true, a read-only runtime retains no
+    /// `EventStore` handle (an advisory travels beside each result instead),
+    /// and a writable runtime attaches its own event store, logging and
+    /// continuing on failure rather than refusing to build. Pass `false` for
+    /// a caller with no use for persisted audit rows.
+    ///
+    /// This helper carries only the subset every ingest path duplicated
+    /// verbatim. The MCP server's own registry construction additionally
+    /// wires channel-loop admission, `config_id`, embedder/entity-type/
+    /// note-mutation-hook registration, schema-plan application, and the WAL
+    /// checkpoint pool handle — all server-only concerns a one-shot CLI pass
+    /// has no use for, so `KhiveMcpServer::with_packs` keeps its own
+    /// construction rather than calling this helper.
+    pub fn build_ingest_registry(
+        runtime: &KhiveRuntime,
+        attach_event_store: bool,
+    ) -> Result<VerbRegistry, RuntimeError> {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_gate(runtime.config().gate.clone());
+        builder.with_default_namespace(runtime.config().default_namespace.as_str());
+        builder.with_visible_namespaces(runtime.config().visible_namespaces.clone());
+        builder.with_actor_id(runtime.config().actor_id.clone());
+        if attach_event_store {
+            if runtime.is_read_only() {
+                builder.with_read_only_audit_store();
+            } else if let Err(error) = builder.with_runtime_event_store(runtime) {
+                tracing::warn!(%error, "ingest registry audit event store is unavailable");
+            }
+        }
+        Self::register_packs(
+            &runtime.config().packs.clone(),
+            runtime.clone(),
+            &mut builder,
+        )
+        .map_err(|e| RuntimeError::Internal(format!("pack registration failed: {e:?}")))?;
+        let registry = builder.build()?;
+        runtime.install_edge_rules(registry.all_edge_rules());
+        Ok(registry)
+    }
+
     /// Register the named packs into `builder`, routing each pack to its own runtime.
     ///
     /// `runtimes` maps pack name → `KhiveRuntime` (one per backend assignment).
