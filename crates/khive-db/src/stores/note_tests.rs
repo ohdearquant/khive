@@ -3733,24 +3733,26 @@ async fn gtd_next_status_in_with_assignee_query_uses_assignee_index() {
     let (sql, params) = listing_sql_and_params(&filter);
     let indexed_plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
     assert!(
-        indexed_plan.contains("idx_notes_task_status")
-            || indexed_plan.contains("idx_notes_task_assignee"),
-        "status-IN plus assignee-eq query must be served by one of the new hot-property \
-         indexes, got plan:\n{indexed_plan}"
+        indexed_plan.contains("idx_notes_task_assignee"),
+        "the assignee equality term must be served by idx_notes_task_assignee even \
+         though the sibling status predicate is a multi-value IN, got plan:\n{indexed_plan}"
+    );
+    assert!(
+        !indexed_plan.contains("idx_notes_task_status"),
+        "got plan:\n{indexed_plan}"
     );
 }
 
-/// khive#2390: a general `(to_actor, direction)` index for the comm mailbox
-/// listing (status="all"/"read", box="sent") was drafted for this change and
-/// dropped after this exact test proved it regressed the tuned unread-probe
-/// path -- with no ANALYZE statistics, SQLite chose the new unconditional
-/// index over the existing partial `idx_notes_unread_probe_recipient_direction`
-/// for the default unread-status listing, even though the partial index is
-/// strictly cheaper there (it excludes read rows structurally; the general
-/// index would only exclude them via a residual filter). This test pins
-/// that the unread-scoped plan stays on the partial index with no
-/// competing general index present, guarding against reintroducing one
-/// without solving the ambiguity first.
+/// The default unread-status inbox listing must stay on
+/// `idx_notes_unread_probe_recipient_direction`: that partial index excludes
+/// read rows structurally (via its `WHERE`), while any general
+/// `(to_actor, direction)`-shaped index can only exclude them with a
+/// residual filter, which costs more. With no `ANALYZE` statistics, SQLite
+/// prefers the first index it finds that matches the query shape rather than
+/// costing them, so a general index present alongside the partial one can
+/// still win the plan even though it does strictly more work -- this test
+/// pins the unread-scoped plan against reintroducing a competing general
+/// index without first re-measuring the tradeoff.
 #[tokio::test]
 async fn comm_inbox_unread_default_query_still_uses_partial_unread_probe_index() {
     use khive_storage::note::PropertyFilter as NotePropFilter;
@@ -3909,6 +3911,81 @@ async fn seek_after_rejects_custom_order_by() {
     assert!(
         err.to_string().contains("order_by"),
         "rejection must name the order_by conflict, got: {err}"
+    );
+}
+
+/// khive#2392: `query_notes_filtered` computes an exact `COUNT(*)` total over
+/// the whole matching set, which has no defined meaning paired with a seek
+/// boundary, so it must reject `NoteFilter.after` rather than silently
+/// ignoring it (the pre-fix behavior: it never read the field at all, so a
+/// caller passing a cursor here got the first page over and over instead of
+/// an error or the seeked rows).
+#[tokio::test]
+async fn query_notes_filtered_rejects_seek_cursor() {
+    use khive_storage::note::{NoteFilter, NoteSeekAfter};
+    use khive_storage::types::PageRequest;
+
+    let store = setup_memory_store();
+    let filter = NoteFilter {
+        kind: Some("widget".to_string()),
+        after: Some(NoteSeekAfter {
+            created_at: 0,
+            id: uuid::Uuid::nil(),
+        }),
+        ..Default::default()
+    };
+    let err = store
+        .query_notes_filtered(
+            "default",
+            &filter,
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect_err("query_notes_filtered must reject NoteFilter.after");
+    assert!(
+        err.to_string().contains("query_notes_filtered_count_free"),
+        "rejection must point callers at the method that does honour after, got: {err}"
+    );
+}
+
+/// The same rejection applies when `after` is combined with a custom
+/// `order_by` — `query_notes_filtered` never seeks, so there is no separate
+/// "order_by conflict" branch to hit; both fields being set still surfaces
+/// the one `after`-not-supported error.
+#[tokio::test]
+async fn query_notes_filtered_rejects_seek_cursor_with_custom_order_by() {
+    use khive_storage::note::{NoteFilter, NoteSeekAfter, SortDir};
+    use khive_storage::types::PageRequest;
+
+    let store = setup_memory_store();
+    let filter = NoteFilter {
+        kind: Some("widget".to_string()),
+        order_by: Some(("$.priority".to_string(), SortDir::Asc)),
+        after: Some(NoteSeekAfter {
+            created_at: 0,
+            id: uuid::Uuid::nil(),
+        }),
+        ..Default::default()
+    };
+    let err = store
+        .query_notes_filtered(
+            "default",
+            &filter,
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect_err(
+            "query_notes_filtered must reject NoteFilter.after even with a custom order_by",
+        );
+    assert!(
+        err.to_string().contains("query_notes_filtered_count_free"),
+        "rejection must point callers at the method that does honour after, got: {err}"
     );
 }
 
@@ -4093,5 +4170,309 @@ async fn json_type_ne_missing_rejects_non_vocabulary_value() {
     assert!(
         err.to_string().contains("json_type"),
         "rejection must name the json_type vocabulary, got: {err}"
+    );
+}
+
+/// khive#2392: `fetch_notes_after`'s `status="all"`/`status="read"` inbox
+/// listings (no `$.read` filter, or `JsonTypeEq` rather than the tuned
+/// `JsonTypeNeMissing` probe) have no index ending in `(created_at DESC, id
+/// ASC)` for their `(namespace, kind, direction, to_actor[, read])`
+/// partition, so the lt-branch (`created_at < ? ORDER BY created_at DESC, id
+/// ASC`) still costs a full partition scan plus a temp-b-tree sort on every
+/// internal page — pins the expected-arm SCAN-plus-sort plan so a future
+/// index addition is a deliberate, measured change rather than a silent
+/// drift. See `candidate_created_at_id_seek_index_flips_unread_probe_plan`
+/// for why the natural fix (a general `(namespace, kind, created_at DESC, id
+/// ASC)` index) was measured and rejected rather than shipped.
+#[tokio::test]
+async fn comm_inbox_status_all_lt_branch_has_no_seek_index() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
+    use khive_storage::types::SqlValue;
+
+    let pool = setup_pool();
+    {
+        let writer = pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
+                    ON notes(namespace, kind, json_extract(properties, '$.direction'), \
+                    json_extract(properties, '$.read'), created_at DESC) \
+                    WHERE deleted_at IS NULL;
+                 CREATE INDEX IF NOT EXISTS idx_comm_message_to_actor \
+                    ON notes(namespace, kind, \
+                    json_extract(properties, '$.to_actor'), \
+                    json_extract(properties, '$.direction'), \
+                    json_extract(properties, '$.read'), \
+                    created_at DESC) \
+                    WHERE deleted_at IS NULL;",
+            )
+            .unwrap();
+    }
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..6000i64 {
+            let to_actor = if i % 5 == 0 {
+                "lambda:target"
+            } else {
+                "lambda:other"
+            };
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                 json_object('direction','inbound','to_actor',?3,'read', (?4 % 2 = 0)), ?4, ?4)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), format!("m{i}"), to_actor, i],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    // Same shape `query_inbox_response` builds for box="inbox", status="all".
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrLegacyIndexed,
+                value: SqlValue::Text("lambda:target".to_string()),
+            },
+        ],
+        ..Default::default()
+    };
+
+    let reader = pool.reader().unwrap();
+    let (lt_where, mut lt_params) = build_note_filter_where("default", &filter).unwrap();
+    lt_params.push(Box::new(3000_i64));
+    let lt_ts_idx = lt_params.len();
+    lt_params.push(Box::new(100_i64));
+    let lt_limit_idx = lt_params.len();
+    let lt_sql = format!(
+        "SELECT id FROM notes{lt_where} AND created_at < ?{lt_ts_idx} \
+         ORDER BY created_at DESC, id ASC LIMIT ?{lt_limit_idx}"
+    );
+    let plan = plan_details(reader.conn(), &lt_sql, &lt_params);
+    assert!(
+        plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "expected arm: the lt-branch still sorts because no index ends in \
+         (created_at DESC, id ASC) for this partition, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("idx_notes_kind_created_seek"),
+        "no such index exists in production schema; a name match here would mean \
+         this test started reading stale state"
+    );
+}
+
+/// khive#2392: the natural seekable fix for the gap pinned by
+/// `comm_inbox_status_all_lt_branch_has_no_seek_index` — a general
+/// `(namespace, kind, created_at DESC, id ASC) WHERE deleted_at IS NULL`
+/// index — was measured, not just assumed, before deciding not to ship it.
+/// Standalone it cuts the lt-branch scan from 57,473 to 7,223 VM steps for a
+/// 6,000-row fixture (~8x), but because it carries no `to_actor`/`read`
+/// predicate it is *also* a legal plan for `comm.inbox`'s default
+/// `status="unread"` listing, and SQLite prefers it (no `ANALYZE`
+/// statistics) over the purpose-built partial
+/// `idx_notes_unread_probe_recipient_direction` — the identical failure mode
+/// V27's header already recorded for the dropped `(to_actor, direction)`
+/// index. Measured on the same fixture: 84 VM steps via the partial index
+/// vs. 125 via this candidate, so it is not even a narrow win there. This
+/// test builds the two indexes together and pins that the unread-probe plan
+/// flips away from the tuned partial index, which is the reason this index
+/// is not part of the migration.
+#[tokio::test]
+async fn candidate_created_at_id_seek_index_flips_unread_probe_plan() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    for i in 0..20 {
+        store
+            .upsert_note(make_note_with_props(
+                "default",
+                "message",
+                &format!("message {i}"),
+                serde_json::json!({
+                    "direction": "inbound",
+                    "to_actor": "lambda:reader",
+                    "read": false,
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_notes_kind_created_seek \
+                    ON notes(namespace, kind, created_at DESC, id ASC) \
+                    WHERE deleted_at IS NULL;",
+            )
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrLegacyIndexed,
+                value: SqlValue::Text("lambda:reader".to_string()),
+            },
+        ],
+        order_by: None,
+        ..Default::default()
+    };
+    let (sql, params) = listing_sql_and_params(&filter);
+    let plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
+    assert!(
+        plan.contains("idx_notes_kind_created_seek"),
+        "expected arm: with both indexes present, the planner prefers the general \
+         created_at/id index over the tuned partial unread-probe index, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("idx_notes_unread_probe_recipient_direction"),
+        "got:\n{plan}"
+    );
+}
+
+/// khive#2392: narrowing `idx_notes_task_status`/`idx_notes_task_assignee`'s
+/// partial `WHERE` to `kind = 'task' AND deleted_at IS NULL` would shrink the
+/// index, but every query that would use it binds `kind` as a parameter
+/// (`build_note_filter_where` never inlines it), and SQLite can only use a
+/// partial index when it can prove the WHERE clause from the query's WHERE
+/// clause using a literal or otherwise plan-time-known value — a bound
+/// parameter is not visible until execution, so a query written exactly as
+/// `kind = ?1` cannot be proven to imply `kind = 'task'` at plan time. This
+/// pins that the narrowed index shape is not chosen, which is why the
+/// shipped V27 indexes stay partial only on `deleted_at IS NULL`.
+#[tokio::test]
+async fn narrowing_hot_property_index_to_kind_task_is_not_chosen() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    for i in 0..20 {
+        store
+            .upsert_note(make_note_with_props(
+                "default",
+                "task",
+                &format!("task {i}"),
+                serde_json::json!({ "status": if i % 2 == 0 { "active" } else { "next" } }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_notes_task_status_narrowed \
+                    ON notes(namespace, json_extract(properties, '$.status'), \
+                    created_at DESC, id ASC) \
+                    WHERE kind = 'task' AND deleted_at IS NULL;",
+            )
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("task".to_string()),
+        property_filters: vec![NotePropFilter {
+            json_path: "$.status".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text("active".to_string()),
+        }],
+        ..Default::default()
+    };
+    let (sql, params) = listing_sql_and_params(&filter);
+    let plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
+    assert!(
+        !plan.contains("idx_notes_task_status_narrowed"),
+        "expected arm: a bound `kind = ?` parameter cannot prove the narrowed \
+         partial index's WHERE clause, so the planner must not choose it, got:\n{plan}"
+    );
+    assert!(
+        plan.contains("idx_notes_task_status") || plan.contains("idx_notes_task_assignee"),
+        "the shipped (non-narrowed) indexes must still serve the query, got:\n{plan}"
+    );
+}
+
+/// khive#2392: `gtd.tasks()` with no `status=` filter compiles
+/// `FilterOp::NotInOrMissing(["done", "cancelled"])` on `$.status`
+/// (`handle_tasks` in `crates/khive-pack-gtd/src/handlers.rs`), which
+/// `build_note_filter_where` turns into `(expr IS NULL OR expr NOT IN
+/// (...))` -- an open exclusion, not a bounded set, so `idx_notes_task_status`
+/// cannot narrow it to an index range seek; the planner can only walk the
+/// `(namespace, kind)` partition.
+///
+/// No seekable rewrite preserves the documented semantics either: the
+/// listing must keep a task whose `$.status` is missing *or* any unrecognized
+/// legacy value (see `handle_tasks`'s comment on why `NotInOrMissing` was
+/// chosen over `Ne`), so the exclusion set is open-ended and cannot be
+/// rewritten as `status IN (<the 5 known non-terminal statuses>)` -- that
+/// would silently drop a task carrying a status string outside
+/// `TASK_STATUSES`, which is exactly the case this predicate exists to keep.
+/// This test measures and pins the current (unindexed) plan rather than
+/// leaving the claim unverified.
+#[tokio::test]
+async fn gtd_tasks_default_listing_not_in_or_missing_has_no_seek_index() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    let statuses = ["inbox", "next", "active", "done", "cancelled"];
+    for i in 0..20 {
+        store
+            .upsert_note(make_note_with_props(
+                "default",
+                "task",
+                &format!("task {i}"),
+                serde_json::json!({ "status": statuses[i % 5] }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("task".to_string()),
+        property_filters: vec![NotePropFilter {
+            json_path: "$.status".to_string(),
+            op: FilterOp::NotInOrMissing(vec![
+                SqlValue::Text("done".to_string()),
+                SqlValue::Text("cancelled".to_string()),
+            ]),
+            value: SqlValue::Null,
+        }],
+        ..Default::default()
+    };
+    let (sql, params) = listing_sql_and_params(&filter);
+    let plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
+    assert!(
+        !plan.contains("idx_notes_task_status"),
+        "expected arm: an open NOT-IN exclusion cannot be served by an equality-\
+         keyed index seek, so idx_notes_task_status must not appear in the plan, \
+         got:\n{plan}"
     );
 }

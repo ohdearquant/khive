@@ -908,8 +908,12 @@ fn build_note_filter_where(
     Ok((format!(" WHERE {}", conditions.join(" AND ")), params))
 }
 
-/// `SELECT` column list shared by every plain note-row projection query in
-/// this file (`query_notes`, `query_notes_count_free`, `query_notes_filtered*`).
+/// `SELECT` column list for a plain note-row projection. Used by
+/// [`fetch_notes_after`] and `query_notes_filtered_count_free`; the other
+/// note-row projection queries in this file (`query_notes`,
+/// `query_notes_count_free`, `query_notes_filtered`,
+/// `query_notes_filtered_after`, `query_notes_filtered_bounded`) still spell
+/// the same column list out inline.
 const NOTE_COLUMNS: &str = "id, namespace, kind, status, name, content, salience, decay_factor, \
      expires_at, properties, created_at, updated_at, deleted_at";
 
@@ -1521,6 +1525,18 @@ impl NoteStore for SqlNoteStore {
         }
         if let Some((path, _)) = &filter.order_by {
             validate_json_path(path)?;
+        }
+        if filter.after.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered".into(),
+                message: "NoteFilter.after (keyset pagination) is not supported by this \
+                          method: it computes an exact COUNT(*) total over the whole \
+                          matching set, which has no defined meaning paired with a seek \
+                          boundary; use query_notes_filtered_count_free instead, which \
+                          seeks and returns total: None"
+                    .into(),
+            });
         }
 
         let namespace = namespace.to_string();

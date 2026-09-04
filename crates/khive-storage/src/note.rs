@@ -558,6 +558,13 @@ pub struct NoteFilter {
     /// `created_at DESC, id ASC` order, for keyset (seek) pagination that
     /// avoids re-walking earlier pages the way `PageRequest.offset` does.
     /// Requires `order_by` to be `None`.
+    ///
+    /// Honoured only by [`NoteStore::query_notes_filtered_count_free`], which
+    /// seeks directly to the boundary and returns `total: None`.
+    /// [`NoteStore::query_notes_filtered`] rejects a non-`None` value with
+    /// `StorageError::InvalidInput`: it computes an exact `COUNT(*)` total
+    /// over the whole matching set, which has no defined meaning paired with
+    /// a seek boundary.
     #[serde(default)]
     pub after: Option<NoteSeekAfter>,
 }

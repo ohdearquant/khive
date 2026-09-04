@@ -1146,13 +1146,25 @@ fn v27_adds_hot_property_indexes_to_a_pre_v27_database() {
 }
 
 #[test]
-fn latest_schema_version_advances_by_one_for_v27() {
-    assert_eq!(latest_schema_version(), 27);
+fn latest_schema_version_matches_the_newest_migrations_entry() {
     assert_eq!(
         MIGRATIONS.last().map(|m| m.version),
-        Some(26 + 1),
-        "V27 must be the newest entry in the migration ledger"
+        Some(latest_schema_version()),
+        "latest_schema_version() must equal the version of the newest MIGRATIONS entry"
     );
+}
+
+#[test]
+fn migration_versions_advance_by_exactly_one() {
+    for pair in MIGRATIONS.windows(2) {
+        assert_eq!(
+            pair[1].version,
+            pair[0].version + 1,
+            "migration versions must be strictly sequential with no gaps: {} -> {}",
+            pair[0].version,
+            pair[1].version
+        );
+    }
 }
 
 #[test]
