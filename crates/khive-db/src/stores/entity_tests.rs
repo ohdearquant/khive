@@ -848,6 +848,22 @@ async fn test_entity_type_roundtrip() {
 }
 
 #[tokio::test]
+async fn insert_entity_if_absent_preserves_the_winning_row() {
+    let store = setup_memory_store();
+    let winner = make_entity("default", "concept", "winner");
+    let mut loser = winner.clone();
+    loser.name = "loser".to_string();
+    loser.description = Some("must not replace the winner".to_string());
+
+    assert!(store.insert_entity_if_absent(winner.clone()).await.unwrap());
+    assert!(!store.insert_entity_if_absent(loser).await.unwrap());
+
+    let persisted = store.get_entity(winner.id).await.unwrap().unwrap();
+    assert_eq!(persisted.name, "winner");
+    assert_eq!(persisted.description, None);
+}
+
+#[tokio::test]
 async fn test_query_by_kind_and_entity_type() {
     let store = setup_memory_store_ns("et_ns");
 

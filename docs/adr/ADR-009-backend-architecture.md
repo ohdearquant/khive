@@ -408,3 +408,30 @@ read-to-replacement race without changing the ordinary upsert contract.
 No open design question remains within this storage amendment: the conflict is a typed storage
 outcome, ordinary upserts retain their existing semantics, and the eight-site boundary above is
 explicit.
+
+## Amendment — Conditional insert for caller-rebased full-row mutations (#2231)
+
+Guarded replacement alone cannot close the missing-row half of a read-modify-write race. Two
+callers may both observe that a deterministic entity or edge id is absent; if both then use an
+ordinary upsert, the later write can replace the first caller's newly inserted row before either
+caller has a chance to reapply its semantic delta.
+
+The storage contract therefore adds `EntityStore::insert_entity_if_absent` and
+`GraphStore::insert_edge_if_absent`. Each method returns `true` only when it inserts its supplied
+row. A conflict returns `false` and leaves the winning row byte-for-byte untouched. For edges,
+either the id or the `(namespace, source_id, target_id, relation)` natural key is a conflict.
+Backends that do not implement these optional methods return `StorageError::Unsupported`; they
+must not fall back to an ordinary upsert.
+
+These methods are the missing-row companions to `replace_entity_if_unchanged` and
+`replace_edge_if_unchanged`, not general retry machinery. A full-row mutation derived from a read
+must follow this loop:
+
+1. Read the current row, including its deletion marker.
+2. Apply the caller's intended semantic delta to that current row.
+3. Use conditional insert when absent or guarded replacement when present.
+4. On refusal, discard the attempted full row, re-read, and reapply the semantic delta.
+
+The loop must be bounded. It must never blindly retry the stale serialized row. Ordinary upserts,
+batch operations, SQL schema, migration level, authorization, event emission, and MCP wire shapes
+are unchanged by this amendment.

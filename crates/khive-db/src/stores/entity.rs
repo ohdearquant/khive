@@ -104,6 +104,21 @@ pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
     }
 }
 
+/// Conditional-insert companion to [`entity_upsert_statement`]. Every
+/// conflict leaves the existing row untouched so a caller can read the
+/// winner and explicitly reapply its intended delta.
+pub fn entity_insert_if_absent_statement(entity: &Entity) -> SqlStatement {
+    let mut statement = entity_upsert_statement(entity);
+    statement.sql = "INSERT INTO entities \
+              (id, namespace, kind, entity_type, name, description, properties, tags, \
+               created_at, updated_at, deleted_at, merged_into, merge_event_id) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+              ON CONFLICT DO NOTHING"
+        .to_string();
+    statement.label = Some("entity-insert-if-absent".to_string());
+    statement
+}
+
 /// Full-entity compare-and-swap update used after caller-side normalization
 /// was derived from a read snapshot. Unlike [`entity_upsert_statement`], this
 /// never inserts and cannot overwrite a row whose revision or deletion
@@ -669,6 +684,16 @@ impl EntityStore for SqlEntityStore {
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn insert_entity_if_absent(&self, entity: Entity) -> Result<bool, StorageError> {
+        let statement = entity_insert_if_absent_statement(&entity);
+        self.with_writer("insert_entity_if_absent", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }
