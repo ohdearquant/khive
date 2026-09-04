@@ -378,6 +378,74 @@ fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
 /// never to the size of the full match set.
 const FTS_TERM_LIMIT: usize = 500;
 
+/// Overfetch factor applied to a term's phase-A rowid window when phase B has
+/// an eligibility predicate (status or type) that can reject rows phase A had
+/// no way to see (issue #1930 Amendment 2 — see [`fetch_fts_candidates`]).
+/// Phase A carries no eligibility predicate at all, so without headroom an
+/// ineligible-heavy match set could starve phase B down to nothing even
+/// though eligible rows exist further down the bm25 ranking.
+const PHASE_A_OVERFETCH_FACTOR: usize = 4;
+
+/// Ceiling a single term's phase-A probe window is allowed to widen to
+/// (issue #1930 Amendment 2). Bounds the worst case — every phase-A row
+/// ineligible, and the corpus large enough to keep returning full pages — to
+/// a fixed per-term cost instead of an unbounded retry loop.
+const PHASE_A_WIDEN_CEILING: usize = 8000;
+
+/// Independent read-deadline budget for the lexical/FTS candidate fetch
+/// (issue #1930 Amendment 2). `khive_storage::scope_request_read_deadline`
+/// keeps whichever deadline is earlier, so nesting this around just the
+/// fetch only ever *tightens* its effective deadline; popping back out of
+/// the scope once the fetch returns restores the wider request deadline for
+/// every stage that runs after it (rerank, body-line counts, member
+/// sizing). A lexical-stage timeout therefore no longer means the request
+/// itself is out of time — only that this one stage's own budget is.
+pub(crate) const LEXICAL_STAGE_BUDGET_MS: u64 = 8_000;
+
+// ── Test-only seam: override the lexical-stage budget ────────────────────────
+//
+// Zero means use the production default (`LEXICAL_STAGE_BUDGET_MS`). Tests
+// set this to a small value so a controlled-deadline test does not depend on
+// a real multi-second wall-clock wait (mirrors
+// `vamana::warm_wait_timeout_ms`'s override seam).
+static LEXICAL_STAGE_BUDGET_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn lexical_stage_budget() -> std::time::Duration {
+    let o = LEXICAL_STAGE_BUDGET_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    std::time::Duration::from_millis(if o > 0 { o } else { LEXICAL_STAGE_BUDGET_MS })
+}
+
+/// Set the lexical-stage budget override for tests. Pass `0` to restore the
+/// production default (`LEXICAL_STAGE_BUDGET_MS`).
+#[cfg(test)]
+pub(crate) fn set_lexical_stage_budget_override_ms(ms: u64) {
+    LEXICAL_STAGE_BUDGET_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// RAII guard: reset the lexical-stage budget override when a test exits
+/// (even on panic). `pub(crate)` (not scoped to `mod tests` below) so the
+/// handler-level degrade tests in `ann_degrade_tests.rs` can reuse it.
+#[cfg(test)]
+pub(crate) struct LexicalStageBudgetReset;
+
+#[cfg(test)]
+impl Drop for LexicalStageBudgetReset {
+    fn drop(&mut self) {
+        set_lexical_stage_budget_override_ms(0);
+    }
+}
+
+/// Serializes tests that mutate the process-global lexical-stage-budget
+/// override — same rationale as `ann_degrade_tests`'s
+/// `TIMEOUT_OVERRIDE_SERIAL` for `vamana`'s warm-wait override: under
+/// Cargo's parallel test runner, one test's reset-on-drop could otherwise
+/// fire mid-flight for another. `pub(crate)` for the same cross-file reuse
+/// as [`LexicalStageBudgetReset`].
+#[cfg(test)]
+pub(crate) static LEXICAL_BUDGET_OVERRIDE_SERIAL: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 /// Outcome of the bounded lexical candidate fetch.
 ///
 /// `timed_out` is set only for [`khive_storage::StorageError::Timeout`] — the
@@ -429,6 +497,33 @@ fn is_read_timeout(e: &RuntimeError) -> bool {
 
 /// Fetch a bounded lexical candidate pool.
 ///
+/// Two-phase per term (issue #1930 Amendment 2). The original shape ordered
+/// a full atom row — `content` included — per FTS5 match *before* its own
+/// per-term `LIMIT`, so every match paid a scattered read against the whole
+/// (potentially multi-gigabyte) atom table even though only the top few
+/// hundred survived. Phase A instead orders bare rowids straight off the
+/// `fts_knowledge` index (`bm25()` needs only the index and the docsize
+/// shadow table, not the content); phase B hydrates just the surviving
+/// rowids from `knowledge_atoms` in chunks, applying namespace, soft-delete,
+/// status, and type eligibility there.
+///
+/// Phase A carries no namespace predicate. `fts_knowledge.namespace` is
+/// UNINDEXED on this external-content FTS5 table, so filtering on it (as the
+/// original single query did) forces FTS5 to fetch the backing content row
+/// per candidate — exactly the cost phase A exists to avoid. The namespace
+/// check moves entirely to phase B, where the atom row is already being
+/// read for its other eligibility columns; a term whose top bm25 matches
+/// are disproportionately from another namespace can therefore come back
+/// short, which the overfetch/widen behavior below exists to absorb for
+/// status/type ineligibility but not for this one — an accepted, narrow
+/// degradation, not a correctness bug (mirrors the eligibility probe's own
+/// choice a few lines down).
+///
+/// Phase A also drops the `a.slug` tie-break the old query used: `rowid` is
+/// already stable and needs no join, so `ORDER BY bm25(fts_knowledge),
+/// rowid` gives deterministic per-term ordering without touching the
+/// content table.
+///
 /// Replaces a single `ORDER BY bm25(...)` over one OR-joined match expression
 /// (whose cost scales with the size of the entire match set — the #1930 read
 /// timeout at ~94K atoms) with one bounded, independently-capped subquery per
@@ -458,30 +553,26 @@ async fn fetch_fts_candidates(
 
     let terms = fts5_candidate_terms(raw_query);
     let type_clause = type_eligibility_sql(type_filter, "a");
-    let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 4);
     let per_term_limit = if terms.len() == 1 {
         fetch_limit
     } else {
         fetch_limit.clamp(1, FTS_TERM_LIMIT)
     };
-
-    let mut seen_ids: HashSet<Uuid> = HashSet::new();
-    let mut combined: Vec<Atom> = Vec::new();
-
-    // Join the canonical atom row before LIMIT so deleted, status-ineligible,
-    // and wrong-kind FTS rows cannot consume the bounded candidate window.
-    // bm25 orders each term's eligible matches before its own cap; slug is
-    // the stable tie break for equal lexical rank.
-    let per_term_sql = format!(
-        "SELECT a.* FROM fts_knowledge \
-         JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
-         WHERE fts_knowledge MATCH ?1 \
-           AND fts_knowledge.namespace = ?2 \
-           AND a.namespace = ?2 \
-           AND a.deleted_at IS NULL{status_clause}{type_clause} \
-         ORDER BY bm25(fts_knowledge), a.slug \
-         LIMIT ?3"
-    );
+    // `status_sql_clause`'s no-filter case still excludes `deprecated`, so
+    // this is currently always true; kept explicit (not assumed) so a future
+    // change that *can* return an empty clause degrades to no-overfetch
+    // instead of silently keeping an overfetch with nothing to absorb.
+    let has_eligibility_clause = !status_sql_clause(statuses, exclude_statuses, 1)
+        .0
+        .is_empty()
+        || !type_clause.is_empty();
+    let base_probe_limit = if has_eligibility_clause {
+        per_term_limit
+            .saturating_mul(PHASE_A_OVERFETCH_FACTOR)
+            .min(PHASE_A_WIDEN_CEILING)
+    } else {
+        per_term_limit
+    };
 
     // Query every term rather than stopping once `combined` reaches
     // `fetch_limit` — an early break made pool membership depend on query
@@ -491,35 +582,114 @@ async fn fetch_fts_candidates(
     let mut per_term_rows: Vec<Vec<Atom>> = Vec::with_capacity(terms.len());
     let mut term_query_timed_out = false;
 
-    for term in &terms {
-        let mut params = vec![
-            SqlValue::Text(term.clone()),
-            SqlValue::Text(ns.to_owned()),
-            SqlValue::Integer(per_term_limit as i64),
-        ];
-        params.extend(status_params.iter().cloned());
+    'terms: for term in &terms {
+        let mut probe_limit = base_probe_limit;
 
-        let rows = match reader
-            .query_all(SqlStatement {
-                sql: per_term_sql.clone(),
-                params,
-                label: None,
-            })
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) if is_timeout(&e) => {
-                term_query_timed_out = true;
-                break;
+        let mut eligible: Vec<Atom> = loop {
+            let phase_a_rows = match reader
+                .query_all(SqlStatement {
+                    sql: "SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
+                          ORDER BY bm25(fts_knowledge), rowid LIMIT ?2"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Text(term.clone()),
+                        SqlValue::Integer(probe_limit as i64),
+                    ],
+                    label: None,
+                })
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) if is_timeout(&e) => {
+                    term_query_timed_out = true;
+                    break 'terms;
+                }
+                Err(e) => return Err(sql_err("search fts phase-a query", e)),
+            };
+            let rowids: Vec<i64> = phase_a_rows
+                .iter()
+                .filter_map(|r| row_i64(r, "rowid"))
+                .collect();
+            let phase_a_full = rowids.len() >= probe_limit;
+            if rowids.is_empty() {
+                break Vec::new();
             }
-            Err(e) => return Err(sql_err("search fts query", e)),
+
+            let mut atoms_by_rowid: HashMap<i64, Atom> = HashMap::with_capacity(rowids.len());
+            for chunk in rowids.chunks(HYDRATION_ID_CHUNK) {
+                let rowid_placeholders = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 2))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let (chunk_status_clause, chunk_status_params) =
+                    status_sql_clause(statuses, exclude_statuses, 2 + chunk.len());
+                let mut params = vec![SqlValue::Text(ns.to_owned())];
+                params.extend(chunk.iter().map(|rowid| SqlValue::Integer(*rowid)));
+                params.extend(chunk_status_params);
+                let hydrate_sql = format!(
+                    "SELECT a.*, a.rowid AS rowid FROM knowledge_atoms AS a \
+                     WHERE a.rowid IN ({rowid_placeholders}) \
+                       AND a.namespace = ?1 \
+                       AND a.deleted_at IS NULL{chunk_status_clause}{type_clause}"
+                );
+                let rows = match reader
+                    .query_all(SqlStatement {
+                        sql: hydrate_sql,
+                        params,
+                        label: None,
+                    })
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) if is_timeout(&e) => {
+                        term_query_timed_out = true;
+                        break 'terms;
+                    }
+                    Err(e) => return Err(sql_err("search fts phase-b hydration", e)),
+                };
+                for row in &rows {
+                    if let (Some(atom), Some(rowid)) = (atom_from_row(row), row_i64(row, "rowid")) {
+                        atoms_by_rowid.insert(rowid, atom);
+                    }
+                }
+            }
+
+            // Reassemble in phase A's bm25/rowid order; a rowid absent from
+            // the hydrated map was ineligible (wrong namespace/status/type)
+            // or deleted between phase A and phase B.
+            let eligible_now: Vec<Atom> = rowids
+                .iter()
+                .filter_map(|rowid| atoms_by_rowid.get(rowid).cloned())
+                .collect();
+
+            // Widen only when phase A itself was the bottleneck (it returned
+            // a full page, meaning more matches may exist beyond this
+            // probe) and only up to the ceiling; a term that is genuinely
+            // exhausted (phase A returned less than it asked for) has
+            // nothing more to gain from a wider probe.
+            if has_eligibility_clause
+                && eligible_now.len() < per_term_limit
+                && phase_a_full
+                && probe_limit < PHASE_A_WIDEN_CEILING
+            {
+                probe_limit = probe_limit
+                    .saturating_mul(PHASE_A_OVERFETCH_FACTOR)
+                    .min(PHASE_A_WIDEN_CEILING);
+                continue;
+            }
+            break eligible_now;
         };
 
-        per_term_rows.push(rows.iter().filter_map(atom_from_row).collect());
+        eligible.truncate(per_term_limit);
+        per_term_rows.push(eligible);
         #[cfg(test)]
         advance_fts_test_deadline_after_term(per_term_rows.len()).await;
     }
 
+    let mut seen_ids: HashSet<Uuid> = HashSet::new();
+    let mut combined: Vec<Atom> = Vec::new();
     let max_term_rows = per_term_rows.iter().map(Vec::len).max().unwrap_or(0);
     'merge: for i in 0..max_term_rows {
         for term_rows in &per_term_rows {
@@ -554,13 +724,19 @@ async fn fetch_fts_candidates(
     // full scan could otherwise admit unrelated zero-score rows when
     // min_score is the default 0. This probe has no ORDER BY and LIMIT 1, so
     // it stays cheap even over the OR-joined expression.
+    //
+    // The namespace predicate is dropped here too, for the same reason
+    // phase A drops it: `namespace` is UNINDEXED on this external-content
+    // table, so filtering on it forces a content-row fetch per candidate. A
+    // cross-namespace positive only means the full-scan fallback below is
+    // not taken — it cannot admit a cross-namespace row into the result,
+    // since the fallback itself still filters by namespace.
     let match_expr = fts5_candidate_expression(raw_query);
     let raw_fts_match = match reader
         .query_row(SqlStatement {
-            sql: "SELECT 1 AS present FROM fts_knowledge \
-                  WHERE fts_knowledge MATCH ?1 AND namespace = ?2 LIMIT 1"
+            sql: "SELECT 1 AS present FROM fts_knowledge WHERE fts_knowledge MATCH ?1 LIMIT 1"
                 .to_string(),
-            params: vec![SqlValue::Text(match_expr), SqlValue::Text(ns.to_owned())],
+            params: vec![SqlValue::Text(match_expr)],
             label: None,
         })
         .await
@@ -688,14 +864,24 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     // fall through to exact-name-bonus-only scoring rather than returning early.
     let terms_only_exact = terms.is_empty();
 
-    let FtsFetchOutcome { atoms, timed_out } = fetch_fts_candidates(
-        runtime,
-        ns,
-        &raw_query,
-        type_filter,
-        ctx.statuses,
-        ctx.exclude_statuses,
-        CANDIDATE_POOL,
+    // The lexical stage owns an independent, narrower read-deadline budget
+    // (issue #1930 Amendment 2): `scope_request_read_deadline` keeps
+    // whichever deadline is earlier, so this only ever tightens the fetch's
+    // effective deadline; once the fetch returns, the wider request
+    // deadline governs everything that runs after it (rerank, body-line
+    // counts, member sizing) — a lexical-stage timeout no longer spends the
+    // whole request.
+    let FtsFetchOutcome { atoms, timed_out } = khive_storage::scope_request_read_deadline(
+        lexical_stage_budget(),
+        fetch_fts_candidates(
+            runtime,
+            ns,
+            &raw_query,
+            type_filter,
+            ctx.statuses,
+            ctx.exclude_statuses,
+            CANDIDATE_POOL,
+        ),
     )
     .await?;
     if atoms.is_empty() {
@@ -944,14 +1130,26 @@ async fn embed_cosine_scores(
         texts.extend_from_slice(candidate_texts);
         texts
     };
+    // A request read-deadline timeout here degrades to "rerank did not run"
+    // (`Ok(None)`) rather than propagating, same contract as every other
+    // read in this module (issue #1930 Amendment 2): before the lexical
+    // stage owned its own budget, this call was only ever reached when the
+    // shared request deadline had *not* already expired, so a mid-flight
+    // expiry racing this specific await was unreachable in practice. With
+    // the stages decoupled, a lexical-only degradation with real time left
+    // to spare now reaches this call normally, and the ordinary
+    // async-scheduling race — the deadline elapsing while this embed_batch
+    // is in flight — is reachable and must degrade, not hard-error.
     let embeddings = match khive_storage::await_request_read_phase(
         "knowledge.embedding_rerank",
         runtime.embed_batch(&texts),
     )
-    .await?
+    .await
     {
-        Ok(embeddings) => embeddings,
-        Err(_) => return Ok(None),
+        Ok(Ok(embeddings)) => embeddings,
+        Ok(Err(_)) => return Ok(None),
+        Err(e) if is_timeout(&e) => return Ok(None),
+        Err(e) => return Err(e.into()),
     };
     if embeddings.len() != texts.len() {
         return Ok(None);
@@ -1490,6 +1688,17 @@ fn parse_domain_members(domain: &Domain) -> Result<Vec<String>, RuntimeError> {
     })
 }
 
+/// Member-token sizing is best-effort, same contract as
+/// [`load_atom_body_line_counts`]: a request read-deadline timeout on either
+/// the reader checkout or the query returns the zero-initialized `sizes` map
+/// rather than propagating `Err`. Before issue #1930 Amendment 2 gave the
+/// lexical stage its own independent budget, `suggest` only ever reached this
+/// call when the shared request deadline had *not* expired, so a mid-flight
+/// timeout here was unreachable in practice. With the stages decoupled, a
+/// lexical-only degradation with real time left to spare now runs this
+/// query normally, and the ordinary async-scheduling race (the deadline
+/// elapsing while this query is in flight) is reachable and must degrade,
+/// not hard-error, exactly like every other read in this module.
 async fn load_domain_member_token_sizes(
     runtime: &KhiveRuntime,
     ns: &str,
@@ -1510,11 +1719,12 @@ async fn load_domain_member_token_sizes(
     params.extend(domain_ids.iter().cloned().map(SqlValue::Text));
 
     let sql = runtime.sql();
-    let mut reader = sql
-        .reader()
-        .await
-        .map_err(|e| sql_err("suggest member size reader", e))?;
-    let rows = reader
+    let mut reader = match sql.reader().await {
+        Ok(reader) => reader,
+        Err(e) if is_timeout(&e) => return Ok(sizes),
+        Err(e) => return Err(sql_err("suggest member size reader", e)),
+    };
+    let rows = match reader
         .query_all(SqlStatement {
             sql: format!(
                 "SELECT d.id AS domain_id, a.name, a.content \
@@ -1532,7 +1742,11 @@ async fn load_domain_member_token_sizes(
             label: None,
         })
         .await
-        .map_err(|e| sql_err("suggest member size query", e))?;
+    {
+        Ok(rows) => rows,
+        Err(e) if is_timeout(&e) => return Ok(sizes),
+        Err(e) => return Err(sql_err("suggest member size query", e)),
+    };
 
     for row in rows {
         let Some(domain_id) = row_str(&row, "domain_id") else {
@@ -2131,11 +2345,12 @@ impl KnowledgeHandlers {
         filter_hits_by_status(&mut hits, &requested_statuses, &effective_exclude_statuses);
         filter_hits_by_type(&mut hits, type_filter);
 
-        // See `suggest`'s matching guard: a lexical-stage timeout means the
-        // request read deadline is already spent, so skip the further
-        // embedding read rather than let it convert a degraded-but-ok
-        // response into a verb-level error.
-        if do_rerank && !hits.is_empty() && !lexical_timed_out {
+        // The lexical stage now owns its own budget (issue #1930 Amendment
+        // 2), so `lexical_timed_out` no longer implies the request read
+        // deadline is spent — only that stage's narrower budget is. Gate on
+        // the live ambient deadline instead: a lexical-only degradation
+        // with request time left to spare still gets its embedding rerank.
+        if do_rerank && !hits.is_empty() && !khive_storage::request_read_is_cancelled() {
             rerank_with_embeddings(
                 runtime,
                 &raw_query,
@@ -2156,7 +2371,7 @@ impl KnowledgeHandlers {
             .map(|hit| hit.id.clone())
             .collect();
         let mut body_lines_timed_out = false;
-        let body_line_counts = if lexical_timed_out {
+        let body_line_counts = if khive_storage::request_read_is_cancelled() {
             None
         } else {
             match load_atom_body_line_counts(runtime, &ns, &atom_ids).await? {
@@ -2205,10 +2420,12 @@ impl KnowledgeHandlers {
             attach_body_lines_timeout_degradation(&mut out);
         }
         attach_hydration_degradation(&mut out, hydration_failures);
-        // A lexical-stage or body-line-stage timeout already committed this
-        // call to a degraded response (never a verb-level error, issue #1930)
-        // — re-checking the same expired deadline here would discard it.
-        if !lexical_timed_out && !body_lines_timed_out {
+        // The lexical stage's own budget no longer implies the request
+        // deadline is spent (issue #1930 Amendment 2), so this last check
+        // re-reads the live ambient deadline rather than the stage-local
+        // flags: skip only when the request has actually stopped, never a
+        // verb-level error for a degradation already reported above.
+        if !khive_storage::request_read_is_cancelled() {
             khive_storage::ensure_request_read_active("knowledge.search")?;
         }
         Ok(out)
@@ -2350,11 +2567,12 @@ impl KnowledgeHandlers {
         filter_hits_by_status(&mut hits, &[], SUGGEST_EXCLUDE);
         filter_hits_by_type(&mut hits, Some("domain"));
 
-        // A lexical-stage timeout already committed this call to a degraded,
-        // ANN-backed response — the request read deadline is spent, so
-        // skip further reads/embedding calls rather than let them convert
-        // this into a verb-level error.
-        let fresh_rerank_applied = if lexical_timed_out {
+        // The lexical stage now owns its own budget (issue #1930 Amendment
+        // 2), so `lexical_timed_out` no longer implies the request read
+        // deadline is spent — only that stage's narrower budget is. Gate on
+        // the live ambient deadline instead: a lexical-only degradation
+        // with request time left to spare still gets its embedding rerank.
+        let fresh_rerank_applied = if khive_storage::request_read_is_cancelled() {
             false
         } else {
             rerank_with_embeddings(
@@ -2372,12 +2590,12 @@ impl KnowledgeHandlers {
         hits.truncate(limit);
 
         let domain_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
-        let member_token_sizes = if lexical_timed_out {
+        let member_token_sizes = if khive_storage::request_read_is_cancelled() {
             HashMap::new()
         } else {
             load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?
         };
-        if !lexical_timed_out {
+        if !khive_storage::request_read_is_cancelled() {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
 
@@ -2441,7 +2659,12 @@ impl KnowledgeHandlers {
             attach_lexical_timeout_degradation(&mut out);
         }
         attach_hydration_degradation(&mut out, hydration_failures);
-        if !lexical_timed_out {
+        // The lexical stage's own budget no longer implies the request
+        // deadline is spent (issue #1930 Amendment 2), so this last check
+        // re-reads the live ambient deadline rather than the stage-local
+        // flag: skip only when the request has actually stopped, never a
+        // verb-level error for a degradation already reported above.
+        if !khive_storage::request_read_is_cancelled() {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
         Ok((out, query_embedding))
@@ -3270,6 +3493,271 @@ mod tests {
                 .map(|a| a.slug.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Issue #1930 Amendment 2: the lexical stage's own budget must not
+    /// cancel the rest of the request when it expires. Paused Tokio time
+    /// plus the existing per-term deadline control place the expiry
+    /// deterministically between two term queries, inside a nested
+    /// `scope_request_read_deadline` call mirroring exactly what
+    /// `search_core` does around `fetch_fts_candidates` (a narrow stage
+    /// scope nested inside a much longer outer one).
+    ///
+    /// Before this change, `search_core` called `fetch_fts_candidates`
+    /// directly under whatever deadline the caller installed, so this same
+    /// expiry — with no separate inner scope to pop back out of — left the
+    /// *outer* deadline expired too, and `ensure_request_read_active`
+    /// called afterward, still nested in that one shared scope, returned
+    /// `Err`. Confirmed by running this test against the fetch called
+    /// directly (no stage-budget wrap) before adding the wrap: `still_active`
+    /// came back `Err(Timeout { .. })` — this assertion is the red-before
+    /// case for that call shape; the wrap makes it green.
+    #[tokio::test(start_paused = true)]
+    async fn lexical_stage_budget_expiry_does_not_cancel_the_request() {
+        let _serial = LEXICAL_BUDGET_OVERRIDE_SERIAL.lock().await;
+        set_lexical_stage_budget_override_ms(50);
+        let _reset = LexicalStageBudgetReset;
+
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        const N: u32 = 1_000;
+        const VOCAB: u32 = 20;
+        seed_low_overlap_corpus(&runtime, N, VOCAB).await;
+
+        let query = "term0 term1";
+        let budget = lexical_stage_budget();
+        let outer_deadline = std::time::Duration::from_secs(60);
+
+        let (fetch, still_active) =
+            khive_storage::scope_request_read_deadline(outer_deadline, async {
+                let fetch = khive_storage::scope_request_read_deadline(
+                    budget,
+                    FTS_TEST_DEADLINE_ADVANCE.scope(
+                        FtsTestDeadlineAdvance {
+                            after_completed_terms: 1,
+                            by: budget,
+                        },
+                        fetch_fts_candidates(
+                            &runtime,
+                            "local",
+                            query,
+                            None,
+                            &[],
+                            &[],
+                            CANDIDATE_POOL,
+                        ),
+                    ),
+                )
+                .await
+                .expect("the fetch must not hard-error on its own stage budget");
+
+                let still_active =
+                    khive_storage::ensure_request_read_active("test.lexical_stage_budget");
+                (fetch, still_active)
+            })
+            .await;
+
+        assert!(
+            fetch.timed_out,
+            "the lexical stage's own narrower budget must be observed"
+        );
+        assert!(
+            !fetch.atoms.is_empty(),
+            "candidates from the completed term must survive the stage degradation"
+        );
+        assert!(
+            still_active.is_ok(),
+            "the outer request deadline must still be active once the lexical \
+             stage's own budget expires and its scope returns; got {still_active:?}"
+        );
+    }
+
+    /// Companion pair for issue #1930 Amendment 2's phase-A overfetch/widen
+    /// behavior. A term whose top bm25/rowid page is entirely status-
+    /// ineligible must still surface its eligible rows once widening looks
+    /// past that page — 30 `deprecated` rows are inserted first (lower
+    /// rowids, so they sort first at equal bm25) and 3 `reviewed` rows
+    /// inserted after (higher rowids). `fetch_limit=5` with a single real
+    /// term gives `per_term_limit=5` and a first-round probe of `5*4=20`,
+    /// which the 30 deprecated rows alone fill — round one must see zero
+    /// eligible rows, forcing the widen arm to reach the 3 reviewed rows in
+    /// round two (probe 80, corpus only has 33 total so phase A returns
+    /// fewer than it asked for, correctly stopping further widening).
+    #[tokio::test]
+    async fn phase_b_widening_recovers_eligible_rows_behind_an_ineligible_top_page() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "WITH RECURSIVE x(n) AS ( \
+                          VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 29 \
+                      ) \
+                      INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) \
+                      SELECT \
+                          printf('92000000-0000-0000-0000-%012d', x.n), \
+                          'local', printf('zzwidenzz-dep-%02d', x.n), printf('Widen Dep %02d', x.n), \
+                          'synthetic content about zzwidenzz only', '[]', NULL, 1, \
+                          'deprecated', NULL, NULL, x.n, x.n, NULL \
+                      FROM x"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed deprecated widen rows");
+        writer
+            .execute(SqlStatement {
+                sql: "WITH RECURSIVE x(n) AS ( \
+                          VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 2 \
+                      ) \
+                      INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) \
+                      SELECT \
+                          printf('92100000-0000-0000-0000-%012d', x.n), \
+                          'local', printf('zzwidenzz-ok-%02d', x.n), printf('Widen Ok %02d', x.n), \
+                          'synthetic content about zzwidenzz only', '[]', NULL, 1, \
+                          'reviewed', NULL, NULL, 100 + x.n, 100 + x.n, NULL \
+                      FROM x"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed reviewed widen rows");
+        drop(writer);
+
+        let outcome = fetch_fts_candidates(&runtime, "local", "zzwidenzz", None, &[], &[], 5)
+            .await
+            .expect("fetch must not error");
+
+        assert!(!outcome.timed_out);
+        assert_eq!(
+            outcome.atoms.len(),
+            3,
+            "only the 3 reviewed rows are eligible; widening must have looked \
+             past the all-deprecated first page to find them: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome
+                .atoms
+                .iter()
+                .all(|a| a.slug.starts_with("zzwidenzz-ok-")),
+            "no deprecated row may survive into the eligible set: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Control for the widening test above: a term with genuinely fewer
+    /// matches than `per_term_limit` (2 reviewed rows, cap 5) must return
+    /// exactly those 2 without fabricating more. Phase A's first probe
+    /// (`5*4=20`) already exceeds the corpus size for this term, so it
+    /// returns short on round one and widening never triggers at all — this
+    /// is what proves `phase_a_full` correctly detects exhaustion instead
+    /// of retrying up to the ceiling.
+    #[tokio::test]
+    async fn phase_b_accepts_a_genuine_shortfall_without_widening() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES \
+                      ('92200000-0000-0000-0000-000000000000', 'local', 'zzsparsezz-00', \
+                       'Sparse 00', 'synthetic content about zzsparsezz only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 0, 0, NULL), \
+                      ('92200000-0000-0000-0000-000000000001', 'local', 'zzsparsezz-01', \
+                       'Sparse 01', 'synthetic content about zzsparsezz only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 1, 1, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed sparse rows");
+        drop(writer);
+
+        let outcome = fetch_fts_candidates(&runtime, "local", "zzsparsezz", None, &[], &[], 5)
+            .await
+            .expect("fetch must not error");
+
+        assert!(!outcome.timed_out);
+        assert_eq!(
+            outcome.atoms.len(),
+            2,
+            "a term with only 2 genuinely eligible matches must return exactly \
+             those, not fabricate more via widening: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Phase A carries no namespace predicate (it is index-only); the
+    /// namespace check moves entirely to phase B's hydration query. Seed a
+    /// matching row in another namespace and confirm it is hydrated out —
+    /// never returned — even though phase A's rowid list spans both
+    /// namespaces.
+    #[tokio::test]
+    async fn phase_a_cross_namespace_matches_are_hydrated_out() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES \
+                      ('92300000-0000-0000-0000-000000000000', 'local', 'zzcrossns-local', \
+                       'Cross NS Local', 'synthetic content about zzcrossns only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 0, 0, NULL), \
+                      ('92300000-0000-0000-0000-000000000001', 'other', 'zzcrossns-other', \
+                       'Cross NS Other', 'synthetic content about zzcrossns only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 1, 1, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed cross-namespace rows");
+        drop(writer);
+
+        let outcome = fetch_fts_candidates(&runtime, "local", "zzcrossns", None, &[], &[], 10)
+            .await
+            .expect("fetch must not error");
+
+        assert!(!outcome.timed_out);
+        assert_eq!(
+            outcome.atoms.len(),
+            1,
+            "only the local-namespace row is eligible: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| (a.slug.as_str(), a.namespace.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(outcome.atoms[0].namespace, "local");
+        assert_eq!(outcome.atoms[0].slug, "zzcrossns-local");
     }
 
     #[tokio::test]

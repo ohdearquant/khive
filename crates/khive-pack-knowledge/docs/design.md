@@ -63,6 +63,36 @@
 - `knowledge.cite` creates an `introduced_by` edge from a concept entity to a source entity
   (document, person, or org). The edge direction is concept → source.
 
+### Lexical candidate fetch and stage budget (issue #1930 Amendment 2)
+
+- `fetch_fts_candidates` (`knowledge/search.rs`) runs each FTS5 term in two phases instead of one
+  joined query. Phase A ranks bare rowids off the `fts_knowledge` index only (`bm25()` needs the
+  index and docsize shadow table, not the content row), carrying no namespace predicate because
+  `namespace` is UNINDEXED on that external-content table and filtering on it there would force a
+  content-row fetch per candidate anyway:
+  `SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 ORDER BY bm25(fts_knowledge), rowid LIMIT ?2`.
+  Phase B hydrates only the surviving rowids from `knowledge_atoms` in chunks, applying namespace,
+  soft-delete, status, and type eligibility at that point — the first query in the whole fetch to
+  touch a full atom row (including `content`), and only for rows that already cleared phase A's
+  cap. This closes the read-cost hole where every FTS match paid a scattered read against the
+  whole (multi-gigabyte-scale) atom table before its own per-term `LIMIT` applied.
+- When phase B carries a status or type eligibility predicate, phase A overfetches by
+  `PHASE_A_OVERFETCH_FACTOR` (4x) so an ineligible-heavy top page cannot starve phase B of rows
+  that are eligible further down the bm25 ranking. If phase A still returned a full page and
+  eligible rows remain short of the per-term cap, the probe widens by the same factor once more,
+  up to `PHASE_A_WIDEN_CEILING` (8000) — bounding the worst case to a fixed per-term cost instead
+  of an unbounded retry loop.
+- The lexical fetch runs under its own read-deadline budget (`LEXICAL_STAGE_BUDGET_MS`, 8s),
+  scoped via `khive_storage::scope_request_read_deadline`. Nested deadlines keep whichever is
+  earlier while active and pop back to the outer request deadline once the scope exits, so a
+  lexical-stage timeout narrows only that stage's own budget — it no longer implies the whole
+  request is out of time. `search`, `suggest`, and their decomposed variant gate every downstream
+  step (embedding rerank, body-line counts, member-size pricing) on the live ambient
+  `khive_storage::request_read_is_cancelled()` check rather than the stage-local timeout flag, so a
+  lexical-only degradation with request time left to spare still gets a full rerank pass; the
+  `lexical_timeout` degradation flag is still attached to the response whenever the stage itself
+  timed out, independent of whether the rest of the request completed normally.
+
 ### Schema Ownership (ADR-015, ADR-028)
 
 - Corpus tables (`knowledge_atoms`, `knowledge_domains`) are added in V19 migration.

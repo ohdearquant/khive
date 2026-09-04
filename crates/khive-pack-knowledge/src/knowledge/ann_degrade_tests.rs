@@ -33,7 +33,7 @@ use khive_runtime::{
 };
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // ── fake embedder ─────────────────────────────────────────────────────────────
@@ -201,6 +201,91 @@ fn rt_with_fake_embedder() -> KhiveRuntime {
     .expect("in-memory runtime");
     rt.register_embedder(FakeDimProvider);
     rt
+}
+
+// Counts `EmbeddingService::embed` invocations (not texts) so a test can tell
+// whether an embedding rerank ran at all, distinct from the ANN query embed
+// that always runs first. `runtime.embed_query` and `runtime.embed_batch`
+// both route through this same `embed()` override (neither `FakeDimService`
+// nor this service overrides `embed_with_role`/`embed_query` separately), so
+// each call — one text or many — is exactly one increment.
+struct CountingEmbedder {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl EmbeddingService for CountingEmbedder {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Ok(texts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let v = (i + 1) as f32;
+                let norm = (DIM as f32 * v * v).sqrt();
+                vec![v / norm; DIM]
+            })
+            .collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "counting-dim"
+    }
+}
+
+struct CountingProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl EmbedderProvider for CountingProvider {
+    fn name(&self) -> &str {
+        MODEL_KEY
+    }
+
+    fn dimensions(&self) -> usize {
+        DIM
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(CountingEmbedder {
+            calls: self.calls.clone(),
+        }))
+    }
+}
+
+fn rt_with_counting_embedder() -> (KhiveRuntime, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
+        db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        default_namespace: Namespace::local(),
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "knowledge".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+    })
+    .expect("in-memory runtime");
+    rt.register_embedder(CountingProvider {
+        calls: calls.clone(),
+    });
+    (rt, calls)
 }
 
 fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
@@ -773,6 +858,156 @@ async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
     assert_eq!(
         result["results"][0]["name"], "Degrade Lexical Timeout Domain",
         "the only vector-backed candidate must be the seeded domain; got: {result}"
+    );
+}
+
+/// Issue #1930 Amendment 2: a lexical-stage-*only* timeout (its own narrow
+/// budget expiring, not the request's) must not skip `search`'s embedding
+/// rerank. Unlike the sibling test above, this installs no outer
+/// `scope_request_read_deadline` at all — the only deadline in play is the
+/// tiny lexical-stage-budget override, so once the lexical fetch degrades
+/// and that scope pops back out, the rest of the request runs under a
+/// perfectly healthy (unset) ambient deadline. `CountingEmbedder` proves the
+/// rerank actually ran: the ANN retrieval step always contributes exactly
+/// one `embed()` call, so a second call landing during this `search()`
+/// invocation can only be the rerank's `embed_batch`.
+#[tokio::test]
+async fn search_still_reranks_after_a_lexical_stage_only_timeout() {
+    let _serial = crate::knowledge::search::LEXICAL_BUDGET_OVERRIDE_SERIAL
+        .lock()
+        .await;
+    crate::knowledge::search::set_lexical_stage_budget_override_ms(50);
+    let _reset = crate::knowledge::search::LexicalStageBudgetReset;
+
+    let (rt, calls) = rt_with_counting_embedder();
+    let registry = build_registry(&rt);
+
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "degrade-lexical-budget-atom",
+                    "name": "Degrade Lexical Budget Atom",
+                    "finalized": true,
+                    "content": "lexicalbudgetsentinel transformer retrieval corpus benchmark search latency vector index nearest neighbor ranking fusion embedding cosine similarity attention encoder decoder positional normalization residual connection"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    // Seeded after indexing (like the sibling test above) so these 200K rows
+    // are never embedded — only the lexical stage's own budget pays for
+    // scanning them, long enough to exceed a 50 ms override.
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+
+    let baseline = calls.load(Ordering::Acquire);
+    let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    let result = KnowledgeHandlers::search(&rt, &token, json!({ "query": query }), &ann)
+        .await
+        .expect("search must not Err on a lexical-stage-only timeout");
+
+    assert_eq!(
+        result["degraded"]["lexical_timeout"], true,
+        "search must flag degraded.lexical_timeout when only the lexical \
+         stage's own budget expires; got: {result}"
+    );
+    assert!(
+        result["total"].as_u64().unwrap_or(0) > 0,
+        "the seeded, ANN-indexed atom must still surface as a candidate; got: {result}"
+    );
+    let after = calls.load(Ordering::Acquire);
+    assert!(
+        after > baseline + 1,
+        "an embedding rerank call beyond the single ANN query embed must \
+         still run once the lexical-stage-only timeout returns control to a \
+         healthy ambient deadline; calls before={baseline}, after={after}"
+    );
+}
+
+/// Suggest-side companion to the rerank test above: a lexical-stage-*only*
+/// timeout must not skip member-token pricing either. The seeded domain has
+/// a real member atom (not an empty `members: []` like the sibling test
+/// above, which would report `size: 0` whether pricing ran or not) so a
+/// non-zero `size` is only possible if `load_domain_member_token_sizes`
+/// actually executed.
+#[tokio::test]
+async fn suggest_still_prices_members_after_a_lexical_stage_only_timeout() {
+    let _serial = crate::knowledge::search::LEXICAL_BUDGET_OVERRIDE_SERIAL
+        .lock()
+        .await;
+    crate::knowledge::search::set_lexical_stage_budget_override_ms(50);
+    let _reset = crate::knowledge::search::LexicalStageBudgetReset;
+
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "lexical-budget-member-atom",
+                    "name": "Lexical Budget Member Atom",
+                    "finalized": true,
+                    "content": "a member atom with enough body content to price a non-zero token size for the owning domain once suggest reaches its member-sizing stage after a lexical-stage-only timeout"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert member atom");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [{
+                "slug": "lexical-budget-domain",
+                "name": "Lexical Budget Domain",
+                "description": "a domain seeded so suggest's member-sizing stage has real content to price after a lexical-stage-only timeout, not just an empty members list",
+                "members": ["lexical-budget-member-atom"]
+            }]}),
+        )
+        .await
+        .expect("upsert domain");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+
+    let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    let result = KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann)
+        .await
+        .expect("suggest must not Err on a lexical-stage-only timeout");
+
+    assert_eq!(
+        result["degraded"]["lexical_timeout"], true,
+        "suggest must flag degraded.lexical_timeout when only the lexical \
+         stage's own budget expires; got: {result}"
+    );
+    assert!(
+        result["total"].as_u64().unwrap_or(0) > 0,
+        "the seeded, ANN-indexed domain must still surface as a candidate; got: {result}"
+    );
+    assert_eq!(
+        result["results"][0]["name"], "Lexical Budget Domain",
+        "the only vector-backed candidate must be the seeded domain; got: {result}"
+    );
+    assert!(
+        result["results"][0]["size"].as_u64().unwrap_or(0) > 0,
+        "member token sizing must still run once the lexical-stage-only \
+         timeout returns control to a healthy ambient deadline; got: {result}"
     );
 }
 
