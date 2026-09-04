@@ -474,6 +474,51 @@ The masking uses ADR-115 Amendment 2's permanent `McpDiagnostic` surface. Diagno
 data rather than durable records and can neither consume a manifest exemption nor produce a secret
 gate stamp or exemption-success event.
 
+Every successful KG search also carries `arm_participation` beside `result`;
+`search_incomplete` carries the same object inside `error`:
+
+```json
+{
+  "arm_participation": {
+    "text": { "status": "ran", "candidate_count": 0 },
+    "vector": { "status": "ran", "candidate_count": 8 }
+  }
+}
+```
+
+Each arm status is `ran`, `skipped`, or `error`. `ran` with zero candidates
+means that arm completed but contributed no final hit; `skipped` means it was
+not selected (for example, vector search without a configured embedding model);
+and `error` means that arm itself failed on at least one backend where it was
+selected — including a backend whose _other_ arm completed normally. A backend
+whose text leg completes and whose vector leg alone fails is therefore not
+"missing": it still contributed usable text hits, so it does not appear in
+`missing_backends` or `backend_errors`, and the response keeps
+`status: "complete"`. `arm_participation.vector.status` is the only place that
+failure surfaces on such a response — `text` still reports `"ran"`. A response
+is `"partial"` (with `missing_backends`/`backend_errors`) only when a whole
+backend's search failed outright — auth, timeout, or a failed text leg — not
+merely one of its arms. On such degraded responses, the bounded reason stays in
+`backend_errors`; its `kind` is the single constant `backend_error` in v0.8.0,
+and the two-value `timeout | backend_error` vocabulary of ADR-130 Amendment 2
+ships in v0.9.0. Arm entries do not duplicate those messages. `candidate_count`
+counts final hits
+whose `source` includes the arm, after server filters and the result limit, so a
+`both` hit increments both counts and each count is bounded by `limit`.
+
+This per-arm tolerance applies to the coordinated multi-backend search path,
+for both entity and note substrates. A single-backend deployment (the
+default — no coordinator installed) has no per-backend fan-out to isolate a
+failing arm from: a vector-arm failure there fails the whole search call, and
+the response carries no `arm_participation` at all.
+
+For an entity-name presence check, issue the short bare canonical name and
+require the matching row itself to report `source: "text"` or `"both"`. An
+all-vector response, or text-arm status `error`/`skipped`, is not evidence that
+the name is absent. Long keyword-dense queries may legitimately report text
+`ran` with `candidate_count: 0` because the lexical expression is selective;
+the explicit arm evidence makes that different from a silent skip or failure.
+
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 
 ```json
