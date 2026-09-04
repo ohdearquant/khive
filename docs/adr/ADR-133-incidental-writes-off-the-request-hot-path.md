@@ -770,3 +770,32 @@ resolve independently, the same non-removal contract Amendment 1 established for
 still returns immediately with no audit row to await, and a genuine `IdentityConflict`,
 `StoreFailure`, unsupported-idempotency, or driver terminal failure that resolves before
 `resolution_deadline` still fails the successful dispatch exactly as before.
+
+## Amendment 5 (2026-09-04): Bound the Driver's Own Append, Not Just the Caller's Wait
+
+**Status**: Accepted, implemented for khive#2331.
+
+Amendment 4 left exactly the gap its own text names: bounding how long a _caller_ waits does not
+bound how long the _driver_ holds a stalled generation. `supervisor_loop` drains rows into one
+generation, spawns a child task that calls `EventStore::append_events_idempotent()`, and then
+awaits that child with no timeout of its own. When the call never returns, the loop never returns
+to the top to drain `state.pending` again — every submission arriving after the stall piles up in
+`pending` regardless of whether its own caller is using bounded `submit()` or resolved-wait
+`submit_until_resolved()`, and regardless of whether that caller has already given up. Once
+`pending` reaches `max_pending_rows`, every later submission gets `QueueAdmissionExhausted`, not
+just the row that started the stall — a caller giving up on its own deadline frees nothing, because
+the row it gave up on is never removed from wherever the driver holds it.
+
+`supervisor_loop` now wraps its `child.await` in `tokio::time::timeout`, bounded by a
+`driver_append_deadline` derived from `resolution_deadline` (3x it, not a new config field — see
+the rationale on `driver_append_deadline` in `audit_batch.rs`, which exists to guarantee the driver
+can never race ahead of a `submit_until_resolved` caller's own, more specific
+`ResolutionDeadlineExpired` reason for the same row). If that bound elapses, the generation is
+recorded with the new `AuditTerminalReason::DriverAppendAbandoned`, every waiter on it is resolved
+with that reason, and the loop continues immediately to drain whatever has queued in `pending`
+since — restoring admission capacity for later callers regardless of how the stalled generation
+eventually resolves. The underlying `append_events_idempotent()` call is not cancelled — it may be
+a blocking storage call that cannot be safely aborted mid-write — so it is handed to a detached
+task that drives it to completion and discards whatever it eventually returns; no waiter is still
+listening for that result. As with `ResolutionDeadlineExpired`, the caller's already-committed
+domain effect is never retried and the row is never re-enqueued.

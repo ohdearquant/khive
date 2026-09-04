@@ -46,6 +46,7 @@ unicode-general-category = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+khive-runtime = { path = ".", features = ["fault-injection", "test-internals"] }
 khive-gate-rego = { version = "0.8.0", path = "../khive-gate-rego" }
 khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }

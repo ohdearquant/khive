@@ -162,6 +162,23 @@ pub enum AuditTerminalReason {
     /// terminally consistent afterward (`in_flight` still set, or the
     /// generation's rows were never resolved).
     DriverExitedInconsistent,
+    /// The driver's own bound on a single generation's
+    /// `EventStore::append_events_idempotent()` call
+    /// (`supervisor_loop`'s `driver_append_deadline`) elapsed while that
+    /// call was still in flight. Unlike [`Self::AdmissionDeadlineExpired`]
+    /// and [`Self::ResolutionDeadlineExpired`], which bound only how long a
+    /// *caller* keeps waiting while the row stays wherever the driver holds
+    /// it, this bounds the driver's own hold: every waiter on the abandoned
+    /// generation is resolved with this reason and the generation is
+    /// removed from the driver's in-flight state, so a stalled store call
+    /// cannot pin `pending` at `max_pending_rows` and starve all later
+    /// admission (khive#2331). The underlying append is not cancelled — it
+    /// may not be safely cancellable mid-flight — so it is left to run to
+    /// completion in the background and its eventual result, whatever it
+    /// is, is discarded; no waiter is still listening for it. The caller's
+    /// domain effect (if any already committed before this row was
+    /// enqueued) is never retried, and the row is never re-enqueued.
+    DriverAppendAbandoned,
 }
 
 /// One row accepted for batching: the immutable event identity plus the
@@ -212,6 +229,13 @@ pub struct AuditBatchConfig {
     /// forever, exhausting both request and audit capacity (khive#2331).
     /// Must be at least `admission_deadline` — validated (debug-only) in
     /// [`AuditBatch::new`]. Defaults to 6x `admission_deadline`.
+    ///
+    /// Also the single source value the driver's own per-generation append
+    /// bound (`supervisor_loop`'s `driver_append_deadline`) is derived from
+    /// — that bound exists so a stalled append cannot keep the driver from
+    /// ever draining `pending` again, which is what actually exhausts
+    /// admission for every later caller, not just the one already waiting
+    /// on the stuck row. See [`AuditTerminalReason::DriverAppendAbandoned`].
     pub resolution_deadline: Duration,
 }
 
@@ -443,6 +467,23 @@ enum GenerationResult {
     /// check actually runs.
     #[cfg_attr(not(any(test, feature = "fault-injection")), allow(dead_code))]
     FakedInconsistent,
+}
+
+/// The driver's own bound on how long `supervisor_loop` waits for one
+/// generation's `run_generation` child task before abandoning it
+/// (khive#2331; see [`AuditTerminalReason::DriverAppendAbandoned`]).
+///
+/// Derived from `resolution_deadline` rather than a second config field, at
+/// 3x it. That margin is load-bearing, not arbitrary: `AuditBatch::new`
+/// already enforces `resolution_deadline >= admission_deadline`, so the
+/// worst-case *caller*-side wait for a `submit_until_resolved` row —
+/// `admission_deadline` then `resolution_deadline` in sequence — is always
+/// `<= 2 * resolution_deadline`. Bounding the driver at `3 *
+/// resolution_deadline` guarantees it can never resolve a still-waiting
+/// caller's row with `DriverAppendAbandoned` ahead of that caller's own,
+/// more specific `ResolutionDeadlineExpired` reason.
+fn driver_append_deadline(config: &AuditBatchConfig) -> Duration {
+    config.resolution_deadline.saturating_mul(3)
 }
 
 async fn run_generation(
@@ -684,7 +725,7 @@ async fn supervisor_loop(
             .map(|w| w.event.clone())
             .collect();
 
-        let child: JoinHandle<GenerationResult> =
+        let mut child: JoinHandle<GenerationResult> =
             tokio::spawn(run_generation(store.clone(), events, config.clone()));
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -698,7 +739,51 @@ async fn supervisor_loop(
             continue;
         }
 
-        let join_result = child.await;
+        let append_deadline = driver_append_deadline(&config);
+        let join_result = match tokio::time::timeout(append_deadline, &mut child).await {
+            Ok(join_result) => join_result,
+            Err(_elapsed) => {
+                // The append is still in flight and may not be safely
+                // cancellable mid-write (a blocking storage call cannot be
+                // forced to stop), so `child` is not aborted here — it is
+                // handed to a detached reaper that drives it to completion
+                // and discards whatever it eventually returns. Every waiter
+                // on this generation is resolved now, and the driver loops
+                // back to `pending` immediately instead of staying pinned on
+                // this one stalled call, which is what actually starves
+                // later admission (khive#2331).
+                tracing::warn!(
+                    ?append_deadline,
+                    "audit generation append exceeded the driver's own bound; abandoning \
+                     this generation so admission capacity recovers for later callers"
+                );
+                let waiting = guard.disarm();
+                let submitted = waiting.len() as u64;
+                {
+                    let mut state = inner.state.lock();
+                    state.in_flight_generation = None;
+                    state.flush_failures += 1;
+                    let generation_id = state.next_generation_id.saturating_sub(1);
+                    state.generations.push(AuditGenerationSnapshot {
+                        generation_id,
+                        submitted_rows: submitted,
+                        committed_rows: 0,
+                        store_batch_calls: 0,
+                        terminal_reason: Some(AuditTerminalReason::DriverAppendAbandoned),
+                    });
+                }
+                for w in waiting {
+                    record_degradation_if_pure(&inner, w.producer);
+                    let _ = w
+                        .responder
+                        .send(Err(AuditTerminalReason::DriverAppendAbandoned));
+                }
+                tokio::spawn(async move {
+                    let _ = child.await;
+                });
+                continue;
+            }
+        };
         match join_result {
             Err(join_err) => {
                 let reason = if join_err.is_panic() {

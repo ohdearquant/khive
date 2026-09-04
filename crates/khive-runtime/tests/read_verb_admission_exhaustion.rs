@@ -23,7 +23,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::audit_batch::{
-    fault_injection, AuditBatchConfig, AuditBatchControl, AuditProducer, PreparedAuditRow,
+    fault_injection, AuditBatch, AuditBatchConfig, AuditBatchControl, AuditCommitOutcome,
+    AuditProducer, AuditTerminalReason, PreparedAuditRow,
 };
 use khive_runtime::pack::{
     audit_admission_refused_obligation_count, audit_admission_unresolved_obligation_count,
@@ -622,6 +623,182 @@ async fn concurrent_write_verbs_all_give_up_after_resolution_deadline() {
     assert_eq!(
         after.pending_rows, 0,
         "no row is pushed back onto the pending queue after its caller gives up"
+    );
+}
+
+/// khive#2331: `AdmissionDeadlineExpired`/`ResolutionDeadlineExpired` bound
+/// only how long a *caller* waits for a row's outcome — the row itself
+/// stays exactly where the driver holds it, by design (see both tests
+/// above). Before this fix, that meant a permanently stalled
+/// `EventStore::append_events_idempotent()` call could pin the driver
+/// inside one generation's `child.await` forever: `supervisor_loop` never
+/// loops back to drain `state.pending` again, so every row still arriving
+/// piles up there until `max_pending_rows` is reached, and every
+/// submission after that gets `QueueAdmissionExhausted` — including ones
+/// that have nothing to do with the original stalled generation. Giving up
+/// as a caller does not free the slot: the row is left enqueued regardless.
+///
+/// Red before the fix: the driver never abandons the stuck generation, so
+/// `pending_rows` never returns to 0 and the final `submit()` below hangs
+/// at `QueueAdmissionExhausted` forever (this test's own 5s outer timeouts
+/// would fail it instead of letting it hang the suite).
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn driver_deadline_recovers_admission_capacity_from_a_stalled_generation() {
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let store = Arc::new(MemoryEventStore {
+        append_started: Some(Arc::clone(&append_started)),
+        // Never notified: every `append_events_idempotent` call blocks
+        // forever, for every generation the driver ever spawns, not just
+        // the first.
+        append_release: Some(Arc::new(tokio::sync::Notify::new())),
+        ..MemoryEventStore::default()
+    });
+    let batch = AuditBatch::new(
+        store,
+        AuditBatchConfig {
+            admission_deadline: std::time::Duration::from_millis(20),
+            resolution_deadline: std::time::Duration::from_millis(30),
+            max_pending_rows: std::num::NonZeroUsize::new(2).unwrap(),
+            ..AuditBatchConfig::default()
+        },
+    );
+
+    // Occupant: drained into generation 1 immediately, which then stalls
+    // forever on the store call.
+    let occupant_batch = batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.occupant"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("generation 1 reaches the blocking store");
+
+    // Two more rows fill `pending` to its configured 2-row capacity while
+    // generation 1 is stuck. (a): each times out on its own
+    // `admission_deadline` — a caller giving up — but per the documented
+    // contract stays enqueued for the driver to resolve.
+    let mut fillers = Vec::new();
+    for i in 0..2 {
+        let b = batch.clone();
+        fillers.push(tokio::spawn(async move {
+            b.submit(PreparedAuditRow {
+                event: mk_event(&format!("kg.filler{i}")),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+        }));
+    }
+    for f in fillers {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), f)
+            .await
+            .expect("filler resolves within its own admission deadline instead of hanging")
+            .expect("filler task joins");
+        assert_eq!(
+            result,
+            Err(AuditTerminalReason::AdmissionDeadlineExpired),
+            "each filler gives up on its own admission_deadline, but its row is left enqueued"
+        );
+    }
+
+    // Capacity is still exhausted by rows the stuck driver has not drained,
+    // even though both fillers' own callers already gave up above — proving
+    // a caller giving up does not, by itself, free anything.
+    let refused = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.refused"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(
+        refused,
+        Err(AuditTerminalReason::QueueAdmissionExhausted),
+        "pending is still full of rows the stuck driver has not drained"
+    );
+
+    // (b): once the driver's own per-generation bound elapses (3x
+    // `resolution_deadline` = 90ms here), it abandons generation 1 and loops
+    // back to drain the two filler rows into generation 2 — which stalls
+    // the same way, but draining `pending` is what frees admission.
+    wait_until(std::time::Duration::from_secs(5), || {
+        batch.test_snapshot().pending_rows == 0
+    })
+    .await;
+    let abandoned = batch
+        .test_snapshot()
+        .per_generation
+        .iter()
+        .filter(|g| g.terminal_reason == Some(AuditTerminalReason::DriverAppendAbandoned))
+        .count();
+    assert!(
+        abandoned >= 1,
+        "generation 1 must be recorded as DriverAppendAbandoned once the driver gives up on it"
+    );
+
+    // (a) continued: a fresh row is admitted (pushed onto `pending`) again,
+    // not synchronously refused — the bug this test guards against.
+    let fresh_batch = batch.clone();
+    let fresh = tokio::spawn(async move {
+        fresh_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.fresh"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snap = batch.test_snapshot();
+        snap.pending_rows >= 1 || snap.in_flight_generation.is_some()
+    })
+    .await;
+
+    drop(occupant);
+    drop(fresh);
+}
+
+/// Control for the fix above: an append that completes well inside the
+/// driver's own per-generation bound must be entirely unaffected by the new
+/// timeout wrapper around it — it still commits normally, through the same
+/// code path as every pre-existing (non-stalling) test in this crate, and
+/// leaves no `DriverAppendAbandoned` generation behind.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn normal_append_inside_driver_deadline_is_unaffected() {
+    let store = Arc::new(MemoryEventStore::default());
+    let batch = AuditBatch::new(
+        store,
+        AuditBatchConfig {
+            admission_deadline: std::time::Duration::from_millis(20),
+            resolution_deadline: std::time::Duration::from_millis(30),
+            ..AuditBatchConfig::default()
+        },
+    );
+    let before = batch.test_snapshot();
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.normal"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Ok(AuditCommitOutcome::Committed));
+    let after = batch.test_snapshot();
+    assert_eq!(after.pending_rows, 0);
+    let new_generations = &after.per_generation[before.per_generation.len()..];
+    assert!(
+        !new_generations.is_empty(),
+        "the committed row must have produced a generation record"
+    );
+    assert!(
+        new_generations.iter().all(|g| g.terminal_reason.is_none()),
+        "a normal, fast append must commit cleanly, never as DriverAppendAbandoned: \
+         {new_generations:?}"
     );
 }
 
