@@ -63,7 +63,7 @@
 - `knowledge.cite` creates an `introduced_by` edge from a concept entity to a source entity
   (document, person, or org). The edge direction is concept → source.
 
-### Lexical candidate fetch and stage budget (issue #1930 Amendment 2)
+### Lexical candidate fetch and stage budget (issue #1930 Amendment 2, issue #2396)
 
 - `fetch_fts_candidates` (`knowledge/search.rs`) runs each FTS5 term in two phases instead of one
   joined query. Phase A ranks bare rowids off the `fts_knowledge` index only (`bm25()` needs the
@@ -75,13 +75,36 @@
   soft-delete, status, and type eligibility at that point — the first query in the whole fetch to
   touch a full atom row (including `content`), and only for rows that already cleared phase A's
   cap. This closes the read-cost hole where every FTS match paid a scattered read against the
-  whole (multi-gigabyte-scale) atom table before its own per-term `LIMIT` applied.
+  whole (multi-gigabyte-scale) atom table before its own per-term `LIMIT` applied. The hydration
+  statement (`phase_b_hydration_statement`) filters on `+a.namespace = ?1` — a unary-plus, not a
+  bare equality — for the same reason as the sibling `hydrate_atoms_statement`/
+  `hydrate_domains_statement`: this codebase never runs `ANALYZE` on `knowledge_atoms`, so the
+  no-statistics planner prefers `idx_knowledge_atoms_ns` over the rowid primary key for a large
+  `rowid IN (...)` list; the unary plus defeats that index without changing the predicate.
 - When phase B carries a status or type eligibility predicate, phase A overfetches by
   `PHASE_A_OVERFETCH_FACTOR` (4x) so an ineligible-heavy top page cannot starve phase B of rows
   that are eligible further down the bm25 ranking. If phase A still returned a full page and
   eligible rows remain short of the per-term cap, the probe widens by the same factor once more,
   up to `PHASE_A_WIDEN_CEILING` (8000) — bounding the worst case to a fixed per-term cost instead
-  of an unbounded retry loop.
+  of an unbounded retry loop. If widening reaches the ceiling and the eligible set is _still_
+  short, the term falls back once to the pre-two-phase eligibility-scoped join (bm25 over
+  `fts_knowledge` joined to `knowledge_atoms` with every predicate applied before its own
+  per-term `LIMIT`) so more than `PHASE_A_WIDEN_CEILING` ineligible top-ranked rows can never hide
+  a real candidate — this fallback trades the bounded-cost guarantee for correctness on the rare
+  term pathological enough to exhaust the ceiling.
+- When no term produces an eligible row, the empty-result fallback (a bounded, namespace-filtered
+  full scan of `knowledge_atoms` ordered by recency) is gated on namespace-scoped evidence only: a
+  chunked `SELECT 1 FROM knowledge_atoms WHERE rowid IN (...) AND namespace = ?1 LIMIT 1` over the
+  rowids every term's phase A already fetched, never a second, unscoped `fts_knowledge` probe. An
+  unscoped probe is a cross-namespace existence oracle — a caller in namespace A whose term exists
+  only in namespace B would see the fallback suppressed (empty result) exactly as for a term that
+  exists nowhere, while a caller whose term genuinely matches nothing still falls through to the
+  fallback's rows; the two cases must be indistinguishable by response shape.
+- Both `PHASE_A_WIDEN_CEILING` and `LEXICAL_STAGE_BUDGET_MS` (below) have test-only overrides
+  (`with_phase_a_widen_ceiling_override`, `with_lexical_stage_budget_override_ms`) implemented as
+  `tokio::task_local!` values scoped to the calling task, mirroring
+  `khive_storage::scope_request_read_deadline`'s own mechanism — never a process-global `AtomicU64`,
+  which a concurrently running test with no override of its own could observe.
 - The lexical fetch runs under its own read-deadline budget (`LEXICAL_STAGE_BUDGET_MS`, 8s),
   scoped via `khive_storage::scope_request_read_deadline`. Nested deadlines keep whichever is
   earlier while active and pop back to the outer request deadline once the scope exits, so a
@@ -92,6 +115,16 @@
   lexical-only degradation with request time left to spare still gets a full rerank pass; the
   `lexical_timeout` degradation flag is still attached to the response whenever the stage itself
   timed out, independent of whether the rest of the request completed normally.
+- `load_domain_member_token_sizes` (member-token pricing for `suggest`'s `results[].size`) returns
+  a `(HashMap<String, usize>, bool)` — the `bool` marks whether the whole batch timed out before
+  any domain could be measured. A single `query_all` call has no partial-completion state, so one
+  flag covers every domain in the batch; a genuinely zero-member domain and an unmeasured one are
+  otherwise indistinguishable in the plain map. `suggest` never serializes `size: 0` for an
+  unmeasured domain — it serializes `null` and lists the domain under
+  `degraded.member_sizing_timeout.domain_ids`. `FoldCandidate::size` (`knowledge.fold`) is a
+  non-optional `usize`, so a caller that feeds `suggest`'s `results` straight into a `fold` call
+  gets a hard parse error on a `null` size instead of `fold` silently admitting an unpriced domain
+  as a free item — the intended fail-closed behavior.
 
 ### Schema Ownership (ADR-015, ADR-028)
 

@@ -861,6 +861,82 @@ async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
     );
 }
 
+/// Issue #2396 fix 3: same outer-deadline shape as the test above, but the
+/// seeded domain has a real member atom, so a real (non-zero) size would be
+/// computed if member sizing ran. The expired ambient deadline skips member
+/// sizing entirely (the same `request_read_is_cancelled()` guard that skips
+/// the embedding rerank), and that must be reported as `size: null` plus a
+/// `degraded.member_sizing_timeout` entry — never `size: 0`, which would let
+/// a caller pass this domain into `knowledge.fold` as a free item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lexical_timeout_reports_member_sizing_as_unmeasured_not_zero() {
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "degrade-sizing-member-atom",
+                    "name": "Degrade Sizing Member Atom",
+                    "finalized": true,
+                    "content": "enough body content to price a non-zero token size for the owning domain if member sizing ever ran to completion"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert member atom");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [{
+                "slug": "degrade-sizing-domain",
+                "name": "Degrade Sizing Domain",
+                "description": "a domain with a real member atom, so a real (non-zero) size would be computed if member sizing ran, proving a timeout is reported as unmeasured rather than a coincidental zero",
+                "members": ["degrade-sizing-member-atom"]
+            }]}),
+        )
+        .await
+        .expect("upsert domain");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    // Seeded after indexing, like the sibling tests above, so these 200K
+    // rows are never embedded — only the lexical stage's own read pays for
+    // scanning them, long enough to exceed the outer deadline below.
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+
+    let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    let deadline = std::time::Duration::from_millis(200);
+    let result = khive_storage::scope_request_read_deadline(
+        deadline,
+        KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+    )
+    .await
+    .expect("suggest must not Err on a lexical-stage read timeout");
+
+    assert_eq!(result["degraded"]["lexical_timeout"], true, "got: {result}");
+    assert!(
+        result["results"][0]["size"].is_null(),
+        "an unmeasured domain's size must serialize as null, never 0; got: {result}"
+    );
+    let unmeasured = result["degraded"]["member_sizing_timeout"]["domain_ids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        unmeasured.len(),
+        1,
+        "the degradation entry must list the unmeasured domain; got: {result}"
+    );
+}
+
 /// Issue #1930 Amendment 2: a lexical-stage-*only* timeout (its own narrow
 /// budget expiring, not the request's) must not skip `search`'s embedding
 /// rerank. Unlike the sibling test above, this installs no outer
@@ -873,12 +949,6 @@ async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
 /// invocation can only be the rerank's `embed_batch`.
 #[tokio::test]
 async fn search_still_reranks_after_a_lexical_stage_only_timeout() {
-    let _serial = crate::knowledge::search::LEXICAL_BUDGET_OVERRIDE_SERIAL
-        .lock()
-        .await;
-    crate::knowledge::search::set_lexical_stage_budget_override_ms(50);
-    let _reset = crate::knowledge::search::LexicalStageBudgetReset;
-
     let (rt, calls) = rt_with_counting_embedder();
     let registry = build_registry(&rt);
 
@@ -911,9 +981,11 @@ async fn search_still_reranks_after_a_lexical_stage_only_timeout() {
 
     let baseline = calls.load(Ordering::Acquire);
     let query = "term0 term1 term2 term3 term4 term5 term6 term7";
-    let result = KnowledgeHandlers::search(&rt, &token, json!({ "query": query }), &ann)
-        .await
-        .expect("search must not Err on a lexical-stage-only timeout");
+    let result = crate::knowledge::search::with_lexical_stage_budget_override_ms(50, async {
+        KnowledgeHandlers::search(&rt, &token, json!({ "query": query }), &ann).await
+    })
+    .await
+    .expect("search must not Err on a lexical-stage-only timeout");
 
     assert_eq!(
         result["degraded"]["lexical_timeout"], true,
@@ -941,12 +1013,6 @@ async fn search_still_reranks_after_a_lexical_stage_only_timeout() {
 /// actually executed.
 #[tokio::test]
 async fn suggest_still_prices_members_after_a_lexical_stage_only_timeout() {
-    let _serial = crate::knowledge::search::LEXICAL_BUDGET_OVERRIDE_SERIAL
-        .lock()
-        .await;
-    crate::knowledge::search::set_lexical_stage_budget_override_ms(50);
-    let _reset = crate::knowledge::search::LexicalStageBudgetReset;
-
     let rt = rt_with_fake_embedder();
     let registry = build_registry(&rt);
 
@@ -987,9 +1053,11 @@ async fn suggest_still_prices_members_after_a_lexical_stage_only_timeout() {
     let token = rt.authorize(Namespace::local()).expect("authorize");
 
     let query = "term0 term1 term2 term3 term4 term5 term6 term7";
-    let result = KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann)
-        .await
-        .expect("suggest must not Err on a lexical-stage-only timeout");
+    let result = crate::knowledge::search::with_lexical_stage_budget_override_ms(50, async {
+        KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann).await
+    })
+    .await
+    .expect("suggest must not Err on a lexical-stage-only timeout");
 
     assert_eq!(
         result["degraded"]["lexical_timeout"], true,

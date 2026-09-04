@@ -319,8 +319,7 @@ fn quote_fts5_phrase(raw_query: &str) -> String {
 
 /// Build the per-term FTS5 match clauses the candidate fetch runs bounded
 /// subqueries over — one quoted phrase per de-duplicated, non-stop, expanded
-/// term. Queries with no scoreable term fall back to the exact raw phrase
-/// (same fallback `fts5_candidate_expression` uses).
+/// term. Queries with no scoreable term fall back to the exact raw phrase.
 ///
 /// FTS is only the candidate generator; TF-IDF remains the ranker. Requiring
 /// the whole raw query as one phrase drops candidates whose matching terms are
@@ -343,15 +342,6 @@ fn fts5_candidate_terms(raw_query: &str) -> Vec<String> {
         let _ = expand_terms(&mut terms);
         terms.iter().map(|term| quote_fts5_phrase(term)).collect()
     }
-}
-
-/// The OR-joined form of [`fts5_candidate_terms`], used only for the cheap
-/// unordered existence probe in `fetch_fts_candidates` (no `ORDER BY bm25`,
-/// `LIMIT 1`) — never as the ordered candidate query itself. See issue #1930:
-/// running that ordered query over the full OR-joined match set is what made
-/// `knowledge.suggest`/`knowledge.search` blow the read deadline at scale.
-fn fts5_candidate_expression(raw_query: &str) -> String {
-    fts5_candidate_terms(raw_query).join(" OR ")
 }
 
 /// SQL eligibility predicate for the public atom/domain kind filter.
@@ -402,49 +392,57 @@ const PHASE_A_WIDEN_CEILING: usize = 8000;
 /// itself is out of time — only that this one stage's own budget is.
 pub(crate) const LEXICAL_STAGE_BUDGET_MS: u64 = 8_000;
 
-// ── Test-only seam: override the lexical-stage budget ────────────────────────
+// ── Test-only seam: override the lexical-stage budget and the phase-A widen
+// ceiling ──────────────────────────────────────────────────────────────────
 //
-// Zero means use the production default (`LEXICAL_STAGE_BUDGET_MS`). Tests
-// set this to a small value so a controlled-deadline test does not depend on
-// a real multi-second wall-clock wait (mirrors
-// `vamana::warm_wait_timeout_ms`'s override seam).
-static LEXICAL_STAGE_BUDGET_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+// Both overrides ride the same request-scoped `tokio::task_local!` mechanism
+// `khive_storage::scope_request_read_deadline` already uses for the read
+// deadline (issue #2396 fix 4). A task-local override is visible only to the
+// task it is scoped around, so two tests running concurrently under Cargo's
+// parallel runner can never observe each other's override the way the prior
+// process-global `AtomicU64` could — there is nothing shared left to reset
+// on drop or serialize with a mutex.
+tokio::task_local! {
+    static LEXICAL_STAGE_BUDGET_OVERRIDE_MS: u64;
+    static PHASE_A_WIDEN_CEILING_OVERRIDE: usize;
+}
 
 fn lexical_stage_budget() -> std::time::Duration {
-    let o = LEXICAL_STAGE_BUDGET_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
-    std::time::Duration::from_millis(if o > 0 { o } else { LEXICAL_STAGE_BUDGET_MS })
+    let ms = LEXICAL_STAGE_BUDGET_OVERRIDE_MS
+        .try_with(|ms| *ms)
+        .unwrap_or(LEXICAL_STAGE_BUDGET_MS);
+    std::time::Duration::from_millis(ms)
 }
 
-/// Set the lexical-stage budget override for tests. Pass `0` to restore the
-/// production default (`LEXICAL_STAGE_BUDGET_MS`).
-#[cfg(test)]
-pub(crate) fn set_lexical_stage_budget_override_ms(ms: u64) {
-    LEXICAL_STAGE_BUDGET_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+fn phase_a_widen_ceiling() -> usize {
+    PHASE_A_WIDEN_CEILING_OVERRIDE
+        .try_with(|ceiling| *ceiling)
+        .unwrap_or(PHASE_A_WIDEN_CEILING)
 }
 
-/// RAII guard: reset the lexical-stage budget override when a test exits
-/// (even on panic). `pub(crate)` (not scoped to `mod tests` below) so the
+/// Scope `future` to a lexical-stage budget override, so a test can force a
+/// controlled deadline instead of depending on a real multi-second wall-clock
+/// wait against the production default (mirrors `vamana::warm_wait_timeout_ms`'s
+/// override seam). `pub(crate)` (not scoped to `mod tests` below) so the
 /// handler-level degrade tests in `ann_degrade_tests.rs` can reuse it.
 #[cfg(test)]
-pub(crate) struct LexicalStageBudgetReset;
-
-#[cfg(test)]
-impl Drop for LexicalStageBudgetReset {
-    fn drop(&mut self) {
-        set_lexical_stage_budget_override_ms(0);
-    }
+pub(crate) async fn with_lexical_stage_budget_override_ms<F>(ms: u64, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    LEXICAL_STAGE_BUDGET_OVERRIDE_MS.scope(ms, future).await
 }
 
-/// Serializes tests that mutate the process-global lexical-stage-budget
-/// override — same rationale as `ann_degrade_tests`'s
-/// `TIMEOUT_OVERRIDE_SERIAL` for `vamana`'s warm-wait override: under
-/// Cargo's parallel test runner, one test's reset-on-drop could otherwise
-/// fire mid-flight for another. `pub(crate)` for the same cross-file reuse
-/// as [`LexicalStageBudgetReset`].
+/// Scope `future` to a phase-A widen-ceiling override, so a test can shrink
+/// the ceiling far below `PHASE_A_WIDEN_CEILING` and reach the ceiling-
+/// exhaustion fallback (fix 2) with a small fixture.
 #[cfg(test)]
-pub(crate) static LEXICAL_BUDGET_OVERRIDE_SERIAL: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
+pub(crate) async fn with_phase_a_widen_ceiling_override<F>(ceiling: usize, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    PHASE_A_WIDEN_CEILING_OVERRIDE.scope(ceiling, future).await
+}
 
 /// Outcome of the bounded lexical candidate fetch.
 ///
@@ -566,10 +564,11 @@ async fn fetch_fts_candidates(
         .0
         .is_empty()
         || !type_clause.is_empty();
+    let widen_ceiling = phase_a_widen_ceiling();
     let base_probe_limit = if has_eligibility_clause {
         per_term_limit
             .saturating_mul(PHASE_A_OVERFETCH_FACTOR)
-            .min(PHASE_A_WIDEN_CEILING)
+            .min(widen_ceiling)
     } else {
         per_term_limit
     };
@@ -580,12 +579,16 @@ async fn fetch_fts_candidates(
     // of a query at all). Each term's rows are collected independently and
     // merged round-robin below, so no single term can crowd out the rest.
     let mut per_term_rows: Vec<Vec<Atom>> = Vec::with_capacity(terms.len());
+    // Every phase-A rowid window each term probed, kept only to decide the
+    // full-scan fallback below from namespace-scoped evidence (fix 1) —
+    // never re-queried against FTS a second time.
+    let mut term_probe_rowids: Vec<Vec<i64>> = Vec::with_capacity(terms.len());
     let mut term_query_timed_out = false;
 
     'terms: for term in &terms {
         let mut probe_limit = base_probe_limit;
 
-        let mut eligible: Vec<Atom> = loop {
+        let (mut eligible, probed_rowids): (Vec<Atom>, Vec<i64>) = loop {
             let phase_a_rows = match reader
                 .query_all(SqlStatement {
                     sql: "SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
@@ -612,36 +615,19 @@ async fn fetch_fts_candidates(
                 .collect();
             let phase_a_full = rowids.len() >= probe_limit;
             if rowids.is_empty() {
-                break Vec::new();
+                break (Vec::new(), rowids);
             }
 
             let mut atoms_by_rowid: HashMap<i64, Atom> = HashMap::with_capacity(rowids.len());
             for chunk in rowids.chunks(HYDRATION_ID_CHUNK) {
-                let rowid_placeholders = chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("?{}", i + 2))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let (chunk_status_clause, chunk_status_params) =
-                    status_sql_clause(statuses, exclude_statuses, 2 + chunk.len());
-                let mut params = vec![SqlValue::Text(ns.to_owned())];
-                params.extend(chunk.iter().map(|rowid| SqlValue::Integer(*rowid)));
-                params.extend(chunk_status_params);
-                let hydrate_sql = format!(
-                    "SELECT a.*, a.rowid AS rowid FROM knowledge_atoms AS a \
-                     WHERE a.rowid IN ({rowid_placeholders}) \
-                       AND a.namespace = ?1 \
-                       AND a.deleted_at IS NULL{chunk_status_clause}{type_clause}"
+                let statement = phase_b_hydration_statement(
+                    ns,
+                    chunk,
+                    statuses,
+                    exclude_statuses,
+                    type_clause.as_str(),
                 );
-                let rows = match reader
-                    .query_all(SqlStatement {
-                        sql: hydrate_sql,
-                        params,
-                        label: None,
-                    })
-                    .await
-                {
+                let rows = match reader.query_all(statement).await {
                     Ok(rows) => rows,
                     Err(e) if is_timeout(&e) => {
                         term_query_timed_out = true;
@@ -669,21 +655,66 @@ async fn fetch_fts_candidates(
             // probe) and only up to the ceiling; a term that is genuinely
             // exhausted (phase A returned less than it asked for) has
             // nothing more to gain from a wider probe.
-            if has_eligibility_clause
-                && eligible_now.len() < per_term_limit
-                && phase_a_full
-                && probe_limit < PHASE_A_WIDEN_CEILING
-            {
-                probe_limit = probe_limit
-                    .saturating_mul(PHASE_A_OVERFETCH_FACTOR)
-                    .min(PHASE_A_WIDEN_CEILING);
-                continue;
+            if has_eligibility_clause && eligible_now.len() < per_term_limit && phase_a_full {
+                if probe_limit < widen_ceiling {
+                    probe_limit = probe_limit
+                        .saturating_mul(PHASE_A_OVERFETCH_FACTOR)
+                        .min(widen_ceiling);
+                    continue;
+                }
+
+                // Ceiling exhausted and still short: more than `widen_ceiling`
+                // ineligible top-ranked rows could still be hiding an
+                // eligible one further down the bm25 ranking than phase A
+                // ever probed. Pay once for the pre-#2396-shape eligibility-
+                // scoped join, bounded to this term's own `per_term_limit`,
+                // so the ceiling bounds cost without letting an ineligible-
+                // heavy match set hide a real candidate (issue #2396 fix 2).
+                let (scoped_status_clause, scoped_status_params) =
+                    status_sql_clause(statuses, exclude_statuses, 4);
+                let scoped_sql = format!(
+                    "SELECT a.* FROM fts_knowledge \
+                     JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+                     WHERE fts_knowledge MATCH ?1 \
+                       AND a.namespace = ?2 \
+                       AND a.deleted_at IS NULL{scoped_status_clause}{type_clause} \
+                     ORDER BY bm25(fts_knowledge), a.rowid \
+                     LIMIT ?3"
+                );
+                let mut scoped_params = vec![
+                    SqlValue::Text(term.clone()),
+                    SqlValue::Text(ns.to_owned()),
+                    SqlValue::Integer(per_term_limit as i64),
+                ];
+                scoped_params.extend(scoped_status_params);
+                let scoped_rows = match reader
+                    .query_all(SqlStatement {
+                        sql: scoped_sql,
+                        params: scoped_params,
+                        label: None,
+                    })
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) if is_timeout(&e) => {
+                        term_query_timed_out = true;
+                        break 'terms;
+                    }
+                    Err(e) => {
+                        return Err(sql_err("search fts eligibility-scoped ceiling fallback", e));
+                    }
+                };
+                break (
+                    scoped_rows.iter().filter_map(atom_from_row).collect(),
+                    rowids,
+                );
             }
-            break eligible_now;
+            break (eligible_now, rowids);
         };
 
         eligible.truncate(per_term_limit);
         per_term_rows.push(eligible);
+        term_probe_rowids.push(probed_rowids);
         #[cfg(test)]
         advance_fts_test_deadline_after_term(per_term_rows.len()).await;
     }
@@ -722,35 +753,64 @@ async fn fetch_fts_candidates(
     // meaning: it is for a lexical miss, not for a lexical match whose rows
     // were all ineligible. In the latter case an empty result is correct; a
     // full scan could otherwise admit unrelated zero-score rows when
-    // min_score is the default 0. This probe has no ORDER BY and LIMIT 1, so
-    // it stays cheap even over the OR-joined expression.
+    // min_score is the default 0.
     //
-    // The namespace predicate is dropped here too, for the same reason
-    // phase A drops it: `namespace` is UNINDEXED on this external-content
-    // table, so filtering on it forces a content-row fetch per candidate. A
-    // cross-namespace positive only means the full-scan fallback below is
-    // not taken — it cannot admit a cross-namespace row into the result,
-    // since the fallback itself still filters by namespace.
-    let match_expr = fts5_candidate_expression(raw_query);
-    let raw_fts_match = match reader
-        .query_row(SqlStatement {
-            sql: "SELECT 1 AS present FROM fts_knowledge WHERE fts_knowledge MATCH ?1 LIMIT 1"
-                .to_string(),
-            params: vec![SqlValue::Text(match_expr)],
-            label: None,
-        })
-        .await
-    {
-        Ok(row) => row,
-        Err(e) if is_timeout(&e) => {
-            return Ok(FtsFetchOutcome {
-                atoms: Vec::new(),
-                timed_out: true,
-            });
+    // The decision is made from namespace-scoped evidence only — never an
+    // unscoped `fts_knowledge` probe (issue #2396 fix 1). An unscoped probe
+    // is a cross-namespace oracle: a caller in namespace A whose term exists
+    // only in namespace B would see this call skip the fallback (empty
+    // result) exactly as it would for a term that exists nowhere, except a
+    // caller who *does* fall through to the fallback below learns nothing —
+    // response shape alone would otherwise reveal whether a term exists in
+    // another tenant. Reusing the phase-A rowids each term already fetched
+    // needs no second FTS query: chunked the same way phase B hydrates them,
+    // bounded by the same phase-A window every term already paid for. A
+    // window that (within its bound) holds only foreign-namespace rows still
+    // takes the fallback below, which is itself namespace-filtered, so this
+    // cannot leak a foreign row into the result — only, in the worst case,
+    // run the fallback scan when a true in-namespace match sits beyond every
+    // term's probed window.
+    let mut probe_rowids: Vec<i64> = term_probe_rowids.into_iter().flatten().collect();
+    probe_rowids.sort_unstable();
+    probe_rowids.dedup();
+
+    let mut namespace_has_match = false;
+    for chunk in probe_rowids.chunks(HYDRATION_ID_CHUNK) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params = vec![SqlValue::Text(ns.to_owned())];
+        params.extend(chunk.iter().map(|rowid| SqlValue::Integer(*rowid)));
+        let membership_sql = format!(
+            "SELECT 1 AS present FROM knowledge_atoms \
+             WHERE rowid IN ({placeholders}) AND namespace = ?1 LIMIT 1"
+        );
+        let row = match reader
+            .query_row(SqlStatement {
+                sql: membership_sql,
+                params,
+                label: None,
+            })
+            .await
+        {
+            Ok(row) => row,
+            Err(e) if is_timeout(&e) => {
+                return Ok(FtsFetchOutcome {
+                    atoms: Vec::new(),
+                    timed_out: true,
+                });
+            }
+            Err(e) => return Err(sql_err("search fts namespace membership probe", e)),
+        };
+        if row.is_some() {
+            namespace_has_match = true;
+            break;
         }
-        Err(e) => return Err(sql_err("search fts eligibility probe", e)),
-    };
-    if raw_fts_match.is_some() {
+    }
+    if namespace_has_match {
         return Ok(FtsFetchOutcome {
             atoms: Vec::new(),
             timed_out: false,
@@ -1287,6 +1347,51 @@ fn hydrate_domains_statement(ns: &str, ids: &[String]) -> SqlStatement {
     }
 }
 
+/// Build the phase-B hydration statement for one chunk of phase-A rowids
+/// (issue #2396 fix 5).
+///
+/// `+a.namespace = ?1` (not a bare equality) is deliberate — same reason and
+/// shape as [`hydrate_atoms_statement`]/[`hydrate_domains_statement`]:
+/// without table statistics (this codebase never runs `ANALYZE` on
+/// `knowledge_atoms`), SQLite's planner prefers `idx_knowledge_atoms_ns` over
+/// the integer primary key for a large `rowid IN (...)` list, turning an
+/// O(chunk) rowid seek into an O(matching-namespace-rows) index scan per
+/// chunk. Verified with `EXPLAIN QUERY PLAN` against a freshly loaded,
+/// unanalyzed `knowledge_atoms` table at a 900-row chunk (this statement's
+/// own `HYDRATION_ID_CHUNK`): without the unary plus the planner chose
+/// `SEARCH a USING INDEX idx_knowledge_atoms_ns (namespace=? AND rowid=?)`;
+/// with it, `SEARCH a USING INTEGER PRIMARY KEY (rowid=?)`. The unary plus
+/// defeats the index without changing the predicate's meaning.
+fn phase_b_hydration_statement(
+    ns: &str,
+    rowids: &[i64],
+    statuses: &[String],
+    exclude_statuses: &[&str],
+    type_clause: &str,
+) -> SqlStatement {
+    let rowid_placeholders = rowids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let (status_clause, status_params) =
+        status_sql_clause(statuses, exclude_statuses, 2 + rowids.len());
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(rowids.iter().map(|rowid| SqlValue::Integer(*rowid)));
+    params.extend(status_params);
+    SqlStatement {
+        sql: format!(
+            "SELECT a.*, a.rowid AS rowid FROM knowledge_atoms AS a \
+             WHERE a.rowid IN ({rowid_placeholders}) \
+               AND +a.namespace = ?1 \
+               AND a.deleted_at IS NULL{status_clause}{type_clause}"
+        ),
+        params,
+        label: None,
+    }
+}
+
 /// Hydrate ANN-only hit shells from the canonical corpus tables.
 ///
 /// Returns the number of candidate rows that could not be hydrated. Missing
@@ -1455,6 +1560,35 @@ fn attach_body_lines_timeout_degradation(out: &mut Value) {
         out["degraded"] = json!({});
     }
     out["degraded"]["body_lines_timeout"] = json!(true);
+}
+
+/// Flag that member-token sizing hit the request read deadline before it
+/// could measure any domain in this response (issue #2396 fix 3). Every
+/// affected result's `size` field is `null`, never `0` — a caller that feeds
+/// `suggest`'s `results` straight into `knowledge.fold`'s `candidates`
+/// (`FoldCandidate::size` is a non-optional `usize`) gets a hard parse error
+/// on any of these domains instead of silently admitting an unpriced item
+/// for free, which is the fail-closed behavior this degradation exists to
+/// force.
+fn attach_member_sizing_timeout_degradation(out: &mut Value, unmeasured_domain_ids: &[String]) {
+    if unmeasured_domain_ids.is_empty() {
+        return;
+    }
+
+    if !out
+        .get("degraded")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        out["degraded"] = json!({});
+    }
+    out["degraded"]["member_sizing_timeout"] = json!({
+        "domain_ids": unmeasured_domain_ids,
+        "note": "member-token sizing did not complete for these domains; their \
+                 `size` is null, not 0. Do not pass them to knowledge.fold \
+                 without measuring size separately — a null size is rejected \
+                 by fold's candidate schema rather than silently admitted as \
+                 free.",
+    });
 }
 
 struct EligibleAnnSearchState {
@@ -1699,14 +1833,24 @@ fn parse_domain_members(domain: &Domain) -> Result<Vec<String>, RuntimeError> {
 /// query normally, and the ordinary async-scheduling race (the deadline
 /// elapsing while this query is in flight) is reachable and must degrade,
 /// not hard-error, exactly like every other read in this module.
+///
+/// The `bool` distinguishes "measured, genuinely zero members" from "not
+/// measured at all" (issue #2396 fix 3): every domain in `sizes` is either
+/// fully priced (this call ran to completion) or entirely unpriced (a
+/// checkout or query timeout returns the zero-initialized map for all of
+/// them — there is no partial-completion state for one `query_all` call), so
+/// one flag for the whole batch is enough. Before this fix `suggest` treated
+/// an unmeasured `size: 0` exactly like a real zero-cost domain and handed it
+/// straight to a caller's `knowledge.fold` budget, letting a deadline-raced
+/// suggestion admit domains for free.
 async fn load_domain_member_token_sizes(
     runtime: &KhiveRuntime,
     ns: &str,
     domain_ids: &[String],
-) -> Result<HashMap<String, usize>, RuntimeError> {
+) -> Result<(HashMap<String, usize>, bool), RuntimeError> {
     let mut sizes: HashMap<String, usize> = domain_ids.iter().map(|id| (id.clone(), 0)).collect();
     if domain_ids.is_empty() {
-        return Ok(sizes);
+        return Ok((sizes, false));
     }
 
     let placeholders = domain_ids
@@ -1721,7 +1865,7 @@ async fn load_domain_member_token_sizes(
     let sql = runtime.sql();
     let mut reader = match sql.reader().await {
         Ok(reader) => reader,
-        Err(e) if is_timeout(&e) => return Ok(sizes),
+        Err(e) if is_timeout(&e) => return Ok((sizes, true)),
         Err(e) => return Err(sql_err("suggest member size reader", e)),
     };
     let rows = match reader
@@ -1744,7 +1888,7 @@ async fn load_domain_member_token_sizes(
         .await
     {
         Ok(rows) => rows,
-        Err(e) if is_timeout(&e) => return Ok(sizes),
+        Err(e) if is_timeout(&e) => return Ok((sizes, true)),
         Err(e) => return Err(sql_err("suggest member size query", e)),
     };
 
@@ -1760,7 +1904,7 @@ async fn load_domain_member_token_sizes(
         *size = size.saturating_add(estimate_compose_item_tokens(&name, &content));
     }
 
-    Ok(sizes)
+    Ok((sizes, false))
 }
 
 /// Body-line metadata is best-effort: a request read-deadline timeout on
@@ -2590,19 +2734,33 @@ impl KnowledgeHandlers {
         hits.truncate(limit);
 
         let domain_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
-        let member_token_sizes = if khive_storage::request_read_is_cancelled() {
-            HashMap::new()
-        } else {
-            load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?
-        };
+        // A cancelled ambient deadline skips the call the same way an
+        // internal timeout inside it does — both leave every domain in this
+        // batch unmeasured, never a real (possibly genuinely-zero) size
+        // (issue #2396 fix 3).
+        let (member_token_sizes, member_sizing_timed_out) =
+            if khive_storage::request_read_is_cancelled() {
+                (HashMap::new(), !domain_ids.is_empty())
+            } else {
+                load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?
+            };
         if !khive_storage::request_read_is_cancelled() {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
+        let unmeasured_domain_ids: Vec<String> = if member_sizing_timed_out {
+            domain_ids.clone()
+        } else {
+            Vec::new()
+        };
 
         // Price the member atom bodies that compose expands, not the much smaller
         // domain mirror description used for retrieval. The batched join keeps the
         // suggest -> fold budget in compose's estimated-token unit without an N+1
-        // hydration pass.
+        // hydration pass. `size` is `null`, never `0`, for a domain whose members
+        // were not measured — `0` would silently pass through `knowledge.fold`'s
+        // budget as a genuinely free item (issue #2396 fix 3); `null` is rejected
+        // by `FoldCandidate::size`'s non-optional `usize`, so a straight pass-
+        // through of these `results` into a `fold` call fails closed instead.
         let results: Vec<Value> = hits
             .iter()
             .map(|h| {
@@ -2610,7 +2768,7 @@ impl KnowledgeHandlers {
                     "id": h.id,
                     "name": h.name,
                     "score": h.score,
-                    "size": member_token_sizes.get(&h.id).copied().unwrap_or_default(),
+                    "size": member_token_sizes.get(&h.id).copied(),
                 })
             })
             .collect();
@@ -2659,6 +2817,7 @@ impl KnowledgeHandlers {
             attach_lexical_timeout_degradation(&mut out);
         }
         attach_hydration_degradation(&mut out, hydration_failures);
+        attach_member_sizing_timeout_degradation(&mut out, &unmeasured_domain_ids);
         // The lexical stage's own budget no longer implies the request
         // deadline is spent (issue #1930 Amendment 2), so this last check
         // re-reads the live ambient deadline rather than the stage-local
@@ -3295,14 +3454,17 @@ mod tests {
     }
 
     #[test]
-    fn fts_candidate_expression_recalls_non_contiguous_terms() {
+    fn fts_candidate_terms_recalls_non_contiguous_terms() {
         assert_eq!(
-            fts5_candidate_expression("alpha beta alpha and"),
+            fts5_candidate_terms("alpha beta alpha and").join(" OR "),
             "\"alpha\" OR \"alphas\" OR \"beta\" OR \"betas\""
         );
-        assert_eq!(fts5_candidate_expression("RAG"), "\"rag\" OR \"rags\"");
         assert_eq!(
-            fts5_candidate_expression("the and"),
+            fts5_candidate_terms("RAG").join(" OR "),
+            "\"rag\" OR \"rags\""
+        );
+        assert_eq!(
+            fts5_candidate_terms("the and").join(" OR "),
             "\"the and\"",
             "stop-only queries retain the exact-phrase fallback"
         );
@@ -3514,17 +3676,18 @@ mod tests {
     /// case for that call shape; the wrap makes it green.
     #[tokio::test(start_paused = true)]
     async fn lexical_stage_budget_expiry_does_not_cancel_the_request() {
-        let _serial = LEXICAL_BUDGET_OVERRIDE_SERIAL.lock().await;
-        set_lexical_stage_budget_override_ms(50);
-        let _reset = LexicalStageBudgetReset;
-
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
         const N: u32 = 1_000;
         const VOCAB: u32 = 20;
         seed_low_overlap_corpus(&runtime, N, VOCAB).await;
 
         let query = "term0 term1";
-        let budget = lexical_stage_budget();
+        // This test wraps `fetch_fts_candidates` in its own explicit
+        // `scope_request_read_deadline`, exactly mirroring what `search_core`
+        // does around it in production — it never goes through
+        // `lexical_stage_budget()`'s override seam, so a literal duration is
+        // enough here.
+        let budget = std::time::Duration::from_millis(50);
         let outer_deadline = std::time::Duration::from_secs(60);
 
         let (fetch, still_active) =
@@ -3760,6 +3923,329 @@ mod tests {
         assert_eq!(outcome.atoms[0].slug, "zzcrossns-local");
     }
 
+    /// Issue #2396 fix 1: the empty-result fallback decision must never be
+    /// made from an unscoped `fts_knowledge` probe — that is a
+    /// cross-namespace oracle. A caller in `local` whose search term exists
+    /// only in another namespace must see the exact same response as a
+    /// caller whose term exists nowhere at all; before the fix, the unscoped
+    /// probe found the foreign match and skipped the fallback entirely, so
+    /// the two cases differed (empty vs. the fallback's rows) and response
+    /// shape alone revealed whether the term existed in another tenant. A
+    /// filler row is seeded in `local` so the fallback — which ignores the
+    /// search term itself, it is a namespace-scoped recency browse — has
+    /// something to surface once it *is* taken in both cases. This also
+    /// covers the suppression half of the fix directly: a term reachable in
+    /// `local` only through the fallback, whose match also exists in another
+    /// namespace, must still return `local`'s fallback rows (red before:
+    /// empty).
+    #[tokio::test]
+    async fn empty_result_fallback_never_leaks_a_foreign_namespace_match() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES \
+                      ('92400000-0000-0000-0000-000000000000', 'local', 'unrelated-local-atom', \
+                       'Unrelated Local Atom', 'generic filler text with no special term', \
+                       '[]', NULL, 1, 'reviewed', NULL, NULL, 0, 0, NULL), \
+                      ('92400000-0000-0000-0000-000000000001', 'tenant-b', 'foreign-term-atom', \
+                       'Foreign Term Atom', 'synthetic content about zzoraclezz only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 1, 1, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed oracle rows");
+        drop(writer);
+
+        let foreign_match =
+            fetch_fts_candidates(&runtime, "local", "zzoraclezz", None, &[], &[], 5)
+                .await
+                .expect("fetch must not error");
+        let no_match =
+            fetch_fts_candidates(&runtime, "local", "zzoracleabsentzz", None, &[], &[], 5)
+                .await
+                .expect("fetch must not error");
+
+        assert!(!foreign_match.timed_out);
+        assert!(!no_match.timed_out);
+        let foreign_slugs: Vec<&str> = foreign_match
+            .atoms
+            .iter()
+            .map(|a| a.slug.as_str())
+            .collect();
+        let absent_slugs: Vec<&str> = no_match.atoms.iter().map(|a| a.slug.as_str()).collect();
+        assert_eq!(
+            foreign_slugs, absent_slugs,
+            "a term matching only in another namespace must produce the exact \
+             same response as a term matching nowhere at all — any \
+             difference is a cross-namespace existence oracle"
+        );
+        assert_eq!(
+            foreign_slugs,
+            vec!["unrelated-local-atom"],
+            "the local fallback must run (never suppressed by the foreign \
+             match) and surface the local filler row: {foreign_slugs:?}"
+        );
+    }
+
+    /// Control for the fix above: when the term genuinely matches within
+    /// `local` via the FTS index, only the indexed row is returned. There is
+    /// no query counter to assert against, but the function returns as soon
+    /// as `combined` is non-empty — before either the namespace-membership
+    /// probe or the fallback query is ever constructed — so seeding a
+    /// second, unrelated `local` row that only an (incorrectly) triggered
+    /// fallback could ever surface (the fallback ignores the search term
+    /// entirely) proves the fallback did not run, by its absence from the
+    /// result.
+    #[tokio::test]
+    async fn empty_result_fallback_control_index_match_skips_fallback() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES \
+                      ('92400000-0000-0000-0000-000000000002', 'local', 'indexed-term-atom', \
+                       'Indexed Term Atom', 'synthetic content about zzindexedzz only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 0, 0, NULL), \
+                      ('92400000-0000-0000-0000-000000000003', 'local', 'unrelated-recent-atom', \
+                       'Unrelated Recent Atom', 'generic filler text with no special term', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 1, 1, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed control rows");
+        drop(writer);
+
+        let outcome = fetch_fts_candidates(&runtime, "local", "zzindexedzz", None, &[], &[], 5)
+            .await
+            .expect("fetch must not error");
+
+        assert!(!outcome.timed_out);
+        assert_eq!(
+            outcome.atoms.len(),
+            1,
+            "only the indexed match may be returned, never the unrelated \
+             fallback-only row: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(outcome.atoms[0].slug, "indexed-term-atom");
+    }
+
+    /// Issue #2396 fix 2: when phase A's widening reaches the ceiling and the
+    /// eligible set is still short, more than `ceiling` ineligible top-ranked
+    /// rows must not be allowed to hide an eligible row further down the
+    /// bm25 ranking than phase A ever probed. The ceiling is overridden down
+    /// to 20 so the fixture can stay small: 20 `deprecated` rows (lower
+    /// rowids, so they sort first at equal bm25) exactly fill the first — and
+    /// at this override, only — probe window, so `eligible_now` is empty
+    /// right at the ceiling. The eligibility-scoped fallback query must then
+    /// recover the 2 `reviewed` rows seeded after them (higher rowids, never
+    /// inside the ceiling-bounded window). The ordinary (non-ceiling)
+    /// widening path and its shortfall control are covered by
+    /// `phase_b_widening_recovers_eligible_rows_behind_an_ineligible_top_page`
+    /// and `phase_b_accepts_a_genuine_shortfall_without_widening` above.
+    #[tokio::test]
+    async fn phase_b_ceiling_exhaustion_recovers_eligible_row_via_scoped_fallback() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "WITH RECURSIVE x(n) AS ( \
+                          VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 19 \
+                      ) \
+                      INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) \
+                      SELECT \
+                          printf('92500000-0000-0000-0000-%012d', x.n), \
+                          'local', printf('zzceilingzz-dep-%02d', x.n), printf('Ceiling Dep %02d', x.n), \
+                          'synthetic content about zzceilingzz only', '[]', NULL, 1, \
+                          'deprecated', NULL, NULL, x.n, x.n, NULL \
+                      FROM x"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed deprecated ceiling rows");
+        writer
+            .execute(SqlStatement {
+                sql: "WITH RECURSIVE x(n) AS ( \
+                          VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 1 \
+                      ) \
+                      INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) \
+                      SELECT \
+                          printf('92510000-0000-0000-0000-%012d', x.n), \
+                          'local', printf('zzceilingzz-ok-%02d', x.n), printf('Ceiling Ok %02d', x.n), \
+                          'synthetic content about zzceilingzz only', '[]', NULL, 1, \
+                          'reviewed', NULL, NULL, 100 + x.n, 100 + x.n, NULL \
+                      FROM x"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed reviewed ceiling rows");
+        drop(writer);
+
+        let outcome = with_phase_a_widen_ceiling_override(20, async {
+            fetch_fts_candidates(&runtime, "local", "zzceilingzz", None, &[], &[], 5).await
+        })
+        .await
+        .expect("fetch must not error");
+
+        assert!(!outcome.timed_out);
+        assert_eq!(
+            outcome.atoms.len(),
+            2,
+            "the 2 reviewed rows sit beyond the ceiling-bounded phase-A \
+             window; only the eligibility-scoped fallback query can recover \
+             them: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome
+                .atoms
+                .iter()
+                .all(|a| a.slug.starts_with("zzceilingzz-ok-")),
+            "no deprecated row may survive into the eligible set: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #2396 fix 3: a member-token-sizing timeout must be reported via
+    /// the returned `bool`, never conflated with a genuine zero-member
+    /// domain — both otherwise produce the same `size: 0` in a `HashMap`-only
+    /// return, which `suggest` then handed a caller's `knowledge.fold` budget
+    /// as a real (free) cost.
+    #[tokio::test]
+    async fn member_token_sizes_report_timeout_instead_of_a_measured_zero() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES ( \
+                          '92600000-0000-0000-0000-000000000000', 'local', 'sizing-member-atom', \
+                          'Sizing Member Atom', \
+                          'enough body content to price a non-zero token size for the owning domain once member sizing actually runs to completion', \
+                          '[]', NULL, 1, 'reviewed', NULL, NULL, 0, 0, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed member atom");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_domains ( \
+                          id, namespace, slug, name, description, tags, members, status, \
+                          created_at, updated_at, deleted_at \
+                      ) VALUES ( \
+                          '92600000-0000-0000-0000-000000000001', 'local', 'sizing-domain', \
+                          'Sizing Domain', NULL, '[]', '[\"sizing-member-atom\"]', 'reviewed', \
+                          0, 0, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed domain");
+        drop(writer);
+
+        let domain_ids = vec!["92600000-0000-0000-0000-000000000001".to_string()];
+
+        let (degraded_sizes, timed_out) = khive_storage::scope_request_read_deadline(
+            std::time::Duration::ZERO,
+            load_domain_member_token_sizes(&runtime, "local", &domain_ids),
+        )
+        .await
+        .expect("an expired read deadline must degrade, not error");
+        assert!(
+            timed_out,
+            "an expired read deadline must be reported as unmeasured"
+        );
+        assert_eq!(
+            degraded_sizes.get(&domain_ids[0]).copied(),
+            Some(0),
+            "the placeholder value is still 0 — callers must check \
+             `timed_out`, never treat this 0 as a measured size"
+        );
+
+        let (healthy_sizes, healthy_timed_out) =
+            load_domain_member_token_sizes(&runtime, "local", &domain_ids)
+                .await
+                .expect("undeadlined lookup must succeed");
+        assert!(!healthy_timed_out);
+        assert!(
+            healthy_sizes.get(&domain_ids[0]).copied().unwrap_or(0) > 0,
+            "control: without a deadline the lookup measures the real member \
+             body cost; got {healthy_sizes:?}"
+        );
+    }
+
+    /// Issue #2396 fix 4: the lexical-stage-budget override rides a
+    /// `tokio::task_local!`, so it is scoped to the task it wraps only.
+    /// Two concurrent tasks — one scoped to an override, one with none —
+    /// must observe different budgets; the prior process-global `AtomicU64`
+    /// override could not guarantee this; a task with no override of its own
+    /// could observe whatever value another concurrently running test last
+    /// stored.
+    #[tokio::test]
+    async fn lexical_stage_budget_override_does_not_leak_across_concurrent_tasks() {
+        let with_override = tokio::spawn(with_lexical_stage_budget_override_ms(50, async {
+            tokio::task::yield_now().await;
+            lexical_stage_budget()
+        }));
+        let without_override = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            lexical_stage_budget()
+        });
+
+        let overridden = with_override.await.expect("task must not panic");
+        let baseline = without_override.await.expect("task must not panic");
+
+        assert_eq!(overridden, std::time::Duration::from_millis(50));
+        assert_eq!(
+            baseline,
+            std::time::Duration::from_millis(LEXICAL_STAGE_BUDGET_MS),
+            "a concurrently running task with no override of its own must \
+             never observe another task's override; got {baseline:?}"
+        );
+    }
+
     #[tokio::test]
     async fn missing_ann_hydration_is_dropped_and_reported() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -3934,6 +4420,42 @@ mod tests {
                 .iter()
                 .any(|detail| detail.contains("idx_knowledge_domains_ns")),
             "domain hydration must not fall back to a namespace index: {details:?}"
+        );
+    }
+
+    /// Issue #2396 fix 5, same plan-pin shape as the two tests above applied
+    /// to the lexical phase-B hydration statement: at `HYDRATION_ID_CHUNK`
+    /// (900) rowids, the no-statistics planner must seek the integer primary
+    /// key, never fall back to `idx_knowledge_atoms_ns`.
+    #[tokio::test]
+    async fn phase_b_hydration_statement_plan_uses_primary_key_not_namespace_index() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let rowids: Vec<i64> = (1..=HYDRATION_ID_CHUNK as i64).collect();
+
+        let mut reader = runtime.sql().reader().await.expect("plan reader");
+        let rows = reader
+            .explain(phase_b_hydration_statement("local", &rowids, &[], &[], ""))
+            .await
+            .expect("explain phase-b hydration statement");
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("USING INTEGER PRIMARY KEY")),
+            "phase-b hydration must seek the rowid primary key: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("idx_knowledge_atoms_ns")),
+            "phase-b hydration must not fall back to a namespace index: {details:?}"
         );
     }
 
