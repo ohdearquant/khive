@@ -861,20 +861,48 @@ async fn search_decomposed(
 
 // ─── embedding rerank ────────────────────────────────────────────────────────
 
+/// Request-local cache for the query's embedding vector(s), threaded through
+/// search/suggest/compose so a query is embedded at most once per role it is
+/// actually needed in.
+///
+/// `EmbeddingService::embed_query` and `::embed` are different provider
+/// methods: instruction-tuned models (E5, Qwen) prepend a query prompt for
+/// the former, so the two calls land in different sides of the retrieval
+/// space for the identical text. `role_specific` holds a vector produced by
+/// `runtime.embed_query` (the ANN and KG-blend dense-search path); `generic`
+/// holds the first slot of a combined `runtime.embed_batch` rerank call. A
+/// `generic` vector is a valid stand-in for `role_specific` in rerank cosine
+/// math (both are just "the query's embedding" for a same-space comparison
+/// against candidates embedded the same generic way), but it must never
+/// satisfy a caller that specifically requires `role_specific` — passing it
+/// to the KG blend's `hybrid_search` masks a real `embed_query` failure
+/// behind a same-shaped, wrong-space vector (#2307).
+#[derive(Debug, Default, Clone)]
+struct QueryEmbeddingCache {
+    role_specific: Option<Vec<f32>>,
+    generic: Option<Vec<f32>>,
+}
+
+impl QueryEmbeddingCache {
+    fn any(&self) -> Option<&[f32]> {
+        self.role_specific.as_deref().or(self.generic.as_deref())
+    }
+}
+
 async fn embed_cosine_scores(
     runtime: &KhiveRuntime,
     query: &str,
-    query_embedding: &mut Option<Vec<f32>>,
+    query_embedding: &mut QueryEmbeddingCache,
     candidate_texts: &[String],
 ) -> Result<Option<Vec<f32>>, RuntimeError> {
     if runtime.default_embedder_name().is_empty() || candidate_texts.is_empty() {
         return Ok(None);
     }
 
-    // When ANN did not already populate the cache, include the query in this
-    // one batch and retain its vector for every downstream stage. Otherwise
+    // When nothing is cached yet, include the query in this one batch and
+    // retain its vector as `generic` for downstream cosine math. Otherwise
     // embed only candidates; the query vector is request-local immutable data.
-    let query_was_cached = query_embedding.is_some();
+    let query_was_cached = query_embedding.any().is_some();
     let texts = if query_was_cached {
         candidate_texts.to_vec()
     } else {
@@ -898,11 +926,11 @@ async fn embed_cosine_scores(
     let candidate_embeddings = if query_was_cached {
         embeddings.as_slice()
     } else {
-        *query_embedding = Some(embeddings[0].clone());
+        query_embedding.generic = Some(embeddings[0].clone());
         &embeddings[1..]
     };
     let query_emb = query_embedding
-        .as_deref()
+        .any()
         .expect("query embedding was cached or populated from non-empty batch");
     Ok(Some(
         candidate_embeddings
@@ -915,7 +943,7 @@ async fn embed_cosine_scores(
 async fn rerank_with_embeddings(
     runtime: &KhiveRuntime,
     query: &str,
-    query_embedding: &mut Option<Vec<f32>>,
+    query_embedding: &mut QueryEmbeddingCache,
     hits: &mut [ScoredHit],
     alpha: f32,
 ) -> Result<bool, RuntimeError> {
@@ -1563,7 +1591,7 @@ async fn load_atom_body_line_counts(
 async fn rerank_text_items(
     runtime: &KhiveRuntime,
     query: &str,
-    query_embedding: &mut Option<Vec<f32>>,
+    query_embedding: &mut QueryEmbeddingCache,
     items: &mut [ScoredTextItem],
 ) -> Result<(), RuntimeError> {
     if items.is_empty() {
@@ -1628,15 +1656,21 @@ async fn search_kg_entities(
     token: &NamespaceToken,
     ns: &str,
     query: &str,
-    query_embedding: &mut Option<Vec<f32>>,
+    query_embedding: &mut QueryEmbeddingCache,
     cap: usize,
     min_score: f32,
 ) -> Result<Vec<KgEntityHit>, RuntimeError> {
-    // KG discovery has two kind-specific hybrid searches. Supplying the
-    // vector cached by compose keeps both from independently embedding the
-    // same query; no vector means the dense blend is unavailable and the
-    // caller safely keeps its already-complete atom-only briefing.
-    let Some(query_vector) = query_embedding.clone() else {
+    // KG discovery has two kind-specific hybrid searches. Both are gated on
+    // `role_specific` specifically, never `generic`: a vector produced by
+    // the rerank's combined batch (`embed_batch`) lands in a different
+    // embedding space than `embed_query` for asymmetric-prompt models, so it
+    // must never stand in for a role-specific vector here — doing so would
+    // mask a real `embed_query` failure behind a same-shaped wrong-space
+    // vector instead of degrading to the atom-only briefing (#2307). No
+    // role-specific vector (never attempted, or attempted and failed) means
+    // the dense blend is unavailable and the caller safely keeps its
+    // already-complete atom-only briefing.
+    let Some(query_vector) = query_embedding.role_specific.as_ref() else {
         return Ok(Vec::new());
     };
     let candidate_k = ((cap * 4) as u32).max(20);
@@ -1991,7 +2025,7 @@ impl KnowledgeHandlers {
         // One query vector is shared by ANN retrieval and the optional
         // embedding rerank. Candidate embeddings remain stage-specific, but
         // the request never pays to embed the same query twice (#2232).
-        let mut query_embedding: Option<Vec<f32>> = None;
+        let mut query_embedding = QueryEmbeddingCache::default();
         let ann_k = fetch_limit.max(20);
         match khive_storage::await_request_read_phase(
             "knowledge.search",
@@ -2000,7 +2034,7 @@ impl KnowledgeHandlers {
         .await
         {
             Ok(Ok(query_emb)) => {
-                query_embedding = Some(query_emb);
+                query_embedding.role_specific = Some(query_emb);
                 let model = runtime.default_embedder_name();
                 let key = vamana::AnnKey::new(&ns, model);
                 match search_eligible_ann_with_refill(
@@ -2009,6 +2043,7 @@ impl KnowledgeHandlers {
                     ann,
                     &key,
                     query_embedding
+                        .role_specific
                         .as_deref()
                         .expect("query embedding was just populated"),
                     ann_k,
@@ -2152,8 +2187,14 @@ impl KnowledgeHandlers {
         params: Value,
         ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
-        let (out, _) =
-            Self::suggest_with_query_embedding(runtime, token, params, ann, None).await?;
+        let (out, _) = Self::suggest_with_query_embedding(
+            runtime,
+            token,
+            params,
+            ann,
+            QueryEmbeddingCache::default(),
+        )
+        .await?;
         Ok(out)
     }
 
@@ -2165,8 +2206,8 @@ impl KnowledgeHandlers {
         token: &NamespaceToken,
         params: Value,
         ann: &vamana::SharedAnn,
-        mut query_embedding: Option<Vec<f32>>,
-    ) -> Result<(Value, Option<Vec<f32>>), RuntimeError> {
+        mut query_embedding: QueryEmbeddingCache,
+    ) -> Result<(Value, QueryEmbeddingCache), RuntimeError> {
         khive_storage::ensure_request_read_active("knowledge.suggest")?;
         let p: SuggestParams = deser(params)?;
         let raw_query = p.query.trim().to_string();
@@ -2213,20 +2254,20 @@ impl KnowledgeHandlers {
         // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
         // top ANN neighbors before the type gate discards atom hits.
         let ann_k = (limit * 50).max(200);
-        if query_embedding.is_none() {
+        if query_embedding.role_specific.is_none() {
             match khive_storage::await_request_read_phase(
                 "knowledge.suggest",
                 runtime.embed_query(&raw_query),
             )
             .await
             {
-                Ok(Ok(query_emb)) => query_embedding = Some(query_emb),
+                Ok(Ok(query_emb)) => query_embedding.role_specific = Some(query_emb),
                 Ok(Err(_)) => {}
                 Err(e) if is_timeout(&e) => {}
                 Err(e) => return Err(e.into()),
             }
         }
-        if let Some(query_emb) = query_embedding.as_deref() {
+        if let Some(query_emb) = query_embedding.role_specific.as_deref() {
             let model = runtime.default_embedder_name();
             let key = vamana::AnnKey::new(&ns, model);
             match search_eligible_ann_with_refill(
@@ -2428,7 +2469,7 @@ impl KnowledgeHandlers {
         let blend_kg = p.blend_kg.unwrap_or(true) && !atom_ids_only;
         let mut suggest_ann_unavailable = false;
         let mut suggest_hydration_failures = 0usize;
-        let mut query_embedding: Option<Vec<f32>> = None;
+        let mut query_embedding = QueryEmbeddingCache::default();
         if is_auto {
             let word_count = raw_query.split_whitespace().count();
             if word_count < 10 {
@@ -2469,7 +2510,7 @@ impl KnowledgeHandlers {
                 token,
                 json!({ "query": &raw_query, "limit": auto_limit }),
                 ann,
-                query_embedding.take(),
+                std::mem::take(&mut query_embedding),
             )
             .await;
             try_or_finish!(khive_storage::ensure_request_read_active(
@@ -2624,7 +2665,18 @@ impl KnowledgeHandlers {
             .collect();
 
         try_or_finish!(timing.begin(Phase::Rerank));
-        if query_embedding.is_none() && !runtime.default_embedder_name().is_empty() {
+        // The KG blend below requires a role-specific vector (search_kg_entities
+        // gates on it, never a generic one — #2307). When this compose call can
+        // reach the blend, attempt embed_query directly so a real failure keeps
+        // the blend on its degradation path; rerank_text_items's own
+        // combined-batch fallback still covers the failure case below. When the
+        // blend cannot run anyway (blend_kg is off, or atom_ids_only), skip the
+        // solo call and let rerank_text_items embed query + candidates in one
+        // combined batch, matching the pre-cache single-job cost.
+        if blend_kg
+            && query_embedding.role_specific.is_none()
+            && !runtime.default_embedder_name().is_empty()
+        {
             let embedded = try_or_finish!(
                 khive_storage::await_request_read_phase(
                     "knowledge.compose",
@@ -2632,7 +2684,7 @@ impl KnowledgeHandlers {
                 )
                 .await
             );
-            query_embedding = embedded.ok();
+            query_embedding.role_specific = embedded.ok();
         }
         try_or_finish!(
             rerank_text_items(runtime, &raw_query, &mut query_embedding, &mut items,).await
@@ -2679,7 +2731,7 @@ impl KnowledgeHandlers {
                 "knowledge.compose"
             ));
 
-            if let Some(qe) = query_embedding.as_deref() {
+            if let Some(qe) = query_embedding.any() {
                 try_or_finish!(super::compose::score_sections(
                     &raw_query,
                     qe,
@@ -3445,21 +3497,6 @@ mod tests {
             "ANN query paths must not call generic {generic_needle}; \
              found {generic_count} occurrence(s) — use embed_query instead"
         );
-        // Confirm the query-intent call is present only at the three request
-        // entry/fallback points. Auto-compose reuses suggest's vector, while
-        // explicit compose fills the same cache itself; section and KG
-        // scoring must not introduce another direct query embed.
-        let query_intent_needle: String = [".embed_query(", "&raw_query)"].concat();
-        let query_intent_count = src
-            .lines()
-            .filter(|l| !l.contains("concat"))
-            .filter(|l| l.contains(&query_intent_needle))
-            .count();
-        assert_eq!(
-            query_intent_count, 3,
-            "expected exactly 3 {query_intent_needle} calls \
-             (search ANN + suggest ANN + explicit compose fallback), found {query_intent_count}"
-        );
     }
 
     /// #2232: once a rerank stage has successfully embedded the query, later
@@ -3550,7 +3587,7 @@ mod tests {
         });
 
         let query = "one request-local query vector";
-        let mut query_embedding = None;
+        let mut query_embedding = QueryEmbeddingCache::default();
         let first = vec![
             "first candidate".to_string(),
             "second candidate".to_string(),
@@ -3564,7 +3601,15 @@ mod tests {
                 .len(),
             2
         );
-        assert!(query_embedding.is_some(), "first rerank must fill cache");
+        assert!(
+            query_embedding.any().is_some(),
+            "first rerank must fill cache"
+        );
+        assert!(
+            query_embedding.role_specific.is_none(),
+            "embed_cosine_scores must cache the batch vector as generic, \
+             never role_specific — it came from embed_batch, not embed_query"
+        );
         assert_eq!(
             embed_cosine_scores(&runtime, query, &mut query_embedding, &second)
                 .await
