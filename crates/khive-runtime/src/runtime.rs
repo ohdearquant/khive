@@ -529,6 +529,14 @@ impl KhiveRuntime {
         &self.config
     }
 
+    /// Whether this runtime selects the vector arm for a hybrid search —
+    /// true exactly when a default embedding model is configured. Single
+    /// source of truth for the policy every fan-out and single-backend
+    /// dispatch path uses to report `arm_participation`/`vector_selected`.
+    pub fn vector_arm_selected(&self) -> bool {
+        self.config.embedding_model.is_some()
+    }
+
     /// Return the immutable ADR-118 fresh-tail serving policy captured when
     /// this runtime was constructed.
     pub fn ann_fresh_tail_enabled(&self) -> bool {

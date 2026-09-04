@@ -157,10 +157,12 @@ frozen `until`; temporary absence is not evidence that the pass failed or commit
 
 ### Remote-URL mode
 
-1. Clone to a daemon-owned scratch directory (`~/.khive/scratch/git-digest/<hash>/`),
-   `git clone --filter=blob:none` (history + trees without file blobs — commit walking
-   needs messages and file lists, not contents; `git log --name-only` works against a
-   partial clone with lazy fetch disabled for our read pattern).
+1. Clone to a daemon-owned scratch directory (`~/.khive/scratch/git-digest/<hash>/`)
+   only when `commits` are requested. An issues/pull-requests-only pass never needs a
+   checkout and goes directly to the source-bound GitHub API path. Required clones use
+   `git clone --filter=blob:none --no-checkout` (history + trees without file blobs —
+   commit walking needs messages and file lists, not contents; `git log --name-only`
+   works against a partial clone with lazy fetch disabled for our read pattern).
 2. Derive `owner/repo` from the canonical source, target that value explicitly in the
    source-bound `gh repo view` probe, and pass it explicitly to issue/PR listing; skip
    requested remote sources with a stable warning when that operation is unavailable.
@@ -168,10 +170,12 @@ frozen `until`; temporary absence is not evidence that the pass failed or commit
    of re-cloning. An LRU cap (default 5 repos / 2GB, config `[git] digest_cache_*`) evicts
    oldest; eviction is safe because cursors live in the database, not the clone.
    Additionally, a per-clone size cap (operator-configurable, default 1GB) bounds any
-   single clone: if a clone or fetch would exceed it, the operation aborts with a clear
-   error before writing further — `max_items` bounds ingestion work, but only this cap
-   bounds disk consumption by a single large-history repository before LRU eviction can
-   apply.
+   single clone: a fresh clone's staging directory is monitored while the child runs and
+   the clone process tree is stopped and reaped once the limit is observed; a final
+   measurement remains the race backstop before publication. Fetches are measured and
+   removed before further use when over cap. `max_items` bounds ingestion work, but only
+   this cap bounds disk consumption by a single large-history repository before LRU
+   eviction can apply.
 4. Cleanup on eviction uses directory removal of the scratch path only (never touches
    user-owned paths).
 

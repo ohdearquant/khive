@@ -16,11 +16,15 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
 use serde::Serialize;
+use serde_json::json;
 
 use khive_db::StorageBackend;
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_pack_code::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions};
-use khive_runtime::{entity_fts_document, note_fts_document, secret_gate, KhiveRuntime, Namespace};
+use khive_runtime::{
+    entity_fts_document, note_fts_document, secret_gate, GateRef, IngestAuditStore,
+    InterceptedDispatchResult, KhiveRuntime, Namespace, PackRegistry, RuntimeError, VerbRegistry,
+};
 use khive_storage::{SqlStatement, SqlValue, SubstrateKind};
 
 /// Upper bound on how long the real ingest path waits for the pool's writer
@@ -30,6 +34,11 @@ use khive_storage::{SqlStatement, SqlValue, SubstrateKind};
 /// writer is wedged, and the caller is told loudly rather than returning
 /// with the database file still in motion.
 const WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Synthetic gate verb for the admin-only findings batch. It is deliberately
+/// distinct from the public `code.ingest` source-map verb because the two
+/// operations have different arguments and storage consequences.
+const CODE_FINDINGS_INGEST_GATE_VERB: &str = "code.findings_ingest";
 
 /// Arguments for `kkernel code-ingest`.
 #[derive(Parser, Debug)]
@@ -140,9 +149,30 @@ where
     code_ingest_batch_with_config_and_runtime_setup(args, None, runtime_setup).await
 }
 
+fn build_code_ingest_registry(runtime: &KhiveRuntime) -> Result<VerbRegistry> {
+    // Shared with `kkernel git-ingest` (`git_ingest.rs`); `Attach` requests
+    // the same event-store attachment `KhiveMcpServer::with_packs` gives its
+    // own registry, so a gate consultation on this path persists an audit
+    // event (ADR-018 Amendment 4) exactly like a live MCP server would.
+    PackRegistry::build_ingest_registry(runtime, IngestAuditStore::Attach)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 async fn code_ingest_batch_with_config_and_runtime_setup<F>(
     args: CodeIngestArgs,
     config: Option<&Path>,
+    runtime_setup: F,
+) -> Result<CodeIngestReport>
+where
+    F: FnOnce(&KhiveRuntime) -> Result<()>,
+{
+    code_ingest_batch_with_config_runtime_setup_and_gate(args, config, None, runtime_setup).await
+}
+
+async fn code_ingest_batch_with_config_runtime_setup_and_gate<F>(
+    args: CodeIngestArgs,
+    config: Option<&Path>,
+    gate_override: Option<GateRef>,
     runtime_setup: F,
 ) -> Result<CodeIngestReport>
 where
@@ -152,7 +182,7 @@ where
         .with_context(|| format!("failed to read {}", args.findings.display()))?;
 
     let ns = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let cfg = resolve_runtime_config(RuntimeConfigInputs {
+    let mut cfg = resolve_runtime_config(RuntimeConfigInputs {
         db: args.db.as_deref(),
         config,
         namespace: ns,
@@ -162,6 +192,9 @@ where
         packs: None,
         brain_profile: None,
     })?;
+    if let Some(gate) = gate_override {
+        cfg.gate = gate;
+    }
 
     // The write path below persists `finding` notes directly through
     // EntityStore/NoteStore/GraphStore rather than through pack dispatch (see
@@ -205,27 +238,41 @@ where
     }
 
     let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let registry = build_code_ingest_registry(&runtime)?;
+    let gate_args = json!({
+        "input_kind": "findings_json",
+        "record_counts": {
+            "entities": batch.entities.len(),
+            "notes": batch.notes.len(),
+            "edges": batch.edges.len(),
+        }
+    });
     // Every path out of the write section below — success or error — must
     // still drain the pool's writer task before this function returns, so
     // the section runs as an inner block and the drain happens once, after
     // it, on the captured result.
-    let ingest_result: Result<CodeIngestReport> = async {
-        runtime_setup(&runtime)?;
-        let resolved_ns = runtime.config().default_namespace.clone();
-        let token = runtime
-            .authorize(resolved_ns)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("failed to authorize namespace")?;
+    let gated_result = registry
+        .dispatch_intercepted_with_metadata_with_identity(
+            CODE_FINDINGS_INGEST_GATE_VERB,
+            &gate_args,
+            None,
+            |resolved_ns| async {
+                let direct_result: Result<CodeIngestReport> = async {
+                    runtime_setup(&runtime)?;
+                    let token = runtime
+                        .authorize(resolved_ns)
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                        .context("failed to authorize namespace")?;
 
-        // One immutable model-name snapshot governs this ingest pass. Each report
-        // below is still derived from the corresponding completed embed call, so a
-        // provider cannot appear in execution without also appearing in reporting.
-        let embedding_model_names = runtime.registered_embedding_model_names();
+                    // One immutable model-name snapshot governs this ingest pass. Each report
+                    // below is still derived from the corresponding completed embed call, so a
+                    // provider cannot appear in execution without also appearing in reporting.
+                    let embedding_model_names = runtime.registered_embedding_model_names();
 
-        let mut report = CodeIngestReport {
-            dry_run: false,
-            ..CodeIngestReport::default()
-        };
+                    let mut report = CodeIngestReport {
+                        dry_run: false,
+                        ..CodeIngestReport::default()
+                    };
 
         let entities = runtime
             .entities(&token)
@@ -385,9 +432,29 @@ where
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
-        Ok(report)
-    }
-    .await;
+                    Ok(report)
+                }
+                .await;
+
+                direct_result
+                    .map(|report| {
+                        let audit_result = json!({
+                            "entities_created": report.entities_created,
+                            "entities_skipped_existing": report.entities_skipped_existing,
+                            "notes_created": report.notes_created,
+                            "notes_skipped_existing": report.notes_skipped_existing,
+                            "edges_created": report.edges_created,
+                            "edges_skipped_existing": report.edges_skipped_existing,
+                        });
+                        InterceptedDispatchResult::new(audit_result, report)
+                    })
+                    .map_err(|err| RuntimeError::Internal(err.to_string()))
+            },
+        )
+        .await;
+    let ingest_result = gated_result
+        .map(|outcome| outcome.metadata)
+        .map_err(|err| anyhow::anyhow!("{err}"));
 
     // The migrated stores above route writes through the pool's shared
     // writer task (ADR-067 Component A), which owns its own SQLite
@@ -399,6 +466,7 @@ where
     // out (success or error); dropping the runtime here closes the queue.
     // Then await the task's exit with a bounded, loud timeout — on BOTH
     // paths, so an early error return cannot leave the file still moving.
+    drop(registry);
     let writer_join = take_writer_task_join_or_warn(runtime.backend().pool());
     drop(runtime);
 
@@ -677,10 +745,12 @@ fn shm_sidecar_path(db_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use khive_runtime::{EmbedderProvider, RuntimeError};
+    use khive_runtime::{
+        EmbedderProvider, Gate, GateDecision, GateError, GateRef, GateRequest, RuntimeError,
+    };
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use serial_test::serial;
 
@@ -703,6 +773,34 @@ mod tests {
             match &self.previous {
                 Some(value) => std::env::set_var("KHIVE_WRITE_QUEUE", value),
                 None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
+            }
+        }
+    }
+
+    /// Pin `KHIVE_PACKS` to an explicit pack list for the guard's lifetime,
+    /// restoring the previous value on drop. Config resolution gives the
+    /// environment variable precedence over a config file's `[runtime].packs`
+    /// (`resolve_runtime_config_with_db_anchor` in `khive-mcp/src/serve.rs`),
+    /// so a test that names its pack set in a TOML fixture is still steered by
+    /// whatever the ambient shell exported unless the variable is pinned too.
+    /// Tests using this guard must be `#[serial]`: process env is global.
+    struct PacksEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl PacksEnvGuard {
+        fn pin(packs: &[&str]) -> Self {
+            let previous = std::env::var_os("KHIVE_PACKS");
+            std::env::set_var("KHIVE_PACKS", packs.join(","));
+            Self { previous }
+        }
+    }
+
+    impl Drop for PacksEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("KHIVE_PACKS", value),
+                None => std::env::remove_var("KHIVE_PACKS"),
             }
         }
     }
@@ -796,6 +894,22 @@ mod tests {
         path
     }
 
+    /// Like [`write_empty_test_config`] but names the pack set explicitly.
+    /// This only decides the pack set when `KHIVE_PACKS` is unset: the
+    /// environment variable outranks the file, so gate-path tests pair this
+    /// fixture with [`PacksEnvGuard::pin`] on the same list.
+    fn write_test_config_with_packs(dir: &Path, packs: &[&str]) -> PathBuf {
+        let path = dir.join("packs-khive-config.toml");
+        let list = packs
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(&path, format!("[runtime]\npacks = [{list}]\n"))
+            .expect("write isolated pack-scoped config");
+        path
+    }
+
     async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
         let config = write_empty_test_config(
             args.findings
@@ -850,6 +964,334 @@ mod tests {
         )
         .expect("write findings.json fixture");
         path
+    }
+
+    /// The full production pack set. Gate-path tests write it into their
+    /// config fixture and pin `KHIVE_PACKS` to it ([`PacksEnvGuard::pin`]),
+    /// because the environment variable outranks the fixture and an ambient
+    /// value naming an unlinked pack would fail registry construction before
+    /// the gate is ever consulted.
+    const ALL_PACKS: &[&str] = &[
+        "kg",
+        "gtd",
+        "memory",
+        "brain",
+        "comm",
+        "schedule",
+        "knowledge",
+        "session",
+        "git",
+        "code",
+        "workspace",
+        "blob",
+    ];
+
+    #[derive(Debug, Default)]
+    struct DenyFindingsIngestGate {
+        requests: Mutex<Vec<GateRequest>>,
+    }
+
+    impl Gate for DenyFindingsIngestGate {
+        fn check(&self, request: &GateRequest) -> std::result::Result<GateDecision, GateError> {
+            self.requests
+                .lock()
+                .expect("gate requests lock")
+                .push(request.clone());
+            if request.verb == CODE_FINDINGS_INGEST_GATE_VERB {
+                Ok(GateDecision::deny("findings ingest denied by test policy"))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+
+        fn impl_name(&self) -> &'static str {
+            "DenyFindingsIngestGate"
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct AllowFindingsIngestGate;
+
+    impl Gate for AllowFindingsIngestGate {
+        fn check(&self, _request: &GateRequest) -> std::result::Result<GateDecision, GateError> {
+            Ok(GateDecision::allow())
+        }
+
+        fn impl_name(&self) -> &'static str {
+            "AllowFindingsIngestGate"
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ErroringFindingsIngestGate;
+
+    impl Gate for ErroringFindingsIngestGate {
+        fn check(&self, request: &GateRequest) -> std::result::Result<GateDecision, GateError> {
+            if request.verb == CODE_FINDINGS_INGEST_GATE_VERB {
+                Err(GateError::Internal(
+                    "test gate backend unreachable".to_string(),
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+
+        fn impl_name(&self) -> &'static str {
+            "ErroringFindingsIngestGate"
+        }
+    }
+
+    /// The single `code.findings_ingest` audit event persisted for this
+    /// batch, read back through a freshly opened runtime onto `db` (the
+    /// production function drops its own runtime, and with it its
+    /// `EventStore` handle, before returning).
+    ///
+    /// Resolves through [`resolve_runtime_config`] exactly like the ingest
+    /// path itself rather than opening `db` directly: ADR-170 routes event
+    /// persistence to a sidecar database beside the main store, so a raw
+    /// `StorageBackend::sqlite(db).events()` read (the main store's own,
+    /// pre-ADR-170 event table) silently finds nothing.
+    async fn only_findings_ingest_event(db: &Path, config: &Path) -> khive_storage::Event {
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(db.to_str().expect("utf8 path")),
+            config: Some(config),
+            namespace: Namespace::parse("local").expect("valid namespace"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve runtime config for event read-back");
+        let runtime = KhiveRuntime::new(cfg).expect("open runtime for event read-back");
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("valid namespace"))
+            .expect("authorize local namespace for event read-back");
+        let events = runtime.events(&token).expect("events store handle");
+        let page = events
+            .query_events(
+                khive_storage::EventFilter {
+                    verbs: vec![CODE_FINDINGS_INGEST_GATE_VERB.to_string()],
+                    ..Default::default()
+                },
+                khive_storage::PageRequest::default(),
+            )
+            .await
+            .expect("query code.findings_ingest audit events");
+        assert_eq!(
+            page.items.len(),
+            1,
+            "expected exactly one code.findings_ingest audit event, got {:?}",
+            page.items
+        );
+        page.items.into_iter().next().expect("checked len == 1")
+    }
+
+    /// The gate fixtures name their pack set in TOML, but `KHIVE_PACKS`
+    /// outranks the file: with an ambient value naming an unlinked pack, the
+    /// registry would fail construction before the gate is consulted. The
+    /// guard pins the variable for the fixture's lifetime and restores the
+    /// ambient value afterwards.
+    #[serial]
+    #[test]
+    fn packs_env_guard_pins_the_fixture_pack_set_over_an_ambient_override() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let db = tmp.path().join("hermetic.db");
+        let resolve = || {
+            resolve_runtime_config(RuntimeConfigInputs {
+                db: Some(db.to_str().expect("utf8 path")),
+                config: Some(&config),
+                namespace: Namespace::parse("local").expect("valid namespace"),
+                namespace_explicit: true,
+                actor_explicit: false,
+                no_embed: true,
+                packs: None,
+                brain_profile: None,
+            })
+            .expect("resolve runtime config")
+            .packs
+        };
+        let expected: Vec<String> = ALL_PACKS.iter().map(|p| p.to_string()).collect();
+
+        let previous = std::env::var_os("KHIVE_PACKS");
+        std::env::set_var("KHIVE_PACKS", "kg,formal");
+        // Control: the ambient value steers resolution past the fixture.
+        assert_eq!(resolve(), vec!["kg".to_string(), "formal".to_string()]);
+        {
+            let _packs = PacksEnvGuard::pin(ALL_PACKS);
+            assert_eq!(
+                resolve(),
+                expected,
+                "the pinned list must win over the ambient value"
+            );
+        }
+        assert_eq!(
+            std::env::var("KHIVE_PACKS").as_deref(),
+            Ok("kg,formal"),
+            "the guard must restore the ambient value it replaced"
+        );
+        match previous {
+            Some(value) => std::env::set_var("KHIVE_PACKS", value),
+            None => std::env::remove_var("KHIVE_PACKS"),
+        }
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_batch_gate_denial_precedes_setup_and_record_writes() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let _packs = PacksEnvGuard::pin(ALL_PACKS);
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("gate-denied.db");
+        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let gate = Arc::new(DenyFindingsIngestGate::default());
+        let setup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setup_called_in_closure = Arc::clone(&setup_called);
+
+        let err = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+            base_args(findings, db.clone()),
+            Some(&config),
+            Some(Arc::clone(&gate) as GateRef),
+            move |_| {
+                setup_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("the operation-specific gate must refuse the direct-store batch");
+
+        assert!(
+            err.to_string().contains(CODE_FINDINGS_INGEST_GATE_VERB),
+            "typed refusal must name the governed batch operation: {err}"
+        );
+        assert!(
+            !setup_called.load(std::sync::atomic::Ordering::SeqCst),
+            "gate denial must occur before the direct-write section begins"
+        );
+
+        {
+            let requests = gate.requests.lock().expect("gate requests lock");
+            assert_eq!(
+                requests.len(),
+                1,
+                "one batch must make one gate consultation"
+            );
+            let request = &requests[0];
+            assert_eq!(request.verb, CODE_FINDINGS_INGEST_GATE_VERB);
+            assert_eq!(request.args["record_counts"]["entities"], 1);
+            assert_eq!(request.args["record_counts"]["notes"], 1);
+            assert_eq!(request.args["record_counts"]["edges"], 1);
+        }
+
+        let backend = StorageBackend::sqlite(&db).expect("open denied-ingest database");
+        let sql = backend.sql();
+        let mut reader = sql.reader().await.expect("acquire denied-ingest reader");
+        for table in ["entities", "notes", "graph_edges"] {
+            let count = reader
+                .query_scalar(SqlStatement {
+                    sql: format!("SELECT COUNT(*) FROM {table}"),
+                    params: vec![],
+                    label: Some(format!("count denied-ingest {table}")),
+                })
+                .await
+                .expect("count denied-ingest rows");
+            assert!(
+                matches!(count, Some(SqlValue::Integer(0))),
+                "gate denial must leave {table} empty, got {count:?}"
+            );
+        }
+
+        let event = only_findings_ingest_event(&db, &config).await;
+        assert_eq!(event.outcome, khive_storage::EventOutcome::Denied);
+        assert_eq!(event.verb, CODE_FINDINGS_INGEST_GATE_VERB);
+        assert_eq!(event.payload["decision"], "deny");
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_batch_gate_allow_persists_success_audit_event() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let _packs = PacksEnvGuard::pin(ALL_PACKS);
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("gate-allowed.db");
+        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let gate = Arc::new(AllowFindingsIngestGate);
+
+        let report = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+            base_args(findings, db.clone()),
+            Some(&config),
+            Some(gate as GateRef),
+            |_| Ok(()),
+        )
+        .await
+        .expect("an allowing gate must let the batch proceed");
+
+        assert_eq!(report.entities_created, 1);
+        assert_eq!(report.notes_created, 1);
+        assert_eq!(report.edges_created, 1);
+
+        let event = only_findings_ingest_event(&db, &config).await;
+        assert_eq!(event.outcome, khive_storage::EventOutcome::Success);
+        assert_eq!(event.verb, CODE_FINDINGS_INGEST_GATE_VERB);
+        assert_eq!(event.payload["decision"], "allow");
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_batch_gate_error_precedes_setup_and_record_writes() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let _packs = PacksEnvGuard::pin(ALL_PACKS);
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("gate-errored.db");
+        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let gate = Arc::new(ErroringFindingsIngestGate);
+        let setup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setup_called_in_closure = Arc::clone(&setup_called);
+
+        let err = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+            base_args(findings, db.clone()),
+            Some(&config),
+            Some(gate as GateRef),
+            move |_| {
+                setup_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a gate backend failure must refuse the direct-store batch");
+
+        assert!(
+            err.to_string().contains(CODE_FINDINGS_INGEST_GATE_VERB),
+            "gate-unavailable refusal must name the governed batch operation: {err}"
+        );
+        assert!(
+            !setup_called.load(std::sync::atomic::Ordering::SeqCst),
+            "gate error must occur before the direct-write section begins"
+        );
+
+        let backend = StorageBackend::sqlite(&db).expect("open errored-ingest database");
+        let sql = backend.sql();
+        let mut reader = sql.reader().await.expect("acquire errored-ingest reader");
+        for table in ["entities", "notes", "graph_edges"] {
+            let count = reader
+                .query_scalar(SqlStatement {
+                    sql: format!("SELECT COUNT(*) FROM {table}"),
+                    params: vec![],
+                    label: Some(format!("count errored-ingest {table}")),
+                })
+                .await
+                .expect("count errored-ingest rows");
+            assert!(
+                matches!(count, Some(SqlValue::Integer(0))),
+                "gate unavailability must leave {table} empty, got {count:?}"
+            );
+        }
+
+        let event = only_findings_ingest_event(&db, &config).await;
+        assert_eq!(event.outcome, khive_storage::EventOutcome::Error);
+        assert_eq!(event.verb, CODE_FINDINGS_INGEST_GATE_VERB);
+        assert_eq!(event.payload["decision"], "gate_unavailable");
     }
 
     const TOMBSTONE_WITNESS: i64 = 1_772_812_800_000_000;

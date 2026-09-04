@@ -85,6 +85,60 @@ impl SearchStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchArmStatus {
+    Ran,
+    Skipped,
+    Error,
+}
+
+impl SearchArmStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ran => "ran",
+            Self::Skipped => "skipped",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchArmEvidence {
+    status: SearchArmStatus,
+    candidate_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchArmParticipation {
+    text: SearchArmEvidence,
+    vector: SearchArmEvidence,
+}
+
+impl SearchArmParticipation {
+    fn complete(vector_selected: bool) -> Self {
+        Self {
+            text: SearchArmEvidence {
+                status: SearchArmStatus::Ran,
+                candidate_count: 0,
+            },
+            vector: SearchArmEvidence {
+                status: if vector_selected {
+                    SearchArmStatus::Ran
+                } else {
+                    SearchArmStatus::Skipped
+                },
+                candidate_count: 0,
+            },
+        }
+    }
+
+    fn observe_result(&mut self, result: &Value) {
+        let (text, vector) = search_arm_candidate_counts(result);
+        self.text.candidate_count = text;
+        self.vector.candidate_count = vector;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BackendErrorDiagnostic {
     message: String,
@@ -96,6 +150,7 @@ struct BackendErrorDiagnostic {
 #[derive(Debug, Default)]
 struct SearchDegradation {
     status: Option<SearchStatus>,
+    arm_participation: Option<SearchArmParticipation>,
     missing_backends: Vec<String>,
     backend_errors: BTreeMap<String, BackendErrorDiagnostic>,
     backend_errors_omitted: usize,
@@ -106,16 +161,72 @@ impl SearchDegradation {
     /// registry dispatch, or (in principle) a coordinator fan-out where
     /// every selected backend succeeded — `from_result` is used for the
     /// latter instead, since it also has to compute `missing_backends`.
-    fn complete() -> Self {
+    fn complete(result: &Value, vector_selected: bool) -> Self {
+        let (_, vector_candidates) = search_arm_candidate_counts(result);
+        let mut arm_participation =
+            SearchArmParticipation::complete(vector_selected || vector_candidates > 0);
+        arm_participation.observe_result(result);
         Self {
             status: Some(SearchStatus::Complete),
+            arm_participation: Some(arm_participation),
             missing_backends: Vec::new(),
             backend_errors: BTreeMap::new(),
             backend_errors_omitted: 0,
         }
     }
 
-    fn from_result(result: &CoordSearchResult) -> Self {
+    fn from_result(result: &CoordSearchResult, final_result: &Value) -> Self {
+        let vector_selected = result
+            .per_backend
+            .iter()
+            .any(|backend| backend.vector_selected || backend.vector_error.is_some())
+            || result.entity_hits.iter().any(|hit| {
+                matches!(
+                    hit.source,
+                    khive_runtime::SearchSource::Vector | khive_runtime::SearchSource::Both
+                )
+            })
+            || result.note_hits.iter().any(|hit| {
+                matches!(
+                    hit.source,
+                    khive_runtime::SearchSource::Vector | khive_runtime::SearchSource::Both
+                )
+            });
+        // A whole-backend `error` means that backend's dispatch task failed
+        // before either arm could be attributed (auth, timeout, join failure,
+        // or a failed text leg — the text leg fails loud inside
+        // `hybrid_search_outcome`, so a text-arm failure always surfaces
+        // here). `vector_error` is populated only when the text leg
+        // completed and the vector leg alone failed, so it never doubles as
+        // a text-arm signal.
+        let text_failed = result
+            .per_backend
+            .iter()
+            .any(|backend| backend.error.is_some());
+        let vector_failed = result.per_backend.iter().any(|backend| {
+            backend.vector_error.is_some() || (backend.vector_selected && backend.error.is_some())
+        });
+        let mut arm_participation = SearchArmParticipation {
+            text: SearchArmEvidence {
+                status: if text_failed {
+                    SearchArmStatus::Error
+                } else {
+                    SearchArmStatus::Ran
+                },
+                candidate_count: 0,
+            },
+            vector: SearchArmEvidence {
+                status: if !vector_selected {
+                    SearchArmStatus::Skipped
+                } else if vector_failed {
+                    SearchArmStatus::Error
+                } else {
+                    SearchArmStatus::Ran
+                },
+                candidate_count: 0,
+            },
+        };
+        arm_participation.observe_result(final_result);
         let failed_backend_count = result
             .per_backend
             .iter()
@@ -149,6 +260,7 @@ impl SearchDegradation {
             candidate.insert(backend, diagnostic);
             let candidate_degradation = Self {
                 status: Some(SearchStatus::Partial),
+                arm_participation: Some(arm_participation),
                 missing_backends: candidate.keys().cloned().collect(),
                 backend_errors_omitted: failed_backend_count.saturating_sub(candidate.len()),
                 backend_errors: candidate.clone(),
@@ -191,6 +303,7 @@ impl SearchDegradation {
         }
         Self {
             status: Some(status),
+            arm_participation: Some(arm_participation),
             missing_backends,
             backend_errors,
             backend_errors_omitted,
@@ -200,6 +313,37 @@ impl SearchDegradation {
     fn is_partial(&self) -> bool {
         self.status == Some(SearchStatus::Partial)
     }
+}
+
+fn search_arm_candidate_counts(result: &Value) -> (usize, usize) {
+    result
+        .as_array()
+        .into_iter()
+        .flatten()
+        .fold((0, 0), |(text, vector), hit| {
+            let source = hit.get("source").and_then(Value::as_str);
+            match source {
+                Some(s) if s == khive_runtime::SearchSource::Text.as_str() => (text + 1, vector),
+                Some(s) if s == khive_runtime::SearchSource::Vector.as_str() => (text, vector + 1),
+                Some(s) if s == khive_runtime::SearchSource::Both.as_str() => {
+                    (text + 1, vector + 1)
+                }
+                _ => (text, vector),
+            }
+        })
+}
+
+fn search_arm_participation_value(participation: SearchArmParticipation) -> Value {
+    json!({
+        "text": {
+            "status": participation.text.status.as_str(),
+            "candidate_count": participation.text.candidate_count,
+        },
+        "vector": {
+            "status": participation.vector.status.as_str(),
+            "candidate_count": participation.vector.candidate_count,
+        },
+    })
 }
 
 fn bounded_backend_error_message(message: &str) -> String {
@@ -281,6 +425,9 @@ fn search_diagnostic_value(degradation: &SearchDegradation) -> Value {
         "missing_backends": degradation.missing_backends,
         "backend_errors": backend_errors_value(&degradation.backend_errors),
     });
+    if let Some(participation) = degradation.arm_participation {
+        value["arm_participation"] = search_arm_participation_value(participation);
+    }
     if degradation.backend_errors_omitted > 0 {
         value["backend_errors_truncated"] = Value::Bool(true);
         value["backend_errors_omitted"] = json!(degradation.backend_errors_omitted);
@@ -313,11 +460,16 @@ impl OpSuccess {
 /// (excluding `help=true`, which returns a schema rather than a result
 /// array) carries `status="complete"` (ADR-130 §1); every other verb keeps
 /// the untagged `OpSuccess::complete` — no `status` field on its envelope.
-fn op_success_from_registry_result(tool: &str, is_help: bool, result: Value) -> OpSuccess {
+fn op_success_from_registry_result(
+    tool: &str,
+    is_help: bool,
+    result: Value,
+    vector_selected: bool,
+) -> OpSuccess {
     if tool == "search" && !is_help {
         OpSuccess {
+            degradation: SearchDegradation::complete(&result, vector_selected),
             result,
-            degradation: SearchDegradation::complete(),
         }
     } else {
         OpSuccess::complete(result)
@@ -681,6 +833,16 @@ fn escape_topology_component(value: &str) -> String {
     escaped
 }
 
+/// Format a backend's served-kinds fingerprint component (`""` when the
+/// backend serves everything, `:serves=<kind>+<kind>` otherwise), shared by
+/// both the legacy and escaped topology encodings below so they always agree
+/// on the same served-kinds suffix for the same input.
+fn format_served_kinds_suffix(served_kinds: Option<&str>) -> String {
+    served_kinds
+        .map(|kinds| format!(":serves={kinds}"))
+        .unwrap_or_default()
+}
+
 fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
     let mut legacy_safe = true;
     let mut backend_rows: Vec<(String, String, String, bool, Option<String>)> = cfg
@@ -737,10 +899,7 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .iter()
             .map(|(name, kind, path, is_read_only, served_kinds)| {
                 let read_only = if *is_read_only { ":read_only" } else { "" };
-                let served_kinds = served_kinds
-                    .as_deref()
-                    .map(|kinds| format!(":serves={kinds}"))
-                    .unwrap_or_default();
+                let served_kinds = format_served_kinds_suffix(served_kinds.as_deref());
                 format!("{name}:{kind}:{path}{read_only}{served_kinds}")
             })
             .collect::<Vec<_>>()
@@ -762,10 +921,7 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .iter()
             .map(|(name, kind, path, read_only, served_kinds)| {
                 let mode = if *read_only { "r" } else { "w" };
-                let served_kinds = served_kinds
-                    .as_deref()
-                    .map(|kinds| format!(":serves={kinds}"))
-                    .unwrap_or_default();
+                let served_kinds = format_served_kinds_suffix(served_kinds.as_deref());
                 format!(
                     "{}:{}:{}:{mode}{served_kinds}",
                     escape_topology_component(name),
@@ -955,6 +1111,7 @@ pub struct KhiveMcpServer {
 pub enum PackRegFailure {
     UnknownPack(String),
     MissingDependency { pack: String, dep: String },
+    NoPublicVerbs { pack: String },
     Registry(khive_runtime::RuntimeError),
 }
 
@@ -973,6 +1130,7 @@ impl std::fmt::Debug for PackRegError {
             PackRegFailure::MissingDependency { pack, dep } => {
                 dbg.field("pack", pack).field("missing_dep", dep)
             }
+            PackRegFailure::NoPublicVerbs { pack } => dbg.field("pack", pack),
             PackRegFailure::Registry(source) => dbg.field("source", source),
         }
         .finish_non_exhaustive()
@@ -992,6 +1150,11 @@ impl std::fmt::Display for PackRegError {
                 f,
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
                  add --pack {dep} before --pack {pack}"
+            ),
+            PackRegFailure::NoPublicVerbs { pack } => write!(
+                f,
+                "declared pack {pack:?} registers no public verbs and is not marked as \
+                 intentionally vocabulary- or ontology-only"
             ),
             PackRegFailure::Registry(source) => write!(f, "pack registry build failed: {source}"),
         }
@@ -1230,6 +1393,7 @@ impl KhiveMcpServer {
                 PackLoadError::MissingDependency { pack, dep } => {
                     PackRegFailure::MissingDependency { pack, dep }
                 }
+                PackLoadError::NoPublicVerbs { pack } => PackRegFailure::NoPublicVerbs { pack },
             };
             return Err(PackRegError { failure, runtime });
         }
@@ -1803,7 +1967,12 @@ impl KhiveMcpServer {
                     result,
                     self.schedule_ticker_last_tick_micros.as_ref(),
                 );
-                let success = op_success_from_registry_result(&tool, is_help, result);
+                let vector_selected = self
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.vector_arm_selected());
+                let success =
+                    op_success_from_registry_result(&tool, is_help, result, vector_selected);
                 chain_ok_envelope_or_depth_error(tool, success)
             }
             Err(error) => Err(DispatchFailure::from_runtime(&tool, error)),
@@ -1912,6 +2081,10 @@ impl KhiveMcpServer {
                 let coordinator: Option<Arc<dyn CoordinatorService>> = self.coordinator.clone();
                 let schedule_ticker_last_tick_micros =
                     self.schedule_ticker_last_tick_micros.clone();
+                let vector_selected = self
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.vector_arm_selected());
                 // ADR-096 Fork 1: a per-request identity overrides the default
                 // namespace for both the coordinator intercept and the registry
                 // dispatch below, so the two can't drift out of sync per op.
@@ -1933,6 +2106,7 @@ impl KhiveMcpServer {
                     let schedule_ticker_last_tick_micros =
                         schedule_ticker_last_tick_micros.clone();
                     let op_identity = identity_owned.clone();
+                    let op_vector_selected = vector_selected;
                     let op_mode = mode_for_op(i);
                     let task_tool = op.tool.clone();
                     BatchTask {
@@ -2044,7 +2218,12 @@ impl KhiveMcpServer {
                                     schedule_ticker_last_tick_micros.as_ref(),
                                 );
                                 let success =
-                                    op_success_from_registry_result(&tool, is_help, result);
+                                    op_success_from_registry_result(
+                                        &tool,
+                                        is_help,
+                                        result,
+                                        op_vector_selected,
+                                    );
                                 present_ok_envelope_or_depth_error(
                                     tool,
                                     success,
@@ -2271,8 +2450,6 @@ async fn dispatch_via_coordinator_inner(
                             .fan_out_search(&request, &namespace, &extra_visible)
                             .await;
                         khive_storage::ensure_request_read_active("search")?;
-                        let degradation = SearchDegradation::from_result(&coord_result);
-
                         // Preserve the coordinator search response's compatibility
                         // fields, and add the KG single-backend handler's canonical
                         // row fields for shape parity (MIN-1): `kind` (duplicates
@@ -2332,6 +2509,8 @@ async fn dispatch_via_coordinator_inner(
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
                         };
+                        let degradation =
+                            SearchDegradation::from_result(&coord_result, &result_val);
 
                         Ok(InterceptedDispatchResult::new(result_val, degradation))
                     },
@@ -2505,12 +2684,14 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
     } = success;
     let SearchDegradation {
         status,
+        arm_participation,
         missing_backends,
         backend_errors,
         backend_errors_omitted,
     } = degradation;
     let is_partial = status == Some(SearchStatus::Partial);
     let extra_fields = usize::from(status.is_some())
+        + usize::from(arm_participation.is_some())
         + if is_partial {
             3 + usize::from(backend_errors_omitted > 0) * 2
         } else {
@@ -2526,6 +2707,12 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         map.insert(
             "status".to_string(),
             Value::String(status.as_str().to_string()),
+        );
+    }
+    if let Some(participation) = arm_participation {
+        map.insert(
+            "arm_participation".to_string(),
+            search_arm_participation_value(participation),
         );
     }
     // Legacy `partial`/`missing_backends` alias, compatibility-release only
@@ -4039,12 +4226,13 @@ fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
                 json!(khive_runtime::daemon::MAX_FRAME_BYTES),
             ),
         ]);
-        // ADR-130 defines `status`/`partial`/`missing_backends`/`backend_errors*`
-        // only on a successful search entry. Once `ok` flips to false here
-        // they no longer belong at the top level; fold any that were present
-        // into `error.search` instead of dropping the diagnostic outright.
+        // ADR-130 defines `status`/`arm_participation`/`partial`/`missing_backends`/
+        // `backend_errors*` only on a successful search entry. Once `ok` flips to
+        // false here they no longer belong at the top level; fold any that were
+        // present into `error.search` instead of dropping the diagnostic outright.
         let search_fields: serde_json::Map<String, Value> = [
             "status",
+            "arm_participation",
             "partial",
             "missing_backends",
             "backend_errors",
@@ -5782,10 +5970,12 @@ mod tests {
                     .expect("valid backend id"),
                     entity_hits: Vec::new(),
                     note_hits: Vec::new(),
+                    vector_selected: true,
                     error: Some(format!(
                         "backend failure {index}: {}",
                         "\0\"\\".repeat(MAX_BACKEND_ERROR_MESSAGE_CHARS)
                     )),
+                    vector_error: None,
                 })
                 .collect();
             if reverse {
@@ -5804,8 +5994,8 @@ mod tests {
             }
         }
 
-        let forward = SearchDegradation::from_result(&degraded_result(false));
-        let reversed = SearchDegradation::from_result(&degraded_result(true));
+        let forward = SearchDegradation::from_result(&degraded_result(false), &json!([]));
+        let reversed = SearchDegradation::from_result(&degraded_result(true), &json!([]));
 
         assert!(!forward.backend_errors.is_empty());
         assert!(forward.backend_errors.len() <= MAX_BACKEND_ERROR_ENTRIES);
@@ -5850,6 +6040,44 @@ mod tests {
         );
     }
 
+    /// A populated `vector_error` is itself proof the vector arm was
+    /// selected and failed. `vector_selected` on the backend can be a
+    /// registry miss (stale/absent metadata) — it must never hide a
+    /// recorded vector-arm failure.
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn vector_error_reports_arm_failure_even_when_vector_selected_is_false() {
+        let result = CoordSearchResult {
+            entity_hits: Vec::new(),
+            note_hits: Vec::new(),
+            per_backend: vec![crate::coordinator::BackendSearchResult {
+                backend_id: khive_runtime::BackendId::parse("main").expect("valid backend id"),
+                entity_hits: Vec::new(),
+                note_hits: Vec::new(),
+                vector_selected: false,
+                error: None,
+                vector_error: Some("injected vector-arm failure".to_string()),
+            }],
+            partial: false,
+            entity_kinds: std::collections::HashMap::new(),
+            note_kinds: std::collections::HashMap::new(),
+            entity_created_at: std::collections::HashMap::new(),
+            note_created_at: std::collections::HashMap::new(),
+            note_names: std::collections::HashMap::new(),
+        };
+
+        let degradation = SearchDegradation::from_result(&result, &json!([]));
+        let arm_participation = degradation
+            .arm_participation
+            .expect("arm participation must be computed");
+        assert_eq!(
+            arm_participation.vector.status,
+            SearchArmStatus::Error,
+            "a recorded vector_error must report the vector arm as failed \
+             regardless of the backend's vector_selected flag"
+        );
+    }
+
     #[test]
     #[serial_test::serial(config_ledger)]
     fn backend_id_credentials_are_absent_from_wire_and_warning() {
@@ -5862,7 +6090,9 @@ mod tests {
                     .expect("valid backend id"),
                 entity_hits: Vec::new(),
                 note_hits: Vec::new(),
+                vector_selected: true,
                 error: Some("storage unavailable".to_string()),
+                vector_error: None,
             }],
             partial: true,
             entity_kinds: std::collections::HashMap::new(),
@@ -5878,7 +6108,7 @@ mod tests {
             .without_time()
             .finish();
         let degradation = tracing::subscriber::with_default(subscriber, || {
-            SearchDegradation::from_result(&result)
+            SearchDegradation::from_result(&result, &json!([]))
         });
         let wire = search_diagnostic_value(&degradation).to_string();
         let logs = captured.contents();
@@ -5906,15 +6136,27 @@ mod tests {
                 "tool": "search",
                 "result": "oversized",
                 "status": "complete",
+                "arm_participation": {
+                    "text": {"status": "ran", "candidate_count": 0},
+                    "vector": {"status": "skipped", "candidate_count": 0}
+                },
             }),
             &registry,
         );
 
         assert_eq!(omitted["ok"], json!(false));
         assert!(omitted.get("status").is_none());
+        assert!(omitted.get("arm_participation").is_none());
         assert!(omitted.get("partial").is_none());
         assert!(omitted.get("result").is_none());
         assert_eq!(omitted["error"]["search"]["status"], json!("complete"));
+        assert_eq!(
+            omitted["error"]["search"]["arm_participation"],
+            json!({
+                "text": {"status": "ran", "candidate_count": 0},
+                "vector": {"status": "skipped", "candidate_count": 0}
+            })
+        );
         assert_eq!(
             omitted["error"]["code"],
             json!("response_frame_budget_exceeded")
@@ -5932,6 +6174,10 @@ mod tests {
             "kind": "search_incomplete",
             "message": "no-match was not established because selected backends failed",
             "retryable": false,
+            "arm_participation": {
+                "text": {"status": "error", "candidate_count": 0},
+                "vector": {"status": "error", "candidate_count": 0}
+            },
             "missing_backends": ["archive"],
             "backend_errors": {
                 "archive": {
@@ -6807,6 +7053,61 @@ mod tests {
         );
     }
 
+    /// The legacy and escaped topology encodings in `encode_backend_topology`
+    /// each formatted their own `:serves=` suffix independently. Drive the
+    /// same served-kinds set through both branches (a name containing `:`
+    /// forces the escaped branch; a plain name keeps the legacy branch) and
+    /// assert they agree, now that both call the shared formatter.
+    #[test]
+    fn served_kinds_suffix_matches_between_legacy_and_escaped_topology_encodings() {
+        use khive_runtime::{BackendConfig, BackendKind, KhiveConfig};
+        use khive_types::SubstrateKind;
+
+        let served_kinds = Some(std::collections::BTreeSet::from([
+            SubstrateKind::Entity,
+            SubstrateKind::Note,
+        ]));
+        let base_backend = BackendConfig {
+            name: "main".to_string(),
+            kind: BackendKind::Memory,
+            path: None,
+            cache_mb: None,
+            journal_mode: None,
+            served_kinds: served_kinds.clone(),
+            read_only: false,
+        };
+
+        let legacy_topology = KhiveConfig {
+            backends: vec![base_backend.clone()],
+            ..KhiveConfig::default()
+        };
+        // A `:` in the name is reserved syntax, forcing the escaped
+        // (non-legacy-safe) encoding path instead.
+        let escaped_topology = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "ma:in".to_string(),
+                ..base_backend
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let legacy_encoded = encode_backend_topology(&legacy_topology);
+        let escaped_encoded = encode_backend_topology(&escaped_topology);
+
+        // `BTreeSet<SubstrateKind>` iterates in discriminant order (Note=0,
+        // Entity=1), so the joined suffix is "note+entity", not input order.
+        let expected_suffix = format_served_kinds_suffix(Some("note+entity"));
+        assert!(
+            legacy_encoded.contains(&expected_suffix),
+            "legacy topology encoding must carry the served-kinds suffix: {legacy_encoded}"
+        );
+        assert!(
+            escaped_encoded.contains(&expected_suffix),
+            "escaped topology encoding must carry the SAME served-kinds suffix as the \
+             legacy encoding, produced by the same formatter: {escaped_encoded}"
+        );
+    }
+
     /// `no_embed` changes runtime behavior (that pack's runtime carries zero
     /// embedders), so two configs differing only in it must not share a
     /// `config_id` — a shared id would let a daemon serve a client whose
@@ -7243,6 +7544,16 @@ mod tests {
             result: json!([{"id": "11111111-1111-1111-1111-111111111111"}]),
             degradation: SearchDegradation {
                 status: Some(SearchStatus::Partial),
+                arm_participation: Some(SearchArmParticipation {
+                    text: SearchArmEvidence {
+                        status: SearchArmStatus::Error,
+                        candidate_count: 1,
+                    },
+                    vector: SearchArmEvidence {
+                        status: SearchArmStatus::Error,
+                        candidate_count: 0,
+                    },
+                }),
                 missing_backends: vec!["archive".to_string()],
                 backend_errors: BTreeMap::from([(
                     "archive".to_string(),
@@ -8049,7 +8360,7 @@ mod tests {
 
         let resp = server
             .dispatch_request_local(RequestParams {
-                ops: r#"search(kind="entity", query="nothing here")"#.to_string(),
+                ops: r#"search(kind="entity", query="a deliberately long keyword dense query whose terms cannot all match any entity in this empty corpus")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
@@ -8064,6 +8375,14 @@ mod tests {
         assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
         assert_eq!(search["status"], json!("complete"));
         assert_eq!(search["result"], json!([]));
+        assert_eq!(
+            search["arm_participation"],
+            json!({
+                "text": {"status": "ran", "candidate_count": 0},
+                "vector": {"status": "skipped", "candidate_count": 0}
+            }),
+            "a dense zero-hit query must prove that text ran without a match"
+        );
         assert!(search.get("partial").is_none());
 
         // Chain (`|`), not a parallel batch: `search` must observe the
@@ -8092,6 +8411,14 @@ mod tests {
         );
         assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
         assert_eq!(search["status"], json!("complete"));
+        assert_eq!(
+            search["arm_participation"],
+            json!({
+                "text": {"status": "ran", "candidate_count": 1},
+                "vector": {"status": "skipped", "candidate_count": 0}
+            }),
+            "an exact-name presence check must expose its text-arm evidence"
+        );
         assert!(
             search["result"]
                 .as_array()

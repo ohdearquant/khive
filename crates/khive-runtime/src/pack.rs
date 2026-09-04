@@ -3489,6 +3489,16 @@ pub trait PackFactory: Send + Sync + 'static {
         &[]
     }
 
+    /// Whether this pack intentionally exposes no top-level MCP verbs.
+    ///
+    /// Defaults to `false` so a declared pack whose runtime contributes no
+    /// [`Visibility::Verb`] handlers fails at registration instead of silently
+    /// disappearing from the served surface. Vocabulary- or ontology-only
+    /// packs must opt in explicitly.
+    fn intentionally_verbless(&self) -> bool {
+        false
+    }
+
     /// Create a new pack instance for the given runtime.
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime>;
 
@@ -3538,6 +3548,12 @@ pub enum PackLoadError {
         /// The dependency that is missing from the requested pack list.
         dep: String,
     },
+    /// A declared pack contributed no top-level verbs without explicitly
+    /// declaring itself vocabulary/ontology-only.
+    NoPublicVerbs {
+        /// The declared pack name.
+        pack: String,
+    },
 }
 
 impl std::fmt::Display for PackLoadError {
@@ -3549,17 +3565,60 @@ impl std::fmt::Display for PackLoadError {
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
                  add --pack {dep} before --pack {pack}"
             ),
+            PackLoadError::NoPublicVerbs { pack } => write!(
+                f,
+                "declared pack {pack:?} registers no public verbs; if this pack is \
+                 intentionally vocabulary- or ontology-only, its factory must declare \
+                 intentionally_verbless() = true"
+            ),
         }
     }
 }
 
 impl std::error::Error for PackLoadError {}
 
+/// Reject a declared pack whose runtime contributes no [`Visibility::Verb`]
+/// handlers unless its factory explicitly opts out via
+/// [`PackFactory::intentionally_verbless`].
+fn check_pack_has_public_verbs(
+    factory: &dyn PackFactory,
+    install: &PackInstall,
+    name: &str,
+) -> Result<(), PackLoadError> {
+    if !factory.intentionally_verbless()
+        && !install
+            .runtime
+            .handlers()
+            .iter()
+            .any(|handler| matches!(handler.visibility, Visibility::Verb))
+    {
+        return Err(PackLoadError::NoPublicVerbs {
+            pack: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Registry of pack factories discovered via `inventory` at link time.
 ///
 /// No instance is needed — all methods are associated functions that walk the
 /// globally-collected [`PackRegistration`] slice.
 pub struct PackRegistry;
+
+/// Whether [`PackRegistry::build_ingest_registry`] attaches the runtime's
+/// event store to the registry it builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestAuditStore {
+    /// Mirror `KhiveMcpServer::with_packs` (`khive-mcp/src/server.rs`): a
+    /// writable runtime attaches its own event store, logging and continuing
+    /// on failure rather than refusing to build; a read-only runtime retains
+    /// no `EventStore` handle and an advisory travels beside each result
+    /// instead.
+    Attach,
+    /// Build the registry with no audit event store, for a caller with no use
+    /// for persisted audit rows.
+    Detach,
+}
 
 impl PackRegistry {
     /// Names of all pack factories discovered via `inventory`.
@@ -3621,6 +3680,7 @@ impl PackRegistry {
         for name in names {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
             let install = factory.create_install(runtime.clone());
+            check_pack_has_public_verbs(factory, &install, name)?;
             if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
                 install
                     .runtime
@@ -3636,6 +3696,50 @@ impl PackRegistry {
         }
 
         Ok(())
+    }
+
+    /// Build a `VerbRegistry` from `runtime`'s own configuration: gate,
+    /// default namespace, visible namespaces, actor id, and the configured
+    /// pack set, then install the registry's aggregated edge rules back onto
+    /// `runtime`. This is the wiring shared by every one-shot CLI ingest path
+    /// (`kkernel code-ingest`, `kkernel git-ingest`) that needs a real
+    /// registry to dispatch through outside of a live MCP server.
+    ///
+    /// `audit_store` selects whether the registry gets the runtime's event
+    /// store; see [`IngestAuditStore`] for what each variant does.
+    ///
+    /// This helper carries only the subset every ingest path duplicated
+    /// verbatim. The MCP server's own registry construction additionally
+    /// wires channel-loop admission, `config_id`, embedder/entity-type/
+    /// note-mutation-hook registration, schema-plan application, and the WAL
+    /// checkpoint pool handle — all server-only concerns a one-shot CLI pass
+    /// has no use for, so `KhiveMcpServer::with_packs` keeps its own
+    /// construction rather than calling this helper.
+    pub fn build_ingest_registry(
+        runtime: &KhiveRuntime,
+        audit_store: IngestAuditStore,
+    ) -> Result<VerbRegistry, RuntimeError> {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_gate(runtime.config().gate.clone());
+        builder.with_default_namespace(runtime.config().default_namespace.as_str());
+        builder.with_visible_namespaces(runtime.config().visible_namespaces.clone());
+        builder.with_actor_id(runtime.config().actor_id.clone());
+        if audit_store == IngestAuditStore::Attach {
+            if runtime.is_read_only() {
+                builder.with_read_only_audit_store();
+            } else if let Err(error) = builder.with_runtime_event_store(runtime) {
+                tracing::warn!(%error, "ingest registry audit event store is unavailable");
+            }
+        }
+        Self::register_packs(
+            &runtime.config().packs.clone(),
+            runtime.clone(),
+            &mut builder,
+        )
+        .map_err(|e| RuntimeError::Internal(format!("pack registration failed: {e:?}")))?;
+        let registry = builder.build()?;
+        runtime.install_edge_rules(registry.all_edge_rules());
+        Ok(registry)
     }
 
     /// Register the named packs into `builder`, routing each pack to its own runtime.
@@ -3685,6 +3789,7 @@ impl PackRegistry {
                 .cloned()
                 .unwrap_or_else(|| default_runtime.clone());
             let install = factory.create_install(runtime);
+            check_pack_has_public_verbs(factory, &install, name)?;
             if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
                 install
                     .runtime
@@ -4817,6 +4922,7 @@ pub(crate) mod tests {
     /// `comm` name is free for the probe here.
     struct CommProbeFactory;
     struct OtherProbeFactory;
+    struct AccidentalZeroVerbFactory;
 
     fn probe_pack(
         _runtime: KhiveRuntime,
@@ -4860,6 +4966,9 @@ pub(crate) mod tests {
         fn name(&self) -> &'static str {
             "comm"
         }
+        fn intentionally_verbless(&self) -> bool {
+            true
+        }
         fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
             probe_pack(runtime, &COMM_PROBE_GRANTED)
         }
@@ -4869,6 +4978,18 @@ pub(crate) mod tests {
         fn name(&self) -> &'static str {
             "grant-probe-other"
         }
+        fn intentionally_verbless(&self) -> bool {
+            true
+        }
+        fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
+            probe_pack(runtime, &OTHER_PROBE_GRANTED)
+        }
+    }
+
+    impl PackFactory for AccidentalZeroVerbFactory {
+        fn name(&self) -> &'static str {
+            "accidental-zero-verb"
+        }
         fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
             probe_pack(runtime, &OTHER_PROBE_GRANTED)
         }
@@ -4876,6 +4997,7 @@ pub(crate) mod tests {
 
     inventory::submit! { PackRegistration(&CommProbeFactory) }
     inventory::submit! { PackRegistration(&OtherProbeFactory) }
+    inventory::submit! { PackRegistration(&AccidentalZeroVerbFactory) }
 
     #[test]
     fn channel_ingest_grant_reaches_only_allowlisted_pack_names() {
@@ -4895,6 +5017,47 @@ pub(crate) mod tests {
             !OTHER_PROBE_GRANTED.load(std::sync::atomic::Ordering::SeqCst),
             "a factory outside CHANNEL_INGEST_CAPABLE_PACKS must never be granted"
         );
+    }
+
+    #[test]
+    fn declared_zero_verb_pack_requires_explicit_intent_metadata() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        let error = PackRegistry::register_packs(
+            &["accidental-zero-verb".to_string()],
+            runtime,
+            &mut builder,
+        )
+        .expect_err("an unmarked zero-verb pack must fail registration");
+
+        assert!(matches!(
+            error,
+            PackLoadError::NoPublicVerbs { ref pack } if pack == "accidental-zero-verb"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("intentionally_verbless() = true"),
+            "operator error must name the explicit exemption: {error}"
+        );
+    }
+
+    #[test]
+    fn multi_backend_loader_enforces_zero_verb_intent_metadata() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        let error = PackRegistry::register_packs_with_runtimes(
+            &["accidental-zero-verb".to_string()],
+            &HashMap::new(),
+            &runtime,
+            &mut builder,
+        )
+        .expect_err("multi-backend registration must enforce the same invariant");
+
+        assert!(matches!(
+            error,
+            PackLoadError::NoPublicVerbs { ref pack } if pack == "accidental-zero-verb"
+        ));
     }
 
     #[test]

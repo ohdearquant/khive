@@ -522,6 +522,18 @@ pub struct PropertyFilter {
     pub value: SqlValue,
 }
 
+/// Keyset pagination boundary over the notes store's default total order
+/// (`created_at DESC, id ASC` — see `note_filter_page_order_clause`).
+///
+/// Only meaningful when [`NoteFilter::order_by`] is `None`: the boundary is
+/// expressed in terms of that default order, and combining it with a custom
+/// sort field has no defined meaning, so callers must not set both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteSeekAfter {
+    pub created_at: i64,
+    pub id: Uuid,
+}
+
 /// Filter + sort options for [`NoteStore::query_notes_filtered`].
 ///
 /// Designed for general property-based filtering on any JSON field, not
@@ -542,6 +554,19 @@ pub struct NoteFilter {
     /// Restrict to notes where `created_at >= min_created_at` (microseconds epoch).
     /// `None` applies no lower-bound constraint.
     pub min_created_at: Option<i64>,
+    /// Restrict results to rows strictly after this boundary in the default
+    /// `created_at DESC, id ASC` order, for keyset (seek) pagination that
+    /// avoids re-walking earlier pages the way `PageRequest.offset` does.
+    /// Requires `order_by` to be `None`.
+    ///
+    /// Honoured only by [`NoteStore::query_notes_filtered_count_free`], which
+    /// seeks directly to the boundary and returns `total: None`.
+    /// [`NoteStore::query_notes_filtered`] rejects a non-`None` value with
+    /// `StorageError::InvalidInput`: it computes an exact `COUNT(*)` total
+    /// over the whole matching set, which has no defined meaning paired with
+    /// a seek boundary.
+    #[serde(default)]
+    pub after: Option<NoteSeekAfter>,
 }
 
 /// Temporal-referential note CRUD over the notes substrate table.

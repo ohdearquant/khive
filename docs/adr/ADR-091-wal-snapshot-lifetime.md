@@ -1599,3 +1599,50 @@ unaccounted totals. Tables containing both ordinary rows and an embedding BLOB s
 class because SQLite pages cannot support a defensible per-column split. Object detail is capped
 and reports truncation/omission explicitly; aggregate class totals continue across the full
 `dbstat` result.
+
+### 2026-08-30 amendment (Amendment 16): bounded FTS5 segment maintenance
+
+**Motivation.** The production main store reached 212,803 indexed notes with
+11 `fts_notes` segments and 10 `fts_entities` segments. Short
+`memory.recall` requests spent seconds in the FTS arm while ANN remained
+sub-millisecond. FTS5 normally merges on foreground writes, but no bounded
+background owner continued incremental optimize work during lower-traffic
+periods. Counting distinct segment IDs through `%_idx` is itself a full scan,
+so that query is unsuitable for the operator diagnostic meant to explain a
+large index.
+
+**Decision.** The main backend's existing dedicated checkpoint task owns a
+second, independent FTS maintenance cadence. Every due call considers exactly
+one of `fts_entities` or `fts_notes` in round-robin order and requests at most
+one configured page budget through FTS5's incremental `merge` command. A
+negative budget begins an incremental optimize cycle; positive budgets
+continue it. The default is 500 pages every 300 seconds with a two-segment
+minimum. The unbounded `optimize` command is not used. Secondary checkpoint
+tasks do not assume these substrate tables exist.
+
+SQLite's persistent `automerge` and `crisismerge` settings remain unchanged.
+Retuning them could shift unpredictable merge work onto foreground commits;
+the explicit maintenance owner instead supplies a bounded, observable work
+budget. Any later retune requires separate production workload evidence.
+
+The merge temporarily sets the dedicated connection's `busy_timeout` to zero.
+It never waits behind an application writer, never enters the pooled writer
+mutex, and does not change the PASSIVE/TRUNCATE gates defined above. Busy,
+threshold, progress, no-op, requested-page, and error outcomes are
+process-lifetime counters. A maintenance failure is independent of a
+successful checkpoint observation and does not discard the connection.
+The converse is not free, however: once a step's merge statement is
+executing it holds SQLite's write lock like any other write, so an
+application writer may wait behind that one step for its execution time,
+bounded by the configured page budget. The step runs off the checkpoint
+task's Tokio worker thread (`tokio::task::spawn_blocking`), so it cannot
+stall the async runtime itself while it executes — only the SQLite-level
+write lock is shared with application writers.
+
+**Diagnostics.** FTS5 documents row id 10 in each `%_data` shadow table as the
+binary structure record. `db_diagnostics.fts_segments` decodes those two
+single rows to report level and segment counts; it never scans `%_idx` and
+never runs a corpus-sized `COUNT`. Malformed/missing structure data degrades
+to `fts_segments_error`. `db_diagnostics.fts_maintenance` exposes the bounded
+maintenance counters. This adds derived-index writes only; it changes no
+logical records, migrations, recall ordering, or WAL escalation policy.

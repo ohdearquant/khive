@@ -758,23 +758,40 @@ async fn query_inbox_response(
     // Offset is defined over the fully-filtered sequence. When a filter cannot
     // be represented by `NoteFilter`, scan the indexed base query and count only
     // matching rows before collecting one lookahead item for `has_more`.
+    //
+    // Each page is fetched from a keyset boundary (`NoteFilter.after`), not a
+    // growing `PageRequest.offset`: an offset re-walks every earlier row on
+    // every page, so this loop's total work was quadratic in the number of
+    // pages scanned before a post-filter match was found. Seeking from the
+    // last row's `(created_at, id)` makes each page's fetch cost independent
+    // of how many pages came before it. `filter.order_by` is always `None`
+    // here (see its construction above), which `after` requires.
     let mut messages: Vec<Value> = if has_post_filter {
         const PAGE_SIZE: u32 = 200;
         let mut collected: Vec<Value> = Vec::new();
         let mut matched: u64 = 0;
-        let mut db_offset: u64 = 0;
+        let mut cursor: Option<khive_storage::note::NoteSeekAfter> = None;
         loop {
+            let mut page_filter = filter.clone();
+            page_filter.after = cursor;
             let page = store
                 .query_notes_filtered_count_free(
                     namespace,
-                    filter,
+                    &page_filter,
                     PageRequest {
                         limit: PAGE_SIZE,
-                        offset: db_offset,
+                        offset: 0,
                     },
                 )
                 .await?;
             let fetched = page.items.len() as u32;
+            cursor = page
+                .items
+                .last()
+                .map(|n| khive_storage::note::NoteSeekAfter {
+                    created_at: n.created_at,
+                    id: n.id,
+                });
             for n in &page.items {
                 if !inbox_note_matches(n, params, before_micros, subject_needle, content_needle) {
                     continue;
@@ -791,9 +808,6 @@ async fn query_inbox_response(
             if collected.len() > limit || fetched < PAGE_SIZE {
                 break;
             }
-            db_offset = db_offset.checked_add(u64::from(PAGE_SIZE)).ok_or_else(|| {
-                RuntimeError::InvalidInput("inbox: pagination offset overflowed".into())
-            })?;
         }
         collected
     } else {
