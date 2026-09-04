@@ -455,6 +455,17 @@ instrumentation cannot see the population this record shrinks.
   the records it holds. That is a separate property and the two must not be conflated: a record
   handled correctly by the write path, on a store configured to lose recent commits, is still
   exposed. Both halves have to hold, and satisfying one says nothing about the other.
+
+  **Named exceptions.** Two bounded exceptions to INV-1 are recorded in this document, and there
+  are no others. Amendment 1 scopes an admission-pressure undercount to allowlisted read verbs.
+  Amendment 5 adds a wedged-store path that applies to every producer class: when a generation's
+  append does not return within `driver_append_deadline` (3x `resolution_deadline`), the driver
+  abandons the generation. If the detached append later commits, its rows are durable but no
+  waiter observes them; if it fails permanently, they are lost. Either way the loss path is never
+  silent: the generation snapshot carries `terminal_reason = DriverAppendAbandoned` with
+  `committed_rows = 0`, `flush_failures` increments, and pure producers record degradation. An
+  operator reads that snapshot as a store that stopped answering for longer than the bound, not as
+  a write-path defect, and treats the snapshot's row count as the upper bound on what was lost.
 - **INV-2 (D5).** An unclassified input resolves to the stricter handling — commit failure fails
   the dispatch — enforced by exhaustive matching without a wildcard.
 - **INV-3.** Batch accumulation is bounded and never blocks dispatch indefinitely; a full batch
@@ -766,7 +777,10 @@ domain effect has already committed, so it is not retried and the row is not re-
 audit outcome itself is now unknown to the caller rather than merely slow. The row is left exactly
 where the driver holds it — in `state.pending`, or already mid-generation — for the driver to
 resolve independently, the same non-removal contract Amendment 1 established for
-`AdmissionDeadlineExpired`. Every other boundary in Amendment 3 is unchanged: `QueueAdmissionExhausted`
+`AdmissionDeadlineExpired`. Amendment 5 gives such a row a second possible ending: once the
+driver's own bound on the generation holding it elapses, that generation is abandoned and the row
+resolves as `DriverAppendAbandoned` rather than to a commit the driver observes. Every other
+boundary in Amendment 3 is unchanged: `QueueAdmissionExhausted`
 still returns immediately with no audit row to await, and a genuine `IdentityConflict`,
 `StoreFailure`, unsupported-idempotency, or driver terminal failure that resolves before
 `resolution_deadline` still fails the successful dispatch exactly as before.
@@ -798,4 +812,7 @@ eventually resolves. The underlying `append_events_idempotent()` call is not can
 a blocking storage call that cannot be safely aborted mid-write — so it is handed to a detached
 task that drives it to completion and discards whatever it eventually returns; no waiter is still
 listening for that result. As with `ResolutionDeadlineExpired`, the caller's already-committed
-domain effect is never retried and the row is never re-enqueued.
+domain effect is never retried and the row is never re-enqueued. Under a store that never returns,
+this mints one detached task per `driver_append_deadline` (90 s at the defaults: a 5 s
+`admission_deadline`, 6x for `resolution_deadline`, 3x again for the driver): bounded in rate,
+unbounded in count, and each such task holds its stalled append until the process exits.
