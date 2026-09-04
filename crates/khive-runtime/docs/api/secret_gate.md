@@ -263,17 +263,22 @@ ADR-115 Amendment 2 declares three permanent mask-only surfaces through the publ
 `RedactionSurface` enum and `redaction_surface_contract`:
 
 - `GitIngest` stores masked commit/issue/pull-request entity and note fields.
-- `SessionMirror` stores masked `session_messages.text`, `session_messages.raw`, and `sessions.slug`
-  projections — the latter covers every parsed title/slug field (ChatGPT export `title`, Claude Code
-  `slug`, claude.ai export `name`/`summary`), not just the message body columns.
-- `McpDiagnostic` returns a bounded masked diagnostic and has no durable stored target. Backend error
-  message masking and backend-id/key masking both run over the full, untruncated text before any
-  input or output length cap is applied, so a detector match whose terminating span crosses a
-  caller-visible truncation boundary is still found. The kkernel coordinator's pre-MCP diagnostic
-  logging (`bounded_backend_cause_for_log`, `bounded_backend_id_for_log` in
+- `SessionMirror` stores masked `session_messages.text`, `session_messages.raw`, `sessions.cwd`,
+  `sessions.git_branch`, and `sessions.slug` projections — the latter covers every parsed
+  title/slug field (ChatGPT export `title`, Claude Code `slug`, claude.ai export `name`/`summary`),
+  not just the message body columns. `cwd`/`git_branch` are session-keyed, not message-keyed:
+  `session_messages` carries no columns of its own for them.
+- `McpDiagnostic` returns a bounded masked diagnostic and has no durable stored target. Backend
+  error message masking and backend-id/key masking both go through `mask_bounded`
+  (see [Bounded masking](#bounded-masking) below): the masker's own input is capped to
+  `MASK_WINDOW_CHARS` (4,096) BEFORE masking runs, not the full, untruncated text — cost scales with
+  the window, never with the caller's raw input length. A token straddling the window boundary,
+  including every fragment of a bridged multi-fragment credential chained to it, is dropped rather
+  than echoed unmasked; see [Bounded masking](#bounded-masking) for why. The kkernel coordinator's
+  pre-MCP diagnostic logging (`bounded_backend_cause_for_log`, `bounded_backend_id_for_log` in
   `crates/kkernel/src/coordinator/dispatch.rs`) is also a named `McpDiagnostic` caller, applying the
-  same mask-then-truncate ordering before the same backend cause/id text reaches a log record ahead
-  of the MCP wire boundary.
+  same bounded-window masking before the same backend cause/id text reaches a log record ahead of
+  the MCP wire boundary.
 
 Each call site uses `mask_for_redaction_surface`. Every contract has mode `PermanentMaskOnly`, no
 stamp property, and no atomic exemption-success event. The wrapper has no manifest input and cannot
@@ -283,6 +288,33 @@ contract change, not a caller-selectable sensitivity option. `redaction_surface_
 `final_stored_target` strings from the `GIT_INGEST_STORED_TARGET` and `SESSION_MIRROR_STORED_TARGET`
 constants, and the contract test compares against those same constants rather than a second copy of
 the prose.
+
+## Bounded masking
+
+`mask_bounded(surface, text, window_chars, output_cap_chars)` is what every diagnostic-boundary
+caller (MCP backend error/key masking, the kkernel coordinator's pre-MCP logging) actually calls,
+not `mask_for_redaction_surface` directly. It caps the masker's own input to `window_chars` BEFORE
+masking runs — `MASK_WINDOW_CHARS` (4,096) for every current caller — so scan cost is bounded by the
+window regardless of the caller's raw input length, then caps the masked output to
+`output_cap_chars` (`output_cap_chars` is clamped to `window_chars` in every build, not just under
+`debug_assert!`, so a misconfigured call site cannot cap tighter than it windows).
+
+A window cut mid-token would let a masker that never saw the token's terminating shape emit the
+token's visible prefix unmasked, so any token straddling the boundary is dropped whole — back to
+the last whitespace inside the window — rather than masked. The same drop extends to a chain of
+`bridge_fragment_chain`-reconstructible fragments straddling the boundary, not just the one token
+touching it: the gap between two fragments is deliberately unbounded in byte length (see
+[Bridge fragment reconstruction](#bridge-fragment-reconstruction)), so no finite forward lookahead
+past the window can guarantee seeing every fragment of a chain that starts before the cut. Instead
+of scanning past the boundary, `mask_bounded` walks BACKWARD from it — over data already inside the
+window, so this adds no lookahead and stays bounded by `window_chars` alone — dropping every further
+bridge-fragment-shaped token chained to the one already removed, within the same
+`MAX_BRIDGE_FRAGMENTS`/`MAX_BRIDGE_GLUE_TOKENS` budgets `bridge_fragment_chain` itself uses. This is
+scoped to windows carrying trigger-word context (the same gate the entropy detector requires before
+it attempts bridge reconstruction at all), so ordinary untriggered prose cut mid-sentence is left
+untouched; a fragment-shaped word that merely sits at the tail of a triggered window, with nothing
+actually chained to it past the boundary, is a false positive this trade accepts in exchange for
+never leaking a real fragment.
 
 ## mask_secrets
 

@@ -932,15 +932,16 @@ change, not an untyped boolean or caller option.
 
 ### 2. Session mirror (#2060)
 
-- **Final stored target:** `session_messages.text`, `session_messages.raw`,
-  `session_messages.cwd`, `session_messages.git_branch`, `sessions.slug`, `sessions.cwd`, and
-  `sessions.git_branch` — the parsed title/slug projections (ChatGPT export `title`, Claude Code
-  `slug`, and the claude.ai export `name`/`summary` title) share the same masker as `text` and
-  `raw`. Masking occurs while constructing the parsed event or session record, before the mirror
-  writes it.
+- **Final stored target:** `session_messages.text`, `session_messages.raw`, `sessions.cwd`,
+  `sessions.git_branch`, and `sessions.slug` — `session_messages` carries no `cwd`/`git_branch`
+  columns of its own; those two fields are keyed per session, not per message, and live only on
+  `sessions`. The parsed title/slug projections (ChatGPT export `title`, Claude Code `slug`, and
+  the claude.ai export `name`/`summary` title) share the same masker as `text` and `raw`. Masking
+  occurs while constructing the parsed event or session record, before the mirror writes it.
 
-  > **Amendment 3 addition:** `cwd` and `git_branch` were copied verbatim into these columns until
-  > Amendment 3, which routes both through the same masking call as `text`/`raw`/`slug`. See
+  > **Amendment 3 addition:** `cwd` and `git_branch` were copied verbatim into `sessions.cwd`/
+  > `sessions.git_branch` until Amendment 3, which routes both through the same masking call as
+  > `text`/`raw`/`slug`. See
   > [Amendment 3 §2](#2-session-mirror-cwd-and-git_branch-now-masked).
 - **Stamp location:** none. Session rows have no exemption posture property.
 - **Atomic success event:** none. Mirror persistence remains idempotent under its existing cursor
@@ -1018,10 +1019,10 @@ boundaries carry different window constants before this amendment.
 
 Independently of the windowing change, this amendment also closes a gap in the Amendment 2 session
 mirror surface: `cwd` and `git_branch` were captured from provider exports and copied verbatim into
-`sessions.cwd`/`sessions.git_branch` and `session_messages.cwd`/`session_messages.git_branch`,
-never passed through `mask_for_redaction_surface` the way `text`, `raw`, and `slug` already were.
-Both fields now route through the same masking call at parse time. `SESSION_MIRROR_STORED_TARGET`
-lists the full corrected column set.
+`sessions.cwd`/`sessions.git_branch` (the only columns that carry them — `session_messages` has no
+`cwd`/`git_branch` columns of its own), never passed through `mask_for_redaction_surface` the way
+`text`, `raw`, and `slug` already were. Both fields now route through the same masking call at
+parse time. `SESSION_MIRROR_STORED_TARGET` lists the full corrected column set.
 
 ### 3. Invariant amendment
 
