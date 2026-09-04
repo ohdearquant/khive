@@ -365,8 +365,7 @@ fn batch_append_events_dml(
     Ok(BatchWriteSummary {
         attempted,
         affected,
-        failed: 0,
-        first_error: String::new(),
+        ..BatchWriteSummary::default()
     })
 }
 

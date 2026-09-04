@@ -80,8 +80,7 @@ impl EventStore for GateEventStore {
         Ok(BatchWriteSummary {
             attempted: n,
             affected: n,
-            failed: 0,
-            first_error: String::new(),
+            ..BatchWriteSummary::default()
         })
     }
     async fn get_event(&self, id: uuid::Uuid) -> StorageResult<Option<Event>> {
