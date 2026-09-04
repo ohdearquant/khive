@@ -19,7 +19,7 @@ use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_runtime::retrieval::EmbeddingTruncationReport;
 use khive_runtime::{
     entity_embedding_text, entity_fts_document, note_embedding_text, note_fts_document,
-    KhiveRuntime, Namespace,
+    KhiveConfig, KhiveRuntime, Namespace,
 };
 use khive_storage::entity::Entity;
 use khive_storage::error::StorageError;
@@ -136,7 +136,9 @@ impl ProgressBar {
 #[derive(Parser, Debug)]
 pub struct ReindexArgs {
     /// Database path (defaults to `~/.khive/khive.db`). `:memory:` selects an
-    /// ephemeral in-memory database, matching `kkernel mcp`/`kkernel exec`.
+    /// ephemeral in-memory database in single-backend mode. When discovered
+    /// config declares `[[backends]]`, this must explicitly match one declared
+    /// persistent SQLite path.
     #[arg(long, env = "KHIVE_DB")]
     pub db: Option<String>,
 
@@ -204,6 +206,56 @@ pub struct ReindexArgs {
     /// Print human-readable output instead of JSON.
     #[arg(long)]
     pub human: bool,
+}
+
+/// Load the same discovered config as runtime resolution and ensure that a
+/// one-database reindex cannot silently escape a declared backend topology.
+///
+/// Returns `None` when no `[[backends]]` are declared (reindex keeps its
+/// ordinary single-backend `--db` behavior); `Some` with the validated target
+/// otherwise. Callers must open exactly the returned target's path — see
+/// [`open_validated_reindex_backend`].
+fn validate_declared_reindex_target(
+    db: Option<&str>,
+    config: Option<&std::path::Path>,
+) -> Result<Option<khive_mcp::serve::ValidatedReindexTarget>> {
+    let discovery_anchor = khive_mcp::serve::config_discovery_db_anchor(db);
+    let loaded =
+        KhiveConfig::load_with_home_fallback_and_source(config, discovery_anchor.as_deref())
+            .context("load reindex khive config for backend-target validation")?;
+    let config_source = loaded.as_ref().map(|(_, source)| source.as_path());
+    let backends = loaded
+        .as_ref()
+        .map(|(config, _)| config.backends.as_slice())
+        .unwrap_or_default();
+
+    khive_mcp::serve::validate_reindex_db_target_with_source(db, backends, config_source)
+}
+
+/// Open the runtime `kkernel reindex` writes to, binding the open to the
+/// filesystem identity [`validate_declared_reindex_target`] already checked.
+///
+/// When a declared-backend topology produced a validated target, this
+/// overrides `cfg.db_path` to that target's canonical path — never the raw
+/// `--db`/`KHIVE_DB` string, which may still name a symlink at this point —
+/// and calls [`khive_mcp::serve::reverify_reindex_target_identity`]
+/// immediately beforehand so a symlink retargeted, or the declared file
+/// replaced in place, since validation is refused before `KhiveRuntime::new`
+/// opens (and migrates) anything. Config discovery is unaffected: `cfg` was
+/// already fully resolved by the caller against the raw `--db` input, and
+/// only the field that decides which file gets opened is overridden here.
+///
+/// With no validated target (no `[[backends]]` declared), `cfg` is used
+/// unchanged — ordinary single-backend reindex behavior.
+fn open_validated_reindex_backend(
+    mut cfg: khive_runtime::RuntimeConfig,
+    validated: Option<&khive_mcp::serve::ValidatedReindexTarget>,
+) -> Result<KhiveRuntime> {
+    if let Some(validated) = validated {
+        khive_mcp::serve::reverify_reindex_target_identity(validated)?;
+        cfg.db_path = Some(validated.path.clone());
+    }
+    KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// What a `--rebuild-fts` run actually did, so a caller never has to take
@@ -496,6 +548,9 @@ async fn filter_unembedded(
 /// MCP server serves recall from. Fails closed on any partial failure unless
 /// `--best-effort` is set.
 pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
+    let validated_target =
+        validate_declared_reindex_target(args.db.as_deref(), args.config.as_deref())?;
+
     // Namespace precedence mirrors `kkernel mcp`:
     //   1. --namespace / KHIVE_NAMESPACE (explicit CLI/env) — skips config tier
     //   2. [actor] id in the config file
@@ -518,7 +573,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     // `!explicit`, `resolve_runtime_config` may have applied `[actor] id` from
     // the config file, making `cfg.default_namespace` differ from the CLI value.
     let resolved_ns = cfg.default_namespace.clone();
-    let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rt = open_validated_reindex_backend(cfg, validated_target.as_ref())?;
     let token = rt
         .authorize(resolved_ns)
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -1363,6 +1418,62 @@ mod tests {
         path
     }
 
+    fn write_declared_backend_test_config(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        let main = dir.join("main.db");
+        let knowledge = dir.join("knowledge.db");
+        let config = dir.join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "knowledge"
+kind = "sqlite"
+path = "{}"
+"#,
+                main.display(),
+                knowledge.display(),
+            ),
+        )
+        .expect("write declared-backend config");
+        (config, main, knowledge)
+    }
+
+    /// One writable `main` backend plus one `read_only = true` `archive`
+    /// backend, so a reindex validator test can assert the read-only path is
+    /// refused while the writable path (the control) still passes.
+    fn write_read_only_backend_test_config(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        let main = dir.join("main.db");
+        let archive = dir.join("archive.db");
+        let config = dir.join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "archive"
+kind = "sqlite"
+path = "{}"
+read_only = true
+"#,
+                main.display(),
+                archive.display(),
+            ),
+        )
+        .expect("write read-only-backend config");
+        (config, main, archive)
+    }
+
     #[test]
     fn allocation_free_embedding_eligibility_matches_canonical_text() {
         let entities = [
@@ -2062,6 +2173,259 @@ mod tests {
     #[test]
     fn db_absent_leaves_default() {
         assert_eq!(resolve_db_override(None), None);
+    }
+
+    #[test]
+    #[serial]
+    fn declared_backends_require_an_explicit_reindex_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, _, _) = write_declared_backend_test_config(dir.path());
+
+        let error = validate_declared_reindex_target(None, Some(&config))
+            .expect_err("a topology-backed reindex without a target must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("requires an explicit persistent --db / KHIVE_DB target"));
+        assert!(message.contains(&config.display().to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn declared_secondary_backend_is_a_valid_reindex_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, _, knowledge) = write_declared_backend_test_config(dir.path());
+
+        validate_declared_reindex_target(knowledge.to_str(), Some(&config))
+            .expect("reindex may target any explicitly declared SQLite backend");
+    }
+
+    #[test]
+    #[serial]
+    fn undeclared_reindex_target_is_rejected_with_config_source() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, _, _) = write_declared_backend_test_config(dir.path());
+        let wrong = dir.path().join("typo.db");
+
+        let error = validate_declared_reindex_target(wrong.to_str(), Some(&config))
+            .expect_err("an undeclared target must never be reindexed");
+        let message = error.to_string();
+        assert!(message.contains("is not a path declared in [[backends]]"));
+        assert!(message.contains(&config.display().to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn read_only_declared_backend_is_refused_as_reindex_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, main, archive) = write_read_only_backend_test_config(dir.path());
+
+        // Expected before the fix: the read-only path passes the validator,
+        // since it only matched declared paths and never inspected
+        // `read_only` — reindex always writes, so that is wrong.
+        let error = validate_declared_reindex_target(archive.to_str(), Some(&config))
+            .expect_err("a backend declared read_only must never be reindexed");
+        let message = error.to_string();
+        assert!(message.contains(&archive.display().to_string()));
+        assert!(message.contains("read_only"));
+
+        // Control: the writable backend in the same config still passes.
+        validate_declared_reindex_target(main.to_str(), Some(&config))
+            .expect("a writable declared backend remains a valid reindex target");
+
+        // Control: an undeclared path is still refused as before.
+        let wrong = dir.path().join("typo.db");
+        validate_declared_reindex_target(wrong.to_str(), Some(&config))
+            .expect_err("an undeclared target must never be reindexed");
+    }
+
+    #[test]
+    #[serial]
+    fn single_backend_reindex_keeps_ordinary_db_override_behavior() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = write_empty_test_config(dir.path());
+        let target = dir.path().join("ordinary.db");
+
+        let validated = validate_declared_reindex_target(target.to_str(), Some(&config))
+            .expect("without [[backends]], --db remains an ordinary target");
+        assert!(
+            validated.is_none(),
+            "no [[backends]] declared: there is no validated identity to bind, so the \
+             ordinary single-backend --db path must be used unchanged"
+        );
+    }
+
+    /// Build the same `RuntimeConfig` `run_reindex` would resolve for `db`, so
+    /// the tests below drive `open_validated_reindex_backend` (the actual open
+    /// path) without running a full reindex.
+    fn resolve_reindex_test_config(
+        db: Option<&str>,
+        config: &std::path::Path,
+    ) -> khive_runtime::RuntimeConfig {
+        resolve_runtime_config(RuntimeConfigInputs {
+            db,
+            config: Some(config),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve reindex runtime config")
+    }
+
+    #[test]
+    #[serial]
+    fn nothing_changed_between_validation_and_open_succeeds() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a_db = dir.path().join("a.db");
+        let config = dir.path().join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = \"{}\"\n",
+                a_db.display()
+            ),
+        )
+        .expect("write config");
+
+        let validated = validate_declared_reindex_target(a_db.to_str(), Some(&config))
+            .expect("a.db is the declared main backend")
+            .expect("backends declared: a validated target must be returned");
+
+        let cfg = resolve_reindex_test_config(a_db.to_str(), &config);
+        open_validated_reindex_backend(cfg, Some(&validated))
+            .expect("an unchanged declared target must open normally (control)");
+    }
+
+    #[test]
+    #[serial]
+    fn declared_secondary_backend_open_targets_its_own_file_not_main() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, main_db, knowledge_db) = write_declared_backend_test_config(dir.path());
+
+        let validated = validate_declared_reindex_target(knowledge_db.to_str(), Some(&config))
+            .expect("knowledge.db is a declared secondary backend")
+            .expect("backends declared: a validated target must be returned");
+        assert_eq!(
+            validated.path.file_name(),
+            knowledge_db.file_name(),
+            "the validated target must be knowledge.db, not main.db"
+        );
+
+        let cfg = resolve_reindex_test_config(knowledge_db.to_str(), &config);
+        open_validated_reindex_backend(cfg, Some(&validated))
+            .expect("declared secondary backend must open");
+
+        assert!(
+            knowledge_db.exists(),
+            "reindex must create/open the targeted secondary backend"
+        );
+        assert!(
+            !main_db.exists(),
+            "no override normalization on the reindex path may redirect the secondary \
+             target to main (control)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn symlink_retargeted_after_validation_does_not_redirect_the_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a_db = dir.path().join("a.db");
+        let b_db = dir.path().join("b.db");
+        let link_db = dir.path().join("link.db");
+        std::fs::write(&a_db, b"").expect("create a.db");
+        std::os::unix::fs::symlink(&a_db, &link_db).expect("create symlink");
+
+        let config = dir.path().join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = \"{}\"\n",
+                link_db.display()
+            ),
+        )
+        .expect("write config");
+
+        let validated = validate_declared_reindex_target(link_db.to_str(), Some(&config))
+            .expect("link.db resolves through the symlink to the declared backend")
+            .expect("backends declared: a validated target must be returned");
+        assert_eq!(
+            validated.path,
+            a_db.canonicalize().expect("canonicalize a.db"),
+            "validation must resolve the symlink to a.db's own canonical path"
+        );
+
+        // Attacker retargets the symlink to an undeclared file after
+        // validation, before anything opens it.
+        std::fs::remove_file(&link_db).expect("remove symlink");
+        std::os::unix::fs::symlink(&b_db, &link_db).expect("retarget symlink");
+
+        // Expected before the fix: `run_reindex` resolved `cfg.db_path` from
+        // the RAW `--db` string alone (tilde-expansion only, never
+        // canonicalized), so `KhiveRuntime::new` opened straight through
+        // `link.db` and the OS followed its CURRENT target — this
+        // demonstrates that pre-fix behavior directly, since
+        // `open_validated_reindex_backend` did not exist before this fix.
+        let pre_fix_cfg = resolve_reindex_test_config(link_db.to_str(), &config);
+        KhiveRuntime::new(pre_fix_cfg)
+            .expect("red before the fix: the retargeted symlink opens without complaint");
+        assert!(
+            b_db.exists(),
+            "red before the fix: resolving the raw --db string at open time follows the \
+             retargeted symlink and creates the undeclared b.db"
+        );
+        std::fs::remove_file(&b_db).expect("reset the undeclared file for the fixed path");
+
+        // Fixed path: the open is pinned to the canonical path validation
+        // observed, so the retargeted symlink has no effect.
+        let cfg = resolve_reindex_test_config(link_db.to_str(), &config);
+        open_validated_reindex_backend(cfg, Some(&validated))
+            .expect("open the declared backend through its validated identity");
+        assert!(
+            !b_db.exists(),
+            "the retargeted undeclared file must never be touched"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn file_replaced_in_place_after_validation_is_refused_at_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a_db = dir.path().join("a.db");
+        let other_db = dir.path().join("other.db");
+        std::fs::write(&a_db, b"declared backend").expect("create a.db");
+        std::fs::write(&other_db, b"a different file entirely").expect("create other.db");
+
+        let config = dir.path().join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = \"{}\"\n",
+                a_db.display()
+            ),
+        )
+        .expect("write config");
+
+        let validated = validate_declared_reindex_target(a_db.to_str(), Some(&config))
+            .expect("a.db is the declared main backend")
+            .expect("backends declared: a validated target must be returned");
+
+        // Same path string, different underlying file: replace a.db in place
+        // between validation and open. The pre-fix validator only ever
+        // compared canonicalized path STRINGS, never filesystem identity, so
+        // this is the arm that proves the check binds to identity, not to
+        // the string that survived the rename.
+        std::fs::rename(&other_db, &a_db).expect("swap a.db's contents in place");
+
+        let cfg = resolve_reindex_test_config(a_db.to_str(), &config);
+        let error = open_validated_reindex_backend(cfg, Some(&validated))
+            .map(|_| ())
+            .expect_err("a file swapped in place after validation must be refused, not opened");
+        let message = error.to_string();
+        assert!(message.contains("changed identity between validation and open"));
+        assert!(message.contains(&a_db.display().to_string()));
     }
 
     #[test]
