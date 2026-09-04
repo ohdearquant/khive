@@ -6662,12 +6662,19 @@ esac
         std::fs::read_to_string(&git_log).unwrap_or_default()
     );
     let gh_invocations = std::fs::read_to_string(gh_log).expect("gh invocation log");
-    assert!(
-        gh_invocations
-            .lines()
-            .all(|line| line.contains("fixture/repository")),
-        "every gh call stays source-bound: {gh_invocations:?}"
+    let lines: Vec<&str> = gh_invocations.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("repo view fixture/repository --json nameWithOwner,url"),
+        "the probe must never delegate repository selection to gh: {lines:?}"
     );
+    for line in lines.iter().skip(1) {
+        assert_eq!(
+            repo_flag_value(line),
+            Some("fixture/repository"),
+            "every issue list call must retain the source-bound repo, exactly: {line:?}"
+        );
+    }
 }
 
 #[tokio::test]
