@@ -2530,25 +2530,23 @@ struct FileIdentity {
 }
 
 fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
-    let meta = std::fs::metadata(path).ok()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(path).ok()?;
         Some(FileIdentity {
             device: meta.dev(),
             inode: meta.ino(),
         })
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
-        use std::os::windows::fs::MetadataExt as _;
-        Some(FileIdentity {
-            device: meta.volume_serial_number()? as u64,
-            inode: meta.file_index()?,
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
+        // The standard library exposes no stable file-identity accessor off
+        // unix (the Windows volume-serial and file-index accessors are
+        // unstable), so the pre-open re-check degrades to path-level
+        // validation there. This crate's non-unix lane is compile-checked
+        // only.
+        let _ = path;
         None
     }
 }
