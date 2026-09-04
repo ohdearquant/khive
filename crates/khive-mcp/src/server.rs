@@ -2995,18 +2995,22 @@ impl KhiveMcpServer {
         // inline result instead. Bypass daemon forwarding whenever `save_to`
         // is set so the local path's manifest/file behavior always applies,
         // matching the existing `kkernel exec --save-file` precedent.
+        // A request cancelled before daemon admission must not start new
+        // work — this must hold regardless of whether the request would go
+        // through daemon forwarding or straight to local dispatch via the
+        // `save_to` bypass below, so the check runs before either branch is
+        // chosen. After admission, however, cancellation cannot safely drop
+        // the forward: the daemon may already have committed one or more
+        // operations, so the bridge must preserve its real response.
+        #[cfg(unix)]
+        if khive_storage::request_read_is_cancelled() {
+            return Err(McpError::internal_error(
+                "request cancelled before daemon dispatch",
+                None,
+            ));
+        }
         #[cfg(unix)]
         if p.save_to.is_none() {
-            // A request cancelled before daemon admission must not start new
-            // work. After admission, however, cancellation cannot safely drop
-            // the forward: the daemon may already have committed one or more
-            // operations, so the bridge must preserve its real response.
-            if khive_storage::request_read_is_cancelled() {
-                return Err(McpError::internal_error(
-                    "request cancelled before daemon dispatch",
-                    None,
-                ));
-            }
             let frame = self.wire_daemon_frame(&p);
             let request_id = frame.request_id;
             // Forward this server's own resolved pack list so a daemon this
@@ -3040,7 +3044,39 @@ impl KhiveMcpServer {
                         "request cancellation arrived after daemon admission; shielding the \
                          forward until its per-operation outcome is known"
                     );
-                    forward_task.await
+                    // Shielding the forward must still be bounded: a stalled
+                    // daemon or a silent same-UID socket peer must not keep
+                    // this handler (and the task awaiting it) alive forever.
+                    // Reuse the same ceiling this bridge already installs as
+                    // its own request-owned-work deadline (`request_read_timeout`,
+                    // `KHIVE_REQUEST_READ_TIMEOUT_SECS`), the same bound the
+                    // daemon client applies to its own response read, so a
+                    // hang anywhere in the round trip surfaces consistently.
+                    match tokio::time::timeout(request_read_timeout(), &mut forward_task).await
+                    {
+                        Ok(result) => result,
+                        Err(_elapsed) => {
+                            // Never abort the task: the daemon may already
+                            // have committed. Just stop waiting on it here —
+                            // dropping the `JoinHandle` detaches without
+                            // cancelling, so the forward keeps running to
+                            // completion on its own.
+                            tracing::warn!(
+                                request_id,
+                                "admitted daemon forward did not resolve within the \
+                                 post-cancellation wait bound; reporting an unknown \
+                                 outcome and leaving the forward to finish on its own"
+                            );
+                            return Err(McpError::internal_error(
+                                "daemon forward outcome unknown after cancellation",
+                                Some(json!({
+                                    "outcome": "unknown",
+                                    "retryable": false,
+                                    "request_id": request_id,
+                                })),
+                            ));
+                        }
+                    }
                 }
             };
             let forwarded = forwarded.map_err(|error| {
@@ -3073,7 +3109,14 @@ impl KhiveMcpServer {
                     },
                 };
             }
-            if cancelled_during_forward {
+            // The forward produced no daemon-side outcome (e.g. no socket,
+            // `KHIVE_NO_DAEMON`). `tokio::select!` is unbiased, so the
+            // task-result arm can win with `None` in the same instant
+            // cancellation becomes visible — `cancelled_during_forward` alone
+            // would miss that race. Re-check the flag directly so local
+            // dispatch never runs after an admitted cancellation regardless
+            // of which arm happened to win.
+            if cancelled_during_forward || khive_storage::request_read_is_cancelled() {
                 return Err(McpError::internal_error(
                     "request cancelled before local fallback dispatch",
                     Some(json!({
@@ -4329,7 +4372,7 @@ mod tests {
 
     #[cfg(unix)]
     use khive_storage::test_support::freeze_snapshot_sidecars;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[test]
@@ -4490,13 +4533,32 @@ mod tests {
     /// committed and which failed validation.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn forwarded_cancellation_returns_the_actual_partial_envelope() {
+        thread_local! {
+            static FORWARD_STARTED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+            static FORWARD_RELEASE: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        // Gated on an explicit release signal rather than a sleep, so the
+        // test can prove the ordering it actually needs (cancellation must
+        // land while the forward is still outstanding) instead of hoping a
+        // fixed delay is long enough.
         fn delayed_partial_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
         ) -> ForwardFuture {
-            Box::pin(async {
-                tokio::time::sleep(Duration::from_millis(40)).await;
+            let started = FORWARD_STARTED
+                .with(|c| c.borrow().clone())
+                .expect("started notify armed");
+            let release = FORWARD_RELEASE
+                .with(|c| c.borrow().clone())
+                .expect("release notify armed");
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
                 Some(Ok(json!({
                     "results": [
                         {"ok": true, "tool": "comm.send", "result": {"id": "sent"}},
@@ -4509,6 +4571,11 @@ mod tests {
             })
         }
 
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
+        FORWARD_RELEASE.with(|c| *c.borrow_mut() = Some(release.clone()));
+
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             embedding_model: None,
@@ -4520,9 +4587,14 @@ mod tests {
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
         let cancellation = tokio_util::sync::CancellationToken::new();
         let cancel_after_admission = cancellation.clone();
+        // The forward cannot possibly complete before `release` fires below,
+        // so once this task observes admission and cancels, the handler's
+        // select is guaranteed to take the cancellation arm — no race with
+        // the task-result arm is possible.
         let canceller = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            started.notified().await;
             cancel_after_admission.cancel();
+            release.notify_one();
         });
 
         let response = scope_mcp_request_read_cancellation(
@@ -4546,23 +4618,199 @@ mod tests {
         assert_eq!(response["results"][1]["error"], "invalid endpoint pair");
     }
 
+    /// The pre-admission cancellation check must run before the `save_to`
+    /// bypass branch, not inside it: a cancelled request that happens to
+    /// carry `save_to` must never fall through to local dispatch and start
+    /// mutating work before cancellation is ever checked. `save_to` bypasses
+    /// daemon forwarding either way (MCP-AUD-002), so the forward seam here
+    /// exists only to prove it is never reached; the real assertion is that
+    /// nothing was created.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn cancelled_request_with_save_to_refuses_before_local_dispatch() {
+        fn unreachable_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+        ) -> ForwardFuture {
+            panic!("save_to must bypass daemon forwarding regardless of cancellation");
+        }
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+        let (_tx, cancelled_rx) = tokio::sync::watch::channel(true);
+        let result = khive_storage::scope_request_read_cancellation(cancelled_rx, async {
+            server
+                .request_with_forward(
+                    RequestParams {
+                        ops: "create(kind=\"entity\", entity_kind=\"concept\", \
+                              name=\"fix2337-cancelled-save-to-probe\")"
+                            .to_string(),
+                        save_to: Some("unused.jsonl".to_string()),
+                        ..Default::default()
+                    },
+                    unreachable_forward,
+                )
+                .await
+        })
+        .await;
+
+        let error = result
+            .expect_err("a cancelled request with save_to set must be refused before dispatch");
+        assert!(
+            error.message.contains("cancelled"),
+            "unexpected error message: {error}"
+        );
+
+        let stats = server
+            .dispatch_request_local(RequestParams {
+                ops: "stats()".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("probe stats() must succeed");
+        let stats: Value = serde_json::from_str(&stats).expect("probe response is JSON");
+        assert_eq!(
+            stats["results"][0]["result"]["entities"], 0,
+            "cancellation before save_to dispatch must mean no entity was ever \
+             created: {stats}"
+        );
+    }
+
+    /// `tokio::select!` is unbiased: when a forward seam sets the
+    /// cancellation flag itself and then resolves to `None` in the same
+    /// poll, the task-result arm can win the select exactly as often as the
+    /// cancellation arm (both branches become ready together). The old code
+    /// only refused local fallback when the cancellation *arm* had won
+    /// (`cancelled_during_forward`); this loops enough attempts to land the
+    /// task-result-arm outcome at least once and asserts every attempt
+    /// refuses regardless of which arm actually won, so the fix does not
+    /// depend on getting lucky with the race.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn cancellation_visible_after_forward_returns_none_refuses_local_dispatch() {
+        thread_local! {
+            static CANCEL_TX: std::cell::RefCell<Option<tokio::sync::watch::Sender<bool>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn cancel_then_none_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+        ) -> ForwardFuture {
+            Box::pin(async move {
+                CANCEL_TX.with(|c| {
+                    c.borrow()
+                        .as_ref()
+                        .expect("cancel sender armed")
+                        .send(true)
+                        .expect("cancellation receiver still live")
+                });
+                None
+            })
+        }
+
+        for attempt in 0..50 {
+            let runtime = KhiveRuntime::new(RuntimeConfig {
+                db_path: None,
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            })
+            .expect("in-memory runtime");
+            let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            CANCEL_TX.with(|c| *c.borrow_mut() = Some(cancel_tx));
+
+            let result = khive_storage::scope_request_read_cancellation(
+                cancel_rx,
+                server.request_with_forward(
+                    RequestParams {
+                        ops: "create(kind=\"entity\", entity_kind=\"concept\", \
+                              name=\"fix2337-none-race-probe\")"
+                            .to_string(),
+                        ..Default::default()
+                    },
+                    cancel_then_none_forward,
+                ),
+            )
+            .await;
+
+            let error = result.expect_err(&format!(
+                "attempt {attempt}: cancellation visible after the forward returns None \
+                 must refuse local dispatch, not run it"
+            ));
+            assert_eq!(
+                error.data.as_ref().map(|d| d["outcome"].clone()),
+                Some(json!("not_dispatched")),
+                "attempt {attempt}: unexpected error data: {error:?}"
+            );
+
+            let stats = server
+                .dispatch_request_local(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("probe stats() must succeed");
+            let stats: Value = serde_json::from_str(&stats).expect("probe response is JSON");
+            assert_eq!(
+                stats["results"][0]["result"]["entities"], 0,
+                "attempt {attempt}: cancellation visible after None must mean no entity \
+                 was ever created: {stats}"
+            );
+        }
+    }
+
     /// Once daemon forwarding is admitted, dropping the outer MCP handler
     /// must detach rather than cancel the socket exchange. Otherwise the
     /// daemon can commit while the bridge silently discards the only result.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn dropping_handler_does_not_drop_an_admitted_forward() {
-        static FORWARD_STARTED: AtomicBool = AtomicBool::new(false);
-        static FORWARD_COMPLETED: AtomicBool = AtomicBool::new(false);
+        thread_local! {
+            static FORWARD_STARTED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+            static FORWARD_RELEASE: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+            static FORWARD_COMPLETED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+        }
 
+        // Gated on explicit release/completion signals rather than sleeps:
+        // the forward only proceeds past admission once the test releases
+        // it (after aborting the outer handler), and completion is observed
+        // by waiting on a notification instead of hoping a fixed delay was
+        // long enough for the detached task to finish.
         fn slow_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
         ) -> ForwardFuture {
-            Box::pin(async {
-                FORWARD_STARTED.store(true, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(60)).await;
-                FORWARD_COMPLETED.store(true, Ordering::SeqCst);
+            let started = FORWARD_STARTED
+                .with(|c| c.borrow().clone())
+                .expect("started notify armed");
+            let release = FORWARD_RELEASE
+                .with(|c| c.borrow().clone())
+                .expect("release notify armed");
+            let completed = FORWARD_COMPLETED
+                .with(|c| c.borrow().clone())
+                .expect("completed notify armed");
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                completed.notify_one();
                 Some(Ok(json!({
                     "results": [{"ok": true, "tool": "stats", "result": {}}],
                     "summary": {"total": 1, "succeeded": 1, "failed": 0, "aborted": 0},
@@ -4572,8 +4820,13 @@ mod tests {
             })
         }
 
-        FORWARD_STARTED.store(false, Ordering::SeqCst);
-        FORWARD_COMPLETED.store(false, Ordering::SeqCst);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
+        FORWARD_RELEASE.with(|c| *c.borrow_mut() = Some(release.clone()));
+        FORWARD_COMPLETED.with(|c| *c.borrow_mut() = Some(completed.clone()));
+
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             embedding_model: None,
@@ -4595,20 +4848,95 @@ mod tests {
                 .await
         });
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !FORWARD_STARTED.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("forward never reached admission");
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("forward never reached admission");
         handler.abort();
         let _ = handler.await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        release.notify_one();
 
-        assert!(
-            FORWARD_COMPLETED.load(Ordering::SeqCst),
-            "dropping the handler must not cancel an already-admitted daemon forward"
+        tokio::time::timeout(Duration::from_secs(1), completed.notified())
+            .await
+            .expect("dropping the handler must not cancel an already-admitted daemon forward");
+    }
+
+    /// An admitted forward must not shield a cancelled request forever: if
+    /// the daemon (or the socket read underneath it) never answers, the
+    /// post-cancellation wait is bounded by `request_read_timeout()`, and on
+    /// expiry the handler reports an outcome-unknown error rather than
+    /// hanging. The forward task itself is left running (never aborted), so
+    /// this only asserts the handler's own return, not the task's fate.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn admitted_forward_that_never_resolves_reports_unknown_outcome_after_the_bound() {
+        thread_local! {
+            static FORWARD_STARTED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn never_resolves_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+        ) -> ForwardFuture {
+            let started = FORWARD_STARTED
+                .with(|c| c.borrow().clone())
+                .expect("started notify armed");
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending::<()>().await;
+                unreachable!("this forward seam must never resolve");
+            })
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel_after_admission = cancellation.clone();
+        let handler = tokio::spawn(async move {
+            scope_mcp_request_read_cancellation(
+                cancel_after_admission,
+                server.request_with_forward(
+                    RequestParams {
+                        ops: "stats()".to_string(),
+                        request_id: Some(7777),
+                        ..Default::default()
+                    },
+                    never_resolves_forward,
+                ),
+            )
+            .await
+        });
+
+        started.notified().await;
+        cancellation.cancel();
+
+        let bound = request_read_timeout();
+        let result = tokio::time::timeout(bound.saturating_add(Duration::from_secs(5)), handler)
+            .await
+            .expect("handler never returned after the post-cancellation bound elapsed")
+            .expect("handler task must not panic");
+
+        let error =
+            result.expect_err("an admitted forward that never resolves must not hang forever");
+        let data = error
+            .data
+            .expect("unknown-outcome error must carry structured data");
+        assert_eq!(data["outcome"], "unknown");
+        assert_eq!(data["retryable"], false);
+        assert_eq!(
+            data["request_id"], 7777,
+            "unknown-outcome error must carry the request id: {data}"
         );
     }
 
@@ -4664,6 +4992,66 @@ mod tests {
             "the real forward_or_spawn_boxed adapter must convert the server's resolved \
              registry pack set into Some(&packs) at the forward_or_spawn_with_config_and_packs \
              call boundary"
+        );
+    }
+
+    /// `ensure_bridge_request_id` unit-tests the helper in isolation, but the
+    /// invariant "every admitted MCP request carries a bridge correlation
+    /// id" is actually established at `request_with_cancellation`, the real
+    /// production entry point. A test that only calls the helper directly
+    /// cannot prove that boundary applies it. This drives
+    /// `request_with_cancellation` itself and observes the `request_id` the
+    /// real daemon adapter boundary received, via the same
+    /// `test_forward_seam` hook `restricted_registry_pack_list_reaches_real_adapter_boundary`
+    /// above uses for the pack list.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn request_with_cancellation_stamps_bridge_id_at_the_real_adapter_boundary() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+        crate::daemon::test_forward_seam::arm();
+        let without_id = RequestParams {
+            ops: "stats()".to_string(),
+            request_id: None,
+            ..Default::default()
+        };
+        let result = server.request_with_cancellation(without_id).await;
+        assert!(
+            result.is_ok(),
+            "the intercepted dispatch through the real production entry point must \
+             succeed: {result:?}"
+        );
+        let minted = crate::daemon::test_forward_seam::take_captured_request_id()
+            .expect("hook was armed and must have observed a call")
+            .expect("the bridge must mint a request id when the caller supplied none");
+        assert_ne!(minted, 0, "bridge-generated ids must be nonzero");
+
+        crate::daemon::test_forward_seam::arm();
+        let with_id = RequestParams {
+            ops: "stats()".to_string(),
+            request_id: Some(4242),
+            ..Default::default()
+        };
+        let result = server.request_with_cancellation(with_id).await;
+        assert!(
+            result.is_ok(),
+            "the intercepted dispatch through the real production entry point must \
+             succeed: {result:?}"
+        );
+        assert_eq!(
+            crate::daemon::test_forward_seam::take_captured_request_id(),
+            Some(Some(4242)),
+            "an explicit caller-supplied request id must reach the real adapter \
+             boundary unchanged"
         );
     }
 

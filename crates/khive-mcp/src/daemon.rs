@@ -551,9 +551,21 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
     if write_frame(&mut stream, &payload).await.is_err() {
         return ForwardOutcome::NoSocket;
     }
-    let resp = match read_frame(&mut stream).await {
-        Ok(r) => r,
-        Err(e) => {
+    // The request is now written and may already be executing (or committed)
+    // on the daemon side, so a stalled or unresponsive daemon must not leave
+    // this read pending forever — that would keep the calling task (and the
+    // MCP handler awaiting it) alive indefinitely. Reuse the same read
+    // ceiling the bridge already applies to its own request-owned work
+    // (`KHIVE_REQUEST_READ_TIMEOUT_SECS`, default 30s) rather than adding a
+    // second, independently-tuned timeout knob.
+    let resp = match tokio::time::timeout(
+        khive_storage::request_read_timeout_from_env(),
+        read_frame(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             // The request was sent but the daemon closed the connection before
             // sending a response frame — likely a daemon crash or panic during
             // dispatch. Treat as ParseFailure (not NoSocket): the request may
@@ -563,6 +575,17 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
                 error = %e,
                 "daemon closed connection without sending a response \
                  (crash during dispatch?) — returning terminal ambiguity"
+            );
+            return ForwardOutcome::ParseFailure;
+        }
+        Err(_elapsed) => {
+            // The daemon never answered within the read ceiling. The write
+            // already completed, so — exactly like the connection-closed case
+            // above — the request may already have committed; there is no
+            // safe retry or local fallback, only a terminal ambiguity error.
+            tracing::warn!(
+                "daemon response read timed out after the request was fully \
+                 written — returning terminal ambiguity"
             );
             return ForwardOutcome::ParseFailure;
         }
@@ -2116,7 +2139,7 @@ pub async fn forward_or_spawn_with_config_and_packs(
     packs: Option<&[String]>,
 ) -> Option<Result<String, McpError>> {
     #[cfg(any(test, feature = "test-forward-seam"))]
-    if let Some(intercepted) = test_forward_seam::intercept(packs) {
+    if let Some(intercepted) = test_forward_seam::intercept(frame, packs) {
         return intercepted;
     }
     let spawn = || {
@@ -2158,12 +2181,14 @@ pub async fn forward_or_spawn_with_config(
 /// re-declaration instead) can reach it.
 #[cfg(any(test, feature = "test-forward-seam"))]
 pub mod test_forward_seam {
-    use super::McpError;
+    use super::{DaemonRequestFrame, McpError};
     use std::cell::Cell;
 
     thread_local! {
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static CAPTURED: std::cell::RefCell<Option<Option<Vec<String>>>> =
+            const { std::cell::RefCell::new(None) };
+        static CAPTURED_REQUEST_ID: std::cell::RefCell<Option<Option<u64>>> =
             const { std::cell::RefCell::new(None) };
     }
 
@@ -2173,6 +2198,7 @@ pub mod test_forward_seam {
     /// spawning a process; the hook then disarms itself.
     pub fn arm() {
         CAPTURED.with(|c| *c.borrow_mut() = None);
+        CAPTURED_REQUEST_ID.with(|c| *c.borrow_mut() = None);
         ARMED.with(|a| a.set(true));
     }
 
@@ -2185,12 +2211,24 @@ pub mod test_forward_seam {
         CAPTURED.with(|c| c.borrow_mut().take())
     }
 
-    pub(super) fn intercept(packs: Option<&[String]>) -> Option<Option<Result<String, McpError>>> {
+    /// Take the captured `frame.request_id` of the most recent armed call,
+    /// if any. Companion to `take_captured` for tests proving the bridge
+    /// correlation id (khive#948, khive-oss#2337) reaches the real
+    /// `forward_or_spawn_with_config_and_packs` adapter boundary unchanged.
+    pub fn take_captured_request_id() -> Option<Option<u64>> {
+        CAPTURED_REQUEST_ID.with(|c| c.borrow_mut().take())
+    }
+
+    pub(super) fn intercept(
+        frame: &DaemonRequestFrame,
+        packs: Option<&[String]>,
+    ) -> Option<Option<Result<String, McpError>>> {
         let was_armed = ARMED.with(|a| a.replace(false));
         if !was_armed {
             return None;
         }
         CAPTURED.with(|c| *c.borrow_mut() = Some(packs.map(<[String]>::to_vec)));
+        CAPTURED_REQUEST_ID.with(|c| *c.borrow_mut() = Some(frame.request_id));
         Some(Some(Ok(serde_json::json!({
             "results": [{"ok": true, "tool": "stats", "result": {}}],
             "summary": {"total": 1, "succeeded": 1, "failed": 0},

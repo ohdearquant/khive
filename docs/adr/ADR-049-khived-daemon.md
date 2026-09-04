@@ -983,6 +983,21 @@ policy, which is why the code is chosen for a stated one. The
 three facts recorded in Amendment 6 are unchanged and remain the reason no
 trajectory reading is available here.
 
+### Test obligations
+
+The per-class end-to-end obligation now covers 0, 2, 3, and 6. State 9's test
+asserts exit 0 and asserts that the refusal message contains both the pid and
+the command line, since dropping either is the failure this amendment guards
+and neither is visible in an exit code. The reserved-code guarantee gains exit
+4: no classified refusal ever exits 1, 4, or 5.
+
+### What is unchanged
+
+Every other state's disposition and exit code, the class rule itself, the
+precedence order, the three withdrawn-premise facts, and all of Amendments 1
+through 5. This amendment changes one exit code, one disposition string, and the
+reserved set.
+
 ## Amendment 8 (2026-08-30): cancellation preserves admitted request outcomes
 
 Amendment 5 made client cancellation close the warm-daemon stream so daemon
@@ -1027,7 +1042,7 @@ outcome-unknown. It closes the cooperative-cancellation seam where the bridge
 is alive and capable of preserving the daemon result, and it makes a vanished
 handler's admitted work correlatable in the audit substrate.
 
-### Test obligations
+### Test obligations (cancellation and bridge request ids)
 
 - A cancellation delivered while a delayed daemon forward is in flight returns
   that forward's real partial envelope, including the original per-op failure.
@@ -1035,18 +1050,3 @@ handler's admitted work correlatable in the audit substrate.
   forwarding future from reaching completion.
 - An omitted request id is replaced with a nonzero bridge id exactly once per
   admitted attempt; an explicit caller value is unchanged.
-
-### Test obligations
-
-The per-class end-to-end obligation now covers 0, 2, 3, and 6. State 9's test
-asserts exit 0 and asserts that the refusal message contains both the pid and
-the command line, since dropping either is the failure this amendment guards
-and neither is visible in an exit code. The reserved-code guarantee gains exit
-4: no classified refusal ever exits 1, 4, or 5.
-
-### What is unchanged
-
-Every other state's disposition and exit code, the class rule itself, the
-precedence order, the three withdrawn-premise facts, and all of Amendments 1
-through 5. This amendment changes one exit code, one disposition string, and the
-reserved set.
