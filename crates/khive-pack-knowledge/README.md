@@ -7,9 +7,10 @@ rerank, and composed into markdown briefings under a token budget.
 ## Features
 
 - **TF-IDF corpus search** (`knowledge.search`) over atom name/tags/content, with
-  score bands (`>=0.46` reliable, `0.42-0.46` mixed, `<0.42` mostly off-target),
-  query decomposition, and RRF fusion against an ANN pass when an embedder is
-  configured
+  request-relative scores, explicit lexical/ANN score provenance, query
+  decomposition, and RRF fusion against an ANN pass when an embedder is configured.
+  Scores are not calibrated probabilities or absolute presence signals; interpret
+  rank together with the reported candidate and score provenance
 - **Section-level records** (`knowledge.edit`) — a closed 10-value `section_type`
   enum (`overview`, `core_model`, `formalism`, `failure_modes`, ... `other`) per
   atom, each independently disputable and adjudicable (ADR-051)

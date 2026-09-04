@@ -1,11 +1,69 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30, 2026-09-03, 2026-09-04)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
+
+## Amendment (2026-09-04): union the exact-name/tag recovery with every lexical outcome
+
+The 2026-09-03 recovery below only ran once FTS had already reported a genuine miss — but FTS
+reports a miss only when _every_ term the query decomposes into failed to match anything eligible.
+A name- or tag-only atom was therefore still dropped whenever the query happened to also match
+some unrelated, eligible atom (FTS non-empty) or match only an ineligible atom (the `filtered`
+case): both outcomes returned before the recovery lookup ever ran.
+
+The recovery lookup now runs whenever the query yields a name needle or tag terms, independent of
+what FTS found, and its rows are unioned with FTS's rows (deduplicated by id, FTS rows ordered
+first). Provenance: `matched` stays `matched` whenever FTS contributed at least one eligible row,
+even if recovery added more; a `filtered` or genuine-miss outcome that recovery turns non-empty
+now reports `exact_match` — the same state the 2026-09-03 amendment already used for
+recovery-sourced rows, so no new provenance value was needed. `filtered` and `no_match` are
+unchanged for the case where recovery also finds nothing.
+
+## Amendment (2026-09-03): exact-name/tag recovery for a genuine FTS miss
+
+Removing the recency fallback (below) made two scorable candidate classes unreachable, because
+`fts_knowledge` cannot surface them regardless of corpus content: a query shorter than the
+trigram tokenizer's minimum span (e.g. "RAG", "ML") never forms a trigram, so `exact_name_bonus`
+scoring — which only needs the raw query as a substring of the name — never got a candidate to
+score; and `tags` is not one of the FTS-indexed columns at all, so a query that only overlaps an
+atom's tags (`w_tags` scoring) never got one either.
+
+A genuine FTS miss now runs one further bounded, direct-predicate lookup — not a recency scan —
+before reporting empty: atoms whose `name` contains the raw query (case-insensitive) or whose
+`tags` JSON array contains a query token, capped at the same candidate-pool limit and still
+scoped by namespace/status/kind eligibility inside the SQL. `candidate_provenance.lexical` reports
+this outcome as `exact_match`, distinct from `matched` (a real FTS/bm25 hit) so a caller can still
+tell which lexical mechanism produced the candidates.
+
+## Amendment (2026-08-30): honest lexical fallback and score provenance
+
+A genuine FTS miss yields an empty lexical candidate set. It no longer falls back to a
+bounded scan ordered by atom creation time: corpus recency is not query evidence, and treating
+those newest rows as a lexical rank source lets reciprocal-rank fusion manufacture relevance
+for zero-overlap queries. The cheap raw-FTS existence probe remains so a miss can be distinguished
+from a lexical match removed by kind/status eligibility. ANN-only retrieval remains available when
+an embedder and index can supply it.
+
+`knowledge.search` adds backward-compatible provenance fields:
+
+- Top-level `candidate_provenance.lexical` is `matched`, `exact_match`, `no_match`, `filtered`,
+  `partial_timeout`, or `timed_out` (`exact_match` added 2026-09-03, see amendment above).
+- Top-level `candidate_provenance.fallback` is `ann` only when the returned set has ANN
+  evidence and no returned result has lexical evidence; otherwise it is `none`.
+- Each result adds `score_provenance` with a stable-order `sources` subset of `lexical` and
+  `ann`, `embedding_rerank` (whether a successful dense rerank transformed the score),
+  `normalization: "s_over_s_plus_1"`, and `calibrated: false`.
+
+Search scores are request-relative ranking values. After lexical/ANN fusion and optional
+embedding rerank, the score is monotonically squashed with `s / (s + 1)` and receives the
+existing status multiplier. It is not a probability, a cross-query comparable measure, or an
+absolute presence signal. The former `0.46`/`0.42` bands predated the squash and are retired;
+callers use response-local rank together with candidate and per-hit provenance. `min_score`
+continues to apply to the final returned score.
 
 ## Amendment (2026-08-29): tri-state atom upsert patches
 
@@ -315,7 +373,7 @@ exhausted. Pure computation — no database access.
 #### `knowledge.search` — TF-IDF ranked search
 
 ```
-search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N}
+search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N, candidate_provenance: {lexical, fallback}}
 ```
 
 FTS5 recall → in-memory TF-IDF scoring across name, tags, and content
@@ -354,8 +412,12 @@ retrieval path goes through the same status gate.
 same default exclusion. There is no `include_drafts` override on `suggest` — domain atoms in
 draft state should not drive agent composition.
 
-**Score bands** (observed in production): `score >= 0.46` reliably on-target,
-`0.42 <= score < 0.46` mixed quality, `score < 0.42` mostly off-target.
+**Score interpretation (amended 2026-08-30)**: scores are request-relative hybrid ranking
+values, not calibrated relevance probabilities or absolute presence signals. Use result rank
+together with `candidate_provenance` and each result's `score_provenance`; do not apply fixed
+numeric bands across queries. A true lexical miss returns no lexical candidates instead of
+ranking the newest corpus rows, though a healthy ANN leg may still return explicitly labeled
+ANN-only results.
 
 #### `knowledge.compose` — namespace-consistent briefing composition
 
