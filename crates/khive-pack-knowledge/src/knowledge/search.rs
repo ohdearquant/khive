@@ -868,19 +868,52 @@ async fn search_decomposed(
 /// `EmbeddingService::embed_query` and `::embed` are different provider
 /// methods: instruction-tuned models (E5, Qwen) prepend a query prompt for
 /// the former, so the two calls land in different sides of the retrieval
-/// space for the identical text. `role_specific` holds a vector produced by
-/// `runtime.embed_query` (the ANN and KG-blend dense-search path); `generic`
-/// holds the first slot of a combined `runtime.embed_batch` rerank call. A
-/// `generic` vector is a valid stand-in for `role_specific` in rerank cosine
-/// math (both are just "the query's embedding" for a same-space comparison
-/// against candidates embedded the same generic way), but it must never
-/// satisfy a caller that specifically requires `role_specific` — passing it
-/// to the KG blend's `hybrid_search` masks a real `embed_query` failure
-/// behind a same-shaped, wrong-space vector (#2307).
+/// space for the identical text. `role_specific` holds the outcome of the
+/// request's one attempt at `runtime.embed_query` (the ANN and KG-blend
+/// dense-search path); `generic` holds the first slot of a combined
+/// `runtime.embed_batch` rerank call. A `generic` vector is a valid stand-in
+/// for `role_specific` in rerank cosine math (both are just "the query's
+/// embedding" for a same-space comparison against candidates embedded the
+/// same generic way), but it must never satisfy a caller that specifically
+/// requires `role_specific` — passing it to the KG blend's `hybrid_search`
+/// masks a real `embed_query` failure behind a same-shaped, wrong-space
+/// vector (#2307).
 #[derive(Debug, Default, Clone)]
 struct QueryEmbeddingCache {
-    role_specific: Option<Vec<f32>>,
+    role_specific: RoleSpecificEmbedding,
     generic: Option<Vec<f32>>,
+}
+
+/// Outcome of the request's (at most one) attempt to obtain the query's
+/// role-specific (`embed_query`) vector.
+///
+/// A plain `Option<Vec<f32>>` cannot tell "never tried" from "tried and the
+/// provider failed" — both read as `None`. That collapse is exactly what let
+/// a failed attempt in one stage (e.g. `suggest`) get retried by a later
+/// stage in the same request (e.g. `compose`'s KG-blend gate): the later
+/// stage saw `None` and had no way to know an attempt, and a failure, had
+/// already happened (#2307). `Failed` records that the attempt happened so
+/// nothing downstream pays for a second failing provider call; only
+/// `NotAttempted` authorizes a stage to try.
+#[derive(Debug, Clone, Default, PartialEq)]
+enum RoleSpecificEmbedding {
+    #[default]
+    NotAttempted,
+    Failed,
+    Vector(Vec<f32>),
+}
+
+impl RoleSpecificEmbedding {
+    fn as_deref(&self) -> Option<&[f32]> {
+        match self {
+            Self::Vector(v) => Some(v.as_slice()),
+            Self::NotAttempted | Self::Failed => None,
+        }
+    }
+
+    fn is_not_attempted(&self) -> bool {
+        matches!(self, Self::NotAttempted)
+    }
 }
 
 impl QueryEmbeddingCache {
@@ -1670,7 +1703,7 @@ async fn search_kg_entities(
     // role-specific vector (never attempted, or attempted and failed) means
     // the dense blend is unavailable and the caller safely keeps its
     // already-complete atom-only briefing.
-    let Some(query_vector) = query_embedding.role_specific.as_ref() else {
+    let Some(query_vector) = query_embedding.role_specific.as_deref() else {
         return Ok(Vec::new());
     };
     let candidate_k = ((cap * 4) as u32).max(20);
@@ -1681,7 +1714,7 @@ async fn search_kg_entities(
             .hybrid_search(
                 token,
                 query,
-                Some(query_vector.clone()),
+                Some(query_vector.to_vec()),
                 candidate_k,
                 Some(kind),
                 None,
@@ -2034,7 +2067,7 @@ impl KnowledgeHandlers {
         .await
         {
             Ok(Ok(query_emb)) => {
-                query_embedding.role_specific = Some(query_emb);
+                query_embedding.role_specific = RoleSpecificEmbedding::Vector(query_emb);
                 let model = runtime.default_embedder_name();
                 let key = vamana::AnnKey::new(&ns, model);
                 match search_eligible_ann_with_refill(
@@ -2254,16 +2287,20 @@ impl KnowledgeHandlers {
         // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
         // top ANN neighbors before the type gate discards atom hits.
         let ann_k = (limit * 50).max(200);
-        if query_embedding.role_specific.is_none() {
+        if query_embedding.role_specific.is_not_attempted() {
             match khive_storage::await_request_read_phase(
                 "knowledge.suggest",
                 runtime.embed_query(&raw_query),
             )
             .await
             {
-                Ok(Ok(query_emb)) => query_embedding.role_specific = Some(query_emb),
-                Ok(Err(_)) => {}
-                Err(e) if is_timeout(&e) => {}
+                Ok(Ok(query_emb)) => {
+                    query_embedding.role_specific = RoleSpecificEmbedding::Vector(query_emb)
+                }
+                Ok(Err(_)) => query_embedding.role_specific = RoleSpecificEmbedding::Failed,
+                Err(e) if is_timeout(&e) => {
+                    query_embedding.role_specific = RoleSpecificEmbedding::Failed
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -2674,7 +2711,7 @@ impl KnowledgeHandlers {
         // solo call and let rerank_text_items embed query + candidates in one
         // combined batch, matching the pre-cache single-job cost.
         if blend_kg
-            && query_embedding.role_specific.is_none()
+            && query_embedding.role_specific.is_not_attempted()
             && !runtime.default_embedder_name().is_empty()
         {
             let embedded = try_or_finish!(
@@ -2684,7 +2721,10 @@ impl KnowledgeHandlers {
                 )
                 .await
             );
-            query_embedding.role_specific = embedded.ok();
+            query_embedding.role_specific = match embedded {
+                Ok(v) => RoleSpecificEmbedding::Vector(v),
+                Err(_) => RoleSpecificEmbedding::Failed,
+            };
         }
         try_or_finish!(
             rerank_text_items(runtime, &raw_query, &mut query_embedding, &mut items,).await
@@ -3477,10 +3517,12 @@ mod tests {
     }
 
     // ── embed-intent regression ───────────────────────────────────────────────
-    // Guard that the ANN query paths in `search` and `suggest` use the
-    // query-intent embedding call, not the generic `runtime.embed(...)`.
-    // Uses include_str! so the assertion runs on the actual source bytes,
-    // but splits the needle to avoid matching the needle itself in test source.
+    // Guard that the query-embedding call sites in `search`, `suggest`, and
+    // `compose` (ANN retrieval for the first two; the KG-blend gate for the
+    // third) use the query-intent embedding call, not the generic
+    // `runtime.embed(...)`. Uses include_str! so the assertion runs on the
+    // actual source bytes, but splits the needle to avoid matching the
+    // needle itself in test source.
     #[test]
     fn knowledge_ann_query_paths_use_query_intent_embed() {
         let src = include_str!("search.rs");
@@ -3496,6 +3538,27 @@ mod tests {
             generic_count, 0,
             "ANN query paths must not call generic {generic_needle}; \
              found {generic_count} occurrence(s) — use embed_query instead"
+        );
+
+        // Positive check (#2307): the assertion above only proves the generic
+        // path is *absent* — a mutation that replaced every production
+        // `embed_query` call with a different method entirely (e.g.
+        // `embed_document`) would still pass it, since that mutation never
+        // introduces the generic-embed needle either. Count the query-intent
+        // call sites directly so a silent removal (or mutation-away) of one
+        // is caught: `search`'s ANN fetch, `suggest`'s ANN fetch, and
+        // `compose`'s KG-blend gate (immediately before its
+        // `rerank_text_items` call) are the only three production call sites.
+        let query_intent_needle: String = [".embed_query(", "&raw_query)"].concat();
+        let query_intent_count = src
+            .lines()
+            .filter(|l| !l.contains("concat") && !l.contains("needle"))
+            .filter(|l| l.contains(&query_intent_needle))
+            .count();
+        assert_eq!(
+            query_intent_count, 3,
+            "expected exactly 3 {query_intent_needle} call sites \
+             (search ANN + suggest ANN + compose KG-blend gate), found {query_intent_count}"
         );
     }
 
@@ -3606,7 +3669,7 @@ mod tests {
             "first rerank must fill cache"
         );
         assert!(
-            query_embedding.role_specific.is_none(),
+            query_embedding.role_specific.is_not_attempted(),
             "embed_cosine_scores must cache the batch vector as generic, \
              never role_specific — it came from embed_batch, not embed_query"
         );
@@ -3629,6 +3692,386 @@ mod tests {
             "the shared query must be embedded exactly once: {recorded:?}"
         );
         assert_eq!(recorded.len(), 4, "one query plus three candidates");
+    }
+
+    // ── #2307: failed query embeddings must not be retried within a request ──
+    //
+    // Extends the #2232 `RecordingService` pattern above with a separate,
+    // overridable `embed_query` (distinct from the generic `embed`) so these
+    // tests can fail the query embedding on demand and prove which method a
+    // given text actually reached.
+
+    const ROLE_RECORDING_MODEL_KEY: &str = "all-minilm-l6-v2";
+    const ROLE_RECORDING_DIM: usize = 384;
+    const ROLE_RECORDING_QUERY: &str = "graph traversal caching strategies distributed \
+         knowledge retrieval systems degraded embedding providers";
+    // Atom content must clear the 20-word minimum; repeats the query terms
+    // (for lexical relevance) plus filler.
+    const ROLE_RECORDING_ATOM_CONTENT: &str = "graph traversal caching strategies distributed \
+         knowledge retrieval systems degraded embedding providers require resilient fallback \
+         behavior across production knowledge retrieval pipelines and search infrastructure";
+
+    #[derive(Debug, Default)]
+    struct RoleAwareRecordingCalls {
+        query: Vec<String>,
+        generic: Vec<String>,
+    }
+
+    struct RoleAwareRecordingService {
+        calls: std::sync::Arc<std::sync::Mutex<RoleAwareRecordingCalls>>,
+        fail_query: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for RoleAwareRecordingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            self.calls
+                .lock()
+                .expect("recording lock")
+                .generic
+                .extend(texts.iter().cloned());
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.5; ROLE_RECORDING_DIM])
+                .collect())
+        }
+
+        async fn embed_query(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            self.calls
+                .lock()
+                .expect("recording lock")
+                .query
+                .extend(texts.iter().cloned());
+            if self.fail_query.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(lattice_embed::EmbedError::InferenceFailed(
+                    "forced query-embedding failure".into(),
+                ));
+            }
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.25; ROLE_RECORDING_DIM])
+                .collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "role-aware-recording-service"
+        }
+    }
+
+    struct RoleAwareRecordingProvider {
+        calls: std::sync::Arc<std::sync::Mutex<RoleAwareRecordingCalls>>,
+        fail_query: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for RoleAwareRecordingProvider {
+        fn name(&self) -> &str {
+            ROLE_RECORDING_MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            ROLE_RECORDING_DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(std::sync::Arc::new(RoleAwareRecordingService {
+                calls: std::sync::Arc::clone(&self.calls),
+                fail_query: std::sync::Arc::clone(&self.fail_query),
+            }))
+        }
+    }
+
+    fn rt_with_role_aware_recording_embedder() -> (
+        KhiveRuntime,
+        std::sync::Arc<std::sync::Mutex<RoleAwareRecordingCalls>>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(RoleAwareRecordingCalls::default()));
+        let fail_query = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
+            db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: Vec::new(),
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: Vec::new(),
+            allowed_outbound_namespaces: Vec::new(),
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        runtime.register_embedder(RoleAwareRecordingProvider {
+            calls: std::sync::Arc::clone(&calls),
+            fail_query: std::sync::Arc::clone(&fail_query),
+        });
+        (runtime, calls, fail_query)
+    }
+
+    fn build_role_recording_registry(rt: &KhiveRuntime) -> khive_runtime::VerbRegistry {
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+        builder.register(crate::KnowledgePack::new(rt.clone()));
+        let registry = builder.build().expect("registry builds");
+        rt.install_edge_rules(registry.all_edge_rules());
+        registry
+    }
+
+    /// Seeds one atom as a domain member so `compose`'s auto flow reaches the
+    /// Rerank phase — a domain with no members short-circuits at "No atoms
+    /// found" before the KG-blend gate these tests exercise.
+    async fn seed_role_recording_corpus(registry: &khive_runtime::VerbRegistry) {
+        registry
+            .dispatch(
+                "knowledge.upsert_atoms",
+                json!({
+                    "atoms": [{
+                        "slug": "role-recording-atom",
+                        "name": "Role Recording Atom",
+                        "finalized": true,
+                        "content": ROLE_RECORDING_ATOM_CONTENT
+                    }]
+                }),
+            )
+            .await
+            .expect("upsert atom");
+        registry
+            .dispatch(
+                "knowledge.upsert_domains",
+                json!({
+                    "domains": [{
+                        "slug": "role-recording-domain",
+                        "name": "Role Recording Domain",
+                        "description": ROLE_RECORDING_ATOM_CONTENT,
+                        "members": ["role-recording-atom"]
+                    }]
+                }),
+            )
+            .await
+            .expect("upsert domain");
+        registry
+            .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+            .await
+            .expect("index");
+    }
+
+    /// (a) A failed `embed_query` inside `suggest` must not be retried by
+    /// `compose`'s KG-blend gate immediately afterward in the same
+    /// auto-compose request. Before the fix, `compose` saw
+    /// `role_specific: None` — indistinguishable from "never tried" — and
+    /// spent a second failing provider call; the query text was attempted
+    /// twice. Red before the fix: 2 attempts.
+    #[tokio::test]
+    async fn compose_auto_does_not_retry_role_specific_embed_after_suggest_failure() {
+        let (rt, calls, fail_query) = rt_with_role_aware_recording_embedder();
+        let registry = build_role_recording_registry(&rt);
+        seed_role_recording_corpus(&registry).await;
+        fail_query.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let ann = vamana::new_shared();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let result = KnowledgeHandlers::compose(
+            &rt,
+            &token,
+            json!({ "query": ROLE_RECORDING_QUERY }),
+            &ann,
+            HashMap::new(),
+        )
+        .await
+        .expect("compose must not Err when the query embedding is degraded");
+
+        let attempts = calls
+            .lock()
+            .expect("recording lock")
+            .query
+            .iter()
+            .filter(|text| text.as_str() == ROLE_RECORDING_QUERY)
+            .count();
+        assert_eq!(
+            attempts, 1,
+            "a failed embed_query must not be retried later in the same request; result: {result}"
+        );
+        assert_eq!(
+            result["data"]["count"].as_u64(),
+            Some(1),
+            "the atom must still reach the briefing through the degraded blend path; \
+             result: {result}"
+        );
+    }
+
+    /// (b) Control: without a prior failure, `suggest`'s successful
+    /// role-specific embed is the *only* attempt across the whole
+    /// auto-compose request — `compose`'s KG-blend gate reuses it rather than
+    /// embedding again. The narrower claim (a rerank stage specifically
+    /// reuses a cached vector across candidate batches) is covered by
+    /// `query_embedding_cache_reuses_query_vector_across_reranks` (#2232)
+    /// above; this test covers the handler-level chain instead.
+    #[tokio::test]
+    async fn compose_auto_reuses_successful_suggest_embed_without_retry() {
+        let (rt, calls, _fail_query) = rt_with_role_aware_recording_embedder();
+        let registry = build_role_recording_registry(&rt);
+        seed_role_recording_corpus(&registry).await;
+
+        let ann = vamana::new_shared();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let result = KnowledgeHandlers::compose(
+            &rt,
+            &token,
+            json!({ "query": ROLE_RECORDING_QUERY }),
+            &ann,
+            HashMap::new(),
+        )
+        .await
+        .expect("compose must not Err");
+
+        let attempts = calls
+            .lock()
+            .expect("recording lock")
+            .query
+            .iter()
+            .filter(|text| text.as_str() == ROLE_RECORDING_QUERY)
+            .count();
+        assert_eq!(
+            attempts, 1,
+            "a successful embed_query must be reused, not repeated; result: {result}"
+        );
+        assert_eq!(
+            result["data"]["count"].as_u64(),
+            Some(1),
+            "result: {result}"
+        );
+    }
+
+    /// (c) Control: a `compose` call that never goes through `suggest` (explicit
+    /// `domain_ids`, so auto-mode never runs) still embeds the query exactly
+    /// once for its own KG-blend gate — `NotAttempted` always authorizes the
+    /// one attempt a stage that never tried is entitled to.
+    #[tokio::test]
+    async fn compose_direct_call_without_suggest_still_embeds_query_once() {
+        let (rt, calls, _fail_query) = rt_with_role_aware_recording_embedder();
+        let registry = build_role_recording_registry(&rt);
+        seed_role_recording_corpus(&registry).await;
+
+        let ann = vamana::new_shared();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let result = KnowledgeHandlers::compose(
+            &rt,
+            &token,
+            json!({
+                "query": ROLE_RECORDING_QUERY,
+                "domain_ids": ["role-recording-domain"],
+            }),
+            &ann,
+            HashMap::new(),
+        )
+        .await
+        .expect("compose must not Err");
+
+        let attempts = calls
+            .lock()
+            .expect("recording lock")
+            .query
+            .iter()
+            .filter(|text| text.as_str() == ROLE_RECORDING_QUERY)
+            .count();
+        assert_eq!(
+            attempts, 1,
+            "a stage that never tried must still embed once; result: {result}"
+        );
+        assert_eq!(
+            result["data"]["count"].as_u64(),
+            Some(1),
+            "result: {result}"
+        );
+    }
+
+    /// (d) #2307 item 2: `search`, `suggest`, and `compose` must each dispatch
+    /// the query text through `EmbeddingService::embed_query` specifically —
+    /// never through the generic `embed`. The source-scan guard below this
+    /// test only ever checked the generic path's *absence*; a mutation
+    /// swapping every production `embed_query` call for `embed_document`
+    /// still passed it (documented in the crate's fix report for #2307).
+    /// This behavioral check closes that gap by observing which method the
+    /// query text actually reaches at runtime.
+    #[tokio::test]
+    async fn search_suggest_compose_dispatch_query_through_embed_query_not_generic() {
+        for verb in ["search", "suggest", "compose"] {
+            let (rt, calls, _fail_query) = rt_with_role_aware_recording_embedder();
+            let registry = build_role_recording_registry(&rt);
+            seed_role_recording_corpus(&registry).await;
+            let ann = vamana::new_shared();
+            let token = rt.authorize(Namespace::local()).expect("authorize");
+
+            match verb {
+                "search" => {
+                    KnowledgeHandlers::search(
+                        &rt,
+                        &token,
+                        json!({ "query": ROLE_RECORDING_QUERY }),
+                        &ann,
+                    )
+                    .await
+                    .expect("search must not Err");
+                }
+                "suggest" => {
+                    KnowledgeHandlers::suggest(
+                        &rt,
+                        &token,
+                        json!({ "query": ROLE_RECORDING_QUERY }),
+                        &ann,
+                    )
+                    .await
+                    .expect("suggest must not Err");
+                }
+                "compose" => {
+                    KnowledgeHandlers::compose(
+                        &rt,
+                        &token,
+                        json!({ "query": ROLE_RECORDING_QUERY }),
+                        &ann,
+                        HashMap::new(),
+                    )
+                    .await
+                    .expect("compose must not Err");
+                }
+                _ => unreachable!(),
+            }
+
+            let recorded = calls.lock().expect("recording lock");
+            assert!(
+                recorded
+                    .query
+                    .iter()
+                    .any(|text| text == ROLE_RECORDING_QUERY),
+                "{verb}: query text must reach embed_query at least once; recorded={recorded:?}"
+            );
+            assert!(
+                !recorded
+                    .generic
+                    .iter()
+                    .any(|text| text == ROLE_RECORDING_QUERY),
+                "{verb}: query text must never reach the generic embed path; recorded={recorded:?}"
+            );
+        }
     }
 
     // ── filter_by_excluded_statuses ───────────────────────────────────────────
