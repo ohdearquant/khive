@@ -1,11 +1,27 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30, 2026-09-03)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30, 2026-09-03, 2026-09-04)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
+
+## Amendment (2026-09-04): union the exact-name/tag recovery with every lexical outcome
+
+The 2026-09-03 recovery below only ran once FTS had already reported a genuine miss — but FTS
+reports a miss only when _every_ term the query decomposes into failed to match anything eligible.
+A name- or tag-only atom was therefore still dropped whenever the query happened to also match
+some unrelated, eligible atom (FTS non-empty) or match only an ineligible atom (the `filtered`
+case): both outcomes returned before the recovery lookup ever ran.
+
+The recovery lookup now runs whenever the query yields a name needle or tag terms, independent of
+what FTS found, and its rows are unioned with FTS's rows (deduplicated by id, FTS rows ordered
+first). Provenance: `matched` stays `matched` whenever FTS contributed at least one eligible row,
+even if recovery added more; a `filtered` or genuine-miss outcome that recovery turns non-empty
+now reports `exact_match` — the same state the 2026-09-03 amendment already used for
+recovery-sourced rows, so no new provenance value was needed. `filtered` and `no_match` are
+unchanged for the case where recovery also finds nothing.
 
 ## Amendment (2026-09-03): exact-name/tag recovery for a genuine FTS miss
 

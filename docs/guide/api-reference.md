@@ -1932,15 +1932,24 @@ score bands.
 | `rerank_alpha`        | number  | no       | Default 0.7 (TF-IDF-dominant blend).                                                    |
 
 The response is `{results, total, candidate_provenance, ...}`. A genuine FTS miss does
-not scan or rank the newest corpus rows. `candidate_provenance.lexical` reports one of:
+not scan or rank the newest corpus rows. Alongside FTS, a bounded direct-predicate lookup
+always runs for a query that yields a name needle or literal tag terms, and its rows are
+unioned (deduplicated by id) with whatever FTS produced — the lookup is not gated behind an
+FTS miss, so an atom reachable only by exact name substring or literal tag is not dropped
+just because the query happens to also match something else in the trigram index.
+`candidate_provenance.lexical` reports one of:
 
-- `matched`: eligible lexical candidates were found via FTS.
-- `exact_match`: FTS found no match, but a bounded direct-predicate lookup found candidates
-  by exact name substring or literal tag — the only way to reach a query too short for the
+- `matched`: FTS found eligible candidates. The direct-predicate lookup still ran and its
+  rows (if any) are unioned in, but provenance stays `matched` whenever FTS contributed at
+  least one row.
+- `exact_match`: FTS found no eligible row (whether a genuine trigram miss or a trigram
+  match whose rows were all ineligible), but the direct-predicate lookup found candidates by
+  exact name substring or literal tag — the only way to reach a query too short for the
   trigram index (e.g. "RAG", "ML") or a query that only overlaps an atom's tags (tags are not
   FTS-indexed).
-- `no_match`: neither FTS nor the exact-match lookup found a lexical candidate.
-- `filtered`: FTS matched, but kind/status eligibility removed every lexical candidate.
+- `no_match`: neither FTS nor the direct-predicate lookup found a lexical candidate.
+- `filtered`: FTS matched, but kind/status eligibility removed every lexical candidate, and
+  the direct-predicate lookup found nothing to recover either.
 - `partial_timeout`: part of a lexical/decomposed candidate stage completed before the
   request read deadline.
 - `timed_out`: the lexical candidate stage timed out without a completed candidate leg.

@@ -702,18 +702,108 @@ async fn fetch_fts_candidates(
         });
     }
 
-    if !combined.is_empty() {
+    // Whether FTS itself produced any eligible row, captured before the
+    // recovery step below folds more rows into `combined`. A query that
+    // lexically matches something else in the trigram index must not
+    // suppress a name/tag match FTS cannot see — so recovery runs whenever
+    // the query could plausibly hit either recoverable class, independent of
+    // whether FTS already matched, matched only ineligible rows, or missed
+    // entirely; its rows are unioned in below rather than gated behind an
+    // early return on any of those three outcomes.
+    let fts_had_rows = !combined.is_empty();
+
+    // Two candidate classes the scorer still promises can never reach the
+    // trigram index at all, regardless of the query: `exact_name_bonus`
+    // scores a name that contains the raw query as a substring, and a query
+    // shorter than the trigram minimum span (e.g. "RAG", "ML") never matches
+    // any trigram; and `w_tags` scores atom tags, which `fts_knowledge` does
+    // not index. Recover both with a bounded direct-predicate lookup — not a
+    // recency scan — so only rows that actually overlap the query by name
+    // substring or literal tag come back.
+    let name_needle = raw_query.trim().to_lowercase();
+    let tag_terms = tag_match_terms(raw_query);
+    if !name_needle.is_empty() || !tag_terms.is_empty() {
+        let mut exact_params: Vec<SqlValue> = vec![SqlValue::Text(ns.to_owned())];
+        let mut predicates: Vec<String> = Vec::new();
+        let mut next_param = 2;
+        if !name_needle.is_empty() {
+            predicates.push(format!("a.name LIKE ?{next_param} ESCAPE '\\'"));
+            exact_params.push(SqlValue::Text(format!("%{}%", escape_like(&name_needle))));
+            next_param += 1;
+        }
+        for term in &tag_terms {
+            predicates.push(format!("a.tags LIKE ?{next_param} ESCAPE '\\'"));
+            exact_params.push(SqlValue::Text(format!("%\"{}\"%", escape_like(term))));
+            next_param += 1;
+        }
+
+        let (status_clause, status_params) =
+            status_sql_clause(statuses, exclude_statuses, next_param);
+        next_param += status_params.len();
+        exact_params.extend(status_params);
+        let limit_param = next_param;
+        exact_params.push(SqlValue::Integer(fetch_limit as i64));
+
+        let exact_sql = format!(
+            "SELECT a.* FROM knowledge_atoms AS a \
+             WHERE a.namespace = ?1 AND a.deleted_at IS NULL{status_clause}{type_clause} \
+               AND ({predicate_or}) \
+             ORDER BY a.slug LIMIT ?{limit_param}",
+            predicate_or = predicates.join(" OR ")
+        );
+
+        let exact_rows = match reader
+            .query_all(SqlStatement {
+                sql: exact_sql,
+                params: exact_params,
+                label: None,
+            })
+            .await
+        {
+            Ok(rows) => rows,
+            // FTS already found eligible rows — report those rather than
+            // discarding them over a timed-out recovery lookup. Only a
+            // recovery timeout on an otherwise-empty pool is a real timeout.
+            Err(e) if is_timeout(&e) => {
+                return Ok(FtsFetchOutcome {
+                    atoms: combined,
+                    state: if fts_had_rows {
+                        LexicalCandidateState::Matched
+                    } else {
+                        LexicalCandidateState::TimedOut
+                    },
+                });
+            }
+            Err(e) => return Err(sql_err("search exact-match candidates", e)),
+        };
+
+        for atom in exact_rows.iter().filter_map(atom_from_row) {
+            if seen_ids.insert(atom.id) {
+                combined.push(atom);
+            }
+        }
+    }
+
+    if fts_had_rows {
         return Ok(FtsFetchOutcome {
             atoms: combined,
             state: LexicalCandidateState::Matched,
         });
     }
 
-    // No term produced an eligible row. Distinguish a true lexical miss from
-    // a lexical match whose rows were all ineligible. In either case an empty
-    // lexical result is correct; the distinction is response provenance.
-    // This probe has no ORDER BY and LIMIT 1, so it stays cheap even over the
-    // OR-joined expression.
+    if !combined.is_empty() {
+        return Ok(FtsFetchOutcome {
+            atoms: combined,
+            state: LexicalCandidateState::ExactMatch,
+        });
+    }
+
+    // No term produced an eligible row and neither name nor tag recovery
+    // matched. Distinguish a true lexical miss from a lexical match whose
+    // rows were all ineligible. In either case an empty lexical result is
+    // correct; the distinction is response provenance. This probe has no
+    // ORDER BY and LIMIT 1, so it stays cheap even over the OR-joined
+    // expression.
     let match_expr = fts5_candidate_expression(raw_query);
     let raw_fts_match = match reader
         .query_row(SqlStatement {
@@ -741,81 +831,9 @@ async fn fetch_fts_candidates(
         });
     }
 
-    // A genuine FTS miss. Corpus recency is still not query evidence — that
-    // fallback stays removed — but two candidate classes the scorer still
-    // promises can never reach the trigram index at all, regardless of the
-    // query: `exact_name_bonus` scores a name that contains the raw query as
-    // a substring, and a query shorter than the trigram minimum span (e.g.
-    // "RAG", "ML") never matches any trigram; and `w_tags` scores atom tags,
-    // which `fts_knowledge` does not index. Recover both with a bounded
-    // direct-predicate lookup — not a recency scan — so only rows that
-    // actually overlap the query by name substring or literal tag come back.
-    let name_needle = raw_query.trim().to_lowercase();
-    let tag_terms = tag_match_terms(raw_query);
-    if name_needle.is_empty() && tag_terms.is_empty() {
-        return Ok(FtsFetchOutcome {
-            atoms: Vec::new(),
-            state: LexicalCandidateState::NoMatch,
-        });
-    }
-
-    let mut exact_params: Vec<SqlValue> = vec![SqlValue::Text(ns.to_owned())];
-    let mut predicates: Vec<String> = Vec::new();
-    let mut next_param = 2;
-    if !name_needle.is_empty() {
-        predicates.push(format!("a.name LIKE ?{next_param} ESCAPE '\\'"));
-        exact_params.push(SqlValue::Text(format!("%{}%", escape_like(&name_needle))));
-        next_param += 1;
-    }
-    for term in &tag_terms {
-        predicates.push(format!("a.tags LIKE ?{next_param} ESCAPE '\\'"));
-        exact_params.push(SqlValue::Text(format!("%\"{}\"%", escape_like(term))));
-        next_param += 1;
-    }
-
-    let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, next_param);
-    next_param += status_params.len();
-    exact_params.extend(status_params);
-    let limit_param = next_param;
-    exact_params.push(SqlValue::Integer(fetch_limit as i64));
-
-    let exact_sql = format!(
-        "SELECT a.* FROM knowledge_atoms AS a \
-         WHERE a.namespace = ?1 AND a.deleted_at IS NULL{status_clause}{type_clause} \
-           AND ({predicate_or}) \
-         ORDER BY a.slug LIMIT ?{limit_param}",
-        predicate_or = predicates.join(" OR ")
-    );
-
-    let exact_rows = match reader
-        .query_all(SqlStatement {
-            sql: exact_sql,
-            params: exact_params,
-            label: None,
-        })
-        .await
-    {
-        Ok(rows) => rows,
-        Err(e) if is_timeout(&e) => {
-            return Ok(FtsFetchOutcome {
-                atoms: Vec::new(),
-                state: LexicalCandidateState::TimedOut,
-            });
-        }
-        Err(e) => return Err(sql_err("search exact-match candidates", e)),
-    };
-
-    let exact_atoms: Vec<Atom> = exact_rows.iter().filter_map(atom_from_row).collect();
-    if exact_atoms.is_empty() {
-        return Ok(FtsFetchOutcome {
-            atoms: Vec::new(),
-            state: LexicalCandidateState::NoMatch,
-        });
-    }
-
     Ok(FtsFetchOutcome {
-        atoms: exact_atoms,
-        state: LexicalCandidateState::ExactMatch,
+        atoms: Vec::new(),
+        state: LexicalCandidateState::NoMatch,
     })
 }
 
@@ -3424,6 +3442,193 @@ mod tests {
 
         assert!(outcome.atoms.is_empty());
         assert_eq!(outcome.state, LexicalCandidateState::Filtered);
+    }
+
+    /// Issue #2381 follow-up: FTS finding *something* for the query must not
+    /// suppress a sibling atom that FTS structurally cannot reach at all
+    /// (here, a tag-only match — `fts_knowledge` never indexes `tags`). The
+    /// old code returned as soon as `combined` was non-empty, before the
+    /// name/tag recovery query ever ran, so the tag-only atom was silently
+    /// dropped whenever anything else in the corpus happened to share a
+    /// lexical term with the query. Recovery must run and union its rows in
+    /// even on a full FTS match.
+    #[tokio::test]
+    async fn matched_fts_result_still_recovers_tag_only_sibling() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '94000000-0000-0000-0000-000000000001', 'local', \
+                              'content-match', 'Content Match', \
+                              'this atom mentions throttle explicitly in its content', \
+                              '[]', NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, NULL \
+                          ), ( \
+                              '94000000-0000-0000-0000-000000000002', 'local', \
+                              'tag-only-sibling', 'Something Else Entirely', \
+                              'content with no lexical overlap with the query at all', \
+                              '[\"throttle\"]', NULL, 1, 'reviewed', NULL, NULL, 2000, 2000, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed content-match atom and tag-only sibling");
+        }
+
+        let outcome = fetch_fts_candidates(
+            &runtime,
+            "local",
+            "throttle",
+            None,
+            &[],
+            &[],
+            CANDIDATE_POOL,
+        )
+        .await
+        .expect("union recovery must not error");
+
+        assert_eq!(
+            outcome.state,
+            LexicalCandidateState::Matched,
+            "FTS rows exist, so provenance stays matched even though recovery added a row"
+        );
+        let mut slugs: Vec<&str> = outcome.atoms.iter().map(|a| a.slug.as_str()).collect();
+        slugs.sort_unstable();
+        assert_eq!(
+            slugs,
+            ["content-match", "tag-only-sibling"],
+            "the tag-only sibling must survive alongside the FTS-matched atom: {slugs:?}"
+        );
+    }
+
+    /// Companion to the match case above, on the `Filtered` branch: FTS
+    /// matches only an ineligible row (excluded by status), and a *separate*
+    /// eligible atom is reachable exclusively by tag. The old code returned
+    /// `Filtered` as soon as the raw-match probe found the ineligible row,
+    /// before ever attempting name/tag recovery, so the eligible tag-only
+    /// atom was dropped even though nothing about its own eligibility ruled
+    /// it out.
+    ///
+    /// (Note: an equivalent name-substring construction is not possible here
+    /// — the trigram tokenizer indexes `name` as raw substrings, so any
+    /// eligible atom whose name contains the query would already be found by
+    /// the FTS probe itself, making the outcome `Matched` rather than
+    /// `Filtered`. Verified empirically: a `trigram` FTS5 table matches a
+    /// query phrase against any substring occurrence, mid-word included.
+    /// Tags are the only recoverable class genuinely invisible to FTS
+    /// regardless of eligibility, so this test exercises the `Filtered`
+    /// branch through tags instead.)
+    #[tokio::test]
+    async fn filtered_fts_result_still_recovers_tag_only_sibling() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '94000000-0000-0000-0000-000000000003', 'local', \
+                              'ineligible-draft', 'Ineligible Draft', \
+                              'gizmocraft content mentioned only in a draft', \
+                              '[]', NULL, 0, 'draft', NULL, NULL, 1000, 1000, NULL \
+                          ), ( \
+                              '94000000-0000-0000-0000-000000000004', 'local', \
+                              'eligible-tag-sibling', 'Eligible Tag Sibling', \
+                              'unrelated content with no lexical overlap at all', \
+                              '[\"gizmocraft\"]', NULL, 1, 'reviewed', NULL, NULL, 2000, 2000, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed ineligible-draft atom and eligible tag sibling");
+        }
+
+        let outcome = fetch_fts_candidates(
+            &runtime,
+            "local",
+            "gizmocraft",
+            None,
+            &[],
+            &["draft", "deprecated"],
+            CANDIDATE_POOL,
+        )
+        .await
+        .expect("filtered-branch recovery must not error");
+
+        assert_eq!(
+            outcome.state,
+            LexicalCandidateState::ExactMatch,
+            "FTS produced no eligible row, so a non-empty recovery reports the recovered-rows state"
+        );
+        let slugs: Vec<&str> = outcome.atoms.iter().map(|a| a.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            ["eligible-tag-sibling"],
+            "the eligible tag sibling must be recovered even though the raw FTS probe only found \
+             the ineligible draft row: {slugs:?}"
+        );
+    }
+
+    /// The union must dedup by id: an atom reachable both through FTS content
+    /// and through the recovery predicate (here, a tag literally equal to
+    /// the query) must appear exactly once in the returned pool.
+    #[tokio::test]
+    async fn union_dedupes_atom_reachable_by_both_fts_and_tag() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '94000000-0000-0000-0000-000000000005', 'local', \
+                              'both-paths', 'Both Paths', \
+                              'this content explicitly mentions duplicatecheck', \
+                              '[\"duplicatecheck\"]', NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, \
+                              NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed atom reachable by both content and tag");
+        }
+
+        let outcome = fetch_fts_candidates(
+            &runtime,
+            "local",
+            "duplicatecheck",
+            None,
+            &[],
+            &[],
+            CANDIDATE_POOL,
+        )
+        .await
+        .expect("dedup union must not error");
+
+        assert_eq!(outcome.state, LexicalCandidateState::Matched);
+        let slugs: Vec<&str> = outcome.atoms.iter().map(|a| a.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            ["both-paths"],
+            "an atom reachable both ways must appear exactly once: {slugs:?}"
+        );
     }
 
     /// A query shorter than the trigram tokenizer's minimum span (schema.sql:
