@@ -2851,9 +2851,12 @@ mod tests {
         }
         let handle = spawn(&pool, 8).unwrap();
 
+        // The delay must dwarf a COMMIT on a slow disk (an fsync of a few
+        // hundred milliseconds has been observed on shared runners), or the
+        // commit-stage comparison below reads the disk instead of the body.
         handle
             .send(|conn| {
-                std::thread::sleep(Duration::from_millis(60));
+                std::thread::sleep(Duration::from_millis(400));
                 conn.execute("INSERT INTO t VALUES (1)", [])
                     .map_err(|error| StorageError::Pool {
                         operation: "writer_stage_sample".into(),
@@ -2865,7 +2868,7 @@ mod tests {
 
         let sample = last_writer_stage_observation(&pool).expect("writer stage sample");
         assert!(
-            sample.body_micros >= 50_000,
+            sample.body_micros >= 350_000,
             "the synthetic delay must land in the body stage: {sample:?}"
         );
         assert!(
