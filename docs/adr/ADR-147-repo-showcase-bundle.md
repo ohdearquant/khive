@@ -420,3 +420,31 @@ constant-time digest comparison. An absent, malformed, or mismatched credential,
 unset or blank `KHIVE_SHOWCASE_ACCESS_TOKEN`, all return the same sanitized 404 used for
 an unconfigured catalog — the failure mode stays indistinguishable from "not
 configured," consistent with the sanitized-error posture in Amendments 1 and 2.
+
+## Amendment 5 — Direct static load when no operator token is present (2026-09-02)
+
+Amendment 3 states that the browser requests the opaque ID route first for a configured
+entry and falls back to the curated asset only on a `404`. Since Amendment 4 that route
+answers every unauthenticated request with the same sanitized `404`, so a browser session
+without an operator token was guaranteed one failed request per load before reaching the
+asset it was always going to use.
+
+The browser now distinguishes the two cases by the presence of a non-blank operator token
+in the session:
+
+- with a non-blank token, the order in Amendment 3 stands unchanged: the opaque ID route is
+  requested first, only a `404` may fall back, and only to the approved curated asset owned
+  by the same merged entry;
+- with no token, or a blank one, a merged entry that owns an approved curated asset loads
+  that asset directly and makes no snapshot request; the reported source is the curated
+  static fallback, exactly as it would have been after the `404`;
+- an entry that exists only in the configured catalog, with no curated asset, still probes
+  the route regardless of the token. The browser knows such an entry only after a
+  successful catalog discovery, which itself carries the token, or when the entry is
+  supplied explicitly; so a session without a token reaches this arm only for an
+  explicitly supplied entry, and then receives an honest repository miss rather than a
+  silent empty state.
+
+The fallback boundary is unchanged: server errors, malformed or oversized reports, missing
+or mismatched provenance headers, repository-identity mismatches, and an elapsed request
+deadline remain hard failures on the authenticated path and never fall back.

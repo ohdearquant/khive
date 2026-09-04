@@ -220,7 +220,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.read",
-        description: "Compatibility mark-read verb for one or up to 500 inbound messages; it does not retrieve message content. Mark writes are best-effort: inspect each result's read/mark_error fields and re-issue failures later.",
+        description: "Compatibility mark-read verb for one or up to 500 inbound messages; it does not retrieve message content. Mark writes are best-effort: each result carries status=success|failed|unknown (unknown means the write's execution seam terminated after the request was accepted, so it may already have applied — re-check with comm.inbox before deciding whether to re-issue; re-issuing is safe, marking read is idempotent), and bulk responses carry status=success|partial|failed|unknown.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -242,7 +242,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.mark_read",
-        description: "Mark up to 500 inbound messages as read; use comm.inbox or comm.thread to retrieve content. Defaults to best-effort updates, with atomic=true for all-or-nothing mutation.",
+        description: "Mark up to 500 inbound messages as read; use comm.inbox or comm.thread to retrieve content. Best-effort responses carry status=success|partial|failed; atomic=true provides all-or-nothing mutation.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -264,7 +264,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.unread",
-        description: "Count-only view of the caller's unread inbound messages (same filter as inbox(status=\"unread\"), no message payloads).",
+        description: "Bounded count-only view of the caller's unread inbound messages (same filter as inbox(status=\"unread\"), no message payloads). Exact below count_cap=1000; count_saturated=true means at least that many.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],

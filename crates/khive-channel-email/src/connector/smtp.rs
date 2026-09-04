@@ -129,6 +129,47 @@ fn reject_crlf(value: &str) -> Result<&str, ChannelError> {
     Ok(value)
 }
 
+fn classify_smtp_send_error(is_permanent: bool, message: String) -> ChannelError {
+    if is_permanent {
+        ChannelError::PermanentTransport(message)
+    } else {
+        ChannelError::Transport(message)
+    }
+}
+
+/// Classify a failure from the connect/AUTH preamble (ADR-122 §4's
+/// "connection, AUTH" stage grouping), distinct from [`classify_smtp_send_error`]
+/// which classifies the post-auth per-message MAIL/RCPT/DATA stage. A
+/// permanent (5xx) rejection here applies to the whole account, not one
+/// recipient, so it is surfaced as `Auth` rather than a per-message
+/// permanent failure: the caller must stop the outbound component for
+/// operator action instead of terminally failing the note being sent.
+fn classify_smtp_connection_error(is_permanent: bool, message: String) -> ChannelError {
+    if is_permanent {
+        ChannelError::Auth(message)
+    } else {
+        ChannelError::Transport(message)
+    }
+}
+
+/// Classify the boolean half of lettre's `test_connection` contract. The
+/// transport swallows the NOOP command's own error and reports `Ok(false)`, so
+/// a refused NOOP after a successful connect/AUTH carries no permanence
+/// information. AUTH rejections surface as `Err` from the connection setup and
+/// are classified by [`classify_smtp_connection_error`]; a refused NOOP is a
+/// connection-stage failure of unknown permanence, so it is retried with the
+/// outbound backoff and never proceeds to the per-message send.
+fn classify_smtp_preamble_status(is_connected: bool) -> Result<(), ChannelError> {
+    if is_connected {
+        Ok(())
+    } else {
+        Err(ChannelError::Transport(
+            "SMTP connection preamble refused: server did not acknowledge NOOP after connect/AUTH"
+                .to_string(),
+        ))
+    }
+}
+
 /// Build the outbound RFC 822 message, applying thread-correlation, Message-ID, and
 /// reply-threading headers.
 ///
@@ -240,10 +281,24 @@ impl SmtpConnector for LettreSmtp {
             }
         };
 
-        transport
-            .send(msg)
-            .await
-            .map_err(|e| ChannelError::Transport(format!("SMTP send failed: {e}")))?;
+        // Explicitly separate the connect/AUTH preamble from the per-message
+        // MAIL/RCPT/DATA exchange (ADR-122 §4): `test_connection` runs only
+        // the former (connect, EHLO, AUTH if configured, NOOP), so a
+        // definitive rejection here is an account-wide auth problem, not a
+        // rejection of this particular recipient. The transport pools the
+        // connection it just opened, so a successful test reuses it for the
+        // send below instead of paying for a second handshake.
+        let is_connected = transport.test_connection().await.map_err(|error| {
+            classify_smtp_connection_error(
+                error.is_permanent(),
+                format!("SMTP connection/authentication failed: {error}"),
+            )
+        })?;
+        classify_smtp_preamble_status(is_connected)?;
+
+        transport.send(msg).await.map_err(|error| {
+            classify_smtp_send_error(error.is_permanent(), format!("SMTP send failed: {error}"))
+        })?;
 
         Ok(())
     }
@@ -383,6 +438,60 @@ mod tests {
         assert_eq!(locked[0].0, "from@example.com");
         assert_eq!(locked[0].1, "to@example.com");
         assert_eq!(locked[0].2, "Hello");
+    }
+
+    #[test]
+    fn smtp_reply_classification_keeps_4xx_transient_and_5xx_permanent() {
+        let transient = classify_smtp_send_error(false, "450 mailbox unavailable".to_string());
+        assert!(matches!(transient, ChannelError::Transport(_)));
+        assert_eq!(
+            transient.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Transient
+        );
+
+        let permanent = classify_smtp_send_error(true, "550 recipient rejected".to_string());
+        assert!(matches!(permanent, ChannelError::PermanentTransport(_)));
+        assert_eq!(
+            permanent.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Permanent
+        );
+    }
+
+    #[test]
+    fn smtp_preamble_noop_refusal_is_retried_and_never_reaches_send() {
+        assert!(classify_smtp_preamble_status(true).is_ok());
+        let refused = classify_smtp_preamble_status(false).unwrap_err();
+        assert!(
+            matches!(refused, ChannelError::Transport(_)),
+            "a refused NOOP carries no permanence information, so it must be a retryable \
+             connection-stage failure, got {refused:?}"
+        );
+        assert!(!matches!(refused, ChannelError::PermanentTransport(_)));
+        assert!(!matches!(refused, ChannelError::Auth(_)));
+    }
+
+    #[test]
+    fn smtp_connection_preamble_permanent_rejection_is_auth_not_permanent_transport() {
+        // A definitive rejection during connect/AUTH applies to the whole
+        // account, not the one message being sent -- it must not be routed
+        // through the same per-message permanent-failure path a rejected
+        // recipient uses (classify_smtp_send_error), or the outbox loop
+        // would terminally fail one note instead of stopping the component.
+        let transient = classify_smtp_connection_error(false, "421 too busy".to_string());
+        assert!(matches!(transient, ChannelError::Transport(_)));
+        assert_eq!(
+            transient.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Transient
+        );
+
+        let permanent =
+            classify_smtp_connection_error(true, "535 5.7.8 authentication failed".to_string());
+        assert!(matches!(permanent, ChannelError::Auth(_)));
+        assert_ne!(
+            std::mem::discriminant(&permanent),
+            std::mem::discriminant(&ChannelError::PermanentTransport(String::new())),
+            "a permanent AUTH rejection must not be classified as a per-message permanent failure"
+        );
     }
 
     #[tokio::test]

@@ -2103,6 +2103,12 @@ fn disclose_resolved_database(cfg: &RuntimeConfig, khive_cfg: &KhiveConfig) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
+fn disclose_resolved_actor(cfg: &RuntimeConfig) {
+    use std::io::Write;
+    let line = khive_mcp::serve::resolved_actor_disclosure(cfg.actor_id.as_deref());
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
 #[derive(Default)]
 struct ExecDbContext {
     raw: Option<String>,
@@ -2251,6 +2257,7 @@ async fn run_exec_inline_with_forward(
     }
 
     disclose_resolved_database(&cfg, &khive_cfg);
+    disclose_resolved_actor(&cfg);
 
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
     // The daemon path does not support --save-file (the daemon returns a string;
@@ -2546,6 +2553,7 @@ async fn run_exec_ops_file(
     }
 
     disclose_resolved_database(&cfg, &khive_cfg);
+    disclose_resolved_actor(&cfg);
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
@@ -3880,6 +3888,7 @@ id = "lambda:fallback"
                     path: Some(std::path::PathBuf::from("/tmp/khive-parity-main.db")),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -3888,6 +3897,7 @@ id = "lambda:fallback"
                     path: Some(std::path::PathBuf::from("/tmp/khive-parity-sessions.db")),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -3993,6 +4003,7 @@ id = "lambda:fallback"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -4001,6 +4012,7 @@ id = "lambda:fallback"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -4134,6 +4146,7 @@ id = "lambda:fallback"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -4173,6 +4186,7 @@ id = "lambda:fallback"
             db_path: Some(db_path),
             embedding_model: None,
             additional_embedding_models: vec![],
+            packs: RuntimeConfig::built_in_packs(),
             ..RuntimeConfig::default()
         };
         let khive_cfg = KhiveConfig::default();
