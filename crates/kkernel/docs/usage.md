@@ -307,7 +307,11 @@ always wins over any config `[actor] id`.
 When the selected config declares `[[backends]]`, reindex remains a
 one-database command: `--db` / `KHIVE_DB` is required and must match one of the
 declared SQLite backend paths (including a secondary backend). An omitted,
-`:memory:`, or undeclared path is refused before any database is opened.
+`:memory:`, or undeclared path is refused before any database is opened. The
+canonical path and filesystem identity (device + inode) observed at
+validation time are what reindex actually opens, re-checked immediately
+before open: a symlink retargeted, or the declared file replaced in place,
+after validation is refused rather than silently followed.
 
 **Fail-closed.** By default reindex returns a **non-zero exit** if any requested
 engine failed, the knowledge pass errored, any knowledge atom vector insert

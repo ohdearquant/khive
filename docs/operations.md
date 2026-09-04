@@ -479,9 +479,16 @@ target from the single-backend default. The operator must pass a persistent
 `--db` / `KHIVE_DB` path that matches any declared SQLite backend; this permits
 an intentional secondary-backend rebuild while catching an omitted or mistyped
 path before the runtime opens it. A backend declared `read_only = true` is
-never accepted as a reindex target, since reindex always writes.
+never accepted as a reindex target, since reindex always writes. The database
+reindex actually opens is bound to the canonical path and filesystem identity
+(device + inode) observed at validation time, and re-checked immediately
+before open: a symlink retargeted, or the declared file replaced in place,
+after validation is refused rather than silently followed. A parent directory
+replaced in the narrow window between that re-check and the underlying SQLite
+open call is not caught — no lower-level file-descriptor check is available
+through the sqlite binding used here.
 
-**Actual scope derivation** (`reindex.rs:551-554`):
+**Actual scope derivation** (`reindex.rs:583-586`):
 
 ```rust
 let do_graph     = !args.knowledge_only && !args.sections_only;

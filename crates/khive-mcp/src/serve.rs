@@ -2520,6 +2520,84 @@ pub fn reject_conflicting_db_override_with_source(
     Err(DatabaseOverrideConflict::new(other, backends.len(), config_source).into())
 }
 
+/// Filesystem identity of a reindex target, captured so a symlink retargeted
+/// or a file replaced in place between validation and open can be told apart
+/// from the declared file validation actually checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(FileIdentity {
+            device: meta.dev(),
+            inode: meta.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        Some(FileIdentity {
+            device: meta.volume_serial_number()? as u64,
+            inode: meta.file_index()?,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// The `kkernel reindex` database target as
+/// [`validate_reindex_db_target_with_source`] resolved it: the canonical path
+/// reindex must open, plus the filesystem identity observed at validation
+/// time (`None` when the file did not exist yet).
+///
+/// [`reverify_reindex_target_identity`] re-derives this identity immediately
+/// before open so a symlink retargeted, or the declared file replaced in
+/// place, after validation is refused instead of silently followed.
+#[derive(Debug, Clone)]
+pub struct ValidatedReindexTarget {
+    /// Canonical path reindex must open — never the raw `--db`/`KHIVE_DB`
+    /// string, which may still name a symlink.
+    pub path: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
+/// Re-stat a validated reindex target and refuse if its filesystem identity
+/// no longer matches what validation observed.
+///
+/// This is what actually binds the checked identity to the file reindex
+/// opens: a symlink retargeted after validation still resolves `target.path`
+/// to the same canonical (already symlink-free) path, so pinning the open to
+/// `target.path` defeats that redirect by construction; a declared file
+/// replaced in place (e.g. another database renamed over it) keeps the same
+/// path string but changes `(device, inode)`, which this call catches.
+///
+/// The gap this does not close: a parent directory replaced in the sliver of
+/// time between this call returning and the underlying SQLite `open()`
+/// syscall. No API the sqlite binding used here exposes reaches an
+/// already-open file descriptor's identity, so that final window stays open.
+pub fn reverify_reindex_target_identity(target: &ValidatedReindexTarget) -> anyhow::Result<()> {
+    let observed = file_identity(&target.path);
+    if observed != target.identity {
+        anyhow::bail!(
+            "kkernel reindex target {} changed identity between validation and open \
+             (validated {:?}, now {:?}); refusing to open a file that may no longer be \
+             the declared backend",
+            target.path.display(),
+            target.identity,
+            observed,
+        );
+    }
+    Ok(())
+}
+
 /// Validate the single database selected by `kkernel reindex` against a
 /// declared multi-backend topology.
 ///
@@ -2528,13 +2606,19 @@ pub fn reject_conflicting_db_override_with_source(
 /// `main`. Once `[[backends]]` exists it must name that target explicitly:
 /// falling through to the ordinary single-backend default can rebuild an
 /// unrelated file while leaving the intended backend's indexes stale.
+///
+/// Returns `None` when no `[[backends]]` are declared — reindex keeps its
+/// ordinary single-backend `--db` behavior and there is no declared identity
+/// to bind. Returns `Some` with the canonical path and filesystem identity of
+/// the matched backend otherwise; the caller must open exactly that path and
+/// call [`reverify_reindex_target_identity`] immediately before doing so.
 pub fn validate_reindex_db_target_with_source(
     db_target: Option<&str>,
     backends: &[BackendConfig],
     config_source: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<ValidatedReindexTarget>> {
     if backends.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let declared_targets = backends
@@ -2582,7 +2666,10 @@ pub fn validate_reindex_db_target_with_source(
                     name = backend.name,
                 );
             }
-            return Ok(());
+            return Ok(Some(ValidatedReindexTarget {
+                identity: file_identity(&target),
+                path: target,
+            }));
         }
     }
 

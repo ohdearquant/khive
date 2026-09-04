@@ -833,6 +833,16 @@ fn escape_topology_component(value: &str) -> String {
     escaped
 }
 
+/// Format a backend's served-kinds fingerprint component (`""` when the
+/// backend serves everything, `:serves=<kind>+<kind>` otherwise), shared by
+/// both the legacy and escaped topology encodings below so they always agree
+/// on the same served-kinds suffix for the same input.
+fn format_served_kinds_suffix(served_kinds: Option<&str>) -> String {
+    served_kinds
+        .map(|kinds| format!(":serves={kinds}"))
+        .unwrap_or_default()
+}
+
 fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
     let mut legacy_safe = true;
     let mut backend_rows: Vec<(String, String, String, bool, Option<String>)> = cfg
@@ -889,10 +899,7 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .iter()
             .map(|(name, kind, path, is_read_only, served_kinds)| {
                 let read_only = if *is_read_only { ":read_only" } else { "" };
-                let served_kinds = served_kinds
-                    .as_deref()
-                    .map(|kinds| format!(":serves={kinds}"))
-                    .unwrap_or_default();
+                let served_kinds = format_served_kinds_suffix(served_kinds.as_deref());
                 format!("{name}:{kind}:{path}{read_only}{served_kinds}")
             })
             .collect::<Vec<_>>()
@@ -914,10 +921,7 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .iter()
             .map(|(name, kind, path, read_only, served_kinds)| {
                 let mode = if *read_only { "r" } else { "w" };
-                let served_kinds = served_kinds
-                    .as_deref()
-                    .map(|kinds| format!(":serves={kinds}"))
-                    .unwrap_or_default();
+                let served_kinds = format_served_kinds_suffix(served_kinds.as_deref());
                 format!(
                     "{}:{}:{}:{mode}{served_kinds}",
                     escape_topology_component(name),
@@ -7046,6 +7050,61 @@ mod tests {
             compute_config_id(&runtime, Some(&legacy)),
             compute_config_id(&runtime, Some(&entity_only)),
             "dispatch-shaping served-kind metadata must move daemon identity"
+        );
+    }
+
+    /// The legacy and escaped topology encodings in `encode_backend_topology`
+    /// each formatted their own `:serves=` suffix independently. Drive the
+    /// same served-kinds set through both branches (a name containing `:`
+    /// forces the escaped branch; a plain name keeps the legacy branch) and
+    /// assert they agree, now that both call the shared formatter.
+    #[test]
+    fn served_kinds_suffix_matches_between_legacy_and_escaped_topology_encodings() {
+        use khive_runtime::{BackendConfig, BackendKind, KhiveConfig};
+        use khive_types::SubstrateKind;
+
+        let served_kinds = Some(std::collections::BTreeSet::from([
+            SubstrateKind::Entity,
+            SubstrateKind::Note,
+        ]));
+        let base_backend = BackendConfig {
+            name: "main".to_string(),
+            kind: BackendKind::Memory,
+            path: None,
+            cache_mb: None,
+            journal_mode: None,
+            served_kinds: served_kinds.clone(),
+            read_only: false,
+        };
+
+        let legacy_topology = KhiveConfig {
+            backends: vec![base_backend.clone()],
+            ..KhiveConfig::default()
+        };
+        // A `:` in the name is reserved syntax, forcing the escaped
+        // (non-legacy-safe) encoding path instead.
+        let escaped_topology = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "ma:in".to_string(),
+                ..base_backend
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let legacy_encoded = encode_backend_topology(&legacy_topology);
+        let escaped_encoded = encode_backend_topology(&escaped_topology);
+
+        // `BTreeSet<SubstrateKind>` iterates in discriminant order (Note=0,
+        // Entity=1), so the joined suffix is "note+entity", not input order.
+        let expected_suffix = format_served_kinds_suffix(Some("note+entity"));
+        assert!(
+            legacy_encoded.contains(&expected_suffix),
+            "legacy topology encoding must carry the served-kinds suffix: {legacy_encoded}"
+        );
+        assert!(
+            escaped_encoded.contains(&expected_suffix),
+            "escaped topology encoding must carry the SAME served-kinds suffix as the \
+             legacy encoding, produced by the same formatter: {escaped_encoded}"
         );
     }
 
