@@ -118,7 +118,7 @@ pub use operations::{
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
     hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, EdgeEndpointKind,
-    EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved,
+    EntityCreateSpec, LinkSpec, NoteSearchHit, NoteSearchOutcome, QueryResult, Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
@@ -139,7 +139,7 @@ pub use reference_resolution::{resolve_reference, ReferenceCandidate, ReferenceR
 pub use reference_ring::{ReferenceRing, RingEntry};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
-pub use retrieval::{SearchHit, SearchSource};
+pub use retrieval::{HybridSearchOutcome, SearchHit, SearchSource};
 pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
     parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
