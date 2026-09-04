@@ -49,6 +49,23 @@ CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient_direction
            OR json_type(properties, '$.read') != 'true')
       AND deleted_at IS NULL;
 
+-- Hot property-path indexes for GTD task listing (status/assignee) -- see
+-- sql/027-notes-hot-property-indexes.sql for the full rationale, the note
+-- that each key expression must match its `FilterOp`'s compiled SQL
+-- byte-for-byte, and why a similarly-shaped comm recipient/direction index
+-- was dropped from this change.
+CREATE INDEX IF NOT EXISTS idx_notes_task_status
+    ON notes(namespace, kind,
+             json_extract(properties, '$.status'),
+             created_at DESC, id ASC)
+    WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_notes_task_assignee
+    ON notes(namespace, kind,
+             json_extract(properties, '$.assignee'),
+             created_at DESC, id ASC)
+    WHERE deleted_at IS NULL;
+
 -- Durable, non-reusing sequence for notes (khive #827). Kept in sync with
 -- `sql/007-notes-seq.sql` (the versioned-migration copy) — see that file for
 -- the full rationale. Duplicated here, belt-and-suspenders style, because

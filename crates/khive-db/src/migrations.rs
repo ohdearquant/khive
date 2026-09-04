@@ -154,6 +154,8 @@ const V25_UP: &str = include_str!("../sql/025-notes-unread-probe-recipient-direc
 
 const V26_UP: &str = include_str!("../sql/026-knowledge-fts-repair.sql");
 
+const V27_UP: &str = include_str!("../sql/027-notes-hot-property-indexes.sql");
+
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
 const V21_ATTACHMENT_FENCES_UP: &str = include_str!("../sql/021-attachments-b-claim-fences.sql");
@@ -338,6 +340,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 26,
         name: "knowledge_fts_repair",
         up: V26_UP,
+    },
+    VersionedMigration {
+        version: 27,
+        name: "notes_hot_property_indexes",
+        up: V27_UP,
     },
 ];
 

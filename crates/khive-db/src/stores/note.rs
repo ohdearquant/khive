@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use khive_storage::attachment::AttachmentSubstrate;
 use khive_storage::error::{StorageError, WriterTaskRequestState};
-use khive_storage::note::{FilterOp, Note, NoteFilter, SortDir};
+use khive_storage::note::{FilterOp, Note, NoteFilter, NoteSeekAfter, SortDir};
 use khive_storage::types::{
     BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
     SqlStatement, SqlValue,
@@ -908,6 +908,89 @@ fn build_note_filter_where(
     Ok((format!(" WHERE {}", conditions.join(" AND ")), params))
 }
 
+/// `SELECT` column list for a plain note-row projection. Used by
+/// [`fetch_notes_after`] and `query_notes_filtered_count_free`; the other
+/// note-row projection queries in this file (`query_notes`,
+/// `query_notes_count_free`, `query_notes_filtered`,
+/// `query_notes_filtered_after`, `query_notes_filtered_bounded`) still spell
+/// the same column list out inline.
+const NOTE_COLUMNS: &str = "id, namespace, kind, status, name, content, salience, decay_factor, \
+     expires_at, properties, created_at, updated_at, deleted_at";
+
+/// Fetch up to `limit` rows strictly after `after` in the notes store's
+/// default `created_at DESC, id ASC` total order, for `NoteFilter.after`
+/// keyset pagination.
+///
+/// Deliberately NOT a single `WHERE ... (created_at, id) < (?, ?)` (row
+/// value) or `WHERE ... (created_at < ?1 OR (created_at = ?1 AND id > ?2))`
+/// predicate: `created_at` sorts DESC while `id` sorts ASC, and neither form
+/// gets index-seek treatment from SQLite for a mixed-direction boundary on
+/// this build (`EXPLAIN QUERY PLAN` showed the same full ordered index scan
+/// as no boundary at all, i.e. exactly the `OFFSET` cost this exists to
+/// avoid — confirmed empirically, not assumed). Splitting into two
+/// single-direction queries keeps each one a plain equality/range AND-chain,
+/// which SQLite reliably turns into an index seek: the first grabs any tied
+/// rows at the exact boundary timestamp (`id ASC` order matches the index
+/// order within that tie group), the second grabs the (strictly smaller)
+/// timestamps that follow. Concatenating the two batches in that order
+/// reproduces `created_at DESC, id ASC` exactly with no merge step, since a
+/// tie-group's rows all sort before every following (smaller) timestamp.
+fn fetch_notes_after(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    base_filter: &NoteFilter,
+    after: &NoteSeekAfter,
+    limit: i64,
+) -> Result<Vec<Note>, rusqlite::Error> {
+    let mut items = Vec::new();
+    if limit <= 0 {
+        return Ok(items);
+    }
+
+    {
+        let (where_sql, mut params) = build_note_filter_where(namespace, base_filter)?;
+        params.push(Box::new(after.created_at));
+        let ts_idx = params.len();
+        params.push(Box::new(after.id.to_string()));
+        let id_idx = params.len();
+        params.push(Box::new(limit));
+        let limit_idx = params.len();
+        let sql = format!(
+            "SELECT {NOTE_COLUMNS} FROM notes{where_sql} AND created_at = ?{ts_idx} \
+             AND id > ?{id_idx} ORDER BY id ASC LIMIT ?{limit_idx}"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), read_note)?;
+        for row in rows {
+            items.push(row?);
+        }
+    }
+
+    let remaining = limit - items.len() as i64;
+    if remaining > 0 {
+        let (where_sql, mut params) = build_note_filter_where(namespace, base_filter)?;
+        params.push(Box::new(after.created_at));
+        let ts_idx = params.len();
+        params.push(Box::new(remaining));
+        let limit_idx = params.len();
+        let sql = format!(
+            "SELECT {NOTE_COLUMNS} FROM notes{where_sql} AND created_at < ?{ts_idx} \
+             ORDER BY created_at DESC, id ASC LIMIT ?{limit_idx}"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), read_note)?;
+        for row in rows {
+            items.push(row?);
+        }
+    }
+
+    Ok(items)
+}
+
 fn execute_filtered_note_property_patch(
     conn: &rusqlite::Connection,
     id: Uuid,
@@ -1443,6 +1526,18 @@ impl NoteStore for SqlNoteStore {
         if let Some((path, _)) = &filter.order_by {
             validate_json_path(path)?;
         }
+        if filter.after.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered".into(),
+                message: "NoteFilter.after (keyset pagination) is not supported by this \
+                          method: it computes an exact COUNT(*) total over the whole \
+                          matching set, which has no defined meaning paired with a seek \
+                          boundary; use query_notes_filtered_count_free instead, which \
+                          seeks and returns total: None"
+                    .into(),
+            });
+        }
 
         let namespace = namespace.to_string();
         let filter = filter.clone();
@@ -1503,6 +1598,24 @@ impl NoteStore for SqlNoteStore {
         if let Some((path, _)) = &filter.order_by {
             validate_json_path(path)?;
         }
+        if filter.after.is_some() && filter.order_by.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered_count_free".into(),
+                message: "NoteFilter.after is incompatible with a custom order_by; it is \
+                          defined only over the default created_at DESC, id ASC order"
+                    .into(),
+            });
+        }
+        if filter.after.is_some() && page.offset != 0 {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered_count_free".into(),
+                message: "NoteFilter.after and a non-zero PageRequest.offset are mutually \
+                          exclusive pagination strategies; pass offset: 0 with after"
+                    .into(),
+            });
+        }
 
         let namespace = namespace.to_string();
         let filter = filter.clone();
@@ -1517,6 +1630,13 @@ impl NoteStore for SqlNoteStore {
         })?;
 
         self.with_reader("query_notes_filtered_count_free", move |conn| {
+            if let Some(after) = &filter.after {
+                let mut base_filter = filter.clone();
+                base_filter.after = None;
+                let items = fetch_notes_after(conn, &namespace, &base_filter, after, limit_i64)?;
+                return Ok(Page { items, total: None });
+            }
+
             let (where_sql, mut params) = build_note_filter_where(&namespace, &filter)?;
             params.push(Box::new(limit_i64));
             params.push(Box::new(offset_i64));
@@ -1524,9 +1644,8 @@ impl NoteStore for SqlNoteStore {
             let offset_idx = params.len();
             let order_clause = note_filter_page_order_clause(&filter);
             let sql = format!(
-                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-                 expires_at, properties, created_at, updated_at, deleted_at \
-                 FROM notes{where_sql}{order_clause} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+                "SELECT {NOTE_COLUMNS} FROM notes{where_sql}{order_clause} \
+                 LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
             );
 
             let mut stmt = conn.prepare(&sql)?;
