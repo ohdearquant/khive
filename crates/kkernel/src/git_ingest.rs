@@ -11,7 +11,7 @@ use clap::Parser;
 
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_pack_git::ingest::{run_ingest, IngestOptions};
-use khive_runtime::{KhiveRuntime, Namespace, PackRegistry};
+use khive_runtime::{IngestAuditStore, KhiveRuntime, Namespace, PackRegistry};
 
 /// Arguments for `kkernel git-ingest`.
 #[derive(Parser, Debug)]
@@ -72,8 +72,8 @@ pub async fn run_git_ingest(args: GitIngestArgs) -> Result<()> {
     // per-write dispatches already went through `VerbRegistry::dispatch`,
     // which is a broader change than this PR's registry-bootstrap
     // deduplication is scoped to.
-    let registry =
-        PackRegistry::build_ingest_registry(&runtime, false).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let registry = PackRegistry::build_ingest_registry(&runtime, IngestAuditStore::Detach)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let report = run_ingest(
         &runtime,

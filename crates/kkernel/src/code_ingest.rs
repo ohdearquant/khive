@@ -22,8 +22,8 @@ use khive_db::StorageBackend;
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_pack_code::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions};
 use khive_runtime::{
-    entity_fts_document, note_fts_document, secret_gate, GateRef, InterceptedDispatchResult,
-    KhiveRuntime, Namespace, PackRegistry, RuntimeError, VerbRegistry,
+    entity_fts_document, note_fts_document, secret_gate, GateRef, IngestAuditStore,
+    InterceptedDispatchResult, KhiveRuntime, Namespace, PackRegistry, RuntimeError, VerbRegistry,
 };
 use khive_storage::{SqlStatement, SqlValue, SubstrateKind};
 
@@ -150,11 +150,12 @@ where
 }
 
 fn build_code_ingest_registry(runtime: &KhiveRuntime) -> Result<VerbRegistry> {
-    // Shared with `kkernel git-ingest` (`git_ingest.rs`); `true` requests the
-    // same event-store attachment `KhiveMcpServer::with_packs` gives its own
-    // registry, so a gate consultation on this path persists an audit event
-    // (ADR-018 Amendment 4) exactly like a live MCP server would.
-    PackRegistry::build_ingest_registry(runtime, true).map_err(|e| anyhow::anyhow!("{e}"))
+    // Shared with `kkernel git-ingest` (`git_ingest.rs`); `Attach` requests
+    // the same event-store attachment `KhiveMcpServer::with_packs` gives its
+    // own registry, so a gate consultation on this path persists an audit
+    // event (ADR-018 Amendment 4) exactly like a live MCP server would.
+    PackRegistry::build_ingest_registry(runtime, IngestAuditStore::Attach)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 async fn code_ingest_batch_with_config_and_runtime_setup<F>(
@@ -776,6 +777,34 @@ mod tests {
         }
     }
 
+    /// Pin `KHIVE_PACKS` to an explicit pack list for the guard's lifetime,
+    /// restoring the previous value on drop. Config resolution gives the
+    /// environment variable precedence over a config file's `[runtime].packs`
+    /// (`resolve_runtime_config_with_db_anchor` in `khive-mcp/src/serve.rs`),
+    /// so a test that names its pack set in a TOML fixture is still steered by
+    /// whatever the ambient shell exported unless the variable is pinned too.
+    /// Tests using this guard must be `#[serial]`: process env is global.
+    struct PacksEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl PacksEnvGuard {
+        fn pin(packs: &[&str]) -> Self {
+            let previous = std::env::var_os("KHIVE_PACKS");
+            std::env::set_var("KHIVE_PACKS", packs.join(","));
+            Self { previous }
+        }
+    }
+
+    impl Drop for PacksEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("KHIVE_PACKS", value),
+                None => std::env::remove_var("KHIVE_PACKS"),
+            }
+        }
+    }
+
     #[derive(Clone, Default)]
     struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -865,9 +894,10 @@ mod tests {
         path
     }
 
-    /// Like [`write_empty_test_config`] but names the pack set explicitly, so
-    /// the resolved config does not fall through to an ambient `KHIVE_PACKS`
-    /// environment variable a concurrently running test may have set.
+    /// Like [`write_empty_test_config`] but names the pack set explicitly.
+    /// This only decides the pack set when `KHIVE_PACKS` is unset: the
+    /// environment variable outranks the file, so gate-path tests pair this
+    /// fixture with [`PacksEnvGuard::pin`] on the same list.
     fn write_test_config_with_packs(dir: &Path, packs: &[&str]) -> PathBuf {
         let path = dir.join("packs-khive-config.toml");
         let list = packs
@@ -936,9 +966,11 @@ mod tests {
         path
     }
 
-    /// The full production pack set, named explicitly so gate-path tests do
-    /// not depend on an ambient `KHIVE_PACKS` environment variable that a
-    /// concurrently running test may have set (or unset).
+    /// The full production pack set. Gate-path tests write it into their
+    /// config fixture and pin `KHIVE_PACKS` to it ([`PacksEnvGuard::pin`]),
+    /// because the environment variable outranks the fixture and an ambient
+    /// value naming an unlinked pack would fail registry construction before
+    /// the gate is ever consulted.
     const ALL_PACKS: &[&str] = &[
         "kg",
         "gtd",
@@ -1055,10 +1087,61 @@ mod tests {
         page.items.into_iter().next().expect("checked len == 1")
     }
 
+    /// The gate fixtures name their pack set in TOML, but `KHIVE_PACKS`
+    /// outranks the file: with an ambient value naming an unlinked pack, the
+    /// registry would fail construction before the gate is consulted. The
+    /// guard pins the variable for the fixture's lifetime and restores the
+    /// ambient value afterwards.
+    #[serial]
+    #[test]
+    fn packs_env_guard_pins_the_fixture_pack_set_over_an_ambient_override() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
+        let db = tmp.path().join("hermetic.db");
+        let resolve = || {
+            resolve_runtime_config(RuntimeConfigInputs {
+                db: Some(db.to_str().expect("utf8 path")),
+                config: Some(&config),
+                namespace: Namespace::parse("local").expect("valid namespace"),
+                namespace_explicit: true,
+                actor_explicit: false,
+                no_embed: true,
+                packs: None,
+                brain_profile: None,
+            })
+            .expect("resolve runtime config")
+            .packs
+        };
+        let expected: Vec<String> = ALL_PACKS.iter().map(|p| p.to_string()).collect();
+
+        let previous = std::env::var_os("KHIVE_PACKS");
+        std::env::set_var("KHIVE_PACKS", "kg,formal");
+        // Control: the ambient value steers resolution past the fixture.
+        assert_eq!(resolve(), vec!["kg".to_string(), "formal".to_string()]);
+        {
+            let _packs = PacksEnvGuard::pin(ALL_PACKS);
+            assert_eq!(
+                resolve(),
+                expected,
+                "the pinned list must win over the ambient value"
+            );
+        }
+        assert_eq!(
+            std::env::var("KHIVE_PACKS").as_deref(),
+            Ok("kg,formal"),
+            "the guard must restore the ambient value it replaced"
+        );
+        match previous {
+            Some(value) => std::env::set_var("KHIVE_PACKS", value),
+            None => std::env::remove_var("KHIVE_PACKS"),
+        }
+    }
+
     #[serial]
     #[tokio::test]
     async fn code_ingest_batch_gate_denial_precedes_setup_and_record_writes() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
+        let _packs = PacksEnvGuard::pin(ALL_PACKS);
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("gate-denied.db");
         let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
@@ -1129,6 +1212,7 @@ mod tests {
     #[tokio::test]
     async fn code_ingest_batch_gate_allow_persists_success_audit_event() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
+        let _packs = PacksEnvGuard::pin(ALL_PACKS);
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("gate-allowed.db");
         let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
@@ -1157,6 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn code_ingest_batch_gate_error_precedes_setup_and_record_writes() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
+        let _packs = PacksEnvGuard::pin(ALL_PACKS);
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("gate-errored.db");
         let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);

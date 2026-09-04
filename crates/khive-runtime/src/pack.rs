@@ -3364,6 +3364,21 @@ impl std::error::Error for PackLoadError {}
 /// globally-collected [`PackRegistration`] slice.
 pub struct PackRegistry;
 
+/// Whether [`PackRegistry::build_ingest_registry`] attaches the runtime's
+/// event store to the registry it builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestAuditStore {
+    /// Mirror `KhiveMcpServer::with_packs` (`khive-mcp/src/server.rs`): a
+    /// writable runtime attaches its own event store, logging and continuing
+    /// on failure rather than refusing to build; a read-only runtime retains
+    /// no `EventStore` handle and an advisory travels beside each result
+    /// instead.
+    Attach,
+    /// Build the registry with no audit event store, for a caller with no use
+    /// for persisted audit rows.
+    Detach,
+}
+
 impl PackRegistry {
     /// Names of all pack factories discovered via `inventory`.
     pub fn discovered_names() -> Vec<&'static str> {
@@ -3448,12 +3463,8 @@ impl PackRegistry {
     /// (`kkernel code-ingest`, `kkernel git-ingest`) that needs a real
     /// registry to dispatch through outside of a live MCP server.
     ///
-    /// `attach_event_store` mirrors `KhiveMcpServer::with_packs`
-    /// (`khive-mcp/src/server.rs`): when true, a read-only runtime retains no
-    /// `EventStore` handle (an advisory travels beside each result instead),
-    /// and a writable runtime attaches its own event store, logging and
-    /// continuing on failure rather than refusing to build. Pass `false` for
-    /// a caller with no use for persisted audit rows.
+    /// `audit_store` selects whether the registry gets the runtime's event
+    /// store; see [`IngestAuditStore`] for what each variant does.
     ///
     /// This helper carries only the subset every ingest path duplicated
     /// verbatim. The MCP server's own registry construction additionally
@@ -3464,14 +3475,14 @@ impl PackRegistry {
     /// construction rather than calling this helper.
     pub fn build_ingest_registry(
         runtime: &KhiveRuntime,
-        attach_event_store: bool,
+        audit_store: IngestAuditStore,
     ) -> Result<VerbRegistry, RuntimeError> {
         let mut builder = VerbRegistryBuilder::new();
         builder.with_gate(runtime.config().gate.clone());
         builder.with_default_namespace(runtime.config().default_namespace.as_str());
         builder.with_visible_namespaces(runtime.config().visible_namespaces.clone());
         builder.with_actor_id(runtime.config().actor_id.clone());
-        if attach_event_store {
+        if audit_store == IngestAuditStore::Attach {
             if runtime.is_read_only() {
                 builder.with_read_only_audit_store();
             } else if let Err(error) = builder.with_runtime_event_store(runtime) {
