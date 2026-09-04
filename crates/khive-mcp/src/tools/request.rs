@@ -93,16 +93,17 @@ pub struct RequestParams {
     #[schemars(description = "Per-op output format override (optional)")]
     pub format_per_op: Option<Vec<Option<String>>>,
 
-    /// Caller-supplied request-group correlation id (khive#948), forwarded
-    /// unchanged onto the daemon request frame and echoed back on the response so a
-    /// benchmark harness can join its own pre-send sample to the server-side
-    /// audit row for this request. Purely a correlation label — it never
-    /// changes how a request is dispatched. Every operation in a batch or
-    /// chain shares the value; it is not an operation-unique id. When omitted, the request
-    /// carries no id and its audit row has no `request_id` key.
+    /// Request-group correlation id (khive#948), forwarded unchanged onto the
+    /// daemon request frame and echoed back on the response so a benchmark
+    /// harness can join its own pre-send sample to the server-side audit row.
+    /// A caller-supplied value wins unchanged; when omitted, the MCP bridge
+    /// mints an opaque nonzero id before daemon forwarding or local fallback.
+    /// Purely a correlation label — it never changes dispatch semantics. Every
+    /// operation in a batch or chain shares the value; it is not an
+    /// operation-unique id or a cross-attempt idempotency key.
     #[serde(default)]
     #[schemars(
-        description = "Caller-supplied request-group correlation id, echoed back and stamped into every operation's audit event (optional)"
+        description = "Request-group correlation id echoed by the daemon and stamped into every operation's audit event; the MCP bridge generates one when omitted"
     )]
     pub request_id: Option<u64>,
 }
