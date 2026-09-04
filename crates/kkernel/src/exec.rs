@@ -4186,6 +4186,7 @@ id = "lambda:fallback"
             db_path: Some(db_path),
             embedding_model: None,
             additional_embedding_models: vec![],
+            packs: RuntimeConfig::built_in_packs(),
             ..RuntimeConfig::default()
         };
         let khive_cfg = KhiveConfig::default();
