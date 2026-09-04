@@ -455,6 +455,23 @@ instrumentation cannot see the population this record shrinks.
   the records it holds. That is a separate property and the two must not be conflated: a record
   handled correctly by the write path, on a store configured to lose recent commits, is still
   exposed. Both halves have to hold, and satisfying one says nothing about the other.
+
+  **Named exceptions.** Two bounded exceptions to INV-1 are recorded in this document, and there
+  are no others. Amendment 1 scopes an admission-pressure undercount to allowlisted read verbs.
+  Amendment 5 adds a wedged-store path that applies to every producer class: when a generation's
+  append does not return within `driver_append_deadline` (3x `resolution_deadline`), the driver
+  abandons the generation. If the detached append later commits, its rows are durable but no
+  waiter observes them; if it fails permanently, they are lost. Either way the loss path is never
+  silent: the generation snapshot carries `terminal_reason = DriverAppendAbandoned` with
+  `committed_rows = 0`, `flush_failures` increments, and pure producers record degradation. An
+  operator reads that snapshot as a store that stopped answering for longer than the bound, not as
+  a write-path defect, and treats the snapshot's row count as the upper bound on what was lost. The
+  same amendment's cap on outstanding abandoned appends (`max_abandoned_appends`) adds a second,
+  same-family sub-path rather than a third exception: once that many appends are already
+  outstanding, a further generation is shed without an append ever being attempted, so its rows are
+  lost with certainty rather than merely possibly, upon the same non-silent surfacing —
+  `terminal_reason = StoreWedged`, `flush_failures` increments, and pure producers record
+  degradation exactly as they do for `DriverAppendAbandoned`.
 - **INV-2 (D5).** An unclassified input resolves to the stricter handling — commit failure fails
   the dispatch — enforced by exhaustive matching without a wildcard.
 - **INV-3.** Batch accumulation is bounded and never blocks dispatch indefinitely; a full batch
@@ -712,3 +729,107 @@ The exception's enumerated verb set is authoritative in ADR-103 Amendment 4, whi
 the extended census test to assert list-to-enumeration equality and per-entry handler resolution —
 so a branch widening the constant without a signed amendment fails the census rather than widening
 this exception silently.
+
+## Amendment 3 (2026-08-30): Resolve Enqueued Audit Outcomes for Committed Successes
+
+**Status**: Accepted, implemented for khive#2256.
+
+Amendment 1 deliberately lets an admission-degrade-safe read return when its already-enqueued
+audit row crosses `admission_deadline`. That same return rule is not sound for a successful
+non-degrade-safe operation: its domain effect may already be committed, so converting the audit
+wait timeout into a generic dispatch failure reports the opposite of what happened and invites an
+unsafe retry of a non-idempotent verb.
+
+Successful `DispatchSucceeded` operations outside the read-degrade allowlist, plus the dedicated
+`GitDigestReceipt` producer, therefore use the batch seam's resolved-wait mode. They enqueue and
+share generations exactly as before. If `admission_deadline` elapses after enqueue, the runtime
+records a warning and keeps awaiting that same receiver until the generation reports its real
+commit or terminal failure; it never re-enqueues the row and never reruns the handler.
+
+The distinction at the two admission boundaries remains exact:
+
+- `QueueAdmissionExhausted` happens before enqueue and is still returned immediately. No audit row
+  exists to await.
+- `AdmissionDeadlineExpired` remains a caller-visible result of ordinary bounded `submit()` and
+  continues to drive Amendment 1's read-degradation accounting. It is not returned by the
+  resolved-wait mode once a committed success row has been enqueued.
+- `IdentityConflict`, `StoreFailure`, unsupported idempotency, and driver terminal failures still
+  fail the successful dispatch once they are known. The change removes only a false failure caused
+  by an unresolved wait threshold; it does not weaken durable audit obligations.
+
+Gate-denial, unknown-verb, failed-dispatch, and pure-observability rows retain bounded submission:
+their caller-visible operation outcome is already fixed, or their contract is explicitly
+best-effort. The eleven admission-degrade-safe reads remain governed by Amendment 1 unchanged.
+
+## Amendment 4 (2026-09-03): Bound the Resolved Wait Itself
+
+**Status**: Accepted, implemented for khive#2331.
+
+Amendment 3's resolved-wait mode kept the enqueued audit receiver alive with no upper bound once
+`admission_deadline` elapsed: a stalled `EventStore::append_events_idempotent()` call (a wedged
+writer task, an unreachable events daemon that never times out at that layer, and so on) retained
+the completed write's caller, its request slot, and its audit-lane waiter indefinitely. The stalled
+generation also stops the driver from draining any row queued behind it, so both request and audit
+capacity exhaust together rather than the caller ever observing a terminal outcome.
+
+`AuditBatchConfig` gains a second, larger bound, `resolution_deadline`, which caps how much longer
+`AuditBatch::submit_until_resolved` may wait once `admission_deadline` has already elapsed on the
+row. It defaults to 6x `admission_deadline` and is validated (debug-only, at `AuditBatch`
+construction) to be no shorter than `admission_deadline`.
+
+If `resolution_deadline` also elapses, the caller receives a new terminal reason,
+`AuditTerminalReason::ResolutionDeadlineExpired`, distinct from `AdmissionDeadlineExpired`: the
+domain effect has already committed, so it is not retried and the row is not re-enqueued, but the
+audit outcome itself is now unknown to the caller rather than merely slow. The row is left exactly
+where the driver holds it — in `state.pending`, or already mid-generation — for the driver to
+resolve independently, the same non-removal contract Amendment 1 established for
+`AdmissionDeadlineExpired`. Amendment 5 gives such a row a second possible ending: once the
+driver's own bound on the generation holding it elapses, that generation is abandoned and the row
+resolves as `DriverAppendAbandoned` rather than to a commit the driver observes. Every other
+boundary in Amendment 3 is unchanged: `QueueAdmissionExhausted`
+still returns immediately with no audit row to await, and a genuine `IdentityConflict`,
+`StoreFailure`, unsupported-idempotency, or driver terminal failure that resolves before
+`resolution_deadline` still fails the successful dispatch exactly as before.
+
+## Amendment 5 (2026-09-04): Bound the Driver's Own Append, Not Just the Caller's Wait
+
+**Status**: Accepted, implemented for khive#2331.
+
+Amendment 4 left exactly the gap its own text names: bounding how long a _caller_ waits does not
+bound how long the _driver_ holds a stalled generation. `supervisor_loop` drains rows into one
+generation, spawns a child task that calls `EventStore::append_events_idempotent()`, and then
+awaits that child with no timeout of its own. When the call never returns, the loop never returns
+to the top to drain `state.pending` again — every submission arriving after the stall piles up in
+`pending` regardless of whether its own caller is using bounded `submit()` or resolved-wait
+`submit_until_resolved()`, and regardless of whether that caller has already given up. Once
+`pending` reaches `max_pending_rows`, every later submission gets `QueueAdmissionExhausted`, not
+just the row that started the stall — a caller giving up on its own deadline frees nothing, because
+the row it gave up on is never removed from wherever the driver holds it.
+
+`supervisor_loop` now wraps its `child.await` in `tokio::time::timeout`, bounded by a
+`driver_append_deadline` derived from `resolution_deadline` (3x it, not a new config field — see
+the rationale on `driver_append_deadline` in `audit_batch.rs`, which exists to guarantee the driver
+can never race ahead of a `submit_until_resolved` caller's own, more specific
+`ResolutionDeadlineExpired` reason for the same row). If that bound elapses, the generation is
+recorded with the new `AuditTerminalReason::DriverAppendAbandoned`, every waiter on it is resolved
+with that reason, and the loop continues immediately to drain whatever has queued in `pending`
+since — restoring admission capacity for later callers regardless of how the stalled generation
+eventually resolves. The underlying `append_events_idempotent()` call is not cancelled — it may be
+a blocking storage call that cannot be safely aborted mid-write — so it is handed to a detached
+task that drives it to completion and discards whatever it eventually returns; no waiter is still
+listening for that result. As with `ResolutionDeadlineExpired`, the caller's already-committed
+domain effect is never retried and the row is never re-enqueued. Under a store that never returns,
+this mints one detached task per `driver_append_deadline` (90 s at the defaults: a 5 s
+`admission_deadline`, 6x for `resolution_deadline`, 3x again for the driver) — but only up to
+`AuditBatchConfig::max_abandoned_appends` (default 4) may be outstanding at once. Before spawning a
+generation's child, `supervisor_loop` reads the current count of still-running
+`DriverAppendAbandoned` appends; at or above the cap, the store is treated as wedged and this
+generation is shed instead of attempted: no child task is spawned and no store call is made, every
+waiter resolves immediately with the new `AuditTerminalReason::StoreWedged`, `flush_failures`
+increments, and the loop continues straight to the next `pending` drain. A shed generation costs no
+store work at all. Recovery needs no timer of its own: as soon as one outstanding append returns —
+commit or failure, each recorded on a dedicated counter so an operator can see that a store recorded
+as wedged later drained — the count drops back below the cap and the next generation attempts a
+real append again. This bounds the retained-buffer growth a wedged store can cause to
+`max_abandoned_appends * max_rows_per_generation` rows, in place of the fully unbounded growth this
+amendment originally left.

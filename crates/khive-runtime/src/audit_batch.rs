@@ -125,6 +125,21 @@ pub enum AuditTerminalReason {
     /// because a row counted here may still commit, unlike one refused
     /// before enqueue.
     AdmissionDeadlineExpired,
+    /// Reached only through `AuditBatch::submit_until_resolved`: the row's
+    /// [`Self::AdmissionDeadlineExpired`] wait had already elapsed, and this
+    /// caller's own `AuditBatchConfig::resolution_deadline` then also
+    /// elapsed still waiting for the row's real generation outcome. The
+    /// caller reaches this only after its domain effect has already
+    /// committed, so the effect is never retried and the row is never
+    /// re-enqueued — but unlike an ordinary commit, the caller now learns
+    /// the effect committed while the audit outcome itself is unresolved.
+    /// Same as [`Self::AdmissionDeadlineExpired`], the row is left exactly
+    /// where the driver holds it (`state.pending`, or already mid-generation)
+    /// for the driver to resolve independently — this reason performs no
+    /// removal. Kept distinct from [`Self::AdmissionDeadlineExpired`] so a
+    /// caller, and diagnostics reading this reason, can tell a merely-slow
+    /// admission wait apart from a resolution wait that gave up entirely.
+    ResolutionDeadlineExpired,
     /// A row shared this generation's id with a previously stored row whose
     /// columns or observation projection did not match exactly.
     IdentityConflict,
@@ -147,6 +162,37 @@ pub enum AuditTerminalReason {
     /// terminally consistent afterward (`in_flight` still set, or the
     /// generation's rows were never resolved).
     DriverExitedInconsistent,
+    /// The driver's own bound on a single generation's
+    /// `EventStore::append_events_idempotent()` call
+    /// (`supervisor_loop`'s `driver_append_deadline`) elapsed while that
+    /// call was still in flight. Unlike [`Self::AdmissionDeadlineExpired`]
+    /// and [`Self::ResolutionDeadlineExpired`], which bound only how long a
+    /// *caller* keeps waiting while the row stays wherever the driver holds
+    /// it, this bounds the driver's own hold: every waiter on the abandoned
+    /// generation is resolved with this reason and the generation is
+    /// removed from the driver's in-flight state, so a stalled store call
+    /// cannot pin `pending` at `max_pending_rows` and starve all later
+    /// admission (khive#2331). The underlying append is not cancelled — it
+    /// may not be safely cancellable mid-flight — so it is left to run to
+    /// completion in the background and its eventual result, whatever it
+    /// is, is discarded; no waiter is still listening for it. The caller's
+    /// domain effect (if any already committed before this row was
+    /// enqueued) is never retried, and the row is never re-enqueued.
+    DriverAppendAbandoned,
+    /// Before spawning a generation's child, the driver found
+    /// `AuditBatchConfig::max_abandoned_appends` detached appends already
+    /// outstanding from prior [`Self::DriverAppendAbandoned`] generations
+    /// (khive#2331). The store is treated as wedged: this generation's rows
+    /// are shed without ever attempting an append — no child task is
+    /// spawned, no store call is made, and every waiter resolves with this
+    /// reason immediately, well inside `driver_append_deadline`. Same
+    /// non-retry contract as [`Self::DriverAppendAbandoned`]: any
+    /// already-committed domain effect is not retried and the row is never
+    /// re-enqueued, and pure-observability producers record degradation.
+    /// The driver reattempts an append on the next generation as soon as an
+    /// outstanding append returns (commit or failure) and the count drops
+    /// back below the cap — recovery needs no timer of its own.
+    StoreWedged,
 }
 
 /// One row accepted for batching: the immutable event identity plus the
@@ -178,6 +224,16 @@ pub struct AuditBatchHealthMetrics {
     pub flush_failures: u64,
     pub degraded_rows: u64,
     pub degraded: bool,
+    /// Detached [`AuditTerminalReason::DriverAppendAbandoned`] appends that
+    /// eventually returned a commit, after their generation had already
+    /// resolved every waiter with `DriverAppendAbandoned`. Lets an operator
+    /// see that a store recorded as wedged later drained.
+    pub late_append_commits: u64,
+    /// Detached [`AuditTerminalReason::DriverAppendAbandoned`] appends that
+    /// eventually returned a failure (store error, panic, or cancellation),
+    /// after their generation had already resolved every waiter with
+    /// `DriverAppendAbandoned`.
+    pub late_append_failures: u64,
 }
 
 /// Tunables for the batch seam. Defaults are conservative; every field is
@@ -189,16 +245,50 @@ pub struct AuditBatchConfig {
     pub max_commit_attempts: std::num::NonZeroU8,
     pub retry_backoff: Duration,
     pub admission_deadline: Duration,
+    /// Caps how much longer `AuditBatch::submit_until_resolved` keeps
+    /// waiting on a row's real generation outcome once `admission_deadline`
+    /// has already elapsed on it. Without this bound a generation stuck on a
+    /// stalled `EventStore::append_events_idempotent` call retains the
+    /// completed write's caller, its request slot, and its audit-lane waiter
+    /// forever, exhausting both request and audit capacity (khive#2331).
+    /// Must be at least `admission_deadline` — validated (debug-only) in
+    /// [`AuditBatch::new`]. Defaults to 6x `admission_deadline`.
+    ///
+    /// Also the single source value the driver's own per-generation append
+    /// bound (`supervisor_loop`'s `driver_append_deadline`) is derived from
+    /// — that bound exists so a stalled append cannot keep the driver from
+    /// ever draining `pending` again, which is what actually exhausts
+    /// admission for every later caller, not just the one already waiting
+    /// on the stuck row. See [`AuditTerminalReason::DriverAppendAbandoned`].
+    pub resolution_deadline: Duration,
+    /// Caps how many [`AuditTerminalReason::DriverAppendAbandoned`] appends
+    /// may be outstanding (handed to a detached task, still running) at
+    /// once. Each outstanding append retains up to
+    /// `max_rows_per_generation` events until it finally returns, so the
+    /// retained-buffer bound this places on a wedged store is
+    /// `max_abandoned_appends * max_rows_per_generation` rows — without it,
+    /// a store whose append never returns mints one such task per
+    /// `driver_append_deadline` with no cap, and both the live task count
+    /// and the retained event batches inside them grow until the process
+    /// exits (khive#2331). Once the cap is reached, `supervisor_loop` sheds
+    /// further generations with [`AuditTerminalReason::StoreWedged`] instead
+    /// of attempting another append; it resumes attempting appends as soon
+    /// as an outstanding one returns and the count drops back below the
+    /// cap. Defaults to 4.
+    pub max_abandoned_appends: std::num::NonZeroUsize,
 }
 
 impl Default for AuditBatchConfig {
     fn default() -> Self {
+        let admission_deadline = Duration::from_secs(5);
         Self {
             max_pending_rows: std::num::NonZeroUsize::new(4096).unwrap(),
             max_rows_per_generation: std::num::NonZeroUsize::new(256).unwrap(),
             max_commit_attempts: std::num::NonZeroU8::new(3).unwrap(),
             retry_backoff: Duration::from_millis(20),
-            admission_deadline: Duration::from_secs(5),
+            admission_deadline,
+            resolution_deadline: admission_deadline * 6,
+            max_abandoned_appends: std::num::NonZeroUsize::new(4).unwrap(),
         }
     }
 }
@@ -252,6 +342,14 @@ struct State {
     flush_failures: u64,
     degraded_rows: u64,
     degraded: bool,
+    /// Detached `DriverAppendAbandoned` appends currently still running,
+    /// bounded by `AuditBatchConfig::max_abandoned_appends`. Incremented
+    /// when `supervisor_loop` abandons a generation and hands its child to a
+    /// detached task; decremented by that task once the child finally
+    /// returns.
+    outstanding_abandoned_appends: usize,
+    late_append_commits: u64,
+    late_append_failures: u64,
 }
 
 impl State {
@@ -269,6 +367,9 @@ impl State {
             flush_failures: 0,
             degraded_rows: 0,
             degraded: false,
+            outstanding_abandoned_appends: 0,
+            late_append_commits: 0,
+            late_append_failures: 0,
         }
     }
 
@@ -419,6 +520,35 @@ enum GenerationResult {
     FakedInconsistent,
 }
 
+/// The driver's own bound on how long `supervisor_loop` waits for one
+/// generation's `run_generation` child task before abandoning it
+/// (khive#2331; see [`AuditTerminalReason::DriverAppendAbandoned`]).
+///
+/// Derived from `resolution_deadline` rather than a second config field, at
+/// 3x it. That margin is load-bearing, not arbitrary: `AuditBatch::new`
+/// already enforces `resolution_deadline >= admission_deadline`, so the
+/// worst-case *caller*-side wait for a `submit_until_resolved` row —
+/// `admission_deadline` then `resolution_deadline` in sequence — is always
+/// `<= 2 * resolution_deadline`. Bounding the driver at `3 *
+/// resolution_deadline` guarantees it can never resolve a still-waiting
+/// caller's row with `DriverAppendAbandoned` ahead of that caller's own,
+/// more specific `ResolutionDeadlineExpired` reason.
+///
+/// This bound alone only stops the driver from holding one stalled
+/// generation forever — a store whose append never returns still mints one
+/// detached append per `driver_append_deadline` with nothing capping how
+/// many run at once. `AuditBatchConfig::max_abandoned_appends` closes that:
+/// once that many detached appends are outstanding, further generations are
+/// shed with [`AuditTerminalReason::StoreWedged`] instead of attempting
+/// another append. Combined, the two bounds guarantee at most
+/// `max_abandoned_appends` live detached appends at any time, at most that
+/// many retained event batches, and a shed generation costs no store work
+/// at all — it resolves inside this function's caller without ever calling
+/// `run_generation`.
+fn driver_append_deadline(config: &AuditBatchConfig) -> Duration {
+    config.resolution_deadline.saturating_mul(3)
+}
+
 async fn run_generation(
     store: Arc<dyn EventStore>,
     events: Vec<Event>,
@@ -463,6 +593,12 @@ pub struct AuditBatch {
 
 impl AuditBatch {
     pub fn new(store: Arc<dyn EventStore>, config: AuditBatchConfig) -> Arc<Self> {
+        debug_assert!(
+            config.resolution_deadline >= config.admission_deadline,
+            "resolution_deadline ({:?}) must be at least admission_deadline ({:?})",
+            config.resolution_deadline,
+            config.admission_deadline
+        );
         Arc::new(Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State::new()),
@@ -485,6 +621,8 @@ impl AuditBatch {
             flush_failures: state.flush_failures,
             degraded_rows: state.degraded_rows,
             degraded: state.degraded,
+            late_append_commits: state.late_append_commits,
+            late_append_failures: state.late_append_failures,
         }
     }
 
@@ -497,6 +635,110 @@ impl AuditBatch {
         });
         *self.supervisor.lock() = Some(handle);
     }
+
+    /// Enqueue one row and keep waiting for its real generation outcome past
+    /// the ordinary admission wait deadline, up to `resolution_deadline`.
+    ///
+    /// This is the narrow khive#2256 seam for a successful operation whose
+    /// domain effect has already committed. Returning
+    /// [`AuditTerminalReason::AdmissionDeadlineExpired`] there would report a
+    /// false operation failure and invite an unsafe retry while the same
+    /// audit row remains enqueued. Pre-enqueue refusal and genuine terminal
+    /// generation failures still return normally. The post-admission wait is
+    /// itself bounded by `resolution_deadline`
+    /// ([`AuditTerminalReason::ResolutionDeadlineExpired`]) so a stalled
+    /// store cannot retain this caller, its request slot, and its audit-lane
+    /// waiter forever (khive#2331).
+    pub(crate) async fn submit_until_resolved(
+        &self,
+        row: PreparedAuditRow,
+    ) -> Result<AuditCommitOutcome, AuditTerminalReason> {
+        self.submit_with_wait_policy(row, true).await
+    }
+
+    async fn submit_with_wait_policy(
+        &self,
+        row: PreparedAuditRow,
+        wait_until_resolved: bool,
+    ) -> Result<AuditCommitOutcome, AuditTerminalReason> {
+        // Pre-enqueue validation (invariant 3): a malformed row is rejected
+        // before it can share a generation with anyone else's.
+        if self.store.preflight_event(&row.event).is_err() {
+            return Err(AuditTerminalReason::PreflightRejected);
+        }
+
+        let producer = row.producer;
+        let (tx, mut rx) = oneshot::channel();
+        let need_spawn = {
+            let mut state = self.inner.state.lock();
+            match state.lifecycle {
+                Lifecycle::Closed | Lifecycle::Closing => {
+                    return Err(AuditTerminalReason::AdmissionClosed)
+                }
+                Lifecycle::Failed(reason) => return Err(reason),
+                Lifecycle::Open => {}
+            }
+            if state.pending.len() >= self.config.max_pending_rows.get() {
+                return Err(AuditTerminalReason::QueueAdmissionExhausted);
+            }
+            state.pending.push(Waiting {
+                event: row.event,
+                producer,
+                responder: tx,
+            });
+            state.submitted_rows += 1;
+            let need_spawn = !state.driver_active;
+            if need_spawn {
+                state.driver_active = true;
+            }
+            need_spawn
+        };
+        if need_spawn {
+            self.spawn_supervisor_if_idle();
+        }
+
+        if wait_until_resolved {
+            match tokio::time::timeout(self.config.admission_deadline, &mut rx).await {
+                Ok(Ok(result)) => return result,
+                Ok(Err(_recv_error)) => return Err(AuditTerminalReason::DriverJoinLost),
+                Err(_elapsed) => tracing::warn!(
+                    ?producer,
+                    "strict audit obligation remains enqueued after the admission wait deadline; \
+                     waiting up to the resolution deadline for its real terminal outcome"
+                ),
+            }
+            return match tokio::time::timeout(self.config.resolution_deadline, rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_recv_error)) => Err(AuditTerminalReason::DriverJoinLost),
+                // Same non-removal contract as the `AdmissionDeadlineExpired`
+                // arm below: the row is left exactly where the driver holds
+                // it. The caller's domain effect already committed by the
+                // time it reached this wait, so it is never retried here;
+                // the audit outcome itself is what remains unresolved.
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        ?producer,
+                        "strict audit obligation remains unresolved after the resolution \
+                         deadline; giving up on this caller's wait — the committed effect is \
+                         not retried and the row is not re-enqueued"
+                    );
+                    Err(AuditTerminalReason::ResolutionDeadlineExpired)
+                }
+            };
+        }
+
+        match tokio::time::timeout(self.config.admission_deadline, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_recv_error)) => Err(AuditTerminalReason::DriverJoinLost),
+            // The row was already pushed onto `state.pending` above (and
+            // `submitted_rows` incremented) before this wait began — this is
+            // a deadline elapsing on an enqueued row, not a queue-full
+            // refusal, so it gets its own terminal reason (khive#2117,
+            // khive#2208). The row is left in place for the driver to drain;
+            // this arm performs no removal.
+            Err(_elapsed) => Err(AuditTerminalReason::AdmissionDeadlineExpired),
+        }
+    }
 }
 
 async fn supervisor_loop(
@@ -505,7 +747,7 @@ async fn supervisor_loop(
     config: Arc<AuditBatchConfig>,
 ) {
     loop {
-        let waiting = {
+        let (waiting, wedged_generation_id) = {
             let mut state = inner.state.lock();
             if matches!(state.lifecycle, Lifecycle::Failed(_)) {
                 state.driver_active = false;
@@ -522,9 +764,45 @@ async fn supervisor_loop(
             let waiting: Vec<Waiting> = state.pending.drain(..take_n).collect();
             let generation_id = state.next_generation_id;
             state.next_generation_id += 1;
-            state.in_flight_generation = Some(generation_id);
-            waiting
+            // khive#2331: a store whose append never returns must not mint
+            // an unbounded number of detached appends. Before committing to
+            // spawning this generation's child, check whether the cap is
+            // already saturated by prior abandoned generations still
+            // running in the background — if so, this generation is shed
+            // below instead of ever calling the store.
+            if state.outstanding_abandoned_appends >= config.max_abandoned_appends.get() {
+                (waiting, Some(generation_id))
+            } else {
+                state.in_flight_generation = Some(generation_id);
+                (waiting, None)
+            }
         };
+
+        if let Some(generation_id) = wedged_generation_id {
+            tracing::warn!(
+                generation_id,
+                max_abandoned_appends = config.max_abandoned_appends.get(),
+                "audit store treated as wedged: max_abandoned_appends detached appends are \
+                 already outstanding; shedding this generation without attempting an append"
+            );
+            let submitted = waiting.len() as u64;
+            {
+                let mut state = inner.state.lock();
+                state.flush_failures += 1;
+                state.generations.push(AuditGenerationSnapshot {
+                    generation_id,
+                    submitted_rows: submitted,
+                    committed_rows: 0,
+                    store_batch_calls: 0,
+                    terminal_reason: Some(AuditTerminalReason::StoreWedged),
+                });
+            }
+            for w in waiting {
+                record_degradation_if_pure(&inner, w.producer);
+                let _ = w.responder.send(Err(AuditTerminalReason::StoreWedged));
+            }
+            continue;
+        }
 
         #[cfg(any(test, feature = "fault-injection"))]
         if fault::SUPERVISOR_PANIC.swap(false, Ordering::SeqCst) {
@@ -548,7 +826,7 @@ async fn supervisor_loop(
             .map(|w| w.event.clone())
             .collect();
 
-        let child: JoinHandle<GenerationResult> =
+        let mut child: JoinHandle<GenerationResult> =
             tokio::spawn(run_generation(store.clone(), events, config.clone()));
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -562,7 +840,61 @@ async fn supervisor_loop(
             continue;
         }
 
-        let join_result = child.await;
+        let append_deadline = driver_append_deadline(&config);
+        let join_result = match tokio::time::timeout(append_deadline, &mut child).await {
+            Ok(join_result) => join_result,
+            Err(_elapsed) => {
+                // The append is still in flight and may not be safely
+                // cancellable mid-write (a blocking storage call cannot be
+                // forced to stop), so `child` is not aborted here — it is
+                // handed to a detached reaper that drives it to completion
+                // and discards whatever it eventually returns. Every waiter
+                // on this generation is resolved now, and the driver loops
+                // back to `pending` immediately instead of staying pinned on
+                // this one stalled call, which is what actually starves
+                // later admission (khive#2331).
+                tracing::warn!(
+                    ?append_deadline,
+                    "audit generation append exceeded the driver's own bound; abandoning \
+                     this generation so admission capacity recovers for later callers"
+                );
+                let waiting = guard.disarm();
+                let submitted = waiting.len() as u64;
+                {
+                    let mut state = inner.state.lock();
+                    state.in_flight_generation = None;
+                    state.flush_failures += 1;
+                    state.outstanding_abandoned_appends += 1;
+                    let generation_id = state.next_generation_id.saturating_sub(1);
+                    state.generations.push(AuditGenerationSnapshot {
+                        generation_id,
+                        submitted_rows: submitted,
+                        committed_rows: 0,
+                        store_batch_calls: 0,
+                        terminal_reason: Some(AuditTerminalReason::DriverAppendAbandoned),
+                    });
+                }
+                for w in waiting {
+                    record_degradation_if_pure(&inner, w.producer);
+                    let _ = w
+                        .responder
+                        .send(Err(AuditTerminalReason::DriverAppendAbandoned));
+                }
+                let reaper_inner = inner.clone();
+                tokio::spawn(async move {
+                    let result = child.await;
+                    let mut state = reaper_inner.state.lock();
+                    state.outstanding_abandoned_appends =
+                        state.outstanding_abandoned_appends.saturating_sub(1);
+                    match result {
+                        Ok(GenerationResult::Committed(_)) => state.late_append_commits += 1,
+                        Ok(GenerationResult::Failed(_) | GenerationResult::FakedInconsistent)
+                        | Err(_) => state.late_append_failures += 1,
+                    }
+                });
+                continue;
+            }
+        };
         match join_result {
             Err(join_err) => {
                 let reason = if join_err.is_panic() {
@@ -656,52 +988,7 @@ impl AuditBatchControl for AuditBatch {
         &self,
         row: PreparedAuditRow,
     ) -> Result<AuditCommitOutcome, AuditTerminalReason> {
-        // Pre-enqueue validation (invariant 3): a malformed row is rejected
-        // before it can share a generation with anyone else's.
-        if self.store.preflight_event(&row.event).is_err() {
-            return Err(AuditTerminalReason::PreflightRejected);
-        }
-
-        let (tx, rx) = oneshot::channel();
-        let need_spawn = {
-            let mut state = self.inner.state.lock();
-            match state.lifecycle {
-                Lifecycle::Closed | Lifecycle::Closing => {
-                    return Err(AuditTerminalReason::AdmissionClosed)
-                }
-                Lifecycle::Failed(reason) => return Err(reason),
-                Lifecycle::Open => {}
-            }
-            if state.pending.len() >= self.config.max_pending_rows.get() {
-                return Err(AuditTerminalReason::QueueAdmissionExhausted);
-            }
-            state.pending.push(Waiting {
-                event: row.event,
-                producer: row.producer,
-                responder: tx,
-            });
-            state.submitted_rows += 1;
-            let need_spawn = !state.driver_active;
-            if need_spawn {
-                state.driver_active = true;
-            }
-            need_spawn
-        };
-        if need_spawn {
-            self.spawn_supervisor_if_idle();
-        }
-
-        match tokio::time::timeout(self.config.admission_deadline, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_recv_error)) => Err(AuditTerminalReason::DriverJoinLost),
-            // The row was already pushed onto `state.pending` above (and
-            // `submitted_rows` incremented) before this wait began — this is
-            // a deadline elapsing on an enqueued row, not a queue-full
-            // refusal, so it gets its own terminal reason (khive#2117,
-            // khive#2208). The row is left in place for the driver to drain;
-            // this arm performs no removal.
-            Err(_elapsed) => Err(AuditTerminalReason::AdmissionDeadlineExpired),
-        }
+        self.submit_with_wait_policy(row, false).await
     }
 
     async fn quiesce(&self) -> Result<(), AuditTerminalReason> {
@@ -802,6 +1089,9 @@ mod test_internals {
         pub committed_rows: u64,
         pub store_batch_calls: u64,
         pub per_generation: Vec<AuditGenerationSnapshot>,
+        /// Live count of detached `DriverAppendAbandoned` appends still
+        /// running, bounded by `AuditBatchConfig::max_abandoned_appends`.
+        pub outstanding_abandoned_appends: usize,
     }
 
     impl AuditBatchSnapshot {
@@ -815,6 +1105,8 @@ mod test_internals {
         pub flush_failures: u64,
         pub degraded_rows: u64,
         pub degraded: bool,
+        pub late_append_commits: u64,
+        pub late_append_failures: u64,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -843,6 +1135,7 @@ mod test_internals {
                 committed_rows: state.committed_rows,
                 store_batch_calls: state.store_batch_calls,
                 per_generation: state.generations.clone(),
+                outstanding_abandoned_appends: state.outstanding_abandoned_appends,
             }
         }
 
@@ -852,6 +1145,8 @@ mod test_internals {
                 flush_failures: state.flush_failures,
                 degraded_rows: state.degraded_rows,
                 degraded: state.degraded,
+                late_append_commits: state.late_append_commits,
+                late_append_failures: state.late_append_failures,
             }
         }
 

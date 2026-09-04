@@ -12,8 +12,13 @@
 //! not reliable. A dedicated binary with no unrelated concurrent tests
 //! removes that source of flakiness.
 //!
-//! Requires `--features fault-injection,test-internals` (same as
-//! `tests/adr133_audit_batch.rs`).
+//! Gated on `--features fault-injection,test-internals` (same as
+//! `tests/adr133_audit_batch.rs`), but this crate's own `[dev-dependencies]`
+//! entry on itself (`crates/khive-runtime/Cargo.toml`) already requests both
+//! features, so plain `cargo test -p khive-runtime` builds and runs this
+//! file with no extra flags — the `#![cfg]` below is what makes the file a
+//! no-op for anyone building khive-runtime as a plain dependency, not an
+//! opt-in a caller of `cargo test -p khive-runtime` has to remember.
 
 #![cfg(all(feature = "fault-injection", feature = "test-internals"))]
 
@@ -23,7 +28,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::audit_batch::{
-    fault_injection, AuditBatchConfig, AuditBatchControl, AuditProducer, PreparedAuditRow,
+    fault_injection, AuditBatch, AuditBatchConfig, AuditBatchControl, AuditCommitOutcome,
+    AuditProducer, AuditTerminalReason, PreparedAuditRow,
 };
 use khive_runtime::pack::{
     audit_admission_refused_obligation_count, audit_admission_unresolved_obligation_count,
@@ -37,9 +43,28 @@ use khive_types::pack::{Pack, Visibility};
 use khive_types::{EventKind, EventOutcome, SubstrateKind, VerbCategory};
 use serial_test::serial;
 
+/// khive#2331 cap-shedding coverage: per-call release gates, keyed by
+/// arrival order, each holding the sender half of a oneshot pair the call
+/// itself created and is awaiting the receiver half of. Lets a test release
+/// one specific blocked `append_events_idempotent` call while an earlier
+/// one stays blocked — a single shared `Notify`/`Semaphore` always wakes its
+/// oldest waiter first, which cannot express "release the newest blocked
+/// call while an older one stays blocked".
+type CallGates = Arc<std::sync::Mutex<Vec<Option<tokio::sync::oneshot::Sender<()>>>>>;
+
+fn release_call_gate(gates: &CallGates, index: usize) {
+    let tx = gates.lock().unwrap()[index]
+        .take()
+        .expect("call gate exists and has not already been released");
+    let _ = tx.send(());
+}
+
 #[derive(Default)]
 struct MemoryEventStore {
     events: std::sync::Mutex<Vec<Event>>,
+    append_started: Option<Arc<tokio::sync::Notify>>,
+    append_release: Option<Arc<tokio::sync::Notify>>,
+    call_gates: Option<CallGates>,
 }
 
 #[async_trait]
@@ -83,6 +108,16 @@ impl EventStore for MemoryEventStore {
         &self,
         events: Vec<Event>,
     ) -> StorageResult<khive_storage::event::IdempotentEventBatchResult> {
+        if let Some(started) = &self.append_started {
+            started.notify_one();
+        }
+        if let Some(gates) = &self.call_gates {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            gates.lock().unwrap().push(Some(tx));
+            let _ = rx.await;
+        } else if let Some(release) = &self.append_release {
+            release.notified().await;
+        }
         let mut store = self.events.lock().unwrap();
         let mut rows = Vec::with_capacity(events.len());
         for event in events {
@@ -326,6 +361,52 @@ impl PackRuntime for CrossPackCensusProbe {
     }
 }
 
+/// Minimal non-idempotent write used by khive#2256 to prove the handler
+/// effect has landed before the audit generation resolves.
+struct RecordingWritePack {
+    effects: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Pack for RecordingWritePack {
+    const NAME: &'static str = "recording_write";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+        name: "create",
+        description: "record one committed effect",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[],
+    }];
+}
+
+#[async_trait]
+impl PackRuntime for RecordingWritePack {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+    fn note_kinds(&self) -> &'static [&'static str] {
+        Self::NOTE_KINDS
+    }
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        Self::ENTITY_KINDS
+    }
+    fn handlers(&self) -> &'static [HandlerDef] {
+        Self::HANDLERS
+    }
+    async fn dispatch(
+        &self,
+        _verb: &str,
+        _params: Value,
+        _registry: &khive_runtime::pack::VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        self.effects
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(serde_json::json!({"created": true}))
+    }
+}
+
 fn mk_event(verb: &str) -> Event {
     Event::new(
         "local",
@@ -354,9 +435,610 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
     }
 }
 
-// Every test in this file arms `fault_injection`'s process-global
+/// khive#2256: a successful non-idempotent write has already committed by
+/// the time its deferred audit row is submitted. If the row is enqueued but
+/// its generation remains in flight past `admission_deadline`, the dispatch
+/// must await the generation's real outcome rather than report the committed
+/// write as a failure and invite an unsafe retry.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn write_verb_waits_past_audit_deadline_until_row_commits() {
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let append_release = Arc::new(tokio::sync::Notify::new());
+    let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store = Arc::new(MemoryEventStore {
+        append_started: Some(Arc::clone(&append_started)),
+        append_release: Some(Arc::clone(&append_release)),
+        ..MemoryEventStore::default()
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(RecordingWritePack {
+        effects: Arc::clone(&effects),
+    });
+    builder.with_event_store(store.clone());
+    builder.with_audit_batch_config(AuditBatchConfig {
+        admission_deadline: std::time::Duration::from_millis(30),
+        ..AuditBatchConfig::default()
+    });
+    let registry = Arc::new(builder.build().expect("registry builds"));
+
+    let mut dispatch = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move { registry.dispatch("create", Value::Null).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("audit generation reaches the blocking store");
+    assert_eq!(
+        effects.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the domain effect must already be committed before the audit wait"
+    );
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(80), &mut dispatch)
+            .await
+            .is_err(),
+        "an enqueued audit row crossing its bounded wait must not turn a committed write into a failure"
+    );
+
+    append_release.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut dispatch)
+        .await
+        .expect("dispatch resolves after the audit generation")
+        .expect("dispatch task joins")
+        .expect("committed write reports success once its audit row commits");
+    assert_eq!(result, serde_json::json!({"created": true}));
+    assert_eq!(
+        effects.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "awaiting audit resolution must not rerun the non-idempotent handler"
+    );
+    assert_eq!(
+        store.events.lock().expect("events lock").len(),
+        1,
+        "the successful dispatch must have exactly one durable audit row"
+    );
+}
+
+/// khive#2331: the earlier `write_verb_waits_past_audit_deadline_until_row_commits`
+/// test only proves the case where the store eventually releases (80ms in,
+/// well inside its huge default `resolution_deadline`). A store that never
+/// returns at all must not pin the caller — and the completed write's
+/// handler — forever. Once `resolution_deadline` also elapses past
+/// `admission_deadline`, the dispatch must give up and report the new
+/// terminal reason rather than await the stalled generation indefinitely.
+/// The outer `tokio::time::timeout` wrapping the dispatch join is a test
+/// safety net, not the mechanism under test: pre-fix, this would hang past
+/// it and fail loudly instead of hanging the whole suite.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn write_verb_gives_up_after_resolution_deadline_when_store_never_returns() {
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store = Arc::new(MemoryEventStore {
+        append_started: Some(Arc::clone(&append_started)),
+        // `append_release` is never notified: `append_events_idempotent`
+        // blocks on `Notify::notified()` forever — a genuinely stalled store.
+        append_release: Some(Arc::new(tokio::sync::Notify::new())),
+        ..MemoryEventStore::default()
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(RecordingWritePack {
+        effects: Arc::clone(&effects),
+    });
+    builder.with_event_store(store.clone());
+    builder.with_audit_batch_config(AuditBatchConfig {
+        admission_deadline: std::time::Duration::from_millis(30),
+        resolution_deadline: std::time::Duration::from_millis(100),
+        ..AuditBatchConfig::default()
+    });
+    let registry = Arc::new(builder.build().expect("registry builds"));
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("event store configured, so the batch seam is too");
+
+    let dispatch = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move { registry.dispatch("create", Value::Null).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("audit generation reaches the blocking store");
+    assert_eq!(
+        effects.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the domain effect must already be committed before the audit wait"
+    );
+
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch)
+        .await
+        .expect("dispatch resolves within the resolution deadline instead of hanging forever")
+        .expect("dispatch task joins")
+        .expect_err("a stalled audit store must not report the committed write as success");
+    assert!(
+        err.to_string().contains("ResolutionDeadlineExpired"),
+        "the caller must learn the effect committed and the audit outcome is unresolved, \
+         distinctly from a plain admission-deadline expiry: {err}"
+    );
+    assert_eq!(
+        effects.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "giving up on the audit wait must not rerun the non-idempotent handler"
+    );
+    let snap = audit_batch.test_snapshot();
+    assert!(
+        snap.in_flight_generation.is_some() && snap.driver_active,
+        "the stalled generation must still be owned by the driver, not abandoned or re-enqueued"
+    );
+    assert_eq!(
+        snap.pending_rows, 0,
+        "the row must not be pushed back onto the pending queue for a retry"
+    );
+}
+
+/// khive#2331: the capacity-exhaustion arm — multiple concurrent committed
+/// writes stalled behind the same never-returning audit store must each give
+/// up at their own resolution deadline rather than piling up unbounded
+/// request/audit capacity. `submitted_rows` grows by exactly N and the
+/// pending queue is empty afterward: nothing was retried, duplicated, or
+/// left queued.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn concurrent_write_verbs_all_give_up_after_resolution_deadline() {
+    const N: usize = 3;
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store = Arc::new(MemoryEventStore {
+        append_started: Some(Arc::clone(&append_started)),
+        append_release: Some(Arc::new(tokio::sync::Notify::new())),
+        ..MemoryEventStore::default()
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(RecordingWritePack {
+        effects: Arc::clone(&effects),
+    });
+    builder.with_event_store(store.clone());
+    builder.with_audit_batch_config(AuditBatchConfig {
+        admission_deadline: std::time::Duration::from_millis(30),
+        resolution_deadline: std::time::Duration::from_millis(100),
+        ..AuditBatchConfig::default()
+    });
+    let registry = Arc::new(builder.build().expect("registry builds"));
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("event store configured, so the batch seam is too");
+    let before = audit_batch.test_snapshot();
+
+    let mut dispatches = Vec::with_capacity(N);
+    for _ in 0..N {
+        let registry = Arc::clone(&registry);
+        dispatches.push(tokio::spawn(async move {
+            registry.dispatch("create", Value::Null).await
+        }));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("audit generation reaches the blocking store");
+
+    for dispatch in dispatches {
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch)
+            .await
+            .expect("each dispatch resolves within the resolution deadline instead of hanging")
+            .expect("dispatch task joins")
+            .expect_err("a stalled audit store must not report a committed write as success");
+        assert!(
+            err.to_string().contains("ResolutionDeadlineExpired"),
+            "unexpected error: {err}"
+        );
+    }
+    assert_eq!(
+        effects.load(std::sync::atomic::Ordering::SeqCst),
+        N,
+        "every handler must have run exactly once, never rerun while awaiting audit resolution"
+    );
+    let after = audit_batch.test_snapshot();
+    assert_eq!(
+        after.submitted_rows - before.submitted_rows,
+        N as u64,
+        "exactly N rows were submitted; giving up on the wait must not re-enqueue or duplicate them"
+    );
+    assert_eq!(
+        after.pending_rows, 0,
+        "no row is pushed back onto the pending queue after its caller gives up"
+    );
+}
+
+/// khive#2331: `AdmissionDeadlineExpired`/`ResolutionDeadlineExpired` bound
+/// only how long a *caller* waits for a row's outcome — the row itself
+/// stays exactly where the driver holds it, by design (see both tests
+/// above). Before this fix, that meant a permanently stalled
+/// `EventStore::append_events_idempotent()` call could pin the driver
+/// inside one generation's `child.await` forever: `supervisor_loop` never
+/// loops back to drain `state.pending` again, so every row still arriving
+/// piles up there until `max_pending_rows` is reached, and every
+/// submission after that gets `QueueAdmissionExhausted` — including ones
+/// that have nothing to do with the original stalled generation. Giving up
+/// as a caller does not free the slot: the row is left enqueued regardless.
+///
+/// Red before the fix: the driver never abandons the stuck generation, so
+/// `pending_rows` never returns to 0 and the final `submit()` below hangs
+/// at `QueueAdmissionExhausted` forever (this test's own 5s outer timeouts
+/// would fail it instead of letting it hang the suite).
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn driver_deadline_recovers_admission_capacity_from_a_stalled_generation() {
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let store = Arc::new(MemoryEventStore {
+        append_started: Some(Arc::clone(&append_started)),
+        // Never notified: every `append_events_idempotent` call blocks
+        // forever, for every generation the driver ever spawns, not just
+        // the first.
+        append_release: Some(Arc::new(tokio::sync::Notify::new())),
+        ..MemoryEventStore::default()
+    });
+    let batch = AuditBatch::new(
+        store,
+        AuditBatchConfig {
+            admission_deadline: std::time::Duration::from_millis(20),
+            resolution_deadline: std::time::Duration::from_millis(30),
+            max_pending_rows: std::num::NonZeroUsize::new(2).unwrap(),
+            ..AuditBatchConfig::default()
+        },
+    );
+
+    // Occupant: drained into generation 1 immediately, which then stalls
+    // forever on the store call.
+    let occupant_batch = batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.occupant"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("generation 1 reaches the blocking store");
+
+    // Two more rows fill `pending` to its configured 2-row capacity while
+    // generation 1 is stuck. (a): each times out on its own
+    // `admission_deadline` — a caller giving up — but per the documented
+    // contract stays enqueued for the driver to resolve.
+    let mut fillers = Vec::new();
+    for i in 0..2 {
+        let b = batch.clone();
+        fillers.push(tokio::spawn(async move {
+            b.submit(PreparedAuditRow {
+                event: mk_event(&format!("kg.filler{i}")),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+        }));
+    }
+    for f in fillers {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), f)
+            .await
+            .expect("filler resolves within its own admission deadline instead of hanging")
+            .expect("filler task joins");
+        assert_eq!(
+            result,
+            Err(AuditTerminalReason::AdmissionDeadlineExpired),
+            "each filler gives up on its own admission_deadline, but its row is left enqueued"
+        );
+    }
+
+    // Capacity is still exhausted by rows the stuck driver has not drained,
+    // even though both fillers' own callers already gave up above — proving
+    // a caller giving up does not, by itself, free anything.
+    let refused = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.refused"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(
+        refused,
+        Err(AuditTerminalReason::QueueAdmissionExhausted),
+        "pending is still full of rows the stuck driver has not drained"
+    );
+
+    // (b): once the driver's own per-generation bound elapses (3x
+    // `resolution_deadline` = 90ms here), it abandons generation 1 and loops
+    // back to drain the two filler rows into generation 2 — which stalls
+    // the same way, but draining `pending` is what frees admission.
+    wait_until(std::time::Duration::from_secs(5), || {
+        batch.test_snapshot().pending_rows == 0
+    })
+    .await;
+    let abandoned = batch
+        .test_snapshot()
+        .per_generation
+        .iter()
+        .filter(|g| g.terminal_reason == Some(AuditTerminalReason::DriverAppendAbandoned))
+        .count();
+    assert!(
+        abandoned >= 1,
+        "generation 1 must be recorded as DriverAppendAbandoned once the driver gives up on it"
+    );
+
+    // (a) continued: a fresh row is admitted (pushed onto `pending`) again,
+    // not synchronously refused — the bug this test guards against.
+    let fresh_batch = batch.clone();
+    let fresh = tokio::spawn(async move {
+        fresh_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.fresh"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snap = batch.test_snapshot();
+        snap.pending_rows >= 1 || snap.in_flight_generation.is_some()
+    })
+    .await;
+
+    drop(occupant);
+    drop(fresh);
+}
+
+/// Control for the fix above: an append that completes well inside the
+/// driver's own per-generation bound must be entirely unaffected by the new
+/// timeout wrapper around it — it still commits normally, through the same
+/// code path as every pre-existing (non-stalling) test in this crate, and
+/// leaves no `DriverAppendAbandoned` generation behind.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn normal_append_inside_driver_deadline_is_unaffected() {
+    let store = Arc::new(MemoryEventStore::default());
+    let batch = AuditBatch::new(
+        store,
+        AuditBatchConfig {
+            admission_deadline: std::time::Duration::from_millis(20),
+            resolution_deadline: std::time::Duration::from_millis(30),
+            ..AuditBatchConfig::default()
+        },
+    );
+    let before = batch.test_snapshot();
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.normal"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Ok(AuditCommitOutcome::Committed));
+    let after = batch.test_snapshot();
+    assert_eq!(after.pending_rows, 0);
+    let new_generations = &after.per_generation[before.per_generation.len()..];
+    assert!(
+        !new_generations.is_empty(),
+        "the committed row must have produced a generation record"
+    );
+    assert!(
+        new_generations.iter().all(|g| g.terminal_reason.is_none()),
+        "a normal, fast append must commit cleanly, never as DriverAppendAbandoned: \
+         {new_generations:?}"
+    );
+}
+
+/// khive#2331: `driver_append_deadline` alone stops the driver from holding
+/// one stalled generation forever, but it does not cap how many detached
+/// appends can be outstanding at once — a store whose append never returns
+/// would otherwise mint one detached task per `driver_append_deadline`
+/// indefinitely, and each retains up to `max_rows_per_generation` events
+/// until it (maybe) finally returns.
+/// `AuditBatchConfig::max_abandoned_appends` caps the outstanding count:
+/// once reached, further generations are shed with
+/// `AuditTerminalReason::StoreWedged` without ever calling the store, and
+/// the driver resumes attempting real appends as soon as an outstanding one
+/// returns and the count drops back below the cap.
+///
+/// Red before the fix: there is no cap, `outstanding_abandoned_appends` does
+/// not exist on the snapshot, and all five generations below resolve
+/// `DriverAppendAbandoned` after their own `driver_append_deadline` instead
+/// of the last three shedding immediately as `StoreWedged`.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn driver_sheds_generations_once_the_abandoned_append_cap_is_reached() {
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let call_gates: CallGates = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = Arc::new(MemoryEventStore {
+        append_started: Some(Arc::clone(&append_started)),
+        call_gates: Some(Arc::clone(&call_gates)),
+        ..MemoryEventStore::default()
+    });
+    // Generous relative to `admission_deadline` so the state-polling below
+    // (a handful of lock/notify round trips) never races a caller's own
+    // bounded wait; the mechanism under test is driven entirely off
+    // `test_snapshot()`/`health_metrics()`, never off a `submit()` call's
+    // own return value, for exactly that reason.
+    let resolution_deadline = std::time::Duration::from_millis(100);
+    // Mirrors `driver_append_deadline()` in `audit_batch.rs` (3x
+    // `resolution_deadline`); that function is private, so this is a
+    // parallel derivation, not a call into it.
+    let driver_append_deadline = resolution_deadline.saturating_mul(3);
+    let batch = AuditBatch::new(
+        store,
+        AuditBatchConfig {
+            admission_deadline: std::time::Duration::from_millis(80),
+            resolution_deadline,
+            max_abandoned_appends: std::num::NonZeroUsize::new(2).unwrap(),
+            ..AuditBatchConfig::default()
+        },
+    );
+
+    // Generation 1: submitted and immediately blocked on call gate index 0.
+    // The caller's own bounded `submit()` may give up at `admission_deadline`
+    // before the driver's own, much larger bound — that is expected and
+    // irrelevant here (its `JoinHandle` is dropped, unawaited), because the
+    // row itself is left with the driver regardless (documented non-removal
+    // contract) and this test observes the driver's behavior directly
+    // through `test_snapshot()`, not through the caller's wait.
+    let b = batch.clone();
+    let g1 = tokio::spawn(async move {
+        b.submit(PreparedAuditRow {
+            event: mk_event("kg.g1"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("generation 1 reaches the blocking store");
+    drop(g1);
+
+    // Generation 1 must abandon (past driver_append_deadline) before the
+    // driver loops back to drain generation 2.
+    wait_until(driver_append_deadline * 2, || {
+        batch.test_snapshot().outstanding_abandoned_appends >= 1
+    })
+    .await;
+
+    // Generation 2: submitted once generation 1 has abandoned, so it forms
+    // its own generation (outstanding == 1 < cap == 2, not shed) and blocks
+    // on call gate index 1.
+    let b = batch.clone();
+    let g2 = tokio::spawn(async move {
+        b.submit(PreparedAuditRow {
+            event: mk_event("kg.g2"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("generation 2 reaches the blocking store");
+    drop(g2);
+
+    // Generation 2 must also abandon before the cap (2) is reached.
+    wait_until(driver_append_deadline * 2, || {
+        batch.test_snapshot().outstanding_abandoned_appends >= 2
+    })
+    .await;
+    let snap = batch.test_snapshot();
+    let abandoned = snap
+        .per_generation
+        .iter()
+        .filter(|g| g.terminal_reason == Some(AuditTerminalReason::DriverAppendAbandoned))
+        .count();
+    assert_eq!(
+        abandoned, 2,
+        "exactly generations 1 and 2 must have abandoned before the cap takes effect: {:?}",
+        snap.per_generation
+    );
+
+    // (a): with the cap reached, three more generations shed immediately —
+    // no store call is ever attempted (the call-gate count stays at 2),
+    // well under `driver_append_deadline`.
+    for i in 0..3 {
+        let start = std::time::Instant::now();
+        let result = batch
+            .submit(PreparedAuditRow {
+                event: mk_event(&format!("kg.wedged{i}")),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            Err(AuditTerminalReason::StoreWedged),
+            "generation must shed once the abandoned-append cap is reached"
+        );
+        assert!(
+            elapsed < driver_append_deadline / 2,
+            "a shed generation must resolve without waiting anywhere near \
+             driver_append_deadline: took {elapsed:?}"
+        );
+    }
+    assert_eq!(
+        call_gates.lock().unwrap().len(),
+        2,
+        "shedding must never attempt a real append: the store must never see a third call"
+    );
+    assert_eq!(
+        batch.test_snapshot().outstanding_abandoned_appends,
+        2,
+        "shedding must not spawn or retain any additional detached appends"
+    );
+
+    // (d): admission capacity was never at risk — `pending` stayed far below
+    // `max_pending_rows`, and every submission above resolved to either
+    // `DriverAppendAbandoned` (observed via the snapshot) or `StoreWedged`
+    // (asserted directly), never `QueueAdmissionExhausted`.
+    assert!(
+        batch.test_snapshot().pending_rows < AuditBatchConfig::default().max_pending_rows.get(),
+        "pending must never approach max_pending_rows while generations are being shed"
+    );
+
+    // (b): recovery. Releasing generation 1's call gate (index 0) lets that
+    // append finally return a commit, dropping the outstanding count to 1 —
+    // below the cap. `notify_one`/a shared `Semaphore` would instead always
+    // wake the OLDEST blocked call first, which is exactly why this test
+    // uses per-call gates: generation 2's call (index 1) must stay blocked
+    // and untouched by this release.
+    release_call_gate(&call_gates, 0);
+    wait_until(std::time::Duration::from_secs(5), || {
+        batch.test_snapshot().outstanding_abandoned_appends == 1
+    })
+    .await;
+    assert_eq!(
+        batch.health_metrics().late_append_commits,
+        1,
+        "the released append must be recorded as a late commit, proving the wedged \
+         store later drained"
+    );
+
+    // Below the cap again (1 < 2), a fresh generation attempts a real
+    // append — no timer needed for recovery.
+    let before_recovery = batch.test_snapshot().per_generation.len();
+    let recovered = batch.clone();
+    let recovered_task = tokio::spawn(async move {
+        recovered
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.recovered"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), append_started.notified())
+        .await
+        .expect("recovery generation attempts a real append, proving it was not shed");
+    wait_until(std::time::Duration::from_secs(5), || {
+        call_gates.lock().unwrap().len() == 3
+    })
+    .await;
+    release_call_gate(&call_gates, 2);
+    drop(recovered_task);
+
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snap = batch.test_snapshot();
+        snap.per_generation.len() > before_recovery
+            && snap.per_generation[before_recovery..]
+                .iter()
+                .any(|g| g.terminal_reason.is_none() && g.committed_rows >= 1)
+    })
+    .await;
+    assert_eq!(
+        batch.test_snapshot().outstanding_abandoned_appends,
+        1,
+        "the recovery generation must commit inline (never detach); generation 2's \
+         still-blocked append remains the only outstanding one"
+    );
+}
+
+// Every test below this point arms `fault_injection`'s process-global
 // `SUPERVISOR_SLEEP_BEFORE_SPAWN` flag; running them concurrently races one
-// test's arm against another supervisor loop consuming it.
+// test's arm against another supervisor loop consuming it. (The
+// `MemoryEventStore`-driven tests above this comment never arm it — their
+// unnamed `#[serial]` is not for this reason.)
 #[serial]
 #[tokio::test]
 #[serial(config_ledger)]
@@ -710,9 +1392,6 @@ async fn cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlis
 /// above does not: `AdmissionDeadlineExpired` on a row that was already
 /// enqueued (`state.pending`), rather than `QueueAdmissionExhausted` before
 /// enqueue.
-// Both tests in this file arm `fault_injection`'s process-global
-// `SUPERVISOR_SLEEP_BEFORE_SPAWN` flag; running them concurrently races one
-// test's arm against the other's supervisor loop consuming it.
 #[serial]
 #[tokio::test]
 #[serial(config_ledger)]

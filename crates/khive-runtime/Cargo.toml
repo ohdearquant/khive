@@ -46,6 +46,13 @@ unicode-general-category = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Self dev-dependency: requests this crate's own `fault-injection` and
+# `test-internals` features for its `tests/` integration binaries. Cargo's
+# feature unification means plain `cargo test -p khive-runtime` already
+# builds and runs those feature-gated tests (e.g.
+# `tests/adr133_audit_batch.rs`, `tests/read_verb_admission_exhaustion.rs`)
+# with no extra `--features` flag.
+khive-runtime = { path = ".", features = ["fault-injection", "test-internals"] }
 khive-gate-rego = { version = "0.8.0", path = "../khive-gate-rego" }
 khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
