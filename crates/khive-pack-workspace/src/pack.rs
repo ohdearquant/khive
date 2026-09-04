@@ -51,6 +51,10 @@ impl khive_runtime::PackFactory for WorkspacePackFactory {
         &["kg", "git", "gtd", "session"]
     }
 
+    fn intentionally_verbless(&self) -> bool {
+        true
+    }
+
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(WorkspacePack::new(runtime))
     }
