@@ -3200,15 +3200,27 @@ impl KhiveMcpServer {
                 .into_iter()
                 .map(str::to_string)
                 .collect();
-            let mut forward_task = tokio::spawn(async move {
-                let outcome = forward_fn(frame, Some(resolved_packs)).await;
-                tracing::debug!(
-                    request_id,
-                    daemon_outcome_present = outcome.is_some(),
-                    "admitted daemon forward reached a terminal outcome"
-                );
-                outcome
-            });
+            // Captured at the moment the forward is admitted so the
+            // post-cancellation wait below can bound itself by the time
+            // actually left on the REQUEST's own deadline, not by a fresh
+            // full ceiling starting from whenever cancellation happens to
+            // arrive. Also propagated into the spawned task itself
+            // (`inherit_request_read_context`) so `try_forward_inner`'s
+            // socket-exchange deadline is this exact same instant, instead
+            // of a second, independently-ticking relative timer.
+            let post_cancellation_deadline = khive_storage::capture_request_read_context()
+                .deadline()
+                .map(khive_storage::RequestReadDeadline::async_at);
+            let mut forward_task =
+                tokio::spawn(khive_storage::inherit_request_read_context(async move {
+                    let outcome = forward_fn(frame, Some(resolved_packs)).await;
+                    tracing::debug!(
+                        request_id,
+                        daemon_outcome_present = outcome.is_some(),
+                        "admitted daemon forward reached a terminal outcome"
+                    );
+                    outcome
+                }));
             let mut cancelled_during_forward = false;
             let forwarded = tokio::select! {
                 result = &mut forward_task => result,
@@ -3222,12 +3234,30 @@ impl KhiveMcpServer {
                     // Shielding the forward must still be bounded: a stalled
                     // daemon or a silent same-UID socket peer must not keep
                     // this handler (and the task awaiting it) alive forever.
-                    // Reuse the same ceiling this bridge already installs as
-                    // its own request-owned-work deadline (`request_read_timeout`,
-                    // `KHIVE_REQUEST_READ_TIMEOUT_SECS`), the same bound the
-                    // daemon client applies to its own response read, so a
-                    // hang anywhere in the round trip surfaces consistently.
-                    match tokio::time::timeout(request_read_timeout(), &mut forward_task).await
+                    // Wait only for whatever time remains on the request's
+                    // own absolute deadline (captured above, before this
+                    // select ever ran) rather than starting a fresh
+                    // `request_read_timeout()` ceiling from the moment
+                    // cancellation happens to arrive — a request cancelled a
+                    // moment before its own deadline must not then hold this
+                    // handler for almost another full ceiling. When no
+                    // deadline was installed (a direct `request_with_forward`
+                    // call outside `scope_mcp_request_read_cancellation`, as
+                    // some tests do), fall back to `request_read_timeout()`.
+                    // If the deadline had already passed by the time
+                    // cancellation arrived, `timeout_at` elapses on its very
+                    // next poll — an immediate unknown-outcome return, which
+                    // is the only consistent reading: there is no time left
+                    // to shield the forward with.
+                    let wait_result = match post_cancellation_deadline {
+                        Some(deadline) => {
+                            tokio::time::timeout_at(deadline, &mut forward_task).await
+                        }
+                        None => {
+                            tokio::time::timeout(request_read_timeout(), &mut forward_task).await
+                        }
+                    };
+                    match wait_result
                     {
                         Ok(result) => result,
                         Err(_elapsed) => {
@@ -5038,10 +5068,18 @@ mod tests {
 
     /// An admitted forward must not shield a cancelled request forever: if
     /// the daemon (or the socket read underneath it) never answers, the
-    /// post-cancellation wait is bounded by `request_read_timeout()`, and on
-    /// expiry the handler reports an outcome-unknown error rather than
-    /// hanging. The forward task itself is left running (never aborted), so
-    /// this only asserts the handler's own return, not the task's fate.
+    /// post-cancellation wait is bounded by the remaining time on the
+    /// request's own absolute deadline (captured at admission via
+    /// `scope_mcp_request_read_cancellation`'s `scope_request_read_deadline`
+    /// call), falling back to a fresh `request_read_timeout()` only when no
+    /// deadline was installed. Cancellation here arrives immediately after
+    /// admission, so the remaining time is nearly the full ceiling — this is
+    /// the control case; see
+    /// `admitted_forward_cancelled_near_deadline_bounds_by_remaining_time_not_a_fresh_ceiling`
+    /// for the case where only a sliver of the deadline is left. On expiry
+    /// the handler reports an outcome-unknown error rather than hanging. The
+    /// forward task itself is left running (never aborted), so this only
+    /// asserts the handler's own return, not the task's fate.
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     #[serial_test::serial(config_ledger)]
@@ -5112,6 +5150,188 @@ mod tests {
         assert_eq!(data["retryable"], false);
         assert_eq!(
             data["request_id"], 7777,
+            "unknown-outcome error must carry the request id: {data}"
+        );
+    }
+
+    /// A request cancelled a moment before its own absolute deadline must be
+    /// bounded by the remaining time to THAT deadline, not by a fresh
+    /// `request_read_timeout()` ceiling starting from the cancel. Before the
+    /// fix the post-cancellation wait always restarted a full
+    /// `request_read_timeout()` from the moment cancellation was observed,
+    /// so this test would only return after almost another full ceiling past
+    /// the point the clock was advanced to (i.e. close to
+    /// `2 * request_read_timeout()` total); after the fix it returns within
+    /// the small margin left on the original deadline.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn admitted_forward_cancelled_near_deadline_bounds_by_remaining_time_not_a_fresh_ceiling()
+    {
+        thread_local! {
+            static FORWARD_STARTED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn never_resolves_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+        ) -> ForwardFuture {
+            let started = FORWARD_STARTED
+                .with(|c| c.borrow().clone())
+                .expect("started notify armed");
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending::<()>().await;
+                unreachable!("this forward seam must never resolve");
+            })
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel_after_admission = cancellation.clone();
+        let handler = tokio::spawn(async move {
+            scope_mcp_request_read_cancellation(
+                cancel_after_admission,
+                server.request_with_forward(
+                    RequestParams {
+                        ops: "stats()".to_string(),
+                        request_id: Some(4242),
+                        ..Default::default()
+                    },
+                    never_resolves_forward,
+                ),
+            )
+            .await
+        });
+
+        started.notified().await;
+
+        // Advance the paused clock to shortly before the request's own
+        // absolute deadline before cancelling, so only a small margin of
+        // that deadline remains.
+        let bound = request_read_timeout();
+        let margin = Duration::from_millis(200);
+        tokio::time::advance(bound.saturating_sub(margin)).await;
+        cancellation.cancel();
+
+        let wait_started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(margin * 10, handler)
+            .await
+            .expect(
+                "handler did not return near the request's own deadline; it appears to have \
+                 restarted a fresh full ceiling instead of using the remaining time",
+            )
+            .expect("handler task must not panic");
+        let elapsed = tokio::time::Instant::now() - wait_started;
+
+        let error = result
+            .expect_err("an admitted forward that never resolves past its deadline must not hang");
+        let data = error
+            .data
+            .expect("unknown-outcome error must carry structured data");
+        assert_eq!(data["outcome"], "unknown");
+        assert_eq!(
+            data["request_id"], 4242,
+            "unknown-outcome error must carry the request id: {data}"
+        );
+        assert!(
+            elapsed < bound / 2,
+            "expected the post-cancellation wait to be bounded by the remaining time on the \
+             request's own deadline (~{margin:?}), not a fresh full ceiling of {bound:?}; \
+             observed elapsed {elapsed:?}"
+        );
+    }
+
+    /// Control for the fallback branch: `request_with_forward` called
+    /// without going through `scope_mcp_request_read_cancellation` (so no
+    /// absolute request deadline is ever installed — only a bare
+    /// cancellation receiver, via `khive_storage::scope_request_read_cancellation`
+    /// directly, as some callers do) must still bound the post-cancellation
+    /// wait by `request_read_timeout()` rather than hanging forever.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn admitted_forward_without_installed_deadline_falls_back_to_request_read_timeout() {
+        thread_local! {
+            static FORWARD_STARTED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn never_resolves_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+        ) -> ForwardFuture {
+            let started = FORWARD_STARTED
+                .with(|c| c.borrow().clone())
+                .expect("started notify armed");
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending::<()>().await;
+                unreachable!("this forward seam must never resolve");
+            })
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let handler = tokio::spawn(khive_storage::scope_request_read_cancellation(
+            cancel_rx,
+            async move {
+                server
+                    .request_with_forward(
+                        RequestParams {
+                            ops: "stats()".to_string(),
+                            request_id: Some(9191),
+                            ..Default::default()
+                        },
+                        never_resolves_forward,
+                    )
+                    .await
+            },
+        ));
+
+        started.notified().await;
+        cancel_tx
+            .send(true)
+            .expect("cancellation receiver still live");
+
+        let bound = request_read_timeout();
+        let result = tokio::time::timeout(bound.saturating_add(Duration::from_secs(5)), handler)
+            .await
+            .expect("handler never returned after the fallback bound elapsed")
+            .expect("handler task must not panic");
+
+        let error =
+            result.expect_err("an admitted forward that never resolves must not hang forever");
+        let data = error
+            .data
+            .expect("unknown-outcome error must carry structured data");
+        assert_eq!(data["outcome"], "unknown");
+        assert_eq!(
+            data["request_id"], 9191,
             "unknown-outcome error must carry the request id: {data}"
         );
     }
