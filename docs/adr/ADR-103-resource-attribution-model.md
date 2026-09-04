@@ -947,6 +947,19 @@ any pack loaded through the same registration path could otherwise declare a han
 that collides with an allowlisted one while performing a durable write of its own, and inherit
 degrade-safety it never earned.
 
+A third condition binds this to registration, not self-report: the pack's `name()` is a value the
+`PackRuntime` trait object reports about itself, so pack identity alone is not a sound key either
+— any pack is free to claim any name, including an allowlisted one, whether or not the real pack
+of that name is also loaded (verb names are unique per registry, so this matters exactly when it
+is not). Eligibility additionally requires that the pack was registered through the composition
+root's trusted path: `PackRegistry::register_packs`/`register_packs_with_runtimes`, which resolve
+packs only from `inventory`-discovered `&'static dyn PackFactory` instances collected at link time,
+not from request-time or caller-supplied data. A pack registered through the public,
+untrusted `VerbRegistryBuilder::register` is never eligible, regardless of what it reports about
+itself. This is where trust is granted — at the composition root, not inside the eligibility check
+— and the check reduces to a set membership test precomputed once when `VerbRegistryBuilder::build`
+runs, not re-derived by scanning packs on every dispatch.
+
 **Consequence, stated precisely:** `brain.event_counts`'s `total_cost_unit` and
 `cost_unit_by_verb` aggregation (Amendment 1) undercount those 39 verbs by the `cost_unit` of
 every row dropped this way — but the two terminal reasons above are not the same fact, and

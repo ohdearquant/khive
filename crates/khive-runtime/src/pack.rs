@@ -547,6 +547,17 @@ pub trait PackByIdResolver: Send + Sync {
 /// immutable and cheaply cloneable.
 pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
+    /// Parallel to `packs`: whether the composition root vouches for the
+    /// pack at the same index, recorded by the registration method the
+    /// *caller* chose rather than anything the pack reports about itself.
+    /// [`Self::register`] (public, reachable from any pack crate) always
+    /// pushes `false`; `register_boxed` (crate-private, exercised only by
+    /// [`PackRegistry::register_packs`]'s `inventory`-discovered factories)
+    /// and the test-only `register_trusted` push `true`. A pack has no API
+    /// surface to set its own entry here — see
+    /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s doc for why
+    /// `pack.name()` alone cannot be trusted for this decision.
+    pack_trusted: Vec<bool>,
     resolvers: Vec<(String, Box<dyn PackByIdResolver>)>,
     gate: GateRef,
     default_namespace: String,
@@ -588,6 +599,7 @@ impl VerbRegistryBuilder {
     pub fn new() -> Self {
         Self {
             packs: Vec::new(),
+            pack_trusted: Vec::new(),
             resolvers: Vec::new(),
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::local().as_str().to_string(),
@@ -625,19 +637,52 @@ impl VerbRegistryBuilder {
 
     /// Register a pack. The bound `P: Pack + PackRuntime` ensures the pack
     /// declares vocabulary via `Pack` consts alongside runtime dispatch.
+    ///
+    /// This is the untrusted path: reachable from any external pack crate,
+    /// so the pack registered here is never eligible for admission-degrade
+    /// under `VerbRegistry::admission_degrade_safe`, regardless of what
+    /// `pack.name()`/handler category it reports. Use `register_boxed`
+    /// (composition root) or `register_trusted` (tests) for a pack the
+    /// caller actually vouches for.
     pub fn register<P: khive_types::Pack + PackRuntime + 'static>(&mut self, pack: P) -> &mut Self {
         self.packs.push(Box::new(pack));
+        self.pack_trusted.push(false);
         self
     }
 
-    /// Register a boxed pack directly.
+    /// Register a boxed pack directly, vouched for by the composition root.
     ///
-    /// Crate-private: only [`PackRegistry::register_packs`] should call this.
-    /// External callers must use the typed [`Self::register`] which enforces the
-    /// `Pack + PackRuntime` dual-impl contract at the call site.  Here the
+    /// Crate-private: only [`PackRegistry::register_packs`]/
+    /// `register_packs_with_runtimes` should call this — both resolve the
+    /// pack from an `inventory`-discovered `&'static dyn PackFactory`
+    /// (collected at link time from `inventory::submit!` call sites, not
+    /// from request-time data), so the trust grant recorded here reflects a
+    /// decision the composition root made, never something the pack itself
+    /// supplied. External callers must use the typed [`Self::register`]
+    /// which enforces the `Pack + PackRuntime` dual-impl contract at the
+    /// call site but is never trusted. Here the `Pack + PackRuntime`
     /// contract is satisfied upstream at the [`PackFactory::create`] site.
     pub(crate) fn register_boxed(&mut self, pack: Box<dyn PackRuntime>) -> &mut Self {
         self.packs.push(pack);
+        self.pack_trusted.push(true);
+        self
+    }
+
+    /// Test-only trusted registration, mirroring `register_boxed`'s trust
+    /// grant for external test binaries (e.g.
+    /// `tests/read_verb_admission_exhaustion.rs`) that cannot reach a
+    /// crate-private method directly — the same reason
+    /// [`VerbRegistry::admission_degrade_safe_probe`] is `pub` rather than
+    /// `pub(crate)`. A test using this method is asserting that the pack it
+    /// registers stands in for a pack the real composition root would load,
+    /// not an untrusted/third-party one.
+    #[cfg(any(test, feature = "test-internals"))]
+    pub fn register_trusted<P: khive_types::Pack + PackRuntime + 'static>(
+        &mut self,
+        pack: P,
+    ) -> &mut Self {
+        self.packs.push(Box::new(pack));
+        self.pack_trusted.push(true);
         self
     }
 
@@ -837,11 +882,24 @@ impl VerbRegistryBuilder {
             ));
         }
 
-        let mut slots: Vec<Option<Box<dyn PackRuntime>>> = packs.into_iter().map(Some).collect();
-        let ordered_packs: Vec<Box<dyn PackRuntime>> = ordered_indices
-            .into_iter()
-            .map(|idx| slots[idx].take().expect("topological index must exist"))
-            .collect();
+        let mut pack_slots: Vec<Option<Box<dyn PackRuntime>>> =
+            packs.into_iter().map(Some).collect();
+        let mut trusted_slots: Vec<Option<bool>> =
+            self.pack_trusted.into_iter().map(Some).collect();
+        let mut ordered_packs: Vec<Box<dyn PackRuntime>> = Vec::with_capacity(pack_slots.len());
+        let mut ordered_trusted: Vec<bool> = Vec::with_capacity(trusted_slots.len());
+        for idx in ordered_indices {
+            ordered_packs.push(
+                pack_slots[idx]
+                    .take()
+                    .expect("topological index must exist"),
+            );
+            ordered_trusted.push(
+                trusted_slots[idx]
+                    .take()
+                    .expect("topological index must exist"),
+            );
+        }
 
         validate_unique_note_kinds(&ordered_packs)?;
         validate_unique_verb_names(&ordered_packs)?;
@@ -854,6 +912,38 @@ impl VerbRegistryBuilder {
             .filter(|h| matches!(h.visibility, Visibility::Verb))
             .map(|h| h.name)
             .collect();
+
+        // Admission-degrade eligibility (#2147/#2217, khive-oss#2311): decided
+        // once here, from the trust bit the composition root recorded at
+        // registration time (never from `pack.name()`'s self-report) plus
+        // each handler's declared category and the `(pack, verb)` allowlist —
+        // see `VerbRegistry::admission_degrade_safe`'s doc. A verb is
+        // globally unique across `Visibility::Verb` handlers at this point
+        // (`validate_unique_verb_names` above already enforced that), so a
+        // flat `HashSet<&'static str>` is an unambiguous key: no dispatch
+        // call site needs to re-resolve which pack owns a verb to answer
+        // this question, and none does (`VerbRegistry::admission_degrade_safe`
+        // is a single hash-set lookup with no per-call pack/handler scan).
+        let mut degrade_safe_verbs: HashSet<&'static str> = HashSet::new();
+        for (pack, &trusted) in ordered_packs.iter().zip(ordered_trusted.iter()) {
+            if !trusted {
+                continue;
+            }
+            let pack_name = pack.name();
+            for handler in pack.handlers() {
+                if !matches!(handler.visibility, Visibility::Verb)
+                    || handler.category != VerbCategory::Assertive
+                {
+                    continue;
+                }
+                let eligible = VerbRegistry::admission_degrade_safe_sorted()
+                    .binary_search_by(|&(p, v)| p.cmp(pack_name).then_with(|| v.cmp(handler.name)))
+                    .is_ok();
+                if eligible {
+                    degrade_safe_verbs.insert(handler.name);
+                }
+            }
+        }
 
         // ADR-133: incidental audit writes route through one batch seam per
         // configured `EventStore` instead of taking a writer-task
@@ -898,6 +988,7 @@ impl VerbRegistryBuilder {
             audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
+            degrade_safe_verbs: Arc::new(degrade_safe_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
             audit_batch,
         })
@@ -1086,6 +1177,12 @@ pub struct VerbRegistry {
     /// message — the pack set is fixed after construction, so there is no
     /// need to re-scan every pack's handlers on every miss.
     available_verbs: Arc<Vec<&'static str>>,
+    /// Verbs eligible for admission-pressure audit degradation, precomputed
+    /// once at `build()` time from registration-time pack trust plus each
+    /// handler's declared category and
+    /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]. See
+    /// [`VerbRegistry::admission_degrade_safe`].
+    degrade_safe_verbs: Arc<HashSet<&'static str>>,
     /// Recently-referenced ring (unified-verb draft ADR, Slice 1). Daemon-warm,
     /// actor-scoped, never persisted — see `crate::reference_ring`. Shared
     /// across every clone of this registry via the `Arc`, so admissions made
@@ -1594,9 +1691,11 @@ impl VerbRegistry {
     ];
 
     /// Sorted copy of [`Self::ADMISSION_DEGRADE_SAFE_VERBS`], built once, so
-    /// [`Self::admission_degrade_safe`] can decide eligibility with a binary
-    /// search instead of a linear scan over every entry on every audited
-    /// dispatch. The source list above stays grouped by pack (with a `//
+    /// [`VerbRegistryBuilder::build`] can decide each trusted handler's
+    /// eligibility with a binary search instead of a linear scan over every
+    /// entry. Consulted exactly once per registry, at `build()` time — see
+    /// [`Self::admission_degrade_safe`] for why no per-dispatch scan exists
+    /// anymore. The source list above stays grouped by pack (with a `//
     /// <pack>` comment per group) for human review; this is a derived,
     /// lookup-shaped view of the same data, not a second source of truth.
     fn admission_degrade_safe_sorted() -> &'static [(&'static str, &'static str)] {
@@ -1614,16 +1713,32 @@ impl VerbRegistry {
     /// than committing a domain change) AND explicitly opted in to
     /// admission-pressure audit degradation via
     /// [`Self::ADMISSION_DEGRADE_SAFE_VERBS`] under the exact pack that
-    /// registered it. Unknown, non-opted-in, or wrong-pack verbs are
+    /// registered it, AND declared by a pack the composition root actually
+    /// vouches for (see [`VerbRegistryBuilder::register_boxed`]'s doc).
+    /// Unknown, non-opted-in, wrong-pack, or untrusted-pack verbs are
     /// conservatively `false` — fail-closed, so a new Assertive handler (or
-    /// one registered by a pack other than the one the allowlist names)
-    /// hard-fails its audit obligation like any write until someone
-    /// deliberately reviews it and adds it to the allowlist.
+    /// one registered by a pack other than the one the allowlist names, or
+    /// one registered through [`VerbRegistryBuilder::register`] rather than
+    /// the trusted path) hard-fails its audit obligation like any write
+    /// until someone deliberately reviews it and adds it to the allowlist.
     ///
-    /// Resolving the handler and its owning pack together (rather than
-    /// checking the verb name and category in isolation) is the point:
-    /// [`Self::ADMISSION_DEGRADE_SAFE_VERBS`]'s doc explains why a bare verb
-    /// name is not a sound key on its own.
+    /// `pack.name()` is a value the `PackRuntime` trait object reports about
+    /// itself — any pack registered through the public
+    /// [`VerbRegistryBuilder::register`] path can claim any name, including
+    /// one on the allowlist, whether or not the pack that name actually
+    /// belongs to is also loaded (verb names are unique per registry, so an
+    /// impostor's same-named handler is only reachable when the real pack
+    /// is absent). Binding eligibility to registration-time trust — decided
+    /// by the *caller*, never by the pack instance — is why this checks
+    /// `degrade_safe_verbs` rather than resolving `pack.name()` at query
+    /// time; [`VerbRegistryBuilder::build`] already excluded every untrusted
+    /// pack's handlers from that set.
+    ///
+    /// The whole decision is precomputed once in `VerbRegistryBuilder::build`
+    /// into [`VerbRegistry::degrade_safe_verbs`] — a verb name is unique
+    /// across `Visibility::Verb` handlers within one registry
+    /// (`validate_unique_verb_names`), so this is a single hash-set lookup,
+    /// not a per-dispatch scan over every registered pack's handler list.
     ///
     /// Used only to decide whether a dispatch's own audit-obligation row may
     /// degrade to best-effort on transient audit-lane admission pressure
@@ -1632,18 +1747,7 @@ impl VerbRegistry {
     /// momentarily saturated. Never used for permission checking, transport
     /// routing, or return-shape selection.
     fn admission_degrade_safe(&self, verb: &str) -> bool {
-        let Some((pack_name, handler)) = self.packs.iter().find_map(|pack| {
-            pack.handlers()
-                .iter()
-                .find(|h| h.name == verb)
-                .map(|handler| (pack.name(), handler))
-        }) else {
-            return false;
-        };
-        handler.category == VerbCategory::Assertive
-            && Self::admission_degrade_safe_sorted()
-                .binary_search_by(|&(p, v)| p.cmp(pack_name).then_with(|| v.cmp(verb)))
-                .is_ok()
+        self.degrade_safe_verbs.contains(verb)
     }
 
     /// White-box accessor for [`Self::admission_degrade_safe`], needed
@@ -4172,6 +4276,151 @@ pub(crate) mod tests {
         "memory.recall",
     ];
 
+    /// Classification outcome for one `HandlerDef {` occurrence in pack
+    /// source, returned by [`classify_handler_def_occurrence`]. `Signature`
+    /// and `StructLiteral` are the two shapes the live cross-pack census
+    /// currently expects; `Unclassified` exists so neither the census nor a
+    /// direct unit test has to rely on a panic to observe a shape that is
+    /// neither — see `classify_handler_def_occurrence_reports_unclassifiable_shapes`
+    /// below.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum HandlerDefOccurrence {
+        /// A function/closure signature merely naming the type in
+        /// return-tail position (`-> &'static HandlerDef {`, possibly
+        /// qualified), not a declared handler.
+        Signature,
+        /// A struct-literal field block whose `name`/`visibility`/`category`
+        /// fields were all found at one consistent indentation.
+        StructLiteral {
+            name: String,
+            visibility: String,
+            category: String,
+        },
+        /// Neither of the above: not a signature tail, and the block does
+        /// not parse as a `name`/`visibility`/`category` struct literal at a
+        /// single consistent indentation either.
+        Unclassified { first_field_line: String },
+    }
+
+    /// Classify one `HandlerDef {` occurrence at `source[match_start..match_end]`
+    /// (`match_end` is the byte offset just past the token). Shared by the
+    /// live cross-pack census
+    /// (`admission_degrade_safe_assertive_census_matches_live_pack_sources`)
+    /// and `classify_handler_def_occurrence_reports_unclassifiable_shapes`'s
+    /// direct unit coverage of the `Unclassified` arm — extracting this as
+    /// its own function is what makes the negative arm testable without
+    /// corrupting a real pack source file to trigger it.
+    fn classify_handler_def_occurrence(
+        source: &str,
+        match_start: usize,
+        match_end: usize,
+    ) -> HandlerDefOccurrence {
+        // A struct literal is never preceded on its own line by `->`; a
+        // signature tail always is.
+        let line_start = source[..match_start]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if source[line_start..match_start].contains("->") {
+            return HandlerDefOccurrence::Signature;
+        }
+
+        let next_marker = source[match_end..].find("HandlerDef {");
+        let block_end = next_marker.map(|o| match_end + o).unwrap_or(source.len());
+        let block = &source[match_end..block_end];
+
+        // The field indentation is read from the block's own first line
+        // rather than hardcoded: array-element declarations (`&[HandlerDef
+        // {`) indent fields one level deeper than the single-element
+        // `static X: [HandlerDef; 1] = [HandlerDef {` shape, and a
+        // hardcoded depth would silently stop matching whichever shape it
+        // didn't anticipate — exactly how the narrower delimiter this
+        // replaced went unnoticed.
+        let Some(first_field_line) = block.lines().find(|line| !line.trim().is_empty()) else {
+            return HandlerDefOccurrence::Unclassified {
+                first_field_line: String::new(),
+            };
+        };
+        let indent_len = first_field_line.len() - first_field_line.trim_start().len();
+        let indent = &first_field_line[..indent_len];
+        let name_prefix = format!("{indent}name: \"");
+        let visibility_prefix = format!("{indent}visibility: ");
+        let category_prefix = format!("{indent}category: ");
+
+        let name = block.lines().find_map(|line| {
+            line.strip_prefix(name_prefix.as_str())
+                .and_then(|rest| rest.strip_suffix("\","))
+        });
+        let visibility = block
+            .lines()
+            .find_map(|line| line.strip_prefix(visibility_prefix.as_str()));
+        let category = block
+            .lines()
+            .find_map(|line| line.strip_prefix(category_prefix.as_str()));
+
+        match (name, visibility, category) {
+            (Some(name), Some(visibility), Some(category)) => HandlerDefOccurrence::StructLiteral {
+                name: name.to_string(),
+                visibility: visibility.to_string(),
+                category: category.to_string(),
+            },
+            _ => HandlerDefOccurrence::Unclassified {
+                first_field_line: first_field_line.to_string(),
+            },
+        }
+    }
+
+    /// khive-oss#2311: before this fix, the live census's per-file
+    /// `classified_count == raw_token_count` assertion incremented
+    /// `classified_count` once per loop iteration — before any
+    /// classification ran — so it counted exactly the same occurrences
+    /// `raw_token_count` counts, by the same method, and could never
+    /// disagree regardless of what the loop body did afterward: a silently
+    /// dropped classification branch would have stayed green. This proves
+    /// the replacement — [`classify_handler_def_occurrence`], now called
+    /// once per occurrence and the sole source of the census's per-branch
+    /// counters — actually distinguishes an unclassifiable shape from the
+    /// two shapes the census expects, using a hand-built snippet with a
+    /// `HandlerDef {` block that is neither a signature tail nor a
+    /// well-formed struct literal (its `category:` field is missing at the
+    /// expected indentation).
+    #[test]
+    fn classify_handler_def_occurrence_reports_unclassifiable_shapes() {
+        let signature_snippet = "fn describe() -> &'static HandlerDef {\n    HANDLER\n}\n";
+        let match_start = signature_snippet.find("HandlerDef {").unwrap();
+        let match_end = match_start + "HandlerDef {".len();
+        assert_eq!(
+            classify_handler_def_occurrence(signature_snippet, match_start, match_end),
+            HandlerDefOccurrence::Signature
+        );
+
+        let struct_literal_snippet = "        HandlerDef {\n            name: \"probe\",\n            visibility: Visibility::Verb,\n            category: VerbCategory::Assertive,\n        }\n";
+        let match_start = struct_literal_snippet.find("HandlerDef {").unwrap();
+        let match_end = match_start + "HandlerDef {".len();
+        assert_eq!(
+            classify_handler_def_occurrence(struct_literal_snippet, match_start, match_end),
+            HandlerDefOccurrence::StructLiteral {
+                name: "probe".to_string(),
+                visibility: "Visibility::Verb,".to_string(),
+                category: "VerbCategory::Assertive,".to_string(),
+            }
+        );
+
+        // Missing `category:` at the expected indentation: not a signature
+        // tail (no `->`), and not a parseable struct literal either.
+        let unclassifiable_snippet = "        HandlerDef {\n            name: \"probe\",\n            visibility: Visibility::Verb,\n        }\n";
+        let match_start = unclassifiable_snippet.find("HandlerDef {").unwrap();
+        let match_end = match_start + "HandlerDef {".len();
+        assert!(
+            matches!(
+                classify_handler_def_occurrence(unclassifiable_snippet, match_start, match_end),
+                HandlerDefOccurrence::Unclassified { .. }
+            ),
+            "a HandlerDef block missing an expected field must classify as Unclassified, not \
+             silently fall through as a recognized shape"
+        );
+    }
+
     /// khive-runtime links no real pack crates in its own test binary (see
     /// the comment on `CommProbeFactory` below), so
     /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`] cannot be checked
@@ -4291,99 +4540,69 @@ pub(crate) mod tests {
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
 
-            // Every literal occurrence of `HandlerDef {` is either a
-            // struct-literal field block (parsed below) or a
-            // function/closure signature merely naming the type in
-            // return-tail position (`-> &'static HandlerDef {`, possibly
-            // qualified as `khive_types::HandlerDef {`) — a struct literal
-            // is never preceded on its own line by `->`. Both are explicitly
-            // classified; neither is silently skipped, and the per-file
-            // count assertion below fails closed if a future shape is
-            // neither.
+            // Every literal occurrence of `HandlerDef {` is classified by
+            // `classify_handler_def_occurrence` into a struct-literal field
+            // block, a function/closure signature merely naming the type
+            // (`-> &'static HandlerDef {`), or `Unclassified`. The count
+            // assertion below sums the first two — counted only where each
+            // branch actually fires, not once per occurrence found — against
+            // `raw_token_count`, computed by an independent method
+            // (`str::matches`). Unlike comparing two counts of the same
+            // occurrences by the same method, this sum can fall short: an
+            // `Unclassified` occurrence increments neither counter, so a
+            // future shape neither branch recognizes fails this assertion
+            // instead of silently passing (`classify_handler_def_occurrence_reports_unclassifiable_shapes`
+            // proves the classifier itself reports `Unclassified` rather
+            // than mis-slotting such a shape into one of the two branches).
             let raw_token_count = source.matches("HandlerDef {").count();
-            let mut classified_count = 0usize;
+            let mut signature_count = 0usize;
+            let mut struct_literal_count = 0usize;
+            let mut unclassified: Vec<String> = Vec::new();
             let mut search_from = 0usize;
             while let Some(rel_pos) = source[search_from..].find("HandlerDef {") {
                 let match_start = search_from + rel_pos;
                 let match_end = match_start + "HandlerDef {".len();
                 search_from = match_end;
-                classified_count += 1;
 
-                let line_start = source[..match_start]
-                    .rfind('\n')
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                if source[line_start..match_start].contains("->") {
-                    continue;
+                match classify_handler_def_occurrence(&source, match_start, match_end) {
+                    HandlerDefOccurrence::Signature => {
+                        signature_count += 1;
+                    }
+                    HandlerDefOccurrence::StructLiteral {
+                        name,
+                        visibility,
+                        category,
+                    } => {
+                        struct_literal_count += 1;
+                        if !visibility.contains("Visibility::Verb")
+                            || !category.contains("VerbCategory::Assertive")
+                        {
+                            continue;
+                        }
+
+                        let prior = live_assertive
+                            .insert(name.clone(), (owning_pack.clone(), relative_path.clone()));
+                        assert!(
+                            prior.is_none(),
+                            "public Assertive verb {name:?} is declared in both {prior:?} and \
+                             ({owning_pack:?}, {relative_path:?}); the registry surface must \
+                             remain collision-free"
+                        );
+                    }
+                    HandlerDefOccurrence::Unclassified { first_field_line } => {
+                        unclassified.push(format!(
+                            "byte {match_start} (first field line {first_field_line:?})"
+                        ));
+                    }
                 }
-
-                let next_marker = source[match_end..].find("HandlerDef {");
-                let block_end = next_marker.map(|o| match_end + o).unwrap_or(source.len());
-                let block = &source[match_end..block_end];
-
-                // The field indentation is read from the block's own first
-                // line rather than hardcoded: array-element declarations
-                // (`&[HandlerDef {`) indent fields one level deeper than the
-                // single-element `static X: [HandlerDef; 1] = [HandlerDef {`
-                // shape, and a hardcoded depth would silently stop matching
-                // whichever shape it didn't anticipate — exactly how the
-                // narrower delimiter this replaced went unnoticed.
-                let first_field_line = block
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "{relative_path}: HandlerDef {{ at byte {match_start} has no \
-                             field line before EOF or the next HandlerDef {{"
-                        )
-                    });
-                let indent_len = first_field_line.len() - first_field_line.trim_start().len();
-                let indent = &first_field_line[..indent_len];
-                let name_prefix = format!("{indent}name: \"");
-                let visibility_prefix = format!("{indent}visibility: ");
-                let category_prefix = format!("{indent}category: ");
-
-                let name = block.lines().find_map(|line| {
-                    line.strip_prefix(name_prefix.as_str())
-                        .and_then(|rest| rest.strip_suffix("\","))
-                });
-                let visibility = block
-                    .lines()
-                    .find_map(|line| line.strip_prefix(visibility_prefix.as_str()));
-                let category = block
-                    .lines()
-                    .find_map(|line| line.strip_prefix(category_prefix.as_str()));
-                let (Some(name), Some(visibility), Some(category)) = (name, visibility, category)
-                else {
-                    panic!(
-                        "{relative_path}: HandlerDef {{ block starting with {first_field_line:?} \
-                         could not be parsed for name/visibility/category at indent \
-                         {indent_len}; extend this census's parser to handle the shape instead \
-                         of silently excluding it"
-                    );
-                };
-                if !visibility.contains("Visibility::Verb")
-                    || !category.contains("VerbCategory::Assertive")
-                {
-                    continue;
-                }
-
-                let prior = live_assertive.insert(
-                    name.to_string(),
-                    (owning_pack.clone(), relative_path.clone()),
-                );
-                assert!(
-                    prior.is_none(),
-                    "public Assertive verb {name:?} is declared in both {prior:?} and \
-                     ({owning_pack:?}, {relative_path:?}); the registry surface must remain \
-                     collision-free"
-                );
             }
             assert_eq!(
-                classified_count, raw_token_count,
+                signature_count + struct_literal_count,
+                raw_token_count,
                 "{relative_path}: found {raw_token_count} occurrences of the `HandlerDef {{` \
-                 token but only classified {classified_count} of them; the census scan must \
-                 account for every occurrence"
+                 token but classified {signature_count} as signatures and \
+                 {struct_literal_count} as struct literals; unclassified: {unclassified:?} — \
+                 extend this census's parser to handle the shape instead of silently excluding it"
             );
         }
 
@@ -4427,6 +4646,111 @@ pub(crate) mod tests {
             classified, live,
             "every public Assertive handler must be classified exactly once after a live-source \
              effect review; live declarations: {live_assertive:#?}"
+        );
+    }
+
+    /// A pack whose `handlers()` counts every call, so a test can prove a
+    /// query touches (or does not touch) it after `VerbRegistryBuilder::build`
+    /// has already run once over every registered pack's handler list.
+    struct CountingHandlersPack {
+        name: &'static str,
+        handlers: &'static [HandlerDef],
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Pack for CountingHandlersPack {
+        const NAME: &'static str = "counting";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
+    }
+
+    #[async_trait]
+    impl PackRuntime for CountingHandlersPack {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.handlers
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({ "pack": self.name, "verb": verb }))
+        }
+    }
+
+    /// khive-oss#2311: before this fix, `admission_degrade_safe` resolved
+    /// the owning pack by scanning every registered pack's `handlers()` on
+    /// every audited dispatch (`self.packs.iter().find_map(|pack|
+    /// pack.handlers().iter().find(...))`). Eligibility is now decided once
+    /// in `VerbRegistryBuilder::build` into `VerbRegistry::degrade_safe_verbs`,
+    /// so `admission_degrade_safe` is a hash-set lookup that never touches
+    /// `handlers()` again. Proves it directly: `handlers()` is called some
+    /// number of times during `build()` (unique-name validation, the
+    /// reserved-envelope-arg check, `available_verbs`, and this
+    /// eligibility precompute all read it), but that count must not move
+    /// across any number of `admission_degrade_safe_probe` calls afterward
+    /// — for an allowlisted verb (a hit) and for one that is not (a miss).
+    #[test]
+    fn admission_degrade_safe_is_a_build_time_lookup_with_no_per_call_pack_scan() {
+        static KG_HANDLERS: [HandlerDef; 1] = [HandlerDef {
+            name: "list",
+            description: "list widgets",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_trusted(CountingHandlersPack {
+            name: "kg",
+            handlers: &KG_HANDLERS,
+            calls: calls.clone(),
+        });
+        let registry = builder.build().expect("registry builds");
+
+        let after_build = calls.load(Ordering::SeqCst);
+        assert!(
+            after_build > 0,
+            "build() is expected to read handlers() at least once (unique-name validation, \
+             available_verbs, and the degrade-safe precompute all do); a count of 0 means this \
+             test's premise (build-time reads happen) is wrong, not that the property under \
+             test holds"
+        );
+
+        assert!(
+            registry.admission_degrade_safe_probe("list"),
+            "\"list\" is Assertive and (\"kg\", \"list\") is allowlisted under trusted \
+             registration, so this must be a hit"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_build,
+            "a hit must not re-scan any pack's handlers() — eligibility was already decided at \
+             build() time"
+        );
+
+        assert!(
+            !registry.admission_degrade_safe_probe("not-a-real-verb"),
+            "an unregistered verb name is never eligible"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_build,
+            "a miss must not re-scan any pack's handlers() either"
         );
     }
 
