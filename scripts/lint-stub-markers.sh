@@ -61,11 +61,13 @@ ROOT="$SCRIPT_DIR/.."
 # stale first phase the way a text scan of the source could. The producer's
 # exit status is read before its output: a list printed by a script that then
 # failed is not an answer, and a pipeline ending in head would discard that
-# status.
+# status. The helper owns that failure: the producer's status is captured on
+# the assignment itself, so a direct call with `set -e` in force still reaches
+# the report below instead of exiting the caller on the failed substitution.
 check_ci_phase_order() {
     phase_ci_sh="$1"
-    phase_list="$(sh "$phase_ci_sh" --print-phases)"
-    phase_rc=$?
+    phase_rc=0
+    phase_list="$(sh "$phase_ci_sh" --print-phases)" || phase_rc=$?
     if [ "$phase_rc" -ne 0 ]; then
         echo "self-test FAILED: '$phase_ci_sh --print-phases' exited with status $phase_rc; the phase-order guard cannot read the list it asserts on"
         return 1
@@ -827,6 +829,25 @@ LSTREEFAILFIXTURE
     elif ! grep -qF 'exited with status 3' "$tmp/phase-producer-fail.log"; then
         echo "self-test FAILED: the producer-failure error did not name the producer's exit status"
         cat "$tmp/phase-producer-fail.log"
+        status=1
+    fi
+    # The arms above call the guard inside an if, where set -e is suspended. A
+    # direct call with set -e in force must behave the same: the producer's
+    # status is reported and the guard returns nonzero, rather than the failed
+    # substitution exiting the caller before the report line prints.
+    # The subshell must not sit in an if, && or || list: the shell suspends
+    # set -e inside those, and the suspension reaches into a subshell that
+    # re-enables it, so the arm would pass against a guard that exits early.
+    set +e
+    (set -e; check_ci_phase_order "$fake_ci") > "$tmp/phase-direct-fail.log" 2>&1
+    direct_rc=$?
+    set -e
+    if [ "$direct_rc" -eq 0 ]; then
+        echo "self-test FAILED: a direct call of the phase-order guard under set -e with a failing producer must return nonzero"
+        status=1
+    elif ! grep -qF 'exited with status 3' "$tmp/phase-direct-fail.log"; then
+        echo "self-test FAILED: a direct call of the phase-order guard under set -e exited before reporting the producer's status (got status $direct_rc)"
+        cat "$tmp/phase-direct-fail.log"
         status=1
     fi
     printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_ci"

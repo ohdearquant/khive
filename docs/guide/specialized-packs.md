@@ -17,8 +17,11 @@ the formal-math and Moodboard packs and how pack loading works in general.
 Every pack implements the `Pack` trait (`crates/khive-types/`) and declares,
 additively, what it contributes: note kinds, entity kinds, verb handlers,
 and edge endpoint rules. A pack can declare zero verbs and still be useful,
-contributing purely to the edge ontology. Packs declare a `REQUIRES` list of
-other packs that must already be loaded; the runtime resolves this at
+contributing purely to the edge ontology, but its `PackFactory` must make that
+intent explicit by returning `true` from `intentionally_verbless()`. An
+unmarked zero-verb pack is rejected at startup so a declared pack cannot
+silently disappear from the served surface. Packs declare a `REQUIRES` list
+of other packs that must already be loaded; the runtime resolves this at
 startup. See [ADR-017](../adr/ADR-017-pack-standard.md) for the full
 standard, including how pack-declared edge endpoint rules combine with the
 base ADR-002 contract: rules are additive only, never tightening what the

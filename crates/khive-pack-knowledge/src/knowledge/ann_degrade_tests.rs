@@ -33,6 +33,7 @@ use khive_runtime::{
 };
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 // ── fake embedder ─────────────────────────────────────────────────────────────
@@ -92,11 +93,13 @@ impl EmbedderProvider for FakeDimProvider {
 
 // Controlled two-topic embedder for the degraded-candidate ranking test.  The
 // query and genuinely relevant domain share the first axis; the domain whose
-// title only collides lexically shares the second.  The failing variant still
-// embeds/indexes the corpus and embeds the ANN query, but rejects the later
-// query-plus-candidates batch so the fresh rerank is genuinely unavailable.
+// title only collides lexically shares the second. The failing variant still
+// embeds/indexes the corpus and embeds the ANN query, but rejects the next
+// candidate batch so the fresh rerank is genuinely unavailable even though
+// #2232 no longer resends the cached query in that batch.
 struct ControlledRankingService {
     fail_fresh_rerank: bool,
+    query_embedded: AtomicBool,
 }
 
 #[async_trait]
@@ -106,10 +109,7 @@ impl EmbeddingService for ControlledRankingService {
         texts: &[String],
         _model: EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if self.fail_fresh_rerank
-            && texts.len() > 1
-            && texts[0].contains("speculative decoding inference acceleration")
-        {
+        if self.fail_fresh_rerank && self.query_embedded.swap(false, Ordering::AcqRel) {
             return Err(EmbedError::InferenceFailed(
                 "controlled fresh-rerank failure".into(),
             ));
@@ -133,6 +133,18 @@ impl EmbeddingService for ControlledRankingService {
                 }
             })
             .collect())
+    }
+
+    async fn embed_query(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let result = self.embed(texts, model).await;
+        if result.is_ok() {
+            self.query_embedded.store(true, Ordering::Release);
+        }
+        result
     }
 
     fn supports_model(&self, _model: EmbeddingModel) -> bool {
@@ -161,6 +173,7 @@ impl EmbedderProvider for ControlledRankingProvider {
     async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
         Ok(Arc::new(ControlledRankingService {
             fail_fresh_rerank: self.fail_fresh_rerank,
+            query_embedded: AtomicBool::new(false),
         }))
     }
 }

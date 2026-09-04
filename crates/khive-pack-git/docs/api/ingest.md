@@ -29,6 +29,21 @@ set `gh_available=false` and mark each requested remote source `skipped`; a
 commits-only pass does not probe and leaves `gh_available` unset. Public
 reasons are stable and omit both origin URLs and `gh` stderr.
 
+The `origin` fallback is controlled by `OriginIdentity`, passed down from
+each public entry point through `run_ingest_inner` to `probe_gh_repository`.
+`run_ingest` and `run_ingest_with_commit_recovery` pass
+`OriginIdentity::DeriveFromCwd`: both run against a real repository checkout
+(a local source, or a cloned remote), so falling back to that checkout's
+configured `origin` when the source itself carries no identity is safe.
+`run_remote_api_ingest` — the issues/pull-requests-only remote pass that
+never clones (see `crates/khive-pack-git/src/handlers.rs`'s remote branch) —
+passes `OriginIdentity::Never` instead: it runs `gh` from a neutral working
+directory that has no relationship to the requested repository, so deriving
+an identity from that directory's `origin` would silently borrow whatever
+repository the daemon process happens to be running inside. A source with no
+usable identity of its own fails the probe under `OriginIdentity::Never`
+rather than falling back.
+
 ## `Budget`
 
 Bounds the number of new-record creation attempts across a `run_ingest`
