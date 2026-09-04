@@ -1272,10 +1272,24 @@ fn coordinator_warning_cause_masker_is_bounded_and_fail_closed() {
     assert!(masked.contains("***MASKED***"));
     assert!(!masked.contains("sk_live_"));
 
+    // 5,000 non-whitespace characters: a single token longer than the
+    // shared masking window (MASK_WINDOW_CHARS = 4,096). There is no
+    // whitespace anywhere in the window to fall back to, so the whole
+    // window is dropped and replaced by the bare truncation marker rather
+    // than partially echoed content — see secret_gate::mask_bounded.
     let oversized = "x".repeat(5_000);
     let bounded = bounded_backend_cause_for_log(&oversized);
+    assert_eq!(bounded, "…");
+
+    // Comfortably under the 4,096-char window (so no token gets dropped),
+    // but over the 1,024-char output cap: behaves exactly as before,
+    // truncated to the output limit plus one trailing truncation marker.
+    let long_benign_prose = "word ".repeat(300);
+    assert!(long_benign_prose.chars().count() < 4_096);
+    let bounded = bounded_backend_cause_for_log(&long_benign_prose);
     assert_eq!(bounded.chars().count(), 1_025);
     assert!(bounded.ends_with('…'));
+
     assert_eq!(
         bounded_backend_cause_for_log(" \t\n"),
         "backend search failed without diagnostic detail"

@@ -14,17 +14,41 @@
 
 use std::path::{Path, PathBuf};
 
-/// Files exempt from the census: the primitive's owning file (which also
-/// defines the `mask_for_redaction_surface` wrapper every other caller must
-/// go through), and this census test itself, which necessarily quotes the
-/// literal string `mask_secrets(` in its own controls and panic message.
+/// Files exempt from the census, relative to the Cargo workspace root
+/// (`crates/` — see [`find_workspace_root`]): the primitive's owning file
+/// (which also defines the `mask_for_redaction_surface` wrapper every other
+/// caller must go through), and this census test itself, which necessarily
+/// quotes the literal string `mask_secrets(` in its own controls and panic
+/// message.
 const EXEMPT_FILES: &[&str] = &[
-    "crates/khive-runtime/src/secret_gate.rs",
-    "crates/khive-runtime/tests/adr115_redaction_call_site_census.rs",
+    "khive-runtime/src/secret_gate.rs",
+    "khive-runtime/tests/adr115_redaction_call_site_census.rs",
 ];
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(format!("{}/../..", env!("CARGO_MANIFEST_DIR")))
+/// Walk upward from `CARGO_MANIFEST_DIR` to the nearest ancestor whose
+/// `Cargo.toml` declares `[workspace]` — i.e. the actual Cargo workspace
+/// root, which in this repository is `crates/`, not the repository's own
+/// top-level directory. Returns `None` when no such ancestor exists — e.g.
+/// this crate built standalone outside the khive workspace checkout —
+/// rather than guessing a fixed number of parent directories, which
+/// silently resolves to the wrong root (or an unrelated directory) the
+/// moment the crate's depth in the tree changes or the crate is vendored
+/// elsewhere.
+fn find_workspace_root() -> Option<PathBuf> {
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if candidate.is_file() {
+            if let Ok(contents) = std::fs::read_to_string(&candidate) {
+                if contents.contains("[workspace]") {
+                    return Some(dir);
+                }
+            }
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -73,14 +97,71 @@ fn detector_recognizes_a_direct_call_and_ignores_the_wrapper() {
 }
 
 #[test]
+fn find_workspace_root_resolves_the_real_checkout() {
+    // Positive control: run from this crate's actual manifest dir, the
+    // resolver must find the real Cargo workspace root (`crates/` in this
+    // repository's layout), identified by owning the `[workspace]` manifest
+    // itself.
+    let root = find_workspace_root().expect("the real checkout declares [workspace]");
+    assert!(root.join("Cargo.toml").is_file());
+    assert!(root.join("khive-runtime").is_dir());
+}
+
+#[test]
+fn find_workspace_root_returns_none_outside_any_workspace() {
+    // Negative control: a manifest dir with no [workspace]-declaring
+    // ancestor anywhere above it (a fresh tempdir has no Cargo.toml at all)
+    // must resolve to None, not silently fall back to some unrelated
+    // ancestor directory.
+    let isolated = tempfile::tempdir().expect("create isolated tempdir");
+    let nested = isolated.path().join("a").join("b").join("c");
+    std::fs::create_dir_all(&nested).expect("create nested dirs");
+    std::fs::write(nested.join("Cargo.toml"), "[package]\nname = \"leaf\"\n")
+        .expect("write non-workspace Cargo.toml");
+
+    // SAFETY-equivalent for tests: CARGO_MANIFEST_DIR is read via env! at
+    // compile time inside find_workspace_root, so exercise the same walk
+    // logic directly against the synthetic tree instead of trying to
+    // override a compile-time macro.
+    fn find_workspace_root_from(start: &Path, floor: &Path) -> Option<PathBuf> {
+        let mut dir = start.to_path_buf();
+        loop {
+            let candidate = dir.join("Cargo.toml");
+            if candidate.is_file() {
+                if let Ok(contents) = std::fs::read_to_string(&candidate) {
+                    if contents.contains("[workspace]") {
+                        return Some(dir);
+                    }
+                }
+            }
+            // Never escape the isolated tempdir into the real filesystem —
+            // stop exactly where the synthetic tree ends, so an incidental
+            // [workspace] ancestor on the host running the test can't turn
+            // this into a false positive.
+            if dir == floor || !dir.pop() {
+                return None;
+            }
+        }
+    }
+
+    assert!(find_workspace_root_from(&nested, isolated.path()).is_none());
+}
+
+#[test]
 fn mask_secrets_has_no_direct_caller_outside_its_owning_file() {
-    let root = workspace_root();
-    let crates_dir = root.join("crates");
+    let Some(root) = find_workspace_root() else {
+        println!(
+            "skipping mask_secrets census: no ancestor Cargo.toml declaring [workspace] found \
+             above {} — this crate is not building inside the khive workspace checkout",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        return;
+    };
     let mut files = Vec::new();
-    collect_rs_files(&crates_dir, &mut files);
+    collect_rs_files(&root, &mut files);
     assert!(
         files.len() > 100,
-        "the walker found suspiciously few .rs files under {crates_dir:?} ({}); \
+        "the walker found suspiciously few .rs files under {root:?} ({}); \
          it likely resolved the wrong root rather than an empty workspace",
         files.len()
     );

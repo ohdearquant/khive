@@ -13,6 +13,21 @@ fn mask_session_mirror(text: &str) -> std::borrow::Cow<'_, str> {
     secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::SessionMirror, text)
 }
 
+/// Bound the masker's own input window (see `secret_gate::mask_bounded`)
+/// before capping display text to `output_cap_chars`, rather than masking
+/// the full, unbounded text: cost stays proportional to the shared window
+/// regardless of input length, and a token straddling the window is dropped
+/// whole rather than echoed unmasked.
+fn mask_session_mirror_bounded(text: &str, output_cap_chars: usize) -> String {
+    secret_gate::mask_bounded(
+        secret_gate::RedactionSurface::SessionMirror,
+        text,
+        secret_gate::MASK_WINDOW_CHARS,
+        output_cap_chars,
+    )
+    .text
+}
+
 /// A single parsed event, source-agnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedEvent {
@@ -40,9 +55,9 @@ pub struct ParsedEvent {
     pub raw: String,
     /// Source timestamp as microseconds since the Unix epoch; 0 if absent or unparseable.
     pub created_at_micros: i64,
-    /// `cwd` if present.
+    /// `cwd` if present, secrets masked.
     pub cwd: Option<String>,
-    /// `gitBranch` (CC) or `payload.git.branch` (Codex) if present.
+    /// `gitBranch` (CC) or `payload.git.branch` (Codex) if present, secrets masked.
     pub git_branch: Option<String>,
     /// `slug` if present (CC: project slug; ChatGPT/Claude.ai export:
     /// conversation title; Codex files carry no slug concept).
@@ -121,12 +136,15 @@ pub fn parse_cc_line(line: &str) -> Option<ParsedEvent> {
         .unwrap_or("unknown")
         .to_string();
 
-    let cwd = map.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
+    let cwd = map
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|s| mask_session_mirror(s).into_owned());
 
     let git_branch = map
         .get("gitBranch")
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(|s| mask_session_mirror(s).into_owned());
 
     let slug = map
         .get("slug")
@@ -222,14 +240,14 @@ pub fn parse_codex_line(line: &str, session_id: &str, abs_byte_offset: u64) -> O
             let cwd = payload
                 .and_then(|p| p.get("cwd"))
                 .and_then(|v| v.as_str())
-                .map(str::to_string);
+                .map(|s| mask_session_mirror(s).into_owned());
 
             let git_branch = payload
                 .and_then(|p| p.get("git"))
                 .and_then(|g| g.as_object())
                 .and_then(|g| g.get("branch"))
                 .and_then(|v| v.as_str())
-                .map(str::to_string);
+                .map(|s| mask_session_mirror(s).into_owned());
 
             let uuid = format!("{session_id}:{abs_byte_offset}");
             let raw = mask_session_mirror(trimmed).into_owned();
@@ -263,10 +281,7 @@ pub fn parse_codex_line(line: &str, session_id: &str, abs_byte_offset: u64) -> O
                 .map(str::to_string);
 
             let text = extract_text(payload.get("content"));
-            let text = text.map(|t| {
-                let masked = mask_session_mirror(&t).into_owned();
-                truncate(&masked, 500)
-            });
+            let text = text.map(|t| mask_session_mirror_bounded(&t, 500));
 
             let uuid = format!("{session_id}:{abs_byte_offset}");
             let raw = mask_session_mirror(trimmed).into_owned();
@@ -648,13 +663,8 @@ fn extract_block(block: &Value) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             let input = map.get("input").cloned().unwrap_or(Value::Null);
-            // Mask the FULL serialized input before truncating: a detector's
-            // terminating span can sit past the 500-char display cap, and a
-            // masker that only sees a truncated prefix cannot recognize a
-            // match it cannot see the end of.
             let input_json = serde_json::to_string(&input).unwrap_or_default();
-            let masked_input = mask_session_mirror(&input_json);
-            let input_str = truncate(&masked_input, 500);
+            let input_str = mask_session_mirror_bounded(&input_json, 500);
             Some(format!("[tool_use: {name}] {input_str}"))
         }
         "tool_result" => {
@@ -663,21 +673,12 @@ fn extract_block(block: &Value) -> Option<String> {
                 Value::String(s) => s.clone(),
                 other => serde_json::to_string(other).unwrap_or_default(),
             };
-            let masked_content = mask_session_mirror(&content_str);
-            Some(format!("[tool_result] {}", truncate(&masked_content, 500)))
+            Some(format!(
+                "[tool_result] {}",
+                mask_session_mirror_bounded(&content_str, 500)
+            ))
         }
         _ => None,
-    }
-}
-
-/// Truncate a string to at most `max_chars` characters, appending `…` if truncated.
-fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max_chars).collect();
-        out.push('…');
-        out
     }
 }
 
@@ -984,6 +985,34 @@ mod tests {
     }
 
     #[test]
+    fn test_cc_line_masks_secret_bearing_cwd_and_git_branch() {
+        let marker = "CwdCredMarkerXYZ789";
+        let cwd = format!("/repo?token=postgres://svc:{marker}q@internal-host.example.test/db");
+        let branch = format!("feature/postgres://svc:{marker}q@internal-host.example.test/db");
+        let line = make_line(
+            "aaaa-cwd1",
+            "sess-1111",
+            "user",
+            &format!(
+                r#","message":{{"role":"user","content":"Hello world"}},"cwd":"{cwd}","gitBranch":"{branch}""#
+            ),
+        );
+        let ev = parse_cc_line(&line).expect("should parse");
+        let stored_cwd = ev.cwd.as_deref().expect("cwd");
+        let stored_branch = ev.git_branch.as_deref().expect("git_branch");
+        assert!(!stored_cwd.contains(marker), "cwd: {stored_cwd}");
+        assert!(stored_cwd.contains("***MASKED***"), "cwd: {stored_cwd}");
+        assert!(
+            !stored_branch.contains(marker),
+            "git_branch: {stored_branch}"
+        );
+        assert!(
+            stored_branch.contains("***MASKED***"),
+            "git_branch: {stored_branch}"
+        );
+    }
+
+    #[test]
     fn test_assistant_with_text_and_tool_use_blocks() {
         let line = r#"{"uuid":"cccc-dddd","sessionId":"sess-1111","type":"assistant","timestamp":"2026-06-29T10:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"I'll run a search."},{"type":"tool_use","name":"bash","input":{"command":"ls"}}]}}"#
             .to_string();
@@ -1222,6 +1251,27 @@ mod tests {
         // Synthetic uuid: "{session_id}:{offset}".
         assert_eq!(ev.uuid, format!("{CDX_SID}:0"));
         assert!(ev.created_at_micros > 0);
+    }
+
+    #[test]
+    fn test_codex_session_meta_masks_secret_bearing_cwd_and_branch() {
+        let marker = "CodexCwdCredMarkerXYZ789";
+        let cwd = format!("/repo?token=postgres://svc:{marker}q@internal-host.example.test/db");
+        let branch = format!("feature/postgres://svc:{marker}q@internal-host.example.test/db");
+        let line = codex_meta(&cwd, &branch);
+        let ev = parse_codex_line(&line, CDX_SID, 0).expect("session_meta should parse");
+        let stored_cwd = ev.cwd.as_deref().expect("cwd");
+        let stored_branch = ev.git_branch.as_deref().expect("git_branch");
+        assert!(!stored_cwd.contains(marker), "cwd: {stored_cwd}");
+        assert!(stored_cwd.contains("***MASKED***"), "cwd: {stored_cwd}");
+        assert!(
+            !stored_branch.contains(marker),
+            "git_branch: {stored_branch}"
+        );
+        assert!(
+            stored_branch.contains("***MASKED***"),
+            "git_branch: {stored_branch}"
+        );
     }
 
     #[test]

@@ -319,7 +319,8 @@ pub const GIT_INGEST_STORED_TARGET: &str = "final git-ingest entity/note fields"
 /// writes a masked provider-export projection into, not just the message
 /// body columns.
 pub const SESSION_MIRROR_STORED_TARGET: &str =
-    "session_messages.text, session_messages.raw, and sessions.slug";
+    "session_messages.text, session_messages.raw, session_messages.cwd, \
+     session_messages.git_branch, sessions.slug, sessions.cwd, and sessions.git_branch";
 
 /// Return the closed contract for a named redact-not-block surface.
 pub const fn redaction_surface_contract(surface: RedactionSurface) -> RedactionSurfaceContract {
@@ -350,6 +351,117 @@ pub fn mask_for_redaction_surface(
         RedactionSurfaceMode::PermanentMaskOnly => mask_secrets(text),
     }
 }
+
+/// Upper bound on how many characters of a diagnostic-boundary input the
+/// canonical masker is ever asked to scan, regardless of a caller's own
+/// output cap. Chosen comfortably larger than the largest output cap among
+/// the callers of [`mask_bounded`] (1,024, `khive-mcp`'s
+/// `MAX_BACKEND_ERROR_MESSAGE_CHARS`) so a credential's terminating span
+/// remains inside the window for any message that is itself smaller than the
+/// window. Masking cost scales with this constant, never with a caller's raw
+/// input length. Shared by every diagnostic-boundary redaction site so the
+/// window cannot drift between them independently.
+pub const MASK_WINDOW_CHARS: usize = 4_096;
+
+/// Result of [`mask_bounded`]: masked, window- and output-bounded text plus
+/// the flags a caller needs to finish assembling a caller-visible
+/// diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedMask {
+    /// Masked text, never longer than `output_cap_chars` plus one trailing
+    /// truncation-marker character. May be the bare truncation marker alone
+    /// when the retained window held a single token longer than the window.
+    pub text: String,
+    /// True when `text` is not the complete masked input: the raw input
+    /// exceeded `window_chars`, the masked window exceeded `output_cap_chars`,
+    /// or the window held one token longer than the window that had to be
+    /// dropped whole.
+    pub truncated: bool,
+    /// True when the canonical masker replaced a span inside the retained
+    /// window, or the window's only content was dropped whole for being an
+    /// oversized single token. A caller that decides whether raw content is
+    /// safe to echo back verbatim on this flag must also treat `truncated`
+    /// as reason enough on its own — content the window never retained is
+    /// exactly as unverified as content the masker redacted.
+    pub redacted: bool,
+}
+
+/// Bound a diagnostic-boundary masking call to at most `window_chars` of
+/// `text` before the canonical masker ever runs, then cap the masked result
+/// to `output_cap_chars`. Bounding happens BEFORE masking — not after, as a
+/// truncate-then-mask policy would — so scan cost is bounded by
+/// `window_chars` regardless of the caller's input length.
+///
+/// A window cut mid-token would let a masker that never saw the token's
+/// terminating shape (e.g. the `@` closing `scheme://user:pass@host`) emit
+/// the token's visible prefix unmasked — the exact split-secret hole a prior
+/// mask-the-full-input-first policy existed to close, at the cost of
+/// unbounded scan work. This function closes the hole without re-widening
+/// the window to the input's full length: any token straddling the window
+/// boundary is dropped in its entirety (back to the last whitespace inside
+/// the window) rather than masked, because a masker can only vouch for a
+/// token it saw whole. A single token that is itself longer than the window
+/// has no earlier whitespace to fall back to inside the window and is
+/// replaced by the truncation marker alone.
+///
+/// `window_chars` must be at least `output_cap_chars`; debug builds assert
+/// this so a misconfigured call site fails loudly instead of silently
+/// capping tighter than it windows.
+pub fn mask_bounded(
+    surface: RedactionSurface,
+    text: &str,
+    window_chars: usize,
+    output_cap_chars: usize,
+) -> BoundedMask {
+    debug_assert!(
+        window_chars >= output_cap_chars,
+        "the input window must stay at least as large as the output cap"
+    );
+
+    let input_truncated = text.chars().nth(window_chars).is_some();
+    let mut window: String = text.chars().take(window_chars).collect();
+
+    if input_truncated {
+        match window
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+        {
+            // Keep the whitespace itself; drop only the partial token after it.
+            Some((idx, ch)) => window.truncate(idx + ch.len_utf8()),
+            // A single token spans the whole window: nothing can be shown
+            // whole, so show nothing at all.
+            None => window.clear(),
+        }
+    }
+
+    if input_truncated && window.is_empty() {
+        return BoundedMask {
+            text: TRUNCATION_MARKER.to_string(),
+            truncated: true,
+            redacted: true,
+        };
+    }
+
+    debug_assert!(window.chars().count() <= window_chars);
+    let masked = mask_for_redaction_surface(surface, &window);
+    let redacted = masked.as_ref() != window.as_str();
+
+    let mut chars = masked.chars();
+    let mut bounded: String = chars.by_ref().take(output_cap_chars).collect();
+    let output_capped = chars.next().is_some();
+    if output_capped || input_truncated {
+        bounded.push_str(TRUNCATION_MARKER);
+    }
+
+    BoundedMask {
+        text: bounded,
+        truncated: input_truncated || output_capped,
+        redacted,
+    }
+}
+
+const TRUNCATION_MARKER: &str = "…";
 
 /// Redact every detected secret span in `text`, replacing each with
 /// `***MASKED***`.
@@ -4554,6 +4666,106 @@ mod tests {
             assert!(masked.contains(REDACTION_MARKER));
             assert!(check(masked.as_ref()).is_ok());
         }
+    }
+
+    #[test]
+    fn mask_bounded_matches_unbounded_masking_when_input_fits_the_window() {
+        let content = format!("credential: {}", openai_project_key_fixture());
+        let expected = mask_for_redaction_surface(RedactionSurface::McpDiagnostic, &content);
+        let result = mask_bounded(RedactionSurface::McpDiagnostic, &content, 4_096, 1_024);
+        assert_eq!(result.text, expected.as_ref());
+        assert!(!result.truncated);
+        assert!(result.redacted);
+    }
+
+    #[test]
+    fn mask_bounded_masks_a_credential_whose_terminator_sits_inside_the_window() {
+        // The window is far larger than the message, and the credential's
+        // terminating `@` sits well inside it — the ordinary case where the
+        // masker sees the whole token and can recognize its shape.
+        let password = format!("PlainPassMarker{}", "q".repeat(24));
+        let url = format!("postgres://svc:{password}@internal-host.example.test/db");
+        let message = format!("backend probe failed: {url}");
+        assert!(message.chars().count() < 200, "fixture must fit the window");
+
+        let result = mask_bounded(RedactionSurface::McpDiagnostic, &message, 200, 100);
+        assert!(
+            !result.text.contains("PlainPassMarker"),
+            "credential must be masked: {}",
+            result.text
+        );
+        assert!(result.text.contains("***MASKED***"));
+        assert!(result.redacted);
+    }
+
+    #[test]
+    fn mask_bounded_drops_a_token_straddling_the_window_boundary_without_partial_leak() {
+        // Constructed so the credential token starts before the window ends
+        // but its terminating `@` lands well past it — a masker restricted
+        // to the window can never observe that `@`, so a truncate-then-mask
+        // policy (the pre-fix behavior at this call site) would recognize no
+        // span and let the visible prefix, including the marker below,
+        // survive untouched in the output. Bounding the input before
+        // masking must not reopen that hole: since the token has no internal
+        // whitespace, the fix drops it whole rather than emitting any
+        // fragment of it.
+        let window_chars = 200;
+        let marker = "StraddleMarkerXYZ789";
+        let padding = "q".repeat(window_chars + 100);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.test/db");
+        let message = format!("benign leading prose here {url}");
+
+        let at_offset = message.find('@').expect("fixture must contain '@'");
+        assert!(
+            at_offset > window_chars,
+            "credential must straddle the window"
+        );
+
+        let result = mask_bounded(RedactionSurface::McpDiagnostic, &message, window_chars, 100);
+        assert!(
+            !result.text.contains(marker),
+            "no fragment of the credential may survive: {}",
+            result.text
+        );
+        assert!(
+            !result.text.contains("postgres://"),
+            "the straddling token must be dropped whole, not partially echoed: {}",
+            result.text
+        );
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn mask_bounded_replaces_a_single_oversized_token_with_the_truncation_marker_alone() {
+        // One token (no whitespace anywhere) longer than the window: there is
+        // no earlier whitespace to fall back to, so nothing from the window
+        // can be shown safely.
+        let window_chars = 50;
+        let text = "q".repeat(window_chars * 4);
+
+        let result = mask_bounded(RedactionSurface::McpDiagnostic, &text, window_chars, 20);
+        assert_eq!(result.text, "…");
+        assert!(result.truncated);
+        assert!(result.redacted);
+    }
+
+    #[test]
+    fn mask_bounded_bounds_output_to_the_window_regardless_of_input_size() {
+        // Several megabytes of benign, whitespace-separated text. A
+        // truncate-then-mask or mask-then-truncate policy alike would still
+        // need to allocate and scan the full input before this function ever
+        // gets to cap the *output*; the point of `mask_bounded` is that the
+        // *masker* itself only ever sees `window_chars`. That is asserted
+        // here as a length invariant (never by wall-clock): the returned
+        // text can never exceed the window, no matter how large the input.
+        let window_chars = 4_096;
+        let huge = "benign word ".repeat(500_000);
+        assert!(huge.len() > 5_000_000, "fixture must be several megabytes");
+
+        let result = mask_bounded(RedactionSurface::McpDiagnostic, &huge, window_chars, 500);
+        assert!(result.truncated);
+        assert!(result.text.chars().count() <= 501);
     }
 
     #[test]

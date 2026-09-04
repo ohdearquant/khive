@@ -932,15 +932,21 @@ change, not an untyped boolean or caller option.
 
 ### 2. Session mirror (#2060)
 
-- **Final stored target:** `session_messages.text`, `session_messages.raw`, and `sessions.slug` —
-  the parsed title/slug projections (ChatGPT export `title`, Claude Code `slug`, and the claude.ai
-  export `name`/`summary` title) share the same masker as `text` and `raw`. Masking occurs while
-  constructing the parsed event or session record, before the mirror writes it.
+- **Final stored target:** `session_messages.text`, `session_messages.raw`,
+  `session_messages.cwd`, `session_messages.git_branch`, `sessions.slug`, `sessions.cwd`, and
+  `sessions.git_branch` — the parsed title/slug projections (ChatGPT export `title`, Claude Code
+  `slug`, and the claude.ai export `name`/`summary` title) share the same masker as `text` and
+  `raw`. Masking occurs while constructing the parsed event or session record, before the mirror
+  writes it.
+
+  > **Amendment 3 addition:** `cwd` and `git_branch` were copied verbatim into these columns until
+  > Amendment 3, which routes both through the same masking call as `text`/`raw`/`slug`. See
+  > [Amendment 3 §2](#2-session-mirror-cwd-and-git_branch-now-masked).
 - **Stamp location:** none. Session rows have no exemption posture property.
 - **Atomic success event:** none. Mirror persistence remains idempotent under its existing cursor
   and row semantics; masking is a deterministic transformation, not an admitted exemption.
-- **Readback:** only the masked text/raw/slug projections are returned. The mirror never retains an
-  alternate unmasked payload for later recovery.
+- **Readback:** only the masked text/raw/slug/cwd/git_branch projections are returned. The mirror
+  never retains an alternate unmasked payload for later recovery.
 
 ### 3. MCP diagnostics (#2061)
 
@@ -949,11 +955,16 @@ change, not an untyped boolean or caller option.
 - **Stamp location:** none.
 - **Atomic success event:** none. Transport sanitization happens independently of operation result
   persistence and cannot assert exemption success.
-- **Readback:** not applicable. Backend error message masking runs over the full, untruncated
-  message text before the input and output length caps are applied — a detector whose match spans
-  past a fixed truncation boundary (e.g. the terminating `@` of a `scheme://user:pass@host`
-  credential) must still be found. Truncation and omission metadata remain transport concerns and
-  do not create a durable redaction record.
+- **Readback:** not applicable. Truncation and omission metadata remain transport concerns and do
+  not create a durable redaction record.
+
+  > **Amendment 3 supersession:** the paragraph that stood here through Amendment 2 said masking
+  > "runs over the full, untruncated message text before the input and output length caps are
+  > applied," so a detector's match spanning past a fixed truncation boundary would still be found.
+  > That is no longer how this surface works: masking cost is now bounded by a fixed input window
+  > applied _before_ masking, not after, so a match cannot span past the window and be found by
+  > scanning further. See [Amendment 3](#amendment-3-2026-09-03-bounding-the-maskers-own-input)
+  > for why the boundary is closed a different way instead.
 
 ### 4. Security and acceptance invariants
 
@@ -968,3 +979,54 @@ These choices are conservative and one-way: permanently mask-only surfaces may l
 content, but they cannot become a laundering channel for manifest exemptions. A future need to
 preserve exact bytes must introduce a separately reviewed final stored target with atomic
 record/stamp/success-event semantics; it cannot reuse these masking wrappers.
+
+## Amendment 3 (2026-09-03): Bounding the masker's own input
+
+Amendment 2 closed the split-secret hole at every named diagnostic boundary by masking the full,
+untruncated input before any length cap was applied. That kept every credential detectable
+regardless of where its terminating span fell, at the cost of scan work (and, for
+`mask_secrets`'s span-collection and buffer allocation, memory) that scaled with the caller's raw
+input length — unbounded at the MCP and coordinator diagnostic boundaries, which accept
+arbitrarily long backend identifiers and failure messages from configuration and downstream
+errors.
+
+This amendment bounds the masker's own input to a fixed window (`secret_gate::MASK_WINDOW_CHARS`,
+shared by every named boundary so it cannot drift between them) applied _before_ masking runs, so
+cost is bounded by the window regardless of input length. Bounding the input before masking
+reopens the exact hole Amendment 2 closed unless handled carefully: a window cut mid-token would
+let a masker that never saw the token's terminating shape (e.g. the `@` closing
+`scheme://user:pass@host`) emit the token's visible, unmasked prefix. This amendment closes that
+hole a different way instead of widening the window to the input's full length: any token
+straddling the window boundary is dropped in its entirety — back to the last whitespace inside the
+window — rather than masked, because a masker can only vouch for a token it saw whole. A single
+token longer than the window has no earlier whitespace to fall back to and is replaced by the bare
+truncation marker. Content that fits inside the window is masked exactly as before; only input
+that exceeds the window changes behavior, trading a detected-and-masked credential for a
+dropped-and-never-echoed one.
+
+### 1. Shared bounded-masking primitive
+
+`secret_gate::mask_bounded(surface, text, window_chars, output_cap_chars)` implements the window,
+drop-partial-token, mask, and output-cap policy in one place and is the only place this policy is
+implemented. The MCP diagnostic boundary (`bounded_backend_error_message`,
+`bounded_backend_error_key` in `khive-mcp`) and the coordinator diagnostic boundary
+(`bounded_backend_cause_for_log`, `bounded_backend_id_for_log` in `kkernel`) both call it instead
+of separately duplicating the window-then-mask recipe, which is the condition that let the two
+boundaries carry different window constants before this amendment.
+
+### 2. Session mirror: `cwd` and `git_branch` now masked
+
+Independently of the windowing change, this amendment also closes a gap in the Amendment 2 session
+mirror surface: `cwd` and `git_branch` were captured from provider exports and copied verbatim into
+`sessions.cwd`/`sessions.git_branch` and `session_messages.cwd`/`session_messages.git_branch`,
+never passed through `mask_for_redaction_surface` the way `text`, `raw`, and `slug` already were.
+Both fields now route through the same masking call at parse time. `SESSION_MIRROR_STORED_TARGET`
+lists the full corrected column set.
+
+### 3. Invariant amendment
+
+Security and acceptance invariant 1 (§4 above) — "a detector match on any named surface is
+replaced by the canonical redaction marker" — holds only for content the masker actually receives.
+Content dropped whole for exceeding the window is never detected, matched, or marked; it is simply
+never echoed. Both outcomes satisfy the same goal (no credential fragment survives to the caller),
+by different means.
