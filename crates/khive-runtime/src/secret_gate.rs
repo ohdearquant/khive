@@ -79,10 +79,9 @@ impl std::fmt::Display for SecretMatch {
 /// is not — the common case for the detectors below, which key off SHAPE
 /// near a trigger word rather than a known credential prefix — the fix is to
 /// break up the flagged token so it no longer reads as one contiguous
-/// high-entropy value: put it on its own line away from words like
-/// key/secret/auth/token, or insert a space/punctuation inside a long path or
-/// identifier (e.g. `workspaces / 20260705 / topic` instead of one glued
-/// token).
+/// high-entropy value: separate it from words like key/secret/auth/token with
+/// a sentence or paragraph boundary, or use an explicit repository revision
+/// reference for a source hash.
 fn block_guidance(detector: &'static str) -> &'static str {
     match detector {
         "high-entropy-token"
@@ -91,9 +90,9 @@ fn block_guidance(detector: &'static str) -> &'static str {
         | "hex-credential-token" => {
             "If this is a real credential, remove it before writing. If it is not \
              (e.g. a file path, UUID, or hash that happens to sit near a word like \
-             key/secret/auth/token), reword so the token is not glued directly next \
-             to that word — e.g. move it to its own line, or insert a space or word \
-             between them."
+             key/secret/auth/token), put the candidate in a separate sentence or \
+             paragraph from those words, or express a source hash as an explicit \
+             commit/revision reference."
         }
         _ => {
             "If this is a real credential, remove it before writing; store secrets \
@@ -874,7 +873,7 @@ const TRIGGER_WINDOW: usize = 120;
 /// doubled, SHA-512 hex, etc.) — checked against a whole token, a single
 /// separator-delimited run, and a normalized (separator-stripped)
 /// concatenation of adjacent hex runs/tokens; see
-/// [`contains_normalized_hex_credential`].
+/// [`normalized_hex_credential_span`].
 const HEX_CREDENTIAL_LENGTHS: &[usize] = &[32, 40, 64, 128];
 
 /// Max fragments [`bridge_fragment_chain`] concatenates per credential (fragment-count bound,
@@ -967,8 +966,8 @@ fn check_entropy_heuristic<'a>(
         // Must not provide its own trigger context (e.g. a path slug like
         // `ADR-051-cli-auth-and-kg-git-workflow.md`); see
         // docs/api/secret_gate.md#check_entropy_heuristic--per-token-flagging-sequence.
-        let near_trigger = contains_trigger(&window[..raw_start])
-            || contains_trigger(&window[raw_end..])
+        let near_trigger = contains_trigger(after_last_sentence_boundary(&window[..raw_start]))
+            || contains_trigger(before_first_sentence_boundary(&window[raw_end..]))
             || has_inline_credential_trigger(raw_token);
         let uuid_near_credential_label = contains_credential_label_trigger(&window[..raw_start])
             || contains_credential_label_trigger(&window[raw_end..])
@@ -1012,13 +1011,30 @@ fn check_entropy_heuristic<'a>(
             continue;
         }
 
-        let vcs_reference_exempt = is_git_revision_reference(text, token_offset, raw_token)
-            && !has_clause_credential_label(
-                text,
-                token_offset,
-                raw_token,
-                ClauseValueKind::VcsReference,
-            );
+        let repository_revision_reference = is_repository_revision_reference(raw_token);
+        let vcs_reference_exempt = if repository_revision_reference {
+            !has_direct_repository_credential_label(text, token_offset, raw_token)
+        } else {
+            is_git_revision_reference(text, token_offset, raw_token)
+                && !has_clause_credential_label(
+                    text,
+                    token_offset,
+                    raw_token,
+                    ClauseValueKind::VcsReference,
+                )
+        };
+
+        // Dense mathematical notation has the same mixed-character entropy
+        // profile as an opaque token. Exempt a syntactically recognizable
+        // LaTeX fragment only when it contains no credential-shaped run and
+        // the immediately preceding field does not label it as a credential
+        // (#1988). Known-prefix detectors have already run before this layer.
+        if near_trigger
+            && is_latex_fragment_without_credential_run(token)
+            && !has_immediate_credential_label(text, token_offset)
+        {
+            continue;
+        }
 
         // Step 3. Hex API keys aren't caught by the entropy heuristic (hex tops out at
         // 4.0 bits/char, below ENTROPY_THRESHOLD 4.5); flag credential-shaped hex directly.
@@ -1045,7 +1061,7 @@ fn check_entropy_heuristic<'a>(
                     && is_pure_hex(run)
                     && HEX_CREDENTIAL_LENGTHS.contains(&run.len())
                 {
-                    return Some((token, "hex-credential-token"));
+                    return Some((run, "hex-credential-token"));
                 }
                 if shannon_entropy(run.as_bytes()) >= ENTROPY_THRESHOLD {
                     return Some((token, "high-entropy-token"));
@@ -1055,8 +1071,10 @@ fn check_entropy_heuristic<'a>(
             // Step 5 (#1062): concatenate consecutive pure-hex runs (dropping
             // separators) and re-check against HEX_CREDENTIAL_LENGTHS — catches a
             // hex payload split into multiple sub-floor runs. See doc.
-            if !vcs_reference_exempt && contains_normalized_hex_credential(token) {
-                return Some((token, "hex-credential-token"));
+            if !vcs_reference_exempt {
+                if let Some(candidate) = normalized_hex_credential_span(token) {
+                    return Some((candidate, "hex-credential-token"));
+                }
             }
 
             // Step 6 (#1062, Unicode variant): bridge fragments split across non-ASCII
@@ -1068,9 +1086,15 @@ fn check_entropy_heuristic<'a>(
             if !vcs_reference_exempt && tokens.len() > 1 {
                 let fragments = bridge_fragment_chain(tokens, text, idx);
                 if fragments.len() > 1 {
-                    let hex_probe = fragments.join(" ");
-                    if contains_normalized_hex_credential(&hex_probe) {
-                        return Some((token, "hex-credential-token"));
+                    let first = fragments[0];
+                    let last = fragments[fragments.len() - 1];
+                    let chain_start = first.as_ptr() as usize - text.as_ptr() as usize;
+                    let chain_end = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
+                    let search_start = chain_start.max(from);
+                    if let Some(candidate) =
+                        normalized_hex_credential_span(&text[search_start..chain_end])
+                    {
+                        return Some((candidate, "hex-credential-token"));
                     }
                     let concatenated: String = fragments.concat();
                     if concatenated.len() >= MIN_ENTROPY_LEN
@@ -1092,6 +1116,14 @@ fn check_entropy_heuristic<'a>(
             {
                 continue;
             }
+        }
+
+        // Canonical repository links and href commit targets are source
+        // coordinates, not standalone values. The direct-label guard above
+        // keeps `api key: <revision URL>` fail-closed; technical prose such as
+        // `key-scoped source` can safely retain the citation (#2076).
+        if vcs_reference_exempt {
+            continue;
         }
 
         // Step 8: structured-identifier exemption, off-trigger only. Must run after the
@@ -1116,7 +1148,7 @@ fn check_entropy_heuristic<'a>(
 
 /// `true` when every byte of `run` is an ASCII hex digit. The
 /// no-minimum-length, no-`0x`-prefix building block for
-/// [`contains_normalized_hex_credential`]'s intra-token run decomposition.
+/// [`normalized_hex_credential_span`]'s intra-token run decomposition.
 /// Unlike [`is_pure_hex`] this has no 8-char floor of its own — a legitimate
 /// credential split across separators can leave a shorter individual run
 /// that still must sum correctly with its neighbors.
@@ -1170,12 +1202,98 @@ fn is_git_revision_reference(text: &str, token_offset: usize, raw_token: &str) -
         && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn is_exact_hex_revision(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Repository-native revision coordinates embedded in a URL/HTML token.
+///
+/// This intentionally recognizes only exact 40-hex revisions after a
+/// canonical repository path marker, plus an exact `href=<40hex>` target.
+/// Arbitrary query values, prefixes, and credential-length hex elsewhere in
+/// markup remain subject to the normal detector.
+fn is_repository_revision_reference(raw_token: &str) -> bool {
+    let token = wrapper_strip_repeated(raw_token);
+    let low = token.to_ascii_lowercase();
+
+    for marker in ["/blob/", "/tree/", "/commit/", "/commits/"] {
+        let mut from = 0usize;
+        while let Some(relative) = low[from..].find(marker) {
+            let value_start = from + relative + marker.len();
+            let remainder = &token[value_start..];
+            let value_end = remainder
+                .bytes()
+                .position(|byte| !byte.is_ascii_hexdigit())
+                .unwrap_or(remainder.len());
+            if is_exact_hex_revision(&remainder[..value_end]) {
+                return true;
+            }
+            from = value_start.min(low.len());
+            if from == low.len() {
+                break;
+            }
+        }
+    }
+
+    for (prefix, quote) in [("href=\"", '"'), ("href='", '\'')] {
+        if let Some(start) = low.find(prefix) {
+            let value = &token[start + prefix.len()..];
+            if let Some(end) = value.find(quote) {
+                if is_exact_hex_revision(&value[..end]) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn trailing_identifier(text: &str) -> &str {
     let trimmed = text.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
     trimmed
         .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .next()
         .unwrap_or_default()
+}
+
+/// Return whether the identifier immediately preceding a candidate is a
+/// credential label. This deliberately does not walk through narrative prose:
+/// notation such as `key estimate uses \\operatorname{softmax}` contains a
+/// trigger word, but does not assign the LaTeX fragment to that word.
+fn has_immediate_credential_label(text: &str, token_offset: usize) -> bool {
+    let before = text[..token_offset].trim_end();
+    let before = before
+        .strip_suffix(':')
+        .or_else(|| before.strip_suffix('='))
+        .unwrap_or(before);
+    let label = trailing_identifier(before).to_ascii_lowercase();
+
+    label == "token"
+        || COMPOUND_TRIGGER_WORDS
+            .iter()
+            .any(|trigger| label.contains(trigger))
+        || TRIGGER_WORDS
+            .iter()
+            .any(|trigger| contains_bounded_word(&label, trigger))
+}
+
+/// A repository revision URL/href is exempt from broad trigger proximity,
+/// but never from a direct credential label. When a value separator is
+/// present immediately before the reference, only its actual field label is
+/// authoritative: narrative shapes such as `key-scoped source citation:`
+/// must not turn the earlier adjective into the citation value's label.
+fn has_direct_repository_credential_label(
+    text: &str,
+    token_offset: usize,
+    raw_token: &str,
+) -> bool {
+    let before = text[..token_offset].trim_end();
+    if before.ends_with(':') || before.ends_with('=') {
+        return has_immediate_credential_label(text, token_offset);
+    }
+
+    has_clause_credential_label(text, token_offset, raw_token, ClauseValueKind::VcsReference)
 }
 
 /// Words the clause walk in [`has_clause_credential_label`] steps over when
@@ -1256,6 +1374,57 @@ enum ClauseValueKind {
     FilePath,
 }
 
+/// End offset of a sentence/paragraph boundary beginning at `index`.
+///
+/// A single newline remains intra-sentence so natural credential assignments
+/// such as `api key:\n<value>` stay protected. Blank lines, clause-ending
+/// punctuation, and a period followed by a non-alphanumeric byte end the
+/// surrounding trigger context. The period rule deliberately keeps `v1.2`
+/// intra-sentence.
+fn sentence_boundary_end_at(bytes: &[u8], index: usize) -> Option<usize> {
+    match bytes.get(index).copied()? {
+        b';' | b'!' | b'?' => Some(index + 1),
+        b'.' if bytes
+            .get(index + 1)
+            .is_some_and(|next| !next.is_ascii_alphanumeric()) =>
+        {
+            Some(index + 1)
+        }
+        b'\n' if bytes.get(index + 1) == Some(&b'\n') => Some(index + 2),
+        b'\r'
+            if bytes
+                .get(index..index + 4)
+                .is_some_and(|window| window == b"\r\n\r\n") =>
+        {
+            Some(index + 4)
+        }
+        _ => None,
+    }
+}
+
+/// Context after the final sentence boundary in `text`.
+fn after_last_sentence_boundary(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    for index in 0..bytes.len() {
+        if let Some(end) = sentence_boundary_end_at(bytes, index) {
+            start = end;
+        }
+    }
+    &text[start..]
+}
+
+/// Context before the first sentence boundary in `text`.
+fn before_first_sentence_boundary(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    for index in 0..bytes.len() {
+        if sentence_boundary_end_at(bytes, index).is_some() {
+            return &text[..index];
+        }
+    }
+    text
+}
+
 /// Sentence/paragraph boundary inside a clause-walk gap. `;`, `!`, `?`, and
 /// blank lines always end the clause. `.` ends it only when it is not
 /// immediately followed by an alphanumeric character: a dot tight between
@@ -1263,16 +1432,8 @@ enum ClauseValueKind {
 /// the end of the gap abuts the next identifier (gaps end where the adjacent
 /// identifier begins) and is likewise intra-token.
 fn gap_has_sentence_boundary(gap: &str) -> bool {
-    if gap.contains("\n\n") || gap.contains("\r\n\r\n") || gap.contains([';', '!', '?']) {
-        return true;
-    }
     let bytes = gap.as_bytes();
-    bytes.iter().enumerate().any(|(i, b)| {
-        *b == b'.'
-            && bytes
-                .get(i + 1)
-                .is_some_and(|next| !next.is_ascii_alphanumeric())
-    })
+    (0..bytes.len()).any(|index| sentence_boundary_end_at(bytes, index).is_some())
 }
 
 /// Version-shaped identifier fragment ("2", "v1", "12") — the pieces a dotted
@@ -1517,6 +1678,35 @@ fn is_plausible_file_path(token: &str) -> bool {
     segment_count >= 2 || (path.starts_with('/') && segment_count == 1)
 }
 
+/// Narrow high-entropy exemption for mathematical notation (#1988).
+///
+/// A fragment needs both a LaTeX control sequence and several structural
+/// delimiters. Any embedded credential-length hex or independently
+/// high-entropy alphanumeric run disables the exemption, so wrapping an
+/// opaque value in `\texttt{...}` does not launder it.
+fn is_latex_fragment_without_credential_run(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let has_control_sequence = bytes
+        .windows(2)
+        .any(|pair| pair[0] == b'\\' && pair[1].is_ascii_alphabetic());
+    let structural_count = bytes
+        .iter()
+        .filter(|byte| matches!(byte, b'\\' | b'{' | b'}' | b'^' | b'_'))
+        .count();
+    if !has_control_sequence || structural_count < 3 {
+        return false;
+    }
+
+    if normalized_hex_credential_span(token).is_some() {
+        return false;
+    }
+
+    !token
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|run| run.len() >= MIN_ENTROPY_LEN)
+        .any(|run| shannon_entropy(run.as_bytes()) >= ENTROPY_THRESHOLD)
+}
+
 fn is_line_location_suffix(suffix: &str) -> bool {
     if suffix.is_empty() {
         return true;
@@ -1535,9 +1725,9 @@ fn is_line_location_suffix(suffix: &str) -> bool {
         && parts.next().is_none()
 }
 
-/// `true` when concatenating consecutive pure-hex runs in `token` — splitting
-/// on every non-alphanumeric character and dropping the separators
-/// themselves — reaches one of [`HEX_CREDENTIAL_LENGTHS`].
+/// The raw span whose consecutive pure-hex runs — splitting on every
+/// non-alphanumeric character and dropping the separators for length
+/// accounting — reach one of [`HEX_CREDENTIAL_LENGTHS`].
 ///
 /// Closes the separator-dilution bypass (#1062) where a credential-length
 /// hex payload is spread across multiple runs each individually below
@@ -1546,22 +1736,27 @@ fn is_line_location_suffix(suffix: &str) -> bool {
 /// credential-length boundary, but normalize to one 40-char hex sequence.
 /// A non-hex, non-empty run resets the running sum — this only bridges
 /// ADJACENT hex runs, not hex fragments scattered across unrelated filler.
-fn contains_normalized_hex_credential(token: &str) -> bool {
+fn normalized_hex_credential_span(token: &str) -> Option<&str> {
     let mut concatenated_len = 0usize;
+    let mut span_start = 0usize;
     for run in token.split(|c: char| !c.is_ascii_alphanumeric()) {
         if run.is_empty() {
             continue;
         }
         if is_hex_run(run) {
+            let run_start = run.as_ptr() as usize - token.as_ptr() as usize;
+            if concatenated_len == 0 {
+                span_start = run_start;
+            }
             concatenated_len += run.len();
             if HEX_CREDENTIAL_LENGTHS.contains(&concatenated_len) {
-                return true;
+                return Some(&token[span_start..run_start + run.len()]);
             }
         } else {
             concatenated_len = 0;
         }
     }
-    false
+    None
 }
 
 /// `true` when the gap `text[gap_start..gap_end]` between two adjacent
@@ -1657,7 +1852,7 @@ fn probe_bridge_fragment(
 /// document order, for the caller to recombine — any delimiter-only glue
 /// tokens absorbed along the way (#1062) are dropped from the
 /// result entirely, so a caller joining fragments with a space
-/// ([`contains_normalized_hex_credential`]) or concatenating them directly
+/// ([`normalized_hex_credential_span`]) or concatenating them directly
 /// (the generic entropy check) sees only the genuine fragments, exactly as
 /// if the glue were more gap. Extends both directions every iteration so a
 /// credential split with fragments on both sides of the anchor (e.g. the
@@ -3236,6 +3431,115 @@ mod tests {
             scan(&line).is_some(),
             "32-char pure hex near 'api key' must be blocked; got None"
         );
+    }
+
+    #[test]
+    fn issue_2056_hex_bridge_masks_the_matched_candidate() {
+        let hex32 = "0af7651916cd43dd8448eb211c80319c";
+        let content = format!("api key values verbatim:\n  {hex32}");
+
+        let (candidate, detector) = scan_match(&content).expect("credential must have a span");
+        assert_eq!(detector, "hex-credential-token");
+        assert_eq!(candidate, hex32);
+        assert!(candidate.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let matched = scan(&content).expect("credential-labeled hex must be blocked");
+        assert_eq!(matched.detector, "hex-credential-token");
+        assert_eq!(matched.masked, "0af765...32chars");
+    }
+
+    #[test]
+    fn issue_2056_detector_name_does_not_trigger_across_sentence_boundary() {
+        let content = "The hex-credential-token bucket held 18. Six are two values verbatim:\n\
+                       0af7651916cd43dd8448eb211c80319c -- spec example identifier";
+
+        assert!(
+            check(content).is_ok(),
+            "a detector name in an earlier sentence must not trigger: {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn issue_2076_allows_repository_revision_links_near_prose_triggers() {
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let contents = [
+            format!(
+                "key-scoped source citation: \
+                 https://github.com/acme/widgets/blob/{revision}/src/runtime/mod.rs"
+            ),
+            format!("auth-bound rendering keeps <a href=\"{revision}\">the commit link</a> intact"),
+        ];
+
+        for content in contents {
+            assert!(
+                check(&content).is_ok(),
+                "repository revision reference must pass: {content:?}, got {:?}",
+                scan(&content)
+            );
+        }
+    }
+
+    #[test]
+    fn issue_2076_repository_revision_links_do_not_hide_labeled_secrets() {
+        let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
+        let contents = [
+            format!("api key: https://github.com/acme/widgets/blob/{revision}/src/runtime/mod.rs"),
+            format!("secret key: href=\"{revision}\""),
+        ];
+
+        for content in contents {
+            assert!(
+                check(&content).is_err(),
+                "a direct credential label must still block: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_2076_guidance_names_a_boundary_that_changes_the_predicate() {
+        let guidance = block_guidance("high-entropy-token");
+        assert!(guidance.contains("sentence") || guidance.contains("paragraph"));
+        assert!(
+            !guidance.contains("own line"),
+            "a single newline remains inside the trigger window"
+        );
+    }
+
+    #[test]
+    fn issue_1988_allows_dense_latex_fragments_near_math_vocabulary() {
+        let latex = r"\operatorname{Spec}_{H_0^1(\Omega)}(K_N(\tau_{\omega}))^{1/2}";
+        assert!(latex.len() >= MIN_ENTROPY_LEN);
+        assert!(shannon_entropy(latex.as_bytes()) >= ENTROPY_THRESHOLD);
+        let content = format!("the attention key estimate uses {latex}");
+
+        assert!(
+            check(&content).is_ok(),
+            "LaTeX structure must not be mistaken for a credential: {:?}",
+            scan(&content)
+        );
+    }
+
+    #[test]
+    fn issue_1988_latex_exemption_does_not_hide_credential_runs() {
+        let credential = "a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4";
+        let content = format!(r"api key: \texttt{{{credential}}}");
+
+        assert!(
+            check(&content).is_err(),
+            "credential-shaped runs inside LaTeX must remain blocked"
+        );
+    }
+
+    #[test]
+    fn issue_1988_published_secret_vectors_remain_fail_closed() {
+        // RFC 8032 Ed25519ph example secret. Published status cannot be
+        // inferred from shape, so exact vectors remain blocked unless a
+        // caller uses the separately audited exemption contract.
+        let published = "833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42";
+        let content = format!("RFC 8032 secret key test vector: {published}");
+
+        assert!(check(&content).is_err());
     }
 
     #[test]
@@ -4968,7 +5272,7 @@ mod tests {
         assert!(is_plausible_file_path(tokens[anchor].1));
         let fragments = bridge_fragment_chain(&tokens, content, anchor);
         assert_eq!(fragments.len(), 2);
-        assert!(contains_normalized_hex_credential(&fragments.join(" ")));
+        assert!(normalized_hex_credential_span(&fragments.join(" ")).is_some());
         assert!(
             check(content).is_err(),
             "path-shaped anchor must not bypass fragment reconstruction: got {:?}",
@@ -5862,14 +6166,14 @@ mod tests {
     }
 
     #[test]
-    fn block_message_shape_guidance_mentions_rewording() {
+    fn block_message_shape_guidance_names_effective_boundary() {
         let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
         let content = format!("auth header {opaque}");
         let m = scan(&content).unwrap();
         let rendered = m.to_string();
         assert!(
-            rendered.contains("reword") || rendered.contains("own line"),
-            "shape-based detector guidance must suggest rewording/splitting: {rendered}"
+            rendered.contains("sentence") || rendered.contains("paragraph"),
+            "shape-based detector guidance must name an effective context boundary: {rendered}"
         );
     }
 }
