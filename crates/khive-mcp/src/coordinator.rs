@@ -67,8 +67,16 @@ pub struct BackendSearchResult {
     pub backend_id: BackendId,
     pub entity_hits: Vec<SearchHit>,
     pub note_hits: Vec<NoteSearchHit>,
-    /// Populated when this backend errored during the fan-out.
+    /// Whether this backend selected the vector arm for this search.
+    pub vector_selected: bool,
+    /// Populated when this backend errored during the fan-out. A whole-backend
+    /// failure (e.g. the text arm, or a fatal error before either arm ran) —
+    /// this backend contributed no hits at all.
     pub error: Option<String>,
+    /// Populated when only the vector arm failed and the text arm still ran:
+    /// `entity_hits` still carries the text arm's results, and `error` above
+    /// stays `None`.
+    pub vector_error: Option<String>,
 }
 
 /// Merged fan-out search result.
@@ -175,6 +183,10 @@ pub(crate) mod tests {
         pub search_called: std::sync::atomic::AtomicBool,
         pub single_backend: bool,
         pub failed_backend: Option<BackendId>,
+        /// A backend whose vector arm alone fails — its text arm still runs
+        /// and contributes hits, so it must not appear in `failed_backend`'s
+        /// whole-backend-error reporting.
+        pub vector_failed_backend: Option<BackendId>,
         /// When `true`, `fan_out_search` returns zero hits regardless of
         /// substrate — used to construct the "complete-empty" (healthy, no
         /// match) and "degraded-empty" (backend failed, no survivor)
@@ -195,6 +207,7 @@ pub(crate) mod tests {
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
                 failed_backend: None,
+                vector_failed_backend: None,
                 empty_hits: false,
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
@@ -211,6 +224,7 @@ pub(crate) mod tests {
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
                 failed_backend: None,
+                vector_failed_backend: None,
                 empty_hits: true,
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
@@ -224,6 +238,7 @@ pub(crate) mod tests {
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
                 failed_backend: Some(BackendId::parse(failed_backend).expect("valid backend id")),
+                vector_failed_backend: None,
                 empty_hits: false,
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
@@ -239,7 +254,28 @@ pub(crate) mod tests {
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
                 failed_backend: Some(BackendId::parse(failed_backend).expect("valid backend id")),
+                vector_failed_backend: None,
                 empty_hits: true,
+                last_search_request: std::sync::Mutex::new(None),
+                last_limit: std::sync::atomic::AtomicU32::new(0),
+                last_extra_visible: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// A backend's vector arm alone failed — its text arm still ran and
+        /// contributed hits, so this must read as `status="complete"` with
+        /// `arm_participation.text.status="ran"`, not as a whole-backend
+        /// failure.
+        pub fn vector_degraded_multi_backend(vector_failed_backend: &str) -> Arc<Self> {
+            Arc::new(Self {
+                link_called: std::sync::atomic::AtomicBool::new(false),
+                search_called: std::sync::atomic::AtomicBool::new(false),
+                single_backend: false,
+                failed_backend: None,
+                vector_failed_backend: Some(
+                    BackendId::parse(vector_failed_backend).expect("valid backend id"),
+                ),
+                empty_hits: false,
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
                 last_extra_visible: std::sync::Mutex::new(Vec::new()),
@@ -252,6 +288,7 @@ pub(crate) mod tests {
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: true,
                 failed_backend: None,
+                vector_failed_backend: None,
                 empty_hits: false,
                 last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
@@ -323,17 +360,47 @@ pub(crate) mod tests {
                 } else {
                     vec![]
                 },
-                per_backend: self
-                    .failed_backend
-                    .iter()
-                    .cloned()
-                    .map(|backend_id| BackendSearchResult {
-                        backend_id,
-                        entity_hits: vec![],
-                        note_hits: vec![],
-                        error: Some("injected search failure".to_string()),
-                    })
-                    .collect(),
+                per_backend: std::iter::once(BackendSearchResult {
+                    backend_id: BackendId::main(),
+                    entity_hits: vec![],
+                    note_hits: vec![],
+                    vector_selected: true,
+                    error: None,
+                    vector_error: None,
+                })
+                .chain(
+                    self.failed_backend
+                        .iter()
+                        .cloned()
+                        .map(|backend_id| BackendSearchResult {
+                            backend_id,
+                            entity_hits: vec![],
+                            note_hits: vec![],
+                            vector_selected: true,
+                            error: Some("injected search failure".to_string()),
+                            vector_error: None,
+                        }),
+                )
+                .chain(
+                    self.vector_failed_backend
+                        .iter()
+                        .cloned()
+                        .map(|backend_id| BackendSearchResult {
+                            backend_id,
+                            entity_hits: vec![SearchHit {
+                                entity_id: id,
+                                score: Default::default(),
+                                source: SearchSource::Text,
+                                title: Some("entity result".to_string()),
+                                snippet: None,
+                            }],
+                            note_hits: vec![],
+                            vector_selected: true,
+                            error: None,
+                            vector_error: Some("injected vector-arm failure".to_string()),
+                        }),
+                )
+                .collect(),
                 partial: self.failed_backend.is_some(),
                 entity_kinds: std::collections::HashMap::from([(id, "concept".to_string())]),
                 note_kinds: std::collections::HashMap::from([(id, "observation".to_string())]),
@@ -618,13 +685,17 @@ pub(crate) mod tests {
     #[serial_test::serial(config_ledger)]
     async fn degraded_search_advisory_survives_single_batch_chain_and_presentation() {
         let cases = [
-            (r#"search(kind="note", query="x")"#, None),
-            (r#"[search(kind="entity", query="x"), stats()]"#, None),
-            (r#"search(kind="entity", query="x") | stats()"#, None),
-            (r#"search(kind="entity", query="x")"#, Some("human")),
+            (r#"search(kind="note", query="x")"#, None, true),
+            (
+                r#"[search(kind="entity", query="x"), stats()]"#,
+                None,
+                false,
+            ),
+            (r#"search(kind="entity", query="x") | stats()"#, None, false),
+            (r#"search(kind="entity", query="x")"#, Some("human"), false),
         ];
 
-        for (ops, presentation) in cases {
+        for (ops, presentation, is_note) in cases {
             let (registry, _runtime) = make_registry();
             let coord = MockCoordinator::degraded_multi_backend("archive");
             let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
@@ -652,6 +723,15 @@ pub(crate) mod tests {
             );
             assert_eq!(search["partial"], json!(true));
             assert_eq!(search["missing_backends"], json!(["archive"]));
+            let expected_text_candidates = usize::from(!is_note);
+            assert_eq!(
+                search["arm_participation"],
+                json!({
+                    "text": {"status": "error", "candidate_count": expected_text_candidates},
+                    "vector": {"status": "error", "candidate_count": 1}
+                }),
+                "selected arms must remain typed on partial-with-hit responses"
+            );
             assert_eq!(
                 search["backend_errors"],
                 json!({
@@ -693,9 +773,77 @@ pub(crate) mod tests {
         assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
         assert_eq!(search["status"], json!("complete"));
         assert_eq!(search["result"], json!([]));
+        assert_eq!(
+            search["arm_participation"],
+            json!({
+                "text": {"status": "ran", "candidate_count": 0},
+                "vector": {"status": "ran", "candidate_count": 0}
+            })
+        );
         assert!(search.get("partial").is_none());
         assert!(search.get("missing_backends").is_none());
         assert!(search.get("backend_errors").is_none());
+    }
+
+    /// A vector-arm-only failure (the text arm still ran and contributed a
+    /// hit) must read as a healthy `status="complete"` response, never a
+    /// whole-backend failure: no `partial`/`missing_backends`/`backend_errors`,
+    /// and `arm_participation` alone carries the vector arm's error while the
+    /// text arm still reports `"ran"`.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn search_vector_arm_failure_reports_complete_status_with_arm_participation_error() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::vector_degraded_multi_backend("archive");
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"search(kind="entity", query="LoRA")"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("a vector-arm-only failure is still a successful dispatch");
+        let response: Value = serde_json::from_str(&raw).expect("JSON response");
+        let search = &response["results"][0];
+        assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
+        assert_eq!(
+            search["status"],
+            json!("complete"),
+            "unexpected response: {search}"
+        );
+        assert!(
+            !search["result"].as_array().unwrap().is_empty(),
+            "text arm's hit must survive: {search}"
+        );
+        assert!(
+            search.get("partial").is_none(),
+            "a vector-arm-only failure must not read as partial: {search}"
+        );
+        assert!(
+            search.get("missing_backends").is_none(),
+            "a backend that returned text hits is not missing: {search}"
+        );
+        assert!(
+            search.get("backend_errors").is_none(),
+            "unexpected response: {search}"
+        );
+        assert_eq!(
+            search["arm_participation"]["text"]["status"],
+            json!("ran"),
+            "unexpected response: {search}"
+        );
+        assert_eq!(
+            search["arm_participation"]["vector"]["status"],
+            json!("error"),
+            "unexpected response: {search}"
+        );
     }
 
     /// ADR-130 §1 completeness contract, degraded-empty case: a backend
@@ -731,6 +879,13 @@ pub(crate) mod tests {
         assert_eq!(search["error"]["kind"], json!("search_incomplete"));
         assert_eq!(search["error"]["retryable"], json!(false));
         assert_eq!(search["error"]["missing_backends"], json!(["archive"]));
+        assert_eq!(
+            search["error"]["arm_participation"],
+            json!({
+                "text": {"status": "error", "candidate_count": 0},
+                "vector": {"status": "error", "candidate_count": 0}
+            })
+        );
         assert_eq!(
             search["error"]["backend_errors"],
             json!({
@@ -985,6 +1140,15 @@ pub(crate) mod tests {
                 hit.get("source").and_then(serde_json::Value::as_str),
                 Some(expected_source),
                 "{kind} hit must expose its retrieval source; got: {hit}"
+            );
+            let expected_text_candidates = usize::from(kind == "entity");
+            assert_eq!(
+                entry["arm_participation"],
+                json!({
+                    "text": {"status": "ran", "candidate_count": expected_text_candidates},
+                    "vector": {"status": "ran", "candidate_count": 1}
+                }),
+                "{kind} search must count final candidates by source membership"
             );
             assert!(entry.get("partial").is_none());
             assert!(entry.get("missing_backends").is_none());
