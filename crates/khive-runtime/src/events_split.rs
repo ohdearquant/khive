@@ -357,6 +357,8 @@ fn direct_backend(
             .create_new(true)
             .mode(0o600)
             .open(db_path);
+        // Before the open, and only before it: see the precondition on
+        // `harden_events_db_sidecars`.
         harden_events_db_sidecars(db_path)
             .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     }
@@ -674,6 +676,15 @@ fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
 /// Tighten the events database and its SQLite sidecars to owner-only.
 /// Fail closed, same contract as the socket chmod: a daemon that cannot
 /// keep its database owner-only must not serve it.
+///
+/// PRECONDITION: no SQLite connection to `db_path` may be open in this
+/// process. This function opens and closes a descriptor on the database and
+/// on each sidecar, and POSIX advisory locks are per process and per inode,
+/// released by the close of ANY descriptor for the inode (fcntl(2)): called
+/// on a live database it silently drops the SHARED lock SQLite keeps in WAL
+/// mode and the `-shm` DMS lock, while the connection believes it still
+/// holds them. Both callers run it before their open; keep it that way. The
+/// post-open check that opens nothing is `verify_events_db_owner_only_unopened`.
 #[cfg(unix)]
 fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -713,6 +724,52 @@ fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
                     path.display()
                 )
             })?;
+    }
+    Ok(())
+}
+
+/// Check, after SQLite has opened the database, that it and its sidecars are
+/// owner-only regular files WITHOUT opening any of them: `lstat` takes no
+/// descriptor, so it cannot release the advisory locks the open connections
+/// hold (see the precondition on `harden_events_db_sidecars`). Sidecars
+/// SQLite creates inherit the database file's mode, so a failure here means
+/// something else changed the file set; refuse to serve rather than tighten
+/// through a path-based chmod and its lookup race.
+#[cfg(unix)]
+fn verify_events_db_owner_only_unopened(db_path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut targets = vec![db_path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        targets.push(PathBuf::from(name));
+    }
+    for path in targets {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                anyhow::bail!(
+                    "refusing to serve events: cannot stat {}: {e}",
+                    path.display()
+                )
+            }
+        };
+        if !metadata.file_type().is_file() {
+            anyhow::bail!(
+                "refusing to serve events: {} is not a regular file. The events database \
+                 and its sidecars must be regular files.",
+                path.display()
+            );
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "refusing to serve events: {} is mode {mode:03o}, not owner-only. The events \
+                 database and its sidecars must be owner-only.",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -858,12 +915,23 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
         return Ok(());
     };
     ensure_events_db_owner_only(db_path)?;
+    // Tighten a pre-existing database and any `-wal`/`-shm` an earlier
+    // process left behind BEFORE SQLite opens the database. The order is
+    // load-bearing: hardening opens and closes its own descriptor on each of
+    // these files, and POSIX advisory locks are per process and per inode,
+    // released by the close of ANY descriptor for the inode (fcntl(2)). Run
+    // after the open, it silently dropped the SHARED lock SQLite keeps on the
+    // database in WAL mode and the shared lock on the `-shm` DMS byte, so the
+    // next external connection to close (a backup tool, an inspection shell)
+    // took itself for the last connection, checkpointed, and unlinked the
+    // sidecars underneath this daemon, which kept writing to the unlinked
+    // inodes. Sidecars SQLite creates from here on inherit the database
+    // file's mode; the check after the open below opens nothing.
+    harden_events_db_sidecars(db_path)?;
     let backend = Arc::new(StorageBackend::sqlite(db_path)?);
     // Ensure the schema once, loudly, before accepting traffic.
     backend.events()?;
-    // The `-wal`/`-shm` sidecars inherit the database file's mode at
-    // creation; tighten any that already exist from before the hardening.
-    harden_events_db_sidecars(db_path)?;
+    verify_events_db_owner_only_unopened(db_path)?;
 
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
@@ -2234,6 +2302,51 @@ mod tests {
         assert!(
             !sidecar.exists(),
             "refusal must precede creation of the events database"
+        );
+    }
+
+    #[test]
+    fn unopened_check_refuses_a_loosened_or_replaced_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = dir.path().join("events.db");
+        let wal = PathBuf::from(format!("{}-wal", db.display()));
+        let shm = PathBuf::from(format!("{}-shm", db.display()));
+        for path in [&db, &wal] {
+            std::fs::write(path, b"").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        // Owner-only regular files, an absent `-shm`: nothing to refuse.
+        verify_events_db_owner_only_unopened(&db).unwrap();
+
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = verify_events_db_owner_only_unopened(&db)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("events.db-wal") && err.contains("644"),
+            "{err}"
+        );
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        verify_events_db_owner_only_unopened(&db).unwrap();
+
+        // A link planted at the `-shm` name is refused as not a regular file,
+        // and the check never followed it: the target keeps its mode.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&victim, &shm).unwrap();
+        let err = verify_events_db_owner_only_unopened(&db)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("events.db-shm") && err.contains("regular file"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
         );
     }
 
