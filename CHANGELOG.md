@@ -24,9 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpointed, and unlinked the sidecars while the daemon kept writing to the
   unlinked files. Hardening now runs before the open, the post-open check uses
   `lstat` only, and a cross-process test asserts the locks are held. The
-  embedded backend registry resolves a database by file identity before it
-  hardens anything, so a second spelling of a held database reuses the open
-  backend and the other access mode is refused instead of touching held files.
+  embedded backend registry resolves a database by the inode it pinned at
+  open, so a held database is found under any spelling and after a rename: a
+  second spelling reuses the open backend, a read-only open of a database the
+  process holds writable is refused, and a writable open beside a read-only
+  holder goes through SQLite alone, with no hardening of the held files.
 
 ## [0.8.0] - 2026-08-27
 
