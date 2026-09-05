@@ -357,10 +357,42 @@ fn direct_backend(
             .create_new(true)
             .mode(0o600)
             .open(db_path);
-        // Before the open, and only before it: see the precondition on
-        // `harden_events_db_sidecars`.
-        harden_events_db_sidecars(db_path)
-            .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
+    }
+    // The registry is keyed by spelling and mode, so a second key can name a
+    // file this process already holds: another spelling of the path, or the
+    // other `read_only` flag. No open outside SQLite may touch that file
+    // then: the hardening below, and the header read a read-only pool makes
+    // before its own open, each close a descriptor, and that close would
+    // release the locks of the pool already holding the file (the
+    // precondition on `harden_events_db_sidecars`). Physical identity by
+    // `stat`, which takes no descriptor, is the test. Same mode: the existing
+    // backend is the backend for this file. Other mode: refused; one process
+    // holds one physical events database in one mode.
+    #[cfg(unix)]
+    match held_backend_for_file(&registry, db_path) {
+        Some((mode, existing)) if mode == read_only => {
+            registry.insert(key, Arc::clone(&existing));
+            return Ok(existing);
+        }
+        Some((mode, _)) => {
+            let name = |read_only: bool| if read_only { "read-only" } else { "writable" };
+            return Err(crate::error::RuntimeError::Internal(format!(
+                "refusing to open the events database {} {}: this process already holds it \
+                 {}, and a second open in the other mode would release the held pool's \
+                 SQLite locks",
+                db_path.display(),
+                name(read_only),
+                name(mode)
+            )));
+        }
+        None => {
+            // Before the open, and only before it: see the precondition on
+            // `harden_events_db_sidecars`.
+            if !read_only {
+                harden_events_db_sidecars(db_path)
+                    .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
+            }
+        }
     }
     let backend = Arc::new(if read_only {
         StorageBackend::sqlite_read_only(db_path)?
@@ -369,6 +401,30 @@ fn direct_backend(
     });
     registry.insert(key, Arc::clone(&backend));
     Ok(backend)
+}
+
+/// The physical identity of an existing file, device and inode, read with
+/// `stat`: no descriptor is opened, so it can be asked about a live database.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+/// The backend this process already holds for the file at `db_path`, under
+/// any spelling and either mode, with that entry's `read_only` flag.
+#[cfg(unix)]
+fn held_backend_for_file(
+    registry: &BackendMap,
+    db_path: &Path,
+) -> Option<(bool, Arc<StorageBackend>)> {
+    let identity = file_identity(db_path)?;
+    registry
+        .iter()
+        .find(|((path, _), _)| file_identity(path) == Some(identity))
+        .map(|((_, read_only), backend)| (*read_only, Arc::clone(backend)))
 }
 
 /// Forwarding metrics for the process-wide client at `socket_path`, if one
@@ -2728,6 +2784,74 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_spelling_of_a_held_database_reuses_the_backend_and_never_reopens_its_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        // A directory link owned by this user is an accepted path component,
+        // and `real/events.db` and `alias/events.db` are two registry keys
+        // for one file.
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let db = real.join("events.db");
+        let first = direct_backend_for(&db).expect("first open");
+        let wal = PathBuf::from(format!("{}-wal", db.display()));
+        assert!(wal.exists(), "the open leaves {} on disk", wal.display());
+        // Loosened by path while the file is held: the hardening, had it run
+        // on the second key, would have opened and tightened it.
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let second = direct_backend_for(&alias.join("events.db")).expect("second spelling");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "one physical file must resolve to one backend"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "a held file set is never touched by a later key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_other_mode_on_a_held_database_is_refused_and_never_runs_the_hardening() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = dir.path().join("events.db");
+        // An existing database for the read-only arm, created outside the
+        // registry and closed again.
+        drop(StorageBackend::sqlite(&db).expect("create the database"));
+        // A pool closes asynchronously and can leave a writable -shm behind;
+        // a read-only open admits only a frozen sidecar set.
+        khive_storage::test_support::freeze_snapshot_sidecars(&db);
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _read_only = direct_backend_read_only_for(&db).expect("read-only open");
+        // Loosened by path while the read-only pool holds the file.
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // The writable key must not tighten it (that would open and close the
+        // held file); the other mode is refused outright.
+        let err = direct_backend_for(&db)
+            .err()
+            .expect("the other mode on a held database is refused")
+            .to_string();
+        assert!(
+            err.contains("events.db") && err.contains("already holds it read-only"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the held file was not touched"
+        );
     }
 
     #[cfg(unix)]

@@ -66,6 +66,17 @@ fn conflicting_lock(path: &Path, start: i64, len: i64) -> libc::flock {
     lock
 }
 
+/// The daemon under test, killed when the test unwinds: a failed assertion
+/// must not leave a child holding descriptors against a removed directory.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn sidecar(db: &Path, suffix: &str) -> PathBuf {
     let mut name = db.as_os_str().to_os_string();
     name.push(suffix);
@@ -84,19 +95,21 @@ fn events_daemon_keeps_shared_locks_on_its_database_while_idle() {
     let stderr_path = dir.path().join("daemon.stderr");
     let stderr = std::fs::File::create(&stderr_path).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kkernel"))
-        .arg("events-daemon")
-        .arg("--db")
-        .arg(&db)
-        .arg("--socket")
-        .arg(&socket)
-        .current_dir(dir.path())
-        .env_remove("KHIVE_DB")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .expect("spawn events daemon");
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_kkernel"))
+            .arg("events-daemon")
+            .arg("--db")
+            .arg(&db)
+            .arg("--socket")
+            .arg(&socket)
+            .current_dir(dir.path())
+            .env_remove("KHIVE_DB")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("spawn events daemon"),
+    );
 
     // Readiness: the daemon binds the socket only after the schema is ensured,
     // which is after SQLite opened the database and its WAL. Cold builds and
@@ -104,7 +117,7 @@ fn events_daemon_keeps_shared_locks_on_its_database_while_idle() {
     // message carries the child's stderr.
     let deadline = Instant::now() + Duration::from_secs(60);
     while !socket.exists() {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.0.try_wait().unwrap() {
             panic!(
                 "events daemon exited before binding: {status}\n{}",
                 std::fs::read_to_string(&stderr_path).unwrap_or_default()
@@ -128,7 +141,7 @@ fn events_daemon_keeps_shared_locks_on_its_database_while_idle() {
         let dms_lock = conflicting_lock(&shm, SHM_DMS_BYTE, 1);
         (db_lock, dms_lock)
     };
-    let daemon_pid = child.id() as libc::pid_t;
+    let daemon_pid = child.0.id() as libc::pid_t;
     let check = |label: &str, lock: libc::flock, path: &Path| {
         assert_eq!(
             lock.l_type,
@@ -159,6 +172,5 @@ fn events_daemon_keeps_shared_locks_on_its_database_while_idle() {
         check("shm DMS byte, idle", dms_lock, &shm);
     }
 
-    child.kill().unwrap();
-    let _ = child.wait();
+    drop(child);
 }

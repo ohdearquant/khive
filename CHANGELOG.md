@@ -23,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection closing afterwards then took itself for the last connection,
   checkpointed, and unlinked the sidecars while the daemon kept writing to the
   unlinked files. Hardening now runs before the open, the post-open check uses
-  `lstat` only, and a cross-process test asserts the locks are held.
+  `lstat` only, and a cross-process test asserts the locks are held. The
+  embedded backend registry resolves a database by file identity before it
+  hardens anything, so a second spelling of a held database reuses the open
+  backend and the other access mode is refused instead of touching held files.
 
 ## [0.8.0] - 2026-08-27
 
