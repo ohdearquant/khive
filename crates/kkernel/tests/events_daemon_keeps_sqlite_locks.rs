@@ -31,6 +31,12 @@ const SHARED_SIZE: i64 = 510;
 /// The `-shm` byte every connection with an open WAL index holds shared
 /// (`UNIX_SHM_DMS`).
 const SHM_DMS_BYTE: i64 = 128;
+/// The libc crate types `F_WRLCK`/`F_RDLCK` as `c_short` on macOS and as
+/// `c_int` on Linux, while `flock.l_type` is `c_short` on both.
+#[allow(clippy::unnecessary_cast)]
+const F_WRLCK: libc::c_short = libc::F_WRLCK as libc::c_short;
+#[allow(clippy::unnecessary_cast)]
+const F_RDLCK: libc::c_short = libc::F_RDLCK as libc::c_short;
 
 /// Ask the kernel, from this process, whether an exclusive lock over
 /// `[start, start + len)` of `path` would conflict with a lock held by another
@@ -43,7 +49,7 @@ fn conflicting_lock(path: &Path, start: i64, len: i64) -> libc::flock {
         .unwrap_or_else(|e| panic!("open {} for F_GETLK: {e}", path.display()));
     // SAFETY: `flock` is plain data; every field is set below or zero.
     let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-    lock.l_type = libc::F_WRLCK;
+    lock.l_type = F_WRLCK;
     lock.l_whence = libc::SEEK_SET as libc::c_short;
     lock.l_start = start;
     lock.l_len = len;
@@ -126,7 +132,7 @@ fn events_daemon_keeps_shared_locks_on_its_database_while_idle() {
     let check = |label: &str, lock: libc::flock, path: &Path| {
         assert_eq!(
             lock.l_type,
-            libc::F_RDLCK,
+            F_RDLCK,
             "{label}: the idle events daemon must hold a shared lock on {} (F_GETLK type {})",
             path.display(),
             lock.l_type
