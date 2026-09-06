@@ -466,6 +466,26 @@ fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
 }
 
+/// Whether two paths spell the same file: the same directory once `.`,
+/// `..` and symlinks are resolved, and the same name. A path whose
+/// directory cannot be resolved spells nothing and equals no other.
+#[cfg(unix)]
+fn same_spelling(a: &Path, b: &Path) -> bool {
+    match (physical_spelling(a), physical_spelling(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn physical_spelling(path: &Path) -> Option<PathBuf> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    Some(dir.canonicalize().ok()?.join(path.file_name()?))
+}
+
 /// The backend this process already holds for the file at `db_path`, under
 /// any spelling and after a rename: the holder in the asked mode when there
 /// is one, else the holder in the other mode. `None` when no file exists at
@@ -500,9 +520,10 @@ fn held_backend_for_file<'a>(
     Ok(other_mode)
 }
 
-/// A database this process holds writable, opened under this very spelling
-/// and since moved away (its pinned inode is no longer the file here, or no
-/// file is here), keeps its live `-wal`/`-shm` at this spelling: a rename
+/// A database this process holds writable, opened at this spelling (the
+/// same directory however it was written, the same name) and since moved
+/// away (its pinned inode is no longer the file here, or no file is here),
+/// keeps its live `-wal`/`-shm` at this spelling: a rename
 /// moves the main file alone. A writable open here would open them for the
 /// hardening and release the holder's locks with the close (the precondition
 /// on `harden_events_db_sidecars`), whatever file has since appeared at the
@@ -525,7 +546,7 @@ fn refuse_held_spellings_sidecars(
     }
     let here = std::fs::metadata(db_path).ok().map(|m| file_identity(&m));
     for held in registry {
-        if held.read_only || held.path != db_path {
+        if held.read_only || !same_spelling(&held.path, db_path) {
             continue;
         }
         let pinned = held.probe.metadata().map_err(|e| {
@@ -3144,6 +3165,27 @@ mod tests {
             "{err}"
         );
         untouched(&sidecars);
+
+        // Nor under another spelling of the same directory: through `.`, or
+        // through a symlink to it. The spelling is compared resolved.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let linked = elsewhere.path().join("linked");
+        std::os::unix::fs::symlink(dir.path(), &linked).unwrap();
+        for spelled in [
+            dir.path().join(".").join("events.db"),
+            linked.join("events.db"),
+        ] {
+            let err = direct_backend_for(&spelled)
+                .err()
+                .expect("a spelling is refused however it is written")
+                .to_string();
+            assert!(
+                err.contains("since moved away") && err.contains("events.db-wal"),
+                "{}: {err}",
+                spelled.display()
+            );
+            untouched(&sidecars);
+        }
         std::fs::remove_file(&db).unwrap();
 
         // The sidecars moved with the main file: the old spelling now names a

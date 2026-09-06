@@ -35,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed from that spelling, possibly one still open. Where this process
   holds the database that was at a spelling, since moved away, a writable
   open there is refused while its sidecars remain, whatever file has since
-  appeared at the spelling.
+  appeared at the spelling and however the path is written: the directory is
+  resolved before the spellings are compared.
 
 ## [0.8.0] - 2026-08-27
 
