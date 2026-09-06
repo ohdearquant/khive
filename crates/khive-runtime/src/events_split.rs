@@ -526,17 +526,18 @@ fn held_backend_for_file<'a>(
     Ok(other_mode)
 }
 
-/// A database this process holds writable, opened at this spelling (the
-/// same directory however it was written, the same name) and since moved
-/// away (its pinned inode is no longer the file here, or no file is here),
-/// keeps its live `-wal`/`-shm` at this spelling: a rename
-/// moves the main file alone. A writable open here would open them for the
-/// hardening and release the holder's locks with the close (the precondition
-/// on `harden_events_db_sidecars`), whatever file has since appeared at the
+/// A database this process holds, writable or read-only, opened at this
+/// spelling (the same directory however it was written, the same name) and
+/// since moved away (its pinned inode is no longer the file here, or no file
+/// is here), keeps its `-wal`/`-shm` at this spelling: a rename moves the
+/// main file alone. A writable holder's are its live sidecars; a read-only
+/// holder's are the frozen snapshot it reads through, its locks on them just
+/// as real. A writable open here would open them for the hardening and
+/// release the holder's locks with the close (the precondition on
+/// `harden_events_db_sidecars`), whatever file has since appeared at the
 /// spelling, so it is refused while any of them remains. Move them with the
-/// database or remove them first. Read-only holders admit no live sidecar
-/// set and are not consulted; a holder whose file is still here was found by
-/// `held_backend_for_file` before this runs.
+/// database or remove them first. A holder whose file is still here was
+/// found by `held_backend_for_file` before this runs.
 #[cfg(unix)]
 fn refuse_held_spellings_sidecars(
     registry: &BackendMap,
@@ -552,7 +553,7 @@ fn refuse_held_spellings_sidecars(
     }
     let here = std::fs::metadata(db_path).ok().map(|m| file_identity(&m));
     for held in registry {
-        if held.read_only || !same_spelling(&held.path, db_path) {
+        if !same_spelling(&held.path, db_path) {
             continue;
         }
         let pinned = held.probe.metadata().map_err(|e| {
@@ -3242,6 +3243,67 @@ mod tests {
             .to_string();
         assert!(err.contains("linked.db"), "{err}");
         drop(third);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_beside_a_read_only_holders_frozen_sidecars_is_refused() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = dir.path().join("events.db");
+        drop(StorageBackend::sqlite(&db).expect("create the database"));
+        khive_storage::test_support::freeze_snapshot_sidecars(&db);
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let read_only = direct_backend_read_only_for(&db).expect("read-only open");
+        // The set the holder admitted and reads through, as its open left
+        // it: SQLite gives an empty WAL the database's mode at open, the
+        // frozen -shm keeps its own.
+        let sidecars = sidecar_paths(&db);
+        let identity = |sidecars: &[PathBuf; 2]| -> Vec<(u64, u32, u64)> {
+            sidecars
+                .iter()
+                .map(|s| {
+                    let m = std::fs::metadata(s).expect("the holder's sidecar is there");
+                    (m.ino(), m.permissions().mode() & 0o777, m.len())
+                })
+                .collect()
+        };
+        let held = identity(&sidecars);
+        assert_eq!(held[1].1, 0o444, "the frozen -shm: {held:?}");
+        // The main file renamed away under the holder; the frozen snapshot
+        // it reads through stays at the old spelling, as a rename leaves it.
+        let moved = dir.path().join("moved.db");
+        std::fs::rename(&db, &moved).expect("rename the held database");
+        // A replacement at the old spelling: hardening would open and close
+        // the holder's sidecars and drop its locks, then SQLite would treat
+        // that snapshot as the replacement's own. Refused, with nothing touched.
+        std::fs::write(&db, b"").unwrap();
+        let err = direct_backend_for(&db)
+            .err()
+            .expect("a read-only holder's frozen sidecars are not opened under a replacement")
+            .to_string();
+        assert!(
+            err.contains("since moved away") && err.contains("events.db-wal"),
+            "{err}"
+        );
+        assert_eq!(
+            identity(&sidecars),
+            held,
+            "the holder's sidecars were never touched"
+        );
+        let still = direct_backend_read_only_for(&moved).expect("the holder is still served");
+        assert!(
+            Arc::ptr_eq(&read_only, &still),
+            "found by its inode under its new name"
+        );
+        // The sidecars moved with the database: the old spelling is free.
+        std::fs::remove_file(&db).unwrap();
+        for (from, suffix) in sidecars.iter().zip(["-wal", "-shm"]) {
+            std::fs::rename(from, PathBuf::from(format!("{}{suffix}", moved.display()))).unwrap();
+        }
+        let fresh = direct_backend_for(&db).expect("a new database once the sidecars went with it");
+        assert!(!Arc::ptr_eq(&read_only, &fresh));
     }
 
     #[cfg(unix)]
