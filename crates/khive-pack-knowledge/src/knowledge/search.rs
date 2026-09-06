@@ -4201,6 +4201,99 @@ mod tests {
         assert_eq!(outcome.atoms[0].slug, "zzcrossns-local");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual 200000-row lexical namespace measurement"]
+    async fn measure_cross_namespace_lexical_work() {
+        async fn seed_namespace(
+            runtime: &KhiveRuntime,
+            ns: &str,
+            id_prefix: &str,
+            rows: i64,
+            matching_rows: i64,
+        ) {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "WITH RECURSIVE seq(n) AS ( \
+                              VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?3 \
+                          ) \
+                          INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, finalized, \
+                              status, created_at, updated_at \
+                          ) \
+                          SELECT printf('%s-%012d', ?2, n), ?1, \
+                                 printf('measurement-%06d', n), 'Measurement Row', \
+                                 CASE WHEN n < ?4 THEN \
+                                     'namespacechannel content with ordinary padding text' \
+                                 ELSE 'unrelated content with ordinary padding text' END, \
+                                 '[]', 1, 'reviewed', n, n FROM seq"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(ns.into()),
+                        SqlValue::Text(id_prefix.into()),
+                        SqlValue::Integer(rows),
+                        SqlValue::Integer(matching_rows),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect("seed namespace corpus");
+        }
+
+        for local_matches in [0, 3] {
+            for foreign_present in [true, false] {
+                let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+                if foreign_present {
+                    seed_namespace(
+                        &runtime,
+                        "tenant-a",
+                        "92500000-0000-0000-0000",
+                        200_000,
+                        200_000,
+                    )
+                    .await;
+                }
+                seed_namespace(
+                    &runtime,
+                    "tenant-b",
+                    "92600000-0000-0000-0000",
+                    10,
+                    local_matches,
+                )
+                .await;
+
+                for (mode, query) in [
+                    ("single", "namespacechannel"),
+                    ("multi", "namespacechannel absentchannel"),
+                ] {
+                    let start = std::time::Instant::now();
+                    let outcome = khive_storage::scope_request_read_deadline(
+                        lexical_stage_budget(),
+                        fetch_fts_candidates(
+                            &runtime,
+                            "tenant-b",
+                            query,
+                            None,
+                            &[],
+                            &[],
+                            CANDIDATE_POOL,
+                        ),
+                    )
+                    .await
+                    .expect("bounded lexical fetch");
+                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    assert!(outcome.atoms.iter().all(|atom| atom.namespace == "tenant-b"));
+                    println!(
+                        "LEXICAL_NAMESPACE mode={mode} foreign_present={foreign_present} local_matches={local_matches} rows={} lexical_elapsed_ms={elapsed_ms:.3} lexical_timeout={}",
+                        outcome.atoms.len(),
+                        outcome.timed_out,
+                    );
+                }
+            }
+        }
+    }
+
     /// Issue #2396 fix 1: the empty-result fallback decision must never be
     /// made from an unscoped `fts_knowledge` probe — that is a
     /// cross-namespace oracle. A caller in `local` whose search term exists
