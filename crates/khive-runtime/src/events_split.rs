@@ -716,6 +716,15 @@ fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
                 )
             }
         };
+        // The open succeeds on a directory too; fstat the handle (no path
+        // re-lookup) so a directory at the path is refused, never chmod'ed.
+        if !file.metadata()?.file_type().is_file() {
+            anyhow::bail!(
+                "refusing to serve events: {} is not a regular file. The events \
+                 database and its sidecars must be regular files.",
+                path.display()
+            );
+        }
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -2306,6 +2315,20 @@ mod tests {
             !sidecar.exists(),
             "refusal must precede creation of the events database"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardening_refuses_a_directory_at_the_database_path_without_touching_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        std::fs::create_dir(&db).unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = harden_events_db_sidecars(&db).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        let mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the directory keeps its mode");
     }
 
     #[test]
