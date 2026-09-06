@@ -1611,7 +1611,7 @@ fn attach_body_lines_timeout_degradation(out: &mut Value) {
 }
 
 /// Report unmeasured domains under the stable `member_sizing_timeout` key,
-/// whether sizing timed out or the domain row was absent from its query.
+/// whether sizing timed out or no live member could be measured.
 /// Every affected domain is withheld from `results` — never left in with a
 /// `size` the caller cannot price — and listed here instead, as
 /// `{id, name, rank, score}`, so the caller sees exactly which ranked hits
@@ -1633,7 +1633,7 @@ fn attach_member_sizing_timeout_degradation(out: &mut Value, excluded: &[Value])
     }
     out["degraded"]["member_sizing_timeout"] = json!({
         "excluded": excluded,
-        "note": "member-token sizing did not complete for these domains, so they \
+        "note": "no measurement was produced (timeout or no live member), so these domains \
                  were withheld from `results` — their cost is unknown and a \
                  budgeted knowledge.fold selection cannot safely admit an unpriced \
                  item. Each entry keeps its id/name/rank/score for reference; \
@@ -1875,8 +1875,8 @@ fn parse_domain_members(domain: &Domain) -> Result<Vec<String>, RuntimeError> {
 /// Member-token sizing is best-effort: a request read-deadline timeout on
 /// reader checkout or the query returns an empty map and `true`, not `Err`.
 /// One `query_all` has no partial-completion state, so the flag covers the batch.
-/// Only live domain rows reached by the query enter the map. A reached domain
-/// with no live members is measured at zero; an absent domain stays unmeasured.
+/// Only live domains with at least one live joined member enter the map.
+/// Absent domains and domains without live members stay unmeasured.
 async fn load_domain_member_token_sizes(
     runtime: &KhiveRuntime,
     ns: &str,
@@ -1930,11 +1930,11 @@ async fn load_domain_member_token_sizes(
         let Some(domain_id) = row_str(&row, "domain_id") else {
             continue;
         };
-        let size = sizes.entry(domain_id).or_default();
         let Some(content) = row_str(&row, "content") else {
             continue;
         };
         let name = row_str(&row, "name").unwrap_or_default();
+        let size = sizes.entry(domain_id).or_default();
         *size = size.saturating_add(estimate_compose_item_tokens(&name, &content));
     }
 
@@ -2609,8 +2609,8 @@ impl KnowledgeHandlers {
         Ok(out)
     }
 
-    /// Suggest domains with measured compose-member costs; missing or deleted
-    /// members cost zero because compose expands no live content for them.
+    /// Suggest domains with measured compose-member costs, using only live members.
+    /// Domains without any live member remain unmeasured.
     /// Every unmeasured domain is withheld under the stable
     /// `degraded.member_sizing_timeout.excluded` key, whether sizing timed out or not.
     pub(crate) async fn suggest(
@@ -2774,7 +2774,7 @@ impl KnowledgeHandlers {
         let domain_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
         // A cancelled ambient deadline skips the call the same way an
         // internal timeout inside it does — both leave every domain in this
-        // batch unmeasured, never a real (possibly genuinely-zero) size
+        // batch unmeasured, never a measured member cost
         // (issue #2396 fix 3).
         let (member_token_sizes, member_sizing_timed_out) =
             if khive_storage::request_read_is_cancelled() {
@@ -5120,8 +5120,8 @@ mod tests {
     }
 
     /// Seeds one atom as a domain member so `compose`'s auto flow reaches the
-    /// Rerank phase — a domain with no members short-circuits at "No atoms
-    /// found" before the KG-blend gate these tests exercise.
+    /// Rerank phase; domains with no live members are withheld by auto-suggest
+    /// before the KG-blend gate these tests exercise.
     async fn seed_role_recording_corpus(registry: &khive_runtime::VerbRegistry) {
         registry
             .dispatch(

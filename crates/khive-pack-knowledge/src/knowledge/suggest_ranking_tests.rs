@@ -249,6 +249,19 @@ const PAIRS: &[Pair] = &[
 ];
 
 async fn seed_pair(registry: &VerbRegistry, pair: &Pair, idx: usize) {
+    let member_slug = format!("fixture-{idx}-member");
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [{
+                "slug": member_slug,
+                "name": "Fixture Member",
+                "content": "Stored text supplies a valid live member with a measurable cost for each domain while the separate domain descriptions determine candidate relevance and ordering.",
+                "finalized": true
+            }]}),
+        )
+        .await
+        .expect("upsert live member");
     registry
         .dispatch(
             "knowledge.upsert_domains",
@@ -258,11 +271,13 @@ async fn seed_pair(registry: &VerbRegistry, pair: &Pair, idx: usize) {
                         "slug": format!("fixture-{idx}-correct"),
                         "name": pair.correct_name,
                         "description": pair.correct_desc,
+                        "members": [member_slug],
                     },
                     {
                         "slug": format!("fixture-{idx}-collision"),
                         "name": pair.collision_name,
                         "description": pair.collision_desc,
+                        "members": [member_slug],
                     }
                 ]
             }),
