@@ -30,8 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process holds writable is refused, and a writable open beside a read-only
   holder goes through SQLite alone, with no hardening of the held files. A
   writable open at a spelling where `-wal`/`-shm` sidecars remain beside no
-  database is refused rather than creating a database over them: they belong
-  to a database moved or removed from that spelling, possibly one still open.
+  database is refused rather than creating a database over them, on the
+  embedded and the daemon arm alike: they belong to a database moved or
+  removed from that spelling, possibly one still open. Where this process
+  holds the database that was at a spelling, since moved away, a writable
+  open there is refused while its sidecars remain, whatever file has since
+  appeared at the spelling.
 
 ## [0.8.0] - 2026-08-27
 

@@ -413,8 +413,10 @@ fn direct_backend(
         Some(_) => {}
         None => {
             // Before the open, and only before it: see the precondition on
-            // `harden_events_db_sidecars`.
+            // `harden_events_db_sidecars`. Never on a held database's
+            // sidecars left at this spelling by a rename.
             if !read_only {
+                refuse_held_spellings_sidecars(&registry, db_path)?;
                 harden_events_db_sidecars(db_path)
                     .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
             }
@@ -496,6 +498,55 @@ fn held_backend_for_file<'a>(
         other_mode = Some(held);
     }
     Ok(other_mode)
+}
+
+/// A database this process holds writable, opened under this very spelling
+/// and since moved away (its pinned inode is no longer the file here, or no
+/// file is here), keeps its live `-wal`/`-shm` at this spelling: a rename
+/// moves the main file alone. A writable open here would open them for the
+/// hardening and release the holder's locks with the close (the precondition
+/// on `harden_events_db_sidecars`), whatever file has since appeared at the
+/// spelling, so it is refused while any of them remains. Move them with the
+/// database or remove them first. Read-only holders admit no live sidecar
+/// set and are not consulted; a holder whose file is still here was found by
+/// `held_backend_for_file` before this runs.
+#[cfg(unix)]
+fn refuse_held_spellings_sidecars(
+    registry: &BackendMap,
+    db_path: &Path,
+) -> crate::error::RuntimeResult<()> {
+    let present: Vec<String> = sidecar_paths(db_path)
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+        .map(|path| path.display().to_string())
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    let here = std::fs::metadata(db_path).ok().map(|m| file_identity(&m));
+    for held in registry {
+        if held.read_only || held.path != db_path {
+            continue;
+        }
+        let pinned = held.probe.metadata().map_err(|e| {
+            crate::error::RuntimeError::Internal(format!(
+                "cannot read the pinned identity of the held events database {}: {e}",
+                held.path.display()
+            ))
+        })?;
+        if Some(file_identity(&pinned)) == here {
+            continue;
+        }
+        return Err(crate::error::RuntimeError::Internal(format!(
+            "refusing to open the events database {}: this process holds the database that \
+             was at this spelling, since moved away, and {} are its sidecars; a new database \
+             here would open them and release its SQLite locks. Move them with it or remove \
+             them first.",
+            db_path.display(),
+            present.join(" and ")
+        )));
+    }
+    Ok(())
 }
 
 /// Forwarding metrics for the process-wide client at `socket_path`, if one
@@ -715,10 +766,6 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
     }
 }
 
-/// Refuse to serve an events database whose path — or whose `-wal`/`-shm`
-/// sidecar path — is a pre-existing symlink. These paths are derived, never
-/// user-chosen (`events_db_path_beside` canonicalizes the main database
-/// spelling first), so a link here is a planted redirect, not an alias:
 /// The `-wal` and `-shm` names SQLite derives from a database's path.
 fn sidecar_paths(db_path: &Path) -> [PathBuf; 2] {
     ["-wal", "-shm"].map(|suffix| {
@@ -740,8 +787,11 @@ fn database_and_sidecars(db_path: &Path) -> Vec<PathBuf> {
 /// database moved away from this spelling, held in this process or another,
 /// still has its SQLite locks on these files, and creating a database here
 /// would open them (the precondition on `harden_events_db_sidecars`) and hand
-/// the new pool another database's WAL. Refused before anything is created;
-/// stale sidecars of a removed database are the operator's to remove.
+/// the new pool another database's WAL. Refused before anything is created,
+/// on the embedded and the daemon arm alike; stale sidecars of a removed
+/// database are the operator's to remove. A database already at the spelling
+/// is taken with the sidecars beside it as its own, as SQLite takes it, except
+/// where this process knows better: `refuse_held_spellings_sidecars`.
 #[cfg(unix)]
 fn refuse_orphaned_sidecars(db_path: &Path) -> anyhow::Result<()> {
     if std::fs::symlink_metadata(db_path).is_ok() {
@@ -765,6 +815,10 @@ fn refuse_orphaned_sidecars(db_path: &Path) -> anyhow::Result<()> {
     )
 }
 
+/// Refuse to serve an events database whose path — or whose `-wal`/`-shm`
+/// sidecar path — is a pre-existing symlink. These paths are derived, never
+/// user-chosen (`events_db_path_beside` canonicalizes the main database
+/// spelling first), so a link here is a planted redirect, not an alias:
 /// permission hardening and SQLite would otherwise follow it and tighten or
 /// write event rows through to whatever file the link's author chose
 /// (CWE-59). Runs before any open on both the embedded and daemon arms; a
@@ -825,6 +879,10 @@ fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
     // After creation so a fresh parent can be validated; a directory this
     // process just created in a trusted ancestor passes by construction.
     ensure_events_db_parent_trusted(db_path)?;
+    // Nothing is created over the sidecars of a database that left this
+    // spelling (see `refuse_orphaned_sidecars`); the embedded arm refuses
+    // the same before its own create.
+    refuse_orphaned_sidecars(db_path)?;
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3054,14 +3112,39 @@ mod tests {
             "{err}"
         );
         assert!(!db.exists(), "the refusal created nothing");
-        for sidecar in &sidecars {
-            assert_eq!(
-                std::fs::metadata(sidecar).unwrap().permissions().mode() & 0o777,
-                0o644,
-                "{}: the holder's sidecar was never touched",
-                sidecar.display()
-            );
-        }
+        let untouched = |sidecars: &[PathBuf; 2]| {
+            for sidecar in sidecars {
+                assert_eq!(
+                    std::fs::metadata(sidecar).unwrap().permissions().mode() & 0o777,
+                    0o644,
+                    "{}: the holder's sidecar was never touched",
+                    sidecar.display()
+                );
+            }
+        };
+        untouched(&sidecars);
+
+        // The daemon's own create refuses the same topology, before it.
+        let err = ensure_events_db_owner_only(&db)
+            .expect_err("the daemon creates nothing over another database's sidecars")
+            .to_string();
+        assert!(err.contains("beside no database"), "{err}");
+        assert!(!db.exists(), "the daemon's refusal created nothing");
+        untouched(&sidecars);
+
+        // A file someone else put at the old spelling does not make the
+        // holder's sidecars its own: this process knows whose they are.
+        std::fs::write(&db, b"").unwrap();
+        let err = direct_backend_for(&db)
+            .err()
+            .expect("the holder's sidecars are not opened under a foreign file")
+            .to_string();
+        assert!(
+            err.contains("since moved away") && err.contains("events.db-wal"),
+            "{err}"
+        );
+        untouched(&sidecars);
+        std::fs::remove_file(&db).unwrap();
 
         // The sidecars moved with the main file: the old spelling now names a
         // new file, its own pool, hardened and opened afresh, while the moved
