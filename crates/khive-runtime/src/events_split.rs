@@ -399,7 +399,10 @@ fn direct_backend(
     // writable asked: the holder is a snapshot reader, and the writable
     // pool opens beside it through SQLite alone, which coordinates its own
     // descriptors on one inode; the hardening is skipped, so the holder's
-    // file set is never touched and keeps the modes the holder admitted.
+    // file set is never touched and keeps the modes the holder admitted. A
+    // set no longer owner-only is refused, read by `lstat` alone, never
+    // tightened here: tightening opens descriptors, and a close would
+    // release the holder's locks.
     #[cfg(unix)]
     match held_backend_for_file(&registry, db_path, read_only)? {
         Some(held) if held.read_only == read_only => return Ok(Arc::clone(&held.backend)),
@@ -410,7 +413,10 @@ fn direct_backend(
                 db_path.display()
             )));
         }
-        Some(_) => {}
+        Some(_) => {
+            verify_events_db_owner_only_unopened(db_path)
+                .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
+        }
         None => {
             // Before the open, and only before it: see the precondition on
             // `harden_events_db_sidecars`. Never on a held database's
@@ -2542,6 +2548,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unopened_check_refuses_a_loosened_or_replaced_sidecar() {
         use std::os::unix::fs::PermissionsExt;
@@ -3040,8 +3047,10 @@ mod tests {
         let read_only = direct_backend_read_only_for(&db).expect("read-only open");
         // Loosened by path while the read-only pool holds the file: the
         // hardening, had it run for the writable key, would have opened and
-        // tightened it. The sidecars go back to writable by path, as a writer
-        // elsewhere leaves them, so the writable pool can use them.
+        // tightened it. The loosened set is refused instead, read by `lstat`
+        // alone, and the file keeps the mode it was given. The sidecars go
+        // back to writable by path, as a writer elsewhere leaves them, so
+        // the writable pool can use them once the database is owner-only.
         std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
         for suffix in ["-wal", "-shm"] {
             let sidecar = PathBuf::from(format!("{}{suffix}", db.display()));
@@ -3049,7 +3058,22 @@ mod tests {
                 std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
             }
         }
+        let err = direct_backend_for(&db)
+            .err()
+            .expect("a loosened database beside a read-only holder is refused")
+            .to_string();
+        assert!(err.contains("not owner-only"), "{err}");
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "refused by metadata alone: the held file was not touched"
+        );
+        let ro_still = direct_backend_read_only_for(&db).expect("the holder is still served");
+        assert!(Arc::ptr_eq(&read_only, &ro_still));
 
+        // Owner-only again, by path as an operator would: the writable pool
+        // opens beside the holder, and still touches nothing.
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
         let writable =
             direct_backend_for(&db).expect("a writable pool opens beside a read-only holder");
         assert!(
@@ -3058,7 +3082,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
-            0o644,
+            0o600,
             "the held file was not touched"
         );
         // Each mode keeps its own holder from here on.

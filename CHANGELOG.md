@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open, so a held database is found under any spelling and after a rename: a
   second spelling reuses the open backend, a read-only open of a database the
   process holds writable is refused, and a writable open beside a read-only
-  holder goes through SQLite alone, with no hardening of the held files. A
+  holder goes through SQLite alone, with no hardening of the held files, and
+  is refused when that file set is no longer owner-only, read by metadata
+  alone rather than tightened. A
   writable open at a spelling where `-wal`/`-shm` sidecars remain beside no
   database is refused rather than creating a database over them, on the
   embedded and the daemon arm alike: they belong to a database moved or
