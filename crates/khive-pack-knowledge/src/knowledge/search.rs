@@ -1611,7 +1611,7 @@ fn attach_body_lines_timeout_degradation(out: &mut Value) {
 }
 
 /// Report unmeasured domains under the stable `member_sizing_timeout` key,
-/// whether sizing timed out or no live member could be measured.
+/// whether sizing timed out or the canonical domain row could not be measured.
 /// Every affected domain is withheld from `results` — never left in with a
 /// `size` the caller cannot price — and listed here instead, as
 /// `{id, name, rank, score}`, so the caller sees exactly which ranked hits
@@ -1633,7 +1633,7 @@ fn attach_member_sizing_timeout_degradation(out: &mut Value, excluded: &[Value])
     }
     out["degraded"]["member_sizing_timeout"] = json!({
         "excluded": excluded,
-        "note": "no measurement was produced (timeout or no live member), so these domains \
+        "note": "no measurement was produced (timeout or missing canonical domain), so these domains \
                  were withheld from `results` — their cost is unknown and a \
                  budgeted knowledge.fold selection cannot safely admit an unpriced \
                  item. Each entry keeps its id/name/rank/score for reference; \
@@ -1872,17 +1872,23 @@ fn parse_domain_members(domain: &Domain) -> Result<Vec<String>, RuntimeError> {
     })
 }
 
+#[derive(Debug, Default)]
+struct DomainMemberSizing {
+    tokens: usize,
+    live_members: usize,
+}
+
 /// Member-token sizing is best-effort: a request read-deadline timeout on
 /// reader checkout or the query returns an empty map and `true`, not `Err`.
 /// One `query_all` has no partial-completion state, so the flag covers the batch.
-/// Only live domains with at least one live joined member enter the map.
-/// Absent domains and domains without live members stay unmeasured.
+/// Every live canonical domain enters the map, with zero size and members
+/// when no live member joins. Only absent domains stay unmeasured.
 async fn load_domain_member_token_sizes(
     runtime: &KhiveRuntime,
     ns: &str,
     domain_ids: &[String],
-) -> Result<(HashMap<String, usize>, bool), RuntimeError> {
-    let mut sizes: HashMap<String, usize> = HashMap::new();
+) -> Result<(HashMap<String, DomainMemberSizing>, bool), RuntimeError> {
+    let mut sizes: HashMap<String, DomainMemberSizing> = HashMap::new();
     if domain_ids.is_empty() {
         return Ok((sizes, false));
     }
@@ -1930,12 +1936,15 @@ async fn load_domain_member_token_sizes(
         let Some(domain_id) = row_str(&row, "domain_id") else {
             continue;
         };
+        let sizing = sizes.entry(domain_id).or_default();
         let Some(content) = row_str(&row, "content") else {
             continue;
         };
         let name = row_str(&row, "name").unwrap_or_default();
-        let size = sizes.entry(domain_id).or_default();
-        *size = size.saturating_add(estimate_compose_item_tokens(&name, &content));
+        sizing.tokens = sizing
+            .tokens
+            .saturating_add(estimate_compose_item_tokens(&name, &content));
+        sizing.live_members = sizing.live_members.saturating_add(1);
     }
 
     Ok((sizes, false))
@@ -2609,8 +2618,8 @@ impl KnowledgeHandlers {
         Ok(out)
     }
 
-    /// Suggest domains with measured compose-member costs, using only live members.
-    /// Domains without any live member remain unmeasured.
+    /// Suggest domains with measured compose-member costs and live member counts.
+    /// Present domains without live members have size zero and members zero.
     /// Every unmeasured domain is withheld under the stable
     /// `degraded.member_sizing_timeout.excluded` key, whether sizing timed out or not.
     pub(crate) async fn suggest(
@@ -2810,12 +2819,13 @@ impl KnowledgeHandlers {
             .iter()
             .filter(|h| !unmeasured_domain_ids.contains(h.id.as_str()))
             .filter_map(|h| {
-                let size = member_token_sizes.get(&h.id).copied()?;
+                let sizing = member_token_sizes.get(&h.id)?;
                 Some(json!({
                     "id": h.id,
                     "name": h.name,
                     "score": h.score,
-                    "size": size,
+                    "size": sizing.tokens,
+                    "members": sizing.live_members,
                 }))
             })
             .collect();
@@ -4579,7 +4589,9 @@ mod tests {
                 .expect("undeadlined lookup must succeed");
         assert!(!healthy_timed_out);
         assert!(
-            healthy_sizes.get(&domain_ids[0]).copied().unwrap_or(0) > 0,
+            healthy_sizes
+                .get(&domain_ids[0])
+                .is_some_and(|sizing| sizing.tokens > 0 && sizing.live_members == 1),
             "control: without a deadline the lookup measures the real member \
              body cost; got {healthy_sizes:?}"
         );
@@ -5216,8 +5228,8 @@ mod tests {
     }
 
     /// Seeds one atom as a domain member so `compose`'s auto flow reaches the
-    /// Rerank phase; domains with no live members are withheld by auto-suggest
-    /// before the KG-blend gate these tests exercise.
+    /// Rerank phase - a domain with no members short-circuits at "No atoms
+    /// found" before the KG-blend gate these tests exercise.
     async fn seed_role_recording_corpus(registry: &khive_runtime::VerbRegistry) {
         registry
             .dispatch(

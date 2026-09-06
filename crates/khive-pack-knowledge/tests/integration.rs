@@ -3177,25 +3177,11 @@ async fn suggest_returns_domains_for_query() {
     let f = pack(rt());
 
     f.dispatch(
-        "knowledge.upsert_atoms",
-        json!({
-            "atoms": [{
-                "slug": "suggest-query-member",
-                "name": "Shared Source Material",
-                "content": "Foundational source material with definitions, examples, supporting evidence, explanatory context, and detailed practical notes for readers studying the subject.",
-                "finalized": true
-            }]
-        }),
-    )
-    .await
-    .expect("upsert live member");
-
-    f.dispatch(
         "knowledge.upsert_domains",
         json!({
             "domains": [
-                { "slug": "retrieval-methods", "name": "Retrieval Methods", "description": "sparse and dense retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "members": ["suggest-query-member"] },
-                { "slug": "embedding-theory", "name": "Embedding Theory", "description": "vector embedding concepts — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts", "members": ["suggest-query-member"] },
+                { "slug": "retrieval-methods", "name": "Retrieval Methods", "description": "sparse and dense retrieval techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —" },
+                { "slug": "embedding-theory", "name": "Embedding Theory", "description": "vector embedding concepts — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts" },
             ]
         }),
     )
@@ -3219,10 +3205,6 @@ async fn suggest_returns_domains_for_query() {
     assert!(first["id"].is_string(), "result must have id");
     assert!(first["name"].is_string(), "result must have name");
     assert!(first["score"].is_number(), "result must have score");
-    assert!(
-        first["size"].as_u64().is_some_and(|size| size > 0),
-        "the live member must give the suggested domain a measured cost: {resp}"
-    );
 }
 
 #[tokio::test]
@@ -3743,26 +3725,12 @@ async fn suggest_honors_limit_param() {
     let f = pack(rt());
 
     f.dispatch(
-        "knowledge.upsert_atoms",
-        json!({
-            "atoms": [{
-                "slug": "suggest-limit-member",
-                "name": "Shared Source Material",
-                "content": "Foundational source material with definitions, examples, supporting evidence, explanatory context, and detailed practical notes for readers studying the subject.",
-                "finalized": true
-            }]
-        }),
-    )
-    .await
-    .expect("upsert live member");
-
-    f.dispatch(
         "knowledge.upsert_domains",
         json!({
             "domains": [
-                { "slug": "domain-one", "name": "Domain One", "description": "first domain about retrieval — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "members": ["suggest-limit-member"] },
-                { "slug": "domain-two", "name": "Domain Two", "description": "second domain about search — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "members": ["suggest-limit-member"] },
-                { "slug": "domain-three", "name": "Domain Three", "description": "third domain about indexing — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "members": ["suggest-limit-member"] },
+                { "slug": "domain-one", "name": "Domain One", "description": "first domain about retrieval — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering" },
+                { "slug": "domain-two", "name": "Domain Two", "description": "second domain about search — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering" },
+                { "slug": "domain-three", "name": "Domain Three", "description": "third domain about indexing — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering" },
             ]
         }),
     )
@@ -3785,10 +3753,6 @@ async fn suggest_honors_limit_param() {
         1,
         "limit=1 with 3 matching domains must return exactly 1 result, got: {}",
         results.len()
-    );
-    assert!(
-        results[0]["size"].as_u64().is_some_and(|size| size > 0),
-        "the live member must give the limited domain a measured cost: {resp}"
     );
 }
 

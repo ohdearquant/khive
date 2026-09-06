@@ -4096,15 +4096,14 @@ mod ann_type_filter_regression {
         .await
         .expect("seed atoms");
 
-        // Seed a matching domain with a live member from the existing ANN population.
+        // Seed a domain that matches the same query terms.
         f.dispatch(
             "knowledge.upsert_domains",
             json!({
                 "domains": [{
                     "slug": "sug-domain",
                     "name": "Suggest Domain",
-                    "description": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
-                    "members": ["sug-a1"]
+                    "description": "machine learning optimization gradient descent retrieval ranking fusion unique sugg1 covering concepts techniques algorithms implementations applications use cases and design patterns in detail"
                 }]
             }),
         )
@@ -4148,14 +4147,6 @@ mod ann_type_filter_regression {
         assert!(
             names.contains(&"Suggest Domain"),
             "suggest must find the matching domain: {names:?}"
-        );
-        let domain = results
-            .iter()
-            .find(|r| r["name"].as_str() == Some("Suggest Domain"))
-            .expect("matching domain");
-        assert!(
-            domain["size"].as_u64().is_some_and(|size| size > 0),
-            "the live member must give the matching domain a measured cost: {domain:?}"
         );
     }
 

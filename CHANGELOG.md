@@ -9,10 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `knowledge.suggest` now withholds domains with no live member atoms from
-  `results`, preserving their rank and score under
-  `degraded.member_sizing_timeout.excluded`. The existing degradation key's
-  note now explains that sizing timed out or found no live member.
 - `KHIVE_EMAIL_DEFAULT_ACTOR` now falls back to `local` when unset or blank,
   matching `KHIVE_EMAIL_INGEST_NAMESPACE` and the adjacent startup resolver,
   instead of a hard-coded identity with no meaning outside the deployment it

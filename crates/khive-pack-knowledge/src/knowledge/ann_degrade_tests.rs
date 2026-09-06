@@ -533,8 +533,8 @@ async fn suggest_sets_ann_unavailable_when_warming_times_out() {
 /// `data["ann_unavailable"] = true` when the underlying `suggest` sets the flag.
 ///
 /// Auto-mode is triggered when `domain_ids` and `atom_ids` are absent. A live
-/// lexical domain with no members is withheld, so compose reaches the no-domains
-/// early return while preserving the degraded suggest signal.
+/// lexical domain with no members makes compose reach the separate "No atoms
+/// found" early return after degraded suggest has already selected a domain.
 #[tokio::test]
 async fn compose_propagates_ann_unavailable_in_auto_mode() {
     let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
@@ -571,7 +571,7 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
 
     let token = rt.authorize(Namespace::local()).expect("authorize");
     // Auto-mode requires ≥10 words; no domain_ids/atom_ids.
-    // type_weights are not reached because the unmeasured domain is withheld.
+    // type_weights are not reached because the selected domain has no members.
     let result = KnowledgeHandlers::compose(
         &rt,
         &token,
@@ -594,9 +594,8 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
          got: {result}"
     );
     assert_eq!(
-        result["data"]["markdown"],
-        "# Knowledge Briefing\n\nNo matching domains found for auto-suggest.",
-        "the unmeasured domain must not reach composition; got: {result}"
+        result["data"]["markdown"], "# Knowledge Briefing\n\nNo atoms found.",
+        "the regression must exercise the empty-member early return; got: {result}"
     );
 }
 
@@ -705,31 +704,17 @@ async fn suggest_reports_degraded_candidates_or_lexical_only_from_ranking_conseq
         let registry = build_registry(&rt);
         registry
             .dispatch(
-                "knowledge.upsert_atoms",
-                json!({"atoms": [{
-                    "slug": "degrade-ranking-member",
-                    "name": "Ranking Member",
-                    "content": "Stored text supplies a valid live member with a measurable cost for each domain while the separate domain descriptions determine candidate relevance and ordering.",
-                    "finalized": true
-                }]}),
-            )
-            .await
-            .expect("upsert ranking member");
-        registry
-            .dispatch(
                 "knowledge.upsert_domains",
                 json!({"domains": [
                     {
                         "slug": "degrade-semantic-domain",
                         "name": "Opaque Systems Domain",
-                        "description": "SEMANTIC_TARGET speculative serving throughput decoding latency batching inference cache scheduling acceleration gpu utilization techniques request queuing large scale parallelism language aware autoscaling models deployment topology load balancing production workloads resource management observability reliability",
-                        "members": ["degrade-ranking-member"]
+                        "description": "SEMANTIC_TARGET speculative serving throughput decoding latency batching inference cache scheduling acceleration gpu utilization techniques request queuing large scale parallelism language aware autoscaling models deployment topology load balancing production workloads resource management observability reliability"
                     },
                     {
                         "slug": "degrade-lexical-collision",
                         "name": "Speculative Decoding Methods for Inference",
-                        "description": "LEXICAL_COLLISION techniques for large language models emphasize decoding speculation, inference methods, acceleration strategies, model techniques, language processing, and unrelated terminology repeated for lexical matching",
-                        "members": ["degrade-ranking-member"]
+                        "description": "LEXICAL_COLLISION techniques for large language models emphasize decoding speculation, inference methods, acceleration strategies, model techniques, language processing, and unrelated terminology repeated for lexical matching"
                     }
                 ]}),
             )
@@ -1038,7 +1023,7 @@ async fn suggest_results_under_a_member_sizing_timeout_still_pass_through_fold()
 }
 
 #[tokio::test]
-async fn suggest_member_sizing_withholds_a_domain_with_only_deleted_members() {
+async fn suggest_member_sizing_serves_a_domain_with_only_a_deleted_member_at_zero() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let registry = build_registry(&rt);
     registry
@@ -1073,6 +1058,7 @@ async fn suggest_member_sizing_withholds_a_domain_with_only_deleted_members() {
         .expect("suggest with live member");
     assert_eq!(baseline["total"], 1, "got: {baseline}");
     assert!(baseline["results"][0]["size"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(baseline["results"][0]["members"], 1, "got: {baseline}");
 
     let deleted = registry
         .dispatch(
@@ -1086,24 +1072,14 @@ async fn suggest_member_sizing_withholds_a_domain_with_only_deleted_members() {
     let result = KnowledgeHandlers::suggest(&rt, &token, params, &ann)
         .await
         .expect("suggest with deleted member");
-    assert_eq!(result["total"], 0, "got: {result}");
-    assert_eq!(result["results"], json!([]), "got: {result}");
-    let hit = &baseline["results"][0];
-    let excluded = result["degraded"]["member_sizing_timeout"]["excluded"]
-        .as_array()
-        .expect("excluded domains");
-    assert_eq!(excluded.len(), 1);
-    assert_eq!(excluded[0]["id"], hit["id"]);
-    assert_eq!(excluded[0]["name"], hit["name"]);
-    assert_eq!(excluded[0]["rank"], 1);
-    assert!(excluded[0]["score"]
-        .as_f64()
-        .is_some_and(|score| score > 0.0));
-    assert!(excluded[0].get("size").is_none());
-    assert!(result["degraded"]["member_sizing_timeout"]["note"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("timeout or no live member"));
+    assert_eq!(result["total"], 1, "got: {result}");
+    assert_eq!(result["results"][0]["id"], baseline["results"][0]["id"]);
+    assert_eq!(result["results"][0]["size"], 0, "got: {result}");
+    assert_eq!(result["results"][0]["members"], 0, "got: {result}");
+    assert!(
+        result["degraded"].get("member_sizing_timeout").is_none(),
+        "a measured zero must not be excluded; got: {result}"
+    );
     assert_ne!(result["degraded"]["lexical_timeout"], true);
     registry
         .dispatch(
@@ -1111,7 +1087,7 @@ async fn suggest_member_sizing_withholds_a_domain_with_only_deleted_members() {
             json!({"candidates": result["results"], "budget": 10_000}),
         )
         .await
-        .expect("withheld domains must not enter fold selection");
+        .expect("member counts must preserve the unmodified suggest-to-fold input");
 }
 
 #[tokio::test]
@@ -1171,6 +1147,7 @@ async fn suggest_member_sizing_counts_only_live_members() {
     .await
     .expect("suggest mixed membership");
     assert_eq!(result["total"], 1, "got: {result}");
+    assert_eq!(result["results"][0]["members"], 1, "got: {result}");
     assert_eq!(
         result["results"][0]["size"],
         crate::knowledge::util::estimate_compose_item_tokens(LIVE_NAME, LIVE_BODY),
@@ -1180,7 +1157,7 @@ async fn suggest_member_sizing_counts_only_live_members() {
 }
 
 #[tokio::test]
-async fn suggest_member_sizing_withholds_empty_or_missing_members() {
+async fn suggest_member_sizing_serves_empty_or_missing_members_at_zero() {
     for members in [json!([]), json!(["absent-member"])] {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let registry = build_registry(&rt);
@@ -1188,8 +1165,8 @@ async fn suggest_member_sizing_withholds_empty_or_missing_members() {
             .dispatch(
                 "knowledge.upsert_domains",
                 json!({"domains": [{
-                    "slug": "sizing-unmeasured-domain",
-                    "name": "Sizing Unmeasured Domain",
+                    "slug": "sizing-empty-domain",
+                    "name": "Sizing Empty Domain",
                     "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
                     "members": members
                 }]}),
@@ -1204,16 +1181,12 @@ async fn suggest_member_sizing_withholds_empty_or_missing_members() {
             &vamana::new_shared(),
         )
         .await
-        .expect("suggest unmeasured domain");
-        assert_eq!(result["total"], 0, "got: {result}");
-        assert_eq!(result["results"], json!([]));
-        let excluded = result["degraded"]["member_sizing_timeout"]["excluded"]
-            .as_array()
-            .expect("excluded domains");
-        assert_eq!(excluded.len(), 1);
-        assert_eq!(excluded[0]["name"], "Sizing Unmeasured Domain");
-        assert_eq!(excluded[0]["rank"], 1);
-        assert!(excluded[0].get("size").is_none());
+        .expect("suggest domain without live members");
+        assert_eq!(result["total"], 1, "got: {result}");
+        assert_eq!(result["results"][0]["name"], "Sizing Empty Domain");
+        assert_eq!(result["results"][0]["size"], 0, "got: {result}");
+        assert_eq!(result["results"][0]["members"], 0, "got: {result}");
+        assert!(result["degraded"].get("member_sizing_timeout").is_none());
         assert_ne!(result["degraded"]["lexical_timeout"], true);
     }
 }
@@ -1224,31 +1197,19 @@ async fn suggest_member_sizing_withholds_a_missing_domain_with_rank_and_score() 
     let registry = build_registry(&rt);
     registry
         .dispatch(
-            "knowledge.upsert_atoms",
-            json!({"atoms": [{
-                "slug": "sizing-shared-member",
-                "name": "Sizing Shared Member",
-                "content": "Stored text supplies a valid live member with a measurable cost for each domain while the separate domain descriptions determine candidate relevance and ordering.",
-                "finalized": true
-            }]}),
-        )
-        .await
-        .expect("upsert live member");
-    registry
-        .dispatch(
             "knowledge.upsert_domains",
             json!({"domains": [
                 {
                     "slug": "sizing-kept-domain",
                     "name": "Sizing Kept Domain",
                     "description": "Lexical domain member sizing search keeps measured domains available for token budget selection, because a fold budget can only admit domains whose compose cost is known.",
-                    "members": ["sizing-shared-member"]
+                    "members": []
                 },
                 {
                     "slug": "sizing-missing-domain",
                     "name": "Sizing Missing Domain",
                     "description": "Lexical domain member sizing search withholds domains whose canonical row cannot be measured and lists them under the degraded exclusion key with their rank and score.",
-                    "members": ["sizing-shared-member"]
+                    "members": []
                 }
             ]}),
         )
@@ -1387,7 +1348,8 @@ async fn search_still_reranks_after_a_lexical_stage_only_timeout() {
 
 /// Suggest-side companion to the rerank test above: a lexical-stage-*only*
 /// timeout must not skip member-token pricing either. The seeded domain has
-/// a real member atom, unlike an empty domain that would remain unmeasured, so a
+/// a real member atom (not an empty `members: []` like the sibling test
+/// above, which would report `size: 0` whether pricing ran or not) so a
 /// non-zero `size` is only possible if `load_domain_member_token_sizes`
 /// actually executed.
 #[tokio::test]

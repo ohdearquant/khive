@@ -645,17 +645,9 @@ async fn auto_compose_propagates_suggest_hydration_degradation() {
         response["data"]["degraded"]["hydration_failures"], 1,
         "compose must preserve internal suggest degradation: {response}"
     );
-    // Domains without live members are withheld before auto-compose expands members.
     assert_eq!(
-        response["data"]["markdown"],
-        "# Knowledge Briefing\n\nNo matching domains found for auto-suggest.",
-        "the withheld domain must not reach member expansion: {response}"
+        response["data"]["markdown"], "# Knowledge Briefing\n\nNo atoms found.",
+        "the regression must exercise the empty-member early return: {response}"
     );
-    assert_eq!(
-        response["data"]["domains"],
-        json!([]),
-        "response: {response}"
-    );
-    assert_eq!(response["data"]["atoms"], json!([]), "response: {response}");
     assert_eq!(response["data"]["count"], 0, "response: {response}");
 }

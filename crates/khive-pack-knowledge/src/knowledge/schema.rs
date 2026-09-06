@@ -254,6 +254,9 @@ pub(crate) struct FoldCandidate {
     /// the selection algorithm itself.
     #[serde(default)]
     pub name: Option<String>,
+    /// Optional live member count accepted from unmodified suggest results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<usize>,
     #[serde(default)]
     pub content: Option<Value>,
     #[serde(default)]
