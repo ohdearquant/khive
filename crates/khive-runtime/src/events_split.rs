@@ -370,9 +370,13 @@ fn direct_backend(
     // and — because event rows carry the same audit payloads either way — a
     // pre-existing database or -wal/-shm sidecar is tightened to 0600 too,
     // fail-closed. A create race just means SQLite finds the file present.
+    // Sidecars beside no database belong to a database that left; nothing
+    // is created over them (see `refuse_orphaned_sidecars`).
     #[cfg(unix)]
     if !read_only {
         use std::os::unix::fs::OpenOptionsExt;
+        refuse_orphaned_sidecars(db_path)
+            .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -715,18 +719,59 @@ pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemo
 /// sidecar path — is a pre-existing symlink. These paths are derived, never
 /// user-chosen (`events_db_path_beside` canonicalizes the main database
 /// spelling first), so a link here is a planted redirect, not an alias:
+/// The `-wal` and `-shm` names SQLite derives from a database's path.
+fn sidecar_paths(db_path: &Path) -> [PathBuf; 2] {
+    ["-wal", "-shm"].map(|suffix| {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    })
+}
+
+/// The database and its two sidecars, the file set every check here covers.
+fn database_and_sidecars(db_path: &Path) -> Vec<PathBuf> {
+    let mut targets = vec![db_path.to_path_buf()];
+    targets.extend(sidecar_paths(db_path));
+    targets
+}
+
+/// A `-wal` or `-shm` file beside a database that does not exist is a live
+/// sidecar set left behind: a rename moves the main file alone, so a
+/// database moved away from this spelling, held in this process or another,
+/// still has its SQLite locks on these files, and creating a database here
+/// would open them (the precondition on `harden_events_db_sidecars`) and hand
+/// the new pool another database's WAL. Refused before anything is created;
+/// stale sidecars of a removed database are the operator's to remove.
+#[cfg(unix)]
+fn refuse_orphaned_sidecars(db_path: &Path) -> anyhow::Result<()> {
+    if std::fs::symlink_metadata(db_path).is_ok() {
+        return Ok(());
+    }
+    let orphaned: Vec<String> = sidecar_paths(db_path)
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+        .map(|path| path.display().to_string())
+        .collect();
+    if orphaned.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to create the events database {}: {} exist beside no database. They are \
+         the sidecars of a database moved or removed from this spelling, possibly one still \
+         open, and a new database here would strip its SQLite locks; move them with it or \
+         remove them first.",
+        db_path.display(),
+        orphaned.join(" and ")
+    )
+}
+
 /// permission hardening and SQLite would otherwise follow it and tighten or
 /// write event rows through to whatever file the link's author chose
 /// (CWE-59). Runs before any open on both the embedded and daemon arms; a
 /// link planted after admission is bounded by the daemon's trusted-directory
 /// contract on the socket parent.
 fn refuse_events_db_symlinks(db_path: &Path) -> anyhow::Result<()> {
-    let mut targets = vec![db_path.to_path_buf()];
-    for suffix in ["-wal", "-shm"] {
-        let mut name = db_path.as_os_str().to_os_string();
-        name.push(suffix);
-        targets.push(PathBuf::from(name));
-    }
+    let targets = database_and_sidecars(db_path);
     for path in targets {
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
@@ -811,12 +856,7 @@ fn ensure_events_db_owner_only(db_path: &Path) -> anyhow::Result<()> {
 #[cfg(unix)]
 fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut targets = vec![db_path.to_path_buf()];
-    for suffix in ["-wal", "-shm"] {
-        let mut name = db_path.as_os_str().to_os_string();
-        name.push(suffix);
-        targets.push(PathBuf::from(name));
-    }
+    let targets = database_and_sidecars(db_path);
     for path in targets {
         // Pin the inode before touching it: `O_NOFOLLOW` makes the open
         // itself refuse a symlink at the final component, and the chmod is
@@ -861,12 +901,7 @@ fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
 #[cfg(unix)]
 fn verify_events_db_owner_only_unopened(db_path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut targets = vec![db_path.to_path_buf()];
-    for suffix in ["-wal", "-shm"] {
-        let mut name = db_path.as_os_str().to_os_string();
-        name.push(suffix);
-        targets.push(PathBuf::from(name));
-    }
+    let targets = database_and_sidecars(db_path);
     for path in targets {
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -2990,7 +3025,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_file_created_at_a_held_spelling_after_a_rename_is_another_database() {
+    fn a_database_at_a_held_spelling_after_a_rename_waits_for_the_sidecars_to_go_with_it() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2998,9 +3033,42 @@ mod tests {
         let first = direct_backend_for(&db).expect("first open");
         let moved = dir.path().join("moved.db");
         std::fs::rename(&db, &moved).expect("rename the held database");
+        let sidecars = sidecar_paths(&db);
+        assert!(
+            sidecars.iter().all(|s| s.exists()),
+            "a writable open leaves -wal and -shm, which a rename of the main file leaves behind"
+        );
+        // Loosened by path while the holder uses them: the hardening a new
+        // database here would run opens and tightens them, releasing the
+        // holder's locks with the close.
+        for sidecar in &sidecars {
+            std::fs::set_permissions(sidecar, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
 
-        // The old spelling now names a new file: its own pool, hardened and
-        // opened afresh, while the moved file keeps its holder.
+        let err = direct_backend_for(&db)
+            .err()
+            .expect("no database is created over another database's sidecars")
+            .to_string();
+        assert!(
+            err.contains("events.db-wal") && err.contains("beside no database"),
+            "{err}"
+        );
+        assert!(!db.exists(), "the refusal created nothing");
+        for sidecar in &sidecars {
+            assert_eq!(
+                std::fs::metadata(sidecar).unwrap().permissions().mode() & 0o777,
+                0o644,
+                "{}: the holder's sidecar was never touched",
+                sidecar.display()
+            );
+        }
+
+        // The sidecars moved with the main file: the old spelling now names a
+        // new file, its own pool, hardened and opened afresh, while the moved
+        // file keeps its holder.
+        for (from, to) in sidecars.iter().zip(sidecar_paths(&moved)) {
+            std::fs::rename(from, to).unwrap();
+        }
         let second = direct_backend_for(&db).expect("a new database at the old spelling");
         assert!(
             !Arc::ptr_eq(&first, &second),
