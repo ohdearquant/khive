@@ -243,7 +243,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "candidates",
                 param_type: "array<object>",
                 required: true,
-                description: "Scored items: {id, score, size, name?, members?, content?, category?, information_gain?}. `members` is an optional live member count. `knowledge.suggest`'s `results` feed this directly.",
+                description: "Scored items: {id, score, size, name?, members?, content?, category?, information_gain?}. `members` is an optional live member count; candidates with members=0 are not selected. `knowledge.suggest`'s `results` feed this directly.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

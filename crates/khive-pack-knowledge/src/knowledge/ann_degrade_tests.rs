@@ -533,8 +533,8 @@ async fn suggest_sets_ann_unavailable_when_warming_times_out() {
 /// `data["ann_unavailable"] = true` when the underlying `suggest` sets the flag.
 ///
 /// Auto-mode is triggered when `domain_ids` and `atom_ids` are absent. A live
-/// lexical domain with no members makes compose reach the separate "No atoms
-/// found" early return after degraded suggest has already selected a domain.
+/// lexical domain with no members is served by suggest but skipped by compose,
+/// which reaches the no-domains early return while preserving the signal.
 #[tokio::test]
 async fn compose_propagates_ann_unavailable_in_auto_mode() {
     let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
@@ -571,7 +571,7 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
 
     let token = rt.authorize(Namespace::local()).expect("authorize");
     // Auto-mode requires ≥10 words; no domain_ids/atom_ids.
-    // type_weights are not reached because the selected domain has no members.
+    // type_weights are not reached because compose skips the zero-member domain.
     let result = KnowledgeHandlers::compose(
         &rt,
         &token,
@@ -594,8 +594,71 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
          got: {result}"
     );
     assert_eq!(
-        result["data"]["markdown"], "# Knowledge Briefing\n\nNo atoms found.",
-        "the regression must exercise the empty-member early return; got: {result}"
+        result["data"]["markdown"],
+        "# Knowledge Briefing\n\nNo matching domains found for auto-suggest.",
+        "compose must skip the zero-member domain while preserving the signal; got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn auto_compose_skips_zero_size_suggested_domains() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [{
+                "slug": "compose-live-member",
+                "name": "Compose Live Member",
+                "content": "Stored text supplies a valid live member with a measurable cost for each domain while the separate domain descriptions determine candidate relevance and ordering.",
+                "finalized": true
+            }]}),
+        )
+        .await
+        .expect("upsert live member");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [
+                {
+                    "slug": "compose-empty-domain",
+                    "name": "Compose Empty Domain",
+                    "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                    "members": []
+                },
+                {
+                    "slug": "compose-populated-domain",
+                    "name": "Compose Populated Domain",
+                    "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                    "members": ["compose-live-member"]
+                }
+            ]}),
+        )
+        .await
+        .expect("upsert empty and populated domains");
+    let response = registry
+        .dispatch(
+            "knowledge.compose",
+            json!({"query": "explain lexical domain member sizing search and token cost for automatic composition"}),
+        )
+        .await
+        .expect("auto-compose succeeds");
+    let domains = response["data"]["domains"].as_array().expect("domains");
+    assert_eq!(domains.len(), 1, "got: {response}");
+    assert_eq!(domains[0]["slug"], "compose-populated-domain");
+    assert_eq!(response["data"]["count"], 1, "got: {response}");
+    assert_eq!(response["data"]["atoms"][0]["slug"], "compose-live-member");
+
+    let explicit = registry
+        .dispatch(
+            "knowledge.compose",
+            json!({"query": "empty domain", "domain_ids": ["compose-empty-domain"]}),
+        )
+        .await
+        .expect("explicit empty-domain request remains supported");
+    assert_eq!(
+        explicit["data"]["markdown"], "# Knowledge Briefing\n\nNo atoms found.",
+        "the candidate skip must not apply to explicit domain ids: {explicit}"
     );
 }
 

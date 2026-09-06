@@ -3043,7 +3043,7 @@ impl KnowledgeHandlers {
                 }
             };
             if let Some(results) = suggest_result.get("results").and_then(|v| v.as_array()) {
-                for r in results {
+                for r in results.iter().filter(|r| r["members"] != 0) {
                     if let Some(id) = r.get("id").and_then(|v| v.as_str()) {
                         domain_ids.push(id.to_string());
                     }
@@ -5228,8 +5228,8 @@ mod tests {
     }
 
     /// Seeds one atom as a domain member so `compose`'s auto flow reaches the
-    /// Rerank phase - a domain with no members short-circuits at "No atoms
-    /// found" before the KG-blend gate these tests exercise.
+    /// Rerank phase; auto-compose skips domains with no live members before
+    /// the KG-blend gate these tests exercise.
     async fn seed_role_recording_corpus(registry: &khive_runtime::VerbRegistry) {
         registry
             .dispatch(
