@@ -690,9 +690,9 @@ async fn fetch_fts_candidates(
                 }
             }
 
-            // Reassemble in phase A's rowid order; a rowid absent from
-            // the hydrated map was ineligible (wrong namespace/status/type)
-            // or deleted between phase A and phase B.
+            // Reassemble in phase A's rowid order; ineligible rows or intervening deletes drop out.
+            // The reads share no snapshot: an intervening edit hydrates current text,
+            // which the lexical scorer uses even if it no longer matches the term.
             let eligible_now: Vec<Atom> = rowids
                 .iter()
                 .filter_map(|rowid| atoms_by_rowid.get(rowid).cloned())
@@ -1610,8 +1610,8 @@ fn attach_body_lines_timeout_degradation(out: &mut Value) {
     out["degraded"]["body_lines_timeout"] = json!(true);
 }
 
-/// Flag that member-token sizing hit the request read deadline before it
-/// could measure any domain in this response (issue #2396 fix 3, revised).
+/// Report unmeasured domains under the stable `member_sizing_timeout` key,
+/// whether sizing timed out or the domain row was absent from its query.
 /// Every affected domain is withheld from `results` — never left in with a
 /// `size` the caller cannot price — and listed here instead, as
 /// `{id, name, rank, score}`, so the caller sees exactly which ranked hits
@@ -1872,33 +1872,17 @@ fn parse_domain_members(domain: &Domain) -> Result<Vec<String>, RuntimeError> {
     })
 }
 
-/// Member-token sizing is best-effort, same contract as
-/// [`load_atom_body_line_counts`]: a request read-deadline timeout on either
-/// the reader checkout or the query returns the zero-initialized `sizes` map
-/// rather than propagating `Err`. Before issue #1930 Amendment 2 gave the
-/// lexical stage its own independent budget, `suggest` only ever reached this
-/// call when the shared request deadline had *not* expired, so a mid-flight
-/// timeout here was unreachable in practice. With the stages decoupled, a
-/// lexical-only degradation with real time left to spare now runs this
-/// query normally, and the ordinary async-scheduling race (the deadline
-/// elapsing while this query is in flight) is reachable and must degrade,
-/// not hard-error, exactly like every other read in this module.
-///
-/// The `bool` distinguishes "measured, genuinely zero members" from "not
-/// measured at all" (issue #2396 fix 3): every domain in `sizes` is either
-/// fully priced (this call ran to completion) or entirely unpriced (a
-/// checkout or query timeout returns the zero-initialized map for all of
-/// them — there is no partial-completion state for one `query_all` call), so
-/// one flag for the whole batch is enough. Before this fix `suggest` treated
-/// an unmeasured `size: 0` exactly like a real zero-cost domain and handed it
-/// straight to a caller's `knowledge.fold` budget, letting a deadline-raced
-/// suggestion admit domains for free.
+/// Member-token sizing is best-effort: a request read-deadline timeout on
+/// reader checkout or the query returns an empty map and `true`, not `Err`.
+/// One `query_all` has no partial-completion state, so the flag covers the batch.
+/// Only live domain rows reached by the query enter the map. A reached domain
+/// with no live members is measured at zero; an absent domain stays unmeasured.
 async fn load_domain_member_token_sizes(
     runtime: &KhiveRuntime,
     ns: &str,
     domain_ids: &[String],
 ) -> Result<(HashMap<String, usize>, bool), RuntimeError> {
-    let mut sizes: HashMap<String, usize> = domain_ids.iter().map(|id| (id.clone(), 0)).collect();
+    let mut sizes: HashMap<String, usize> = HashMap::new();
     if domain_ids.is_empty() {
         return Ok((sizes, false));
     }
@@ -1923,8 +1907,8 @@ async fn load_domain_member_token_sizes(
             sql: format!(
                 "SELECT d.id AS domain_id, a.name, a.content \
                  FROM knowledge_domains AS d \
-                 JOIN json_each(d.members) AS member ON 1 = 1 \
-                 JOIN knowledge_atoms AS a \
+                 LEFT JOIN json_each(d.members) AS member ON 1 = 1 \
+                 LEFT JOIN knowledge_atoms AS a \
                    ON a.namespace = d.namespace \
                   AND a.slug = member.value \
                   AND a.deleted_at IS NULL \
@@ -1946,11 +1930,11 @@ async fn load_domain_member_token_sizes(
         let Some(domain_id) = row_str(&row, "domain_id") else {
             continue;
         };
+        let size = sizes.entry(domain_id).or_default();
         let Some(content) = row_str(&row, "content") else {
             continue;
         };
         let name = row_str(&row, "name").unwrap_or_default();
-        let size = sizes.entry(domain_id).or_default();
         *size = size.saturating_add(estimate_compose_item_tokens(&name, &content));
     }
 
@@ -2625,6 +2609,10 @@ impl KnowledgeHandlers {
         Ok(out)
     }
 
+    /// Suggest domains with measured compose-member costs; missing or deleted
+    /// members cost zero because compose expands no live content for them.
+    /// Every unmeasured domain is withheld under the stable
+    /// `degraded.member_sizing_timeout.excluded` key, whether sizing timed out or not.
     pub(crate) async fn suggest(
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
@@ -3604,6 +3592,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fts_candidates_pin_the_rowid_prefix_boundary() {
+        for (regular_count, best_is_admitted) in [
+            (FTS_TERM_LIMIT * PHASE_A_OVERFETCH_FACTOR, false),
+            (FTS_TERM_LIMIT - 1, true),
+        ] {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "WITH RECURSIVE entries(n) AS ( \
+                              VALUES(1) UNION ALL SELECT n + 1 FROM entries WHERE n < ?1 \
+                          ) \
+                          INSERT INTO knowledge_atoms ( \
+                              rowid, id, namespace, slug, name, content, tags, finalized, \
+                              status, created_at, updated_at \
+                          ) \
+                          SELECT n, printf('92700000-0000-0000-0000-%012d', n), \
+                              'local', printf('prefix-%06d', n), 'Prefix Document', \
+                              'zzprefixzz padding padding padding padding padding padding padding', \
+                              '[]', 1, 'reviewed', 0, 0 FROM entries"
+                        .into(),
+                    params: vec![SqlValue::Integer(regular_count as i64)],
+                    label: None,
+                })
+                .await
+                .expect("seed early matches");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              rowid, id, namespace, slug, name, content, tags, finalized, \
+                              status, created_at, updated_at \
+                          ) VALUES ( \
+                              ?1, '92700000-0000-0000-0001-000000000000', 'local', \
+                              'zzprefix-best', 'Prefix Document', ?2, '[]', 1, 'reviewed', 0, 0)"
+                        .into(),
+                    params: vec![
+                        SqlValue::Integer((regular_count + 1) as i64),
+                        SqlValue::Text("zzprefixzz ".repeat(8)),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect("seed late repeated match");
+            drop(writer);
+
+            let mut reader = access.reader().await.expect("reader");
+            let best = reader
+                .query_row(SqlStatement {
+                    sql: "SELECT a.rowid, a.slug FROM fts_knowledge \
+                          JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+                          WHERE fts_knowledge MATCH ?1 AND a.namespace = 'local' \
+                            AND a.deleted_at IS NULL \
+                          ORDER BY bm25(fts_knowledge), a.slug LIMIT 1"
+                        .into(),
+                    params: vec![SqlValue::Text("\"zzprefixzz\"".into())],
+                    label: None,
+                })
+                .await
+                .expect("BM25 control query")
+                .expect("BM25 match");
+            assert_eq!(row_str(&best, "slug").as_deref(), Some("zzprefix-best"));
+            assert_eq!(row_i64(&best, "rowid"), Some((regular_count + 1) as i64));
+            drop(reader);
+
+            let outcome = fetch_fts_candidates(
+                &runtime,
+                "local",
+                "zzprefixzz",
+                None,
+                &[],
+                &[],
+                FTS_TERM_LIMIT,
+            )
+            .await
+            .expect("bounded candidate fetch");
+            assert!(!outcome.timed_out);
+            assert_eq!(outcome.atoms.len(), FTS_TERM_LIMIT);
+            assert_eq!(
+                outcome.atoms.iter().any(|atom| atom.slug == "zzprefix-best"),
+                best_is_admitted,
+                "BM25-best row admission must follow the rowid window; regular_count={regular_count}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn phase_a_limit_uses_index_order_without_sorting_matches() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
         seed_low_overlap_corpus(&runtime, 1_000, 20).await;
@@ -4345,11 +4420,8 @@ mod tests {
         );
     }
 
-    /// Issue #2396 fix 3: a member-token-sizing timeout must be reported via
-    /// the returned `bool`, never conflated with a genuine zero-member
-    /// domain — both otherwise produce the same `size: 0` in a `HashMap`-only
-    /// return, which `suggest` then handed a caller's `knowledge.fold` budget
-    /// as a real (free) cost.
+    /// A member-token-sizing timeout returns no measurements, never a
+    /// placeholder zero that could be admitted as a free fold candidate.
     #[tokio::test]
     async fn member_token_sizes_report_timeout_instead_of_a_measured_zero() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -4400,11 +4472,9 @@ mod tests {
             timed_out,
             "an expired read deadline must be reported as unmeasured"
         );
-        assert_eq!(
-            degraded_sizes.get(&domain_ids[0]).copied(),
-            Some(0),
-            "the placeholder value is still 0 — callers must check \
-             `timed_out`, never treat this 0 as a measured size"
+        assert!(
+            degraded_sizes.is_empty(),
+            "a timed-out batch must not contain fabricated measurements"
         );
 
         let (healthy_sizes, healthy_timed_out) =

@@ -73,6 +73,11 @@
   `SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 ORDER BY rowid LIMIT ?2`.
   FTS5 consumes rowid order directly, so enumeration stops at the limit without sorting or
   computing BM25 over the entire match set. TF-IDF remains the application-level ranker.
+  When a term exceeds its admitted window (the fetch limit for a single term; up to
+  `FTS_TERM_LIMIT`, 500, for a multi-term query), candidates are its lowest eligible rowids,
+  not the BM25-best matches admitted by the previous fetch. This trades bounded probe cost
+  against recall for high-frequency terms, which carry little IDF weight and run after rarer
+  terms under capped-frequency scheduling; eligibility probes can widen to 8000 rowids as below.
   Multi-term queries first probe at most 501 rowids per term and process non-empty terms by
   ascending observed frequency, breaking ties by term spelling. Frequencies up to 500 are exact;
   larger posting lists share the capped frequency. These index-only probes also run inside the
@@ -82,17 +87,19 @@
   soft-delete, status, and type eligibility at that point — the first query in the whole fetch to
   touch a full atom row (including `content`), and only for rows that already cleared phase A's
   cap. This closes the read-cost hole where every FTS match paid a scattered read against the
-  whole (multi-gigabyte-scale) atom table before its own per-term `LIMIT` applied. The hydration
-  statement (`phase_b_hydration_statement`) filters on `+a.namespace = ?1` — a unary-plus, not a
-  bare equality — for the same reason as the sibling `hydrate_atoms_statement`/
+  whole (multi-gigabyte-scale) atom table before its own per-term `LIMIT` applied.
+  The phase-A and phase-B statements share no snapshot, so a row edited between them is scored
+  from its current hydrated text. The hydration statement (`phase_b_hydration_statement`)
+  filters on `+a.namespace = ?1` (a unary-plus, not a bare equality) for the same reason as
+  the sibling `hydrate_atoms_statement`/
   `hydrate_domains_statement`: this codebase never runs `ANALYZE` on `knowledge_atoms`, so the
   no-statistics planner prefers `idx_knowledge_atoms_ns` over the rowid primary key for a large
   `rowid IN (...)` list; the unary plus defeats that index without changing the predicate.
 - When phase B carries a status or type eligibility predicate, phase A overfetches by
   `PHASE_A_OVERFETCH_FACTOR` (4x) so an ineligible-heavy top page cannot starve phase B of rows
   that are eligible further down the rowid sequence. If phase A still returned a full page and
-  eligible rows remain short of the per-term cap, the probe widens by the same factor once more,
-  up to `PHASE_A_WIDEN_CEILING` (8000) — bounding the worst case to a fixed per-term cost instead
+  eligible rows remain short of the per-term cap, the probe widens by the same factor until the
+  ceiling, `PHASE_A_WIDEN_CEILING` (8000) — bounding the worst case to a fixed per-term cost instead
   of an unbounded retry loop. If widening reaches the ceiling and the eligible set is _still_
   short, the term falls back once to an eligibility-scoped join (`fts_knowledge` drives primary-key
   lookups in `knowledge_atoms`, with every predicate applied before its own per-term `LIMIT`,
@@ -113,9 +120,11 @@
   `tokio::task_local!` values scoped to the calling task, mirroring
   `khive_storage::scope_request_read_deadline`'s own mechanism — never a process-global `AtomicU64`,
   which a concurrently running test with no override of its own could observe.
-- The lexical fetch runs under its own read-deadline budget (`LEXICAL_STAGE_BUDGET_MS`, 2s),
-  scoped via `khive_storage::scope_request_read_deadline`. Nested deadlines keep whichever is
-  earlier while active and pop back to the outer request deadline once the scope exits, so a
+- The lexical fetch runs under its own read-deadline budget (`LEXICAL_STAGE_BUDGET_MS`, 2s per
+  lexical fetch), scoped via `khive_storage::scope_request_read_deadline`. `search_decomposed`
+  runs up to three fetches, so a decomposed request can spend up to three stage budgets on
+  lexical work before other stages. Nested deadlines keep whichever is earlier while active
+  and pop back to the outer request deadline once the scope exits, so a
   lexical-stage timeout narrows only that stage's own budget — it no longer implies the whole
   request is out of time. `search`, `suggest`, and their decomposed variant gate every downstream
   step (embedding rerank, body-line counts, member-size pricing) on the live ambient
@@ -126,11 +135,15 @@
 - `load_domain_member_token_sizes` (member-token pricing for `suggest`'s `results[].size`) returns
   a `(HashMap<String, usize>, bool)` — the `bool` marks whether the whole batch timed out before
   any domain could be measured. A single `query_all` call has no partial-completion state, so one
-  flag covers every domain in the batch; a genuinely zero-member domain and an unmeasured one are
-  otherwise indistinguishable in the plain map. `suggest` never serializes `size: 0` for an
-  unmeasured domain, and it does not serialize a `null` size either: the domain is withheld from
+  flag covers every domain in the batch. The map starts empty, and left joins preserve each live
+  domain reached by the sizing query even when it has no live members, measuring that domain at
+  zero; missing or deleted members cost zero because compose expands no live content for them.
+  A domain absent from the sizing query stays absent from the map and is unmeasured.
+  `suggest` never serializes `size: 0` for an unmeasured domain, and it does not serialize a
+  `null` size either: the domain is withheld from
   `results` entirely and listed instead under `degraded.member_sizing_timeout.excluded` as
   `{id, name, rank, score}`, so the caller still sees which ranked hit was withheld and why.
+  This stable exclusion key covers every unmeasured domain, whether sizing timed out or not.
   `FoldCandidate::size` (`knowledge.fold`) is a non-optional `usize`, so a `null` size would turn
   one unmeasured domain into a hard parse error for a caller that feeds `suggest`'s `results`
   straight into a `fold` call (issue #105's documented passthrough contract). Withholding the

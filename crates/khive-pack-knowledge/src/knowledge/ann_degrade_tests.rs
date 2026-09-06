@@ -1059,6 +1059,141 @@ async fn suggest_results_under_a_member_sizing_timeout_still_pass_through_fold()
         .expect("suggest's results must feed fold unmodified (issue #105 passthrough)");
 }
 
+#[tokio::test]
+async fn suggest_member_sizing_serves_a_domain_with_only_a_deleted_member_at_zero() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [{
+                "slug": "sizing-deleted-member",
+                "name": "Sizing Deleted Member",
+                "content": "A live member body with enough content to have a nonzero estimated token cost before the atom is soft deleted.",
+                "finalized": true
+            }]}),
+        )
+        .await
+        .expect("upsert member atom");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [{
+                "slug": "sizing-measured-domain",
+                "name": "Sizing Measured Domain",
+                "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost.",
+                "members": ["sizing-deleted-member"]
+            }]}),
+        )
+        .await
+        .expect("upsert domain");
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let ann = vamana::new_shared();
+    let params = json!({"query": "lexical domain member sizing search", "limit": 1});
+    let baseline = KnowledgeHandlers::suggest(&rt, &token, params.clone(), &ann)
+        .await
+        .expect("suggest with live member");
+    assert_eq!(baseline["total"], 1, "got: {baseline}");
+    assert!(baseline["results"][0]["size"].as_u64().unwrap_or(0) > 0);
+
+    let deleted = registry
+        .dispatch(
+            "knowledge.delete_atoms",
+            json!({"ids": ["sizing-deleted-member"]}),
+        )
+        .await
+        .expect("soft-delete member atom");
+    assert_eq!(deleted["deleted"], 1, "got: {deleted}");
+
+    let result = KnowledgeHandlers::suggest(&rt, &token, params, &ann)
+        .await
+        .expect("suggest with deleted member");
+    assert_eq!(result["total"], 1, "got: {result}");
+    assert_eq!(result["results"][0]["id"], baseline["results"][0]["id"]);
+    assert_eq!(result["results"][0]["size"], 0, "got: {result}");
+    assert!(
+        result["degraded"].get("member_sizing_timeout").is_none(),
+        "a measured zero must not be excluded; got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn suggest_member_sizing_withholds_a_missing_domain_with_rank_and_score() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [
+                {
+                    "slug": "sizing-kept-domain",
+                    "name": "Sizing Kept Domain",
+                    "description": "Lexical domain member sizing search keeps measured domains available for token budget selection.",
+                    "members": []
+                },
+                {
+                    "slug": "sizing-missing-domain",
+                    "name": "Sizing Missing Domain",
+                    "description": "Lexical domain member sizing search withholds domains whose canonical row cannot be measured.",
+                    "members": []
+                }
+            ]}),
+        )
+        .await
+        .expect("upsert domains");
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let ann = vamana::new_shared();
+    let params = json!({"query": "lexical domain member sizing search", "limit": 2});
+    let baseline = KnowledgeHandlers::suggest(&rt, &token, params.clone(), &ann)
+        .await
+        .expect("suggest with both domain rows");
+    assert_eq!(baseline["total"], 2, "got: {baseline}");
+    let baseline_hits = baseline["results"].as_array().expect("baseline results");
+    let missing_rank = baseline_hits
+        .iter()
+        .position(|hit| hit["name"] == "Sizing Missing Domain")
+        .expect("domain to remove");
+    let missing = &baseline_hits[missing_rank];
+    let kept = baseline_hits
+        .iter()
+        .find(|hit| hit["name"] == "Sizing Kept Domain")
+        .expect("domain to retain");
+
+    // Retain the retrieval mirror so the hit list carries a domain that
+    // the canonical sizing query can no longer reach.
+    let access = rt.sql();
+    let mut writer = access.writer().await.expect("writer");
+    let removed = writer
+        .execute(khive_storage::types::SqlStatement {
+            sql: "DELETE FROM knowledge_domains WHERE namespace = 'local' AND id = ?1".into(),
+            params: vec![khive_storage::types::SqlValue::Text(
+                missing["id"].as_str().expect("domain id").to_owned(),
+            )],
+            label: None,
+        })
+        .await
+        .expect("remove canonical domain row");
+    assert_eq!(removed, 1);
+    drop(writer);
+
+    let result = KnowledgeHandlers::suggest(&rt, &token, params, &ann)
+        .await
+        .expect("suggest with a missing domain row");
+    assert_eq!(result["results"], json!([kept]), "got: {result}");
+    assert_eq!(result["total"], 1, "got: {result}");
+    assert_eq!(
+        result["degraded"]["member_sizing_timeout"]["excluded"],
+        json!([{
+            "id": missing["id"],
+            "name": missing["name"],
+            "rank": missing_rank + 1,
+            "score": missing["score"]
+        }]),
+        "the missing domain must be withheld with its original rank and score, without a size; got: {result}"
+    );
+    assert_ne!(result["degraded"]["lexical_timeout"], true);
+}
+
 /// Issue #1930 Amendment 2: a lexical-stage-*only* timeout (its own narrow
 /// budget expiring, not the request's) must not skip `search`'s embedding
 /// rerank. Paused time advances by the production stage budget after the
