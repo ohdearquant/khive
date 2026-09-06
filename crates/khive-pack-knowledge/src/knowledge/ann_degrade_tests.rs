@@ -1081,7 +1081,7 @@ async fn suggest_member_sizing_serves_a_domain_with_only_a_deleted_member_at_zer
             json!({"domains": [{
                 "slug": "sizing-measured-domain",
                 "name": "Sizing Measured Domain",
-                "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost.",
+                "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
                 "members": ["sizing-deleted-member"]
             }]}),
         )
@@ -1128,13 +1128,13 @@ async fn suggest_member_sizing_withholds_a_missing_domain_with_rank_and_score() 
                 {
                     "slug": "sizing-kept-domain",
                     "name": "Sizing Kept Domain",
-                    "description": "Lexical domain member sizing search keeps measured domains available for token budget selection.",
+                    "description": "Lexical domain member sizing search keeps measured domains available for token budget selection, because a fold budget can only admit domains whose compose cost is known.",
                     "members": []
                 },
                 {
                     "slug": "sizing-missing-domain",
                     "name": "Sizing Missing Domain",
-                    "description": "Lexical domain member sizing search withholds domains whose canonical row cannot be measured.",
+                    "description": "Lexical domain member sizing search withholds domains whose canonical row cannot be measured and lists them under the degraded exclusion key with their rank and score.",
                     "members": []
                 }
             ]}),

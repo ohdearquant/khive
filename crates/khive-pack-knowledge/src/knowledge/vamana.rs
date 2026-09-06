@@ -5165,6 +5165,20 @@ mod tests {
             })
             .await
             .expect("insert hydratable knowledge atom");
+        // The mirror atom above is what retrieval sees; the canonical row is what
+        // member sizing measures, and suggest withholds a domain it cannot measure.
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_domains \
+                      (id, namespace, slug, name, description, members, created_at, updated_at) \
+                      VALUES (?1, 'local', 'opaque-fresh-tail', 'Opaque Fresh Tail', \
+                              'content with no lexical overlap', '[]', ?2, ?2)"
+                    .into(),
+                params: vec![SqlValue::Text(fresh_id.to_string()), SqlValue::Integer(now)],
+                label: None,
+            })
+            .await
+            .expect("insert the canonical domain row the mirror atom stands for");
         drop(writer);
 
         let (_, still_loaded_watermark) = search_loaded_with_seq(&ann, &key, &query, 20)
