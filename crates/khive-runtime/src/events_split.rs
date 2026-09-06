@@ -281,6 +281,12 @@ struct HeldBackend {
     /// reused by another file while the entry lives. See `identity_probe`.
     #[cfg(unix)]
     probe: std::fs::File,
+    /// Its `-wal`/`-shm` as they stood beside it at the open, pinned the same
+    /// way (`sidecar_probes`): reached under another name, a hard link or a
+    /// spelling the filesystem folds onto theirs, they are still its
+    /// sidecars, and a close would still release its locks.
+    #[cfg(unix)]
+    sidecars: Vec<std::fs::File>,
     backend: Arc<StorageBackend>,
 }
 
@@ -439,11 +445,15 @@ fn direct_backend(
     });
     #[cfg(unix)]
     let probe = identity_probe(db_path)?;
+    #[cfg(unix)]
+    let sidecars = sidecar_probes(db_path)?;
     registry.push(HeldBackend {
         path: db_path.to_path_buf(),
         read_only,
         #[cfg(unix)]
         probe,
+        #[cfg(unix)]
+        sidecars,
         backend: Arc::clone(&backend),
     });
     Ok(backend)
@@ -467,6 +477,35 @@ fn identity_probe(db_path: &Path) -> crate::error::RuntimeResult<std::fs::File> 
                 db_path.display()
             ))
         })
+}
+
+/// Descriptors on the sidecars beside the database a pool just opened, one
+/// per sidecar present, never closed while the entry lives, as
+/// `identity_probe`: a sidecar reached later under another name is known by
+/// what they pin. A sidecar SQLite has not created by the open pins nothing,
+/// and the spelling check stands for it; a present one that cannot be pinned
+/// fails the open closed.
+#[cfg(unix)]
+fn sidecar_probes(db_path: &Path) -> crate::error::RuntimeResult<Vec<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut probes = Vec::new();
+    for path in sidecar_paths(db_path) {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => probes.push(file),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(crate::error::RuntimeError::Internal(format!(
+                    "cannot pin the identity of the events database sidecar {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    Ok(probes)
 }
 
 /// Device and inode from metadata, whether read by `stat` or `fstat`.
@@ -539,27 +578,44 @@ fn held_backend_for_file<'a>(
 /// as real. A writable open here would open them for the hardening and
 /// release the holder's locks with the close (the precondition on
 /// `harden_events_db_sidecars`), whatever file has since appeared at the
-/// spelling, so it is refused while any of them remains. Move them with the
-/// database or remove them first. A holder whose file is still here was
-/// found by `held_backend_for_file` before this runs; when that file is a
-/// read-only holder's own, come here by a rename, the writable open beside
-/// it runs this check too, for the sidecars another holder left.
+/// spelling, so it is refused while any of them remains. The same sidecars
+/// reached under another name, a hard link or a spelling the filesystem
+/// folds onto theirs (case, on a volume that folds it), are known by the
+/// identity the holder pinned at its open (`sidecar_probes`) and refused the
+/// same way. Move them with the database or remove them first. A holder
+/// whose file is still here was found by `held_backend_for_file` before this
+/// runs; when that file is a read-only holder's own, come here by a rename,
+/// the writable open beside it runs this check too, for the sidecars another
+/// holder left.
 #[cfg(unix)]
 fn refuse_held_spellings_sidecars(
     registry: &BackendMap,
     db_path: &Path,
 ) -> crate::error::RuntimeResult<()> {
-    let present: Vec<String> = sidecar_paths(db_path)
-        .iter()
-        .filter(|path| std::fs::symlink_metadata(path).is_ok())
-        .map(|path| path.display().to_string())
+    let present: Vec<(PathBuf, (u64, u64))> = sidecar_paths(db_path)
+        .into_iter()
+        .filter_map(|path| {
+            let identity = file_identity(&std::fs::symlink_metadata(&path).ok()?);
+            Some((path, identity))
+        })
         .collect();
     if present.is_empty() {
         return Ok(());
     }
     let here = std::fs::metadata(db_path).ok().map(|m| file_identity(&m));
     for held in registry {
-        if !same_spelling(&held.path, db_path) {
+        let mut theirs = same_spelling(&held.path, db_path);
+        for probe in &held.sidecars {
+            let pinned = probe.metadata().map_err(|e| {
+                crate::error::RuntimeError::Internal(format!(
+                    "cannot read the pinned identity of a sidecar of the held events database \
+                     {}: {e}",
+                    held.path.display()
+                ))
+            })?;
+            theirs |= present.iter().any(|(_, id)| *id == file_identity(&pinned));
+        }
+        if !theirs {
             continue;
         }
         let pinned = held.probe.metadata().map_err(|e| {
@@ -571,13 +627,17 @@ fn refuse_held_spellings_sidecars(
         if Some(file_identity(&pinned)) == here {
             continue;
         }
+        let names: Vec<String> = present
+            .iter()
+            .map(|(p, _)| p.display().to_string())
+            .collect();
         return Err(crate::error::RuntimeError::Internal(format!(
-            "refusing to open the events database {}: this process holds the database that \
-             was at this spelling, since moved away, and {} are its sidecars; a new database \
-             here would open them and release its SQLite locks. Move them with it or remove \
-             them first.",
+            "refusing to open the events database {}: {} are the sidecars of a database this \
+             process holds, at this spelling since moved away or reached here under another \
+             name; a new database here would open them and release its SQLite locks. Move \
+             them with it or remove them first.",
             db_path.display(),
-            present.join(" and ")
+            names.join(" and ")
         )));
     }
     Ok(())
@@ -3377,6 +3437,97 @@ mod tests {
         let beside = direct_backend_for(&db).expect("a writable open beside the read-only holder");
         assert!(!Arc::ptr_eq(&read_only, &beside));
         assert!(!Arc::ptr_eq(&writable, &beside));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_sidecar_reached_under_another_name_is_refused_before_the_hardening() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = dir.path().join("events.db");
+        let writable = direct_backend_for(&db).expect("writable open");
+        let sidecars = sidecar_paths(&db);
+        let identity = |sidecars: &[PathBuf; 2]| -> Vec<(u64, u32, u64)> {
+            sidecars
+                .iter()
+                .map(|s| {
+                    let m = std::fs::metadata(s).expect("the holder's sidecar is there");
+                    (m.ino(), m.permissions().mode() & 0o777, m.len())
+                })
+                .collect()
+        };
+        let fresh_file = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .expect("a fresh database file");
+        };
+        let live = identity(&sidecars);
+        let moved = dir.path().join("moved.db");
+        std::fs::rename(&db, &moved).expect("rename the held database");
+        // The holder's live sidecars under another name: hard links beside a
+        // fresh database file, no spelling of the holder's among them.
+        let other = dir.path().join("other.db");
+        let linked = sidecar_paths(&other);
+        for (from, to) in sidecars.iter().zip(&linked) {
+            std::fs::hard_link(from, to).expect("link the holder's sidecar under another name");
+        }
+        fresh_file(&other);
+        let err = direct_backend_for(&other)
+            .err()
+            .expect("the holder's sidecars are not opened under another name")
+            .to_string();
+        assert!(
+            err.contains("since moved away") && err.contains("other.db-wal"),
+            "{err}"
+        );
+        assert_eq!(
+            identity(&sidecars),
+            live,
+            "the holder's sidecars were never touched"
+        );
+        let still = direct_backend_for(&moved).expect("the holder is still served");
+        assert!(
+            Arc::ptr_eq(&writable, &still),
+            "found by its inode under its new name"
+        );
+        // The links gone, the other spelling is a database of its own.
+        for path in &linked {
+            std::fs::remove_file(path).unwrap();
+        }
+        let own = direct_backend_for(&other).expect("a database of its own once the links went");
+        assert!(!Arc::ptr_eq(&writable, &own));
+        // A spelling the filesystem folds onto the holder's reaches the same
+        // sidecars and is refused the same way; where nothing folds, it is a
+        // name of its own and the open lands.
+        let folded = dir.path().join("Events.db");
+        fresh_file(&folded);
+        let folds = std::fs::symlink_metadata(dir.path().join("Events.db-wal")).is_ok();
+        match direct_backend_for(&folded) {
+            Err(e) => {
+                assert!(folds, "refused where nothing folds: {e}");
+                let e = e.to_string();
+                assert!(
+                    e.contains("since moved away") && e.contains("Events.db-wal"),
+                    "{e}"
+                );
+                assert_eq!(
+                    identity(&sidecars),
+                    live,
+                    "never touched through the folded name"
+                );
+            }
+            Ok(own) => {
+                assert!(
+                    !folds,
+                    "landed where the name folds onto the holder's sidecars"
+                );
+                assert!(!Arc::ptr_eq(&writable, &own));
+            }
+        }
     }
 
     #[cfg(unix)]

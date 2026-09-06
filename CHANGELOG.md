@@ -39,7 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moved away, a writable open there is refused while its sidecars remain,
   whatever file has since appeared at the spelling, a database this process
   holds read-only included, and however the path is written: the directory is
-  resolved before the spellings are compared.
+  resolved before the spellings are compared, and the sidecars are known by
+  the identity the holder pinned at its open, so the same files reached under
+  another name, a hard link or a spelling the filesystem folds onto theirs,
+  are refused the same way.
 
 ## [0.8.0] - 2026-08-27
 
