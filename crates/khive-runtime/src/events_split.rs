@@ -734,7 +734,10 @@ fn harden_events_db_sidecars(db_path: &Path) -> anyhow::Result<()> {
 /// hold (see the precondition on `harden_events_db_sidecars`). Sidecars
 /// SQLite creates inherit the database file's mode, so a failure here means
 /// something else changed the file set; refuse to serve rather than tighten
-/// through a path-based chmod and its lookup race.
+/// through a path-based chmod and its lookup race. What this attests is
+/// exactly that: each present path is a regular file with no group or other
+/// permission bits. It does not compare inode identity with the files SQLite
+/// opened, and an absent path is skipped, not refused.
 #[cfg(unix)]
 fn verify_events_db_owner_only_unopened(db_path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;

@@ -21,7 +21,7 @@
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// SQLite's pending byte and the SHARED range above it (`os_unix.c`).
@@ -37,6 +37,15 @@ const SHM_DMS_BYTE: i64 = 128;
 const F_WRLCK: libc::c_short = libc::F_WRLCK as libc::c_short;
 #[allow(clippy::unnecessary_cast)]
 const F_RDLCK: libc::c_short = libc::F_RDLCK as libc::c_short;
+
+struct DaemonGuard(Child);
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 /// Ask the kernel, from this process, whether an exclusive lock over
 /// `[start, start + len)` of `path` would conflict with a lock held by another
@@ -84,7 +93,7 @@ fn events_daemon_keeps_shared_locks_on_its_database_while_idle() {
     let stderr_path = dir.path().join("daemon.stderr");
     let stderr = std::fs::File::create(&stderr_path).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kkernel"))
+    let child = Command::new(env!("CARGO_BIN_EXE_kkernel"))
         .arg("events-daemon")
         .arg("--db")
         .arg(&db)
@@ -97,6 +106,8 @@ fn events_daemon_keeps_shared_locks_on_its_database_while_idle() {
         .stderr(Stdio::from(stderr))
         .spawn()
         .expect("spawn events daemon");
+    let mut daemon = DaemonGuard(child);
+    let child = &mut daemon.0;
 
     // Readiness: the daemon binds the socket only after the schema is ensured,
     // which is after SQLite opened the database and its WAL. Cold builds and
