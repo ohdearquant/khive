@@ -5165,15 +5165,16 @@ mod tests {
             })
             .await
             .expect("insert hydratable knowledge atom");
-        // The mirror atom above is what retrieval sees; the canonical row is what
-        // member sizing measures, and suggest withholds a domain it cannot measure.
+        // Reuse the live mirror atom as a member so pricing runs without adding
+        // another vector or changing the loaded bridge's watermark.
         writer
             .execute(SqlStatement {
-                sql: "INSERT INTO knowledge_domains \
+                sql:
+                    "INSERT INTO knowledge_domains \
                       (id, namespace, slug, name, description, members, created_at, updated_at) \
                       VALUES (?1, 'local', 'opaque-fresh-tail', 'Opaque Fresh Tail', \
-                              'content with no lexical overlap', '[]', ?2, ?2)"
-                    .into(),
+                              'content with no lexical overlap', '[\"opaque-fresh-tail\"]', ?2, ?2)"
+                        .into(),
                 params: vec![SqlValue::Text(fresh_id.to_string()), SqlValue::Integer(now)],
                 label: None,
             })
@@ -5234,6 +5235,16 @@ mod tests {
         assert!(
             suggest_ids.contains(&fresh_id.as_str()),
             "fresh-tail domain atom must be visible to knowledge.suggest: {suggest}"
+        );
+        let fresh_index = suggest_ids
+            .iter()
+            .position(|id| *id == fresh_id.as_str())
+            .expect("fresh-tail domain result");
+        assert!(
+            suggest["results"][fresh_index]["size"]
+                .as_u64()
+                .is_some_and(|size| size > 0),
+            "the live member must give the fresh-tail domain a measured cost: {suggest}"
         );
     }
 

@@ -1096,14 +1096,14 @@ async fn suggest_member_sizing_withholds_a_domain_with_only_deleted_members() {
     assert_eq!(excluded[0]["id"], hit["id"]);
     assert_eq!(excluded[0]["name"], hit["name"]);
     assert_eq!(excluded[0]["rank"], 1);
-    assert!(excluded[0]["score"].as_f64().is_some_and(|score| score > 0.0));
+    assert!(excluded[0]["score"]
+        .as_f64()
+        .is_some_and(|score| score > 0.0));
     assert!(excluded[0].get("size").is_none());
-    assert!(
-        result["degraded"]["member_sizing_timeout"]["note"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("timeout or no live member")
-    );
+    assert!(result["degraded"]["member_sizing_timeout"]["note"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("timeout or no live member"));
     assert_ne!(result["degraded"]["lexical_timeout"], true);
     registry
         .dispatch(

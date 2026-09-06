@@ -4283,7 +4283,10 @@ mod tests {
                     .await
                     .expect("bounded lexical fetch");
                     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    assert!(outcome.atoms.iter().all(|atom| atom.namespace == "tenant-b"));
+                    assert!(outcome
+                        .atoms
+                        .iter()
+                        .all(|atom| atom.namespace == "tenant-b"));
                     println!(
                         "LEXICAL_NAMESPACE mode={mode} foreign_present={foreign_present} local_matches={local_matches} rows={} lexical_elapsed_ms={elapsed_ms:.3} lexical_timeout={}",
                         outcome.atoms.len(),
