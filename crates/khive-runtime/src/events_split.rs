@@ -286,7 +286,7 @@ struct HeldBackend {
 
 /// A read-only open and a writable open of one file are different pools with
 /// different guarantees and are never handed out interchangeably; entries
-/// are found by spelling and mode first, then by the pinned identity.
+/// are found by the pinned identity and the mode, never by spelling.
 type BackendMap = Vec<HeldBackend>;
 
 #[cfg(unix)]
@@ -338,6 +338,11 @@ fn direct_backend(
     let mut registry = direct_backend_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Without the inode probe the registry can only go by spelling and mode.
+    // With it, the spelling is never consulted: a file created at a held
+    // path after a rename is another inode and gets its own pool, and a link
+    // planted there is refused below like any other.
+    #[cfg(not(unix))]
     if let Some(held) = registry
         .iter()
         .find(|held| held.read_only == read_only && held.path.as_path() == db_path)
@@ -2981,6 +2986,45 @@ mod tests {
             err.contains("moved.db") && err.contains("already holds it writable"),
             "{err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_created_at_a_held_spelling_after_a_rename_is_another_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = dir.path().join("events.db");
+        let first = direct_backend_for(&db).expect("first open");
+        let moved = dir.path().join("moved.db");
+        std::fs::rename(&db, &moved).expect("rename the held database");
+
+        // The old spelling now names a new file: its own pool, hardened and
+        // opened afresh, while the moved file keeps its holder.
+        let second = direct_backend_for(&db).expect("a new database at the old spelling");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a spelling is not a file: the new file at the old path is another database"
+        );
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the new file was created owner-only"
+        );
+        let held = direct_backend_for(&moved).expect("the moved file is still held");
+        assert!(Arc::ptr_eq(&first, &held));
+
+        // A link planted at the old spelling is refused, held holder or not.
+        let linked = dir.path().join("linked.db");
+        let third = direct_backend_for(&linked).expect("a third database");
+        std::fs::rename(&linked, dir.path().join("linked-moved.db")).unwrap();
+        std::os::unix::fs::symlink(&moved, &linked).unwrap();
+        let err = direct_backend_for(&linked)
+            .err()
+            .expect("a symlink at a held spelling is refused")
+            .to_string();
+        assert!(err.contains("linked.db"), "{err}");
+        drop(third);
     }
 
     #[cfg(unix)]
