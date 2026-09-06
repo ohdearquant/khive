@@ -347,6 +347,31 @@ fn build_registry(rt: &KhiveRuntime) -> VerbRegistry {
     registry
 }
 
+async fn lexical_timeout_fixture(
+    atoms: Vec<serde_json::Value>,
+    domain: serde_json::Value,
+) -> (KhiveRuntime, VerbRegistry) {
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+    if !atoms.is_empty() {
+        registry
+            .dispatch("knowledge.upsert_atoms", json!({"atoms": atoms}))
+            .await
+            .expect("upsert member atoms");
+    }
+    registry
+        .dispatch("knowledge.upsert_domains", json!({"domains": [domain]}))
+        .await
+        .expect("upsert domain");
+    registry
+        .dispatch("knowledge.index", json!({"rebuild_ann": false}))
+        .await
+        .expect("index");
+    // Index only the small corpus; these additional rows stay lexical-only.
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+    (rt, registry)
+}
+
 /// RAII guard: reset the timeout override when the test exits (even on panic).
 struct TimeoutOverrideReset;
 
@@ -823,32 +848,16 @@ async fn suggest_flags_degraded_no_match_when_hits_empty() {
 /// fabricated size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
-    let rt = rt_with_fake_embedder();
-    let registry = build_registry(&rt);
-
-    registry
-        .dispatch(
-            "knowledge.upsert_domains",
-            json!({"domains": [{
-                "slug": "degrade-lexical-timeout-domain",
-                "name": "Degrade Lexical Timeout Domain",
-                "description": "a domain seeded only so ANN has a real vector to serve from the fresh-tail scan path when the lexical fetch itself exceeds the request read deadline during this regression test",
-                "members": []
-            }]}),
-        )
-        .await
-        .expect("upsert domain");
-    registry
-        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
-        .await
-        .expect("index");
-
-    // A large low-overlap lexical corpus, seeded via raw SQL *after*
-    // `knowledge.index` above (which pages every un-deleted atom in the
-    // namespace) so these 200K rows are never embedded — only the domain is.
-    // This makes the bounded per-term lexical fetch itself take long enough
-    // to exceed a tight deadline, without paying to embed 200K atoms.
-    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+    let (rt, _registry) = lexical_timeout_fixture(
+        Vec::new(),
+        json!({
+            "slug": "degrade-lexical-timeout-domain",
+            "name": "Degrade Lexical Timeout Domain",
+            "description": "a domain seeded only so ANN has a real vector to serve from the fresh-tail scan path when the lexical fetch itself exceeds the request read deadline during this regression test",
+            "members": []
+        }),
+    )
+    .await;
 
     // A fresh SharedAnn: nothing warmed, no snapshot. `search_eligible_ann_with_refill`
     // falls back to the fresh-tail vector-store scan, which still finds the
@@ -909,44 +918,21 @@ async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
 /// (which breaks the documented suggest -> fold passthrough, issue #105).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lexical_timeout_reports_member_sizing_as_unmeasured_not_zero() {
-    let rt = rt_with_fake_embedder();
-    let registry = build_registry(&rt);
-
-    registry
-        .dispatch(
-            "knowledge.upsert_atoms",
-            json!({
-                "atoms": [{
-                    "slug": "degrade-sizing-member-atom",
-                    "name": "Degrade Sizing Member Atom",
-                    "finalized": true,
-                    "content": "enough body content to price a non-zero token size for the owning domain if member sizing ever ran to completion"
-                }]
-            }),
-        )
-        .await
-        .expect("upsert member atom");
-    registry
-        .dispatch(
-            "knowledge.upsert_domains",
-            json!({"domains": [{
-                "slug": "degrade-sizing-domain",
-                "name": "Degrade Sizing Domain",
-                "description": "a domain with a real member atom, so a real (non-zero) size would be computed if member sizing ran, proving a timeout is reported as unmeasured rather than a coincidental zero",
-                "members": ["degrade-sizing-member-atom"]
-            }]}),
-        )
-        .await
-        .expect("upsert domain");
-    registry
-        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
-        .await
-        .expect("index");
-
-    // Seeded after indexing, like the sibling tests above, so these 200K
-    // rows are never embedded — only the lexical stage's own read pays for
-    // scanning them, long enough to exceed the outer deadline below.
-    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+    let (rt, registry) = lexical_timeout_fixture(
+        vec![json!({
+            "slug": "degrade-sizing-member-atom",
+            "name": "Degrade Sizing Member Atom",
+            "finalized": true,
+            "content": "enough body content to price a non-zero token size for the owning domain if member sizing ever ran to completion"
+        })],
+        json!({
+            "slug": "degrade-sizing-domain",
+            "name": "Degrade Sizing Domain",
+            "description": "a domain with a real member atom, so a real (non-zero) size would be computed if member sizing ran, proving a timeout is reported as unmeasured rather than a coincidental zero",
+            "members": ["degrade-sizing-member-atom"]
+        }),
+    )
+    .await;
 
     let ann = vamana::new_shared();
     let token = rt.authorize(Namespace::local()).expect("authorize");
@@ -1007,44 +993,21 @@ async fn lexical_timeout_reports_member_sizing_as_unmeasured_not_zero() {
 /// parse error on the degraded domain's `size: null`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn suggest_results_under_a_member_sizing_timeout_still_pass_through_fold() {
-    let rt = rt_with_fake_embedder();
-    let registry = build_registry(&rt);
-
-    registry
-        .dispatch(
-            "knowledge.upsert_atoms",
-            json!({
-                "atoms": [{
-                    "slug": "degrade-sizing-passthrough-atom",
-                    "name": "Degrade Sizing Passthrough Atom",
-                    "finalized": true,
-                    "content": "enough body content to price a non-zero token size for the owning domain if member sizing ever ran to completion"
-                }]
-            }),
-        )
-        .await
-        .expect("upsert member atom");
-    registry
-        .dispatch(
-            "knowledge.upsert_domains",
-            json!({"domains": [{
-                "slug": "degrade-sizing-passthrough-domain",
-                "name": "Degrade Sizing Passthrough Domain",
-                "description": "a domain with a real member atom, so a real (non-zero) size would be computed if member sizing ran, proving a timeout is reported as unmeasured rather than a coincidental zero",
-                "members": ["degrade-sizing-passthrough-atom"]
-            }]}),
-        )
-        .await
-        .expect("upsert domain");
-    registry
-        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
-        .await
-        .expect("index");
-
-    // Seeded after indexing, like the sibling tests above, so these 200K
-    // rows are never embedded — only the lexical stage's own read pays for
-    // scanning them, long enough to exceed the outer deadline below.
-    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+    let (rt, registry) = lexical_timeout_fixture(
+        vec![json!({
+            "slug": "degrade-sizing-passthrough-atom",
+            "name": "Degrade Sizing Passthrough Atom",
+            "finalized": true,
+            "content": "enough body content to price a non-zero token size for the owning domain if member sizing ever ran to completion"
+        })],
+        json!({
+            "slug": "degrade-sizing-passthrough-domain",
+            "name": "Degrade Sizing Passthrough Domain",
+            "description": "a domain with a real member atom, so a real (non-zero) size would be computed if member sizing ran, proving a timeout is reported as unmeasured rather than a coincidental zero",
+            "members": ["degrade-sizing-passthrough-atom"]
+        }),
+    )
+    .await;
 
     let ann = vamana::new_shared();
     let token = rt.authorize(Namespace::local()).expect("authorize");
