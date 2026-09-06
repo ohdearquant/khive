@@ -1061,11 +1061,10 @@ async fn suggest_results_under_a_member_sizing_timeout_still_pass_through_fold()
 
 /// Issue #1930 Amendment 2: a lexical-stage-*only* timeout (its own narrow
 /// budget expiring, not the request's) must not skip `search`'s embedding
-/// rerank. Unlike the sibling test above, this installs no outer
-/// `scope_request_read_deadline` at all — the only deadline in play is the
-/// tiny lexical-stage-budget override, so once the lexical fetch degrades
-/// and that scope pops back out, the rest of the request runs under a
-/// perfectly healthy (unset) ambient deadline. `CountingEmbedder` proves the
+/// rerank. Paused time advances by the production stage budget after the
+/// first term, while the real handler runs under a 30-second request deadline.
+/// Removing the independent stage scope must fail this test even though the
+/// outer request remains healthy. `CountingEmbedder` proves the
 /// rerank actually ran: the ANN retrieval step always contributes exactly
 /// one `embed()` call, so a second call landing during this `search()`
 /// invocation can only be the rerank's `embed_batch`.
@@ -1093,21 +1092,32 @@ async fn search_still_reranks_after_a_lexical_stage_only_timeout() {
         .await
         .expect("index");
 
-    // Seeded after indexing (like the sibling test above) so these 200K rows
-    // are never embedded — only the lexical stage's own budget pays for
-    // scanning them, long enough to exceed a 50 ms override.
-    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+    // These lexical-only rows are seeded after indexing; fake time, not
+    // corpus size or machine load, determines when the stage expires.
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 1_000, 20).await;
 
     let ann = vamana::new_shared();
     let token = rt.authorize(Namespace::local()).expect("authorize");
 
     let baseline = calls.load(Ordering::Acquire);
     let query = "term0 term1 term2 term3 term4 term5 term6 term7";
-    let result = crate::knowledge::search::with_lexical_stage_budget_override_ms(50, async {
-        KnowledgeHandlers::search(&rt, &token, json!({ "query": query }), &ann).await
-    })
-    .await
-    .expect("search must not Err on a lexical-stage-only timeout");
+    let stage_budget =
+        std::time::Duration::from_millis(crate::knowledge::search::LEXICAL_STAGE_BUDGET_MS);
+    assert!(stage_budget < std::time::Duration::from_secs(6));
+    tokio::time::pause();
+    let result =
+        khive_storage::scope_request_read_deadline(std::time::Duration::from_secs(30), async {
+            let result = crate::knowledge::search::with_fts_deadline_advance_after_term(
+                1,
+                stage_budget,
+                KnowledgeHandlers::search(&rt, &token, json!({ "query": query }), &ann),
+            )
+            .await;
+            assert!(khive_storage::ensure_request_read_active("test.search_stage").is_ok());
+            result
+        })
+        .await
+        .expect("search must not Err on a lexical-stage-only timeout");
 
     assert_eq!(
         result["degraded"]["lexical_timeout"], true,
@@ -1169,17 +1179,28 @@ async fn suggest_still_prices_members_after_a_lexical_stage_only_timeout() {
         .await
         .expect("index");
 
-    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 1_000, 20).await;
 
     let ann = vamana::new_shared();
     let token = rt.authorize(Namespace::local()).expect("authorize");
 
     let query = "term0 term1 term2 term3 term4 term5 term6 term7";
-    let result = crate::knowledge::search::with_lexical_stage_budget_override_ms(50, async {
-        KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann).await
-    })
-    .await
-    .expect("suggest must not Err on a lexical-stage-only timeout");
+    let stage_budget =
+        std::time::Duration::from_millis(crate::knowledge::search::LEXICAL_STAGE_BUDGET_MS);
+    tokio::time::pause();
+    let result =
+        khive_storage::scope_request_read_deadline(std::time::Duration::from_secs(30), async {
+            let result = crate::knowledge::search::with_fts_deadline_advance_after_term(
+                1,
+                stage_budget,
+                KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+            )
+            .await;
+            assert!(khive_storage::ensure_request_read_active("test.suggest_stage").is_ok());
+            result
+        })
+        .await
+        .expect("suggest must not Err on a lexical-stage-only timeout");
 
     assert_eq!(
         result["degraded"]["lexical_timeout"], true,

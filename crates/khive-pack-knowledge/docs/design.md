@@ -66,11 +66,18 @@
 ### Lexical candidate fetch and stage budget (issue #1930 Amendment 2, issue #2396)
 
 - `fetch_fts_candidates` (`knowledge/search.rs`) runs each FTS5 term in two phases instead of one
-  joined query. Phase A ranks bare rowids off the `fts_knowledge` index only (`bm25()` needs the
-  index and docsize shadow table, not the content row), carrying no namespace predicate because
+  joined query. Phase A enumerates bare rowids off the `fts_knowledge` index, carrying no namespace
+  predicate because
   `namespace` is UNINDEXED on that external-content table and filtering on it there would force a
   content-row fetch per candidate anyway:
-  `SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 ORDER BY bm25(fts_knowledge), rowid LIMIT ?2`.
+  `SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 ORDER BY rowid LIMIT ?2`.
+  FTS5 consumes rowid order directly, so enumeration stops at the limit without sorting or
+  computing BM25 over the entire match set. TF-IDF remains the application-level ranker.
+  Multi-term queries first probe at most 501 rowids per term and process non-empty terms by
+  ascending observed frequency, breaking ties by term spelling. Frequencies up to 500 are exact;
+  larger posting lists share the capped frequency. These index-only probes also run inside the
+  lexical deadline. Completed terms are merged round-robin, retaining rare matches if a later
+  common term times out and preventing query-word order from selecting the surviving prefix.
   Phase B hydrates only the surviving rowids from `knowledge_atoms` in chunks, applying namespace,
   soft-delete, status, and type eligibility at that point — the first query in the whole fetch to
   touch a full atom row (including `content`), and only for rows that already cleared phase A's
@@ -83,15 +90,16 @@
   `rowid IN (...)` list; the unary plus defeats that index without changing the predicate.
 - When phase B carries a status or type eligibility predicate, phase A overfetches by
   `PHASE_A_OVERFETCH_FACTOR` (4x) so an ineligible-heavy top page cannot starve phase B of rows
-  that are eligible further down the bm25 ranking. If phase A still returned a full page and
+  that are eligible further down the rowid sequence. If phase A still returned a full page and
   eligible rows remain short of the per-term cap, the probe widens by the same factor once more,
   up to `PHASE_A_WIDEN_CEILING` (8000) — bounding the worst case to a fixed per-term cost instead
   of an unbounded retry loop. If widening reaches the ceiling and the eligible set is _still_
-  short, the term falls back once to the pre-two-phase eligibility-scoped join (bm25 over
-  `fts_knowledge` joined to `knowledge_atoms` with every predicate applied before its own
-  per-term `LIMIT`) so more than `PHASE_A_WIDEN_CEILING` ineligible top-ranked rows can never hide
+  short, the term falls back once to an eligibility-scoped join (`fts_knowledge` drives primary-key
+  lookups in `knowledge_atoms`, with every predicate applied before its own per-term `LIMIT`,
+  still in FTS rowid order) so more than `PHASE_A_WIDEN_CEILING` ineligible prefix rows can never hide
   a real candidate — this fallback trades the bounded-cost guarantee for correctness on the rare
-  term pathological enough to exhaust the ceiling.
+  term pathological enough to exhaust the ceiling. Its enumeration can stop once enough eligible
+  rows have been found; the independent stage deadline still bounds a long ineligible prefix.
 - When no term produces an eligible row, the empty-result fallback (a bounded, namespace-filtered
   full scan of `knowledge_atoms` ordered by recency) is gated on namespace-scoped evidence only: a
   chunked `SELECT 1 FROM knowledge_atoms WHERE rowid IN (...) AND namespace = ?1 LIMIT 1` over the
@@ -105,7 +113,7 @@
   `tokio::task_local!` values scoped to the calling task, mirroring
   `khive_storage::scope_request_read_deadline`'s own mechanism — never a process-global `AtomicU64`,
   which a concurrently running test with no override of its own could observe.
-- The lexical fetch runs under its own read-deadline budget (`LEXICAL_STAGE_BUDGET_MS`, 8s),
+- The lexical fetch runs under its own read-deadline budget (`LEXICAL_STAGE_BUDGET_MS`, 2s),
   scoped via `khive_storage::scope_request_read_deadline`. Nested deadlines keep whichever is
   earlier while active and pop back to the outer request deadline once the scope exits, so a
   lexical-stage timeout narrows only that stage's own budget — it no longer implies the whole

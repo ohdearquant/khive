@@ -361,19 +361,46 @@ fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
 
 // ─── FTS5 candidate pool fetch ────────────────────────────────────────────────
 
-/// Per-term bounded candidate cap (issue #1930). A single-term `MATCH` orders
-/// a much smaller row set than the OR-joined expression over every expanded
-/// term, so bounding each term independently — instead of bounding only the
-/// combined result — keeps the read cost proportional to the number of terms,
-/// never to the size of the full match set.
+/// Per-term candidate cap. FTS enumerates in rowid order and stops at the
+/// limit; application TF-IDF scoring ranks only the admitted candidates.
 const FTS_TERM_LIMIT: usize = 500;
+
+fn phase_a_rowids_statement(term: &str, limit: usize) -> SqlStatement {
+    SqlStatement {
+        sql: "SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
+              ORDER BY rowid LIMIT ?2"
+            .into(),
+        params: vec![SqlValue::Text(term.into()), SqlValue::Integer(limit as i64)],
+        label: Some("knowledge.fts_rowids".into()),
+    }
+}
+
+async fn rarest_fts_terms_first(
+    reader: &mut dyn khive_storage::SqlReader,
+    terms: Vec<String>,
+) -> Result<Vec<String>, khive_storage::StorageError> {
+    let mut frequencies = Vec::with_capacity(terms.len());
+    for term in terms {
+        // Count only a bounded index prefix. Rare counts are exact; terms
+        // above the cap tie by spelling, without scanning their whole lists.
+        let rows = reader
+            .query_all(phase_a_rowids_statement(&term, FTS_TERM_LIMIT + 1))
+            .await?;
+        if !rows.is_empty() {
+            frequencies.push((term, rows.len()));
+        }
+    }
+    frequencies
+        .sort_unstable_by(|(a, a_count), (b, b_count)| a_count.cmp(b_count).then_with(|| a.cmp(b)));
+    Ok(frequencies.into_iter().map(|(term, _)| term).collect())
+}
 
 /// Overfetch factor applied to a term's phase-A rowid window when phase B has
 /// an eligibility predicate (status or type) that can reject rows phase A had
 /// no way to see (issue #1930 Amendment 2 — see [`fetch_fts_candidates`]).
 /// Phase A carries no eligibility predicate at all, so without headroom an
 /// ineligible-heavy match set could starve phase B down to nothing even
-/// though eligible rows exist further down the bm25 ranking.
+/// though eligible rows exist further down the rowid sequence.
 const PHASE_A_OVERFETCH_FACTOR: usize = 4;
 
 /// Ceiling a single term's phase-A probe window is allowed to widen to
@@ -390,7 +417,7 @@ const PHASE_A_WIDEN_CEILING: usize = 8000;
 /// every stage that runs after it (rerank, body-line counts, member
 /// sizing). A lexical-stage timeout therefore no longer means the request
 /// itself is out of time — only that this one stage's own budget is.
-pub(crate) const LEXICAL_STAGE_BUDGET_MS: u64 = 8_000;
+pub(crate) const LEXICAL_STAGE_BUDGET_MS: u64 = 2_000;
 
 // ── Test-only seam: override the lexical-stage budget and the phase-A widen
 // ceiling ──────────────────────────────────────────────────────────────────
@@ -480,6 +507,26 @@ async fn advance_fts_test_deadline_after_term(completed_terms: usize) {
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn with_fts_deadline_advance_after_term<F>(
+    after_completed_terms: usize,
+    by: std::time::Duration,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    FTS_TEST_DEADLINE_ADVANCE
+        .scope(
+            FtsTestDeadlineAdvance {
+                after_completed_terms,
+                by,
+            },
+            future,
+        )
+        .await
+}
+
 fn is_timeout(e: &khive_storage::StorageError) -> bool {
     matches!(e, khive_storage::StorageError::Timeout { .. })
 }
@@ -499,9 +546,9 @@ fn is_read_timeout(e: &RuntimeError) -> bool {
 /// a full atom row — `content` included — per FTS5 match *before* its own
 /// per-term `LIMIT`, so every match paid a scattered read against the whole
 /// (potentially multi-gigabyte) atom table even though only the top few
-/// hundred survived. Phase A instead orders bare rowids straight off the
-/// `fts_knowledge` index (`bm25()` needs only the index and the docsize
-/// shadow table, not the content); phase B hydrates just the surviving
+/// hundred survived. Phase A instead enumerates bare rowids straight off
+/// the `fts_knowledge` index, stopping before scoring the full match set;
+/// phase B hydrates just the surviving
 /// rowids from `knowledge_atoms` in chunks, applying namespace, soft-delete,
 /// status, and type eligibility there.
 ///
@@ -510,17 +557,12 @@ fn is_read_timeout(e: &RuntimeError) -> bool {
 /// original single query did) forces FTS5 to fetch the backing content row
 /// per candidate — exactly the cost phase A exists to avoid. The namespace
 /// check moves entirely to phase B, where the atom row is already being
-/// read for its other eligibility columns; a term whose top bm25 matches
-/// are disproportionately from another namespace can therefore come back
-/// short, which the overfetch/widen behavior below exists to absorb for
-/// status/type ineligibility but not for this one — an accepted, narrow
-/// degradation, not a correctness bug (mirrors the eligibility probe's own
-/// choice a few lines down).
+/// read for its other eligibility columns. Overfetch and the scoped ceiling
+/// fallback recover eligible rows beyond an ineligible prefix.
 ///
 /// Phase A also drops the `a.slug` tie-break the old query used: `rowid` is
-/// already stable and needs no join, so `ORDER BY bm25(fts_knowledge),
-/// rowid` gives deterministic per-term ordering without touching the
-/// content table.
+/// already stable and needs no join. `ORDER BY rowid` is consumed by FTS5,
+/// so LIMIT can stop enumeration without a temporary full-match sort.
 ///
 /// Replaces a single `ORDER BY bm25(...)` over one OR-joined match expression
 /// (whose cost scales with the size of the entire match set — the #1930 read
@@ -549,7 +591,7 @@ async fn fetch_fts_candidates(
         Err(e) => return Err(sql_err("search fts reader", e)),
     };
 
-    let terms = fts5_candidate_terms(raw_query);
+    let mut terms = fts5_candidate_terms(raw_query);
     let type_clause = type_eligibility_sql(type_filter, "a");
     let per_term_limit = if terms.len() == 1 {
         fetch_limit
@@ -573,11 +615,26 @@ async fn fetch_fts_candidates(
         per_term_limit
     };
 
-    // Query every term rather than stopping once `combined` reaches
+    if terms.len() > 1 {
+        terms = match rarest_fts_terms_first(reader.as_mut(), terms).await {
+            Ok(terms) => terms,
+            Err(e) if is_timeout(&e) => {
+                return Ok(FtsFetchOutcome {
+                    atoms: Vec::new(),
+                    timed_out: true,
+                });
+            }
+            Err(e) => return Err(sql_err("search fts term frequency probe", e)),
+        };
+    }
+
+    // Query every matching term rather than stopping once `combined` reaches
     // `fetch_limit` — an early break made pool membership depend on query
     // word order (a fast-filling early term could starve every later term
     // of a query at all). Each term's rows are collected independently and
     // merged round-robin below, so no single term can crowd out the rest.
+    // Rarest-first scheduling preserves useful narrow matches if a later
+    // common term exhausts the independent stage deadline.
     let mut per_term_rows: Vec<Vec<Atom>> = Vec::with_capacity(terms.len());
     // Every phase-A rowid window each term probed, kept only to decide the
     // full-scan fallback below from namespace-scoped evidence (fix 1) —
@@ -590,16 +647,7 @@ async fn fetch_fts_candidates(
 
         let (mut eligible, probed_rowids): (Vec<Atom>, Vec<i64>) = loop {
             let phase_a_rows = match reader
-                .query_all(SqlStatement {
-                    sql: "SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
-                          ORDER BY bm25(fts_knowledge), rowid LIMIT ?2"
-                        .to_string(),
-                    params: vec![
-                        SqlValue::Text(term.clone()),
-                        SqlValue::Integer(probe_limit as i64),
-                    ],
-                    label: None,
-                })
+                .query_all(phase_a_rowids_statement(term, probe_limit))
                 .await
             {
                 Ok(rows) => rows,
@@ -642,7 +690,7 @@ async fn fetch_fts_candidates(
                 }
             }
 
-            // Reassemble in phase A's bm25/rowid order; a rowid absent from
+            // Reassemble in phase A's rowid order; a rowid absent from
             // the hydrated map was ineligible (wrong namespace/status/type)
             // or deleted between phase A and phase B.
             let eligible_now: Vec<Atom> = rowids
@@ -665,7 +713,7 @@ async fn fetch_fts_candidates(
 
                 // Ceiling exhausted and still short: more than `widen_ceiling`
                 // ineligible top-ranked rows could still be hiding an
-                // eligible one further down the bm25 ranking than phase A
+                // eligible one further down the rowid sequence than phase A
                 // ever probed. Pay once for the pre-#2396-shape eligibility-
                 // scoped join, bounded to this term's own `per_term_limit`,
                 // so the ceiling bounds cost without letting an ineligible-
@@ -674,11 +722,11 @@ async fn fetch_fts_candidates(
                     status_sql_clause(statuses, exclude_statuses, 4);
                 let scoped_sql = format!(
                     "SELECT a.* FROM fts_knowledge \
-                     JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+                     CROSS JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
                      WHERE fts_knowledge MATCH ?1 \
-                       AND a.namespace = ?2 \
+                       AND +a.namespace = ?2 \
                        AND a.deleted_at IS NULL{scoped_status_clause}{type_clause} \
-                     ORDER BY bm25(fts_knowledge), a.rowid \
+                     ORDER BY fts_knowledge.rowid \
                      LIMIT ?3"
                 );
                 let mut scoped_params = vec![
@@ -3451,6 +3499,36 @@ pub(crate) async fn seed_low_overlap_corpus(runtime: &KhiveRuntime, n: u32, voca
 #[cfg(test)]
 mod tests {
     use super::*;
+    use khive_storage::types::{SqlRow, StorageResult};
+
+    struct ProbeRecordingReader {
+        inner: Box<dyn khive_storage::SqlReader>,
+        probes: Vec<(SqlStatement, usize)>,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::SqlReader for ProbeRecordingReader {
+        async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>> {
+            self.inner.query_row(statement).await
+        }
+
+        async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            let rows = self.inner.query_all(statement.clone()).await?;
+            self.probes.push((statement, rows.len()));
+            Ok(rows)
+        }
+
+        async fn query_scalar(
+            &mut self,
+            statement: SqlStatement,
+        ) -> StorageResult<Option<SqlValue>> {
+            self.inner.query_scalar(statement).await
+        }
+
+        async fn explain(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            self.inner.explain(statement).await
+        }
+    }
 
     #[tokio::test]
     async fn compose_direct_handler_rejects_namespace_token_mismatch() {
@@ -3492,6 +3570,107 @@ mod tests {
             "\"the and\"",
             "stop-only queries retain the exact-phrase fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn rarity_probes_are_capped_and_sort_rare_terms_before_common_terms() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        seed_low_overlap_corpus(&runtime, 1_100, 20).await;
+        let mut reader = ProbeRecordingReader {
+            inner: runtime.sql().reader().await.expect("reader"),
+            probes: Vec::new(),
+        };
+        let terms = ["\"term1\"", "\"term18\"", "\"missing\"", "\"term11\""];
+        let ordered = rarest_fts_terms_first(
+            &mut reader,
+            terms.iter().map(|term| (*term).to_string()).collect(),
+        )
+        .await
+        .expect("frequency probes");
+        assert_eq!(ordered, ["\"term11\"", "\"term18\"", "\"term1\""]);
+        assert_eq!(reader.probes.len(), terms.len());
+        assert_eq!(
+            reader
+                .probes
+                .iter()
+                .map(|(_, count)| *count)
+                .collect::<Vec<_>>(),
+            [501, 55, 0, 55]
+        );
+        for (statement, count) in &reader.probes {
+            assert!(matches!(statement.params[1], SqlValue::Integer(501)));
+            assert!(*count <= FTS_TERM_LIMIT + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_a_limit_uses_index_order_without_sorting_matches() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        seed_low_overlap_corpus(&runtime, 1_000, 20).await;
+        let access = runtime.sql();
+        let mut reader = access.reader().await.expect("reader");
+        let statement = phase_a_rowids_statement("\"term1\"", 3);
+        for (query, should_sort) in [
+            (statement.sql.clone(), false),
+            (
+                statement
+                    .sql
+                    .replace("ORDER BY rowid", "ORDER BY bm25(fts_knowledge), rowid"),
+                true,
+            ),
+        ] {
+            let plan = reader
+                .query_all(SqlStatement {
+                    sql: format!("EXPLAIN QUERY PLAN {query}"),
+                    params: statement.params.clone(),
+                    label: None,
+                })
+                .await
+                .expect("query plan");
+            assert!(!plan.is_empty());
+            let sorts = plan.iter().any(|row| {
+                row_str(row, "detail").is_some_and(|detail| detail.contains("TEMP B-TREE"))
+            });
+            assert_eq!(sorts, should_sort, "plan: {plan:?}");
+        }
+        let rows = reader.query_all(statement).await.expect("bounded rowids");
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|row| row_i64(row, "rowid").unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rare_term_survives_stage_expiry_independent_of_query_order() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        seed_low_overlap_corpus(&runtime, 1_000, 20).await;
+        let deadline = std::time::Duration::from_secs(1);
+        for query in ["term1 term18", "term18 term1"] {
+            let outcome = khive_storage::scope_request_read_deadline(
+                deadline,
+                FTS_TEST_DEADLINE_ADVANCE.scope(
+                    FtsTestDeadlineAdvance {
+                        after_completed_terms: 1,
+                        by: deadline,
+                    },
+                    fetch_fts_candidates(&runtime, "local", query, None, &[], &[], CANDIDATE_POOL),
+                ),
+            )
+            .await
+            .expect("partial fetch");
+            assert!(outcome.timed_out);
+            assert_eq!(
+                outcome.atoms.len(),
+                50,
+                "the rarer term must complete first"
+            );
+            assert!(outcome
+                .atoms
+                .iter()
+                .all(|atom| atom.content.contains("term18")));
+        }
     }
 
     /// Issue #1930: the old OR-joined query returned an all-or-nothing error
