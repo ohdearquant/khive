@@ -14,6 +14,8 @@ caller retries them differently:
 
 from __future__ import annotations
 
+from .models import OpError
+
 
 class KhiveError(Exception):
     """Base class for every error this package raises."""
@@ -50,8 +52,9 @@ class RequestRejected(KhiveError):
 class OperationError(KhiveError):
     """A single op inside a request failed server-side."""
 
-    def __init__(self, tool: str, message: str) -> None:
+    def __init__(self, tool: str, message: OpError | str) -> None:
         self.tool = tool
+        self.error = message
         super().__init__(f"{tool}: {message}")
 
 
@@ -62,7 +65,9 @@ class BatchError(KhiveError):
     `failures` is the failed subset as (index, tool, error) tuples.
     """
 
-    def __init__(self, results: list[dict], failures: list[tuple[int, str, str]]) -> None:
+    def __init__(
+        self, results: list[dict], failures: list[tuple[int, str, OpError | str | None]]
+    ) -> None:
         self.results = results
         self.failures = failures
         summary = "; ".join(f"[{i}] {tool}: {err}" for i, tool, err in failures[:3])
