@@ -188,6 +188,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-169](ADR-169-timezone-correct-timestamps.md)                       | Timezone-Correct Timestamps: Date-Only Values and a Configured Display Timezone                            |
 | [ADR-170](ADR-170-events-daemon-split.md)                               | Dedicated events daemon — the audit lane leaves the domain store                                           |
 | [ADR-171](ADR-171-brain-daemon-split.md)                                | Brain daemon — profile state leaves the domain process                                                     |
+| [ADR-173](ADR-173-blob-chunked-upload.md)                               | Chunked blob upload — objects larger than one wire frame                                                   |
 
 <!-- END GENERATED ADR CATALOG -->
 
