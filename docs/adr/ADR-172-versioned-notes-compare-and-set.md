@@ -40,8 +40,12 @@ Two facts bound the design:
 
 A fourth fact matters to any caller whose contract is "a returned write has survived machine death": every
 connection sets `PRAGMA synchronous = NORMAL` (`crates/khive-db/src/pool.rs`, three sites). In WAL mode
-that survives process death and can lose the tail of the log on OS crash or power loss. Blob puts fsync
-(ADR-111), so objects already meet the stronger contract and notes do not.
+that survives process death and can lose the tail of the log on OS crash or power loss. The blob store is
+not better off: `FsBlobStore::put` syncs the temporary file, renames it into the shard and returns
+without an fsync of the shard directory, freshly created shard directories get no barrier, and the
+dedup branch returns after an mtime touch (`crates/khive-db/src/stores/blob.rs`). On Linux a directory
+entry needs its own fsync to be durable; on macOS a plain `fsync` does not flush the drive cache. So
+neither plane meets the stronger contract today, and no claim in this ADR rests on either doing so.
 
 ## Decision
 
@@ -130,8 +134,11 @@ calls a note, a `key` is what a program looks it up by.
   `NoteFilter.min_created_at` already exists and costs nothing).
 - `tag_mode`: `"any"` (today's behaviour, the default) or `"all"`.
 
-A keyed listing (any request carrying `key_prefix` or `updated_after`) is ordered `updated_at DESC, key
-DESC` and paginates by keyset on that pair: `next_after` is an opaque cursor encoding the last row's
+A keyed listing is a request carrying `key_prefix`; `key_prefix=""` selects every keyed note. It admits
+only rows with `key IS NOT NULL`, so the cursor below never compares a NULL. `updated_after` without
+`key_prefix` is a plain filter on the unkeyed listing, which keeps its insertion order and cursor and
+does include unkeyed rows. A keyed listing is ordered `updated_at DESC, key DESC` and paginates by
+keyset on that pair: `next_after` is an opaque cursor encoding the last row's
 `(updated_at, key)`, passed back as `after`. This is a different cursor from the V13 insertion-sequence
 walk, which stays the order for unkeyed listings; a document updated after the cutoff moves to the front
 of a keyed listing, which the insertion cursor could never show. `tag_mode`, `tags`, `note_kind` and
@@ -140,7 +147,10 @@ of a keyed listing, which the insertion cursor could never show. `tag_mode`, `ta
 ### 5. A per-deployment durability option
 
 `[storage] synchronous = "normal" | "full"` and `[storage] fullfsync = false | true` in `khive.toml`,
-applied at the three pragma sites in `pool.rs`. Defaults are today's values (`normal`, `false`); nothing
+applied at the three pragma sites in `pool.rs`. These settings cover the record plane only: the blob
+store's own `sync_all` calls are not `F_FULLFSYNC` on macOS and its directory barriers are missing, and
+that repair is separate work under the same deployment option, not decided here. Defaults are today's
+values (`normal`, `false`); nothing
 changes for a deployment that does not opt in. `fullfsync` maps to `PRAGMA fullfsync` and
 `PRAGMA checkpoint_fullfsync`, which matter on macOS, where plain `fsync(2)` does not flush the drive's
 write cache and only `F_FULLFSYNC` does. The daemon reports both values in `db_diagnostics` so a caller can
@@ -191,6 +201,11 @@ uniqueness is not offered: the index is per namespace by construction.
   gains `expected_version`. The help text for each names the conflict codes.
 - Two new conflict codes, `version_conflict` and `key_conflict`, both under `kind: conflict`, both carrying
   the values a caller needs to recover.
+- This is the idempotency story for note writes. `request_id` is correlation and not an idempotency key;
+  the version precondition is what makes a blind retry after a lost response safe: it either applies
+  once or reports the version the earlier attempt produced.
+- There is no restore path for a soft-deleted note today. If one is added, restoring a note whose key a
+  live note has since taken fails with `key_conflict`; the index decides, not the handler.
 
 ## Acceptance
 
@@ -210,13 +225,22 @@ Stated before implementation, checked at the PR that lands the code:
 5. **Listing.** Fixtures where `tag_mode="all"` and `"any"` yield different counts; `key_prefix` with a
    key containing `%` and `_`; `updated_after` inclusive on a boundary timestamp, with an older document
    updated after the cutoff appearing first; two documents with equal `updated_at` ordered by `key DESC`;
-   each walked across at least two pages with the keyed cursor, and the page set equal to the unpaged set.
-   5b. **Fence.** A write with `fence` at the right generation succeeds; at a stale generation, or when the
+   each walked across at least two pages with the keyed cursor, and the page set equal to the unpaged set;
+   a fixture mixing unkeyed and keyed notes where `key_prefix=""` returns only the keyed ones and
+   `updated_after` alone returns both in insertion order.
+6. **Fence.** A write with `fence` at the right generation succeeds; at a stale generation, or when the
    fence row is missing, it fails with `fence_conflict` and neither row changes. Cross-process, as in 1.
    The cross-process compare-and-set control in 1 is new acceptance written for this ADR; no existing
    test is cited as already covering it.
-6. **Migration.** Upgrading a populated pre-028 database leaves every existing row at `version = 1` with
+7. **Already-stale client.** B commits at version N before A sends `update(expected_version=N)`; A gets
+   `version_conflict` with `current_version: N+1` and writes nothing. The runtime's internal snapshot
+   guard is not the check here; the caller's precondition is.
+8. **Lost acknowledgement.** A's update at `expected_version=N` commits and A never sees the response; A
+   retries the identical request. The retry gets `version_conflict` with `current_version: N+1`, and the
+   row advanced exactly once. Absent-key create races the same way: two `create(key=K,
+   expected_version=0)` from two processes, one success, one `key_conflict`, one live row.
+9. **Migration.** Upgrading a populated pre-028 database leaves every existing row at `version = 1` with
    `key IS NULL`, and the index creation succeeds with duplicate `name` values present.
-7. **Durability option.** A deployment started with `synchronous = "full"` reports it in `db_diagnostics`;
-   the verb-level cost of `create` under each of the three settings is measured over the socket, 1,000
-   calls each, and recorded in the PR.
+10. **Durability option.** A deployment started with `synchronous = "full"` reports it in `db_diagnostics`;
+    the verb-level cost of `create` under each of the three settings is measured over the socket, 1,000
+    calls each, and recorded in the PR.
