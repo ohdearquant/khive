@@ -1,0 +1,16 @@
+{
+  "version": "1.0",
+  "profile": "ARW-1",
+  "site": {
+    "name": "Fern Notebook",
+    "description": "A fictional notebook of woodland botany.",
+    "homepage": "https://fern.invalid"
+  },
+  "content": [
+    {
+      "url": "/notebook",
+      "description": "Read fictional notes about woodland ferns.",
+      "tags": ["botany", "ferns"]
+    }
+  ]
+}
