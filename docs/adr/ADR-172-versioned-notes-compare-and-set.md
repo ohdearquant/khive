@@ -287,3 +287,40 @@ Stated before implementation, checked at the PR that lands the code:
 10. **Durability option.** A deployment started with `synchronous = "full"` reports it in `db_diagnostics`;
     the verb-level cost of `create` under each of the three settings is measured over the socket, 1,000
     calls each, and recorded in the PR.
+
+## Amendment 1 (2026-09-07): keyed cursor tiebreaker, `after_key` ambiguity, disclosure scope, migration path
+
+Four corrections to §3 and §4, none of which changes a verb signature.
+
+**Keyed cursor.** A key may be held by one live note of each kind, and a keyed listing that omits
+`note_kind` spans kinds, so two rows can share `(updated_at, key)`; a keyset cursor on that pair alone
+would drop or repeat a row at a page boundary. The keyed listing is ordered `updated_at DESC, key DESC,
+id ASC`, and `next_after` encodes `(updated_at, key, id)`. `id` is the note's primary key, so the triple
+is unique and the walk is total. §4's statement of the order and cursor reads with `id` appended.
+
+**`after_key` on an ambiguous key.** `after_key=K` without `note_kind`, when more than one live note in
+the listing's namespace holds `K`, fails with `KhiveError::conflict`,
+`details: {"reason": "key_ambiguous", "key": K, "kinds": "..."}`, the same refusal §3 gives `get`; it
+never picks one of them. With `note_kind` given the resolution is unique.
+
+**Disclosure scope.** `existing_id` in `key_conflict`, `kinds` in `key_ambiguous`, and the
+`after_key_missing` answer each say something about which keys are occupied. They are answered within
+the caller's primary namespace only, the visibility a `list` in that namespace already grants, and they
+are admitted under the same gate decision as a read of that namespace: a deployment that gates reads
+and writes differently gets the read decision for these details, so a caller who may create but may
+not read learns nothing from a refused create beyond that it was refused.
+
+**Migration path.** Migration 028 is one entry in the versioned chain that every database walks from V1
+(`crates/khive-db/sql/schema.sql`) on first open, so a freshly built database and an upgraded one carry
+the same column, trigger and index; there is no build path that takes `schema.sql` alone.
+
+Acceptance, added to the list above:
+
+11. **Tiebreaker.** Two live notes of different kinds holding the same key with an equal `updated_at`,
+    walked with a page size of one across the boundary: the page set equals the unpaged set, and the
+    order is `id ASC` between them. Mutation: with `id` dropped from the cursor the walk drops or
+    repeats one of the two (red). `after_key` on that key without `note_kind` fails with
+    `key_ambiguous` and returns no rows; with `note_kind` it resumes after the named one.
+12. **Fresh build.** A database created empty walks the chain to 028 on first open and reports that
+    version through `read_schema_version`; the column, trigger and index are present, the same set an
+    upgraded pre-028 database shows in test 9.
