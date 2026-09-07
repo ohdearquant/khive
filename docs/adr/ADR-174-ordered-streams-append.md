@@ -235,8 +235,10 @@ Stated before implementation, checked at the PR that lands the code; every arm n
    the union of returned `seq` values is exactly `1..100` with no repeat and no gap, and `stream.read`
    returns them in that order. In-process tasks alone do not satisfy this arm.
 3. **`expected_seq` conflict writes nothing.** With one entry present, `append(expected_seq=3)` fails with
-   `seq_conflict` carrying `next_seq = 2`; the note count, the ledger count and the audit event count are
-   unchanged from before the call; `append(expected_seq=2)` then succeeds with `seq = 2`.
+   `seq_conflict` carrying `next_seq = 2`; the note count and the ledger count are unchanged from before
+   the call, and the audit event count is unchanged as a control that must stay at zero delta (§1: the
+   generic note create emits no audit event today, so a nonzero delta here means a writer this ADR does
+   not know about); `append(expected_seq=2)` then succeeds with `seq = 2`.
 4. **Fence.** An append with `fence` at the right version succeeds; at a stale version, or when the fence
    row is missing, it fails with `fence_conflict` and neither the stream nor the fence row changes.
    Cross-process, as in 2.
