@@ -116,8 +116,12 @@ namespace. Existing rows have `NULL` and are untouched. `create(kind="note", not
 inserts the note or fails with `KhiveError::conflict`, `code: "key_conflict"`, `details: {"key": K,
 "existing_id": <uuid>}` when a live note already holds `K`; the index is what refuses, so two racing
 creators get exactly one success. `get(kind="note", key=K)` resolves by key within the caller's primary
-namespace, the same scope rule as prefix resolution in ADR-007. `key` is immutable after create;
-`update` does not accept it. A soft-deleted note releases its key; a hard delete does too.
+namespace, the same scope rule as prefix resolution in ADR-007. Uniqueness is per note kind, so `K` may
+be held by one live note of each kind; `get(kind="note", key=K, note_kind=X)` selects one, and a lookup
+without `note_kind` that matches more than one kind fails with `KhiveError::conflict`,
+`code: "key_ambiguous"`, `details: {"key": K, "kinds": [...]}` rather than returning either. `key` is
+immutable after create; `update` does not accept it. A soft-deleted note releases its key; a hard delete
+does too.
 
 `name` is unchanged and stays free-form. The two words mean different things: a `name` is what a human
 calls a note, a `key` is what a program looks it up by.
@@ -149,6 +153,15 @@ keyset on that pair: `next_after` is an opaque cursor encoding the last row's
 walk, which stays the order for unkeyed listings; a document updated after the cutoff moves to the front
 of a keyed listing, which the insertion cursor could never show. `tag_mode`, `tags`, `note_kind` and
 `namespace=` compose with both. Offset mode is unchanged.
+
+A keyed listing also accepts `after_key=K` in place of `after`: the server resolves the live note holding
+`K` in the listing's namespace and note kind, takes its current `(updated_at, key)` as the cursor, and
+continues from there, whether or not that note itself satisfies the call's other filters. A client that
+holds only the last key it saw can therefore resume without a cursor of its own. When no live note holds
+`K` the call fails with `KhiveError::not_found`, `code: "after_key_missing"`, `details: {"key": K}`,
+never silently restarting from the front. A note updated between two pages moves to the front of the
+order, so resuming from it skips whatever was written in between; that is a property of last-write
+order, and a client that needs a stable walk uses `created_after` on the unkeyed listing instead.
 
 ### 5. A per-deployment durability option
 
