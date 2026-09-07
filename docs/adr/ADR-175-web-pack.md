@@ -60,11 +60,15 @@ base `org` entities. No new base entity kind, no new note kind, and no new edge 
 | `site`         | `Service`  | `origin`         | One web origin publishing a manifest; properties carry `homepage`, `contact`, `profile`, `content_signals`                          |
 | `page`         | `Document` | `web_page`       | One declared content entry: `url`, `description`, `tags`, `purpose`, `priority`, `authored`, `chunks`                               |
 | `machine_view` | `Document` | `view`           | The markdown rendering a page declares at `markdown_url`; frontmatter fields (`page_type`, `schema_org_type`, `aeo`) are properties |
-| `agent_tool`   | `Resource` | `mcp_tool`       | One callable the site declares for agents (name, description, input schema reference)                                               |
-| `agent_skill`  | `Resource` | `skill_manifest` | One declared agent skill (name, description, the tools it names)                                                                    |
+| `agent_tool`   | `Service`  | `mcp_tool`       | One callable the site declares for agents (name, description, input schema reference); a served endpoint, so a service              |
+| `agent_skill`  | `Document` | `skill_manifest` | One declared agent skill (name, description, the tools it names); a served instruction file, so a document                          |
 
 The tokens `tool` and `skill` are not claimed: `tool` is an existing `project` subtype and both words
-are existing aliases of the bare `resource` kind, so the web vocabulary takes qualified tokens. Tokens
+are existing aliases of the kg pack's local `resource` kind, so the web vocabulary takes qualified
+tokens. `resource` itself is not a shared `EntityKind` (the shared enum has eight variants, ending at
+`Service`), and the subtype registry and validated create path parse the shared enum, so no web subtype
+is assigned to it: a tool is a served endpoint (`Service`), a skill is a served instruction file
+(`Document`). Tokens
 are added to the registry in `crates/khive-types/src/entity_type.rs` following the ADR-085 precedent;
 the consequence that subtype tokens validate everywhere while edge rules apply only where the pack is
 loaded is inherited unchanged.
@@ -86,16 +90,19 @@ ADR-069 D3. Every relation is one of the closed 17; no native label is needed ag
 this record was written from (every declared relation is containment, derivation, dependency or
 implementation).
 
-| # | Relation       | Source                  | Target                 | Reading                                           |
-| - | -------------- | ----------------------- | ---------------------- | ------------------------------------------------- |
-| 1 | `contains`     | service/`site`          | document/`page`        | site declares page                                |
-| 2 | `contains`     | service/`site`          | resource/`agent_tool`  | site exposes tool                                 |
-| 3 | `contains`     | service/`site`          | resource/`agent_skill` | site publishes skill                              |
-| 4 | `derived_from` | document/`machine_view` | document/`page`        | view is rendered from page                        |
-| 5 | `depends_on`   | resource/`agent_skill`  | resource/`agent_tool`  | skill names tool                                  |
-| 6 | `implements`   | service/`site`          | concept/`interface`    | site implements protocol (profile, MCP, UCP, ACP) |
+| # | Relation       | Source                  | Target                 | Reading                                   |
+| - | -------------- | ----------------------- | ---------------------- | ----------------------------------------- |
+| 1 | `contains`     | service/`site`          | document/`page`        | site declares page                        |
+| 2 | `contains`     | service/`site`          | service/`agent_tool`   | site exposes tool                         |
+| 3 | `contains`     | service/`site`          | document/`agent_skill` | site publishes skill                      |
+| 4 | `derived_from` | document/`machine_view` | document/`page`        | view is rendered from page (base-covered) |
+| 5 | `depends_on`   | document/`agent_skill`  | service/`agent_tool`   | skill names tool                          |
+| 6 | `implements`   | service/`site`          | concept/`interface`    | site implements protocol (base-covered)   |
 
-`part_of` in the reverse direction is not declared; `contains` is the canonical direction, as in
+Rows 4 and 6 are already legal under the base endpoint contract (`document derived_from document`,
+`service implements concept`) and are declared for introspection only, the practice the code pack
+follows for its base-covered rows; rows 1, 2, 3 and 5 are the additive ones. `part_of` in the reverse
+direction is not declared; `contains` is the canonical direction, as in
 ADR-085. `instance_of` (tool to tool type) waits for a tool taxonomy and is not v0. Cross-site
 references (`mentions`) wait on the ADR-002 ratification of that label and carry no rule here.
 
@@ -119,12 +126,18 @@ One verb, `web.ingest(source, db?, include_views?)`, commissive, opt-in:
   presence and the tool and skill declarations the manifest carries.
 - **Extractor** maps raw declarations to one entity/edge batch with deterministic ids: UUIDv5 under a
   pack namespace constant keyed by `(origin, url)` for pages and views, `(origin, tool name)` and
-  `(origin, skill name)` for tools and skills, `(origin)` for the site. Re-ingesting the same tree is
-  idempotent; a changed declaration updates the same row.
+  `(origin, skill name)` for tools and skills, `(origin)` for the site. Canonicalization of the key:
+  origin is the manifest's `site.homepage` host, lowercased, scheme and port dropped; url is the
+  declared path with one leading slash and no trailing slash; names are the declared strings as-is.
+  Re-ingesting the same tree is idempotent; a changed declaration updates the same row.
+- **`include_views`** defaults to true; false skips the view files entirely (no `machine_view` rows, no
+  rule-4 edges) and the report says so. A declared view that is absent on disk yields the page without
+  a view and one `views_missing` count in the report, not a quarantine.
 - **Target**: a dedicated map database, default `<source>/.khive/web-map.db`; the shared production
   database is always rejected, with no override (ADR-085 D6.1, mirrored).
-- **Report**: counts per subtype and relation, quarantined declarations with reason, the manifest's
-  content digest, and the source path. The report is the verb's result, never a side file.
+- **Report**: counts per subtype and relation, `views_missing`, quarantined declarations with reason,
+  the manifest digest (BLAKE3 of the manifest file's raw bytes, hex), and the source path. The report
+  is the verb's result, never a side file.
 
 ### D5: Pack mechanics
 
@@ -168,7 +181,10 @@ load-bearing.
    re-ingest doubles the rows (red).
 5. **Production refusal.** `db` pointed at the production database is refused before any write, with
    no override. Mutation: remove the check (red).
-6. **Vocabulary.** Every D2 token validates through the create path, and the endpoint-rule
+6. **Views switch.** `include_views=false` on tree A produces zero `machine_view` rows and zero rule-4
+   edges with the page counts unchanged; a declared view removed from disk yields `views_missing` of one
+   and no quarantine.
+7. **Vocabulary.** Every D2 token validates through the create path, and the endpoint-rule
    introspection test lists exactly the six D3 rules, none shadowing a base row.
 
 ## Rationale
@@ -215,15 +231,17 @@ its own gate, and putting it first would hold the vocabulary behind that review.
 
 1. Whether `machine_view` deserves its own subtype or should be a property of `page` once views are
    universal in the profile; v0 keeps the subtype because a view carries its own frontmatter fields.
-2. Whether `agent_skill` belongs under `resource` or `concept`; v0 chooses `resource` because a skill
-   is declared as a served file the agent loads, not an idea.
+2. Whether `agent_skill` belongs under `document` or `concept`; v0 chooses `document` because a skill
+   is declared as a served instruction file the agent loads, not an idea.
 
 ## Implementation
 
 1. Registry tokens (D2) and `EDGE_RULES` (D3) in `crates/khive-pack-web/src/vocab.rs`, with the
    endpoint-rule introspection test the code pack carries.
 2. Scanner (`manifest.rs`, `views.rs`) and Extractor (`extract.rs`) with the deterministic id
-   namespace; `web.ingest` handler; the map-database refusal of the production path.
+   namespace; `web.ingest` handler; the map-database refusal of the production path as a web-specific
+   wrapper (the code pack's fence hard-codes its own default filename and verb label, so the safety
+   comparison is reused and the default and error text are the web pack's own).
 3. Fixture: two fictional site trees (one with tools and skills, one without) and a broken manifest;
    tests assert the counts, the quarantine reasons, and idempotent re-ingest.
 4. `docs/packs/web.md`: the vocabulary tables, the report shape, and a ten-line multi-site run.
