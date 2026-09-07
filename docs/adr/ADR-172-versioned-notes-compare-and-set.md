@@ -86,7 +86,10 @@ serialises as `{"kind", "message", "code", "details"}` where `code` is a numeric
 `kind: "conflict"` (or `not_found` where stated), `code` unchanged from what the constructor gives today,
 and the discriminator is `details.reason`; every detail value is a string, a list is comma-joined, and a
 value that has no current row is omitted rather than written as null. A client that wants the
-structured object reads `details` verbatim; the Python client preserves it as sent.
+structured object reads `details` verbatim. The Python client in this tree flattens a per-op error to a
+string and drops `details`; the change that preserves the error object as sent is a separate client fix,
+in review beside this ADR, and this ADR's recovery contract is reachable from that client only once it
+lands.
 
 On mismatch the verb fails with `KhiveError::conflict` and
 `details: {"reason": "version_conflict", "expected_version": "N", "current_version": "M"}`. `M` is read
