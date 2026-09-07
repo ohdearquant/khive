@@ -2,6 +2,8 @@
 
 - Status: Proposed
 - Date: 2026-09-07
+- Depends on: ADR-172 (`version`, `key`, `fence`). It merges first; the migration here takes the number after
+  ADR-172's.
 
 ## Context
 
@@ -44,21 +46,41 @@ ordinary note whose content is the appended record, joined to the stream by a ne
 CREATE TABLE IF NOT EXISTS note_streams (
     namespace TEXT    NOT NULL,
     stream    TEXT    NOT NULL,
-    seq       INTEGER NOT NULL,
+    seq       INTEGER NOT NULL CHECK (seq > 0),
     note_id   TEXT    NOT NULL UNIQUE,
-    PRIMARY KEY (namespace, stream, seq)
+    PRIMARY KEY (namespace, stream, seq),
+    FOREIGN KEY (namespace, note_id) REFERENCES notes (namespace, id)
 );
+
+CREATE TRIGGER IF NOT EXISTS refuse_stream_gap
+BEFORE INSERT ON note_streams
+WHEN NEW.seq != (SELECT COALESCE(MAX(seq), 0) + 1 FROM note_streams
+                 WHERE namespace = NEW.namespace AND stream = NEW.stream)
+BEGIN
+    SELECT RAISE(ABORT, 'stream_gap');
+END;
+
+CREATE TRIGGER IF NOT EXISTS refuse_stream_ledger_delete
+BEFORE DELETE ON note_streams
+BEGIN
+    SELECT RAISE(ABORT, 'stream_member');
+END;
 ```
 
 `seq` is assigned by the writer inside the transaction that inserts the note, as one more than the
 stream's current highest `seq` (`0` for a stream with no rows). The single-writer transaction is what
-makes two concurrent appends take consecutive numbers rather than the same one; the primary key is the
-backstop that turns any error in that reasoning into a constraint failure rather than a duplicate. No
-backfill: existing notes belong to no stream.
+makes two concurrent appends take consecutive numbers rather than the same one. The schema is the
+backstop, and it holds against any writer, not only the verb: `refuse_stream_gap` admits exactly the
+next number, so a duplicate, a skip and a zero all fail as constraint errors; the ledger cannot lose a
+row; the foreign key, enforced because the pool turns `foreign_keys` on for every connection
+(`crates/khive-db/src/pool.rs`), ties each row to a live note in the same namespace and refuses a
+rewrite of that note's `id`. No backfill: existing notes belong to no stream.
 
-Because the entry is a note it inherits the writer, the gate and admission path, the audit event, the
-`version` column and trigger from ADR-172, `search`, and the unkeyed `list` walk, where it appears in
-store insertion order like any other note. The ordered surface is the verb family below.
+Because the entry is a note it inherits the writer, the gate and admission path, the `version` column
+and trigger from ADR-172, `search`, and the `list(after=)` cursor walk over `notes_seq`, where it appears
+in store insertion order like any other note (ordinary unkeyed pages order by `created_at DESC, id ASC`,
+as today). The ordered surface is the verb family below. This ADR defines no audit event: today's note
+create emits none on the generic path, and a stream append is the same write.
 
 ### 2. Verbs
 
@@ -69,13 +91,15 @@ Three verbs, registered by the kg pack because the entries are its notes:
   "created_at": ...}`. `record` is a JSON value stored as the note's content; the existing note content
   limits apply unchanged, and this ADR adds none.
   - With `expected_seq=N`, the append succeeds only when `N` is the number this entry would receive.
-    Otherwise it fails with `KhiveError::conflict`, `code: "seq_conflict"`,
-    `details: {"stream": S, "expected_seq": N, "next_seq": M}`, and nothing is written: no note, no
-    ledger row, no audit event for a write that did not happen. `M` is read inside the same request so
-    the caller's next attempt can carry it.
+    Otherwise it fails with `KhiveError::conflict`,
+    `details: {"reason": "seq_conflict", "stream": S, "expected_seq": "N", "next_seq": "M"}`, and
+    nothing is written: no note, no ledger row. `M` is read inside the same request so the caller's next
+    attempt can carry it. Refusals in this ADR use the error shape ADR-172 §2 defines: `kind`
+    `conflict`, `code` unchanged, the discriminator in `details.reason`, every value a string.
   - `fence` is ADR-172 §2b unchanged: `{"key": K, "kind": <note kind>, "expected_version": G}` names a
     keyed note whose `version` must equal `G`, checked before the insert in the same transaction; a
-    missing row or a different version fails with `fence_conflict` and nothing is written. The fence is
+    missing row or a different version fails with `details.reason = "fence_conflict"` and nothing is
+    written. The fence is
     checked only when supplied. Whether an unfenced append to a stream that belongs to a leased run
     should be refused is policy above khive: the layer that knows which streams belong to which run
     decides it, and passes the fence when it applies.
@@ -93,10 +117,10 @@ Three verbs, registered by the kg pack because the entries are its notes:
 
 ### 3. Entries are immutable and streams are dense, enforced at the schema
 
-Density means a number, once assigned, is never removed. An entry's note therefore cannot be deleted,
-soft or hard, and its content cannot change. Rather than ask every one of the existing delete and update
-sites to check membership, two triggers close the population the way ADR-172's trigger closed the
-`UPDATE` sites:
+Density means a number, once assigned, is never removed; §1's ledger constraints hold that side. An
+entry's note therefore cannot be deleted, soft or hard, and its record cannot change. Rather than ask
+every one of the existing delete and update sites to check membership, two triggers on `notes` close the
+population the way ADR-172's trigger closed the `UPDATE` sites:
 
 ```sql
 CREATE TRIGGER IF NOT EXISTS refuse_stream_entry_delete
@@ -114,9 +138,12 @@ BEGIN
 END;
 ```
 
-The runtime maps that abort to `KhiveError::conflict`, `code: "stream_member"`, `details: {"id": <uuid>,
-"stream": S, "seq": N}`. Tags, `salience` and `name` stay writable: they are the caller's annotations on
-an entry, not the record. The note upsert statement is `ON CONFLICT(id) DO UPDATE`, which fires the
+The runtime maps that abort to `KhiveError::conflict`,
+`details: {"reason": "stream_member", "id": <uuid>, "stream": S, "seq": "N"}`. `properties` is frozen
+because that is where a note's tags live (`properties.tags`), so tags are part of the record and are
+frozen with it; `name`, `salience` and `decay_factor` stay writable, they are scoring and display knobs
+and not the record. A caller that wants to annotate an entry after the fact writes a separate note and
+links it with `annotates`. The note upsert statement is `ON CONFLICT(id) DO UPDATE`, which fires the
 update trigger; an `INSERT OR REPLACE` path would not fire the delete trigger with `recursive_triggers`
 off, and there is none on notes today. The implementing PR asserts that by grepping the statements, and
 the acceptance list carries the mutation arm.
@@ -153,7 +180,7 @@ the array as an ordered transaction.
 
 - Drop and truncation (§3).
 - Cross-stream ordering: `seq` orders one stream; `notes_seq` still orders the store, and a reader that
-  wants a global order across streams walks the unkeyed `list` instead.
+  wants a global insertion order across streams walks `list(after=)` instead.
 - Subscriptions and long polling; `head_seq` is the caught-up signal for a polling reader.
 - A per-namespace or per-stream quota. The record size limit is the note's.
 
@@ -174,9 +201,12 @@ the array as an ordered transaction.
 - Notes gain a second insertion path that cannot be undone. A note that is a stream entry is the first
   kind of note in khive that `delete` refuses; tools that assume every note is deletable meet
   `stream_member` and must say so rather than retry.
-- Two more triggers on `notes`. Their `WHEN` clause is one indexed lookup on `note_streams.note_id`
-  (`UNIQUE` gives the index) per delete or content update, which is the same order of cost as the
-  ADR-172 version bump.
+- Two triggers on `notes` and two on `note_streams`, plus a foreign key. The `notes` triggers' `WHEN`
+  clause is one indexed lookup on `note_streams.note_id` (`UNIQUE` gives the index) per delete or
+  content update, the same order of cost as the ADR-172 version bump; the gap trigger is one primary-key
+  seek per append.
+- An entry's tags cannot change after append, because they live in `properties`. Annotation is a
+  separate note.
 - The per-stream `MAX(seq)` read inside the writer is a single index seek on the primary key
   `(namespace, stream, seq)`; it does not grow with the stream.
 - Streams have no retention until a later ADR. A deployment that records long runs plans its disk on
@@ -207,14 +237,18 @@ Stated before implementation, checked at the PR that lands the code; every arm n
    the retry with the same `expected_seq` fails with `seq_conflict`, and `stream.read(after=N-1, limit=1)`
    returns the record the first attempt carried. A control where another writer took `N` first returns a
    different record.
-7. **Immutability.** `update` of an entry's content, `delete` (soft and hard) of an entry, and an update
-   that would move its namespace or note kind all fail with `stream_member`; a tag update on the same
-   entry succeeds; `stream.stat.count` still equals `head_seq` after all of them.
+7. **Immutability and density at the schema.** Through the verbs: `update` of an entry's `content` or
+   `properties` and `delete` (soft and hard) of an entry fail with `stream_member`; `update` of its
+   `salience` succeeds. Through direct statements against a migrated scratch database, because no verb can
+   issue them: an `UPDATE notes` moving an entry's `namespace`, `kind` or `id`, a `DELETE FROM
+   note_streams`, an `INSERT` into `note_streams` with `seq` equal to `0`, to the current head, or to
+   the head plus two, and an insert naming a `note_id` absent from `notes`, all fail as constraint or
+   trigger errors. `stream.stat.count` still equals `head_seq` after all of them.
 8. **Mutation.** With the `expected_seq` predicate removed, test 3 goes red; with the fence check removed,
    test 4 goes red; with the note insert committed before the ledger insert instead of in one
    transaction and the ledger insert forced to fail, test 3's unchanged-count assertion goes red; with
-   either trigger dropped, the corresponding arm of test 7 goes red. All four logs retained beside the
-   PR evidence.
+   any one of the four triggers, the `CHECK` or the foreign key dropped, the corresponding arm of test
+   7 goes red. All logs retained beside the PR evidence.
 9. **Migration.** The migration applies to a populated store and to an empty one; no existing note joins
    a stream; a database at the previous version migrates and passes tests 1 and 7.
 10. **Batch order.** A `|` chain of three appends to one stream returns `seq` 1, 2, 3 in that order; a
