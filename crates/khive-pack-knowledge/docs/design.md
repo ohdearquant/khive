@@ -132,6 +132,25 @@
   lexical-only degradation with request time left to spare still gets a full rerank pass; the
   `lexical_timeout` degradation flag is still attached to the response whenever the stage itself
   timed out, independent of whether the rest of the request completed normally.
+- `degraded.lexical_timeout` remains a boolean. When a timed-out read's phase can be disclosed
+  without exposing global-index match presence, `degraded.lexical_timeout_details` adds at most
+  one record per lexical pass (`full`, `subquery_1`, `subquery_2`), at most three records total.
+  Each record contains `pass`, `phase`, `stage_elapsed_ms`, `operation_elapsed_ms`,
+  `configured_budget_ms`, and `effective_budget_ms`. Milliseconds are monotonic durations,
+  truncated to integers and captured when the failed read returns. The effective budget is the
+  remaining deadline allowance at stage entry, including an earlier parent deadline; it is not
+  reset after cancellation or sampled after leaving the scope. Stage elapsed includes earlier
+  work in the pass, while operation elapsed covers just the failed read attempt, including
+  waiting and cleanup. Neither is an attribution of deadline expiry versus cancellation.
+  Healthy responses omit the list. Public phases are `reader_open` and `term_frequency`, whose
+  entry does not depend on corpus contents. The later `phase_a_rowids`, `phase_b_hydration`,
+  `eligibility_fallback`, `namespace_membership`, and `recent_fallback` records are operator-only:
+  their reachability can change with foreign-index matches even when local results do not.
+  Responses with only operator-only records retain the boolean and omit the details list.
+  All seven phases emit the same structured timing fields through tracing, with no SQL, query
+  text, row identifiers, namespace names, row counts, or byte counts. A phase identifies where
+  the timeout was observed, not why the allowance was exhausted. Pooled-reader waiting occurs
+  inside query calls and cannot be separated from execution without separate backend timing.
 - `load_domain_member_token_sizes` (member-token pricing for `suggest`'s `results[].size`) returns
   a `(HashMap<String, usize>, bool)` — the `bool` marks whether the whole batch timed out before
   any domain could be measured. A single `query_all` call has no partial-completion state, so one
