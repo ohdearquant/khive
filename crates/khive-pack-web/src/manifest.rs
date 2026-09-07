@@ -59,10 +59,10 @@ pub(crate) fn read_manifest(source: &Path) -> Result<Manifest, String> {
         .get("site")
         .and_then(Value::as_object)
         .ok_or_else(|| "manifest_malformed: site must be an object".to_string())?;
-    if !site
+    if site
         .get("name")
         .and_then(Value::as_str)
-        .is_some_and(|name| !name.trim().is_empty())
+        .is_none_or(|name| name.trim().is_empty())
     {
         return Err("manifest_malformed: site.name must be a non-empty string".to_string());
     }
