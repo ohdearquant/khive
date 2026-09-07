@@ -325,12 +325,12 @@ For guided workflows, install the marketplace plugin:
 This adds one pattern skill per pack (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`,
 `knowledge`), four kg workflow skills, and six kg stewardship agents:
 
-| Skill            | What it does                                                   |
-| ---------------- | -------------------------------------------------------------- |
-| `/khive:digest`  | Ingest material into the graph: extract entities, link, verify |
-| `/khive:gap`     | Survey the graph's structural gaps: read-only frontier ranking |
-| `/khive:expand`  | Grow the graph to close one strategic gap, with create caps    |
-| `/khive:polish`  | Audit and fix: orphans, low-degree nodes, duplicates           |
+| Skill           | What it does                                                   |
+| --------------- | -------------------------------------------------------------- |
+| `/khive:digest` | Ingest material into the graph: extract entities, link, verify |
+| `/khive:gap`    | Survey the graph's structural gaps: read-only frontier ranking |
+| `/khive:expand` | Grow the graph to close one strategic gap, with create caps    |
+| `/khive:polish` | Audit and fix: orphans, low-degree nodes, duplicates           |
 
 The agents (`khive:digester`, `khive:gap-analyst`, `khive:expander`, `khive:polisher`,
 `khive:librarian`, `khive:researcher`) and the pattern skills are described in
