@@ -5,7 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use khive_runtime::ann_registry::{self, CompactionScope, WatermarkAuthority, PENDING_WATERMARK};
@@ -46,12 +47,21 @@ impl AnnKey {
 pub(crate) struct AnnBridge {
     index: VamanaIndex,
     id_map: Vec<Uuid>,
+    /// Digest of the v2 commit record this mmap bridge loaded. Every
+    /// file-backed publication carries a fresh nonce, so equality means the
+    /// mapped file generation is still current (#2081). Owned builds have no
+    /// publication identity until they are persisted and reopened.
+    commit_digest: Option<[u8; 32]>,
     /// Indexed namespaces, used to skip unnecessary recall over-fetch retries.
     pub(crate) namespace_set: HashSet<String>,
     /// In-process write generation captured before this build's corpus scan.
     pub(crate) generation: u64,
     /// Durable corpus epoch observed at build or snapshot load time.
     pub(crate) epoch_baseline: u64,
+    /// Lets rotation tests prove replacement drops the bridge that owns the
+    /// predecessor mmaps, rather than merely changing the cache metadata.
+    #[cfg(test)]
+    drop_probe: Option<Arc<()>>,
 }
 
 /// Shared model-index cache with single-flight and freshness coordination.
@@ -65,6 +75,8 @@ pub(crate) struct AnnState {
     generations: Mutex<HashMap<AnnKey, u64>>,
     /// Last durable-epoch query per model, used to debounce warm-hit checks.
     last_epoch_check: std::sync::Mutex<HashMap<AnnKey, std::time::Instant>>,
+    /// Idempotence guard for the pack-lifetime file-generation watcher.
+    rotation_watch_started: AtomicBool,
     /// Counts how many times `search_loaded` returned a warm hit. Test-only;
     /// call `reset_warm_route_count()` between operations to isolate counts.
     #[cfg(test)]
@@ -105,6 +117,7 @@ pub(crate) fn new_shared() -> SharedAnn {
         model_locks: Mutex::new(HashMap::new()),
         generations: Mutex::new(HashMap::new()),
         last_epoch_check: std::sync::Mutex::new(HashMap::new()),
+        rotation_watch_started: AtomicBool::new(false),
         #[cfg(test)]
         warm_route_count: AtomicUsize::new(0),
         #[cfg(test)]
@@ -174,6 +187,11 @@ const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::f
 const REBUILD_CHAIN_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(test)]
 const REBUILD_CHAIN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// File-generation polling cadence for mmap bridges. Only the tiny commit
+/// record is read on an unchanged tick; vector/graph files are reopened only
+/// after a distinct publication identity appears.
+const ROTATION_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Mark a cached graph stale when its debounced durable epoch has advanced.
 ///
@@ -336,9 +354,12 @@ impl AnnBridge {
         Ok(Self {
             index,
             id_map,
+            commit_digest: None,
             namespace_set,
             generation: 0,
             epoch_baseline: 0,
+            #[cfg(test)]
+            drop_probe: None,
         })
     }
 
@@ -512,9 +533,12 @@ impl AnnBridge {
         Ok(Self {
             index,
             id_map,
+            commit_digest: Some(commit_digest),
             namespace_set: HashSet::new(),
             generation: 0,
             epoch_baseline: 0,
+            #[cfg(test)]
+            drop_probe: None,
         })
     }
 
@@ -804,6 +828,183 @@ pub(crate) async fn warm_existing_memory_indexes(rt: &KhiveRuntime, ann: &Shared
             Err(e) => {
                 tracing::warn!(error = %e, model = %model, "memory ANN warm failed");
             }
+        }
+    }
+}
+
+/// Whether `start_rotation_watcher` has claimed its one-shot guard for `ann`.
+#[cfg(test)]
+pub(crate) fn rotation_watch_started_for_test(ann: &SharedAnn) -> bool {
+    ann.rotation_watch_started.load(Ordering::Acquire)
+}
+
+/// Start one pack-lifetime watcher that releases mmap file generations after
+/// a peer checkpoint rotates them. The task holds only a weak ANN reference
+/// between ticks, so dropping the pack ends it even in a non-daemon stdio
+/// process; daemon shutdown is an immediate second exit path.
+pub(crate) fn start_rotation_watcher(rt: &KhiveRuntime, ann: &SharedAnn) {
+    let Some(ann_root) = rt.backend_ann_root() else {
+        return;
+    };
+    if ann
+        .rotation_watch_started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let ann = Arc::downgrade(ann);
+    let shutdown = khive_runtime::daemon_shutdown_token();
+    khive_runtime::track_background_task(async move {
+        let start = tokio::time::Instant::now() + ROTATION_WATCH_INTERVAL;
+        let mut ticks = tokio::time::interval_at(start, ROTATION_WATCH_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticks.tick() => {}
+            }
+            let Some(ann) = ann.upgrade() else {
+                break;
+            };
+            refresh_rotated_segments_in_root(&ann_root, &ann).await;
+        }
+    });
+}
+
+/// Poll every installed mmap bridge once and replace any generation published
+/// by another process. This performs no corpus scan on the unchanged path.
+#[cfg(test)]
+async fn refresh_rotated_segments_once(rt: &KhiveRuntime, ann: &SharedAnn) {
+    let Some(ann_root) = rt.backend_ann_root() else {
+        return;
+    };
+    refresh_rotated_segments_in_root(&ann_root, ann).await;
+}
+
+async fn refresh_rotated_segments_in_root(ann_root: &std::path::Path, ann: &SharedAnn) {
+    let installed: Vec<(AnnKey, [u8; 32])> = ann
+        .indexes
+        .read()
+        .await
+        .iter()
+        .filter_map(|(key, bridge)| bridge.commit_digest.map(|digest| (key.clone(), digest)))
+        .collect();
+
+    for (key, expected) in installed {
+        let dir = ann_segment_dir_from_root(ann_root, &key.model);
+        match segment_commit_digest(&dir) {
+            Ok(Some(observed)) if observed != expected => {
+                refresh_rotated_segment(ann, &key, expected, dir).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    model = %key.model,
+                    "memory ANN rotation check failed; retaining the installed generation"
+                );
+            }
+        }
+    }
+}
+
+/// Reload one changed publication under the same local and cross-process
+/// locks used by checkpoint writers. A committed-but-invalid replacement
+/// evicts the predecessor: its segment files have already been unlinked, and
+/// retaining it would recreate the disk-space leak this watcher prevents.
+async fn refresh_rotated_segment(
+    ann: &SharedAnn,
+    key: &AnnKey,
+    expected: [u8; 32],
+    dir: std::path::PathBuf,
+) {
+    let local_lock = model_warm_lock(ann, key).await;
+    let _local_guard = local_lock.lock().await;
+
+    let incumbent = ann.indexes.read().await.get(key).map(|bridge| {
+        (
+            bridge.commit_digest,
+            bridge.generation,
+            bridge.epoch_baseline,
+            bridge.index.last_applied_seq().unwrap_or(0),
+        )
+    });
+    let Some((Some(incumbent_digest), generation, epoch_baseline, incumbent_seq)) = incumbent
+    else {
+        return;
+    };
+    if incumbent_digest != expected {
+        return;
+    }
+
+    let _publication_guard = match acquire_bridge_checkpoint_lock_async(dir.clone()).await {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                model = %key.model,
+                "memory ANN rotation reload could not acquire the publication lock"
+            );
+            return;
+        }
+    };
+
+    let observed = match segment_commit_digest(&dir) {
+        Ok(Some(digest)) if digest != incumbent_digest => digest,
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                model = %key.model,
+                "memory ANN rotated commit identity could not be read"
+            );
+            return;
+        }
+    };
+
+    let replacement = AnnBridge::load(&dir).and_then(|bridge| {
+        if bridge.commit_digest != Some(observed) {
+            return Err("commit identity changed during locked rotation reload".to_string());
+        }
+        let replacement_seq = bridge.index.last_applied_seq().unwrap_or(0);
+        if replacement_seq < incumbent_seq {
+            return Err(format!(
+                "rotated segment watermark {replacement_seq} regressed below installed {incumbent_seq}"
+            ));
+        }
+        Ok(bridge
+            .with_generation(generation)
+            .with_epoch_baseline(epoch_baseline))
+    });
+
+    match replacement {
+        Ok(bridge) => {
+            // Do not carry the incumbent's namespace_set onto the rotated
+            // bridge: a peer's checkpoint can cover namespaces this process
+            // never observed. Leave the conservative empty set `load` set,
+            // so recall keeps over-fetching until it repopulates.
+            if install_replacing(ann, key, bridge).await {
+                tracing::debug!(
+                    model = %key.model,
+                    "memory ANN adopted rotated mmap generation and released its predecessor"
+                );
+            }
+        }
+        Err(error) => {
+            let mut indexes = ann.indexes.write().await;
+            if indexes
+                .get(key)
+                .is_some_and(|bridge| bridge.commit_digest == Some(incumbent_digest))
+            {
+                indexes.remove(key);
+            }
+            tracing::warn!(
+                error = %error,
+                model = %key.model,
+                "memory ANN rotated generation failed validation; released predecessor and will rebuild on demand"
+            );
         }
     }
 }
@@ -1265,9 +1466,13 @@ async fn load_and_build_from_vector_store(
 /// in-memory backends.
 fn ann_segment_dir(rt: &KhiveRuntime, model: &str) -> Option<std::path::PathBuf> {
     let ann_root = rt.backend_ann_root()?;
+    Some(ann_segment_dir_from_root(&ann_root, model))
+}
+
+fn ann_segment_dir_from_root(ann_root: &std::path::Path, model: &str) -> std::path::PathBuf {
     let key = snapshot_key("global", model);
     let hex: String = key.bytes().map(|b| format!("{b:02x}")).collect();
-    Some(ann_root.join(hex))
+    ann_root.join(hex)
 }
 
 fn acquire_bridge_checkpoint_lock(dir: &std::path::Path) -> Result<std::fs::File, String> {
@@ -2628,6 +2833,20 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// Owns a file-backed runtime and removes its database directory after shutdown.
+    struct TestRuntime {
+        runtime: KhiveRuntime,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestRuntime {
+        type Target = KhiveRuntime;
+
+        fn deref(&self) -> &Self::Target {
+            &self.runtime
+        }
+    }
+
     struct InterleavingTailReader {
         subject: Uuid,
         calls: Vec<String>,
@@ -2999,6 +3218,187 @@ mod tests {
         AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![id], HashSet::new())
             .expect("build tiny bridge")
             .with_generation(generation)
+    }
+
+    /// A peer can rotate an otherwise byte-identical checkpoint while this
+    /// process is completely idle. One watcher tick must adopt its new UUID
+    /// sidecar and drop the bridge that owns the unlinked predecessor mmaps.
+    #[tokio::test]
+    async fn rotation_tick_releases_predecessor_and_adopts_identical_peer_checkpoint() {
+        const MODEL: &str = "memory-rotation-release-test-model";
+        let rt = test_runtime_with_hash_embedder(MODEL, 4);
+        let ann = new_shared();
+        let key = AnnKey::new(MODEL);
+        let dir = ann_segment_dir(&rt, MODEL).expect("file-backed segment directory");
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+
+        tiny_bridge(old_id, 7)
+            .save_atomic(&dir)
+            .expect("persist first generation");
+        let mut loaded = AnnBridge::load(&dir)
+            .expect("load first mmap generation")
+            .with_generation(7);
+        let probe = Arc::new(());
+        let dropped = Arc::downgrade(&probe);
+        loaded.drop_probe = Some(probe);
+        assert!(install_replacing(&ann, &key, loaded).await);
+        let first_digest = ann
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .and_then(|bridge| bridge.commit_digest)
+            .expect("loaded bridge identity");
+
+        // The vector bytes and Vamana lifecycle are identical. Only the ID
+        // sidecar denotes the peer's newly published logical mapping.
+        tiny_bridge(new_id, 7)
+            .save_atomic(&dir)
+            .expect("rotate identical checkpoint");
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        assert!(
+            dropped.upgrade().is_none(),
+            "replacing the cache entry must drop the predecessor mmap owner"
+        );
+        let installed = ann.indexes.read().await;
+        let bridge = installed.get(&key).expect("rotated bridge installed");
+        assert_ne!(bridge.commit_digest, Some(first_digest));
+        let hits = bridge
+            .search(&[1.0, 0.0, 0.0, 0.0], 1)
+            .expect("search replacement");
+        assert_eq!(hits.first().map(|hit| hit.0), Some(new_id));
+        assert_eq!(bridge.generation, 7, "local generation fence is preserved");
+    }
+
+    /// A peer's rotated checkpoint can cover namespaces this process never
+    /// queried. Adopting it must not inherit the incumbent's narrower
+    /// namespace_set — recall's over-fetch decision trusts an empty set as
+    /// "assume non-visible namespaces exist" and a stale narrow set as
+    /// "corpus fully accounted for", so carrying the incumbent's set forward
+    /// would hide eligible memories from namespaces the peer's checkpoint
+    /// added.
+    #[tokio::test]
+    async fn rotation_tick_resets_namespace_set_instead_of_inheriting_incumbent() {
+        const MODEL: &str = "memory-rotation-namespace-reset-test-model";
+        let rt = test_runtime_with_hash_embedder(MODEL, 4);
+        let ann = new_shared();
+        let key = AnnKey::new(MODEL);
+        let dir = ann_segment_dir(&rt, MODEL).expect("file-backed segment directory");
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+
+        tiny_bridge(old_id, 7)
+            .save_atomic(&dir)
+            .expect("persist first generation");
+        let mut incumbent = AnnBridge::load(&dir)
+            .expect("load first mmap generation")
+            .with_generation(7);
+        // Simulate a bridge this process actually built: it only ever
+        // observed namespace "ns-a".
+        incumbent.set_namespace_set(HashSet::from(["ns-a".to_string()]));
+        assert!(install_replacing(&ann, &key, incumbent).await);
+
+        // The peer's rotated checkpoint carries data from a namespace this
+        // process never saw.
+        tiny_bridge(new_id, 7)
+            .save_atomic(&dir)
+            .expect("rotate peer checkpoint covering an unseen namespace");
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        let installed = ann.indexes.read().await;
+        let bridge = installed.get(&key).expect("rotated bridge installed");
+        assert!(
+            bridge.namespace_set.is_empty(),
+            "rotation must not carry the incumbent's namespace_set {:?} onto a peer \
+             checkpoint of unknown namespace coverage; recall requires the conservative \
+             empty set to keep over-fetching for eligible visible memories",
+            bridge.namespace_set
+        );
+    }
+
+    /// Mirrors the knowledge-pack invalid-rotation tests (issue #2340): a
+    /// peer's rotated checkpoint that fails validation must evict the
+    /// predecessor here too, and a later warm must recover. Unlike the
+    /// knowledge pack, memory has no separate warm-lifecycle map to race —
+    /// `refresh_rotated_segment` and `ensure_ann_for_model` both take
+    /// `model_warm_lock` for the same key before touching `indexes`, so the
+    /// watcher and an in-flight rebuild are
+    /// already mutually exclusive; this test pins the recovery behavior that
+    /// serialization is relied on to make safe.
+    #[tokio::test]
+    async fn invalid_rotation_evicts_predecessor_and_next_warm_recovers() {
+        const MODEL: &str = "memory-invalid-rotation-recovery-test-model";
+        const DIMS: usize = 4;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        rt.create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "invalid rotation recovery note",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+        let ann = new_shared();
+        let key = AnnKey::new(MODEL);
+
+        let first = ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("initial full checkpoint");
+        assert!(
+            matches!(first, AnnEnsureStatus::Built { vectors: 1 }),
+            "sanity: the initial warm must build and persist the corpus, got {first:?}"
+        );
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "sanity: the initial build must be installed"
+        );
+
+        // A peer publishes a changed commit whose UUID sidecar is missing, so
+        // the rotated generation fails validation and the incumbent is evicted.
+        let dir = ann_segment_dir(&rt, MODEL).expect("file-backed segment directory");
+        let incumbent_seq = ann
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .and_then(|bridge| bridge.index.last_applied_seq())
+            .expect("initial build carries an applied watermark");
+        let mut rotated = tiny_bridge(Uuid::new_v4(), 1);
+        rotated.set_applied_seq(incumbent_seq);
+        rotated.save_atomic(&dir).expect("rotate checkpoint");
+        std::fs::remove_file(dir.join("external_ids.bin")).expect("remove sidecar");
+
+        refresh_rotated_segments_once(&rt, &ann).await;
+
+        assert!(
+            ann.indexes.read().await.get(&key).is_none(),
+            "an invalid rotated generation must evict the incumbent"
+        );
+
+        // The next warm must recover: `model_warm_lock` is the same lock the
+        // watcher just released, so no stale ownership blocks the rebuild.
+        let recovered = ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("recovery checkpoint after eviction");
+        assert!(
+            matches!(recovered, AnnEnsureStatus::Built { vectors: 1 }),
+            "the next warm must rebuild after the watcher's eviction, got {recovered:?}"
+        );
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "the recovery build must reinstall the index"
+        );
     }
 
     /// A strictly older generation than the installed entry must never replace it (pre-#750 bug shape).
@@ -3906,14 +4306,12 @@ mod tests {
         );
     }
 
-    fn test_runtime_with_hash_embedder(model: &str, dims: usize) -> KhiveRuntime {
+    fn test_runtime_with_hash_embedder(model: &str, dims: usize) -> TestRuntime {
         let tmp = tempfile::Builder::new()
             .prefix("khive-memory-ann-test-")
             .tempdir_in(std::env::temp_dir())
             .expect("temp db dir");
-        // Leak the guard so the returned runtime's database directory remains alive.
         let db_path = tmp.path().join("khive-graph.db");
-        std::mem::forget(tmp);
         let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
             db_path: Some(db_path),
             embedding_model: None,
@@ -3925,7 +4323,10 @@ mod tests {
             model_name: model.to_owned(),
             dims,
         });
-        rt
+        TestRuntime {
+            runtime: rt,
+            _temp_dir: tmp,
+        }
     }
 
     /// A completed warm releases its guard so a later write can trigger another rebuild.
@@ -4381,7 +4782,6 @@ mod tests {
             .tempdir_in(std::env::temp_dir())
             .expect("temp db dir");
         let db_path = tmp.path().join("khive-graph.db");
-        std::mem::forget(tmp);
 
         // "Daemon": first runtime, warms the ANN index and stays resident —
         // exactly like a long-lived `kkernel mcp --daemon` process.

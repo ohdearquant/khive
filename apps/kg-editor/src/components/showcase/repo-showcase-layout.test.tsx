@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RepoShowcase } from "@/components/showcase/repo-showcase";
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
+import { repositoryLocationUrl } from "@/lib/repository-location";
 
 const settleGraphLayoutSpy = vi.hoisted(() => vi.fn());
 
@@ -92,6 +93,229 @@ describe("repository showcase graph layout", () => {
     };
     rerender(<RepoShowcase bundle={replacedModulePage} />);
     expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the user's graph selection across a rerender, and only realigns it on real navigation", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+    const { container, rerender } = render(<RepoShowcase bundle={bundle} />);
+    await waitFor(() => expect(settleGraphLayoutSpy).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", {
+      name: `${bundle.capability.views.structure_graph.label} +`,
+    }));
+
+    const packageChoice = bundle.graph.packages.items[0];
+    await user.selectOptions(
+      screen.getByRole("combobox", {
+        name:
+          `${bundle.capability.labels.node_types.package} · ${bundle.capability.views.structure_graph.label}`,
+      }),
+      packageChoice.id,
+    );
+    const moduleNode = container.querySelector<HTMLButtonElement>(
+      "[data-module-node]",
+    )!;
+    const moduleNodeId = moduleNode.getAttribute("data-node-id")!;
+    await user.click(moduleNode);
+    expect(
+      container.querySelector(`[data-node-id="${moduleNodeId}"]`),
+    ).toHaveAttribute("aria-pressed", "true");
+
+    // A rerender that only supplies a fresh `modules` items array identity
+    // (same content, new reference) must not reset the in-graph selection
+    // the user just made.
+    const freshModuleList = {
+      ...bundle,
+      graph: {
+        ...bundle.graph,
+        modules: {
+          ...bundle.graph.modules,
+          items: [...bundle.graph.modules.items],
+        },
+      },
+    };
+    rerender(<RepoShowcase bundle={freshModuleList} />);
+    expect(
+      screen.getByRole("combobox", {
+        name:
+          `${bundle.capability.labels.node_types.package} · ${bundle.capability.views.structure_graph.label}`,
+      }),
+    ).toHaveValue(packageChoice.id);
+    expect(
+      container.querySelector(`[data-node-id="${moduleNodeId}"]`),
+    ).toHaveAttribute("aria-pressed", "true");
+
+    // An in-app navigation (a view switch pushes a new location) followed by
+    // another fresh-module-list rerender must not realign the graph either:
+    // the selection was set explicitly and the URL merely followed it.
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.hidden_coupling.label,
+    }));
+    rerender(
+      <RepoShowcase
+        bundle={{
+          ...freshModuleList,
+          graph: {
+            ...freshModuleList.graph,
+            modules: {
+              ...freshModuleList.graph.modules,
+              items: [...freshModuleList.graph.modules.items],
+            },
+          },
+        }}
+      />,
+    );
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.structure_graph.label,
+    }));
+    expect(
+      screen.getByRole("combobox", {
+        name:
+          `${bundle.capability.labels.node_types.package} · ${bundle.capability.views.structure_graph.label}`,
+      }),
+    ).toHaveValue(packageChoice.id);
+    expect(
+      container.querySelector(`[data-node-id="${moduleNodeId}"]`),
+    ).toHaveAttribute("aria-pressed", "true");
+
+    // An actual navigation (browser back/forward) to a different module's
+    // URL still realigns the graph to that module.
+    const otherModule = bundle.graph.modules.items.find((module) =>
+      module.package_id !== packageChoice.id
+    )!;
+    const target = repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: bundle.meta.snapshot.head_sha,
+      modulePath: null,
+      moduleId: otherModule.id,
+      view: "structure_graph",
+    });
+    window.history.pushState(null, "", target);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", {
+          name:
+            `${bundle.capability.labels.node_types.package} · ${bundle.capability.views.structure_graph.label}`,
+        }),
+      ).toHaveValue(otherModule.package_id)
+    );
+    expect(
+      container.querySelector(`[data-node-id="${otherModule.id}"]`),
+    ).toHaveAttribute("aria-pressed", "true");
+  });
+
+  async function selectGraphModule(
+    bundle: RepoBundle,
+    container: HTMLElement,
+    user: ReturnType<typeof userEvent.setup>,
+  ) {
+    await user.click(screen.getByRole("button", {
+      name: `${bundle.capability.views.structure_graph.label} +`,
+    }));
+    const packageChoice = bundle.graph.packages.items[0];
+    const comboboxName =
+      `${bundle.capability.labels.node_types.package} · ${bundle.capability.views.structure_graph.label}`;
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: comboboxName }),
+      packageChoice.id,
+    );
+    const moduleNode = container.querySelector<HTMLButtonElement>(
+      "[data-module-node]",
+    )!;
+    const moduleNodeId = moduleNode.getAttribute("data-node-id")!;
+    await user.click(moduleNode);
+    expect(
+      container.querySelector(`[data-node-id="${moduleNodeId}"]`),
+    ).toHaveAttribute("aria-pressed", "true");
+    return { packageChoice, comboboxName, moduleNodeId };
+  }
+
+  function freshModuleList(bundle: RepoBundle): RepoBundle {
+    return {
+      ...bundle,
+      graph: {
+        ...bundle.graph,
+        modules: {
+          ...bundle.graph.modules,
+          items: [...bundle.graph.modules.items],
+        },
+      },
+    };
+  }
+
+  function staleSnapshotLink(bundle: RepoBundle) {
+    return repositoryLocationUrl(new URL(window.location.href), {
+      repository: bundle.meta.repository.canonical_url,
+      snapshotSha: "0000000000000000000000000000000000000000",
+      modulePath: bundle.graph.modules.items[0].source_path,
+      moduleId: bundle.graph.modules.items[0].id,
+      view: "structure_graph",
+    });
+  }
+
+  it("keeps the user's graph selection after a stale link is normalized to the current snapshot", async () => {
+    const bundle = golden();
+    window.history.replaceState(null, "", staleSnapshotLink(bundle));
+    const user = userEvent.setup();
+    const { container, rerender } = render(<RepoShowcase bundle={bundle} />);
+    const notice = await screen.findByRole("status", {
+      name: "Investigation link status",
+    });
+    await waitFor(() => expect(settleGraphLayoutSpy).toHaveBeenCalled());
+    const { packageChoice, comboboxName, moduleNodeId } =
+      await selectGraphModule(bundle, container, user);
+
+    // Normalizing rewrites the location in place; a later rerender that only
+    // supplies a fresh module list must still see that location as applied.
+    await user.click(within(notice).getByRole("button", {
+      name: "Use current snapshot",
+    }));
+    expect(new URL(window.location.href).searchParams.get("at")).toBe(
+      bundle.meta.snapshot.head_sha,
+    );
+    rerender(<RepoShowcase bundle={freshModuleList(bundle)} />);
+
+    expect(screen.getByRole("combobox", { name: comboboxName })).toHaveValue(
+      packageChoice.id,
+    );
+    expect(
+      container.querySelector(`[data-node-id="${moduleNodeId}"]`),
+    ).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("keeps the user's graph selection after copying a link rewrites a stale location", async () => {
+    const bundle = golden();
+    window.history.replaceState(null, "", staleSnapshotLink(bundle));
+    const writeText = vi.spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+    writeText.mockClear();
+    const user = userEvent.setup();
+    const { container, rerender } = render(<RepoShowcase bundle={bundle} />);
+    await screen.findByRole("status", { name: "Investigation link status" });
+    await waitFor(() => expect(settleGraphLayoutSpy).toHaveBeenCalled());
+    const { packageChoice, comboboxName, moduleNodeId } =
+      await selectGraphModule(bundle, container, user);
+
+    await user.click(
+      screen.getByRole("button", { name: "Copy investigation link" }),
+    );
+    expect(writeText).toHaveBeenCalledOnce();
+    await waitFor(() =>
+      expect(new URL(window.location.href).searchParams.get("at")).toBe(
+        bundle.meta.snapshot.head_sha,
+      )
+    );
+    rerender(<RepoShowcase bundle={freshModuleList(bundle)} />);
+
+    expect(screen.getByRole("combobox", { name: comboboxName })).toHaveValue(
+      packageChoice.id,
+    );
+    expect(
+      container.querySelector(`[data-node-id="${moduleNodeId}"]`),
+    ).toHaveAttribute("aria-pressed", "true");
   });
 
   it("reports the selected subtree's true totals, not the displayed slice, in the disclosure counts", async () => {

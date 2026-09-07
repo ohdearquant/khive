@@ -13,7 +13,7 @@ delivery confirmation, and channel polling observability.
 | `comm.inbox`     | Page and filter the caller's inbound inbox or sent-message history, optionally waiting up to 30 seconds for a new matching message                            |
 | `comm.read`      | Mark one or up to 500 inbound messages as read (best-effort: inspect each result's `read`/`mark_error`)                                                       |
 | `comm.mark_read` | Named bulk mark-read for 1-500 inbound messages; `atomic=true` makes the cross-message mutation all-or-nothing                                                |
-| `comm.unread`    | Count the caller's unread inbound messages without message payloads                                                                                           |
+| `comm.unread`    | Count the caller's unread inbound messages without payloads; exact below 1,000 with explicit cap/saturation metadata                                           |
 | `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
 | `comm.thread`    | Retrieve all messages in a conversation thread, chronologically                                                                                               |
 | `comm.health`    | Read a bounded heartbeat-first channel snapshot, quarantine backlog counts, nominal poll cadence, and nullable advisory schedule staleness                    |
@@ -161,8 +161,15 @@ message view. Stable property aliases such as `from_actor`, `to_actor`, and
 
 `comm.read(id=...)` keeps the single-message response. The additive
 `comm.read(ids=[...])` form validates 1-500 supplied IDs and returns per-item
-outcomes with marked/failed counts; inspect `read`/`mark_error` because bulk
-updates are not one cross-message transaction. `comm.read` remains available
+outcomes with marked/failed/unknown counts. Each result carries
+`status=success|failed|unknown`, and the bulk result carries
+`status=success|partial|failed|unknown`, so a degraded mark is explicit
+alongside `read`/`mark_error`. `unknown` (`read: null`) means the write's
+execution seam terminated after the request was accepted, so the mark may
+already have landed; check the message's current state through `comm.inbox`
+before deciding whether to re-issue it — re-issuing is safe, since marking a
+message read is idempotent. Bulk updates are not one
+cross-message transaction. `comm.read` remains available
 for compatibility, but its name describes neither retrieval nor mutation
 clearly; retrieve message content through `comm.inbox` or `comm.thread`.
 

@@ -126,6 +126,7 @@ async fn test_remember_dispatch_succeeds_with_no_embeddings_runtime() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_remember_recall_smoke() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -161,6 +162,7 @@ async fn test_remember_recall_smoke() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_decay_ranking() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -261,6 +263,7 @@ async fn test_recall_decay_ranking() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_salience_ranking() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -330,6 +333,7 @@ async fn test_recall_salience_ranking() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_memory_type_filter() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -636,6 +640,7 @@ fn test_memory_dotted_verbs_registered() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_candidates_returns_arrays() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -669,6 +674,7 @@ async fn test_recall_candidates_returns_arrays() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_fuse_returns_fused_candidates_not_full_recall() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -701,6 +707,7 @@ async fn test_recall_fuse_returns_fused_candidates_not_full_recall() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_breakdown_is_opt_in() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -744,6 +751,7 @@ async fn test_recall_breakdown_is_opt_in() {
 /// recall.candidates always includes both array keys even when the embedding model is absent
 /// and the vector path returns nothing.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_candidates_vector_field_always_present() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -777,6 +785,7 @@ async fn test_recall_candidates_vector_field_always_present() {
 
 /// recall.fuse source field must be a plain string ("text"), not a serde-tagged enum.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_fuse_source_field_is_plain_string() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -815,6 +824,7 @@ async fn test_recall_fuse_source_field_is_plain_string() {
 /// 0.0164) is the discriminator: if the adapter did not pass k=1 through to
 /// khive_retrieval::HybridConfig, the score would not be 0.5.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_fuse_rrf_k1_uses_retrieval_adapter() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -864,6 +874,7 @@ async fn test_recall_fuse_rrf_k1_uses_retrieval_adapter() {
 /// per-candidate note_id + fused_score + source must all be present. Full recall
 /// fields (content, salience) must remain absent.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_fuse_shape_preserved_after_retrieval_wiring() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -923,6 +934,7 @@ async fn test_recall_fuse_shape_preserved_after_retrieval_wiring() {
 
 /// When include_breakdown is true, breakdown.total() must equal the hit's composite score.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_breakdown_total_matches_composite_score() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -975,6 +987,7 @@ async fn test_recall_breakdown_total_matches_composite_score() {
 /// at which non-memory notes can dominate the candidate pool without pre-filtering), then
 /// verifies that recall returns only memory-kind notes.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_excludes_non_memory_notes() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -1056,6 +1069,7 @@ async fn test_recall_excludes_non_memory_notes() {
 /// non-memory notes would otherwise exhaust the candidate cap before the
 /// memory-kind scope is ever applied.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn recall_candidate_cap_counts_eligible_memories_not_generic_notes() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -1241,6 +1255,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
 // ── ADR-033 §6 knob tests ──────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_default_identity() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -1315,6 +1330,7 @@ async fn test_recall_default_identity() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_top_k_override() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -1365,6 +1381,7 @@ async fn test_recall_top_k_override() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_fusion_strategy_override() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -1421,6 +1438,7 @@ async fn test_recall_fusion_strategy_override() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_score_floor() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -1496,6 +1514,7 @@ async fn test_recall_score_floor() {
 /// PR #375: empty reranker_weights is a pass-through — results must be identical
 /// to a baseline recall with no reranker config.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_with_empty_reranker_weights_is_passthrough() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -1560,6 +1579,7 @@ async fn test_recall_with_empty_reranker_weights_is_passthrough() {
 /// low-salience notes rank first.  The salience=1.0 reranker then flips the
 /// order, placing the high-salience note at rank #1.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_with_reranker_weights_changes_ordering() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -1889,6 +1909,7 @@ fn test_handler_def_remember_params_complete() {
 /// return a non-zero comparable number of hits under both RRF and Weighted fusion
 /// — not 0 for one and many for the other.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_score_floor_portable_across_fusion_strategies() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -1973,6 +1994,7 @@ async fn test_score_floor_portable_across_fusion_strategies() {
 
 /// Fix 5: include_breakdown=true includes score breakdown without changing agent-mode shape.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_include_breakdown_flag_includes_breakdown() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -2027,6 +2049,7 @@ async fn test_recall_include_breakdown_flag_includes_breakdown() {
 
 /// #514 regression: presentation= must be rejected by deny_unknown_fields.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn recall_presentation_alias_is_rejected_by_deny_unknown_fields() {
     let registry = make_registry(make_runtime());
     let err = registry
@@ -2113,6 +2136,7 @@ impl EmbedderProvider for ConstVecProvider {
 /// Previously the fan-out gate checked `config().embedding_model.is_some()`;
 /// custom-only runtimes fell through to `vec![]`.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_custom_embedder_only_runtime_fanout_remember_recall() {
     const MODEL_A: &str = "custom-enc-a";
     const DIMS: usize = 4;
@@ -2182,6 +2206,7 @@ async fn test_custom_embedder_only_runtime_fanout_remember_recall() {
 /// This test verifies that a memory created with two registered embedders is
 /// returned by recall under the Weighted strategy (text contributes).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_weighted_fusion_multi_model_text_not_zeroed() {
     const MODEL_A: &str = "enc-model-a";
     const MODEL_B: &str = "enc-model-b";
@@ -2243,6 +2268,7 @@ async fn test_weighted_fusion_multi_model_text_not_zeroed() {
 /// only through the primary engine must still be found by a CJK query, even
 /// though FTS5 has no CJK tokenizer and cannot rescue it via the text leg.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_cjk_query_finds_note_embedded_by_primary_engine() {
     const PRIMARY: &str = "enc-primary";
     const SECONDARY: &str = "enc-multilingual-b";
@@ -2327,6 +2353,7 @@ async fn test_remember_procedural_memory_type_rejected() {
 
 /// M-C1: recall with memory_type="procedural" must also be rejected.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_procedural_memory_type_filter_rejected() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -2358,6 +2385,7 @@ async fn test_recall_procedural_memory_type_filter_rejected() {
 /// Specifically, after normalize_relevance + weighted combination, scores must
 /// not exceed 1.0.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_composite_score_bounded_to_unit_interval() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -2460,6 +2488,7 @@ fn test_handler_def_remember_memory_type_description_lists_valid_values() {
 // matches a memory note. Previously the conjunction Plain MATCH returned zero
 // candidates if the note only contained some of the query terms.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn recall_candidates_text_candidates_non_empty_for_partial_match() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -2511,6 +2540,7 @@ async fn recall_candidates_text_candidates_non_empty_for_partial_match() {
 // Issue #482: recall include_breakdown=true must include per-component breakdown.
 // presentation= was removed in #514 and is now rejected by deny_unknown_fields.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn recall_include_breakdown_true_includes_breakdown() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -2540,6 +2570,7 @@ async fn recall_include_breakdown_true_includes_breakdown() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn recall_default_omits_breakdown() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -2625,6 +2656,7 @@ async fn search_kind_memory_resolves_when_memory_pack_loaded() {
 
 /// #515: tag filter — OR (any), AND (all), and no-filter behaviors.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn recall_tags_filter_any_all_and_no_filter() {
     let registry = make_registry(make_runtime());
 
@@ -2764,6 +2796,7 @@ async fn recall_tags_filter_any_all_and_no_filter() {
 /// memory.recall, including when tag filters narrow the result set with tag_mode="all".
 /// The field is null for text-only hits (no vector index) and a float for vector hits.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn recall_raw_score_field_always_present_with_tag_filter() {
     let registry = make_registry(make_runtime());
 
@@ -3081,6 +3114,7 @@ async fn test_remember_explicit_decay_overrides_episodic_default() {
 /// no decay_factor) must be returned by memory.recall(memory_type="episodic") because
 /// the resolved memory_type defaults to "episodic" when no stored value is present.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_legacy_note_no_memory_type_returned_as_episodic() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -3168,6 +3202,7 @@ async fn test_recall_legacy_note_no_memory_type_returned_as_episodic() {
 /// `truncated: true`; each surviving result also retains its per-item signal.
 /// Uncapped responses remain bare arrays.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_budget_capped_surfaces_signal() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -3236,6 +3271,7 @@ async fn test_recall_budget_capped_surfaces_signal() {
 /// A budget cutoff at the first ranked candidate must remain distinguishable
 /// from a genuine recall miss even though both contain zero returned items.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_oversized_single_candidate_surfaces_top_level_truncation() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -3303,6 +3339,7 @@ async fn test_recall_oversized_single_candidate_surfaces_top_level_truncation() 
 /// #94 regression (no false positive): when all results fit within the token budget,
 /// the response is a plain array with count equal to available results.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_no_budget_cap_returns_plain_array() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -3355,6 +3392,7 @@ async fn test_recall_no_budget_cap_returns_plain_array() {
 ///
 /// Assert: exactly 1 result returned AND it is rank #1 AND rank #3 is absent.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_budget_truncation_preserves_rank_order() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -3449,6 +3487,7 @@ async fn test_recall_budget_truncation_preserves_rank_order() {
 /// not empty recall results. Validation must happen before candidate retrieval
 /// so the behavior does not depend on whether the namespace contains a match.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_rejects_degenerate_and_overflowing_token_budgets() {
     let rt = make_runtime();
     let registry = make_registry(rt);
@@ -3491,6 +3530,7 @@ async fn test_recall_rejects_degenerate_and_overflowing_token_budgets() {
 /// edge targets B, so both the page loop and the old candidate-count leak are
 /// exercised deterministically.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
     let rt = make_runtime();
     let token = rt
@@ -3693,6 +3733,7 @@ async fn adr007_rev4_writes_stamp_local() {
 /// A registry built with no visible_namespaces must NOT surface notes written
 /// to a foreign namespace via default-path recall.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn adr007_rev4_no_actor_yields_local_only_visible_set() {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
@@ -3755,6 +3796,7 @@ async fn adr007_rev4_no_actor_yields_local_only_visible_set() {
 /// be EXACTLY that namespace. A note written to `local` must NOT appear in the
 /// results (the explicit param is not widened by visible_namespaces).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn adr007_rev4_explicit_namespace_is_strict_reading2() {
     const MODEL_A: &str = "custom-enc-a";
     const DIMS: usize = 4;
@@ -3914,6 +3956,7 @@ async fn adr007_rev4_get_byid_is_namespace_agnostic() {
 ///   5b — default recall with a lexically-disjoint query (no shared trigrams) still returns the
 ///        note, isolating the vector leg via the `authorize(ns)` fanout.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn adr007_rev4_default_recall_surfaces_actor_ns_via_both_legs() {
     const MODEL_A: &str = "custom-enc-a";
     const DIMS: usize = 4;
@@ -4000,6 +4043,7 @@ async fn adr007_rev4_default_recall_surfaces_actor_ns_via_both_legs() {
 /// The note id must appear — with the vector leg dead, the ONLY path that can
 /// surface it is the FTS fanout (`with_namespace` selecting `fts_notes_lambda:khive`).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn adr007_rev4_default_recall_surfaces_actor_ns_via_fts_leg() {
     // Build a runtime with visible_namespaces = ["lambda:khive"] and NO embedder,
     // so the vector leg is dead.
@@ -4074,6 +4118,7 @@ async fn adr007_rev4_default_recall_surfaces_actor_ns_via_fts_leg() {
 ///
 /// Uses a deterministic custom embedder (no lattice weights required).
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_multi_namespace_recall_overfetch_filter() {
     use khive_runtime::PackRuntime;
 
@@ -4420,6 +4465,7 @@ async fn c1_setup() -> (
 // Both branches are exercised in-process via RecallConfig.ann_overfetch_max_rounds.
 // No env var mutation; no cross-test interference; no silent skips.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_ann_overfetch_retry_both_branches_deterministic() {
     use khive_runtime::PackRuntime;
 
@@ -4681,6 +4727,7 @@ async fn test_episodic_anonymous_actor_uses_local() {
 /// Note: recall as alice requires alice's registry to have `with_visible_namespaces([alice_ns])`
 /// because pack.rs dispatch (default path) fans reads over {local} ∪ visible_namespaces only.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn adr007_rev6_episodic_cross_actor_isolation() {
     const MODEL_A: &str = "rev6-isolation-enc";
     const DIMS: usize = 4;
@@ -4783,6 +4830,7 @@ async fn adr007_rev6_episodic_cross_actor_isolation() {
 
 /// Expired memories (expires_at <= now) must be excluded from recall results.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_expires_at_excluded_from_recall() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
@@ -5075,6 +5123,7 @@ async fn test_vacuum_succeeds() {
 /// A readable record with a null snapshot (new profile) still stamps; that is
 /// the posterior bootstrap path, exercised by the brain pack's own tests.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_unreadable_bound_profile_is_not_stamped_as_served_by() {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
@@ -5128,6 +5177,7 @@ async fn test_unreadable_bound_profile_is_not_stamped_as_served_by() {
 /// A readable profile record with a null state snapshot is the bootstrap case,
 /// not a failed read. It must remain positively attributed on the wire.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn test_readable_null_snapshot_profile_still_stamps_as_serving() {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: None,

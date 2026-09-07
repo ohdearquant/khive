@@ -63,6 +63,29 @@ fn single_op_with_multiple_typed_args() {
     assert_eq!(val(&v[0].args["active"]), &json!(true));
 }
 
+#[test]
+fn function_form_integer_boundaries_match_serde_json_value_representation() {
+    // Mirrors `crates/khive-wire-protocol/src/codec.rs`'s boundary test for
+    // `decode_payload`'s `serde_json::from_slice` seam, but exercises the
+    // request parser's own scalar decode instead (`parser_impl.rs::parse_value`'s
+    // `serde_json::from_str(trimmed)` call) — a literal within
+    // `[i64::MIN, u64::MAX]` decodes as an exact integer there too; past
+    // either endpoint it silently becomes `f64`, changing the JSON type.
+    let min_i64 = ops("v(a=-9223372036854775808)");
+    assert!(val(&min_i64[0].args["a"]).is_i64());
+
+    let max_u64 = ops("v(a=18446744073709551615)");
+    assert!(val(&max_u64[0].args["a"]).is_u64());
+
+    let below_min = ops("v(a=-9223372036854775809)");
+    assert!(val(&below_min[0].args["a"]).is_f64());
+    assert!(!val(&below_min[0].args["a"]).is_i64());
+
+    let above_max = ops("v(a=18446744073709551616)");
+    assert!(val(&above_max[0].args["a"]).is_f64());
+    assert!(!val(&above_max[0].args["a"]).is_u64());
+}
+
 // ── Batch ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -650,6 +673,57 @@ fn unclosed_paren_rejected() {
     let err = parse_request(r#"gtd.assign(title="a""#).unwrap_err();
     // The string is closed; the args list isn't.
     assert!(matches!(err, DslError::UnclosedCall { .. }));
+}
+
+#[test]
+fn object_key_position_distinguishes_end_of_input_from_a_present_byte() {
+    // Only true end-of-input right after `{` reaches the object-key `None` arm.
+    let err = parse_request("v(a={").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DslError::UnexpectedEof {
+                expected: "object key"
+            }
+        ),
+        "{err:?}"
+    );
+    // Any present byte, `)` or `,` alike, takes the `Some(c)` arm instead.
+    for input in ["v(a={)", "v(a={, b=1)"] {
+        let err = parse_request(input).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DslError::UnexpectedChar {
+                    expected: "quoted string key",
+                    ..
+                }
+            ),
+            "{input}: {err:?}"
+        );
+    }
+    // The empty object closes only when `}` is the very next byte.
+    let parsed = ops("v(a={})");
+    assert_eq!(val(&parsed[0].args["a"]), &json!({}));
+}
+
+#[test]
+fn a_closing_brace_inside_an_open_local_bracket_is_rejected_at_once() {
+    // `[` is still open when `}` arrives, so the value scan rejects immediately.
+    let err = parse_request("v(a=1[})").unwrap_err();
+    assert!(
+        matches!(err, DslError::UnclosedBracket { kind: '{' }),
+        "{err:?}"
+    );
+    // With no local container open, `}` ends the value and the arg list rejects it.
+    let err = parse_request("v(a=1})").unwrap_err();
+    assert!(
+        matches!(err, DslError::UnexpectedChar { found: '}', .. }),
+        "{err:?}"
+    );
+    // Inside a quoted span the `}` is string content; the malformed scalar fails as a value.
+    let err = parse_request(r#"v(a=1["x}"])"#).unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }), "{err:?}");
 }
 
 #[test]

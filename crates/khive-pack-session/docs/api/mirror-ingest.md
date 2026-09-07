@@ -30,18 +30,19 @@ run of blank or oversized lines can no longer read to EOF unbounded, nor lose
 its cursor advance.
 
 A line that crosses `max_line_bytes` with no terminating `\n` yet — a
-still-growing file's in-progress final line, or a genuinely truncated /
-corrupt tail — is its own bounded case, distinct from the complete
-(terminated) oversized-line skip above: `read_line_bounded` reports
-`LineRead::OversizedUnterminated` as soon as one bounded read window crosses
-the cap without finding `\n`, instead of scanning onward to EOF looking for
-one. The cursor is intentionally left at that line's start (like an ordinary
-`Partial`), so the next poll — or the next daemon start — repeats the same
-bounded read rather than an unbounded tail scan; once the line eventually
-terminates (or the file stops growing and reaches true EOF mid-line), it
-resolves to the normal `Oversized` skip-and-advance path or stays a bounded
-`Partial`/`OversizedUnterminated` retry, never a full-file read in one call
-(PACKSESSION-AUD-003).
+still-growing file's in-progress final line, a genuinely truncated tail, or
+the prefix of a complete line spanning several reader windows — is its own
+bounded case. `read_line_bounded` reports
+`LineRead::OversizedUnterminated` as soon as one bounded read crosses the cap
+without finding `\n`, instead of scanning onward to EOF looking for one.
+`read_bounded_chunk` checkpoints that discarded prefix, and the next poll —
+including after a daemon restart — recognizes the mid-line cursor because the
+preceding byte is not `\n`. It continues discarding bounded prefixes until a
+poll reaches the terminator, then resumes parsing at the following line. A
+truncated tail with no new bytes becomes an EOF no-op; if a final under-cap
+fragment remains, it is retried as `Partial` until more bytes arrive. No
+oversized prefix is reparsed as an independent JSON record, and every call
+retains the PACKSESSION-AUD-003 read bound.
 
 ## `MirrorLimits` / per-pass caps
 
@@ -96,15 +97,17 @@ still-growing file) in a single pass.
 
 - `Eof` — EOF with nothing read at all.
 - `Partial` — EOF reached before a terminating `\n`: an incomplete trailing
-  line, left for the next pass. No bytes are considered consumed by the
-  caller, regardless of how large the partial line has already grown.
+  line or the final under-cap fragment of an oversized continuation, left for
+  the next pass. No bytes from this call are considered consumed by the
+  caller.
 - `Complete { bytes }` — a complete line fit within `max_line_bytes`.
 - `Oversized { bytes }` — a complete line exceeded `max_line_bytes` before
   the newline was found; bytes past the cap were scanned for `\n` and
   discarded without buffering, so the caller must skip it, not parse `buf`.
 - `OversizedUnterminated { bytes }` — the line has already exceeded
-  `max_line_bytes` and no terminating `\n` has been found yet, but this is
-  NOT end-of-file. Unlike `Oversized`, the caller must not advance past it.
+  `max_line_bytes` and this bounded read stopped before finding a terminating
+  `\n` or probing farther. The caller checkpoints the discarded prefix and
+  resumes in oversized-skip mode on the next pass.
 
 ## `read_bounded_chunk` — oversized-line handling
 
@@ -119,12 +122,14 @@ advances past it (so ingestion does not wedge on it forever), and a
 `tracing::warn!` names the file and starting byte offset so an operator can
 find and inspect it (PACKSESSION-AUD-003 — no silent coercion).
 
-On `OversizedUnterminated`, the offset is intentionally NOT advanced past
-`line_offset` — the next call re-reads from the same `line_offset` and is
-bounded the same way, whether the file is still growing (a later pass will
-eventually see the terminator and fall into the `Oversized` skip-and-advance
-arm) or genuinely corrupt/truncated (every later poll or daemon restart
-repeats this same bounded read, never an unbounded tail scan).
+On `OversizedUnterminated`, the offset advances by the bounded number of bytes
+discarded in that call and is persisted even though no event was parsed. A
+cursor whose preceding byte is not `\n` is therefore a restart-safe marker
+that ingest is partway through an oversized line. The next call starts in
+oversized-skip mode, so a remainder that happens to fit under the cap cannot
+be parsed as an independent JSON record. Each pass either checkpoints another
+bounded prefix, reaches the terminator and resumes normal parsing, or pauses
+on an under-cap tail fragment until the file grows.
 
 ## ChatGPT export whole-file re-parse (`mirror_chatgpt_export_file`)
 
@@ -252,13 +257,15 @@ test-only byte cap forcing multi-pass behavior instead of giant fixtures:
   cap were never buffered. The READ itself must be bounded too, not just the
   buffered memory. A small, explicit `BufReader` capacity is used so the
   bound is provable independent of the platform default (8 KiB).
-- **oversized-unterminated line leaves the cursor at line start and is
-  bounded on retry**: a single huge line with NO trailing newline (a
-  still-growing or corrupt final line) must not advance the cursor, and
-  repeated calls from the same persisted offset must each be bounded, not
-  replay an unbounded scan of the whole file every poll. Once the line
-  eventually completes, it must be recognized as the ordinary
-  complete-oversized-line skip and clear normally.
+- **complete oversized line spanning several reader windows makes progress**:
+  every non-EOF pass must advance its persisted cursor through the discarded
+  line, and valid records before and after it must land. This catches the
+  former deterministic replay from the same line start.
+- **oversized-unterminated line persists skip progress and resumes after its
+  terminator**: a huge final line with no trailing newline checkpoints the
+  bounded bytes already discarded, remains an EOF no-op across a simulated
+  restart, and cannot be parsed as an event. Once the terminator and a valid
+  line are appended, skip mode clears and the following record lands.
 - **still-growing partial line under the cap is unaffected**: guards that an
   ordinary still-growing file whose latest line is under `max_line_bytes` and
   has no newline yet still behaves as a plain `Partial` — this must not

@@ -763,6 +763,94 @@ v0.8.0 contract. Emitting `timeout` while keeping `retryable` unconditionally
 `false` is not a valid partial adoption, because it publishes a cause the reader
 can act on while denying the action the cause licenses.
 
+## Amendment 3 (2026-08-30): per-arm participation evidence
+
+The KG search envelope MUST expose `arm_participation` on every successful
+search and inside every `search_incomplete` error. It is an object with exactly
+the keys `text` and `vector`; each value carries:
+
+- `status`, from the closed vocabulary `ran | skipped | error`; and
+- `candidate_count`, a non-negative integer.
+
+The statuses describe selection and completion, not result presence:
+
+- `ran` means the arm was selected and every backend on which it was selected
+  completed that search.
+- `skipped` means the arm was not selected on any backend. Today this occurs
+  for `vector` when no configured embedding model can produce a query vector.
+- `error` means at least one backend on which the arm was selected failed
+  before the server could establish that arm's complete contribution. Other
+  backends may still have contributed candidates, so `error` does not require
+  `candidate_count` to be zero.
+
+`candidate_count` counts final canonical response candidates whose `source`
+includes that arm, after every server-side predicate, source/score filter, and
+the caller's result limit. A `source="both"` hit increments both counts. The
+count therefore describes evidence in the response, not the backend's raw
+pre-fusion candidate pool. It is bounded by the public search result limit and
+does not alter ranking, fusion, eligibility, or truncation.
+
+In particular, `status="ran", candidate_count=0` is a clean zero-contribution
+outcome and is distinct from both `skipped` and `error`. This is the fact needed
+for long, keyword-dense FTS queries: an all-vector response can now prove that
+the text arm completed with no surviving match instead of leaving completion
+implicit.
+
+Arm evidence deliberately does not duplicate an error message or invent a
+second cause taxonomy. On partial and `search_incomplete` responses, the
+bounded per-backend causes remain in `backend_errors`, typed with the `kind`
+vocabulary of the serving release: the single constant `backend_error` in
+v0.8.0, and Amendment 2's closed `timeout | backend_error` from v0.9.0 per the
+Compatibility section above. `arm_participation` states which
+selected arms failed to complete; `backend_errors` states why and where the
+backend search failed. Both fields MUST survive presentation and frame-budget
+omission at their normal envelope location.
+
+This amendment does not make vector nearest neighbours an identity lookup. A
+caller checking whether an entity name already exists MUST issue the bare
+canonical name and require the matching row itself to carry
+`source="text" | "both"`. It MUST NOT infer absence from an all-vector result,
+or from text-arm `status="error" | "skipped"`. A text arm that ran with zero
+final candidates establishes only that the lexical query produced no surviving
+match under the requested filters.
+
+This change is additive in v0.8.0. Tolerant readers ignore the new object;
+strict readers must add the two fixed arm keys and the closed status vocabulary.
+Verification MUST cover an exact-name text hit, a 60-plus-character
+keyword-dense text zero-hit, vector-only and `both` candidate counting,
+complete-empty, partial-with-hit, degraded-empty, and frame-budget preservation.
+
+## Amendment 4 (2026-09-03): arm status is per-arm, not per-backend
+
+Amendment 3's status definitions read as backend-granular — `ran` as "every
+backend on which [the arm] was selected completed that search", `error` as "a
+backend on which the arm was selected failed" — and cannot unambiguously
+express the coordinated multi-backend case where one backend's text leg
+completes while that same backend's vector leg fails. This amendment restates
+both statuses at arm granularity, superseding Amendment 3's wording (not its
+intent) for `ran` and `error`:
+
+- `ran` means the arm completed on every backend on which it was selected.
+- `error` means the arm itself failed on at least one backend on which it was
+  selected, whether or not that backend's other arm completed. A backend
+  whose text leg completed and whose vector leg alone failed makes `vector`
+  read `error` while `text` reads `ran`, on the same response.
+
+`skipped` is unchanged from Amendment 3. The backend-level completeness
+fields — `missing_backends` and `backend_errors` — are also unchanged: they
+still report whole-backend failures only. A backend whose only failure was
+one arm does not appear in either field, and the response's top-level
+`status` stays `"complete"`.
+
+Separately, the sentence in Amendment 3 stating "Both fields [`arm_participation`
+and `backend_errors`] MUST survive presentation and frame-budget omission at
+their normal envelope location" is corrected: frame-budget omission relocates
+both fields from their normal top-level location to `error.search` on the
+omitted envelope (the operation's `ok` flips to `false` once its result is
+discarded, so the two fields move under the synthesized `error` object rather
+than staying beside a `result` that no longer exists). They still survive
+omission; they do not survive at the _same_ location.
+
 ## References
 
 - the two follow-up items this record's fixes were split from

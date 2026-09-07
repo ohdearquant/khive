@@ -59,6 +59,7 @@ fn contains_id(hits: &[serde_json::Value], id: uuid::Uuid) -> bool {
 /// any background rebuild.
 #[tokio::test]
 #[serial(adr118_fresh_tail)]
+#[serial_test::serial(config_ledger)]
 async fn same_process_write_then_recall_surfaces_without_rebuild() {
     let tmp = tempfile::Builder::new()
         .prefix("khive-adr118-e2e-1-")
@@ -143,6 +144,7 @@ async fn same_process_write_then_recall_surfaces_without_rebuild() {
 /// generation counters were never touched by the external write.
 #[tokio::test]
 #[serial(adr118_fresh_tail)]
+#[serial_test::serial(config_ledger)]
 async fn cross_process_external_writer_surfaces_on_next_recall() {
     let tmp = tempfile::Builder::new()
         .prefix("khive-adr118-e2e-2-")
@@ -221,6 +223,7 @@ async fn cross_process_external_writer_surfaces_on_next_recall() {
 /// is nothing to merge.
 #[tokio::test]
 #[serial(adr118_fresh_tail)]
+#[serial_test::serial(config_ledger)]
 async fn empty_tail_leaves_vector_candidates_unchanged() {
     let tmp = tempfile::Builder::new()
         .prefix("khive-adr118-e2e-5-")
@@ -276,6 +279,7 @@ async fn empty_tail_leaves_vector_candidates_unchanged() {
 /// vector leg — unlike full `memory.recall`, unaffected by FTS finding it).
 #[tokio::test]
 #[serial(adr118_fresh_tail)]
+#[serial_test::serial(config_ledger)]
 async fn runtime_policy_disables_fresh_tail_restoring_pre_adr_behavior() {
     let tmp = tempfile::Builder::new()
         .prefix("khive-adr118-e2e-6-")

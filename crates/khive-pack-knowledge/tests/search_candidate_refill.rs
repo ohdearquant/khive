@@ -645,9 +645,11 @@ async fn auto_compose_propagates_suggest_hydration_degradation() {
         response["data"]["degraded"]["hydration_failures"], 1,
         "compose must preserve internal suggest degradation: {response}"
     );
+    // Auto-compose skips the zero-size domain served with no live members.
     assert_eq!(
-        response["data"]["markdown"], "# Knowledge Briefing\n\nNo atoms found.",
-        "the regression must exercise the empty-member early return: {response}"
+        response["data"]["markdown"],
+        "# Knowledge Briefing\n\nNo matching domains found for auto-suggest.",
+        "the zero-member candidate must be skipped before composition: {response}"
     );
     assert_eq!(response["data"]["count"], 0, "response: {response}");
 }

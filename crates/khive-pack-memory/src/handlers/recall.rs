@@ -29,8 +29,9 @@ use crate::MemoryPack;
 use super::common::{
     compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, plog, plog_n,
     recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
-    TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
-    DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
+    RecallStageTimings, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC,
+    DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID,
+    RECALL_SLOW_THRESHOLD_MS,
 };
 
 /// Bounded storage page for inbound supersession checks. This is deliberately
@@ -58,6 +59,35 @@ fn checked_token_budget_chars(scoring_cfg: &ScoringConfig) -> Result<usize, Runt
                 "memory.recall effective character budget overflows platform size".to_string(),
             )
         })
+}
+
+fn emit_slow_recall_warning(
+    total_ms: u64,
+    timings: &RecallStageTimings,
+    result_count: usize,
+    query_bytes: usize,
+    ann_degraded: bool,
+    budget_capped: bool,
+    is_verbose: bool,
+) {
+    if total_ms < RECALL_SLOW_THRESHOLD_MS {
+        return;
+    }
+    tracing::warn!(
+        total_ms,
+        threshold_ms = RECALL_SLOW_THRESHOLD_MS,
+        embed_ms = timings.embed_ms(),
+        fts_ms = timings.fts_ms(),
+        ann_ms = timings.ann_ms(),
+        fresh_tail_ms = timings.fresh_tail_ms(),
+        hydrate_ms = timings.hydrate_ms(),
+        result_count,
+        query_bytes,
+        ann_degraded,
+        budget_capped,
+        is_verbose,
+        "memory.recall exceeded slow-request threshold"
+    );
 }
 
 async fn load_brain_profile(
@@ -300,6 +330,7 @@ impl MemoryPack {
         // pointer at both await sites so its state is not inlined into this
         // already-large pipeline and then into the MCP dispatch poll stack.
         let mut current_candidate_limit = candidate_limit;
+        let mut recall_stage_timings = RecallStageTimings::default();
         let mut candidates = Box::pin(self.collect_recall_candidates(
             query_trimmed,
             token,
@@ -314,8 +345,11 @@ impl MemoryPack {
             },
         ))
         .await?;
+        recall_stage_timings.add_retrieval_round(candidates.timings);
+        let hydrate_started = Instant::now();
         let (mut memory_ids, mut notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
+        recall_stage_timings.add_hydration(hydrate_started.elapsed());
 
         // Widening must count only candidates the created_at window can keep:
         // the window predicate runs post-fusion, so counting raw candidates
@@ -390,8 +424,11 @@ impl MemoryPack {
                 },
             ))
             .await?;
+            recall_stage_timings.add_retrieval_round(candidates.timings);
+            let hydrate_started = Instant::now();
             (memory_ids, notes_by_id) =
                 self.load_memory_candidate_notes(token, &candidates).await?;
+            recall_stage_timings.add_hydration(hydrate_started.elapsed());
             eligible_count = count_eligible(&candidates, &notes_by_id);
         }
         let candidate_limit = current_candidate_limit;
@@ -452,6 +489,8 @@ impl MemoryPack {
         };
 
         let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize);
+        // Needed on both the empty and non-empty completion paths.
+        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 
         if prof {
             if let Some(ref t) = t_stage {
@@ -476,6 +515,15 @@ impl MemoryPack {
             if let Ok(mut state) = self.recall_state.lock() {
                 on_recall_miss(&mut state);
             }
+            emit_slow_recall_warning(
+                recall_start.elapsed().as_millis() as u64,
+                &recall_stage_timings,
+                0,
+                query_trimmed.len(),
+                ann_degraded,
+                false,
+                is_verbose,
+            );
             // #1657: an empty degraded response is a third state — surface the
             // marker here too, otherwise a bare [] is indistinguishable from a
             // genuine no-match.
@@ -553,9 +601,6 @@ impl MemoryPack {
         }
 
         let recall_pipeline = make_pipeline(&cfg);
-
-        // Only verbose responses pay for the second default-weight score.
-        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 
         let mut ranked: Vec<ScoredNote> = Vec::new();
         for hit in &fused {
@@ -944,21 +989,15 @@ impl MemoryPack {
         // whose total handler time crosses the threshold, regardless of whether
         // KHIVE_RECALL_PROFILE is set, so a slow-but-completing recall leaves
         // daemon-side evidence even when nobody opted into per-stage profiling.
-        {
-            let total_ms = recall_start.elapsed().as_millis() as u64;
-            if total_ms >= RECALL_SLOW_THRESHOLD_MS {
-                tracing::warn!(
-                    total_ms,
-                    threshold_ms = RECALL_SLOW_THRESHOLD_MS,
-                    result_count = results.len(),
-                    query_bytes = query_trimmed.len(),
-                    ann_degraded,
-                    budget_capped,
-                    is_verbose,
-                    "memory.recall exceeded slow-request threshold"
-                );
-            }
-        }
+        emit_slow_recall_warning(
+            recall_start.elapsed().as_millis() as u64,
+            &recall_stage_timings,
+            results.len(),
+            query_trimmed.len(),
+            ann_degraded,
+            budget_capped,
+            is_verbose,
+        );
 
         if is_verbose && candidates.vector_hits_per_model.len() > 1 {
             // Raw global ANN diagnostics MUST use the same hydrated namespace filter as results.
@@ -1236,6 +1275,30 @@ mod tests {
 
     use crate::MemoryPack;
 
+    /// Keeps a file-backed test runtime alive before removing its database directory.
+    /// Fields are declared in drop order: the runtime closes before the guard cleans up.
+    struct TestRuntime {
+        runtime: KhiveRuntime,
+        _temp_dir: Option<tempfile::TempDir>,
+    }
+
+    impl TestRuntime {
+        fn in_memory(runtime: KhiveRuntime) -> Self {
+            Self {
+                runtime,
+                _temp_dir: None,
+            }
+        }
+    }
+
+    impl std::ops::Deref for TestRuntime {
+        type Target = KhiveRuntime;
+
+        fn deref(&self) -> &Self::Target {
+            &self.runtime
+        }
+    }
+
     fn memory_runtime_with_fresh_tail(ann_fresh_tail_enabled: bool) -> KhiveRuntime {
         KhiveRuntime::memory()
             .expect("in-memory runtime")
@@ -1298,6 +1361,7 @@ mod tests {
     /// Exercises `$` sanitization; serialized because non-empty recall tracks background work.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_with_dollar_sign_query_does_not_error() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("local namespace");
@@ -1344,6 +1408,7 @@ mod tests {
     // the sibling dollar-sign test above.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_with_residual_fts5_char_now_sanitized() {
         const MODEL: &str = "recall-residual-char-test-model";
         const DIMS: usize = 32;
@@ -1400,6 +1465,7 @@ mod tests {
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_836_degrades_to_fts_only_when_ann_lock_is_held() {
         const MODEL: &str = "recall-836-ann-timeout-model";
         const DIMS: usize = 16;
@@ -1468,6 +1534,7 @@ mod tests {
     /// Uncontended ANN readiness must not add a degradation marker.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_836_normal_path_has_no_degraded_marker() {
         const MODEL: &str = "recall-836-ann-normal-model";
         const DIMS: usize = 16;
@@ -1525,6 +1592,7 @@ mod tests {
     /// and no per-item marker at all.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_1477_skipped_fresh_tail_stamps_degraded() {
         const MODEL: &str = "recall-1477-fresh-tail-disabled-model";
         const DIMS: usize = 16;
@@ -1601,6 +1669,7 @@ mod tests {
     /// distinguishes degraded-empty from a genuine no-match.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_budget_capped_empty_response_still_discloses_ann_degradation() {
         const MODEL: &str = "recall-budget-capped-degraded-model";
         const DIMS: usize = 16;
@@ -1691,6 +1760,7 @@ mod tests {
     /// captured at the failure site, never a bare [] (indistinguishable from a
     /// genuine no-match) and never an error.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn recall_1657_degraded_with_zero_fts_hits_carries_marker_and_reason() {
         const MODEL: &str = "recall-1657-ann-timeout-empty-model";
         const DIMS: usize = 16;
@@ -1753,6 +1823,7 @@ mod tests {
     /// #1657 companion arm: a genuine no-match (no degradation) keeps the
     /// marker absent — the two empty outcomes must stay distinguishable.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn recall_1657_genuine_empty_match_has_no_degraded_marker() {
         const MODEL: &str = "recall-1657-genuine-empty-model";
         const DIMS: usize = 16;
@@ -1866,24 +1937,42 @@ mod tests {
              error with {{:?}} formatting, got: {reason:?}"
         );
 
-        // Arm 2 — bounded-wait timeout: a cold model (no index ever ensured)
-        // with a near-zero readiness wait expires the bounded wait and
-        // degrades to FTS-only with the timeout recorded as the reason.
-        let outcome2 = super::super::common::collect_model_ann_hits(
-            &rt,
-            &ann,
-            &token,
-            "local",
-            &["local".to_string()],
-            COLD_MODEL.to_string(),
-            vec![0.0_f32; DIMS],
-            10,
-            40,
-            2,
-            0,
+        // Arm 2 — bounded-wait timeout: hold the cold model's real detached
+        // ensure task unresolved so the receiver cannot win the timeout race.
+        let build_hook = super::super::common::retrieval_failpoints::hold_ann_build(COLD_MODEL);
+        let outcome2 = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            super::super::common::collect_model_ann_hits(
+                &rt,
+                &ann,
+                &token,
+                "local",
+                &["local".to_string()],
+                COLD_MODEL.to_string(),
+                vec![0.0_f32; DIMS],
+                10,
+                40,
+                2,
+                0,
+            ),
         )
         .await
+        .expect("the readiness wait must stay bounded while the detached build is held")
         .expect("the wrapper must degrade to FTS-only, never propagate a retrieval failure");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_hook.wait_entered(),
+        )
+        .await
+        .expect("detached ANN build must reach the test hook");
+        build_hook.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_hook.wait_completed(),
+        )
+        .await
+        .expect("detached ANN build must finish after the hook releases it");
 
         assert!(
             outcome2.degraded,
@@ -1903,6 +1992,7 @@ mod tests {
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_836_self_build_timeout_detaches_build_instead_of_dropping_it() {
         const MODEL: &str = "recall-836-self-build-detach-model";
         const DIMS: usize = 16;
@@ -1923,6 +2013,7 @@ mod tests {
 
         let pack = MemoryPack::new(rt.clone());
         let ann_handle = pack.ann.clone();
+        let build_hook = super::super::common::retrieval_failpoints::hold_ann_build(MODEL);
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
@@ -1958,20 +2049,25 @@ mod tests {
             );
         }
 
-        // The detached build must keep running after the timed-out recall
-        // returns — poll the ANN cache directly (mirrors ann.rs's own
-        // #812/#844 convergence tests) rather than sleeping a fixed amount.
+        // The detached build must keep running after the timed-out recall.
+        // Its test-only completion signal is the pass condition; the outer
+        // timeout is only a hang failsafe.
         let key = crate::ann::AnnKey::new(MODEL);
-        let mut warmed = false;
-        for _ in 0..300 {
-            if crate::ann::is_current(&ann_handle, &key).await {
-                warmed = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_hook.wait_entered(),
+        )
+        .await
+        .expect("detached ANN build must reach the test hook");
+        build_hook.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_hook.wait_completed(),
+        )
+        .await
+        .expect("detached ANN build must finish after the hook releases it");
         assert!(
-            warmed,
+            crate::ann::is_current(&ann_handle, &key).await,
             "the detached build must eventually install a fresh ANN index for \
              {MODEL} instead of being dropped on timeout (#836)"
         );
@@ -2003,22 +2099,25 @@ mod tests {
 
     // ── ADR-081 §5 (#394): recall serve-time attribution + ledger append ──────
 
-    fn build_full_rt_with_brain() -> khive_runtime::KhiveRuntime {
+    fn build_full_rt_with_brain() -> TestRuntime {
         let tmp = tempfile::Builder::new()
             .prefix("khive-mem-recall-adr081-")
             .tempdir_in(std::env::temp_dir())
             .expect("temp dir");
         let db_path = tmp.path().join("khive.db");
-        std::mem::forget(tmp);
 
-        khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        let runtime = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
             db_path: Some(db_path),
             embedding_model: None,
             additional_embedding_models: vec![],
             packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
             ..khive_runtime::RuntimeConfig::default()
         })
-        .expect("runtime")
+        .expect("runtime");
+        TestRuntime {
+            runtime,
+            _temp_dir: Some(tmp),
+        }
     }
 
     // `#[serial(background_tasks)]`: see the note on
@@ -2027,6 +2126,7 @@ mod tests {
     // append it names, so it shares the process-wide counter.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_stamps_served_by_profile_id_and_appends_serve_ledger_row() {
         use khive_pack_brain::BrainPack;
 
@@ -2152,6 +2252,7 @@ mod tests {
     // stored marker exists to preserve.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_with_unreadable_bound_profile_persists_unattributed_marker_on_ledger_row() {
         use khive_pack_brain::BrainPack;
 
@@ -2160,7 +2261,6 @@ mod tests {
             .tempdir_in(std::env::temp_dir())
             .expect("temp dir");
         let db_path = tmp.path().join("khive.db");
-        std::mem::forget(tmp);
 
         let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
             db_path: Some(db_path),
@@ -2268,6 +2368,7 @@ mod tests {
     // `recall_executed` emission now live in the same tracked task).
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_emits_exactly_one_recall_executed_event() {
         let rt = build_full_rt_with_brain();
         let ns = Namespace::parse("local").expect("local namespace");
@@ -2397,6 +2498,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn successful_empty_recall_emits_recall_executed_event() {
         let rt = build_full_rt_with_brain();
         let ns = Namespace::parse("local").expect("local namespace");
@@ -2453,6 +2555,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_failure_emits_no_recall_executed_event() {
         let rt = build_full_rt_with_brain();
         let ns = Namespace::parse("local").expect("local namespace");
@@ -2506,6 +2609,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_event_store_acquisition_failure_warns_without_failing_response() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let db_path = tmp.path().join("khive.db");
@@ -2608,6 +2712,7 @@ mod tests {
     // actor (namespace left "*") could never match here.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_stamps_served_by_profile_id_via_actor_binding() {
         use khive_pack_brain::BrainPack;
 
@@ -2616,7 +2721,6 @@ mod tests {
             .tempdir_in(std::env::temp_dir())
             .expect("temp dir");
         let db_path = tmp.path().join("khive.db");
-        std::mem::forget(tmp);
 
         let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
             db_path: Some(db_path),
@@ -2753,6 +2857,7 @@ mod tests {
     // The actor-resolved profile must both project weights and stamp the response.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
         use khive_pack_brain::BrainPack;
 
@@ -2761,7 +2866,6 @@ mod tests {
             .tempdir_in(std::env::temp_dir())
             .expect("temp dir");
         let db_path = tmp.path().join("khive.db");
-        std::mem::forget(tmp);
 
         let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
             db_path: Some(db_path),
@@ -2869,6 +2973,7 @@ mod tests {
     // Anonymous callers must not match an explicit `actor="local"` binding.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_anonymous_caller_does_not_match_explicit_actor_local_binding() {
         use khive_pack_brain::BrainPack;
 
@@ -2993,6 +3098,7 @@ mod tests {
     // `recall_with_dollar_sign_query_does_not_error` above.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_without_brain_pack_omits_stamp_and_does_not_error() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("local namespace");
@@ -3153,6 +3259,7 @@ mod tests {
     // `recall_with_dollar_sign_query_does_not_error` above.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_profile_resolution_latency_is_bounded() {
         use khive_pack_brain::BrainPack;
         use std::time::Duration;
@@ -3161,7 +3268,7 @@ mod tests {
             let rt = if with_brain {
                 build_full_rt_with_brain()
             } else {
-                KhiveRuntime::memory().expect("in-memory runtime")
+                TestRuntime::in_memory(KhiveRuntime::memory().expect("in-memory runtime"))
             };
             let ns = Namespace::parse("local").expect("ns");
             let token = rt.authorize(ns.clone()).expect("token");
@@ -3333,7 +3440,7 @@ mod tests {
 
     /// Build a controlled four-note corpus whose profile salience projection flips H/L order.
     async fn adr104_build_ranking_corpus() -> (
-        khive_runtime::KhiveRuntime,
+        TestRuntime,
         khive_runtime::VerbRegistry,
         Namespace,
         Uuid,
@@ -3440,6 +3547,7 @@ mod tests {
     /// Different profile state must flip ordering for the same corpus and query.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn adr104_profile_differentiated_ranking_flips_order() {
         let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
 
@@ -3493,6 +3601,7 @@ mod tests {
     /// Without a resolved profile, loading the brain pack must not change scores.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_no_profile_scores_identically_with_or_without_brain_pack() {
         use khive_pack_brain::BrainPack;
 
@@ -3500,7 +3609,7 @@ mod tests {
             let rt = if with_brain {
                 build_full_rt_with_brain()
             } else {
-                KhiveRuntime::memory().expect("in-memory runtime")
+                TestRuntime::in_memory(KhiveRuntime::memory().expect("in-memory runtime"))
             };
             let ns = Namespace::parse("local").expect("ns");
             let token = rt.authorize(ns.clone()).expect("token");
@@ -3557,6 +3666,7 @@ mod tests {
     /// Explicit profile override stamps results/ledger; an unknown ID is an error.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_profile_id_override_stamps_ledger_and_rejects_unknown_profile() {
         use khive_pack_brain::BrainPack;
 
@@ -3674,6 +3784,7 @@ mod tests {
     /// profile is also applied to scoring, proving this is more than a stamp.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn namespaced_recall_loads_arm_profile_and_applies_its_state() {
         use khive_pack_brain::BrainPack;
 
@@ -3756,6 +3867,7 @@ mod tests {
     /// Breakdown reports neutral/default profile state and learned entity posterior state.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() {
         {
             let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -3875,6 +3987,7 @@ mod tests {
     /// Identical store, query, and profile state must yield identical ranks and scores.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_profile_projection_is_deterministic_across_repeated_calls() {
         let (_rt, registry, ns, h_id, _l_id) = adr104_build_ranking_corpus().await;
 
@@ -3946,6 +4059,7 @@ mod tests {
     /// A missing entity posterior is an exact identity under a fresh default profile.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn adr104_stage_b_no_posterior_candidate_scores_identically_with_fresh_profile() {
         use khive_pack_brain::BrainPack;
 
@@ -4030,6 +4144,7 @@ mod tests {
     /// One useful signal lifts only the targeted profile's next equivalent recall.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn adr104_stage_b_one_signal_lifts_rank_only_under_the_served_profile() {
         use khive_pack_brain::BrainPack;
 
@@ -4138,6 +4253,7 @@ mod tests {
     /// Near-saturated entity feedback must remain inside the ±15% pipeline clamp.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn adr104_stage_b_saturated_posterior_never_exceeds_clamp_bound_end_to_end() {
         use khive_pack_brain::BrainPack;
 
@@ -4236,6 +4352,7 @@ mod tests {
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn adr104_stage_b_entity_term_isolated_via_matched_global_feedback_count() {
         use khive_pack_brain::BrainPack;
 
@@ -4362,6 +4479,7 @@ mod tests {
     /// The entity term must apply after weighted reranking, not only default scoring.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn adr104_stage_b_entity_term_applies_under_weighted_reranker() {
         use khive_pack_brain::BrainPack;
 
@@ -4474,6 +4592,7 @@ mod tests {
     /// Ignored benchmark comparing median/p95 recall with and without profile-state reads.
     #[tokio::test]
     #[ignore]
+    #[serial_test::serial(config_ledger)]
     async fn adr104_r2_measure_profile_state_read_overhead() {
         use khive_pack_brain::BrainPack;
 
@@ -4662,6 +4781,7 @@ mod tests {
     /// With no override, recall uses exactly the caller token's visible namespaces.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn ns733_recall_namespace_absent_regresses_to_local_only() {
         let (registry, local_id_1, local_id_2, _bench_id) = ns733_seed_three_memories().await;
 
@@ -4692,6 +4812,7 @@ mod tests {
     /// An explicit namespace narrows recall to that exact namespace.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn ns733_recall_namespace_explicit_returns_only_that_namespace() {
         let (registry, _local_id_1, _local_id_2, bench_id) = ns733_seed_three_memories().await;
 
@@ -4721,6 +4842,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn direct_recall_rejects_namespace_token_mismatch() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let pack = MemoryPack::new(rt.clone());
@@ -4749,6 +4871,7 @@ mod tests {
     /// An absent namespace returns an empty successful result.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn ns733_recall_namespace_no_match_returns_empty_ok() {
         let (registry, ..) = ns733_seed_three_memories().await;
 
@@ -4773,6 +4896,7 @@ mod tests {
     /// An invalid namespace is a per-operation error naming the supplied value.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn ns733_recall_invalid_namespace_is_a_per_op_error() {
         let (registry, ..) = ns733_seed_three_memories().await;
 
@@ -4827,6 +4951,7 @@ mod tests {
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(FixedVecProvider {
@@ -5685,6 +5810,7 @@ mod tests {
 
     /// A zero request deadline is a per-operation `InvalidInput` error.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn recall_889_zero_deadline_override_returns_invalid_input_via_dispatch() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("local namespace");
@@ -5731,6 +5857,7 @@ mod tests {
 
     /// A genuinely held embed stage returns typed `DeadlineExceeded` promptly.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
         const MODEL: &str = "recall-889-slow-model";
         let hold = Arc::new(Notify::new());
@@ -5868,6 +5995,7 @@ mod tests {
     /// A deadline-exceeded recall emits an unconditional daemon-side WARN — the
     /// exact evidence #30/#889 reported as missing during the incident.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn recall_30_deadline_exceeded_emits_abandoned_slow_path_warn() {
         let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = CaptureSubscriber {
@@ -5972,9 +6100,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn completed_slow_recall_warning_names_every_retrieval_stage() {
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: Arc::clone(&buffer),
+        };
+        let timings = super::RecallStageTimings::from_millis_for_test(11, 22, 33, 44, 55);
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::emit_slow_recall_warning(
+                super::RECALL_SLOW_THRESHOLD_MS,
+                &timings,
+                7,
+                9,
+                false,
+                true,
+                false,
+            );
+        });
+
+        let events = buffer.lock().unwrap();
+        let warning = events
+            .iter()
+            .find(|event| {
+                event.message.as_deref() == Some("memory.recall exceeded slow-request threshold")
+            })
+            .unwrap_or_else(|| panic!("expected completed slow-recall warning, got {events:?}"));
+        for (field, expected) in [
+            ("embed_ms", "11"),
+            ("fts_ms", "22"),
+            ("ann_ms", "33"),
+            ("fresh_tail_ms", "44"),
+            ("hydrate_ms", "55"),
+        ] {
+            assert_eq!(
+                warning.fields.get(field).map(String::as_str),
+                Some(expected),
+                "missing or incorrect {field}: {warning:?}"
+            );
+        }
+    }
+
     /// A deadline-exceeded dispatch does not affect a concurrent sibling dispatch.
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn recall_889_deadline_exceeded_does_not_affect_concurrent_sibling_op() {
         const MODEL: &str = "recall-889-slow-sibling-model";
         let hold = Arc::new(Notify::new());
@@ -6051,6 +6222,7 @@ mod tests {
 
     /// The 30-second default leaves normal uncontended recall unchanged.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn recall_889_normal_path_succeeds_within_default_deadline() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("local namespace");
@@ -6093,6 +6265,7 @@ mod tests {
 
     /// A generous request override leaves normal recall unchanged.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn recall_889_generous_override_succeeds() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("local namespace");
@@ -6181,6 +6354,7 @@ mod tests {
     /// One embedding engine failing must degrade recall to the healthy engine, not abort it.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_1116_one_failed_engine_still_serves_the_healthy_engines_hits() {
         const HEALTHY_MODEL: &str = "recall-1116-healthy-model";
         const FAILING_MODEL: &str = "recall-1116-failing-model";
@@ -6245,6 +6419,7 @@ mod tests {
     /// If every engine's embedder fails, recall must error rather than silently return empty.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_1116_all_engines_failed_returns_error_not_empty() {
         const FAILING_MODEL_A: &str = "recall-1116-all-failed-model-a";
         const FAILING_MODEL_B: &str = "recall-1116-all-failed-model-b";
@@ -6288,6 +6463,7 @@ mod tests {
     /// One engine's ANN retrieval failing must degrade recall to the healthy engine.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_1116_one_engine_ann_retrieval_failure_still_serves_healthy() {
         const HEALTHY_MODEL: &str = "recall-1116-ann-healthy-model";
         const FAILING_MODEL: &str = "recall-1116-ann-failing-model";
@@ -6349,6 +6525,7 @@ mod tests {
     /// One engine's sqlite-vec retrieval failing must degrade recall to the healthy engine.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_1116_one_engine_sqlite_vec_retrieval_failure_still_serves_healthy() {
         const HEALTHY_MODEL: &str = "recall-1116-vec-healthy-model";
         const FAILING_MODEL: &str = "recall-1116-vec-failing-model";
@@ -6419,6 +6596,7 @@ mod tests {
     /// stamp.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_persists_recall_executed_event_with_full_payload() {
         const NOTE_TEXT: &str = "khive#36 recall executed event payload coverage note";
 
@@ -6509,6 +6687,7 @@ mod tests {
     /// date-only-rejection error paths.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_created_at_window_filters_half_open() {
         use khive_storage::types::{SqlStatement, SqlValue};
 
@@ -6654,6 +6833,7 @@ mod tests {
     /// until it is found.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_widens_when_out_of_window_candidates_crowd_out_eligible_ones() {
         use khive_storage::types::{SqlStatement, SqlValue};
 
@@ -6856,6 +7036,7 @@ mod tests {
     /// an in-window keyword match existed one widening round deeper.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn keyword_only_widening_ignores_vector_leg_candidates() {
         use khive_storage::types::{SqlStatement, SqlValue};
 

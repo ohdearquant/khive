@@ -378,7 +378,11 @@ impl CandidateDispatch {
     /// provider candidate would have parsed into rows. Its cursor commit is
     /// deferred (`mirror_file_deferred`) and committed by the dispatch loop
     /// only when no inserting candidate claims the span and no candidate
-    /// errored.
+    /// errored — except a skip caused by a known-oversized line
+    /// (`stats.skipped_oversized_bytes`), which `finalize_dispatch_stats`
+    /// commits unconditionally: that determination never depended on which
+    /// source parsed the line, so no sibling candidate could ever have
+    /// claimed the same bytes.
     ///
     /// Recording precedence: an advancing result (`new_offset >
     /// start_offset`) always replaces a recorded non-advancing one, so a
@@ -1196,8 +1200,11 @@ fn tally_dispatch_errors(
 }
 
 /// Finish dispatch bookkeeping for a deferred empty advance. The service
-/// vetoes the cursor commit when any candidate errored, and a commit failure
-/// itself becomes an error poll so persistent failures reach cold cadence.
+/// vetoes the cursor commit when any candidate errored, unless the advance is
+/// a known-oversized-line skip (source-independent — see
+/// [`ingest::MirrorStats::skipped_oversized_bytes`]), which always commits. A
+/// commit failure itself becomes an error poll so persistent failures reach
+/// cold cadence.
 async fn finalize_dispatch_stats(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -1206,15 +1213,25 @@ async fn finalize_dispatch_stats(
     stats: Option<ingest::MirrorStats>,
     mut had_errors: bool,
 ) -> (Option<ingest::MirrorStats>, bool) {
-    // Commit a deferred empty advance only when dispatch ended with no
-    // inserting candidate AND no candidate error. An erroring candidate might
-    // have parsed the span had it succeeded, so the cursor stays at the old
-    // offset and a later pass re-reads the bytes (bounded and idempotent)
-    // rather than skipping them. On commit failure the in-memory offset is
+    // Commit a deferred empty advance when dispatch ended with no inserting
+    // candidate AND (no candidate error OR the advance skipped bytes from a
+    // known-oversized line). An erroring candidate might have parsed an
+    // ordinary empty-advance span had it succeeded, so that case holds the
+    // cursor at the old offset and re-reads the bytes (bounded and
+    // idempotent) on a later pass. A pass that skipped only oversized bytes
+    // carries no such ambiguity — the line was too large for ANY parser
+    // before one ever ran — so it commits even when a sibling candidate
+    // errored on the same span (ADR-080). On commit failure the in-memory offset is
     // likewise NOT applied.
     let stats = match stats {
         Some(stats) if !ended_by_inserting && stats.inserted == 0 && stats.new_offset > offset => {
-            if had_errors {
+            // The exemption is exact only when the pass consumed nothing but
+            // the oversized bytes (and blank lines): a bounded chunk keeps
+            // reading ordinary lines after a terminated oversized line, and
+            // those lines an erroring sibling might have parsed, so a mixed
+            // pass (`scanned > 0`) keeps the veto.
+            let uncontested_skip = stats.skipped_oversized_bytes && stats.scanned == 0;
+            if had_errors && !uncontested_skip {
                 tracing::debug!(
                     path = %path.display(),
                     new_offset = stats.new_offset,
@@ -1223,6 +1240,14 @@ async fn finalize_dispatch_stats(
                 );
                 None
             } else {
+                if had_errors {
+                    tracing::debug!(
+                        path = %path.display(),
+                        new_offset = stats.new_offset,
+                        "session mirror: committing an oversized-line skip despite a \
+                         sibling candidate error — the skip is source-independent"
+                    );
+                }
                 match ingest::commit_empty_advance(runtime, path, stats.new_offset).await {
                     Ok(()) => Some(stats),
                     Err(error) => {
@@ -1869,6 +1894,7 @@ mod discovery_tests {
                 inserted: 0,
                 scanned: 0,
                 new_offset: start_offset,
+                ..Default::default()
             }),
             start_offset,
         ));
@@ -1877,6 +1903,7 @@ mod discovery_tests {
                 inserted: 2,
                 scanned: 2,
                 new_offset: 97,
+                ..Default::default()
             }),
             start_offset,
         ));
@@ -2081,6 +2108,7 @@ mod discovery_tests {
                 inserted: 4,
                 scanned: 4,
                 new_offset: start_offset - 60,
+                ..Default::default()
             }),
             start_offset,
         ));
@@ -2094,6 +2122,7 @@ mod discovery_tests {
                 inserted: 1,
                 scanned: 1,
                 new_offset: start_offset + 50,
+                ..Default::default()
             }),
             start_offset,
         ));
@@ -2329,6 +2358,7 @@ mod discovery_tests {
                 inserted: 0,
                 scanned: 0,
                 new_offset: start_offset + 40,
+                ..Default::default()
             }),
             start_offset,
         ));
@@ -2337,6 +2367,7 @@ mod discovery_tests {
                 inserted: 3,
                 scanned: 3,
                 new_offset: start_offset + 40,
+                ..Default::default()
             }),
             start_offset,
         ));
@@ -2360,6 +2391,7 @@ mod discovery_tests {
                 inserted: 0,
                 scanned: 0,
                 new_offset: start_offset,
+                ..Default::default()
             }),
             start_offset,
         ));
@@ -2371,6 +2403,7 @@ mod discovery_tests {
                 inserted: 0,
                 scanned: 0,
                 new_offset: start_offset + 64,
+                ..Default::default()
             }),
             start_offset,
         ));
@@ -2396,6 +2429,7 @@ mod discovery_tests {
                 inserted: 0,
                 scanned: 0,
                 new_offset: start_offset + 30,
+                ..Default::default()
             }),
             start_offset,
         ));
@@ -2404,6 +2438,7 @@ mod discovery_tests {
                 inserted: 0,
                 scanned: 0,
                 new_offset: start_offset + 90,
+                ..Default::default()
             }),
             start_offset,
         ));
@@ -2603,12 +2638,14 @@ mod discovery_tests {
 mod cursor_retry_tests {
     use super::{
         delete_cursors, drain_pending_cursor_deletes, finalize_dispatch_stats,
-        queue_cursor_deletes, tally_dispatch_errors, DiscoveredKind, DiscoveryIndex,
-        CURSOR_DELETE_RETRY_LIMIT, FILE_ERROR_POLLS_BEFORE_COLD,
+        queue_cursor_deletes, tally_dispatch_errors, CandidateDispatch, DiscoveredKind,
+        DiscoveryIndex, CURSOR_DELETE_RETRY_LIMIT, FILE_ERROR_POLLS_BEFORE_COLD,
     };
     use crate::mirror::ingest::{mirror_file, LineTailSource, MirrorStats};
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
-    use khive_runtime::{AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig};
+    use khive_runtime::{
+        AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig, RuntimeError,
+    };
     use khive_storage::types::{SqlStatement, SqlValue};
     use std::collections::HashMap;
     use std::collections::VecDeque;
@@ -2683,6 +2720,22 @@ mod cursor_retry_tests {
             .await
             .expect("cursor query");
         !rows.is_empty()
+    }
+
+    async fn cursor_row_offset(rt: &KhiveRuntime, path: &std::path::Path) -> Option<i64> {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT byte_offset FROM session_mirror_cursor WHERE file_path = ?1".into(),
+                params: vec![SqlValue::Text(path.to_string_lossy().into_owned())],
+                label: None,
+            })
+            .await
+            .expect("cursor query");
+        rows.first().and_then(|row| match row.get("byte_offset") {
+            Some(SqlValue::Integer(n)) => Some(*n),
+            _ => None,
+        })
     }
 
     #[tokio::test]
@@ -2881,6 +2934,7 @@ mod cursor_retry_tests {
                 inserted: 0,
                 scanned: 0,
                 new_offset: 64,
+                ..Default::default()
             }),
             false,
         )
@@ -2903,6 +2957,99 @@ mod cursor_retry_tests {
             had_errors
         ));
         assert!(discovery.files[&path].cold);
+    }
+
+    /// ADR-080 regression: under overlapping-root dispatch, one candidate
+    /// reports a genuine skipped-oversized-line advance while a sibling
+    /// candidate errors on the same span. The skip is source-independent —
+    /// the line was too large for any parser before one ever ran — so it
+    /// must commit despite the sibling's error, instead of being discarded
+    /// and re-read (bounded but forever) on every later poll.
+    #[tokio::test]
+    async fn oversized_skip_advance_commits_despite_a_sibling_candidate_error() {
+        let (rt, _dir) = runtime_without_schema();
+        apply_session_schema(&rt).await;
+        let path = PathBuf::from("/projects/oversized.jsonl");
+        let start_offset = 0u64;
+
+        let mut dispatch = CandidateDispatch::default();
+
+        // Candidate A: the oversized-unterminated-line skip. Bytes consumed,
+        // nothing inserted, but source-independent.
+        assert!(!dispatch.record(
+            Ok(MirrorStats {
+                inserted: 0,
+                scanned: 0,
+                new_offset: 4096,
+                skipped_oversized_bytes: true,
+            }),
+            start_offset,
+        ));
+        // Candidate B: an unrelated provider candidate errors on this pass.
+        assert!(!dispatch.record(Err(RuntimeError::Internal("boom".into())), start_offset,));
+
+        let CandidateDispatch { stats, errors } = dispatch;
+        let had_errors = !errors.is_empty();
+        assert!(had_errors, "the sibling error must be recorded");
+
+        let (stats, had_errors) =
+            finalize_dispatch_stats(&rt, &path, start_offset, false, stats, had_errors).await;
+
+        let stats = stats.expect(
+            "a skipped-oversized-line advance must commit even when a sibling \
+             candidate errored on the same span",
+        );
+        assert_eq!(stats.new_offset, 4096);
+        assert!(
+            had_errors,
+            "the sibling's error is still reported for cold-demotion accounting"
+        );
+        assert_eq!(
+            cursor_row_offset(&rt, &path).await,
+            Some(4096),
+            "the cursor for the oversized file must have durably advanced, so the \
+             next pass starts past the discarded prefix instead of re-reading it"
+        );
+    }
+
+    /// A pass that skipped an oversized line but also scanned an ordinary line
+    /// is not source-independent: the ordinary line is exactly what the
+    /// erroring sibling might have parsed, so the veto still holds and the
+    /// bounded span is re-read on a later pass.
+    #[tokio::test]
+    async fn mixed_oversized_skip_and_scanned_line_keeps_the_error_veto() {
+        let (rt, _dir) = runtime_without_schema();
+        apply_session_schema(&rt).await;
+        let path = PathBuf::from("/projects/mixed.jsonl");
+        let start_offset = 0u64;
+
+        let mut dispatch = CandidateDispatch::default();
+        assert!(!dispatch.record(
+            Ok(MirrorStats {
+                inserted: 0,
+                scanned: 1,
+                new_offset: 4200,
+                skipped_oversized_bytes: true,
+            }),
+            start_offset,
+        ));
+        assert!(!dispatch.record(Err(RuntimeError::Internal("boom".into())), start_offset,));
+
+        let CandidateDispatch { stats, errors } = dispatch;
+        let (stats, had_errors) =
+            finalize_dispatch_stats(&rt, &path, start_offset, false, stats, !errors.is_empty())
+                .await;
+
+        assert!(
+            stats.is_none(),
+            "an advance that also scanned an ordinary line stays vetoed while a sibling errored"
+        );
+        assert!(had_errors);
+        assert_eq!(
+            cursor_row_offset(&rt, &path).await,
+            None,
+            "no cursor row may be written for a contested span"
+        );
     }
 
     #[tokio::test]

@@ -37,6 +37,7 @@ khive-runtime = { version = "0.8.0", path = "../khive-runtime", features = ["fau
 lattice-embed = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype"] }
 tempfile = { workspace = true }
+serial_test = { workspace = true }
 
 [[bench]]
 name = "comm_bench"

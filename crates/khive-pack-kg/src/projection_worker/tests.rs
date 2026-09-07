@@ -182,7 +182,9 @@ async fn applied_and_emit_sets_status_applied_and_publishes_success() {
         "pre_apply_cas must return true when status='approved'"
     );
 
-    let event = proposal_applied_event(&tok, pid);
+    let mut event = proposal_applied_event(&tok, pid);
+    event.namespace = "forged-namespace".to_string();
+    event.actor = "forged-actor".to_string();
     let event_id = event.id;
     let usage = khive_runtime::usage::UsageContext::new();
     let applied = khive_runtime::usage::scope(usage.clone(), async {
@@ -208,6 +210,15 @@ async fn applied_and_emit_sets_status_applied_and_publishes_success() {
         event_exists(&rt, event_id).await,
         "ProposalApplied success must be published with the applied projection"
     );
+    let persisted = rt
+        .events(&tok)
+        .expect("event store")
+        .get_event(event_id)
+        .await
+        .expect("read event")
+        .expect("event exists");
+    assert_eq!(persisted.namespace, "local");
+    assert_eq!(persisted.actor, "anonymous:local");
 }
 
 // H1 regression: pre_apply_cas must fail when proposal was already withdrawn.

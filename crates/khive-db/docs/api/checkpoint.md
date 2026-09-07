@@ -80,6 +80,53 @@ per-tick `debug!` trace of the oldest open entry, and the Plank 1 age sweep,
 run unconditionally on every tick — including a Skipped one; the sweep's own
 emissions stay edge-triggered per rung via `TxAgeSweepState`.
 
+### Bounded FTS5 segment maintenance
+
+The daemon's main-backend checkpoint task also owns derived-index maintenance because it
+already has one long-lived standalone SQLite connection and a lifecycle tied
+to the file-backed backend. FTS maintenance is independent of the 500 ms WAL
+tick: by default it considers one table every 300 seconds, round-robins
+`fts_entities` and `fts_notes`, and performs at most one 500-page incremental
+merge step per due call. The first step uses FTS5's negative `merge` command
+to begin an incremental optimize; later positive steps continue that cycle.
+It never invokes the unbounded `optimize` command.
+
+The daemon deliberately leaves FTS5's persistent `automerge` and
+`crisismerge` settings unchanged. Retuning either would move less predictable
+merge work back onto foreground commits; the explicit maintenance owner keeps
+that work bounded and observable. A future retune requires production
+workload evidence rather than being coupled to this maintenance policy.
+
+Before each merge the dedicated connection temporarily sets `busy_timeout`
+to zero. An application writer therefore wins immediately; the skipped step
+is counted and the same negative starter is retried on that table's next
+turn. Maintenance errors are logged and counted independently and do not make
+an otherwise successful checkpoint discard its connection. Tables below two
+segments are skipped. Secondary-backend checkpoint tasks never probe for or
+maintain the main substrate's FTS tables.
+
+The converse also holds for a step that does start: once the merge statement
+is executing, it holds SQLite's write lock like any other write, so a
+concurrent application writer may wait behind that one step for its
+execution time, bounded by the configured page budget. The step itself runs
+off the checkpoint task's Tokio worker thread (`tokio::task::spawn_blocking`),
+so a large merge cannot stall the async runtime while it runs — only the
+SQLite-level write lock is shared with application writers, not the async
+executor.
+The checkpoint task itself awaits that step before it can observe its next
+tick, so WAL ticks falling inside one step's execution are skipped rather than
+queued (the interval uses `MissedTickBehavior::Skip`); the page budget bounds
+that pause.
+
+Operator overrides are `KHIVE_FTS_MERGE_ENABLED`,
+`KHIVE_FTS_MERGE_INTERVAL_SECS`, `KHIVE_FTS_MERGE_PAGES`, and
+`KHIVE_FTS_MERGE_MIN_SEGMENTS`. Invalid values warn and retain conservative
+compiled defaults; `KHIVE_FTS_MERGE_PAGES` accepts `1..=2147483647`, the range
+the FTS5 `merge` command carries as a 32-bit integer in either sign. `db_diagnostics.fts_maintenance` exposes checks, attempts,
+progress/no-op/threshold/busy/error outcomes, and cumulative requested pages.
+`db_diagnostics.fts_segments` decodes the documented structure record at
+`%_data.id = 10` for both indexes; it does not count or scan `%_idx` rows.
+
 ### Plank 2: rare TRUNCATE escalation
 
 The periodic tick stays PASSIVE-only and non-blocking; on top of it,
@@ -166,7 +213,7 @@ session that keeps calling in) can keep extending its pin, closing the
 mid-flight with no
 further calls at all: `rusqlite::Connection` is thread-owned and not `Sync`,
 and a genuinely idle connection has no in-flight statement for
-`sqlite3_interrupt` to act on, so reaching *that* connection from outside
+`sqlite3_interrupt` to act on, so reaching _that_ connection from outside
 would need a live, forcibly-interruptible handle registry the pool does not
 keep today. That remains open design work, not something this change
 attempts.

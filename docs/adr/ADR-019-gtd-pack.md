@@ -717,3 +717,12 @@ minimal. Operators who want GTD configure it explicitly.
   `EDGE_RULES` — the mechanism GTD demonstrates.
 - ADR-018: Authorization Gate — gate enforcement applies to GTD verbs like any
   other.
+
+## Amendment 1 (2026-09-07): plugin packaging
+
+The per-pack plugin this ADR describes (`marketplace/gtd/`, a `plugin.json` pinning
+`KHIVE_PACKS=gtd`) no longer exists in the tree. The marketplace ships one umbrella plugin,
+`marketplace/khive/`, whose MCP server entry loads the default pack set; a task-only surface is
+still reachable by setting `KHIVE_PACKS=gtd` on that server's environment, which is the runtime
+selection §Configuration describes. The `marketplace/gtd/plugin.json` lines above are the design at
+acceptance and are kept as history; the shipping manifest is `.claude-plugin/marketplace.json`.

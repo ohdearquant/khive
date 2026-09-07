@@ -435,7 +435,11 @@ pub async fn create_notes_atomic_with_report(
             // `upsert_document_dml` exactly, so a caller-supplied/reused note
             // id never leaves a stale/duplicate FTS document behind (the
             // note row itself is already an upsert via
-            // `note_upsert_statement`).
+            // `note_upsert_statement`). The delete alone is enough on the
+            // sidecar rowid-map side too — the insert pair's `INSERT OR
+            // REPLACE` below overwrites the map row rather than requiring a
+            // prior delete of it (see `delete_document_statement`'s doc
+            // comment).
             statements.push(PlanStatement {
                 statement: khive_db::stores::text::delete_document_statement(
                     "fts_notes",
@@ -444,13 +448,20 @@ pub async fn create_notes_atomic_with_report(
                 ),
                 guard: None,
             });
-            statements.push(PlanStatement {
-                statement: khive_db::stores::text::insert_document_statement(
-                    "fts_notes",
-                    &note_fts_document(note),
-                ),
-                guard: None,
-            });
+            // Order-sensitive pair: the map upsert's `last_insert_rowid()`
+            // must read back the FTS insert immediately before it, with
+            // nothing else written to this connection in between — pushed
+            // here as the array `insert_document_statements` returns so the
+            // two can never be separated by an edit to this call site.
+            for statement in khive_db::stores::text::insert_document_statements(
+                "fts_notes",
+                &note_fts_document(note),
+            ) {
+                statements.push(PlanStatement {
+                    statement,
+                    guard: None,
+                });
+            }
         }
 
         if let Some(fault) = maybe_inject_vector_failure(&note.namespace, "fault-injected-vector") {

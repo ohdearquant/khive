@@ -42,6 +42,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 khive-db = { version = "0.8.0", path = "../khive-db" }
 khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
+toml = { workspace = true }
 
 [[test]]
 name = "integration"

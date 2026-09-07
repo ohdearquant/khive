@@ -61,7 +61,7 @@ mod tests {
 
         let mut config = khive_runtime::RuntimeConfig::no_embeddings();
         config.packs = vec!["kg".to_string()];
-        config.backend_id = khive_runtime::BackendId::new("sessions");
+        config.backend_id = khive_runtime::BackendId::parse("sessions").expect("valid backend id");
 
         KhiveRuntime::from_backend(sessions_backend, config).with_core_backend(main_backend)
     }

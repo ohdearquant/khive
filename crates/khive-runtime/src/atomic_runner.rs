@@ -401,13 +401,27 @@ mod tests {
     use khive_storage::types::{SqlValue, StorageResult as StorageResultAlias};
     use uuid::Uuid;
 
+    /// Owns a file-backed pool and removes its database directory after shutdown.
+    struct TestPool {
+        pool: StdArc<ConnectionPool>,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestPool {
+        type Target = StdArc<ConnectionPool>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.pool
+        }
+    }
+
     /// A scratch pool wired exactly like the daemon.rs / sql_bridge.rs
     /// tests above it: file-backed (atomic_unit's single-writer path is
     /// only reachable file-backed), `write_queue_enabled: Some(true)` so
     /// `atomic_unit` routes through the real `WriterTask` + `block_on_sync`
     /// seam rather than the flag-off manual-transaction fallback — the
     /// suspend-trap contract only fires on this path.
-    fn scratch_pool(name: &str) -> StdArc<ConnectionPool> {
+    fn scratch_pool(name: &str) -> TestPool {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(format!("{name}.db"));
         let pool = StdArc::new(
@@ -418,10 +432,10 @@ mod tests {
             })
             .expect("pool open"),
         );
-        // Leak the tempdir so the file lives for the pool's lifetime within
-        // one test function — every test here is single-scoped and short.
-        std::mem::forget(dir);
-        pool
+        TestPool {
+            pool,
+            _temp_dir: dir,
+        }
     }
 
     /// Minimal real schema slice (`entities`, `graph_edges`) — copied from

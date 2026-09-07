@@ -660,6 +660,7 @@ impl VamanaIndex {
             self.config.alpha,
             self.last_applied_seq,
             None,
+            None,
         );
 
         let mut segments = vec![
@@ -961,6 +962,11 @@ impl VamanaIndex {
             content_hash,
         };
 
+        // A checkpoint publication is an event even when every semantic byte
+        // matches its predecessor. Include a fresh nonce in the commit record
+        // so long-lived mmap readers can distinguish the new file generation
+        // and release the unlinked predecessor (#2081).
+        let publication_nonce = *uuid::Uuid::new_v4().as_bytes();
         write_v2_commit_full(
             &metadata_tmp,
             vectors_hash.as_bytes(),
@@ -974,6 +980,7 @@ impl VamanaIndex {
             self.config.alpha,
             self.last_applied_seq,
             Some(codes_hash.as_bytes()),
+            Some(&publication_nonce),
         )?;
         fs::rename(&metadata_tmp, &metadata_path)?;
 
@@ -2887,6 +2894,7 @@ fn write_v2_commit_full(
     alpha: f64,
     last_applied_seq: Option<u64>,
     codes_hash: Option<&[u8; 32]>,
+    publication_nonce: Option<&[u8; 16]>,
 ) -> Result<()> {
     let buf = encode_v2_commit_full(
         vectors_hash,
@@ -2900,6 +2908,7 @@ fn write_v2_commit_full(
         alpha,
         last_applied_seq,
         codes_hash,
+        publication_nonce,
     );
     let file = File::create(path)?;
     let mut w = std::io::BufWriter::new(file);
@@ -2922,8 +2931,9 @@ fn encode_v2_commit_full(
     alpha: f64,
     last_applied_seq: Option<u64>,
     codes_hash: Option<&[u8; 32]>,
+    publication_nonce: Option<&[u8; 16]>,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(220);
+    let mut buf = Vec::with_capacity(236);
     buf.extend_from_slice(V2_COMMIT_MAGIC);
     buf.extend_from_slice(vectors_hash);
     buf.extend_from_slice(graph_hash);
@@ -2950,6 +2960,13 @@ fn encode_v2_commit_full(
     buf.push(flags);
     buf.extend_from_slice(&last_applied_seq.unwrap_or(0).to_le_bytes());
     buf.extend_from_slice(codes_hash.unwrap_or(&[0u8; 32]));
+    // New file-backed checkpoints append a per-publication nonce. The length,
+    // rather than a flag bit, discriminates this backward-compatible layout:
+    // old base and 41-byte-trailer records remain valid, while portable
+    // containers can keep deterministic metadata by passing `None`.
+    if let Some(nonce) = publication_nonce {
+        buf.extend_from_slice(nonce);
+    }
     buf
 }
 
@@ -2958,11 +2975,15 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
     // magic(8) + 3 hashes(96) + fp.vector_count(8) + fp.dimensions(8) + fp.content_hash(32)
     // + num_vectors(8) + dimensions(8) + max_degree(8) + search_list_size(8) + alpha(8)
     // + optional trailer: flags(1) + last_applied_seq(8) + codes_hash(32)
+    // + optional per-publication nonce(16)
     let base_len = 8 + 32 + 32 + 32 + 8 + 8 + 32 + 8 + 8 + 8 + 8 + 8;
     let trailer_len = base_len + 41;
-    if data.len() != base_len && data.len() != trailer_len {
+    let publication_trailer_len = trailer_len + 16;
+    if data.len() != base_len && data.len() != trailer_len && data.len() != publication_trailer_len
+    {
         return Err(VamanaError::invalid_format(format!(
-            "v2 commit record length {} != {base_len} or {trailer_len}",
+            "v2 commit record length {} != {base_len}, {trailer_len}, or \
+             {publication_trailer_len}",
             data.len()
         )));
     }
@@ -3018,7 +3039,7 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
     let alpha = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
     offset += 8;
 
-    let (last_applied_seq, codes_hash) = if data.len() == trailer_len {
+    let (last_applied_seq, codes_hash) = if data.len() >= trailer_len {
         let flags = data[offset];
         offset += 1;
         let seq = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
@@ -5101,6 +5122,32 @@ mod tests {
         );
     }
 
+    /// A checkpoint publication is an event, even when its semantic payload is
+    /// byte-for-byte identical to the preceding checkpoint. Long-lived mmap
+    /// readers need an identity that changes on every rotation so they can
+    /// release the now-unlinked predecessor files (#2081).
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn identical_checkpoint_rotations_have_distinct_commit_identities() {
+        let vectors = rand_unit_vectors(10, 4, 2081);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(4)
+            .with_search_list_size(8);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        idx.save_atomic(dir.path()).unwrap();
+        let first = blake3::hash(&fs::read(dir.path().join("metadata.bin")).unwrap());
+
+        idx.save_atomic(dir.path()).unwrap();
+        let second = blake3::hash(&fs::read(dir.path().join("metadata.bin")).unwrap());
+
+        assert_ne!(
+            first, second,
+            "every successful checkpoint rotation needs a distinct commit identity"
+        );
+    }
+
     #[cfg(feature = "mmap")]
     #[test]
     fn read_commit_fingerprint_absent_dir_returns_none() {
@@ -5458,6 +5505,7 @@ mod tests {
             commit.index_meta.alpha,
             commit.last_applied_seq,
             commit.codes_hash.as_ref(),
+            None,
         )
         .unwrap();
 
@@ -5520,6 +5568,7 @@ mod tests {
             commit.index_meta.alpha,
             commit.last_applied_seq,
             Some(&corrupt_codes_hash),
+            None,
         )
         .unwrap();
 
@@ -5586,6 +5635,7 @@ mod tests {
             commit.index_meta.alpha,
             commit.last_applied_seq,
             commit.codes_hash.as_ref(),
+            None,
         )
         .unwrap();
 
@@ -5692,6 +5742,7 @@ mod tests {
             commit.index_meta.alpha,
             commit.last_applied_seq,
             commit.codes_hash.as_ref(),
+            None,
         )
         .unwrap();
 

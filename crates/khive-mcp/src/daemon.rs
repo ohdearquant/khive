@@ -229,7 +229,9 @@ struct ConfigIdFields<'a> {
     blob_hydration_bytes: &'a str,
     backend: &'a str,
     outbound: &'a str,
+    gate: &'a str,
     git_write: &'a str,
+    display_timezone: &'a str,
     backends: Option<&'a str>,
     pack_backends: Option<&'a str>,
 }
@@ -246,7 +248,13 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
 
     let base = base.strip_prefix("packs=[")?;
     let (packs, rest) = base.split_once("];db=")?;
+    let (rest, display_timezone) = rest
+        .rsplit_once(";display_tz=")
+        .unwrap_or((rest, "<legacy-absent>"));
     let (rest, git_write) = rest.rsplit_once(";git_write=")?;
+    let (rest, gate) = rest
+        .rsplit_once(";gate=")
+        .unwrap_or((rest, "<legacy-absent>"));
     let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
     let outbound = outbound.strip_suffix(']')?;
     let (rest, backend) = rest.rsplit_once(";backend=")?;
@@ -270,7 +278,9 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         blob_hydration_bytes,
         backend,
         outbound,
+        gate,
         git_write,
+        display_timezone,
         backends,
         pack_backends,
     })
@@ -300,8 +310,12 @@ fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static s
         "backend"
     } else if client.outbound != daemon.outbound {
         "outbound"
+    } else if client.gate != daemon.gate {
+        "gate"
     } else if client.git_write != daemon.git_write {
         "git_write"
+    } else if client.display_timezone != daemon.display_timezone {
+        "display_tz"
     } else if client.backends != daemon.backends {
         "backends"
     } else if client.pack_backends != daemon.pack_backends {
@@ -477,6 +491,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
 // ── client ────────────────────────────────────────────────────────────────────
 
 /// Result of a single forward attempt to the daemon socket.
+#[derive(Debug)]
 enum ForwardOutcome {
     /// Successfully received and decoded a response frame.
     Response(Box<DaemonResponseFrame>),
@@ -526,20 +541,82 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
             return classify_socket_connect_error(std::io::Error::from_raw_os_error(forced_error));
         }
     }
-    let mut stream = match UnixStream::connect(&sock).await {
-        Ok(s) => s,
-        Err(error) => return classify_socket_connect_error(error),
+
+    // One absolute deadline bounds connect, write, and read together, so the
+    // whole socket exchange can never exceed the ceiling the read phase alone
+    // used to honour on its own. A same-UID peer that accepts the connection
+    // and never reads it would otherwise block the write forever with
+    // nothing above this function able to stop it.
+    //
+    // When this task inherited the caller's request-read deadline — the
+    // spawned forward task in `server.rs` wraps this call in
+    // `khive_storage::inherit_request_read_context` — that same absolute
+    // instant is reused here, so an admitted forward cannot outlive the
+    // deadline the rest of the request already obeys. Callers that never
+    // scoped a request context (this function's own unit tests, or any
+    // future caller outside the MCP bridge) fall back to a fresh relative
+    // ceiling: the same `request_read_timeout_from_env()` bound the read
+    // phase alone used before this change.
+    let deadline = khive_storage::capture_request_read_context()
+        .deadline()
+        .map(khive_storage::RequestReadDeadline::async_at)
+        .unwrap_or_else(|| {
+            tokio::time::Instant::now() + khive_storage::request_read_timeout_from_env()
+        });
+
+    let mut stream = match tokio::time::timeout_at(deadline, UnixStream::connect(&sock)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(error)) => return classify_socket_connect_error(error),
+        Err(_elapsed) => {
+            // Nothing was ever written to a peer, so this is exactly the
+            // ordinary not-listening case: safe to let recovery proceed.
+            tracing::warn!(
+                "daemon connect timed out before the socket-exchange deadline — \
+                 treating as no socket"
+            );
+            return ForwardOutcome::NoSocket;
+        }
     };
     let payload = match serde_json::to_vec(frame) {
         Ok(p) => p,
         Err(_) => return ForwardOutcome::NoSocket,
     };
-    if write_frame(&mut stream, &payload).await.is_err() {
-        return ForwardOutcome::NoSocket;
+    match tokio::time::timeout_at(deadline, write_frame(&mut stream, &payload)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return ForwardOutcome::NoSocket,
+        Err(_elapsed) => {
+            // The write itself never completed. Dropping `stream` here (it
+            // goes out of scope on this return) closes the socket, so a peer
+            // that later resumes reading observes end-of-stream in the
+            // middle of the frame — at most the 4-byte length prefix and a
+            // short partial body — and can never finish `read_frame`'s
+            // `read_exact` for the full body. It cannot misdispatch a
+            // truncated request.
+            //
+            // Because nothing was fully delivered, this is NOT the
+            // post-write ambiguity the read-timeout arm below returns for
+            // (where the write had already completed and the request may
+            // already be executing on the daemon side). Treat it like
+            // `NoSocket` — the pre-write, "nothing sent" case — so
+            // `forward_or_spawn_with_exe`'s recovery path can kill and
+            // respawn a stuck peer and retry, instead of surfacing a
+            // permanent no-retry ambiguity error for what may just be a
+            // wedged process squatting on the socket path.
+            tracing::warn!(
+                "daemon write timed out before the socket-exchange deadline — \
+                 dropping the connection and treating as no socket"
+            );
+            return ForwardOutcome::NoSocket;
+        }
     }
-    let resp = match read_frame(&mut stream).await {
-        Ok(r) => r,
-        Err(e) => {
+    // The request is now fully written and may already be executing (or
+    // committed) on the daemon side, so a stalled or unresponsive daemon
+    // must not leave this read pending forever — that would keep the
+    // calling task (and the MCP handler awaiting it) alive indefinitely.
+    // Bounded by the same deadline as the connect and write phases above.
+    let resp = match tokio::time::timeout_at(deadline, read_frame(&mut stream)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             // The request was sent but the daemon closed the connection before
             // sending a response frame — likely a daemon crash or panic during
             // dispatch. Treat as ParseFailure (not NoSocket): the request may
@@ -549,6 +626,17 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
                 error = %e,
                 "daemon closed connection without sending a response \
                  (crash during dispatch?) — returning terminal ambiguity"
+            );
+            return ForwardOutcome::ParseFailure;
+        }
+        Err(_elapsed) => {
+            // The daemon never answered within the deadline. The write
+            // already completed, so — exactly like the connection-closed case
+            // above — the request may already have committed; there is no
+            // safe retry or local fallback, only a terminal ambiguity error.
+            tracing::warn!(
+                "daemon response read timed out after the request was fully \
+                 written — returning terminal ambiguity"
             );
             return ForwardOutcome::ParseFailure;
         }
@@ -2102,7 +2190,7 @@ pub async fn forward_or_spawn_with_config_and_packs(
     packs: Option<&[String]>,
 ) -> Option<Result<String, McpError>> {
     #[cfg(any(test, feature = "test-forward-seam"))]
-    if let Some(intercepted) = test_forward_seam::intercept(packs) {
+    if let Some(intercepted) = test_forward_seam::intercept(frame, packs) {
         return intercepted;
     }
     let spawn = || {
@@ -2144,12 +2232,14 @@ pub async fn forward_or_spawn_with_config(
 /// re-declaration instead) can reach it.
 #[cfg(any(test, feature = "test-forward-seam"))]
 pub mod test_forward_seam {
-    use super::McpError;
+    use super::{DaemonRequestFrame, McpError};
     use std::cell::Cell;
 
     thread_local! {
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static CAPTURED: std::cell::RefCell<Option<Option<Vec<String>>>> =
+            const { std::cell::RefCell::new(None) };
+        static CAPTURED_REQUEST_ID: std::cell::RefCell<Option<Option<u64>>> =
             const { std::cell::RefCell::new(None) };
     }
 
@@ -2159,6 +2249,7 @@ pub mod test_forward_seam {
     /// spawning a process; the hook then disarms itself.
     pub fn arm() {
         CAPTURED.with(|c| *c.borrow_mut() = None);
+        CAPTURED_REQUEST_ID.with(|c| *c.borrow_mut() = None);
         ARMED.with(|a| a.set(true));
     }
 
@@ -2171,12 +2262,24 @@ pub mod test_forward_seam {
         CAPTURED.with(|c| c.borrow_mut().take())
     }
 
-    pub(super) fn intercept(packs: Option<&[String]>) -> Option<Option<Result<String, McpError>>> {
+    /// Take the captured `frame.request_id` of the most recent armed call,
+    /// if any. Companion to `take_captured` for tests proving the bridge
+    /// correlation id (khive#948, khive-oss#2337) reaches the real
+    /// `forward_or_spawn_with_config_and_packs` adapter boundary unchanged.
+    pub fn take_captured_request_id() -> Option<Option<u64>> {
+        CAPTURED_REQUEST_ID.with(|c| c.borrow_mut().take())
+    }
+
+    pub(super) fn intercept(
+        frame: &DaemonRequestFrame,
+        packs: Option<&[String]>,
+    ) -> Option<Option<Result<String, McpError>>> {
         let was_armed = ARMED.with(|a| a.replace(false));
         if !was_armed {
             return None;
         }
         CAPTURED.with(|c| *c.borrow_mut() = Some(packs.map(<[String]>::to_vec)));
+        CAPTURED_REQUEST_ID.with(|c| *c.borrow_mut() = Some(frame.request_id));
         Some(Some(Ok(serde_json::json!({
             "results": [{"ok": true, "tool": "stats", "result": {}}],
             "summary": {"total": 1, "succeeded": 1, "failed": 0},
@@ -2389,6 +2492,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::test_harness::{
         clear_daemon_env, connect_when_ready, exchange, HarnessDispatch, InProcessDaemonHandle,
         InProcessDaemonLauncher, RecoveryTestGuard,
@@ -2814,6 +2919,26 @@ mod tests {
             first_config_mismatch_field(&client, Some(&daemon)),
             "outbound"
         );
+    }
+
+    #[test]
+    fn first_config_mismatch_field_names_caller_enrollment_policy() {
+        let base = RuntimeConfig::no_embeddings();
+        let enrolled = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(
+                vec!["lambda:enrolled".to_string()],
+                false,
+            )),
+            ..base.clone()
+        };
+        let revoked = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(Vec::new(), false)),
+            ..base
+        };
+        let client = crate::server::compute_config_id_with_ann_fresh_tail(&enrolled, None, true);
+        let daemon = crate::server::compute_config_id_with_ann_fresh_tail(&revoked, None, true);
+
+        assert_eq!(first_config_mismatch_field(&client, Some(&daemon)), "gate");
     }
 
     #[test]
@@ -3341,6 +3466,7 @@ mod tests {
     /// invocation (`crates/kkernel/src/exec.rs`'s spy seam proves the exec
     /// side hands the path over; this side proves it reaches `argv`).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_config_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3370,6 +3496,7 @@ mod tests {
     /// (or `--pack`-flag, or config-file `[runtime].packs`) selection when it
     /// spawns a fresh daemon (khive-oss#1941).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_pack_flags_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3398,6 +3525,7 @@ mod tests {
     /// at all — the spawned daemon falls through to its own env/config
     /// resolution exactly as before this fix.
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_omits_pack_flags_when_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3425,6 +3553,7 @@ mod tests {
     /// would bind the config's declared persistent backend files, the exact
     /// inversion of the operator's ephemeral invocation.
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_memory_db_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3464,6 +3593,7 @@ mod tests {
     /// the frame's fingerprint has already been normalized to the
     /// no-override anchor (`normalize_redundant_db_override_with_source`).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_forwards_concrete_db_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3491,6 +3621,7 @@ mod tests {
     /// seam retries only ExecutableFileBusy, so holding this file open for
     /// writing forces the exact failure class reported by coverage CI.
     #[test]
+    #[serial]
     fn spawn_daemon_retries_a_transient_executable_file_busy_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let exe = daemon_script_fixture(&dir, "temporarily-busy.sh", "#!/bin/sh\nexit 0\n");
@@ -3508,6 +3639,220 @@ mod tests {
         release.join().expect("fixture writer release thread");
         let status = child.wait().expect("wait for executable fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
+    }
+
+    /// Blank out `"..."` string-literal contents (escapes and
+    /// backslash-newline continuations included) so a spawn-seam name
+    /// mentioned in an error message or doc comment can never read as a
+    /// call.
+    fn strip_string_literals_for_census(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut in_string = false;
+        for line in text.lines() {
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                if in_string {
+                    if c == '\\' {
+                        out.push(' ');
+                        if chars.next().is_some() {
+                            out.push(' ');
+                        }
+                        continue;
+                    }
+                    if c == '"' {
+                        in_string = false;
+                        out.push('"');
+                    } else {
+                        out.push(' ');
+                    }
+                } else {
+                    if c == '"' {
+                        in_string = true;
+                    }
+                    out.push(c);
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// `true` if `text` contains a call to `name` — `name` immediately
+    /// followed by `(` (optional whitespace between, including newlines —
+    /// `rustfmt` is free to break a long call onto its own line), a
+    /// non-identifier character (or start of text) before it, and not
+    /// inside a string literal. Anchoring both boundaries matters here
+    /// specifically because `spawn_daemon_with_exe(` is a prefix-shaped
+    /// substring of `spawn_daemon_with_exe_and_config(` up to the
+    /// `_and_config` suffix — a plain `contains` check would still tell
+    /// them apart by luck (the character after `exe` differs), but a
+    /// boundary check makes that non-collision load-bearing instead of
+    /// incidental.
+    fn calls_name_for_census(text: &str, name: &str) -> bool {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let text = strip_string_literals_for_census(text);
+        let bytes = text.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(name) {
+            let idx = search_from + rel;
+            let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+            let after = idx + name.len();
+            let mut j = after;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let after_ok = j < bytes.len() && bytes[j] == b'(';
+            let is_definition = text[..idx].ends_with("fn ");
+            if before_ok && after_ok && !is_definition {
+                return true;
+            }
+            search_from = idx + 1;
+        }
+        false
+    }
+
+    /// Regression for a scanner that only tolerated a space/tab between a
+    /// seam name and its `(` — see the identical fix and rationale for
+    /// `khive-runtime`'s `calls_name`.
+    #[test]
+    fn calls_name_for_census_matches_across_a_newline_before_the_parenthesis() {
+        let text = "fn wraps_it() {\n    spawn_daemon_with_exe\n        (exe)\n}";
+        assert!(calls_name_for_census(text, "spawn_daemon_with_exe"));
+    }
+
+    /// The name of the function whose signature starts at `sig_line`
+    /// (already stripped of leading whitespace), if any.
+    fn fn_name_from_signature_for_census(sig_line: &str) -> Option<&str> {
+        let mut rest = sig_line;
+        for prefix in ["pub(crate) ", "pub(super) ", "pub "] {
+            if let Some(stripped) = rest.strip_prefix(prefix) {
+                rest = stripped;
+            }
+        }
+        let rest = rest
+            .strip_prefix("async fn ")
+            .or_else(|| rest.strip_prefix("fn "))?;
+        Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest))
+    }
+
+    /// Recursively collect every `.rs` file under `dir` into `out`.
+    fn collect_rust_files_for_census(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_files_for_census(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// `spawn_daemon_with_exe_and_config` and its thin wrapper
+    /// `spawn_daemon_with_exe` are both module-private — visible only
+    /// inside `daemon.rs` and its descendant modules — so unlike the
+    /// config-ledger seam (`with_event_store`, `pub` and reachable from any
+    /// crate in the workspace), the real population for this census is
+    /// bounded to this file plus the `daemon/` submodule directory, not the
+    /// whole workspace. This walks that directory explicitly instead of
+    /// hard-coding "just this file" so a future submodule under `daemon/`
+    /// is covered without anyone remembering to widen the scan.
+    fn daemon_module_sources() -> Vec<(std::path::PathBuf, String)> {
+        let this_file = std::path::PathBuf::from(file!());
+        let daemon_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon.rs");
+        let daemon_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon");
+        let mut files = vec![daemon_rs];
+        if daemon_dir.is_dir() {
+            collect_rust_files_for_census(&daemon_dir, &mut files);
+        }
+        let _ = this_file; // `file!()` is relative; CARGO_MANIFEST_DIR-joined paths are the source of truth.
+        files
+            .into_iter()
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((path, text))
+            })
+            .collect()
+    }
+
+    /// Every direct test caller of the spawn seam — `daemon.rs` and its
+    /// `daemon/` submodules, the only places `spawn_daemon_with_exe[_and_
+    /// config]` are visible from — mutates the process-wide `SPAWN_COUNT`,
+    /// so it must share the default serial group with tests that reset and
+    /// assert that counter.
+    #[test]
+    fn direct_spawn_seam_test_callers_are_serialized() {
+        let sources = daemon_module_sources();
+        assert!(
+            !sources.is_empty(),
+            "the daemon-module source scan found no .rs files under \
+             crates/khive-mcp/src/daemon.rs or src/daemon/; the census's own file walk \
+             is broken, not the population it walks"
+        );
+
+        let spawn_calls = ["spawn_daemon_with_exe_and_config", "spawn_daemon_with_exe"];
+        let mut candidate_count = 0usize;
+        let mut offenders = Vec::new();
+
+        for (path, text) in &sources {
+            let lines: Vec<&str> = text.lines().collect();
+            let test_starts: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let trimmed = line.trim();
+                    trimmed == "#[test]" || trimmed.starts_with("#[tokio::test")
+                })
+                .map(|(index, _)| index)
+                .collect();
+
+            for (index, start) in test_starts.iter().copied().enumerate() {
+                let end = test_starts.get(index + 1).copied().unwrap_or(lines.len());
+                let span = &lines[start..end];
+                let span_text = span.join("\n");
+                let matched = spawn_calls
+                    .iter()
+                    .find(|seam| calls_name_for_census(&span_text, seam));
+                let Some(matched) = matched else {
+                    continue;
+                };
+                candidate_count += 1;
+
+                if !span.iter().any(|line| line.trim() == "#[serial]") {
+                    let signature_offset = span
+                        .iter()
+                        .position(|line| {
+                            fn_name_from_signature_for_census(line.trim_start()).is_some()
+                        })
+                        .expect("test span has a function signature");
+                    let name =
+                        fn_name_from_signature_for_census(span[signature_offset].trim_start())
+                            .unwrap_or("<unknown>");
+                    offenders.push(format!(
+                        "{}:{name} (reaches the spawn seam via `{matched}`)",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            candidate_count > 0,
+            "census found zero direct spawn-seam test candidates under the daemon \
+             module ({} source files) — the scan is broken, not the population it \
+             should have found (this file's own argv-forwarding tests are known \
+             direct callers)",
+            sources.len()
+        );
+        assert!(
+            offenders.is_empty(),
+            "tests that directly call the SPAWN_COUNT-mutating spawn seam must use \
+             #[serial]; offenders: {offenders:?}"
+        );
     }
 
     /// The helper behind the retry above must actually retry the exact
@@ -3904,6 +4249,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn daemon_round_trip_dispatches_and_enforces_config_id() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4508,6 +4854,7 @@ mod tests {
     // override machinery introduced for daemon-forwarded requests.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn local_dispatch_without_identity_context_uses_baked_actor() {
         clear_daemon_env();
 
@@ -4804,6 +5151,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn try_forward_inner_returns_parse_failure_when_daemon_closes_without_response() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4854,6 +5202,316 @@ mod tests {
              ParseFailure, not NoSocket — got a different variant"
         );
 
+        clear_daemon_env();
+    }
+
+    // ── unbounded-write regression (khive-oss#2337) ────────────────────────────
+    //
+    // Before the fix, `try_forward_inner` only bounded the response *read*;
+    // the connect and write phases had no deadline at all. A same-UID peer
+    // that accepts the connection and never reads from it can fill the
+    // kernel socket send buffer and block the write forever — nothing above
+    // this function could stop it, so cancellation-shielding in `server.rs`
+    // would eventually detach the task, but the task, its `UnixStream`, and
+    // the request payload would live on indefinitely as long as that peer
+    // stays connected.
+    //
+    // The fix bounds connect, write, and read by one absolute deadline. On a
+    // write timeout the stream is dropped (so a peer that later resumes
+    // reading observes end-of-stream mid-frame) and the outcome is
+    // `NoSocket` — nothing was fully delivered, so it is safe for
+    // `forward_or_spawn_with_exe`'s recovery path to kill/respawn and retry,
+    // unlike the post-write `ParseFailure` ambiguity case above.
+
+    /// Accept one connection and never read from it, simulating a same-UID
+    /// peer that squats on the socket path without servicing requests. The
+    /// accepted stream is handed back over `hold` so the test can observe it
+    /// after the writer's own timeout fires.
+    async fn serve_accept_and_never_read(
+        listener: tokio::net::UnixListener,
+        hold: tokio::sync::oneshot::Sender<tokio::net::UnixStream>,
+    ) {
+        if let Ok((stream, _)) = listener.accept().await {
+            let _ = hold.send(stream);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn try_forward_inner_write_timeout_drops_stream_and_returns_no_socket() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        // A short ceiling keeps this test fast. `try_forward_inner` has no
+        // inherited request-read context here (called directly, not via the
+        // `server.rs` spawn site), so it falls back to reading this env var
+        // fresh on every call via `request_read_timeout_from_env()` — real
+        // (unpaused) time, since a genuinely blocked socket write is real
+        // I/O, not a timer, and would not release control for a paused
+        // clock's auto-advance to fire.
+        std::env::set_var("KHIVE_REQUEST_READ_TIMEOUT_SECS", "1");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake silent-peer socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let fake_handle = tokio::spawn(serve_accept_and_never_read(listener, held_tx));
+
+        // Comfortably inside MAX_FRAME_BYTES but large enough to exceed any
+        // realistic Unix-domain-socket kernel send buffer, so the write
+        // blocks once that buffer fills (the peer above never reads).
+        let big_ops = format!("stats(padding=\"{}\")", "x".repeat(7 * 1024 * 1024));
+        assert!(
+            big_ops.len() < khive_runtime::daemon::MAX_FRAME_BYTES,
+            "test payload must stay under MAX_FRAME_BYTES so write_frame does not reject it \
+             outright before the timeout can be observed"
+        );
+        let frame = DaemonRequestFrame {
+            ops: big_ops,
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+
+        let started = std::time::Instant::now();
+        // (a) `try_forward_inner` must return within the ceiling plus a
+        // margin, not hang on the unbounded write. Pre-fix this outer
+        // `tokio::time::timeout` is what actually terminates the test (the
+        // real call never returns on its own), which is the red-before
+        // signal for this assertion.
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), try_forward_inner(&frame))
+                .await
+                .expect(
+                    "try_forward_inner must return within the ceiling plus margin, not hang on an \
+             unbounded write to a silent peer",
+                );
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, ForwardOutcome::NoSocket),
+            "a write that never completes delivered nothing, so it must be treated like the \
+             pre-write no-socket case (safe to retry/recover) — got a different variant: \
+             {outcome:?}",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "expected the ~1s write-timeout ceiling to fire well under the 5s test bound; \
+             elapsed {elapsed:?}"
+        );
+
+        // (b) the peer's held stream must observe end-of-stream once
+        // `try_forward_inner` drops its end on timeout — proving the cleanup
+        // actually closed the socket rather than leaking it. Pre-fix this
+        // read hangs forever (the writer's task, and its stream, never went
+        // away), which is the red-before signal for this assertion.
+        let mut held_stream = held_rx.await.expect("peer accepted the connection");
+        // The kernel receive buffer may already hold bytes that made it
+        // through before the write blocked, so draining to end-of-stream
+        // takes a read loop, not a single read: the peer must consume
+        // whatever was already queued before it can observe the writer's
+        // end actually closing.
+        let drain_result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 4096];
+            loop {
+                match held_stream.read(&mut buf).await {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .expect(
+            "peer-side read must not hang once try_forward_inner's write timeout has fired \
+             and dropped its end of the connection",
+        );
+        // A connection-reset error also proves the writer's end was dropped;
+        // `Ok(())` (clean end-of-stream) is the expected outcome here.
+        let _ = drain_result;
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+        clear_daemon_env();
+    }
+
+    /// (d) The existing read-timeout arm — the peer reads the frame in full
+    /// but never answers — must still yield `ParseFailure` (terminal
+    /// ambiguity: the write completed, so the request may already be
+    /// executing on the daemon side). This is the control that proves the
+    /// write-phase fix above did not change the read-phase's own timeout
+    /// classification.
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn try_forward_inner_read_timeout_after_full_write_returns_parse_failure() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        std::env::set_var("KHIVE_REQUEST_READ_TIMEOUT_SECS", "1");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        async fn serve_read_then_never_answer(listener: tokio::net::UnixListener) {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_frame(&mut stream).await;
+                std::future::pending::<()>().await;
+            }
+        }
+
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind fake read-then-silent socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let fake_handle = tokio::spawn(serve_read_then_never_answer(listener));
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+
+        let started = std::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), try_forward_inner(&frame))
+                .await
+                .expect("try_forward_inner must return within the ceiling plus margin");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, ForwardOutcome::ParseFailure),
+            "a read timeout after a completed write must stay ParseFailure (terminal \
+             ambiguity) — got a different variant: {outcome:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "expected the ~1s read-timeout ceiling to fire well under the 5s test bound; \
+             elapsed {elapsed:?}"
+        );
+
+        fake_handle.abort();
+        clear_daemon_env();
+    }
+
+    /// (c) Control: a peer that reads the frame and answers normally well
+    /// within the ceiling still yields the ordinary `Response` outcome. The
+    /// end-to-end round trip in `daemon_round_trip_dispatches_and_enforces_config_id`
+    /// above already exercises `write_frame`/`read_frame` against a real
+    /// in-process daemon; this test instead drives `try_forward_inner`
+    /// itself, so the single-deadline rewrite above is checked directly at
+    /// the same call site the write/read-timeout tests use.
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn try_forward_inner_normal_response_within_ceiling_still_succeeds() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        async fn serve_one_ok_response(listener: tokio::net::UnixListener, config_id: String) {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req = read_frame(&mut stream).await.expect("read request frame");
+                let req: DaemonRequestFrame =
+                    serde_json::from_slice(&req).expect("decode request frame");
+                assert_eq!(req.config_id, config_id);
+                let resp = DaemonResponseFrame {
+                    ok: true,
+                    result: Some(serde_json::json!({"results": [], "summary": {}}).to_string()),
+                    error: None,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: Some(req.config_id.clone()),
+                    version_mismatch: false,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    metrics: None,
+                    request_id: req.request_id,
+                };
+                let payload = serde_json::to_vec(&resp).expect("serialize response frame");
+                write_frame(&mut stream, &payload)
+                    .await
+                    .expect("write response frame");
+            }
+        }
+
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind fake well-behaved socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let fake_handle = tokio::spawn(serve_one_ok_response(listener, config_id.to_string()));
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: Some(555),
+        };
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), try_forward_inner(&frame))
+                .await
+                .expect("try_forward_inner must not time out against a well-behaved peer");
+
+        match outcome {
+            ForwardOutcome::Response(resp) => {
+                assert!(resp.ok, "well-behaved response must round-trip as ok=true");
+                assert_eq!(resp.request_id, Some(555));
+            }
+            other => panic!("expected ForwardOutcome::Response, got {other:?}"),
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
         clear_daemon_env();
     }
 
@@ -5446,6 +6104,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn recovery_path_dispatches_real_request_exactly_once() {
         clear_daemon_env();
         reset_counters();
@@ -6507,6 +7166,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn ambiguous_write_never_retries_against_freshly_spawned_daemon() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");

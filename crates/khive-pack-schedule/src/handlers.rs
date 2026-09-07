@@ -911,7 +911,7 @@ pub(crate) async fn handle_agenda(
 
     loop {
         let page = store
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 namespace,
                 &filter,
                 PageRequest {

@@ -17,10 +17,9 @@ import subprocess
 import sys
 import os
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
-)
+from kkernel_binary import resolve_binary_path
+
+BINARY = resolve_binary_path()
 
 request_id = 0
 

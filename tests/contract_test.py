@@ -52,16 +52,9 @@ import tempfile
 import traceback
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# Binary location
-# ---------------------------------------------------------------------------
+from kkernel_binary import resolve_binary_path
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(
-        os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"
-    ),
-)
+BINARY = resolve_binary_path()
 
 # ---------------------------------------------------------------------------
 # Low-level JSON-RPC + MCP helpers

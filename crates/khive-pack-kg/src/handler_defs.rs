@@ -1199,13 +1199,16 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         category: VerbCategory::Assertive,
         params: &[],
     },
-    // Assertive: writer-contention, edge-integrity, and WAL diagnostics (ADR-091/ADR-135)
+    // Assertive: reader/writer contention, edge-integrity, and WAL diagnostics.
     HandlerDef {
         name: "db_diagnostics",
-        description: "Report writer-contention, graph-edge integrity, and WAL/checkpoint \
+        description: "Report reader- and writer-contention, graph-edge integrity, and WAL/checkpoint \
                       diagnostics for the main \
-                      database: aggregate and class-specific pooled/standalone/writer-task \
-                      acquisitions, finite-wait pool timeouts, writer-task request failures and \
+                      database: reader admission capacity/availability, pooled reader checkouts, \
+                      separately attributed request/infrastructure standalone reader opens, \
+                      reader checkout timeouts, active/peak/completed pooled checkouts and maximum \
+                      completed hold time; aggregate and class-specific pooled/standalone/writer-task \
+                      writer acquisitions, finite-wait pool timeouts, writer-task request failures and \
                       their unknown-side-effects subset, swallowed best-effort audit \
                       append failures, additive audit-batch flush-failure/degraded-row/degraded \
                       counters (present once a runtime audit-batch control is wired; \
@@ -1217,9 +1220,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                       expected non-negative ledger delta explicit; a negative delta is unexpected \
                       unless the report also flags the pre-V14 duplicate-edge state, which is \
                       classified as ledger_behind_pre_v14_duplicate_edge_state. \
+                      A bounded dbstat size composition reports per-table/per-index pages and \
+                      row, index, FTS, vector, mixed row-and-embedding, and internal byte totals. \
                       ADR-091 checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
-                      WAL-pin holder census. The \
+                      WAL-pin holder census reconciled with a bounded read-only sidecar pass. The \
                       checkpoint probe issues a real PRAGMA wal_checkpoint(PASSIVE), which \
                       backfills WAL frames into the main database on the happy path — that \
                       is ordinary checkpoint I/O, never a TRUNCATE escalation, and it never \
@@ -1356,6 +1361,8 @@ mod tests {
 
         let diagnostics = find_handler("db_diagnostics");
         for required in [
+            "reader admission capacity",
+            "maximum completed hold time",
             "all namespaces",
             "soft-deleted rows",
             "hard deletion",

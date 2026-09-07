@@ -70,14 +70,19 @@ impl CoordinatorService for SubstrateCoordinatorService {
         self.inner
             .link_cross_backend(namespace, source_id, target_id, relation, weight, metadata)
             .await
-            .map(|edge| {
+            .and_then(|edge| {
                 let cross_backend = edge.target_backend.is_some();
-                let target_backend_id = edge.target_backend.as_deref().map(BackendId::new);
-                CoordLinkResult {
+                let target_backend_id = edge
+                    .target_backend
+                    .as_deref()
+                    .map(BackendId::parse)
+                    .transpose()
+                    .map_err(|error| format!("stored target backend is invalid: {error}"))?;
+                Ok(CoordLinkResult {
                     edge,
                     cross_backend,
                     target_backend_id,
-                }
+                })
             })
             .map_err(|msg| {
                 if msg.contains("not found on any backend") {
@@ -158,11 +163,20 @@ impl CoordinatorService for SubstrateCoordinatorService {
 
         let coord_per_backend: Vec<CoordBackendResult> = per_backend
             .into_iter()
-            .map(|r| CoordBackendResult {
-                backend_id: r.backend_id,
-                entity_hits: r.hits,
-                note_hits: r.note_hits,
-                error: r.error,
+            .map(|r| {
+                let vector_selected = self
+                    .inner
+                    .registry()
+                    .get(&r.backend_id)
+                    .is_some_and(|entry| entry.runtime.vector_arm_selected());
+                CoordBackendResult {
+                    backend_id: r.backend_id,
+                    entity_hits: r.hits,
+                    note_hits: r.note_hits,
+                    vector_selected,
+                    error: r.error,
+                    vector_error: r.vector_error,
+                }
             })
             .collect();
 

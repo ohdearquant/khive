@@ -13,6 +13,7 @@ pub mod diagnostics;
 pub mod error;
 /// SQLite extension registration (sqlite-vec auto-extension).
 pub mod extension;
+mod fts_maintenance;
 /// Schema migration system (versioned migrations).
 pub mod migrations;
 /// WAL-mode connection pool: one writer, N concurrent readers.
@@ -40,6 +41,10 @@ pub use checkpoint::{
 };
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
 pub use error::SqliteError;
+pub use fts_maintenance::{
+    fts_maintenance_counters, FtsIndexStructure, FtsLevelStructure, FtsMaintenanceCounters,
+    FtsSegmentDiagnostics,
+};
 pub use khive_storage::{
     await_request_read_phase, effective_request_read_deadline, ensure_request_read_active,
     inherit_request_read_cancellation, inherit_request_read_context, request_read_is_cancelled,

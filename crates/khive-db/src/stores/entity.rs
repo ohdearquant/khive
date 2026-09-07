@@ -196,10 +196,10 @@ pub fn entity_hard_delete_statement(id: Uuid) -> SqlStatement {
 /// An EntityStore backed by SQLite. Namespace is the caller's responsibility.
 ///
 /// UUID is globally unique — get/delete by ID alone. Query/count use the
-/// namespace parameter as passed. The store is just a pool + is_file_backed.
+/// namespace parameter as passed. Read routing is always pool-backed; the
+/// constructor's legacy file-backed flag is retained for API compatibility.
 pub struct SqlEntityStore {
     pool: Arc<ConnectionPool>,
-    is_file_backed: bool,
     writer_task: Option<WriterTaskHandle>,
 }
 
@@ -221,7 +221,7 @@ impl SqlEntityStore {
     /// (for example, an in-memory pool, which has no standalone-connection
     /// support) — enabled by default for file-backed pools; explicit
     /// off/degraded fallback remains possible.
-    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+    pub fn new(pool: Arc<ConnectionPool>, _is_file_backed: bool) -> Self {
         // Enabled by default for file-backed pools; explicit off/degraded
         // fallback remains possible: a missing writer task — whether
         // explicitly disabled, spawn degraded (e.g. in-memory pool), or no
@@ -231,11 +231,7 @@ impl SqlEntityStore {
         // remaining miss and compatibility mode may use the legacy path.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
-        Self {
-            pool,
-            is_file_backed,
-            writer_task,
-        }
+        Self { pool, writer_task }
     }
 
     fn current_writer_task(
@@ -339,36 +335,13 @@ impl SqlEntityStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Entities,
-                op,
-                move |scope| {
-                    scope.ensure_active()?;
-                    let conn = pool
-                        .open_standalone_reader()
-                        .map_err(|error| map_sqlite_err(error, op))?;
-                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        } else {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Entities,
-                op,
-                move |scope| {
-                    let mut guard = pool.resolve_reader_checkout(
-                        StorageCapability::Entities,
-                        op,
-                        pool.reader_until(|| scope.should_stop()),
-                    )?;
-                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        }
+        super::run_pooled_store_read(
+            Arc::clone(&self.pool),
+            StorageCapability::Entities,
+            op,
+            move |conn| f(conn).map_err(|error| map_err(error, op)),
+        )
+        .await
     }
 }
 
@@ -458,11 +431,12 @@ fn batch_upsert_entities(
     entities: &[Entity],
     attempted: u64,
 ) -> Result<BatchWriteSummary, rusqlite::Error> {
-    let mut affected = 0u64;
-    let mut failed = 0u64;
-    let mut first_error = String::new();
+    let mut summary = BatchWriteSummary {
+        attempted,
+        ..BatchWriteSummary::default()
+    };
 
-    for entity in entities {
+    for (index, entity) in entities.iter().enumerate() {
         let id_str = entity.id.to_string();
         let properties_str = entity
             .properties
@@ -493,22 +467,15 @@ fn batch_upsert_entities(
                 merge_event_id_str,
             ],
         ) {
-            Ok(_) => affected += 1,
+            Ok(_) => summary.affected = summary.affected.saturating_add(1),
             Err(e) => {
-                if first_error.is_empty() {
-                    first_error = e.to_string();
-                }
-                failed += 1;
+                let (class, retryability) = super::classify_batch_sqlite_error(&e);
+                summary.record_failure(index, Some(id_str), class, retryability, e.to_string());
             }
         }
     }
 
-    Ok(BatchWriteSummary {
-        attempted,
-        affected,
-        failed,
-        first_error,
-    })
+    Ok(summary)
 }
 
 fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {

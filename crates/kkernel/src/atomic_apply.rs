@@ -1517,18 +1517,34 @@ mod tests {
 
     use khive_types::Namespace;
 
-    fn scratch_runtime() -> KhiveRuntime {
+    /// Owns a file-backed runtime and removes its database directory after shutdown.
+    struct TestRuntime {
+        runtime: KhiveRuntime,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestRuntime {
+        type Target = KhiveRuntime;
+
+        fn deref(&self) -> &Self::Target {
+            &self.runtime
+        }
+    }
+
+    fn scratch_runtime() -> TestRuntime {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("atomic_apply_gtd.db");
-        let rt = KhiveRuntime::new(RuntimeConfig {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: Some(path),
             embedding_model: None,
             additional_embedding_models: vec![],
             ..RuntimeConfig::default()
         })
         .expect("runtime");
-        std::mem::forget(dir);
-        rt
+        TestRuntime {
+            runtime,
+            _temp_dir: dir,
+        }
     }
 
     /// Seed a live GTD task note directly (bypassing `gtd.assign`'s handler,

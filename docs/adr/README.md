@@ -188,6 +188,9 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-169](ADR-169-timezone-correct-timestamps.md)                       | Timezone-Correct Timestamps: Date-Only Values and a Configured Display Timezone                            |
 | [ADR-170](ADR-170-events-daemon-split.md)                               | Dedicated events daemon — the audit lane leaves the domain store                                           |
 | [ADR-171](ADR-171-brain-daemon-split.md)                                | Brain daemon — profile state leaves the domain process                                                     |
+| [ADR-172](ADR-172-versioned-notes-compare-and-set.md)                   | Versioned notes — compare-and-set updates, keyed create-if-absent, and a durability option                 |
+| [ADR-173](ADR-173-blob-chunked-upload.md)                               | Chunked blob upload — objects larger than one wire frame                                                   |
+| [ADR-174](ADR-174-ordered-streams-append.md)                            | Ordered streams — dense per-stream append with `expected_seq` and a lease fence                            |
 | [ADR-176](ADR-176-server-owned-config-thin-clients.md)                  | Server-owned storage config — client processes stop carrying engines                                       |
 | [ADR-177](ADR-177-weighted-incidence-topology.md)                       | Weighted incidence as the graph's storage primitive                                                        |
 

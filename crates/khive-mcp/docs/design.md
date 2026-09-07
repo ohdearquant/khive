@@ -27,6 +27,15 @@ decisions and rationale.
   even when a sibling `comm.send` or `comm.reply` fails. Callers that need the
   acknowledgement conditioned on delivery must use a Chain, or use `comm.reply`
   for the common deliver-first/read-mark-second flow.
+- Every MCP attempt receives one request-group correlation id before dispatch.
+  A caller-supplied `request_id` wins; otherwise the bridge mints an opaque
+  nonzero value that the daemon echoes and every per-op audit row records.
+- Once warm-daemon forwarding is admitted, cancellation cannot replace the
+  daemon outcome with a bare RPC error. The socket exchange runs in a detached
+  task, and a still-live handler waits for the real success/partial envelope.
+  Dropping the handler does not drop the exchange; the correlated audit rows
+  remain the observable terminal record. Cancellation before admission starts
+  no daemon or local work.
 - Invalid DSL (parse/lex failure) is preflighted before warm-daemon forwarding
   and returns an RPC-level `invalid_params` error; its error data carries
   `reason: "parse-error"` on both local and daemon-available paths. Per-verb

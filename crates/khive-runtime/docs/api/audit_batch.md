@@ -66,12 +66,26 @@ are terminal for the generation, not retried.
 `DispatchObligation` row produced by a verb that is both `VerbCategory::Assertive` AND explicitly
 opted in via `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` (an explicit, fail-closed allowlist —
 `Assertive` alone is not a sound proxy, since some Assertive handlers have their own
-accounting-bearing side effects; see that constant's doc comment), either reason degrades to
-best-effort instead of failing the dispatch — the read performed no domain write, so discarding
-its already-computed result to protect an obligation it does not need as strictly as a write does
-inverts the point of serving it (khive#2147, khive#2217). Every other obligation failure, and
-every failure for a non-opted-in verb, is unaffected — write-side hard-fail semantics are
-unchanged.
+durable or accounting-bearing side effects; see that constant's doc comment), either reason
+degrades to best-effort instead of failing the dispatch — the read performed no domain write, so
+discarding its already-computed result to protect an obligation it does not need as strictly as a
+write does inverts the point of serving it (khive#2147, khive#2217). The allowlist's opt-in is
+keyed by the owning pack and verb together, not the verb name alone, so a handler registered under
+the same name by a different pack never inherits degrade-safety it was not reviewed for. A closed
+live-source census classifies every public Assertive handler as either allowlisted or an
+incidental-effect exclusion, so newly added Assertive verbs remain fail-closed until reviewed.
+Every other obligation failure, and every failure for a non-opted-in verb, is unaffected —
+write-side hard-fail semantics are unchanged.
+
+Pack identity for this decision is never taken from the pack's own `PackRuntime::name()` report:
+eligibility additionally requires the pack to have been registered through the composition root's
+trusted path (`VerbRegistryBuilder::register_boxed`, exercised only by `PackRegistry::register_packs`'s
+`inventory`-discovered factories), not the public `VerbRegistryBuilder::register`. A pack loaded
+through the untrusted path can claim any `name()` it likes, including an allowlisted one, so
+without this third condition a same-named handler from an unreviewed pack could inherit
+degrade-safety whenever the real pack of that name was not also loaded. The whole eligibility
+decision — pack trust, category, and the `(pack, verb)` allowlist — is precomputed once when
+`VerbRegistryBuilder::build` runs, not re-derived per dispatch.
 
 ## Supervision and failure ownership (owner ruling R1)
 

@@ -23,22 +23,19 @@ use khive_db::{ConnectionPool, PoolConfig};
 
 const WRITE_DELAY_MS: u64 = 5_000;
 
-fn point_sink_at_slow_writer() {
+fn point_sink_at_slow_writer() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::env::set_var("KHIVE_WRITER_TIMEOUT_SINK_DIR", dir.path());
     std::env::set_var(
         "KHIVE_WRITER_TIMEOUT_SINK_WRITE_DELAY_MS",
         WRITE_DELAY_MS.to_string(),
     );
-    // Leak the tempdir so it stays alive for the rest of the process — the
-    // writer thread keeps writing (slowly) into it for as long as the
-    // process runs.
-    std::mem::forget(dir);
+    dir
 }
 
 #[test]
 fn sink_never_adds_measurable_latency_when_its_writer_is_genuinely_slow() {
-    point_sink_at_slow_writer();
+    let _sink_dir = point_sink_at_slow_writer();
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("stalled_writer_sink_test.db");

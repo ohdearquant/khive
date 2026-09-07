@@ -39,7 +39,7 @@ pub(crate) fn clear_post_load_hook() {
 
 use serde_json::Value;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{EventAttribution, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::event::Event;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{SqlAccess, SqlReader, SqlWriter};
@@ -560,6 +560,7 @@ pub(crate) async fn persist_feedback_state_mutation(
     };
 
     let namespace_for_op = namespace.clone();
+    let attribution_for_op = EventAttribution::from_token(token);
     let profile_id_for_op = profile_id;
     let op: khive_storage::AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
@@ -638,7 +639,8 @@ pub(crate) async fn persist_feedback_state_mutation(
                 .map(|updated_at| now_us.max(updated_at.saturating_add(1)))
                 .unwrap_or(now_us);
             let event = match event_write {
-                FeedbackEventWrite::Direct(mut event) => {
+                FeedbackEventWrite::Direct(event) => {
+                    let mut event = attribution_for_op.stamp(event);
                     event.created_at = commit_at_us;
                     khive_db::stores::event::append_event_on_writer(writer, &event)
                         .await
@@ -665,6 +667,7 @@ pub(crate) async fn persist_feedback_state_mutation(
                     let outcome = crate::fold_gate::apply_gate_and_append_within_tx(
                         writer,
                         &namespace_for_op,
+                        &attribution_for_op,
                         &profile_id_for_op,
                         &target_id,
                         gate_mode,

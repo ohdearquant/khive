@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import os
 import shutil
-import tempfile
 import signal
-import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 

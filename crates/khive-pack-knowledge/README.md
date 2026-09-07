@@ -65,20 +65,30 @@ let report = reindex_knowledge(&runtime, &token, opts, None, None).await?;
 
 ## Verbs
 
-| Verb                                                                              | What it does                                             |
-| --------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| `knowledge.upsert_atoms` / `knowledge.upsert_domains`                             | Bulk insert or update atoms / domains                    |
-| `knowledge.get` / `knowledge.list` / `knowledge.delete_atoms` / `knowledge.stats` | Corpus CRUD and aggregate counts                         |
-| `knowledge.index`                                                                 | Backfill embeddings + FTS for atoms/domains              |
-| `knowledge.search` / `knowledge.suggest` / `knowledge.compose`                    | TF-IDF search, domain suggestion, briefing assembly      |
-| `knowledge.fold`                                                                  | Knapsack selection of scored candidates against a budget |
-| `knowledge.edit`                                                                  | Upsert one atom's sections without wiping the rest       |
-| `knowledge.import`                                                                | Validate/import atlas markdown with stable path identity |
-| `knowledge.challenge` / `knowledge.adjudicate`                                    | Dispute and resolve a section's content                  |
-| `knowledge.learn` / `knowledge.cite` / `knowledge.topic`                          | Register/link/browse `concept` entities                  |
-| `knowledge.feedback`                                                              | Apply per-section signals to posterior weights           |
+| Verb                                                                              | What it does                                                |
+| --------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `knowledge.upsert_atoms` / `knowledge.upsert_domains`                             | Bulk insert or update atoms / domains                       |
+| `knowledge.get` / `knowledge.list` / `knowledge.delete_atoms` / `knowledge.stats` | Corpus CRUD and aggregate counts                            |
+| `knowledge.index`                                                                 | Backfill embeddings (FTS rebuild is `kkernel reindex`-only) |
+| `knowledge.search` / `knowledge.suggest` / `knowledge.compose`                    | TF-IDF search, domain suggestion, briefing assembly         |
+| `knowledge.fold`                                                                  | Knapsack selection of scored candidates against a budget    |
+| `knowledge.edit`                                                                  | Upsert one atom's sections without wiping the rest          |
+| `knowledge.import`                                                                | Validate/import atlas markdown with stable path identity    |
+| `knowledge.challenge` / `knowledge.adjudicate`                                    | Dispute and resolve a section's content                     |
+| `knowledge.learn` / `knowledge.cite` / `knowledge.topic`                          | Register/link/browse `concept` entities                     |
+| `knowledge.feedback`                                                              | Apply per-section signals to posterior weights              |
 
 All 19 verbs are `Visibility::Verb` (exposed on the agent-facing MCP surface).
+
+For a cheap, stable inventory walk, call
+`knowledge.list(fields=["id","slug"], after="", limit=500)` and round-trip each
+non-null `next_after`. The projection is pushed into SQL, so atom `content` is
+not hydrated. Cursor pages use `created_at ASC, id ASC`; legacy offset pages
+retain `created_at DESC, id DESC`. The cursor is a live traversal: inserts
+behind an issued boundary wait for a fresh walk, while inserts ahead may extend
+the current walk without shifting or duplicating pre-existing rows. Stop when
+`next_after` is null; cursor pages carry no `total`, because counting the
+namespace is a full scan per page.
 
 ## Where this sits
 

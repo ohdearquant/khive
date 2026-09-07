@@ -648,6 +648,18 @@ restore them: the presentation transform runs before format rendering, so
 already-transformed value. Extending the carve-out to container values is a
 separate decision that amends this paragraph.
 
+## Amendment 4 (2026-09-03): keyset cursor envelopes are structural
+
+The stable-list-envelope exception (section 7, Amendment 1) extends to keyset
+cursor pages that are not ADR-023 envelopes. A response object carrying a
+`next_after` key beside a `results` array — the
+`knowledge.list(after=…)` page: `results`, `limit`, `order`, `next_after` — is a
+cursor envelope. Agent mode retains `results` when it is `[]` and `next_after`
+when it is `null`, because an empty page and a null cursor are the walk's
+completion signals and a caller that cannot see them cannot terminate. The
+exception is envelope-scoped in the same way: a `results` array without a
+sibling `next_after` key receives the ordinary transform.
+
 ## References
 
 - ADR-016 (Request DSL) §"UUID arguments" — short-prefix resolution on input

@@ -14,7 +14,7 @@ use khive_runtime::{
 };
 use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
-use khive_types::namespace::Namespace;
+use khive_types::{namespace::Namespace, SubstrateKind};
 
 use super::locator::LocatorCache;
 use super::registry::BackendRegistry;
@@ -77,13 +77,18 @@ pub(super) fn bounded_backend_cause_for_log(message: &str) -> String {
 /// Result of a single backend's entity-search contribution to a fan-out.
 ///
 /// `hits` may be empty when the backend returned no results.
-/// `error` carries the backend-specific failure message on error.
+/// `error` carries a whole-backend failure message (text arm, or a fatal
+/// error before either arm ran); a backend that reported one is treated as
+/// having contributed no hits at all. `vector_error` instead carries a
+/// vector-arm-only failure: the text arm still ran and `hits` still carries
+/// its results, so this backend is NOT `error`-failed.
 #[derive(Debug)]
 pub struct BackendSearchResult {
     pub backend_id: BackendId,
     pub hits: Vec<SearchHit>,
     pub note_hits: Vec<NoteSearchHit>,
     pub error: Option<String>,
+    pub vector_error: Option<String>,
 }
 
 /// A located edge endpoint: which backend owns it, and its substrate kind.
@@ -568,6 +573,11 @@ impl SubstrateCoordinator {
         extra_visible: &[Namespace],
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
         let search_notes = request.substrate() == SearchSubstrate::Note;
+        let requested_substrate = if search_notes {
+            SubstrateKind::Note
+        } else {
+            SubstrateKind::Entity
+        };
         let search_limit = rrf_fanout_search_limit(request);
         let limit = request.limit();
         let props_filter_owned = request.properties().cloned();
@@ -579,6 +589,7 @@ impl SubstrateCoordinator {
         let entries: Vec<(BackendId, Arc<KhiveRuntime>)> = self
             .registry
             .iter()
+            .filter(|entry| entry.serves(requested_substrate))
             .map(|e| (e.id.clone(), Arc::clone(&e.runtime)))
             .collect();
 
@@ -608,6 +619,7 @@ impl SubstrateCoordinator {
                         hits: vec![],
                         note_hits: vec![],
                         error: Some(e.to_string()),
+                        vector_error: None,
                     };
                     return (vec![], vec![], vec![backend_result]);
                 }
@@ -632,10 +644,9 @@ impl SubstrateCoordinator {
                         unreachable!("a pending future never resolves");
                     }
                     runtime
-                        .search_notes(
+                        .search_notes_outcome(
                             &token,
                             request.query(),
-                            None,
                             search_limit,
                             request.kind_filter(),
                             include_superseded,
@@ -648,8 +659,9 @@ impl SubstrateCoordinator {
                     khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
-                    Ok(Ok(note_hits)) => {
-                        let filtered_note_hits: Vec<NoteSearchHit> = note_hits
+                    Ok(Ok(outcome)) => {
+                        let filtered_note_hits: Vec<NoteSearchHit> = outcome
+                            .hits
                             .iter()
                             .filter(|hit| {
                                 request
@@ -662,8 +674,9 @@ impl SubstrateCoordinator {
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
-                            note_hits,
+                            note_hits: outcome.hits,
                             error: None,
+                            vector_error: outcome.vector_error,
                         };
                         return (vec![], filtered_note_hits, vec![backend_result]);
                     }
@@ -673,6 +686,7 @@ impl SubstrateCoordinator {
                             hits: vec![],
                             note_hits: vec![],
                             error: Some(e.to_string()),
+                            vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
@@ -692,6 +706,7 @@ impl SubstrateCoordinator {
                             hits: vec![],
                             note_hits: vec![],
                             error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                            vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
@@ -703,10 +718,9 @@ impl SubstrateCoordinator {
                         unreachable!("a pending future never resolves");
                     }
                     runtime
-                        .hybrid_search(
+                        .hybrid_search_outcome(
                             &token,
                             request.query(),
-                            None,
                             search_limit,
                             request.kind_filter(),
                             request.entity_type(),
@@ -719,8 +733,9 @@ impl SubstrateCoordinator {
                     khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
-                    Ok(Ok(hits)) => {
-                        let filtered_hits: Vec<SearchHit> = hits
+                    Ok(Ok(outcome)) => {
+                        let filtered_hits: Vec<SearchHit> = outcome
+                            .hits
                             .iter()
                             .filter(|hit| {
                                 request
@@ -732,9 +747,10 @@ impl SubstrateCoordinator {
                             .collect();
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
-                            hits,
+                            hits: outcome.hits,
                             note_hits: vec![],
                             error: None,
+                            vector_error: outcome.vector_error,
                         };
                         return (filtered_hits, vec![], vec![backend_result]);
                     }
@@ -744,6 +760,7 @@ impl SubstrateCoordinator {
                             hits: vec![],
                             note_hits: vec![],
                             error: Some(e.to_string()),
+                            vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
@@ -763,6 +780,7 @@ impl SubstrateCoordinator {
                             hits: vec![],
                             note_hits: vec![],
                             error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                            vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
@@ -849,14 +867,15 @@ impl SubstrateCoordinator {
                             "injected failure".to_string(),
                         )),
                         None::<Vec<NoteSearchHit>>,
+                        None,
                     );
                 }
                 if search_notes {
                     if let Some(hits) = note_override {
-                        return (backend_id, Ok(vec![]), Some(hits));
+                        return (backend_id, Ok(vec![]), Some(hits), None);
                     }
                 } else if let Some(hits) = entity_override {
-                    return (backend_id, Ok(hits), None);
+                    return (backend_id, Ok(hits), None, None);
                 }
                 let token = match runtime.authorize_with_visibility(ns, extra_visible_task) {
                     Ok(t) => t,
@@ -865,15 +884,14 @@ impl SubstrateCoordinator {
                             error = %bounded_backend_cause_for_log(&e.to_string()),
                             "fan_out_search: authorization denied for namespace"
                         );
-                        return (backend_id, Err(e), None);
+                        return (backend_id, Err(e), None, None);
                     }
                 };
                 if search_notes {
                     let result = runtime
-                        .search_notes(
+                        .search_notes_outcome(
                             &token,
                             &q,
-                            None,
                             sl,
                             kf.as_deref(),
                             include_superseded,
@@ -887,15 +905,19 @@ impl SubstrateCoordinator {
                         // would remove candidates the RRF merge needs to fairly
                         // rank a hit that only places #2+ on any single backend.
                         // `rrf_merge_note_hits` applies `limit` once, after merge.
-                        Ok(note_hits) => (backend_id, Ok(vec![]), Some(note_hits)),
-                        Err(e) => (backend_id, Err(e), None),
+                        Ok(outcome) => (
+                            backend_id,
+                            Ok(vec![]),
+                            Some(outcome.hits),
+                            outcome.vector_error,
+                        ),
+                        Err(e) => (backend_id, Err(e), None, None),
                     }
                 } else {
                     let result = runtime
-                        .hybrid_search(
+                        .hybrid_search_outcome(
                             &token,
                             &q,
-                            None,
                             sl,
                             kf.as_deref(),
                             et.as_deref(),
@@ -906,8 +928,8 @@ impl SubstrateCoordinator {
                     match result {
                         // See the note-substrate arm above: no per-backend
                         // truncation before RRF merge (MAJ-4).
-                        Ok(hits) => (backend_id, Ok(hits), None),
-                        Err(e) => (backend_id, Err(e), None),
+                        Ok(outcome) => (backend_id, Ok(outcome.hits), None, outcome.vector_error),
+                        Err(e) => (backend_id, Err(e), None, None),
                     }
                 }
             };
@@ -948,7 +970,7 @@ impl SubstrateCoordinator {
                 }
             };
             match joined {
-                Ok(Ok(((backend_id, Ok(hits), note_hits_opt), completed_at)))
+                Ok(Ok(((backend_id, Ok(hits), note_hits_opt, vector_error), completed_at)))
                     if completed_at <= request_deadline.async_at() =>
                 {
                     let note_hits = note_hits_opt.unwrap_or_default();
@@ -963,9 +985,10 @@ impl SubstrateCoordinator {
                         hits,
                         note_hits,
                         error: None,
+                        vector_error,
                     });
                 }
-                Ok(Ok(((backend_id, Err(e), _), completed_at)))
+                Ok(Ok(((backend_id, Err(e), _, _), completed_at)))
                     if completed_at <= request_deadline.async_at() =>
                 {
                     per_backend.push(BackendSearchResult {
@@ -973,6 +996,7 @@ impl SubstrateCoordinator {
                         hits: vec![],
                         note_hits: vec![],
                         error: Some(e.to_string()),
+                        vector_error: None,
                     });
                 }
                 Ok(Err(join_err)) => {
@@ -989,6 +1013,7 @@ impl SubstrateCoordinator {
                         hits: vec![],
                         note_hits: vec![],
                         error: Some(error.to_string()),
+                        vector_error: None,
                     });
                 }
                 Ok(Ok((_late_result, _completed_at))) => {
@@ -1002,6 +1027,7 @@ impl SubstrateCoordinator {
                         hits: vec![],
                         note_hits: vec![],
                         error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                        vector_error: None,
                     });
                 }
                 Err(_elapsed) => {
@@ -1015,6 +1041,7 @@ impl SubstrateCoordinator {
                         hits: vec![],
                         note_hits: vec![],
                         error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                        vector_error: None,
                     });
                 }
             }

@@ -82,8 +82,7 @@ impl VectorStore for TestVectorStore {
         Ok(BatchWriteSummary {
             attempted: records.len() as u64,
             affected: records.len() as u64,
-            failed: 0,
-            first_error: String::new(),
+            ..BatchWriteSummary::default()
         })
     }
 
