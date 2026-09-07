@@ -69,12 +69,14 @@ class _Record(BaseModel):
     def _null_list(cls, v: Any) -> Any:
         return [] if v is None else v
 
+
 class Entity(_Record):
     """A named node in the graph. `kind` validates server-side against the
     pack-declared entity vocabulary (concept, document, project, ...)."""
 
     name: str
     description: str | None = None
+
 
 class Note(_Record):
     """Free-text annotation record. `kind` validates server-side against the
@@ -93,6 +95,7 @@ class Note(_Record):
         if not isinstance(v, str):
             raise TypeError(f"kind must be a string, got {type(v)}")
         return v
+
 
 class Incidence(BaseModel):
     """One node's participation in one edge (weighted incidence).
@@ -155,14 +158,47 @@ class Edge(_Record):
                 return m.weight
         raise KeyError(f"{node_id} is not a member of edge {self.id}")
 
+
 class Page(BaseModel, Generic[T]):
-    """One page of results. `total=None` means the server skipped the count."""
+    """One page; missing counts/continuations are not inferred from its length.
+
+    Cursor readers follow `next_after`. An empty or short page with a cursor
+    or `scan_incomplete=True` does not establish the end of the filtered scan.
+    """
 
     model_config = ConfigDict(extra="allow")
 
     items: list[T] = Field(default_factory=list)
     total: int | None = None
     next_offset: int | None = None
+    next_after: str | None = None
+    scan_incomplete: bool | None = None
+    requested_limit: int | None = None
+    effective_limit: int | None = None
+    limit_clamped: bool | None = None
+
+
+class OpError(BaseModel):
+    """A structured per-op error, including the server's unchanged write finality."""
+
+    model_config = ConfigDict(extra="allow", strict=True)
+
+    message: str
+    kind: str | None = None
+    code: str | None = None
+    stage: str | None = None
+    retryable: bool | None = None
+    request_state: str | None = None
+    task_terminated: bool | None = None
+    timeout_ms: int | None = None
+    capability: str | None = None
+    operation: str | None = None
+    scope: str | None = None
+    retry_after_ms: int | None = None
+    details: dict[str, str] | None = None
+
+    def __str__(self) -> str:
+        return f"{self.code}: {self.message}" if self.code else self.message
 
 
 class OpResult(BaseModel):
@@ -173,4 +209,4 @@ class OpResult(BaseModel):
     ok: bool
     tool: str
     result: Any = None
-    error: str | None = None
+    error: OpError | str | None = None
