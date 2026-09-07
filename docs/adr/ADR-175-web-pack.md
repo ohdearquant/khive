@@ -184,8 +184,9 @@ load-bearing.
 6. **Views switch.** `include_views=false` on tree A produces zero `machine_view` rows and zero rule-4
    edges with the page counts unchanged; a declared view removed from disk yields `views_missing` of one
    and no quarantine.
-7. **Vocabulary.** Every D2 token validates through the create path, and the endpoint-rule
-   introspection test lists exactly the six D3 rules, none shadowing a base row.
+7. **Vocabulary.** Every D2 token validates through the create path; the endpoint-rule introspection
+   test lists the six D3 rules as declared, asserts rows 1, 2, 3 and 5 are absent from the base contract
+   (additive), and accepts rows 4 and 6 as intentional restatements of base rows.
 
 ## Rationale
 
@@ -236,14 +237,16 @@ its own gate, and putting it first would hold the vocabulary behind that review.
 
 ## Implementation
 
-1. Registry tokens (D2) and `EDGE_RULES` (D3) in `crates/khive-pack-web/src/vocab.rs`, with the
-   endpoint-rule introspection test the code pack carries.
+1. The five D2 entries added to the shared registry in `crates/khive-types/src/entity_type.rs` (the
+   ADR-085 path, so they validate through the shared create path); the D3 `EDGE_RULES` in
+   `crates/khive-pack-web/src/vocab.rs` with the endpoint-rule introspection test the code pack carries.
 2. Scanner (`manifest.rs`, `views.rs`) and Extractor (`extract.rs`) with the deterministic id
    namespace; `web.ingest` handler; the map-database refusal of the production path as a web-specific
    wrapper (the code pack's fence hard-codes its own default filename and verb label, so the safety
    comparison is reused and the default and error text are the web pack's own).
-3. Fixture: two fictional site trees (one with tools and skills, one without) and a broken manifest;
-   tests assert the counts, the quarantine reasons, and idempotent re-ingest.
+3. Fixtures: two fictional site trees (one with tools, skills and views; one manifest-only) and a
+   broken manifest. The Acceptance section above is the authoritative test matrix: one test per arm,
+   plus the two mutations.
 4. `docs/packs/web.md`: the vocabulary tables, the report shape, and a ten-line multi-site run.
 5. Status flip to Accepted by the rule in the catalog README once the implementation lands.
 
