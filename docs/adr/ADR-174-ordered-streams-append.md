@@ -89,8 +89,11 @@ to be live and in the ledger row's namespace. No backfill: existing notes belong
 Because the entry is a note it inherits the writer, the gate and admission path, the `version` column
 and trigger from ADR-172, `search`, and the `list(after=)` cursor walk over `notes_seq`, where it appears
 in store insertion order like any other note (ordinary unkeyed pages order by `created_at DESC, id ASC`,
-as today). The ordered surface is the verb family below. This ADR defines no audit event: today's note
-create emits none on the generic path, and a stream append is the same write.
+as today). The ordered surface is the verb family below. This ADR defines no audit event of its own:
+today's note create emits none on the generic path, and a stream append is the same write. The
+dispatch layer's per-call gate audit row (one per verb call whenever an event store is configured,
+`crates/khive-runtime/src/pack.rs`) applies to the stream verbs as to every other verb, refused calls
+included, and is not this ADR's event.
 
 ### 2. Verbs
 
@@ -236,9 +239,11 @@ Stated before implementation, checked at the PR that lands the code; every arm n
    returns them in that order. In-process tasks alone do not satisfy this arm.
 3. **`expected_seq` conflict writes nothing.** With one entry present, `append(expected_seq=3)` fails with
    `seq_conflict` carrying `next_seq = 2`; the note count and the ledger count are unchanged from before
-   the call, and the audit event count is unchanged as a control that must stay at zero delta (§1: the
-   generic note create emits no audit event today, so a nonzero delta here means a writer this ADR does
-   not know about); `append(expected_seq=2)` then succeeds with `seq = 2`.
+   the call. The audit population is read as domain events only, excluding the dispatch layer's
+   per-call gate row, which the refused call does write; that domain count is a control that must stay
+   at zero delta (§1: the generic note create emits no domain audit event today, so a nonzero delta
+   here means a writer this ADR does not know about). `append(expected_seq=2)` then succeeds with
+   `seq = 2`.
 4. **Fence.** An append with `fence` at the right version succeeds; at a stale version, or when the fence
    row is missing, it fails with `fence_conflict` and neither the stream nor the fence row changes.
    Cross-process, as in 2.
