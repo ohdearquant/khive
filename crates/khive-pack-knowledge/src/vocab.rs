@@ -463,7 +463,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "auto_limit",
                 param_type: "integer",
                 required: false,
-                description: "Number of domains to auto-suggest from `query` when both domain_ids and atom_ids are empty (default 5, clamped 1-20).",
+                description: "Number of domains to auto-suggest from `query` when both domain_ids and atom_ids are empty (default 5, clamped 1-20). This caps suggested candidates before domains without live members are dropped, so auto-compose may compose fewer domains than auto_limit.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

@@ -1220,6 +1220,80 @@ async fn suggest_member_sizing_counts_only_live_members() {
 }
 
 #[tokio::test]
+async fn suggest_member_sizing_counts_each_distinct_live_atom_once() {
+    const NAME: &str = "Sizing Shared Member Name";
+    const BODY: &str = "Stored text supplies a valid live member with a measurable cost for each domain while the separate domain descriptions determine candidate relevance and ordering.";
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [
+                {
+                    "slug": "sizing-distinct-member-a",
+                    "name": NAME,
+                    "content": BODY,
+                    "finalized": true
+                },
+                {
+                    "slug": "sizing-distinct-member-b",
+                    "name": NAME,
+                    "content": BODY,
+                    "finalized": true
+                }
+            ]}),
+        )
+        .await
+        .expect("upsert distinct atoms with identical names and content");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [
+                {
+                    "slug": "sizing-repeated-domain",
+                    "name": "Sizing Repeated Domain",
+                    "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                    "members": ["sizing-distinct-member-a", "sizing-distinct-member-a"]
+                },
+                {
+                    "slug": "sizing-distinct-domain",
+                    "name": "Sizing Distinct Domain",
+                    "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                    "members": ["sizing-distinct-member-a", "sizing-distinct-member-b"]
+                }
+            ]}),
+        )
+        .await
+        .expect("upsert repeated and distinct membership");
+
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let result = KnowledgeHandlers::suggest(
+        &rt,
+        &token,
+        json!({"query": "lexical domain member sizing search", "limit": 2}),
+        &vamana::new_shared(),
+    )
+    .await
+    .expect("suggest domains with repeated and distinct members");
+    assert_eq!(result["total"], 2, "got: {result}");
+    let results = result["results"].as_array().expect("suggest results");
+    let single_atom_size = crate::knowledge::util::estimate_compose_item_tokens(NAME, BODY);
+    for (name, expected_members) in [("Sizing Repeated Domain", 1), ("Sizing Distinct Domain", 2)] {
+        let domain = results
+            .iter()
+            .find(|domain| domain["name"] == name)
+            .expect("domain is served");
+        assert_eq!(domain["members"], expected_members, "got: {result}");
+        assert_eq!(
+            domain["size"],
+            single_atom_size * expected_members,
+            "got: {result}"
+        );
+    }
+    assert!(result["degraded"].get("member_sizing_timeout").is_none());
+}
+
+#[tokio::test]
 async fn suggest_member_sizing_serves_empty_or_missing_members_at_zero() {
     for members in [json!([]), json!(["absent-member"])] {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");

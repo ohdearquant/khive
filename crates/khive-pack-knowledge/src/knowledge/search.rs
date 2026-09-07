@@ -1911,7 +1911,7 @@ async fn load_domain_member_token_sizes(
     let rows = match reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT d.id AS domain_id, a.name, a.content \
+                "SELECT DISTINCT d.id AS domain_id, a.id AS atom_id, a.name, a.content \
                  FROM knowledge_domains AS d \
                  LEFT JOIN json_each(d.members) AS member ON 1 = 1 \
                  LEFT JOIN knowledge_atoms AS a \
