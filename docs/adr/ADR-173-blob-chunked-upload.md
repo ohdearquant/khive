@@ -47,7 +47,12 @@ sits inside the `ops` string and the `ops` string sits inside the frame; the con
 is tighter, so raising either cap later moves `part_limit` without a second edit. `REQUEST_RESERVE` is
 the room the call's own text needs around the payload (`upload_id`, `index`, the verb name, the ops
 wrapper, and at the frame the actor and namespace fields) and is fixed at 8192 bytes, twice the
-response reserve, because the request carries more fields than the response. With the constants as
+response reserve, because the request carries more fields than the response. The reserve is a bound
+on the call's own text inside `ops`, which is fixed in shape; it is not a bound on the frame envelope,
+whose `visible_namespaces` list has no cardinality limit. That is safe today because the parser cap
+binds and the frame keeps `MAX_FRAME_BYTES - MAX_OPS_INPUT_LEN` of headroom above the whole `ops`
+string, 7 MiB for the envelope; if the two caps ever converge, the reserve must be re-derived from
+bounded envelope fields, and acceptance 4's formula assert is where that shows up. With the constants as
 they stand the parser cap is the tighter one and `part_limit` is 780,288 bytes, so a 64 MiB object
 takes 87 parts. A part of exactly `part_limit` raw bytes renders to an `ops` string under
 `MAX_OPS_INPUT_LEN` and to a frame under `MAX_FRAME_BYTES`; a part one byte larger is refused by the
@@ -86,7 +91,7 @@ second object, and on the filesystem backend the existing object's mtime touched
 `upload_id` is dead.
 
 Because commit and put share one publish routine, commit inherits what put has today, including the
-missing directory barrier after the rename that 01260bf0 tracks: the file is synced, the directory is
+missing directory barrier after the rename, a known defect with its own repair in flight: the file is synced, the directory is
 not, so the published entry is not machine-death durable on either path. The barrier repair lands in
 that one routine and covers both; a second copy of the publish step is not permitted, and the
 acceptance list holds the barrier test against commit as well as put once the repair lands.
@@ -138,10 +143,22 @@ names that as a deployment requirement rather than pretending the daemon can rea
 ### 4. Abort and expiry
 
 `blob.abort(upload_id)` discards the staging object and the pack record. An upload with no part for one
-hour is expired: the pack's periodic task, the one that drives the transactional GC of ADR-111 §8,
-aborts idle records and calls `sweep_uploads` with the same idle bound, which also catches staging left
-behind by a crash. The public snapshot orphan sweep is disabled in this tree; the upload sweep does not
-depend on it. Uploads do not survive a daemon restart: the pack record is not journaled, and a client
+hour is expired, and expiry is enforced at two places so that neither depends on the other's timing.
+At the verbs: `put_part` and `commit` on an upload whose last part is older than the idle bound abort
+it, drop the record, and answer unknown upload, so a stale upload never commits whatever the sweeper is
+doing. By a sweeper: the blob pack has no periodic task in this tree (its GC entry points are
+administrative, ADR-111 §8), so this ADR adds one, spawned by the serving lifecycle beside the session
+WAL-registry sweep in `crates/khive-mcp/src/serve.rs` and shaped the same way: a config read from the
+environment (`KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS`, default 600; `KHIVE_BLOB_UPLOAD_IDLE_SECS`,
+default 3600), a shutdown watch channel, and a join handle the server awaits at shutdown. Each tick
+aborts idle pack records and calls `sweep_uploads(idle_for)` on the backend, which also catches staging
+left behind by a crash. A tick that fails logs the backend error at warn and the next tick retries; a
+failing sweeper never stops serving and never touches a committed object. The sweeper and the
+transactional orphan GC of ADR-111 §8 do not coordinate because neither can see the other's objects: on
+the filesystem the GC walk skips dot-leading entries, so `.uploads/` is invisible to it, and on S3 the
+orphan sweep skips any key that does not parse as a shard key, so `uploads/<id>` is invisible to it
+(the filesystem caller-snapshot `orphan_sweep` is disabled in this tree; the S3 one is live, and it is
+safe for that reason). Uploads do not survive a daemon restart: the pack record is not journaled, and a client
 whose upload id is unknown after a restart begins again. That is stated here rather than engineered
 around because the client already retries from `begin` on any error class it cannot classify.
 
@@ -179,11 +196,12 @@ uploads that survive a daemon restart, and a dedup flag on the result.
 
 - Four verbs added to the blob pack; five methods added to `BlobStore`, implemented by both backends
   and refused by the read-only wrapper; no schema change; no wire protocol change.
+- The serving lifecycle gains one periodic task, the upload sweeper, with two environment knobs.
 - The filesystem backend gains a staging directory under the blob root and its own expiry sweep; the S3
   backend gains a staging prefix, a buffered multipart writer, a server-side copy at commit, a prefix
   sweep, and a documented dependency on the bucket's incomplete-multipart lifecycle rule.
-- Commit and put share the publish routine, so the 01260bf0 directory-barrier repair covers both when it
-  lands, and until then neither is machine-death durable.
+- Commit and put share the publish routine, so the directory-barrier repair covers both when it lands,
+  and until then neither is machine-death durable.
 - A client library can expose one `put(bytes)` that chooses `blob.put` or the chunked path by size, so
   callers see one operation with one result shape.
 - The 64 MiB ceiling is now reachable over the wire, which is the point.
@@ -204,19 +222,26 @@ uploads that survive a daemon restart, and a dedup flag on the result.
    request parser accepts and is accepted by the handler, and one of `part_limit + 1` is refused on
    decoded length; the same test asserts `part_limit` equals the §1 formula evaluated over the live
    constants, so a moved cap fails the test rather than a client.
-5. Abort leaves no file; an upload idle past the expiry is gone after the sweep; the transactional
-   orphan GC run with a live staging file present deletes nothing it should not (the control: a
-   committed object and a staging file side by side, both survive one GC pass, the staging file alone is
-   removed by the upload sweep after expiry).
+5. Abort leaves no file. Expiry, verb side: with no sweeper running, a `put_part` after the idle bound
+   answers unknown upload and the staging file is gone. Expiry, sweeper side: with no verb call, an
+   idle upload's staging file is gone after the sweeper's next tick. The transactional orphan GC run
+   with a live staging file present deletes nothing it should not (the control: a committed object and
+   a staging file side by side, both survive one GC pass, the staging file alone is removed by the
+   sweeper after expiry); on S3 the same control runs against the S3 orphan sweep with a `uploads/<id>`
+   key present.
 6. Restart between `put_part` and `commit`: `commit` answers unknown upload; the client's begin-again path
-   succeeds; on the filesystem backend the orphaned staging file is removed by the next upload sweep.
-7. Mutation: with the tail-retry length check removed, test 3's different-length resend is accepted
-   (red); with the tail-retry hash check removed, test 3's same-length different-bytes resend is
-   accepted (red); with the upload sweep pass removed, test 5's expiry arm is red; with commit given its
-   own copy of the publish step, the shared-routine assertion in test 8 is red.
+   succeeds; the orphaned staging object, whose record died with the process, is removed by the
+   sweeper's first tick after the idle bound on both backends.
+7. Mutation: with the tail-retry hash check removed, test 3's same-length different-bytes resend is
+   accepted (red). The length comparison is a pre-check the digest subsumes, so it carries no mutation
+   arm of its own: a different-length resend also has a different digest and is refused either way.
+   With the verb-side expiry removed, test 5's stale `put_part` is accepted (red); with the sweeper's
+   `sweep_uploads` call removed, test 5's sweeper arm and test 6 are red; with commit given its own copy
+   of the publish step, the shared-routine assertion in test 8 is red.
 8. One publish routine: a test asserts by construction that `put` and `commit_upload` call the same
-   function for the rename-into-shard step, and once the 01260bf0 barrier repair lands, the barrier test
-   runs against `commit` as well as `put`.
-9. S3 backend: a 64 MiB upload through wire parts of `part_limit` bytes completes against a MinIO-compatible target
-   (the ADR-111 Amendment 2 lane) and reads back byte-identical; abort leaves no staging object.
+   function for the rename-into-shard step, and once the directory-barrier repair lands, the barrier
+   test runs against `commit` as well as `put`.
+9. S3 backend: a 64 MiB upload through wire parts of `part_limit` bytes completes against a
+   MinIO-compatible target (the ADR-111 Amendment 2 lane) and reads back byte-identical; abort leaves no
+   staging object.
 10. Where ADR-111 Amendment 4's put ledger exists: no row before commit and exactly one after.
