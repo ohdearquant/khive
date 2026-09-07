@@ -49,8 +49,16 @@ CREATE TABLE IF NOT EXISTS note_streams (
     seq       INTEGER NOT NULL CHECK (seq > 0),
     note_id   TEXT    NOT NULL UNIQUE,
     PRIMARY KEY (namespace, stream, seq),
-    FOREIGN KEY (namespace, note_id) REFERENCES notes (namespace, id)
+    FOREIGN KEY (note_id) REFERENCES notes (id)
 );
+
+CREATE TRIGGER IF NOT EXISTS refuse_stream_foreign_note
+BEFORE INSERT ON note_streams
+WHEN NOT EXISTS (SELECT 1 FROM notes
+                 WHERE id = NEW.note_id AND namespace = NEW.namespace AND deleted_at IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'stream_member');
+END;
 
 CREATE TRIGGER IF NOT EXISTS refuse_stream_gap
 BEFORE INSERT ON note_streams
@@ -73,8 +81,10 @@ makes two concurrent appends take consecutive numbers rather than the same one. 
 backstop, and it holds against any writer, not only the verb: `refuse_stream_gap` admits exactly the
 next number, so a duplicate, a skip and a zero all fail as constraint errors; the ledger cannot lose a
 row; the foreign key, enforced because the pool turns `foreign_keys` on for every connection
-(`crates/khive-db/src/pool.rs`), ties each row to a live note in the same namespace and refuses a
-rewrite of that note's `id`. No backfill: existing notes belong to no stream.
+(`crates/khive-db/src/pool.rs`), ties each row to an existing note and refuses a rewrite of that note's
+`id` (`notes.id` is the table's primary key; `namespace` is a separate column with no unique key of its
+own, so the namespace match is the trigger's job), and `refuse_stream_foreign_note` requires the note
+to be live and in the ledger row's namespace. No backfill: existing notes belong to no stream.
 
 Because the entry is a note it inherits the writer, the gate and admission path, the `version` column
 and trigger from ADR-172, `search`, and the `list(after=)` cursor walk over `notes_seq`, where it appears
@@ -201,7 +211,7 @@ the array as an ordered transaction.
 - Notes gain a second insertion path that cannot be undone. A note that is a stream entry is the first
   kind of note in khive that `delete` refuses; tools that assume every note is deletable meet
   `stream_member` and must say so rather than retry.
-- Two triggers on `notes` and two on `note_streams`, plus a foreign key. The `notes` triggers' `WHEN`
+- Two triggers on `notes` and three on `note_streams`, plus a foreign key. The `notes` triggers' `WHEN`
   clause is one indexed lookup on `note_streams.note_id` (`UNIQUE` gives the index) per delete or
   content update, the same order of cost as the ADR-172 version bump; the gap trigger is one primary-key
   seek per append.
@@ -242,12 +252,12 @@ Stated before implementation, checked at the PR that lands the code; every arm n
    `salience` succeeds. Through direct statements against a migrated scratch database, because no verb can
    issue them: an `UPDATE notes` moving an entry's `namespace`, `kind` or `id`, a `DELETE FROM
    note_streams`, an `INSERT` into `note_streams` with `seq` equal to `0`, to the current head, or to
-   the head plus two, and an insert naming a `note_id` absent from `notes`, all fail as constraint or
-   trigger errors. `stream.stat.count` still equals `head_seq` after all of them.
+   the head plus two, an insert naming a `note_id` absent from `notes`, and one naming a note that
+   exists in another namespace, all fail as constraint or trigger errors. `stream.stat.count` still equals `head_seq` after all of them.
 8. **Mutation.** With the `expected_seq` predicate removed, test 3 goes red; with the fence check removed,
    test 4 goes red; with the note insert committed before the ledger insert instead of in one
    transaction and the ledger insert forced to fail, test 3's unchanged-count assertion goes red; with
-   any one of the four triggers, the `CHECK` or the foreign key dropped, the corresponding arm of test
+   any one of the five triggers, the `CHECK` or the foreign key dropped, the corresponding arm of test
    7 goes red. All logs retained beside the PR evidence.
 9. **Migration.** The migration applies to a populated store and to an empty one; no existing note joins
    a stream; a database at the previous version migrates and passes tests 1 and 7.
