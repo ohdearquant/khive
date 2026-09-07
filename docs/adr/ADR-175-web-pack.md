@@ -151,6 +151,26 @@ follow-up decision gated on one validated real ingest of a multi-site tree.
 6. **Fixtures are synthetic.** Test fixtures use fictional site trees only; no real brand's content
    is committed to this repository.
 
+## Acceptance, stated before implementation
+
+Each arm names its expected red before it runs; the mutations are the controls that prove the arm is
+load-bearing.
+
+1. **Fixture counts.** Two fictional site trees ingest to exact, pre-stated counts per subtype and per
+   relation in the report (tree A: tools, skills and views; tree B: manifest-only, so zero tools, zero
+   skills, pages without `machine_view`).
+2. **Manifest refusal.** A missing manifest refuses the whole site with `manifest_missing`; a malformed
+   one with `manifest_malformed`; in both cases the map database holds zero rows afterwards.
+3. **Cross-check.** An `llms.txt` disagreeing with the manifest yields one quarantined declaration
+   naming the field and the reason; the manifest value is what is stored.
+4. **Idempotence.** Re-ingesting the same tree changes nothing (row count and ids equal). One changed
+   declaration updates the same id and the count is unchanged. Mutation: drop the UUIDv5 keying and the
+   re-ingest doubles the rows (red).
+5. **Production refusal.** `db` pointed at the production database is refused before any write, with
+   no override. Mutation: remove the check (red).
+6. **Vocabulary.** Every D2 token validates through the create path, and the endpoint-rule
+   introspection test lists exactly the six D3 rules, none shadowing a base row.
+
 ## Rationale
 
 **Why a domain-ontology pack and not a capability pack.** The value is a shared vocabulary that two
