@@ -17,7 +17,7 @@ this shape:
    the defining application to the cited one. Hypergraph literature makes
    this exact distinction — a weighted incidence `γ(v, e)` per member,
    separate from any global edge weight `w(e)` (edge-dependent vertex
-   weights; Chitra & Raphael, ICML 2019). One `weight` column per edge
+   weights, as defined in the ICML 2019 paper on hypergraphs with edge-dependent vertex weights). One `weight` column per edge
    cannot represent it.
 2. **Hyperedges are unrepresentable.** A relation over three or more
    records (a composition, a multi-party derivation, an n-ary event) has
