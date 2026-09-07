@@ -126,9 +126,15 @@ calls a note, a `key` is what a program looks it up by.
 
 `list(kind="note", ...)` gains:
 
-- `key_prefix`: rows whose `key` starts with the string. Implemented as a range predicate
-  (`key >= ?p AND key < ?p || CHAR(0x10FFFF)`) so it uses the index in §3, never `LIKE`, so `%` and `_` in
-  a key need no escaping.
+- `key_prefix`: rows whose `key` starts with the string. Implemented as a range predicate on the index
+  in §3, never `LIKE`, so `%` and `_` in a key need no escaping: `key >= ?p AND key < ?s`, where `?s` is
+  the lexicographic successor of the prefix computed by the caller of the statement: drop every trailing
+  U+10FFFF code point, then increment the last remaining code point (skipping the surrogate block, so
+  U+D7FF steps to U+E000). SQLite's default `BINARY` collation compares UTF-8 bytes, and UTF-8 preserves
+  code point order, so every key that starts with the prefix sorts in `[p, s)`. When nothing remains
+  after the drop, or the prefix is empty, there is no upper bound and the predicate is `key >= ?p`
+  alone. `p || CHAR(0x10FFFF)` is not a valid upper bound: the keys `p` + U+10FFFF and any extension of
+  it start with `p` and sort at or above it, so a `<` bound omits them.
 - `updated_after`: RFC 3339 timestamp, inclusive, against `updated_at` (the last write, which is what a
   "changed since" question asks; `created_after` against `created_at` is added alongside since
   `NoteFilter.min_created_at` already exists and costs nothing).
@@ -187,6 +193,7 @@ uniqueness is not offered: the index is per namespace by construction.
 | Maintain `version` in each `UPDATE notes` statement      | Thirty-three sites in eight files today; the first site that forgets it silently breaks the precondition for every caller. The trigger closes the population.                                                                  |
 | Reuse `name` as the unique key                           | `name` is free-form and unindexed; making it unique would reject existing data and change the meaning of a human-facing field. A separate nullable column changes nothing for existing rows.                                   |
 | A `LIKE 'prefix%'` predicate for `key_prefix`            | Needs escaping of `%` and `_`, and a leading-anchored `LIKE` uses the index only under `case_sensitive_like`; the range form needs neither.                                                                                    |
+| `key < p \|\| CHAR(0x10FFFF)` as the range's upper bound | Omits `p` + U+10FFFF and every key extending it, which are permitted keys that start with `p`; the successor bound admits them, and the no-successor case degrades to a lower bound only.                                      |
 | Client-side read-then-write with a retry loop            | Not compare-and-set: two processes can both read version N and both write; the conformance test for a state layer is exactly that race, cross-process.                                                                         |
 | Make `FULL` (or `FULL` + `fullfsync`) the default        | The measured cost is small at `FULL` but the p99 at `fullfsync` is a visible regression for every deployment that does not need it; an opt-in that the diagnostics report is the honest shape.                                 |
 
@@ -223,7 +230,11 @@ Stated before implementation, checked at the PR that lands the code:
 4. **Mutation.** With the `AND version = ?` predicate removed, test 1 goes red (both updates succeed);
    with the trigger removed, test 3 goes red. Both logs retained beside the PR evidence.
 5. **Listing.** Fixtures where `tag_mode="all"` and `"any"` yield different counts; `key_prefix` with a
-   key containing `%` and `_`; `updated_after` inclusive on a boundary timestamp, with an older document
+   key containing `%` and `_`; `key_prefix=p` over the keys `p`, `p` + `"a"`, `p` + U+10FFFF,
+   `p` + U+10FFFF + `"x"` and `p`'s successor, returning the first four and not the fifth, repeated
+   with a prefix ending in U+10FFFF and with a prefix ending in U+D7FF, and with the successor
+   computation stubbed to the `CHAR(0x10FFFF)` form as the mutation arm that must go red;
+   `updated_after` inclusive on a boundary timestamp, with an older document
    updated after the cutoff appearing first; two documents with equal `updated_at` ordered by `key DESC`;
    each walked across at least two pages with the keyed cursor, and the page set equal to the unpaged set;
    a fixture mixing unkeyed and keyed notes where `key_prefix=""` returns only the keyed ones and
