@@ -1,5 +1,5 @@
 use super::*;
-use crate::knowledge::lexical_timeout::tests::with_timeout;
+use crate::knowledge::lexical_timeout::tests::{with_pass_timeouts, with_timeout};
 use khive_pack_kg::KgPack;
 use khive_runtime::{VerbRegistry, VerbRegistryBuilder};
 use std::{
@@ -213,6 +213,13 @@ async fn public_dispatch_preserves_boolean_and_all_three_pass_tags() {
             .unwrap()
             .remove("lexical_timeout_details");
         assert_eq!(
+            response["degraded"]
+                .as_object_mut()
+                .unwrap()
+                .remove("lexical_timeout_instrumented"),
+            Some(json!(true))
+        );
+        assert_eq!(
             response,
             json!({"results": [], "total": 0, "degraded": {"lexical_timeout": true}}),
             "legacy empty-timeout response must be unchanged: {verb}"
@@ -239,6 +246,10 @@ async fn healthy_dispatch_omits_timeout_details() {
         assert!(response
             .get("degraded")
             .and_then(|d| d.get("lexical_timeout"))
+            .is_none());
+        assert!(response
+            .get("degraded")
+            .and_then(|d| d.get("lexical_timeout_instrumented"))
             .is_none());
         assert_eq!(
             response["total"],
@@ -294,7 +305,8 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
             assert_eq!(
                 response,
                 json!({"results": [], "total": 0, "degraded": {
-                    "lexical_timeout": true, "lexical_timeout_details": [{
+                    "lexical_timeout": true, "lexical_timeout_instrumented": true,
+                    "lexical_timeout_details": [{
                         "pass": "full", "phase": phase.label(), "stage_elapsed_ms": 11,
                         "operation_elapsed_ms": 11, "configured_budget_ms": 2000, "effective_budget_ms": 2000,
                     }]
@@ -314,7 +326,85 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
     );
     assert_eq!(
         responses[0],
-        json!({"results": [], "total": 0, "degraded": {"lexical_timeout": true}})
+        json!({"results": [], "total": 0, "degraded": {
+            "lexical_timeout": true, "lexical_timeout_instrumented": true
+        }})
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn mixed_pass_capability_marker_does_not_reveal_foreign_matches() {
+    let mut responses = Vec::new();
+    for foreign in [false, true] {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        if foreign {
+            let sql = runtime.sql();
+            let mut writer = sql.writer().await.expect("writer");
+            writer.execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, finalized, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?3, ?4, '[]', 1, 'reviewed', 0, 0)".into(),
+                params: [
+                    "10000000-0000-0000-0000-000000000002", "tenant-b",
+                    "foreign-control", "zzoraclezz",
+                ].into_iter().map(|value| SqlValue::Text(value.into())).collect(),
+                label: None,
+            }).await.expect("seed foreign row with no local rows");
+        }
+        let registry = registry(&runtime);
+        let events = TimeoutEvents::default();
+        // The full pass is identical; only the foreign match enables the hidden read.
+        let response = with_pass_timeouts(
+            vec![
+                (LexicalPass::Full, LexicalPhase::TermFrequency),
+                (LexicalPass::Subquery1, LexicalPhase::PhaseARowids),
+            ],
+            Duration::from_millis(11),
+            registry.dispatch(
+                "knowledge.search",
+                json!({
+                    "query": "zzoraclezz alphazz betazz gammazz",
+                    "decompose": true, "rerank": false,
+                }),
+            ),
+        )
+        .with_subscriber(events.clone())
+        .await
+        .expect("mixed-pass public dispatch");
+        let observed: Vec<_> = events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|detail| (detail["pass"].clone(), detail["phase"].clone()))
+            .collect();
+        let mut expected = vec![(json!("full"), json!("term_frequency"))];
+        if foreign {
+            expected.push((json!("subquery_1"), json!("phase_a_rowids")));
+        }
+        assert_eq!(
+            observed, expected,
+            "positive control: only the foreign corpus enables the hidden timeout"
+        );
+        assert_eq!(
+            response["degraded"]["lexical_timeout_instrumented"], true,
+            "capability marker must be true regardless of hidden records: foreign={foreign}"
+        );
+        assert_eq!(
+            response,
+            json!({"results": [], "total": 0, "degraded": {
+                "lexical_timeout": true, "lexical_timeout_instrumented": true,
+                "lexical_timeout_details": [{
+                    "pass": "full", "phase": "term_frequency",
+                    "stage_elapsed_ms": 11, "operation_elapsed_ms": 11,
+                    "configured_budget_ms": 2000, "effective_budget_ms": 2000,
+                }]
+            }}),
+            "both corpora must disclose exactly the same public record"
+        );
+        responses.push(serde_json::to_vec(&response).expect("serialize public JSON"));
+    }
+    assert_eq!(
+        responses[0], responses[1],
+        "public JSON must be byte-identical despite different hidden timeout records"
     );
 }
 
@@ -343,6 +433,13 @@ fn attachment_preserves_other_degradation_fields_and_hides_operator_only_phases(
                 effective_budget_ms: 70,
             }],
         );
+        assert_eq!(
+            response["degraded"]
+                .as_object_mut()
+                .unwrap()
+                .remove("lexical_timeout_instrumented"),
+            Some(json!(true))
+        );
         assert_eq!(response, base);
     }
     let mut public = base.clone();
@@ -356,6 +453,13 @@ fn attachment_preserves_other_degradation_fields_and_hides_operator_only_phases(
             configured_budget_ms: 2000,
             effective_budget_ms: 70,
         }],
+    );
+    assert_eq!(
+        public["degraded"]
+            .as_object_mut()
+            .unwrap()
+            .remove("lexical_timeout_instrumented"),
+        Some(json!(true))
     );
     let detail = public["degraded"]
         .as_object_mut()
@@ -488,6 +592,13 @@ async fn partial_scored_candidates_match_the_base_rare_term_fixture() {
         );
         let mut legacy = json!({});
         attach_lexical_timeout_degradation(&mut legacy, &outcome.lexical_timeouts);
+        assert_eq!(
+            legacy["degraded"]
+                .as_object_mut()
+                .unwrap()
+                .remove("lexical_timeout_instrumented"),
+            Some(json!(true))
+        );
         assert_eq!(legacy, json!({"degraded": {"lexical_timeout": true}}));
     }
 }

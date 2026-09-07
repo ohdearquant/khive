@@ -105,7 +105,7 @@ impl LexicalStage {
     ) -> Result<T, StorageError> {
         let operation_started = Instant::now();
         #[cfg(test)]
-        if let Some(error) = tests::inject_timeout(phase).await {
+        if let Some(error) = tests::inject_timeout(self.pass, phase).await {
             self.capture_timeout(phase, operation_started);
             return Err(error);
         }
@@ -144,7 +144,7 @@ pub(super) mod tests {
     use super::*;
 
     tokio::task_local! {
-        static INJECT: (Vec<LexicalPhase>, Duration);
+        static INJECT: (Vec<(LexicalPass, LexicalPhase)>, Duration);
     }
 
     pub(in crate::knowledge) async fn with_timeout<F: Future>(
@@ -152,12 +152,34 @@ pub(super) mod tests {
         elapsed: Duration,
         future: F,
     ) -> F::Output {
-        INJECT.scope((phases, elapsed), future).await
+        let targets = phases
+            .into_iter()
+            .flat_map(|phase| {
+                [
+                    LexicalPass::Full,
+                    LexicalPass::Subquery1,
+                    LexicalPass::Subquery2,
+                ]
+                .map(|pass| (pass, phase))
+            })
+            .collect();
+        with_pass_timeouts(targets, elapsed, future).await
     }
 
-    pub(super) async fn inject_timeout(phase: LexicalPhase) -> Option<StorageError> {
+    pub(in crate::knowledge) async fn with_pass_timeouts<F: Future>(
+        targets: Vec<(LexicalPass, LexicalPhase)>,
+        elapsed: Duration,
+        future: F,
+    ) -> F::Output {
+        INJECT.scope((targets, elapsed), future).await
+    }
+
+    pub(super) async fn inject_timeout(
+        pass: LexicalPass,
+        phase: LexicalPhase,
+    ) -> Option<StorageError> {
         let elapsed = INJECT
-            .try_with(|(phases, elapsed)| phases.contains(&phase).then_some(*elapsed))
+            .try_with(|(targets, elapsed)| targets.contains(&(pass, phase)).then_some(*elapsed))
             .ok()
             .flatten()?;
         tokio::time::advance(elapsed).await;

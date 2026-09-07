@@ -132,7 +132,11 @@
   lexical-only degradation with request time left to spare still gets a full rerank pass; the
   `lexical_timeout` degradation flag is still attached to the response whenever the stage itself
   timed out, independent of whether the rest of the request completed normally.
-- `degraded.lexical_timeout` remains a boolean. When a timed-out read's phase can be disclosed
+- `degraded.lexical_timeout` remains a boolean. On instrumented builds, every response with
+  `degraded.lexical_timeout=true` also carries `degraded.lexical_timeout_instrumented=true`,
+  regardless of whether any phase is withheld. This marker identifies build capability, not
+  hidden execution details; healthy lexical responses omit it entirely, never emitting false.
+  When a timed-out read's phase can be disclosed
   without exposing global-index match presence, `degraded.lexical_timeout_details` adds at most
   one record per lexical pass (`full`, `subquery_1`, `subquery_2`), at most three records total.
   Each record contains `pass`, `phase`, `stage_elapsed_ms`, `operation_elapsed_ms`,
@@ -146,7 +150,8 @@
   entry does not depend on corpus contents. The later `phase_a_rowids`, `phase_b_hydration`,
   `eligibility_fallback`, `namespace_membership`, and `recent_fallback` records are operator-only:
   their reachability can change with foreign-index matches even when local results do not.
-  Responses with only operator-only records retain the boolean and omit the details list.
+  Responses with only operator-only records retain both booleans and omit the details list.
+  The public list can omit records and is not a complete execution ledger, even when non-empty.
   All seven phases emit the same structured timing fields through tracing, with no SQL, query
   text, row identifiers, namespace names, row counts, or byte counts. A phase identifies where
   the timeout was observed, not why the allowance was exhausted. Pooled-reader waiting occurs

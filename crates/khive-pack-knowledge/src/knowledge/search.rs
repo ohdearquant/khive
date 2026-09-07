@@ -1628,6 +1628,7 @@ fn attach_lexical_timeout_degradation(out: &mut Value, timeouts: &[LexicalTimeou
         out["degraded"] = json!({});
     }
     out["degraded"]["lexical_timeout"] = json!(true);
+    out["degraded"]["lexical_timeout_instrumented"] = json!(true);
     let details: Vec<_> = timeouts
         .iter()
         .filter(|detail| detail.phase.public())
