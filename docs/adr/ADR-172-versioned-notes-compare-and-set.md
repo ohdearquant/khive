@@ -149,11 +149,11 @@ assert the deployment it was promised.
 Measured on this development machine (Apple silicon, APFS, load average about 7), one 200-byte row per
 `BEGIN IMMEDIATE ... COMMIT`, WAL mode, 1,000 commits per row, wall clock per commit:
 
-| setting | mean | p50 | p99 |
-|---|---|---|---|
-| `synchronous=NORMAL` (today) | 0.028 ms | 0.019 ms | 0.055 ms |
-| `synchronous=FULL` | 0.075 ms | 0.057 ms | 0.125 ms |
-| `synchronous=FULL` + `fullfsync=ON` | 1.07 ms | 0.51 ms | 5.6 ms |
+| setting                             | mean     | p50      | p99      |
+| ----------------------------------- | -------- | -------- | -------- |
+| `synchronous=NORMAL` (today)        | 0.028 ms | 0.019 ms | 0.055 ms |
+| `synchronous=FULL`                  | 0.075 ms | 0.057 ms | 0.125 ms |
+| `synchronous=FULL` + `fullfsync=ON` | 1.07 ms  | 0.51 ms  | 5.6 ms   |
 
 For scale, one warm `whoami()` over the daemon socket from a Python client on the same machine measured
 4.8 ms mean, 4.05 ms p50, 18.4 ms p99 over 200 calls. `FULL` alone is within noise of the request cost;
@@ -171,14 +171,14 @@ uniqueness is not offered: the index is per namespace by construction.
 
 ## Alternatives considered
 
-| Alternative | Why not |
-|---|---|
+| Alternative                                              | Why not                                                                                                                                                                                                                        |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Expose `expected_updated_at` instead of adding `version` | A microsecond timestamp round-trips through presentations as a string and through clients as floating point; an integer revision is exact, and the internal guard already needs both `updated_at` and `deleted_at` to be safe. |
-| Maintain `version` in each `UPDATE notes` statement | Thirty-three sites in eight files today; the first site that forgets it silently breaks the precondition for every caller. The trigger closes the population. |
-| Reuse `name` as the unique key | `name` is free-form and unindexed; making it unique would reject existing data and change the meaning of a human-facing field. A separate nullable column changes nothing for existing rows. |
-| A `LIKE 'prefix%'` predicate for `key_prefix` | Needs escaping of `%` and `_`, and a leading-anchored `LIKE` uses the index only under `case_sensitive_like`; the range form needs neither. |
-| Client-side read-then-write with a retry loop | Not compare-and-set: two processes can both read version N and both write; the conformance test for a state layer is exactly that race, cross-process. |
-| Make `FULL` (or `FULL` + `fullfsync`) the default | The measured cost is small at `FULL` but the p99 at `fullfsync` is a visible regression for every deployment that does not need it; an opt-in that the diagnostics report is the honest shape. |
+| Maintain `version` in each `UPDATE notes` statement      | Thirty-three sites in eight files today; the first site that forgets it silently breaks the precondition for every caller. The trigger closes the population.                                                                  |
+| Reuse `name` as the unique key                           | `name` is free-form and unindexed; making it unique would reject existing data and change the meaning of a human-facing field. A separate nullable column changes nothing for existing rows.                                   |
+| A `LIKE 'prefix%'` predicate for `key_prefix`            | Needs escaping of `%` and `_`, and a leading-anchored `LIKE` uses the index only under `case_sensitive_like`; the range form needs neither.                                                                                    |
+| Client-side read-then-write with a retry loop            | Not compare-and-set: two processes can both read version N and both write; the conformance test for a state layer is exactly that race, cross-process.                                                                         |
+| Make `FULL` (or `FULL` + `fullfsync`) the default        | The measured cost is small at `FULL` but the p99 at `fullfsync` is a visible regression for every deployment that does not need it; an opt-in that the diagnostics report is the honest shape.                                 |
 
 ## Consequences
 
@@ -211,7 +211,7 @@ Stated before implementation, checked at the PR that lands the code:
    key containing `%` and `_`; `updated_after` inclusive on a boundary timestamp, with an older document
    updated after the cutoff appearing first; two documents with equal `updated_at` ordered by `key DESC`;
    each walked across at least two pages with the keyed cursor, and the page set equal to the unpaged set.
-5b. **Fence.** A write with `fence` at the right generation succeeds; at a stale generation, or when the
+   5b. **Fence.** A write with `fence` at the right generation succeeds; at a stale generation, or when the
    fence row is missing, it fails with `fence_conflict` and neither row changes. Cross-process, as in 1.
    The cross-process compare-and-set control in 1 is new acceptance written for this ADR; no existing
    test is cited as already covering it.
