@@ -28,6 +28,7 @@ members = [
     "khive-pack-schedule",
     "khive-pack-formal",
     "khive-pack-code",
+    "khive-pack-web",
     "khive-pack-blob",
     "khive-pack-moodboard",
     "khive-pack-template",

@@ -2004,6 +2004,7 @@ dependencies = [
  "khive-pack-moodboard",
  "khive-pack-schedule",
  "khive-pack-session",
+ "khive-pack-web",
  "khive-pack-workspace",
  "khive-request",
  "khive-runtime",
@@ -2364,6 +2365,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-pack-web"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "chrono",
+ "inventory",
+ "khive-db",
+ "khive-pack-kg",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "khive-pack-workspace"
 version = "0.8.0"
 dependencies = [
@@ -2625,6 +2648,7 @@ dependencies = [
  "khive-pack-moodboard",
  "khive-pack-schedule",
  "khive-pack-session",
+ "khive-pack-web",
  "khive-pack-workspace",
  "khive-repo-showcase",
  "khive-request",
