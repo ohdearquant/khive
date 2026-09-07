@@ -27,7 +27,8 @@ count=$(LC_ALL=C awk '
         sub(/\r$/, "", line)
         # A Rust test path can begin with result::; it is not a summary.
         if (line !~ /^[[:space:]]*test result:([^:]|$)/) next
-        if (line !~ /^[[:space:]]*test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed;([[:space:]]|$)/) {
+        # The whole cargo summary grammar, so a truncated line or trailing text is malformed, not counted.
+        if (line !~ /^[[:space:]]*test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out(; finished in [0-9]+(\.[0-9]+)?s)?[[:space:]]*$/) {
             printf "malformed test summary at line %d\n", NR > "/dev/stderr"
             invalid = 1
             next

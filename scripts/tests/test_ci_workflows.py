@@ -135,9 +135,7 @@ class WasmtimeParityWorkflowTests(unittest.TestCase):
             "${{ env.WASMTIME_VERSION }}",
             job,
         )
-        self.assertIn(
-            "if: steps.cache-wasmtime.outputs.cache-hit != 'true'", job
-        )
+        self.assertIn("if: steps.cache-wasmtime.outputs.cache-hit != 'true'", job)
         self.assertIn("set -euo pipefail", job)
         self.assertIn("--retry 5", job)
         self.assertIn("--retry-all-errors", job)
@@ -174,12 +172,8 @@ class BenchTrackWorkflowTests(unittest.TestCase):
 
 class FilteredCargoTestWorkflowTests(unittest.TestCase):
     ASSERT_SCRIPT = REPO_ROOT / "scripts" / "assert-tests-ran.sh"
-    SUMMARY = (
-        "test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 9 filtered out\n"
-    )
-    ZERO_SUMMARY = (
-        "running 0 tests\ntest result: ok. 0 passed; 0 failed; 10 filtered out\n"
-    )
+    SUMMARY = "test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 9 filtered out; finished in 0.01s\n"
+    ZERO_SUMMARY = "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\n"
 
     @staticmethod
     def name_filter(command: str) -> str | None:
@@ -410,7 +404,9 @@ class FilteredCargoTestWorkflowTests(unittest.TestCase):
 
     def test_sums_passed_and_failed_across_harnesses(self):
         result = self.run_assertion(
-            self.SUMMARY + "test result: FAILED. 0 passed; 1 failed; 0 ignored;\n", "3"
+            self.SUMMARY
+            + "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s\n",
+            "3",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("counted=3 floor=3", result.stdout)
@@ -425,6 +421,22 @@ class FilteredCargoTestWorkflowTests(unittest.TestCase):
         self.assertIn("counted=2 floor=1", result.stdout)
         malformed = "\x1b[32mtest result: ok. 717junk passed; 0 failed;\x1b[0m\r\n"
         self.assertNotEqual(self.run_assertion(summary + malformed).returncode, 0)
+
+    def test_truncated_and_trailing_text_summaries_are_malformed(self):
+        # A summary cut off after the failed count, or followed by anything after
+        # the cargo grammar, is not a summary; it must fail closed, not count.
+        for content in (
+            "test result: ok. 1 passed; 0 failed;\n",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;\n",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s extra\n",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s; more\n",
+        ):
+            with self.subTest(content=content):
+                result = self.run_assertion(self.SUMMARY + content)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("malformed test summary", result.stderr)
+        without_timing = self.SUMMARY.replace("; finished in 0.01s", "")
+        self.assertEqual(self.run_assertion(without_timing).returncode, 0)
 
     def test_zero_selection_and_no_summary_fail(self):
         for content in (self.ZERO_SUMMARY, "", "running 1 test\n"):
@@ -458,7 +470,7 @@ class FilteredCargoTestWorkflowTests(unittest.TestCase):
             ("1", ""),
         ):
             with self.subTest(passed=passed, failed=failed):
-                malformed = f"test result: ok. {passed} passed; {failed} failed;\n"
+                malformed = f"test result: ok. {passed} passed; {failed} failed; 0 ignored; 0 measured; 0 filtered out\n"
                 result = self.run_assertion(self.SUMMARY + malformed)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("floor=1", result.stdout + result.stderr)
@@ -484,7 +496,8 @@ class FilteredCargoTestWorkflowTests(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0, result.stdout)
         result = self.run_assertion(
-            self.SUMMARY + "test result: ok. 2147483647 passed; 0 failed;\n"
+            self.SUMMARY
+            + "test result: ok. 2147483647 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
 
@@ -771,8 +784,12 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('if [ "$VERSION" != "$ALIAS_KHIVE_VERSION" ]', workflow)
 
         umbrella_publish = workflow.index("- name: Publish khive (umbrella)")
-        alias_rewrite = workflow.index("- name: Set CLI alias version and khive dependency")
-        alias_publish = workflow.index("- name: Publish @khive-ai/cli (compatibility alias)")
+        alias_rewrite = workflow.index(
+            "- name: Set CLI alias version and khive dependency"
+        )
+        alias_publish = workflow.index(
+            "- name: Publish @khive-ai/cli (compatibility alias)"
+        )
         self.assertLess(umbrella_publish, alias_rewrite)
         self.assertLess(alias_rewrite, alias_publish)
         self.assertIn("working-directory: npm/cli-alias", workflow[alias_publish:])
@@ -784,7 +801,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             npm_stub.write_text(
                 "#!/bin/sh\n"
                 "if [ \"${1:-}\" = view ]; then echo 'npm ERR! code E404' >&2; exit 1; fi\n"
-                "echo \"unexpected npm command: $*\" >&2\n"
+                'echo "unexpected npm command: $*" >&2\n'
                 "exit 97\n"
             )
             npm_stub.chmod(0o755)
@@ -800,7 +817,9 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        version = json.loads((REPO_ROOT / "npm" / "package.json").read_text())["version"]
+        version = json.loads((REPO_ROOT / "npm" / "package.json").read_text())[
+            "version"
+        ]
         umbrella = f"[dry-run] would publish khive@{version}"
         alias = f"[dry-run] would publish @khive-ai/cli@{version}"
         self.assertIn(umbrella, completed.stdout)
@@ -813,11 +832,11 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             npm_stub = pathlib.Path(temp_dir) / "npm"
             npm_stub.write_text(
                 "#!/bin/sh\n"
-                "if [ \"${1:-}\" = view ]; then\n"
-                "  case \"${2:-}\" in @khive-ai/cli@*) echo 0.0.1; exit 0;; esac\n"
+                'if [ "${1:-}" = view ]; then\n'
+                '  case "${2:-}" in @khive-ai/cli@*) echo 0.0.1; exit 0;; esac\n'
                 "  exit 1\n"
                 "fi\n"
-                "echo \"unexpected npm command: $*\" >&2\n"
+                'echo "unexpected npm command: $*" >&2\n'
                 "exit 97\n"
             )
             npm_stub.chmod(0o755)
@@ -832,7 +851,9 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
                 text=True,
             )
 
-        version = json.loads((REPO_ROOT / "npm" / "package.json").read_text())["version"]
+        version = json.loads((REPO_ROOT / "npm" / "package.json").read_text())[
+            "version"
+        ]
         self.assertEqual(completed.returncode, 1, completed.stdout)
         self.assertIn(f"depends on khive 0.0.1, expected {version}", completed.stderr)
         self.assertNotIn("would publish @khive-ai/cli", completed.stdout)
@@ -843,11 +864,11 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             npm_stub = pathlib.Path(temp_dir) / "npm"
             npm_stub.write_text(
                 "#!/bin/sh\n"
-                "if [ \"${1:-}\" = view ]; then\n"
+                'if [ "${1:-}" = view ]; then\n'
                 "  case \"${2:-}\" in @khive-ai/cli@*) echo 'npm ERR! code ECONNREFUSED' >&2; exit 1;; esac\n"
                 "  echo 'npm ERR! code E404' >&2; exit 1\n"
                 "fi\n"
-                "echo \"unexpected npm command: $*\" >&2\n"
+                'echo "unexpected npm command: $*" >&2\n'
                 "exit 97\n"
             )
             npm_stub.chmod(0o755)
