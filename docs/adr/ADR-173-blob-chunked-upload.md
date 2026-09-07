@@ -92,13 +92,13 @@ conformance baseline. `blob.get` range reads are the read side for large objects
 
 ## Alternatives considered
 
-| Alternative | Why not |
-|---|---|
-| Raise `MAX_FRAME_BYTES` to cover 64 MiB objects | ADR-137 Amendment 1 ratified 8 MiB for every transport; every client and every daemon worker buffers a whole frame, one 90 MiB request would hold a socket worker and its memory for its whole transfer, and the audit, comm and events frames share the cap. |
-| A streaming frame type in the wire protocol | A protocol version bump that every client must implement to keep talking to the daemon at all, for one verb's benefit. |
-| Client-side chunking with a manifest object | The reference a caller stores would be the manifest's hash, not the object's; two clients chunking differently would store one object twice under two refs; the state layer that motivates this explicitly refuses it. |
-| A server-local file path on `blob.put` | Rejected already in the blob handler; a path is not a capability and a remote client has no such path. |
-| Let the client compute the hash and target key up front (required) | Requires BLAKE3 in every client; the optional `content_ref` in §1 keeps the early-dedup benefit for clients that have it without making it a dependency. |
+| Alternative                                                        | Why not                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Raise `MAX_FRAME_BYTES` to cover 64 MiB objects                    | ADR-137 Amendment 1 ratified 8 MiB for every transport; every client and every daemon worker buffers a whole frame, one 90 MiB request would hold a socket worker and its memory for its whole transfer, and the audit, comm and events frames share the cap. |
+| A streaming frame type in the wire protocol                        | A protocol version bump that every client must implement to keep talking to the daemon at all, for one verb's benefit.                                                                                                                                        |
+| Client-side chunking with a manifest object                        | The reference a caller stores would be the manifest's hash, not the object's; two clients chunking differently would store one object twice under two refs; the state layer that motivates this explicitly refuses it.                                        |
+| A server-local file path on `blob.put`                             | Rejected already in the blob handler; a path is not a capability and a remote client has no such path.                                                                                                                                                        |
+| Let the client compute the hash and target key up front (required) | Requires BLAKE3 in every client; the optional `content_ref` in §1 keeps the early-dedup benefit for clients that have it without making it a dependency.                                                                                                      |
 
 ## Consequences
 
