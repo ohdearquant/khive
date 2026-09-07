@@ -135,10 +135,13 @@ that buffer and the provider sees only 5 MiB chunks plus a final one. `commit_up
 multipart upload, then does the head check and a server-side copy to the sharded key with the same
 create-if-absent semantics `put` uses, then deletes the staging key; the copy costs at most one object's
 worth of bytes inside the store and never crosses the wire. `abort_upload` aborts the multipart upload.
-`sweep_uploads` lists the `uploads/` prefix and deletes staging objects older than `idle_for`.
-Incomplete multipart uploads that a daemon restart orphans cannot be listed through `object_store`, so a
-deployment on this backend sets the bucket's abort-incomplete-multipart-upload lifecycle rule; the ADR
-names that as a deployment requirement rather than pretending the daemon can reap them.
+`sweep_uploads` lists the `uploads/` prefix and deletes staging objects older than `idle_for`. On this
+backend a staging object becomes visible only when its multipart upload finishes, so the sweep reaches
+uploads that finished but never committed (a crash between finish and the copy) and cannot reach one
+still open. Open multipart uploads that a daemon restart orphans cannot be listed through
+`object_store`, so a deployment on this backend sets the bucket's abort-incomplete-multipart-upload
+lifecycle rule, and that rule's days-after-initiation is the cleanup bound for them; the ADR names
+that as a deployment requirement rather than pretending the daemon can reap them.
 
 ### 4. Abort and expiry
 
@@ -147,13 +150,18 @@ hour is expired, and expiry is enforced at two places so that neither depends on
 At the verbs: `put_part` and `commit` on an upload whose last part is older than the idle bound abort
 it, drop the record, and answer unknown upload, so a stale upload never commits whatever the sweeper is
 doing. By a sweeper: the blob pack has no periodic task in this tree (its GC entry points are
-administrative, ADR-111 §8), so this ADR adds one, spawned by the serving lifecycle beside the session
-WAL-registry sweep in `crates/khive-mcp/src/serve.rs` and shaped the same way: a config read from the
-environment (`KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS`, default 600; `KHIVE_BLOB_UPLOAD_IDLE_SECS`,
-default 3600), a shutdown watch channel, and a join handle the server awaits at shutdown. Each tick
-aborts idle pack records and calls `sweep_uploads(idle_for)` on the backend, which also catches staging
-left behind by a crash. A tick that fails logs the backend error at warn and the next tick retries; a
-failing sweeper never stops serving and never touches a committed object. The sweeper and the
+administrative, ADR-111 §8), so this ADR adds one. It is daemon-role only: the upload records live in
+the daemon's memory and only the daemon holds them, so the task starts where the daemon's other owned
+loops start in `crates/khive-mcp/src/serve.rs` (the daemon component start that runs before the daemon
+loop), never in a non-daemon serve process; the session WAL-registry sweep is the wrong neighbour for
+it, because that one deliberately runs in every non-daemon process. It borrows that task's shape: a
+config read from the environment (`KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS`, default 600;
+`KHIVE_BLOB_UPLOAD_IDLE_SECS`, default 3600), the daemon's blob store handle, a shutdown watch channel,
+and a join handle the daemon's drain awaits. Each tick aborts idle pack records and calls
+`sweep_uploads(idle_for)` on the backend, which also catches staging a crash left visible: every
+filesystem staging file, and on S3 the finished-but-uncommitted staging objects (an open multipart
+upload is the lifecycle rule's job, §3). A tick that fails logs the backend error at warn and the next
+tick retries; a failing sweeper never stops serving and never touches a committed object. The sweeper and the
 transactional orphan GC of ADR-111 §8 do not coordinate because neither can see the other's objects: on
 the filesystem the GC walk skips dot-leading entries, so `.uploads/` is invisible to it, and on S3 the
 orphan sweep skips any key that does not parse as a shard key, so `uploads/<id>` is invisible to it
@@ -196,7 +204,8 @@ uploads that survive a daemon restart, and a dedup flag on the result.
 
 - Four verbs added to the blob pack; five methods added to `BlobStore`, implemented by both backends
   and refused by the read-only wrapper; no schema change; no wire protocol change.
-- The serving lifecycle gains one periodic task, the upload sweeper, with two environment knobs.
+- The daemon gains one periodic task, the upload sweeper, with two environment knobs; non-daemon serve
+  processes gain nothing.
 - The filesystem backend gains a staging directory under the blob root and its own expiry sweep; the S3
   backend gains a staging prefix, a buffered multipart writer, a server-side copy at commit, a prefix
   sweep, and a documented dependency on the bucket's incomplete-multipart lifecycle rule.
@@ -221,7 +230,10 @@ uploads that survive a daemon restart, and a dedup flag on the result.
    is refused before any part; a part of exactly `part_limit` bytes renders to an `ops` string the
    request parser accepts and is accepted by the handler, and one of `part_limit + 1` is refused on
    decoded length; the same test asserts `part_limit` equals the §1 formula evaluated over the live
-   constants, so a moved cap fails the test rather than a client.
+   constants, so a moved cap fails the test rather than a client. The frame-fit half of that claim holds
+   under the envelope precondition §1 states (the serialized request minus `ops` under
+   `MAX_FRAME_BYTES - MAX_OPS_INPUT_LEN`); the test pads an envelope past that bound and asserts the
+   daemon refuses the frame before dispatch, not that the part was accepted.
 5. Abort leaves no file. Expiry, verb side: with no sweeper running, a `put_part` after the idle bound
    answers unknown upload and the staging file is gone. Expiry, sweeper side: with no verb call, an
    idle upload's staging file is gone after the sweeper's next tick. The transactional orphan GC run
@@ -230,13 +242,19 @@ uploads that survive a daemon restart, and a dedup flag on the result.
    sweeper after expiry); on S3 the same control runs against the S3 orphan sweep with a `uploads/<id>`
    key present.
 6. Restart between `put_part` and `commit`: `commit` answers unknown upload; the client's begin-again path
-   succeeds; the orphaned staging object, whose record died with the process, is removed by the
-   sweeper's first tick after the idle bound on both backends.
+   succeeds. On the filesystem the orphaned staging file, whose record died with the process, is
+   removed by the sweeper's first tick after the idle bound; on S3 a staging object left visible
+   (finished, uncommitted) is removed the same way, and for an open multipart upload the arm asserts
+   the bucket's abort-incomplete-multipart lifecycle rule is present (the MinIO lane reads it back),
+   not that the daemon reaped it. Owner control: an upload begun through the daemon by a client process
+   that then exits is expired by the daemon's sweeper with no client alive, which fails if the task
+   were started in the client's serve path instead.
 7. Mutation: with the tail-retry hash check removed, test 3's same-length different-bytes resend is
    accepted (red). The length comparison is a pre-check the digest subsumes, so it carries no mutation
    arm of its own: a different-length resend also has a different digest and is refused either way.
    With the verb-side expiry removed, test 5's stale `put_part` is accepted (red); with the sweeper's
-   `sweep_uploads` call removed, test 5's sweeper arm and test 6 are red; with commit given its own copy
+   `sweep_uploads` call removed, test 5's sweeper arm and test 6's filesystem and visible-S3 arms are
+   red; with commit given its own copy
    of the publish step, the shared-routine assertion in test 8 is red.
 8. One publish routine: a test asserts by construction that `put` and `commit_upload` call the same
    function for the rename-into-shard step, and once the directory-barrier repair lands, the barrier
