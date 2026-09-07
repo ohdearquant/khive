@@ -243,7 +243,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "candidates",
                 param_type: "array<object>",
                 required: true,
-                description: "Scored items: {id, score, size, name?, content?, category?, information_gain?}. `knowledge.suggest`'s `results` feed this directly.",
+                description: "Scored items: {id, score, size, name?, members?, content?, category?, information_gain?}. `members` is an optional live member count; candidates with members=0 are not selected. `knowledge.suggest`'s `results` feed this directly.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -391,7 +391,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.suggest",
-        description: "Suggest relevant knowledge domains for a query. Draft and deprecated domain atoms are excluded by default (same quality default as knowledge.search). Each result carries {id, name, score, size} — `size` is the aggregate estimated-token cost of the domain's member atom bodies that compose expands, in the same unit as `knowledge.fold`'s `budget`, so results feed `knowledge.fold(candidates=...)` directly with no caller-side field construction. When ANN candidate retrieval is unavailable, the response sets `ann_unavailable: true` and reports `degraded.mode`: `no_match` when lexical/FTS retrieval found no candidates, `ann_candidates_degraded` when lexical/FTS candidates still received fresh embedding cosine reranking, or `lexical_only` when that fresh rerank did not run.",
+        description: "Suggest relevant knowledge domains for a query. Draft and deprecated domain atoms are excluded by default (same quality default as knowledge.search). Each result carries {id, name, score, size, members} — `size` is the aggregate estimated-token cost of the domain's live member atom bodies, and `members` is their count. A present domain without live members has size 0 and members 0. The size uses the same unit as `knowledge.fold`'s `budget`, so results feed `knowledge.fold(candidates=...)` directly with no caller-side field construction. When ANN candidate retrieval is unavailable, the response sets `ann_unavailable: true` and reports `degraded.mode`: `no_match` when lexical/FTS retrieval found no candidates, `ann_candidates_degraded` when lexical/FTS candidates still received fresh embedding cosine reranking, or `lexical_only` when that fresh rerank did not run.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -463,7 +463,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "auto_limit",
                 param_type: "integer",
                 required: false,
-                description: "Number of domains to auto-suggest from `query` when both domain_ids and atom_ids are empty (default 5, clamped 1-20).",
+                description: "Number of domains to auto-suggest from `query` when both domain_ids and atom_ids are empty (default 5, clamped 1-20). This caps suggested candidates before domains without live members are dropped, so auto-compose may compose fewer domains than auto_limit.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
