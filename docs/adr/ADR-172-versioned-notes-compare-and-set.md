@@ -287,3 +287,54 @@ Stated before implementation, checked at the PR that lands the code:
 10. **Durability option.** A deployment started with `synchronous = "full"` reports it in `db_diagnostics`;
     the verb-level cost of `create` under each of the three settings is measured over the socket, 1,000
     calls each, and recorded in the PR.
+
+## Amendment 1 (2026-09-07): keyed cursor tiebreaker, `after_key` ambiguity, disclosure scope, migration path
+
+Four corrections to §3 and §4, none of which changes a verb signature. Where this amendment and the
+sections above disagree, the amendment governs: it supersedes §4's order and cursor sentences (`updated_at
+DESC, key DESC`; `next_after` encoding `(updated_at, key)`) and §4's `after_key` resolution sentence, and
+it narrows §3's `key_conflict` details.
+
+**Keyed cursor.** A key may be held by one live note of each kind, and a keyed listing that omits
+`note_kind` spans kinds, so two rows can share `(updated_at, key)`; a keyset cursor on that pair alone
+would drop or repeat a row at a page boundary. The keyed listing is ordered `updated_at DESC, key DESC,
+id ASC`, and `next_after` encodes `(updated_at, key, id)`. `id` is the note's primary key, so the triple
+is unique and the walk is total. §4's statement of the order and cursor reads with `id` appended.
+
+**`after_key` on an ambiguous key.** `after_key=K` without `note_kind`, when more than one live note in
+the listing's namespace holds `K`, fails with `KhiveError::conflict`,
+`details: {"reason": "key_ambiguous", "key": K, "kinds": "..."}`, the same refusal §3 gives `get`; it
+never picks one of them. With `note_kind` given the resolution is unique.
+
+**Disclosure scope.** `existing_id` in `key_conflict`, `kinds` in `key_ambiguous`, and the
+`after_key_missing` answer each say something about which keys are occupied, and each is answered
+within the caller's primary namespace only. `get` and `list` are read verbs, so `key_ambiguous` from
+`get` and `after_key_missing` from `list` disclose nothing the gate has not already admitted for that
+call. `create` is the one write that answers with a read's knowledge, and the gate runs once per
+dispatched verb (`crates/khive-runtime/src/pack.rs`, one `GateRequest` for the verb, one `check`), so
+the create handler asks a second question before it attaches `existing_id`: a `GateRequest` for verb
+`list` in the same namespace by the same caller. When that check allows, `key_conflict` carries
+`existing_id`; when it denies, the details are `{"reason": "key_conflict", "key": K}` and nothing else.
+A deployment whose policy admits `create` and denies `list` in a namespace therefore learns from a
+refused create only that the key is taken, which the refusal itself already says.
+
+**Migration path.** Migration 028 does not exist in the tree yet; it lands with the implementation.
+When it does, it is one entry in the versioned chain (`MIGRATIONS`, `crates/khive-db/src/migrations.rs`)
+that every database walks from V1 (`crates/khive-db/sql/schema.sql`) on first open, so a freshly built
+database and an upgraded one carry the same column, trigger and index; no build path in the tree takes
+`schema.sql` alone (`crates/khive-db/src/backend.rs` opens through the chain).
+
+Acceptance, added to the list above:
+
+11. **Tiebreaker.** Two live notes of different kinds holding the same key with an equal `updated_at`,
+    walked with a page size of one across the boundary: the page set equals the unpaged set, and the
+    order is `id ASC` between them. Mutation: with `id` dropped from the cursor the walk drops or
+    repeats one of the two (red). `after_key` on that key without `note_kind` fails with
+    `key_ambiguous` and returns no rows; with `note_kind` it resumes after the named one.
+12. **Fresh build.** At the PR that lands migration 028: a database created empty walks the chain to 028
+    on first open and reports that version through `read_schema_version`; the column, trigger and index
+    are present, the same set an upgraded pre-028 database shows in test 9.
+13. **Disclosure.** Under a policy that admits `create` and denies `list` in one namespace, a refused
+    `create(key=K)` answers `key_conflict` with `key` and no `existing_id`; under a policy that admits
+    both, `existing_id` is present. Mutation: with the second gate question removed, the deny arm
+    carries `existing_id` (red).
