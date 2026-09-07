@@ -15,6 +15,7 @@ use khive_score::DeterministicScore;
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
 
+use super::lexical_timeout::{LexicalPass, LexicalPhase, LexicalStage, LexicalTimeout};
 use super::matching;
 use super::schema::{Atom, ComposeParams, Domain, SearchParams, SuggestParams};
 use super::scoring::{
@@ -378,13 +379,17 @@ fn phase_a_rowids_statement(term: &str, limit: usize) -> SqlStatement {
 async fn rarest_fts_terms_first(
     reader: &mut dyn khive_storage::SqlReader,
     terms: Vec<String>,
+    stage: &mut LexicalStage,
 ) -> Result<Vec<String>, khive_storage::StorageError> {
     let mut frequencies = Vec::with_capacity(terms.len());
     for term in terms {
         // Count only a bounded index prefix. Rare counts are exact; terms
         // above the cap tie by spelling, without scanning their whole lists.
-        let rows = reader
-            .query_all(phase_a_rowids_statement(&term, FTS_TERM_LIMIT + 1))
+        let rows = stage
+            .read(
+                LexicalPhase::TermFrequency,
+                reader.query_all(phase_a_rowids_statement(&term, FTS_TERM_LIMIT + 1)),
+            )
             .await?;
         if !rows.is_empty() {
             frequencies.push((term, rows.len()));
@@ -473,13 +478,12 @@ where
 
 /// Outcome of the bounded lexical candidate fetch.
 ///
-/// `timed_out` is set only for [`khive_storage::StorageError::Timeout`] — the
-/// request-scoped read deadline elapsing mid-fetch. Any other storage error
+/// `timeout` is set only for [`khive_storage::StorageError::Timeout`]. Any other storage error
 /// (including a genuine FTS5 syntax/parser error) still surfaces as an `Err`;
 /// fail-open applies to a timeout only.
 struct FtsFetchOutcome {
     atoms: Vec<Atom>,
-    timed_out: bool,
+    timeout: Option<LexicalTimeout>,
 }
 
 #[cfg(test)]
@@ -570,6 +574,7 @@ fn is_read_timeout(e: &RuntimeError) -> bool {
 /// term, unioned and deduplicated in application code. FTS remains only the
 /// candidate generator; TF-IDF in `search_core` remains the ranker, so the
 /// per-term merge order does not need to be a globally correct bm25 rank.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_fts_candidates(
     runtime: &KhiveRuntime,
     ns: &str,
@@ -578,14 +583,15 @@ async fn fetch_fts_candidates(
     statuses: &[String],
     exclude_statuses: &[&str],
     fetch_limit: usize,
+    mut stage: LexicalStage,
 ) -> Result<FtsFetchOutcome, RuntimeError> {
     let sql = runtime.sql();
-    let mut reader = match sql.reader().await {
+    let mut reader = match stage.read(LexicalPhase::ReaderOpen, sql.reader()).await {
         Ok(reader) => reader,
         Err(e) if is_timeout(&e) => {
             return Ok(FtsFetchOutcome {
                 atoms: Vec::new(),
-                timed_out: true,
+                timeout: stage.timeout,
             });
         }
         Err(e) => return Err(sql_err("search fts reader", e)),
@@ -616,12 +622,12 @@ async fn fetch_fts_candidates(
     };
 
     if terms.len() > 1 {
-        terms = match rarest_fts_terms_first(reader.as_mut(), terms).await {
+        terms = match rarest_fts_terms_first(reader.as_mut(), terms, &mut stage).await {
             Ok(terms) => terms,
             Err(e) if is_timeout(&e) => {
                 return Ok(FtsFetchOutcome {
                     atoms: Vec::new(),
-                    timed_out: true,
+                    timeout: stage.timeout,
                 });
             }
             Err(e) => return Err(sql_err("search fts term frequency probe", e)),
@@ -646,8 +652,11 @@ async fn fetch_fts_candidates(
         let mut probe_limit = base_probe_limit;
 
         let (mut eligible, probed_rowids): (Vec<Atom>, Vec<i64>) = loop {
-            let phase_a_rows = match reader
-                .query_all(phase_a_rowids_statement(term, probe_limit))
+            let phase_a_rows = match stage
+                .read(
+                    LexicalPhase::PhaseARowids,
+                    reader.query_all(phase_a_rowids_statement(term, probe_limit)),
+                )
                 .await
             {
                 Ok(rows) => rows,
@@ -675,7 +684,10 @@ async fn fetch_fts_candidates(
                     exclude_statuses,
                     type_clause.as_str(),
                 );
-                let rows = match reader.query_all(statement).await {
+                let rows = match stage
+                    .read(LexicalPhase::PhaseBHydration, reader.query_all(statement))
+                    .await
+                {
                     Ok(rows) => rows,
                     Err(e) if is_timeout(&e) => {
                         term_query_timed_out = true;
@@ -735,12 +747,15 @@ async fn fetch_fts_candidates(
                     SqlValue::Integer(per_term_limit as i64),
                 ];
                 scoped_params.extend(scoped_status_params);
-                let scoped_rows = match reader
-                    .query_all(SqlStatement {
-                        sql: scoped_sql,
-                        params: scoped_params,
-                        label: None,
-                    })
+                let scoped_rows = match stage
+                    .read(
+                        LexicalPhase::EligibilityFallback,
+                        reader.query_all(SqlStatement {
+                            sql: scoped_sql,
+                            params: scoped_params,
+                            label: None,
+                        }),
+                    )
                     .await
                 {
                     Ok(rows) => rows,
@@ -786,14 +801,14 @@ async fn fetch_fts_candidates(
     if term_query_timed_out {
         return Ok(FtsFetchOutcome {
             atoms: combined,
-            timed_out: true,
+            timeout: stage.timeout,
         });
     }
 
     if !combined.is_empty() {
         return Ok(FtsFetchOutcome {
             atoms: combined,
-            timed_out: false,
+            timeout: None,
         });
     }
 
@@ -836,19 +851,22 @@ async fn fetch_fts_candidates(
             "SELECT 1 AS present FROM knowledge_atoms \
              WHERE rowid IN ({placeholders}) AND namespace = ?1 LIMIT 1"
         );
-        let row = match reader
-            .query_row(SqlStatement {
-                sql: membership_sql,
-                params,
-                label: None,
-            })
+        let row = match stage
+            .read(
+                LexicalPhase::NamespaceMembership,
+                reader.query_row(SqlStatement {
+                    sql: membership_sql,
+                    params,
+                    label: None,
+                }),
+            )
             .await
         {
             Ok(row) => row,
             Err(e) if is_timeout(&e) => {
                 return Ok(FtsFetchOutcome {
                     atoms: Vec::new(),
-                    timed_out: true,
+                    timeout: stage.timeout,
                 });
             }
             Err(e) => return Err(sql_err("search fts namespace membership probe", e)),
@@ -861,7 +879,7 @@ async fn fetch_fts_candidates(
     if namespace_has_match {
         return Ok(FtsFetchOutcome {
             atoms: Vec::new(),
-            timed_out: false,
+            timeout: None,
         });
     }
 
@@ -880,19 +898,22 @@ async fn fetch_fts_candidates(
     ];
     params.extend(status_params);
 
-    let rows = match reader
-        .query_all(SqlStatement {
-            sql: sql_str,
-            params,
-            label: None,
-        })
+    let rows = match stage
+        .read(
+            LexicalPhase::RecentFallback,
+            reader.query_all(SqlStatement {
+                sql: sql_str,
+                params,
+                label: None,
+            }),
+        )
         .await
     {
         Ok(rows) => rows,
         Err(e) if is_timeout(&e) => {
             return Ok(FtsFetchOutcome {
                 atoms: Vec::new(),
-                timed_out: true,
+                timeout: stage.timeout,
             });
         }
         Err(e) => return Err(sql_err("search full scan", e)),
@@ -900,7 +921,7 @@ async fn fetch_fts_candidates(
 
     Ok(FtsFetchOutcome {
         atoms: rows.iter().filter_map(atom_from_row).collect(),
-        timed_out: false,
+        timeout: None,
     })
 }
 
@@ -920,16 +941,19 @@ struct SearchCtx<'a> {
 
 // ─── core single-pass search ──────────────────────────────────────────────────
 
-/// `search_core`'s result plus whether the lexical/FTS candidate fetch hit the
-/// request read deadline (issue #1930's fail-open signal). A caller sees
-/// `hits` possibly empty/partial and `lexical_timed_out = true` instead of an
+/// `search_core`'s result plus any lexical/FTS read timeout diagnostics.
+/// A caller sees `hits` possibly empty/partial and timeout details instead of an
 /// `Err` — never a verb-level error for a genuine timeout.
 struct SearchCoreOutcome {
     hits: Vec<ScoredHit>,
-    lexical_timed_out: bool,
+    lexical_timeouts: Vec<LexicalTimeout>,
 }
 
-async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutcome, RuntimeError> {
+async fn search_core(
+    ctx: &SearchCtx<'_>,
+    query: &str,
+    pass: LexicalPass,
+) -> Result<SearchCoreOutcome, RuntimeError> {
     let runtime = ctx.runtime;
     let ns = ctx.ns;
     let role = ctx.role;
@@ -941,7 +965,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     if raw_query.is_empty() {
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
-            lexical_timed_out: false,
+            lexical_timeouts: Vec::new(),
         });
     }
 
@@ -979,23 +1003,29 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     // deadline governs everything that runs after it (rerank, body-line
     // counts, member sizing) — a lexical-stage timeout no longer spends the
     // whole request.
-    let FtsFetchOutcome { atoms, timed_out } = khive_storage::scope_request_read_deadline(
-        lexical_stage_budget(),
-        fetch_fts_candidates(
-            runtime,
-            ns,
-            &raw_query,
-            type_filter,
-            ctx.statuses,
-            ctx.exclude_statuses,
-            CANDIDATE_POOL,
-        ),
-    )
-    .await?;
+    let configured_budget = lexical_stage_budget();
+    let stage_started = tokio::time::Instant::now();
+    let FtsFetchOutcome { atoms, timeout } =
+        khive_storage::scope_request_read_deadline(configured_budget, async {
+            let stage = LexicalStage::new(pass, stage_started, configured_budget);
+            fetch_fts_candidates(
+                runtime,
+                ns,
+                &raw_query,
+                type_filter,
+                ctx.statuses,
+                ctx.exclude_statuses,
+                CANDIDATE_POOL,
+                stage,
+            )
+            .await
+        })
+        .await?;
+    let lexical_timeouts: Vec<_> = timeout.into_iter().collect();
     if atoms.is_empty() {
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
-            lexical_timed_out: timed_out,
+            lexical_timeouts,
         });
     }
 
@@ -1003,7 +1033,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     if candidates.is_empty() {
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
-            lexical_timed_out: timed_out,
+            lexical_timeouts,
         });
     }
 
@@ -1054,7 +1084,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
                 score,
             })
             .collect(),
-        lexical_timed_out: timed_out,
+        lexical_timeouts,
     })
 }
 
@@ -1077,8 +1107,8 @@ async fn search_decomposed(
 
     let SearchCoreOutcome {
         hits: full,
-        lexical_timed_out: full_timed_out,
-    } = search_core(ctx, query).await?;
+        mut lexical_timeouts,
+    } = search_core(ctx, query, LexicalPass::Full).await?;
     let sub_ctx1 = SearchCtx {
         runtime: ctx.runtime,
         ns: ctx.ns,
@@ -1092,13 +1122,14 @@ async fn search_decomposed(
     };
     let SearchCoreOutcome {
         hits: s1,
-        lexical_timed_out: s1_timed_out,
-    } = search_core(&sub_ctx1, &sub_q1).await?;
+        lexical_timeouts: s1_timeouts,
+    } = search_core(&sub_ctx1, &sub_q1, LexicalPass::Subquery1).await?;
     let SearchCoreOutcome {
         hits: s2,
-        lexical_timed_out: s2_timed_out,
-    } = search_core(&sub_ctx1, &sub_q2).await?;
-    let lexical_timed_out = full_timed_out || s1_timed_out || s2_timed_out;
+        lexical_timeouts: s2_timeouts,
+    } = search_core(&sub_ctx1, &sub_q2, LexicalPass::Subquery2).await?;
+    lexical_timeouts.extend(s1_timeouts);
+    lexical_timeouts.extend(s2_timeouts);
 
     let mut scores: HashMap<String, f32> = HashMap::new();
     let mut data: HashMap<String, ScoredHit> = HashMap::new();
@@ -1149,7 +1180,7 @@ async fn search_decomposed(
     ranked.truncate(ctx.fetch_limit);
     Ok(SearchCoreOutcome {
         hits: ranked,
-        lexical_timed_out,
+        lexical_timeouts,
     })
 }
 
@@ -1586,7 +1617,10 @@ fn attach_hydration_degradation(out: &mut Value, hydration_failures: usize) {
 /// (issue #1930). Set alongside whatever ANN-backed results (if any) still
 /// made it into the response — a timed-out lexical stage degrades the
 /// response, it never fails the verb outright.
-fn attach_lexical_timeout_degradation(out: &mut Value) {
+fn attach_lexical_timeout_degradation(out: &mut Value, timeouts: &[LexicalTimeout]) {
+    if timeouts.is_empty() {
+        return;
+    }
     if !out
         .get("degraded")
         .is_some_and(serde_json::Value::is_object)
@@ -1594,6 +1628,15 @@ fn attach_lexical_timeout_degradation(out: &mut Value) {
         out["degraded"] = json!({});
     }
     out["degraded"]["lexical_timeout"] = json!(true);
+    out["degraded"]["lexical_timeout_instrumented"] = json!(true);
+    let details: Vec<_> = timeouts
+        .iter()
+        .filter(|detail| detail.phase.public())
+        .take(3)
+        .collect();
+    if !details.is_empty() {
+        out["degraded"]["lexical_timeout_details"] = json!(details);
+    }
 }
 
 /// Flag that the best-effort body-line aggregate hit the request read
@@ -2505,11 +2548,11 @@ impl KnowledgeHandlers {
 
         let SearchCoreOutcome {
             mut hits,
-            lexical_timed_out,
+            lexical_timeouts,
         } = if do_decompose && non_stop_count >= decompose_threshold {
             search_decomposed(&ctx, &raw_query, intersection_bonus).await?
         } else {
-            search_core(&ctx, &raw_query).await?
+            search_core(&ctx, &raw_query, LexicalPass::Full).await?
         };
 
         let mut ann_unavailable = false;
@@ -2533,7 +2576,7 @@ impl KnowledgeHandlers {
         filter_hits_by_type(&mut hits, type_filter);
 
         // The lexical stage now owns its own budget (issue #1930 Amendment
-        // 2), so `lexical_timed_out` no longer implies the request read
+        // 2), so `lexical_timeout` no longer implies the request read
         // deadline is spent — only that stage's narrower budget is. Gate on
         // the live ambient deadline instead: a lexical-only degradation
         // with request time left to spare still gets its embedding rerank.
@@ -2600,9 +2643,7 @@ impl KnowledgeHandlers {
         if ann_unavailable {
             out["ann_unavailable"] = json!(true);
         }
-        if lexical_timed_out {
-            attach_lexical_timeout_degradation(&mut out);
-        }
+        attach_lexical_timeout_degradation(&mut out, &lexical_timeouts);
         if body_lines_timed_out {
             attach_body_lines_timeout_degradation(&mut out);
         }
@@ -2742,8 +2783,8 @@ impl KnowledgeHandlers {
 
         let SearchCoreOutcome {
             mut hits,
-            lexical_timed_out,
-        } = search_core(&ctx, &raw_query).await?;
+            lexical_timeouts,
+        } = search_core(&ctx, &raw_query, LexicalPass::Full).await?;
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -2759,7 +2800,7 @@ impl KnowledgeHandlers {
         filter_hits_by_type(&mut hits, Some("domain"));
 
         // The lexical stage now owns its own budget (issue #1930 Amendment
-        // 2), so `lexical_timed_out` no longer implies the request read
+        // 2), so `lexical_timeout` no longer implies the request read
         // deadline is spent — only that stage's narrower budget is. Gate on
         // the live ambient deadline instead: a lexical-only degradation
         // with request time left to spare still gets its embedding rerank.
@@ -2883,9 +2924,7 @@ impl KnowledgeHandlers {
                 "note": note,
             });
         }
-        if lexical_timed_out {
-            attach_lexical_timeout_degradation(&mut out);
-        }
+        attach_lexical_timeout_degradation(&mut out, &lexical_timeouts);
         attach_hydration_degradation(&mut out, hydration_failures);
         attach_member_sizing_timeout_degradation(&mut out, &excluded);
         // The lexical stage's own budget no longer implies the request
@@ -3495,9 +3534,39 @@ pub(crate) async fn seed_low_overlap_corpus(runtime: &KhiveRuntime, n: u32, voca
 }
 
 #[cfg(test)]
+#[path = "lexical_timeout_tests.rs"]
+mod lexical_timeout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use khive_storage::types::{SqlRow, StorageResult};
+
+    async fn fetch_fts_candidates(
+        runtime: &KhiveRuntime,
+        ns: &str,
+        raw_query: &str,
+        type_filter: Option<&str>,
+        statuses: &[String],
+        exclude_statuses: &[&str],
+        fetch_limit: usize,
+    ) -> Result<FtsFetchOutcome, RuntimeError> {
+        super::fetch_fts_candidates(
+            runtime,
+            ns,
+            raw_query,
+            type_filter,
+            statuses,
+            exclude_statuses,
+            fetch_limit,
+            LexicalStage::new(
+                LexicalPass::Full,
+                tokio::time::Instant::now(),
+                lexical_stage_budget(),
+            ),
+        )
+        .await
+    }
 
     struct ProbeRecordingReader {
         inner: Box<dyn khive_storage::SqlReader>,
@@ -3582,6 +3651,11 @@ mod tests {
         let ordered = rarest_fts_terms_first(
             &mut reader,
             terms.iter().map(|term| (*term).to_string()).collect(),
+            &mut LexicalStage::new(
+                LexicalPass::Full,
+                tokio::time::Instant::now(),
+                lexical_stage_budget(),
+            ),
         )
         .await
         .expect("frequency probes");
@@ -3678,7 +3752,7 @@ mod tests {
             )
             .await
             .expect("bounded candidate fetch");
-            assert!(!outcome.timed_out);
+            assert!(outcome.timeout.is_none());
             assert_eq!(outcome.atoms.len(), FTS_TERM_LIMIT);
             assert_eq!(
                 outcome.atoms.iter().any(|atom| atom.slug == "zzprefix-best"),
@@ -3745,7 +3819,7 @@ mod tests {
             )
             .await
             .expect("partial fetch");
-            assert!(outcome.timed_out);
+            assert!(outcome.timeout.is_some());
             assert_eq!(
                 outcome.atoms.len(),
                 50,
@@ -3800,7 +3874,7 @@ mod tests {
              expires between term queries",
         );
         assert!(
-            outcome.timed_out,
+            outcome.timeout.is_some(),
             "the controlled deadline must be observed"
         );
         assert!(
@@ -3925,7 +3999,7 @@ mod tests {
             fetch_fts_candidates(&runtime, "local", "alpha beta", None, &[], &[], fetch_limit)
                 .await
                 .expect("fetch must not error");
-        assert!(!outcome.timed_out);
+        assert!(outcome.timeout.is_none());
         assert_eq!(outcome.atoms.len(), fetch_limit);
 
         let beta_present = outcome
@@ -4008,7 +4082,7 @@ mod tests {
             .await;
 
         assert!(
-            fetch.timed_out,
+            fetch.timeout.is_some(),
             "the lexical stage's own narrower budget must be observed"
         );
         assert!(
@@ -4086,7 +4160,7 @@ mod tests {
             .await
             .expect("fetch must not error");
 
-        assert!(!outcome.timed_out);
+        assert!(outcome.timeout.is_none());
         assert_eq!(
             outcome.atoms.len(),
             3,
@@ -4148,7 +4222,7 @@ mod tests {
             .await
             .expect("fetch must not error");
 
-        assert!(!outcome.timed_out);
+        assert!(outcome.timeout.is_none());
         assert_eq!(
             outcome.atoms.len(),
             2,
@@ -4196,7 +4270,7 @@ mod tests {
             .await
             .expect("fetch must not error");
 
-        assert!(!outcome.timed_out);
+        assert!(outcome.timeout.is_none());
         assert_eq!(
             outcome.atoms.len(),
             1,
@@ -4300,7 +4374,7 @@ mod tests {
                     println!(
                         "LEXICAL_NAMESPACE mode={mode} foreign_present={foreign_present} local_matches={local_matches} rows={} lexical_elapsed_ms={elapsed_ms:.3} lexical_timeout={}",
                         outcome.atoms.len(),
-                        outcome.timed_out,
+                        outcome.timeout.is_some(),
                     );
                 }
             }
@@ -4356,8 +4430,8 @@ mod tests {
                 .await
                 .expect("fetch must not error");
 
-        assert!(!foreign_match.timed_out);
-        assert!(!no_match.timed_out);
+        assert!(foreign_match.timeout.is_none());
+        assert!(no_match.timeout.is_none());
         let foreign_slugs: Vec<&str> = foreign_match
             .atoms
             .iter()
@@ -4416,7 +4490,7 @@ mod tests {
             .await
             .expect("fetch must not error");
 
-        assert!(!outcome.timed_out);
+        assert!(outcome.timeout.is_none());
         assert_eq!(
             outcome.atoms.len(),
             1,
@@ -4499,7 +4573,7 @@ mod tests {
         .await
         .expect("fetch must not error");
 
-        assert!(!outcome.timed_out);
+        assert!(outcome.timeout.is_none());
         assert_eq!(
             outcome.atoms.len(),
             2,
