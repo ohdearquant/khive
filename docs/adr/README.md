@@ -191,6 +191,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-172](ADR-172-versioned-notes-compare-and-set.md)                   | Versioned notes — compare-and-set updates, keyed create-if-absent, and a durability option                 |
 | [ADR-173](ADR-173-blob-chunked-upload.md)                               | Chunked blob upload — objects larger than one wire frame                                                   |
 | [ADR-174](ADR-174-ordered-streams-append.md)                            | Ordered streams — dense per-stream append with `expected_seq` and a lease fence                            |
+| [ADR-175](ADR-175-web-pack.md)                                          | Web Pack — Site Ontology and Manifest Ingest for Agent-Readable Web Origins                                |
 
 <!-- END GENERATED ADR CATALOG -->
 
