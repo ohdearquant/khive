@@ -4,8 +4,8 @@ The optional `web` pack maps a local site's ARW manifest and markdown machine vi
 knowledge graph database. It reads declarations as supplied; it does not fetch URLs, parse HTML,
 infer protocols, or calculate quality scores.
 
-Load it with `KHIVE_PACKS=kg,web` or add `--pack web` when starting the MCP server. The pack requires
-`kg` and is outside the default pack set. Its only verb is `web.ingest`.
+Load it with `KHIVE_PACKS=kg,web` or pass `--pack kg --pack web` when starting the MCP server. The pack
+requires `kg` and is outside the default pack set. Its only verb is `web.ingest`.
 
 ## Vocabulary
 
