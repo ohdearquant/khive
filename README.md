@@ -313,23 +313,28 @@ Add the same server entry to `claude_desktop_config.json`:
 See [docs/guide/getting-started.md](docs/guide/getting-started.md) for the config file location
 on each platform.
 
-### Claude Code plugin (skills + agent)
+### Claude Code plugin (skills + agents)
 
-For guided research workflows, install the marketplace plugin:
+For guided workflows, install the marketplace plugin:
 
 ```
 /plugin marketplace add ohdearquant/khive
-/plugin install kg
+/plugin install khive
 ```
 
-This adds 4 workflow skills and a researcher agent:
+This adds one pattern skill per pack (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`,
+`knowledge`), four kg workflow skills, and six kg stewardship agents:
 
-| Skill         | What it does                                                   |
-| ------------- | -------------------------------------------------------------- |
-| `/kg:digest`  | Ingest material into the graph: extract entities, link, verify |
-| `/kg:explore` | Discover what the graph knows: traverse, narrate, surface gaps |
-| `/kg:connect` | Wire a new concept into existing knowledge: find relations     |
-| `/kg:polish`  | Audit and fix: orphans, low-degree nodes, duplicates           |
+| Skill           | What it does                                                   |
+| --------------- | -------------------------------------------------------------- |
+| `/khive:digest` | Ingest material into the graph: extract entities, link, verify |
+| `/khive:gap`    | Survey the graph's structural gaps: read-only frontier ranking |
+| `/khive:expand` | Grow the graph to close one strategic gap, with create caps    |
+| `/khive:polish` | Audit and fix: orphans, low-degree nodes, duplicates           |
+
+The agents (`khive:digester`, `khive:gap-analyst`, `khive:expander`, `khive:polisher`,
+`khive:librarian`, `khive:researcher`) and the pattern skills are described in
+[marketplace/khive/README.md](marketplace/khive/README.md).
 
 ### Configuration
 
