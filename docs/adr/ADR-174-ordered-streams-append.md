@@ -252,8 +252,9 @@ Stated before implementation, checked at the PR that lands the code; every arm n
    `salience` succeeds. Through direct statements against a migrated scratch database, because no verb can
    issue them: an `UPDATE notes` moving an entry's `namespace`, `kind` or `id`, a `DELETE FROM
    note_streams`, an `INSERT` into `note_streams` with `seq` equal to `0`, to the current head, or to
-   the head plus two, an insert naming a `note_id` absent from `notes`, and one naming a note that
-   exists in another namespace, all fail as constraint or trigger errors. `stream.stat.count` still equals `head_seq` after all of them.
+   the head plus two, an insert naming a `note_id` absent from `notes`, one naming a note that exists
+   in another namespace, and one naming a note whose `deleted_at` is set, all fail as constraint or
+   trigger errors. `stream.stat.count` still equals `head_seq` after all of them.
 8. **Mutation.** With the `expected_seq` predicate removed, test 3 goes red; with the fence check removed,
    test 4 goes red; with the note insert committed before the ledger insert instead of in one
    transaction and the ledger insert forced to fail, test 3's unchanged-count assertion goes red; with
