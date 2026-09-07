@@ -4,8 +4,7 @@ contract.
 
 This module provides the steps a transport needs to turn raw response
 bytes into validated `OpResult` entries: decode JSON, check the result is a
-request-envelope shape, flatten each per-op error object to the plain
-string `OpResult.error` expects, admit the daemon's minimal
+request-envelope shape, preserve validated per-op error objects, admit the daemon's minimal
 aborted-chain-entry shape, and validate every entry against `OpResult`. It
 is transport-agnostic and calls no transport itself — a transport that
 wants a malformed body, a malformed envelope, or a malformed per-op entry
@@ -20,7 +19,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .errors import TransportError
-from .models import OpResult
+from .models import OpError, OpResult
 
 
 def _decode_json_text(text: str, url: str) -> Any:
@@ -35,7 +34,7 @@ def _envelope_from_payload(payload: Any, url: str) -> dict[str, Any]:
     """Rejects a decoded JSON payload that is not a request envelope shape:
     a dict whose `results` member is a list. Shared by every transport so
     they all agree on this check, not just on the per-op normalization that
-    runs after it (`_stringify_op_errors`/`_validate_envelope_results`)."""
+    runs after it (`_validate_op_errors`/`_validate_envelope_results`)."""
     if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
         raise TransportError(f"response from {url} is not a request envelope: {str(payload)[:200]}")
     return payload
@@ -58,22 +57,17 @@ def _is_minimal_aborted_entry(entry: Any) -> bool:
 def _validate_envelope_results(envelope: dict[str, Any], url: str) -> dict[str, Any]:
     """Reject an envelope whose result entries do not match `OpResult`.
 
-    Runs after `_stringify_op_errors`, so a per-op error is already the
-    plain string `OpResult.error` expects, not a transport-native
-    `{"code","message"}` object — a top-level-only check would otherwise let
-    e.g. `{"results": [42]}` or an entry missing `ok`/`tool` reach the caller
-    as a successful response.
+    Error objects remain dictionaries in the returned envelope. Validation
+    never flattens or infers finality from their fields.
 
-    A minimal aborted entry (see `_is_minimal_aborted_entry`) is admitted
-    without going through `OpResult`, but normalized in place to carry
-    `tool: ""` first, keeping every entry (aborted or not) satisfying
+    A minimal aborted entry (see `_is_minimal_aborted_entry`) is normalized
+    in place to carry `tool: ""` before validation, keeping every entry satisfying
     `OpResult.tool: str` exactly, so every transport hands the caller the
     same object.
     """
     for index, entry in enumerate(envelope["results"]):
         if _is_minimal_aborted_entry(entry):
             entry["tool"] = ""
-            continue
         try:
             OpResult.model_validate(entry)
         except ValidationError as exc:
@@ -83,15 +77,8 @@ def _validate_envelope_results(envelope: dict[str, Any], url: str) -> dict[str, 
     return envelope
 
 
-def _stringify_op_errors(envelope: Any, url: str) -> Any:
-    """Flatten a transport's `{"code","message"}` per-op error objects to a
-    string, in place, so each entry still validates against
-    `OpResult.error: str | None`.
-
-    Validates the error object's shape first: `code`, when present, and
-    `message` must both be strings — anything else is a malformed entry,
-    not a value to flatten and pass along.
-    """
+def _validate_op_errors(envelope: Any, url: str) -> Any:
+    """Validate structured errors without replacing their original payloads."""
     if not isinstance(envelope, dict):
         return envelope
     for index, entry in enumerate(envelope.get("results", [])):
@@ -100,17 +87,10 @@ def _stringify_op_errors(envelope: Any, url: str) -> Any:
         err = entry.get("error")
         if not isinstance(err, dict):
             continue
-        code = err.get("code")
-        if code is not None and not isinstance(code, str):
+        try:
+            OpError.model_validate(err)
+        except ValidationError as exc:
             raise TransportError(
-                f"response from {url} has a malformed error object at index {index}: "
-                f"'code' must be a string, got {type(code).__name__}"
-            )
-        message = err.get("message")
-        if not isinstance(message, str):
-            raise TransportError(
-                f"response from {url} has a malformed error object at index {index}: "
-                f"'message' must be a string, got {type(message).__name__}"
-            )
-        entry["error"] = f"{code}: {message}" if code else message
+                f"response from {url} has a malformed error object at index {index}: {exc}"
+            ) from exc
     return envelope
