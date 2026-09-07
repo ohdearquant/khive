@@ -69,7 +69,7 @@ plan result can never be mistaken for a dispatch result by shape.
       "prev_refs": ["id"]
     }
   ],
-  "limits": { "max_ops": 100, "max_depth": 8 }
+  "limits": { "max_ops": 100, "max_depth": 64 }
 }
 ```
 
