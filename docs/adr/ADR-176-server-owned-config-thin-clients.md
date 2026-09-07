@@ -1,4 +1,4 @@
-# ADR-172: Server-owned storage config — client processes stop carrying engines
+# ADR-176: Server-owned storage config — client processes stop carrying engines
 
 - Status: Proposed
 - Date: 2026-09-01

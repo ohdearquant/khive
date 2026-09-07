@@ -1,4 +1,4 @@
-# ADR-173: Weighted incidence as the graph's storage primitive
+# ADR-177: Weighted incidence as the graph's storage primitive
 
 - Status: Proposed
 - Date: 2026-09-01
