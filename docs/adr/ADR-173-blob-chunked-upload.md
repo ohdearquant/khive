@@ -11,11 +11,15 @@
 Two ceilings disagree. `blob.put` accepts objects up to 64 MiB (`MAX_OBJECT_BYTES`,
 `crates/khive-pack-blob/src/handlers.rs`, matched by the S3 backend's ceiling from ADR-111 Amendment 2).
 The daemon frame is 8 MiB in either direction (`MAX_FRAME_BYTES`, `crates/khive-runtime/src/daemon.rs`;
-ratified as the default for the tailnet transport by ADR-137 Amendment 1). `blob.put` carries its bytes
-as base64 inside one frame, so the largest object a client can actually put over the wire is just under
-6 MiB: base64 grows 3 bytes into 4, and the request envelope needs room too. A 6 MiB object encodes past
-the cap before the connection opens. Anything between about 6 MiB and 64 MiB can be stored only by a
-caller inside the daemon process.
+ratified as the default for the tailnet transport by ADR-137 Amendment 1), and inside the frame the
+request parser refuses an `ops` string longer than 1 MiB before it parses anything (`MAX_OPS_INPUT_LEN`,
+`crates/khive-request/src/types.rs`, checked in `crates/khive-request/src/parser/dispatch.rs`; the
+Python client mirrors the constant in `python/khive/dsl.py` and refuses to render past it). `blob.put`
+carries its bytes as base64 inside that `ops` string, so the tighter of the two caps binds: base64 grows
+3 bytes into 4, and the largest object a client can actually put over the wire today is 768 KiB
+(786,432 bytes), a little under that once the call's own envelope is counted. A 1 MiB object renders past
+the parser cap before the connection opens. Anything between roughly 768 KiB and 64 MiB can be stored
+only by a caller inside the daemon process.
 
 Reads do not have this problem. `blob.get` already takes `range={offset, length}` and bounds each
 response by the frame budget (`max_returnable_raw_bytes()`, 6,288,384 bytes), so a 64 MiB object is read
@@ -36,14 +40,20 @@ commit that upload, the same capability-by-possession model ADR-111 Amendment 4 
 references. `size` is the declared total and is refused above `MAX_OBJECT_BYTES` before any bytes move.
 
 `part_limit` is the largest raw part the server accepts, and it is a named constant beside
-`max_returnable_raw_bytes()` in the blob handlers: `max_request_part_raw_bytes() = ((MAX_FRAME_BYTES -
-REQUEST_RESERVE) * 3) / 4`, where `REQUEST_RESERVE` is the room the request envelope needs around the
-base64 payload (`upload_id`, `index`, the verb name, the frame's actor and namespace fields, the ops
-wrapper) and is fixed at 8192 bytes, twice the response reserve, because the request carries more
-fields than the response. A part of exactly `part_limit` raw bytes serialises to a frame under
-`MAX_FRAME_BYTES`; a part one byte larger is refused by the handler on decoded length, and a frame that
-overflows the cap is refused by the daemon before dispatch, so a client that computes the same formula
-never learns the cap by a rejected frame.
+`max_returnable_raw_bytes()` in the blob handlers: `max_request_part_raw_bytes() =
+((min(MAX_OPS_INPUT_LEN, MAX_FRAME_BYTES) - REQUEST_RESERVE) * 3) / 4`. The minimum is over both caps a
+request passes through, the parser's `ops` input cap and the daemon frame, because the base64 payload
+sits inside the `ops` string and the `ops` string sits inside the frame; the constant tracks whichever
+is tighter, so raising either cap later moves `part_limit` without a second edit. `REQUEST_RESERVE` is
+the room the call's own text needs around the payload (`upload_id`, `index`, the verb name, the ops
+wrapper, and at the frame the actor and namespace fields) and is fixed at 8192 bytes, twice the
+response reserve, because the request carries more fields than the response. With the constants as
+they stand the parser cap is the tighter one and `part_limit` is 780,288 bytes, so a 64 MiB object
+takes 87 parts. A part of exactly `part_limit` raw bytes renders to an `ops` string under
+`MAX_OPS_INPUT_LEN` and to a frame under `MAX_FRAME_BYTES`; a part one byte larger is refused by the
+handler on decoded length, an `ops` string over the parser cap is refused before parsing, and a frame
+that overflows the frame cap is refused by the daemon before dispatch, so a client that computes the
+same formula never learns either cap by a rejected request.
 
 When the caller already knows the object's BLAKE3 reference it may pass `content_ref`. The server then
 checks existence first and, if the object is present, answers `{content_ref, size}` with no `upload_id`,
@@ -161,7 +171,8 @@ uploads that survive a daemon restart, and a dedup flag on the result.
 | A server-local file path on `blob.put`                             | Rejected already in the blob handler; a path is not a capability and a remote client has no such path.                                                                                                                                                        |
 | Let the client compute the hash and target key up front (required) | Requires BLAKE3 in every client; the optional `content_ref` in §1 keeps the early-dedup benefit for clients that have it without making it a dependency.                                                                                                      |
 | A `deduplicated` flag on commit                                    | Neither backend reports it and `blob.put` does not; adding it changes a public result for a bit `blob.stat` already answers before the upload starts.                                                                                                         |
-| Send each wire part as one provider multipart part                 | Most providers refuse non-final parts under 5 MiB and some require equal sizes; the wire part limit is under 6 MiB and clients choose smaller parts. `WriteMultipart`'s fixed 5 MiB chunking absorbs the mismatch.                                            |
+| Send each wire part as one provider multipart part                 | Most providers refuse non-final parts under 5 MiB and some require equal sizes; the wire part limit is under 1 MiB and clients may choose smaller parts still. `WriteMultipart`'s fixed 5 MiB chunking absorbs the mismatch.                                  |
+| Raise or exempt `MAX_OPS_INPUT_LEN` for the blob verbs             | The cap guards the request parser for every verb and every transport; a per-verb exemption is a parser change with a wider blast radius than this ADR, and the price of keeping it is part count, not reachability. Kept; the formula in §1 follows the cap if it ever moves. |
 | Acknowledge a tail resend on length alone                          | A same-length resend with different bytes would be acknowledged while the staging object holds the first bytes; the hash of the last part costs 32 bytes per upload and closes it.                                                                            |
 
 ## Consequences
@@ -189,8 +200,10 @@ uploads that survive a daemon restart, and a dedup flag on the result.
    and the upload is gone; a resend with the same length and different bytes is refused and the upload
    is gone, and a subsequent `commit` answers unknown upload.
 4. A part crossing `size` aborts the upload and leaves no staging file; `begin` above `MAX_OBJECT_BYTES`
-   is refused before any part; a part of exactly `part_limit` bytes is accepted and one of
-   `part_limit + 1` is refused on decoded length.
+   is refused before any part; a part of exactly `part_limit` bytes renders to an `ops` string the
+   request parser accepts and is accepted by the handler, and one of `part_limit + 1` is refused on
+   decoded length; the same test asserts `part_limit` equals the §1 formula evaluated over the live
+   constants, so a moved cap fails the test rather than a client.
 5. Abort leaves no file; an upload idle past the expiry is gone after the sweep; the transactional
    orphan GC run with a live staging file present deletes nothing it should not (the control: a
    committed object and a staging file side by side, both survive one GC pass, the staging file alone is
@@ -204,6 +217,6 @@ uploads that survive a daemon restart, and a dedup flag on the result.
 8. One publish routine: a test asserts by construction that `put` and `commit_upload` call the same
    function for the rename-into-shard step, and once the 01260bf0 barrier repair lands, the barrier test
    runs against `commit` as well as `put`.
-9. S3 backend: a 64 MiB upload through wire parts of 1 MiB completes against a MinIO-compatible target
+9. S3 backend: a 64 MiB upload through wire parts of `part_limit` bytes completes against a MinIO-compatible target
    (the ADR-111 Amendment 2 lane) and reads back byte-identical; abort leaves no staging object.
 10. Where ADR-111 Amendment 4's put ledger exists: no row before commit and exactly one after.
