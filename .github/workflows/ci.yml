@@ -269,6 +269,37 @@ jobs:
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh contract-suite
 
+  khive-py:
+    name: Python client tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      KKERNEL: ${{ github.workspace }}/crates/target/debug/kkernel
+      PYTHONPATH: ${{ github.workspace }}/python
+      TMPDIR: /tmp
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          key: line-tables
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: No-stub placeholder scan (before any cargo)
+        run: scripts/ci.sh no-stubs-scan
+      - name: Build debug kkernel
+        run: cargo build --manifest-path crates/Cargo.toml --locked -p kkernel --bin kkernel
+      - name: Install dependencies and run Python tests
+        # pytest exits nonzero when no tests are collected; no separate floor is needed.
+        run: uv run --no-project --with 'pydantic>=2.7' --with 'pytest>=8' pytest python/tests
+
   kg-editor:
     name: KG Studio (Next.js)
     runs-on: ubuntu-latest
@@ -884,6 +915,7 @@ jobs:
     needs:
       - automerge-push-guard
       - ci
+      - khive-py
       - kg-editor
       - supply-chain
       - data-leak-guard
