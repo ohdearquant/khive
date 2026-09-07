@@ -30,6 +30,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from .envelope import _decode_json_text, _envelope_from_payload, _validate_envelope_results
 from .errors import (
     ConfigMismatch,
     FrameTooLarge,
@@ -165,10 +166,9 @@ class Session:
         if not response.get("ok"):
             raise RequestRejected(str(response.get("error")))
         raw = response.get("result")
-        parsed = json.loads(raw) if isinstance(raw, str) else raw
-        if isinstance(parsed, dict) and "results" in parsed:
-            return parsed["results"]
-        raise TransportError(f"response result missing 'results': {str(parsed)[:200]}")
+        parsed = _decode_json_text(raw, "daemon") if isinstance(raw, str) else raw
+        envelope = _envelope_from_payload(parsed, "daemon")
+        return _validate_envelope_results(envelope, "daemon")["results"]
 
     def _base_frame(self) -> dict[str, Any]:
         return {
