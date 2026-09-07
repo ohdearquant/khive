@@ -33,8 +33,8 @@ Two facts bound the design:
 - By-id verbs resolve without a namespace filter (ADR-007, `unscoped_by_id`): a caller holding an id can
   read and overwrite a note in any namespace. A version precondition therefore protects against lost
   updates, not against other principals; authorization stays the Gate's seam.
-- Thirty-three `UPDATE notes` statements live across eight files (`grep -rn "UPDATE notes" crates
-  --include='*.rs'`, test modules excluded): the note store, pending-events replay, gtd, memory, schedule,
+- Thirty-two `UPDATE notes` statements live across eight files (`grep -rn "UPDATE notes" crates
+  --include='*.rs'`, with `_tests.rs` files and `tests/` directories excluded): the note store, pending-events replay, gtd, memory, schedule,
   the atomic-message path, and curation. A revision maintained by hand at each site would drift at the
   first site that forgets it.
 
@@ -62,7 +62,7 @@ BEGIN
 END;
 ```
 
-Every existing row starts at 1. Every statement that touches a note row, today's thirty-three and any
+Every existing row starts at 1. Every statement that touches a note row, today's thirty-two and any
 future one, advances the version in the same transaction, because the trigger runs inside it. The `WHEN`
 clause makes a statement that sets `version` explicitly a no-op for the trigger; nothing in tree does, and
 a test asserts that no production statement writes the column (the population is the grep above, named
@@ -80,9 +80,17 @@ gains `AND version = ?expected` when the caller supplied one, so the check and t
 inside the writer's `BEGIN IMMEDIATE` (ADR-067). No new transaction shape, no read-then-write in the
 handler. The internal snapshot guard stays as it is; the caller's precondition composes with it.
 
-On mismatch the verb fails with `KhiveError::conflict`, `code: "version_conflict"`, and
-`details: {"expected_version": N, "current_version": M}`. `M` is read after the failed statement, inside
-the same writer request, so the caller's next attempt can carry it. A `version_conflict` performs no
+Every refusal this ADR introduces uses the error shape the runtime can already emit. `KhiveError`
+serialises as `{"kind", "message", "code", "details"}` where `code` is a numeric domain code such as
+`runtime:10` or `null`, and `details` is at most eight string-to-string pairs. The refusals below are
+`kind: "conflict"` (or `not_found` where stated), `code` unchanged from what the constructor gives today,
+and the discriminator is `details.reason`; every detail value is a string, a list is comma-joined, and a
+value that has no current row is omitted rather than written as null. A client that wants the
+structured object reads `details` verbatim; the Python client preserves it as sent.
+
+On mismatch the verb fails with `KhiveError::conflict` and
+`details: {"reason": "version_conflict", "expected_version": "N", "current_version": "M"}`. `M` is read
+after the failed statement, inside the same writer request, so the caller's next attempt can carry it. A `version_conflict` performs no
 mutation: `version` does not advance, `updated_at` does not move.
 
 Omitting `expected_version` keeps today's behaviour exactly. Entities and edges are out of scope here;
@@ -97,8 +105,8 @@ evaluated in the same transaction as the write. `update` and `create` (§3) acce
 `fence={"key": K2, "kind": <note kind>, "expected_version": G}`. Inside the writer request, before the
 conditional write, the fence row is resolved by key in the caller's primary namespace and its `version`
 compared to `G`; a missing row or a different version fails the whole request with `KhiveError::conflict`,
-`code: "fence_conflict"`, `details: {"key": K2, "expected_version": G, "current_version": M | null}`, and
-nothing is written. The fence is checked only when supplied; whether a write without a fence should be
+`details: {"reason": "fence_conflict", "key": K2, "expected_version": "G", "current_version": "M"}`
+(the last pair omitted when no row holds `K2`), and nothing is written. The fence is checked only when supplied; whether a write without a fence should be
 refused for a run that has a lease is policy above khive and is not decided here.
 
 ### 3. `key`, and create-if-absent
@@ -113,13 +121,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_namespace_kind_key
 
 `key` is a caller-chosen string, at most 512 bytes, no U+0000, unique among live notes of one kind in one
 namespace. Existing rows have `NULL` and are untouched. `create(kind="note", note_kind=..., key=K, ...)`
-inserts the note or fails with `KhiveError::conflict`, `code: "key_conflict"`, `details: {"key": K,
+inserts the note or fails with `KhiveError::conflict`, `details: {"reason": "key_conflict", "key": K,
 "existing_id": <uuid>}` when a live note already holds `K`; the index is what refuses, so two racing
 creators get exactly one success. `get(kind="note", key=K)` resolves by key within the caller's primary
 namespace, the same scope rule as prefix resolution in ADR-007. Uniqueness is per note kind, so `K` may
 be held by one live note of each kind; `get(kind="note", key=K, note_kind=X)` selects one, and a lookup
 without `note_kind` that matches more than one kind fails with `KhiveError::conflict`,
-`code: "key_ambiguous"`, `details: {"key": K, "kinds": [...]}` rather than returning either. `key` is
+`details: {"reason": "key_ambiguous", "key": K, "kinds": "observation,decision"}` rather than returning
+either. `key` is
 immutable after create; `update` does not accept it. A soft-deleted note releases its key; a hard delete
 does too.
 
@@ -158,7 +167,7 @@ A keyed listing also accepts `after_key=K` in place of `after`: the server resol
 `K` in the listing's namespace and note kind, takes its current `(updated_at, key)` as the cursor, and
 continues from there, whether or not that note itself satisfies the call's other filters. A client that
 holds only the last key it saw can therefore resume without a cursor of its own. When no live note holds
-`K` the call fails with `KhiveError::not_found`, `code: "after_key_missing"`, `details: {"key": K}`,
+`K` the call fails with `KhiveError::not_found`, `details: {"reason": "after_key_missing", "key": K}`,
 never silently restarting from the front. A note updated between two pages moves to the front of the
 order, so resuming from it skips whatever was written in between; that is a property of last-write
 order, and a client that needs a stable walk uses `created_after` on the unkeyed listing instead.
@@ -203,7 +212,7 @@ uniqueness is not offered: the index is per namespace by construction.
 | Alternative                                              | Why not                                                                                                                                                                                                                        |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Expose `expected_updated_at` instead of adding `version` | A microsecond timestamp round-trips through presentations as a string and through clients as floating point; an integer revision is exact, and the internal guard already needs both `updated_at` and `deleted_at` to be safe. |
-| Maintain `version` in each `UPDATE notes` statement      | Thirty-three sites in eight files today; the first site that forgets it silently breaks the precondition for every caller. The trigger closes the population.                                                                  |
+| Maintain `version` in each `UPDATE notes` statement      | Thirty-two sites in eight files today; the first site that forgets it silently breaks the precondition for every caller. The trigger closes the population.                                                                    |
 | Reuse `name` as the unique key                           | `name` is free-form and unindexed; making it unique would reject existing data and change the meaning of a human-facing field. A separate nullable column changes nothing for existing rows.                                   |
 | A `LIKE 'prefix%'` predicate for `key_prefix`            | Needs escaping of `%` and `_`, and a leading-anchored `LIKE` uses the index only under `case_sensitive_like`; the range form needs neither.                                                                                    |
 | `key < p \|\| CHAR(0x10FFFF)` as the range's upper bound | Omits `p` + U+10FFFF and every key extending it, which are permitted keys that start with `p`; the successor bound admits them, and the no-successor case degrades to a lower bound only.                                      |
@@ -217,10 +226,13 @@ uniqueness is not offered: the index is per namespace by construction.
 - Every note response grows an integer field. Clients that ignore unknown fields are unaffected.
 - The `replace_note_if_unchanged` statement gains one optional predicate; every other note write is
   untouched and still advances `version` through the trigger.
-- `create` for notes gains `key`; `get` gains `key` for notes; `list` gains three parameters; `update`
-  gains `expected_version`. The help text for each names the conflict codes.
-- Two new conflict codes, `version_conflict` and `key_conflict`, both under `kind: conflict`, both carrying
-  the values a caller needs to recover.
+- `create` for notes gains `key` and `fence`; `get` gains `key` and `note_kind` for notes; `list` gains
+  five parameters (`key_prefix`, `updated_after`, `created_after`, `tag_mode`, `after_key`); `update`
+  gains `expected_version` and `fence`. The help text for each names the refusal reasons.
+- Four conflict reasons, `version_conflict`, `fence_conflict`, `key_conflict` and `key_ambiguous`, all
+  under `kind: conflict`, and one `not_found` reason, `after_key_missing`, all carried in
+  `details.reason` with the values a caller needs to recover. No new `code` value and no change to the
+  error type.
 - This is the idempotency story for note writes. `request_id` is correlation and not an idempotency key;
   the version precondition is what makes a blind retry after a lost response safe: it either applies
   once or reports the version the earlier attempt produced.
@@ -251,7 +263,10 @@ Stated before implementation, checked at the PR that lands the code:
    updated after the cutoff appearing first; two documents with equal `updated_at` ordered by `key DESC`;
    each walked across at least two pages with the keyed cursor, and the page set equal to the unpaged set;
    a fixture mixing unkeyed and keyed notes where `key_prefix=""` returns only the keyed ones and
-   `updated_after` alone returns both in insertion order.
+   `updated_after` alone returns both in insertion order; `created_after` alone, inclusive on the
+   boundary, on the same mixed fixture; `after_key=K` resuming a keyed listing yields exactly the pages
+   the cursor walk yields from the same row, also when `K`'s own note fails the call's `tags` filter,
+   and `after_key` naming no live note fails with `after_key_missing` and returns no rows.
 6. **Fence.** A write with `fence` at the right generation succeeds; at a stale generation, or when the
    fence row is missing, it fails with `fence_conflict` and neither row changes. Cross-process, as in 1.
    The cross-process compare-and-set control in 1 is new acceptance written for this ADR; no existing
@@ -261,8 +276,8 @@ Stated before implementation, checked at the PR that lands the code:
    guard is not the check here; the caller's precondition is.
 8. **Lost acknowledgement.** A's update at `expected_version=N` commits and A never sees the response; A
    retries the identical request. The retry gets `version_conflict` with `current_version: N+1`, and the
-   row advanced exactly once. Absent-key create races the same way: two `create(key=K,
-   expected_version=0)` from two processes, one success, one `key_conflict`, one live row.
+   row advanced exactly once. Absent-key create races the same way: two `create(key=K)` from
+   two processes, one success, one `key_conflict`, one live row.
 9. **Migration.** Upgrading a populated pre-028 database leaves every existing row at `version = 1` with
    `key IS NULL`, and the index creation succeeds with duplicate `name` values present.
 10. **Durability option.** A deployment started with `synchronous = "full"` reports it in `db_diagnostics`;
