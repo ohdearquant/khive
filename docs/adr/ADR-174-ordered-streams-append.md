@@ -437,9 +437,14 @@ BEGIN
 END;
 ```
 
-A ledger row is immutable once written; the only write to `note_streams` is an append. Acceptance
-7 gains, in its direct-statement list, an `UPDATE note_streams` that changes `seq` or `note_id`,
-and acceptance 8 counts six triggers.
+A ledger row is immutable once written; the only write to `note_streams` is an append. The
+membership trigger `refuse_stream_foreign_note` also refuses an insert naming a `note_id` already in
+the ledger (`OR EXISTS (SELECT 1 FROM note_streams WHERE note_id = NEW.note_id)` in its `WHEN`),
+because `INSERT OR REPLACE` resolves the `UNIQUE (note_id)` conflict by deleting the old row without
+firing the delete trigger while recursive triggers are off, which would re-seat an entry at a new
+`seq` past every guard above. Acceptance 7 gains, in its direct-statement list, an
+`UPDATE note_streams` that changes `seq` or `note_id` and an `INSERT OR REPLACE` naming a member's
+`note_id` at the next `seq`, each leaving count and head unchanged; acceptance 8 counts six triggers.
 2. **The check constraint is overdetermined for `seq = 0`.** `refuse_stream_gap` refuses `seq = 0`
 on its own, because zero is never one more than the head, so dropping `CHECK (seq > 0)` alone
 leaves acceptance 7's `seq = 0` arm green and proves nothing about the check. The mutation arm for
