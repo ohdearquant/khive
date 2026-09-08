@@ -81,3 +81,39 @@ The sandbox is macOS seatbelt only; a Linux profile is a later slice. Toolchain 
 configuration and a missing root reads as a tool failure, not a policy refusal. Every run materializes
 from scratch; build caches across runs are a later slice. Output caps and run retention are config,
 not policy.
+
+## Amendment 1 (2026-09-08): run parameters, capture, refusal receipts, sandbox identity
+
+Adopted on the first whole-file read against the loop driver's contract page. Each item is a
+contract the driver's tests bind to; the record above stands where not restated.
+
+1. **`cwd`.** `exec.run` takes `cwd`, a path relative to the tree, default `.`. An absolute path, a
+   `..` component or a symlink escape is refused before materialization.
+2. **Environment.** The caller supplies the environment values; the `[exec] env` config allow-lists
+   the keys that may pass; the server sets `HOME` to the run directory; nothing is inherited from the
+   host. The receipt records `env_keys`.
+3. **`declared_write_paths`** (optional). When given, a change outside the declared set makes the run
+   `success: false`, names the offending paths in `undeclared_changes`, and drops their bytes: they
+   are neither stored nor part of `tree_out`.
+4. **Capture over the cap keeps the tail.** For each stream the receipt carries `produced_bytes`,
+   `retained_bytes` and `capture: complete | incomplete`; a test runner's closing summary survives.
+5. **Every refusal writes a receipt.** An unregistered tool, a `deny` or `ask` decision, an invalid
+   tree and a `cwd` escape each write an `exec_runs` row with `decision` and `reason`, `tree_out`
+   null, and no run directory is created.
+6. **Session identity.** `exec.run` takes an optional `session_id`, echoed in the receipt with a
+   per-session `seq`; `exec.runs` filters on it. The driver's command identity is `session:seq`.
+7. **Sandbox object.** The receipt carries `sandbox: {profile_digest, tool_binary_digest,
+   read_roots_digest}` (the resolved read roots and the registered binary hashed at run time), not a
+   bare profile digest.
+8. **Version control never runs here.** A registered tool whose binary resolves, after
+   canonicalization, to `git` or `gh`, or to any path in the `[exec] never` config set, is refused;
+   repository operations go through ADR-182 only.
+9. **Driver mapping.** An `argv` from the driver binds `argv[0]` to a registered tool label and passes
+   `argv[1..]` as `args`; this lives in the driver's test file and changes nothing here.
+
+Acceptance arms added: 9 `cwd` escape refused with no run directory; 10 an env key outside the
+allow-list is absent inside the run and a caller value for an allowed key is present; 11 a write
+outside `declared_write_paths` yields `success: false` and the bytes are not retrievable; 12 output
+over the cap retains the tail and the receipt's counts match the bytes produced; 13 each refusal
+class has a receipt row; 14 two runs with one `session_id` carry `seq` 1 and 2; 15 the sandbox object
+changes when the read roots change (control); 16 a tool registered at the `git` binary is refused.
