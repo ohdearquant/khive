@@ -780,7 +780,12 @@ chain entry carries no error object today (`ok: false`, `aborted: true`, `messag
 `runtime_error_value` renders obligation errors as a structured object with `kind: "obligation"`,
 `code` set to the terminal reason (`admission_deadline_expired`, `store_failure`, and the other
 `AuditTerminalReason` values in snake case), `message`, `domain_disposition: "committed"` and
-`domain_result`. Errors that today serialize as a bare string keep their message and gain the field
+`domain_result`. An obligation path that fails before it has a terminal reason (the git digest
+receipt path's setup branches: no event store, no deferred audit, a malformed receipt payload)
+renders the same object with `code` set to that path's own failure code in snake case
+(`git_digest_receipt_failure`) and the branch named in `message`; it is `committed` because the
+digest report exists, and `domain_result` carries it. Any handler-owned receipt path that bypasses
+the fold is in scope of this amendment and renders through the same serializer. Errors that today serialize as a bare string keep their message and gain the field
 by becoming an object of the shape `{"kind": "...", "message": "...", "domain_disposition": "..."}`.
 
 Wire rule. Today `error` is a string at some sites (dispatch failures, the conflict and `$prev`
