@@ -200,3 +200,29 @@ exactly one native call, and `git.reconcile` settles it to `committed`; 24 recei
 every reply, receipt, table row and raw record; 25 the resolver is read exactly once per mutation
 and returns the rotated value; 26 a gate deny records no `tool.check` call and a null policy, while a
 gate allow records exactly one call with the policy id.
+
+## Amendment 3 (2026-09-08): credential selection bound to the resolved caller, fork merges recorded
+
+Adopted after the review that followed the first exec implementation, which read this record beside
+it. Item 1 makes Amendment 2 item 3 exact; item 2 records an argument rather than a change.
+
+1. **The actor is the identity the runtime resolved, never a value the call carries.** The
+   `[git_write.actors]` row that selects a credential is looked up by the actor label the runtime
+   resolved for the request before the handler ran (ADR-096: the peer's declared identity on the
+   daemon socket, or the configured actor of an in-process dispatch), which is the label the receipt
+   records as `actor`. No request parameter, no environment variable read by the handler and no
+   repository configuration takes part in that lookup; the `actor`, `author` and `credential` params
+   refuse (Amendment 2 item 3) so that a caller cannot name a row. A contract fixture therefore binds
+   an identity by running a process as that actor, not by passing a field. Two processes with the
+   same resolved label share the row, which is a trust decision the deployment takes in
+   configuration.
+2. **Fork merges (recorded argument).** The review asked that a merge of a cross-repository pull
+   request require a human decision. The policy row `git.pr_merge.fork` is that decision: a person
+   writes it, it names the actor, and without it every fork merge refuses (Amendment 1 item 3). A
+   per-call prompt is not available to a daemon with no console, and the row leaves the person in
+   the loop and the decision in the audit. No rule changes.
+
+Acceptance arms added: 27 two processes resolved as different actors get different credential
+references for the same call, a process whose resolved actor has no row refuses `actor_unmapped`
+while the same call from a mapped actor proceeds (control), and the receipt's `actor` equals the
+resolved label in every case.
