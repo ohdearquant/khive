@@ -131,9 +131,10 @@ so that nothing downstream can be written to depend on one.
    `prev_refs` listing exactly the `$prev` paths each stage uses.
 4. **Unknown verb is not an error.** A string naming a verb the registry lacks returns
    `parsed=true`, `known=false` for that stage, and no error.
-5. **Envelope isolation.** `plan=true` beside any of `presentation`, `presentation_per_op`, `format`,
-   `format_per_op`, `save_to` or `request_id` is refused with `invalid_params` naming the offending
-   field, on the MCP envelope and on the daemon frame alike.
+5. **Envelope isolation.** On the MCP envelope, `plan=true` beside any of `presentation`,
+   `presentation_per_op`, `format`, `format_per_op`, `save_to` or `request_id` is refused with
+   `invalid_params` naming the offending field; on the daemon frame, which carries no `save_to`, the
+   same for the other five.
 6. **Three surfaces, one result.** The MCP tool, `kkernel exec --plan`, and `Session.plan` return
    structurally equal results for the same string. The two daemon-frame surfaces send `plan=true` on
    the frame; a frame with `plan=true` sent to a daemon at the previous protocol version is answered
