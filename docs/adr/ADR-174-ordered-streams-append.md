@@ -417,3 +417,36 @@ serial execution under the writer lock.
    refusals promoted to whole-batch refusals, arm 4 goes red; with per-stream numbering assigned
    outside the transaction, arm 6 goes red; with per-member mode run as one transaction, arm 7's
    interleaving control goes red.
+
+## Amendment 2 (2026-09-08): the ledger refuses updates, an isolating fixture for the check constraint
+
+Adopted on the source audit that preceded the first implementation of Amendment 1. Nothing above is
+withdrawn; item 1 adds a guard the Decision claimed by implication, item 2 corrects an acceptance
+arm that could not fail.
+
+1. **No update on the ledger.** The schema guards `note_streams` against inserts that break order or
+   membership and against deletes, and says nothing about updates, so a direct `UPDATE note_streams`
+   could move a `seq` or rebind a `note_id` past every invariant claimed above. A sixth trigger
+   closes it, in the same migration as the rest of the streams schema:
+
+```sql
+CREATE TRIGGER IF NOT EXISTS refuse_stream_ledger_update
+BEFORE UPDATE ON note_streams
+BEGIN
+    SELECT RAISE(ABORT, 'stream_member');
+END;
+```
+
+A ledger row is immutable once written; the only write to `note_streams` is an append. Acceptance
+7 gains, in its direct-statement list, an `UPDATE note_streams` that changes `seq` or `note_id`,
+and acceptance 8 counts six triggers.
+2. **The check constraint is overdetermined for `seq = 0`.** `refuse_stream_gap` refuses `seq = 0`
+on its own, because zero is never one more than the head, so dropping `CHECK (seq > 0)` alone
+leaves acceptance 7's `seq = 0` arm green and proves nothing about the check. The mutation arm for
+the check drops `refuse_stream_gap` as well: with both removed the `seq = 0` insert succeeds
+(red); with only the trigger removed it still refuses through the check (control). Acceptance 8
+reads accordingly. The check stays in the schema as the one guard that does not depend on a head
+read.
+3. **Count and head are read from one snapshot.** `stream.stat` reads `COUNT(*)` and `MAX(seq)` in
+one statement over the same rows, so the equality acceptance 7 asserts compares two readings of
+one snapshot, and a divergence between them is a ledger defect, never a race between two reads.
