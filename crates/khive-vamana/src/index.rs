@@ -5648,23 +5648,21 @@ mod tests {
         let reader_path = dir.path().to_path_buf();
         let (probe_tx, probe_rx) = std::sync::mpsc::sync_channel(0);
         let reader_handle = std::thread::spawn(move || {
-            VamanaIndex::load_with_lock_hook(&reader_path, |lock| {
-                match lock.try_lock_shared() {
-                    Ok(()) => {
-                        probe_tx.send(ProbeOutcome::Uncontended).unwrap();
-                        Ok(())
-                    }
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        probe_tx.send(ProbeOutcome::Contended).unwrap();
-                        lock.lock_shared()?;
-                        Ok(())
-                    }
-                    Err(std::fs::TryLockError::Error(err)) => {
-                        probe_tx
-                            .send(ProbeOutcome::ProbeFailed(err.to_string()))
-                            .unwrap();
-                        Err(err.into())
-                    }
+            VamanaIndex::load_with_lock_hook(&reader_path, |lock| match lock.try_lock_shared() {
+                Ok(()) => {
+                    probe_tx.send(ProbeOutcome::Uncontended).unwrap();
+                    Ok(())
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    probe_tx.send(ProbeOutcome::Contended).unwrap();
+                    lock.lock_shared()?;
+                    Ok(())
+                }
+                Err(std::fs::TryLockError::Error(err)) => {
+                    probe_tx
+                        .send(ProbeOutcome::ProbeFailed(err.to_string()))
+                        .unwrap();
+                    Err(err.into())
                 }
             })
         });

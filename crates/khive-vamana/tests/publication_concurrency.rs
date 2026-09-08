@@ -39,7 +39,9 @@ fn corpus(round: u64) -> Vec<f32> {
     let mut state = 0x2545_F491_4F6C_DD1Du64 ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (0..VECTORS * DIMS)
         .map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
         })
         .collect()

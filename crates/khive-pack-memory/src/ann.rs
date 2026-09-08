@@ -118,8 +118,10 @@ pub(crate) struct AnnState {
 
 pub(crate) type SharedAnn = Arc<AnnState>;
 
-/// Shared ANN state for a process that builds corpus indexes: the warm daemon
-/// and the admin reindex path.
+/// Shared ANN state for a process that builds corpus indexes. Test-only here:
+/// production reaches this through `MemoryPack::new_with_index_role`, which
+/// states the role rather than assuming it.
+#[cfg(test)]
 pub(crate) fn new_shared() -> SharedAnn {
     new_shared_for_role(true)
 }
@@ -215,7 +217,9 @@ const REBUILD_CHAIN_DEBOUNCE_DEFAULT: std::time::Duration = std::time::Duration:
 
 fn rebuild_chain_debounce() -> std::time::Duration {
     resolve_rebuild_chain_debounce(
-        std::env::var("KHIVE_ANN_REBUILD_DEBOUNCE_MS").ok().as_deref(),
+        std::env::var("KHIVE_ANN_REBUILD_DEBOUNCE_MS")
+            .ok()
+            .as_deref(),
         REBUILD_CHAIN_DEBOUNCE_DEFAULT,
     )
 }
@@ -624,7 +628,9 @@ pub(crate) fn snapshot_key(_namespace: &str, model: &str) -> String {
 pub(crate) enum AnnEnsureStatus {
     AlreadyLoaded,
     LoadedSnapshot,
-    Built { vectors: usize },
+    Built {
+        vectors: usize,
+    },
     EmptyCorpus,
     DiscardedStaleBuild,
     /// Nothing on disk was adoptable and this process does not build corpus
@@ -3479,7 +3485,10 @@ mod tests {
         );
         // A malformed value must not silently become zero, which would restore
         // the behaviour this default exists to fix.
-        assert_eq!(resolve_rebuild_chain_debounce(Some("soon"), default), default);
+        assert_eq!(
+            resolve_rebuild_chain_debounce(Some("soon"), default),
+            default
+        );
         assert_eq!(resolve_rebuild_chain_debounce(Some("-1"), default), default);
         assert_eq!(resolve_rebuild_chain_debounce(Some(""), default), default);
     }
