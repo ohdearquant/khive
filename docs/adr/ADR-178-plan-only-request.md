@@ -40,9 +40,21 @@ returns the plan below. Nothing is dispatched, no identity is minted, no gate ru
 is appended, no store is touched. The CLI form is `kkernel exec --plan '<ops>'`. The Python client
 exposes `Session.plan(ops)` returning the same object.
 
-`plan=true` composes with `ops` only. `presentation`, `output_format`, their per-op overrides, the
-sink file and `request_id` are rejected with `invalid_params` when present beside `plan=true`, so a
-plan result can never be mistaken for a dispatch result by shape.
+`plan=true` composes with `ops` only. The other envelope fields of the `request` tool, by their wire
+names `presentation`, `presentation_per_op`, `format`, `format_per_op`, `save_to` and `request_id`, are
+rejected with `invalid_params` naming the field when present beside `plan=true`, so a plan result can
+never be mistaken for a dispatch result by shape.
+
+### D1a. The daemon frame carries the same flag
+
+`kkernel exec --plan` and `Session.plan` do not speak MCP; they send a `DaemonRequestFrame` to the warm
+daemon, and the daemon's normal path always dispatches `ops`. The frame therefore gains a boolean `plan`
+field (default false, the shape `probe_only` and `metrics_only` already use), and the connection handler
+answers it before `dispatch` is reached, on the same `parse_request`, with the plan object in the
+response's `result`. `presentation`, `presentation_per_op`, `format`, `format_per_op` and `request_id`
+beside `plan` on the frame are rejected the same way. The frame's protocol version is bumped with the
+field, so a daemon that predates it refuses the frame with `version_mismatch` instead of dispatching the
+ops as an ordinary request; a plan is never silently executed by an older daemon.
 
 ### D2. The plan result
 
@@ -69,7 +81,7 @@ plan result can never be mistaken for a dispatch result by shape.
       "prev_refs": ["id"]
     }
   ],
-  "limits": { "max_ops": 100, "max_depth": 64 }
+  "limits": { "max_ops": 100, "max_depth": 64, "max_input_len": 1048576 }
 }
 ```
 
@@ -81,7 +93,8 @@ plan result can never be mistaken for a dispatch result by shape.
   the name exists, nothing about whether this caller may call it.
 - `args` are the parser's normalized arguments (JSON literals decoded, strings unescaped); `$prev`
   references stay as the literal `$prev.<path>` string and are listed in `prev_refs`.
-- `limits` echoes the parser's own caps so a caller can size a string before sending it.
+- `limits` echoes the parser's three caps, op count, nesting depth and raw input length in bytes, so a
+  caller can size a string before sending it.
 
 ### D3. Same grammar, same errors, one parser
 
@@ -106,7 +119,7 @@ so that nothing downstream can be written to depend on one.
 - Out of scope, deliberately: dry-run of effects, resolved `$prev` targets, gate pre-checks, cost
   estimates. Each of those is admission or execution in disguise.
 
-## Acceptance (stated before implementation)
+## Acceptance
 
 1. **Same error, same text.** For every string in the parser's conformance corpus that fails to
    parse, `request(ops, plan=true)` returns `parsed=false` with an `error` equal to the dispatch
@@ -118,10 +131,13 @@ so that nothing downstream can be written to depend on one.
    `prev_refs` listing exactly the `$prev` paths each stage uses.
 4. **Unknown verb is not an error.** A string naming a verb the registry lacks returns
    `parsed=true`, `known=false` for that stage, and no error.
-5. **Envelope isolation.** `plan=true` beside `presentation`, `output_format`, a sink or
-   `request_id` is refused with `invalid_params` naming the offending field.
+5. **Envelope isolation.** `plan=true` beside any of `presentation`, `presentation_per_op`, `format`,
+   `format_per_op`, `save_to` or `request_id` is refused with `invalid_params` naming the offending
+   field, on the MCP envelope and on the daemon frame alike.
 6. **Three surfaces, one result.** The MCP tool, `kkernel exec --plan`, and `Session.plan` return
-   structurally equal results for the same string.
+   structurally equal results for the same string. The two daemon-frame surfaces send `plan=true` on
+   the frame; a frame with `plan=true` sent to a daemon at the previous protocol version is answered
+   with `version_mismatch` and nothing is dispatched (test against a stub daemon at the old version).
 7. **No admission leak.** A grep of the plan handler's call graph reaches no gate, no store and no
    identity constructor; the test asserts the handler's dependencies by module.
 
@@ -131,5 +147,8 @@ so that nothing downstream can be written to depend on one.
   is read before dispatch, the parser is called, and the result is returned on the same path `help`
   uses. `kkernel exec` gains `--plan` in `crates/kkernel/src/exec.rs`.
 - Catalog read through the registry's existing verb listing; no new registry API.
-- `python/khive/transport.py`: `Session.plan(ops)` renders the envelope with `plan=true` and
+- `crates/khive-runtime/src/daemon.rs`: `DaemonRequestFrame` gains `plan: bool` (serde default), the
+  connection handler takes the plan arm beside `probe_only`, before `dispatch`, and `PROTOCOL_VERSION`
+  is bumped with the field.
+- `python/khive/transport.py`: `Session.plan(ops)` sends the daemon frame with `plan=true` and
   returns the decoded object; `envelope.py` gains the plan shape beside the results envelope.
