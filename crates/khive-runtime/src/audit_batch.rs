@@ -298,6 +298,7 @@ impl Inner {
         let drained: Vec<Waiting> = std::mem::take(&mut state.pending);
         if !already_failed {
             state.flush_failures += 1;
+            state.degraded = true;
             let generation_id = state.next_generation_id;
             state.generations.push(AuditGenerationSnapshot {
                 generation_id,
@@ -583,6 +584,7 @@ async fn supervisor_loop(
                     state.in_flight_generation = None;
                     state.store_batch_calls += 1;
                     state.flush_failures += 1;
+                    state.degraded = true;
                     let generation_id = state.next_generation_id.saturating_sub(1);
                     state.generations.push(AuditGenerationSnapshot {
                         generation_id,
