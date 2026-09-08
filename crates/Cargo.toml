@@ -36,6 +36,7 @@ members = [
     "khive-pack-knowledge",
     "khive-pack-session",
     "khive-pack-tool",
+    "khive-pack-exec",
     "khive-pack-git",
     "khive-pack-workspace",
     "khive-mcp",

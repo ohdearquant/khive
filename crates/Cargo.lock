@@ -1996,6 +1996,7 @@ dependencies = [
  "khive-pack-brain",
  "khive-pack-code",
  "khive-pack-comm",
+ "khive-pack-exec",
  "khive-pack-git",
  "khive-pack-gtd",
  "khive-pack-kg",
@@ -2004,6 +2005,7 @@ dependencies = [
  "khive-pack-moodboard",
  "khive-pack-schedule",
  "khive-pack-session",
+ "khive-pack-tool",
  "khive-pack-web",
  "khive-pack-workspace",
  "khive-request",
@@ -2131,6 +2133,30 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "khive-pack-exec"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "chrono",
+ "inventory",
+ "khive-pack-blob",
+ "khive-pack-kg",
+ "khive-pack-tool",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -2362,6 +2388,24 @@ dependencies = [
  "khive-types",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "khive-pack-tool"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "inventory",
+ "khive-pack-kg",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2639,6 +2683,7 @@ dependencies = [
  "khive-pack-brain",
  "khive-pack-code",
  "khive-pack-comm",
+ "khive-pack-exec",
  "khive-pack-formal",
  "khive-pack-git",
  "khive-pack-gtd",
@@ -2648,6 +2693,7 @@ dependencies = [
  "khive-pack-moodboard",
  "khive-pack-schedule",
  "khive-pack-session",
+ "khive-pack-tool",
  "khive-pack-web",
  "khive-pack-workspace",
  "khive-repo-showcase",

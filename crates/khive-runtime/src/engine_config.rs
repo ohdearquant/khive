@@ -83,6 +83,9 @@ pub enum ConfigError {
     #[error("[[git_write.allowed]] entry {repo:?}: {reason}")]
     InvalidGitWriteEntry { repo: String, reason: String },
 
+    #[error("[exec] {key}: {reason}")]
+    InvalidExecConfig { key: String, reason: String },
+
     #[error(
         "[runtime] blob_hydration_bytes must be between {min} and {max} bytes inclusive; got {value}"
     )]
@@ -436,6 +439,63 @@ pub struct GitWriteSectionConfig {
     pub allowed: Vec<GitWriteEntryConfig>,
 }
 
+// ---- exec sandbox (ADR-181) ----
+
+/// `[exec.limits]`: per-run resource limits applied to the sandboxed child
+/// and inherited by its descendants (`setrlimit` before exec).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ExecLimitsConfig {
+    #[serde(default)]
+    pub cpu_seconds: Option<u64>,
+    #[serde(default)]
+    pub address_space: Option<u64>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    #[serde(default)]
+    pub nproc: Option<u64>,
+}
+
+/// `[exec]` section (ADR-181): where runs materialize, what they may read,
+/// which caller environment keys pass through, which binaries never run,
+/// output caps, wall-clock defaults and resource limits.
+///
+/// ```toml
+/// [exec]
+/// root = "/var/lib/khive/exec"
+/// read_roots = ["/opt/toolchains/python3.11"]
+/// env = ["SOURCE_DATE_EPOCH"]
+/// never = ["/usr/bin/curl"]
+/// max_output_bytes = 1048576
+/// timeout_default_s = 30
+/// timeout_max_s = 600
+/// keep = false
+///
+/// [exec.limits]
+/// cpu_seconds = 60
+/// file_size = 104857600
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ExecSectionConfig {
+    #[serde(default)]
+    pub root: Option<String>,
+    #[serde(default)]
+    pub read_roots: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub never: Vec<String>,
+    #[serde(default)]
+    pub max_output_bytes: Option<u64>,
+    #[serde(default)]
+    pub timeout_default_s: Option<f64>,
+    #[serde(default)]
+    pub timeout_max_s: Option<f64>,
+    #[serde(default)]
+    pub keep: bool,
+    #[serde(default)]
+    pub limits: ExecLimitsConfig,
+}
+
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
 ///
 /// Sections consumed today:
@@ -509,6 +569,11 @@ pub struct KhiveConfig {
     /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).
     #[serde(default)]
     pub storage: StorageSectionConfig,
+
+    /// Exec sandbox section (ADR-181). Absent means no runs: the exec pack
+    /// refuses every `exec.run` until `[exec] read_roots` names a toolchain.
+    #[serde(default)]
+    pub exec: ExecSectionConfig,
 
     /// Rendering timezone configuration (ADR-169). Absent `timezone` resolves
     /// to the host's local zone at [`RuntimeConfig`](crate::RuntimeConfig)
@@ -804,6 +869,32 @@ impl KhiveConfig {
             if !value.is_empty() {
                 return Err(ConfigError::UnsupportedTopLevelDb {
                     value: value.to_string(),
+                });
+            }
+        }
+
+        // ADR-181 resource limits: macOS returns EINVAL for RLIMIT_AS and
+        // RLIMIT_DATA, and RLIMIT_NPROC counts every process of the uid, so
+        // neither can bound one run. Refuse loudly instead of pretending.
+        if cfg!(target_os = "macos") {
+            if self.exec.limits.address_space.is_some() {
+                return Err(ConfigError::InvalidExecConfig {
+                    key: "limits.address_space".to_string(),
+                    reason: "unsupported_on_platform: macOS does not enforce an address-space rlimit per process".to_string(),
+                });
+            }
+            if self.exec.limits.nproc.is_some() {
+                return Err(ConfigError::InvalidExecConfig {
+                    key: "limits.nproc".to_string(),
+                    reason: "unsupported_on_platform: RLIMIT_NPROC counts every process of the uid, not one run".to_string(),
+                });
+            }
+        }
+        if let (Some(d), Some(m)) = (self.exec.timeout_default_s, self.exec.timeout_max_s) {
+            if d > m {
+                return Err(ConfigError::InvalidExecConfig {
+                    key: "timeout_default_s".to_string(),
+                    reason: format!("default {d} exceeds timeout_max_s {m}"),
                 });
             }
         }

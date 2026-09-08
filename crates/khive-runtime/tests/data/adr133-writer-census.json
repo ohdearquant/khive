@@ -15,7 +15,8 @@
     "code",
     "workspace",
     "blob",
-    "tool"
+    "tool",
+    "exec"
   ],
   "positive_control": "comm.read",
   "entries": [
