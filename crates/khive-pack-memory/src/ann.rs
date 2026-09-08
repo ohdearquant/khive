@@ -2879,6 +2879,23 @@ async fn classify_and_adopt_segment(
             tracing::warn!(error = %e, "memory tail replay failed; Cold rebuild");
             return SegmentOutcome::Cold;
         }
+        // Replay is cheap and in memory; the checkpoint that follows it is a full
+        // segment publication. A process that is not the warm index host serves the
+        // replayed bridge and publishes nothing, so a client warming after a write
+        // does not rewrite the segment for every other reader on the root.
+        if !ann.builds_corpus_indexes {
+            install_replacing(
+                ann,
+                key,
+                bridge
+                    .with_generation(target_generation)
+                    .with_epoch_baseline(target_epoch),
+            )
+            .await;
+            tracing::debug!(model = %model, tail,
+                "memory ANN served from Stale-tail replay without checkpoint; not the warm index host");
+            return SegmentOutcome::Installed(AnnEnsureStatus::LoadedSnapshot);
+        }
         let installed = checkpoint_raise_compact_readopt(
             rt,
             ann,
@@ -3464,6 +3481,109 @@ mod tests {
         assert!(
             matches!(built, AnnEnsureStatus::Built { vectors: 1 }),
             "control: with the authority the same corpus builds, got {built:?}"
+        );
+    }
+
+    /// The Stale-tail path replays in memory and then checkpoints, and the
+    /// checkpoint is a full segment publication. A process without corpus-build
+    /// authority must serve the replayed bridge and publish nothing, or every
+    /// client warming after any write republishes the segment. The search for
+    /// the tail note is the witness that the replay path ran rather than a Hot
+    /// load of the seeded segment. The control is the same state warmed with
+    /// the authority, which does checkpoint.
+    #[tokio::test]
+    async fn a_process_that_does_not_build_replays_the_tail_without_publishing() {
+        const MODEL: &str = "memory-non-building-process-stale-tail-test-model";
+        const DIMS: usize = 4;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for i in 0..4 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("seeded note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create seeded note");
+        }
+        let seed = new_shared();
+        let built = ensure_ann_for_model(&rt, &token, &seed, MODEL)
+            .await
+            .expect("seed build");
+        assert!(
+            matches!(built, AnnEnsureStatus::Built { vectors: 4 }),
+            "seed: expected a build over 4 vectors, got {built:?}"
+        );
+        let seg_dir = ann_segment_dir(&rt, MODEL).expect("segment dir");
+        let metadata = seg_dir.join("metadata.bin");
+        let vectors = seg_dir.join("vectors.bin");
+        let before_metadata = std::fs::read(&metadata).expect("seeded metadata.bin");
+        let before_vectors = std::fs::read(&vectors).expect("seeded vectors.bin");
+
+        // One more note: live = 5, tail = 1 ≤ ceil(0.20 × 5) → Stale-tail.
+        let tail_note = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "the note only a tail replay can find",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create tail note");
+
+        let key = AnnKey::new(MODEL);
+        let client = new_shared_for_role(false);
+        let status = ensure_ann_for_model(&rt, &token, &client, MODEL)
+            .await
+            .expect("client warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::LoadedSnapshot),
+            "a client must adopt the segment through Stale-tail replay, got {status:?}"
+        );
+        let query = fnv_to_vec("the note only a tail replay can find", DIMS);
+        let hits = search_loaded(&client, &key, &query, 5)
+            .await
+            .expect("search must succeed")
+            .expect("the replayed bridge must be installed");
+        assert!(
+            hits.iter()
+                .any(|(id, score)| *id == tail_note.id && *score > 0.99),
+            "the tail note must be served from the replayed bridge, got {hits:?}"
+        );
+        assert_eq!(
+            std::fs::read(&metadata).expect("metadata.bin after client warm"),
+            before_metadata,
+            "a client must not checkpoint: metadata.bin changed"
+        );
+        assert_eq!(
+            std::fs::read(&vectors).expect("vectors.bin after client warm"),
+            before_vectors,
+            "a client must not checkpoint: vectors.bin changed"
+        );
+
+        let host = new_shared();
+        let status = ensure_ann_for_model(&rt, &token, &host, MODEL)
+            .await
+            .expect("host warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::LoadedSnapshot),
+            "control: the host adopts the same segment, got {status:?}"
+        );
+        assert_ne!(
+            std::fs::read(&metadata).expect("metadata.bin after host warm"),
+            before_metadata,
+            "control: the host checkpoints after replay, so metadata.bin must change"
         );
     }
 
