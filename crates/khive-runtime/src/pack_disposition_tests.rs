@@ -273,6 +273,7 @@ async fn disposition_audit_deadline_keeps_one_write_and_one_late_audit_row() {
         let registry = Arc::new(builder.build().unwrap());
         let handler_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let project_id = uuid::Uuid::new_v4();
+        let unresolved_before = crate::pack::audit_admission_unresolved_obligation_count();
         let mut dispatch = tokio::spawn({
             let registry = registry.clone();
             let notes = notes.clone();
@@ -320,29 +321,47 @@ async fn disposition_audit_deadline_keeps_one_write_and_one_late_audit_row() {
         .await
         .expect("released audit generation drains")
         .expect("late audit commit succeeds");
-        let error = response
+        let response = response
             .expect("audit deadline returns without waiting for the store release")
-            .expect("dispatch task joins")
-            .unwrap_err();
+            .expect("dispatch task joins");
         assert!(audit_was_uncommitted);
-        assert_eq!(error.disposition(), DomainDisposition::Committed);
-        assert!(error.source().retryable_failure_context().is_none());
-        let RuntimeError::AuditObligation {
-            failure,
-            domain_result,
-        } = error.into_source()
-        else {
-            panic!("expired post-write audit must retain the canonical domain result");
+        // The domain write committed and its audit row is enqueued; the
+        // generation commits that row on its own, so the dispatch reports the
+        // committed result. Only the git.digest receipt stays strict: there the
+        // audit row is the receipt the caller is promised.
+        let domain_result = if verb == "git.digest" {
+            let error = response.unwrap_err();
+            assert_eq!(error.disposition(), DomainDisposition::Committed);
+            assert!(error.source().retryable_failure_context().is_none());
+            let RuntimeError::AuditObligation {
+                failure,
+                domain_result,
+            } = error.into_source()
+            else {
+                panic!("expired receipt must retain the canonical domain result");
+            };
+            assert_eq!(failure.wire_code(), "admission_deadline_expired");
+            assert_eq!(
+                failure.reason,
+                crate::AuditObligationReason::Terminal(
+                    crate::audit_batch::AuditTerminalReason::AdmissionDeadlineExpired
+                )
+            );
+            domain_result
+        } else {
+            response
+                .expect("a committed write whose audit row is enqueued reports success")
+                .result
         };
-        assert_eq!(failure.wire_code(), "admission_deadline_expired");
-        assert_eq!(
-            failure.reason,
-            crate::AuditObligationReason::Terminal(
-                crate::audit_batch::AuditTerminalReason::AdmissionDeadlineExpired
-            )
-        );
         assert_eq!(domain_result["project_id"], serde_json::json!(project_id));
         assert_eq!(domain_result["count"], 1);
+        if verb != "git.digest" {
+            assert_eq!(
+                crate::pack::audit_admission_unresolved_obligation_count(),
+                unresolved_before + 1,
+                "a degraded write counts on the unresolved-obligation counter"
+            );
+        }
         let id = domain_result["id"].as_str().unwrap().parse().unwrap();
         assert!(notes.get_note(id).await.unwrap().is_some());
         assert_eq!(notes.count_notes("local", None).await.unwrap(), 1);
