@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::Direction;
-use khive_types::{EdgeRelation, Entity, VerbCategory, Visibility};
+use khive_storage::Entity;
+use khive_types::{EdgeRelation, VerbCategory, Visibility};
 
 use crate::policy::{self, actor_label, now_micros, Decision};
 use crate::vocab::{
@@ -89,11 +90,11 @@ fn one_of(value: &str, allowed: &[&str], what: &str) -> Result<(), RuntimeError>
 // ── entity helpers ───────────────────────────────────────────────────────────
 
 fn entity_uuid(e: &Entity) -> Uuid {
-    Uuid::from_bytes(*e.header.id.as_bytes())
+    e.id
 }
 
 fn props_json(e: &Entity) -> Value {
-    serde_json::to_value(&e.properties).unwrap_or(Value::Null)
+    e.properties.clone().unwrap_or(Value::Null)
 }
 
 fn prop_str(props: &Value, key: &str) -> Option<String> {
@@ -121,8 +122,8 @@ fn full(e: &Entity) -> Value {
     let props = props_json(e);
     v["schema"] = props.get("schema").cloned().unwrap_or(Value::Null);
     v["properties"] = props;
-    v["created_at"] = json!(micros_to_iso(e.header.created_at.as_micros() as i64));
-    v["updated_at"] = json!(micros_to_iso(e.header.updated_at.as_micros() as i64));
+    v["created_at"] = json!(micros_to_iso(e.created_at));
+    v["updated_at"] = json!(micros_to_iso(e.updated_at));
     v
 }
 
@@ -178,6 +179,16 @@ async fn resolve_tool(
     find_by_name(rt, token, reference)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("tool {reference:?} is not registered")))
+}
+
+/// Resolve a registry object by uuid, id prefix or name for another pack
+/// (the exec pack binds a tool label to its registered binary this way).
+pub async fn resolve_registered(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    reference: &str,
+) -> Result<Entity, RuntimeError> {
+    resolve_tool(rt, token, reference).await
 }
 
 async fn ensure_capability(

@@ -15,4 +15,5 @@ mod pack;
 pub mod policy;
 pub mod vocab;
 
+pub use handlers::resolve_registered;
 pub use pack::ToolPack;
