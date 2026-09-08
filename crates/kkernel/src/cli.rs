@@ -438,6 +438,9 @@ pub async fn cli_main() -> Result<()> {
                 // failing to acquire the lock here must abort before that
                 // unguarded construction runs, rather than silently
                 // proceeding with `boot_guard = None`.
+                if a.daemon {
+                    khive_runtime::daemon::mark_warm_index_host();
+                }
                 #[cfg(unix)]
                 let boot_guard = if a.daemon {
                     Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
