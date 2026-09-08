@@ -748,24 +748,45 @@ Every per-op error object on the `request` envelope, and the error field of a da
 carries `domain_disposition` with exactly one of three values:
 
 - `committed`: the domain dispatch returned a success value and the error was raised afterwards by
-  the obligation path (D2). The error object also carries `domain_result`, the value the fold was
-  holding, so the caller learns the same identifiers a success would have returned. The op still
-  reports `ok: false`; D2, D3 and D4 are unchanged.
-- `not_committed`: the error was raised before any dispatch reached a pack: an unknown verb, a
-  request that failed parameter validation, a write-time gate refusal. No domain effect exists.
+  the obligation path (D2), or by the transport after the dispatch returned. The error object also
+  carries `domain_result`, the value the fold was holding, so the caller learns the same identifiers
+  a success would have returned. When that value cannot be carried (the response depth guard or the
+  batch byte budget refused it), `domain_result` is omitted and `code` names the limit; the caller
+  resolves that case as it resolves `unknown`. The op still reports `ok: false`; D2, D3 and D4 are
+  unchanged.
+- `not_committed`: the error was raised by the envelope layer before the op was handed to a pack:
+  an unknown verb, a request that failed parameter validation or `$prev` resolution, a conflict
+  refusal, the permission refusal of an internal subhandler, and every aborted chain entry (an op
+  never dispatched because an earlier op in its chain failed). No domain effect exists. The value
+  is assigned by raise site, never by error variant. The secret gate is the standing example: it is
+  invoked inside handlers (`crates/khive-runtime/src/operations.rs`, the code and git ingest
+  handlers) at points where a handler may already have written, so a `SecretDetected` raised there
+  is `unknown`. A handler whose gate provably runs before every write on a path may claim
+  `not_committed` for that path by name, in a later amendment.
 - `unknown`: everything else. A domain handler's own error, an error the transport could not
   deliver, a daemon `version_mismatch`. The caller cannot learn the disposition from the error and
   must resolve it another way.
 
 Three values, not two, because a caller reads an absent or two-valued field as `not_committed`
 exactly when the runtime could not tell, which reinstates the defect with more confidence attached.
-The field is present on every error object; absence is a defect, not a fourth state.
+The field is present on every error object; absence is a defect, not a fourth state. An aborted
+chain entry carries no error object today (`ok: false`, `aborted: true`, `message`); it carries
+`domain_disposition: "not_committed"` at the entry level.
 
 `runtime_error_value` renders obligation errors as a structured object with `kind: "obligation"`,
 `code` set to the terminal reason (`admission_deadline_expired`, `store_failure`, and the other
 `AuditTerminalReason` values in snake case), `message`, `domain_disposition: "committed"` and
 `domain_result`. Errors that today serialize as a bare string keep their message and gain the field
 by becoming an object of the shape `{"kind": "...", "message": "...", "domain_disposition": "..."}`.
+
+Wire rule. Today `error` is a string at some sites (dispatch failures, the conflict and `$prev`
+refusals, the internal-subhandler permission refusal, the batch byte budget) and an object at others
+(the storage and unavailable contexts, the depth guard). String to object is a shape change for
+every consumer that reads `error` as text; the message stays at `error.message`. Presentation is
+applied to the `result` field only and never touches an error entry, so the two fields survive every
+presentation mode and per-op override on the canonical machine result. A client that reshapes
+entries on its own side is outside this guarantee; the canonical request/outcome carrier for the
+Python client is separate work and cites this record.
 
 ### A3.2 A post-dispatch obligation error is UNKNOWN to the caller and never retry permission
 
@@ -786,10 +807,11 @@ before the fold and every `unknown` disposition stay genuinely unknown until it 
    returns `ok: false`, `domain_disposition: "committed"`, and a `domain_result` carrying the id of
    the row; the row exists in the store. On the pre-amendment code the same test fails because the
    field is absent (run the mutation, quote both results).
-2. **Not-committed arm.** An unknown verb, an invalid-parameter request and a write-time gate refusal
-   each return `domain_disposition: "not_committed"` and leave `stats()` unchanged.
+2. **Not-committed arm.** An unknown verb, an invalid-parameter request and the permission refusal
+   of an internal subhandler each return `domain_disposition: "not_committed"` and leave `stats()`
+   unchanged.
 3. **Unknown arm.** A handler that returns its own error yields `domain_disposition: "unknown"`
-   and no `domain_result`.
+   and no `domain_result`; a secret-gate refusal raised inside a handler yields the same.
 4. **Degrade path unchanged.** An admission-degrade-safe read under the two transient reasons of
    Amendment 1 still returns `ok: true` with its result; no disposition field appears on a success.
 5. **Every error carries the field.** A test walks every error constructor reachable from the
@@ -802,6 +824,13 @@ before the fold and every `unknown` disposition stay genuinely unknown until it 
    request produces a second domain record, and the test asserts that second record exists. This
    arm documents today's behaviour honestly; it flips to a refusal when the caller-chosen identity
    record lands, and stays in the suite until then.
+8. **Aborted entries.** A chain whose first op fails returns every later entry with `aborted: true`
+   and `domain_disposition: "not_committed"`; the summary counts them as aborted, not failed.
+9. **Consumers of the error field.** Before the object form replaces a string at any site, the
+   implementation enumerates the consumers of `error` outside this repository (the lionagi v1
+   client, autopipe, khive-cloud, the inbox monitor probe) and shows each parses the object form,
+   quoting the read site. A consumer that reads the text keeps the string at `error` and the object
+   lands at `error_detail` instead; the implementation PR states which of the two it shipped.
 
 ### Implementation notes
 
@@ -809,8 +838,8 @@ before the fold and every `unknown` disposition stay genuinely unknown until it 
   a `RuntimeError` variant wrapping the audit reason and the domain value (name is implementation
   freedom; the wire fields are not).
 - `runtime_error_value` in `crates/khive-mcp/src/server.rs` sets `domain_disposition` for every
-  variant through an exhaustive match; the pre-dispatch refusal sites (`UnknownVerb`, parameter
-  validation, `SecretDetected`) map to `not_committed`; the daemon response path uses the same
-  serializer.
+  variant through an exhaustive match; `not_committed` is assigned at the envelope-layer raise
+  sites and in the aborted-entry constructor, never by matching a variant (`SecretDetected` maps to
+  `unknown`); the daemon response path uses the same serializer.
 - `python/khive/envelope.py`: `_validate_op_errors` admits the two keys and exposes them; no
   behaviour change for callers that ignore them.
