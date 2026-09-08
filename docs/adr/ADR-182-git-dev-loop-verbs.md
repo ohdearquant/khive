@@ -81,3 +81,30 @@ The GitHub CLI is a runtime dependency of the pull request verbs. The actor cred
 pack-local until the provider pack owns profiles and credential references. Local merge, rebase and
 tags stay out of scope, as in ADR-108. Read-only checkout of a remote goes through the ADR-088 cache
 and inherits its bounds.
+
+## Amendment 1 (2026-09-08): credential rule, enforcement order, fork pull requests, checkout scope
+
+Adopted on the first whole-file read against ADR-108. The header's "all of it stands" reads as "all
+of it stands except hard rule 4, amended in item 1".
+
+1. **Credential rule (amends ADR-108 hard rule 4).** ADR-108 has khive never become a credential
+   broker: writes run on the daemon's own credentials. This record amends that for actor-bound
+   operations: a per-actor credential reference is resolved by the daemon at call time, is never
+   returned to any caller, is never stored (the table holds keychain reference names only), and the
+   receipt names `credential: actor | daemon`. No verb, receipt or error carries a secret value.
+2. **Enforcement order.** The Gate (ADR-018) decides first, as today; `tool.check` decides second;
+   both decisions are in the receipt; a refusal at either seam is the refusal, and the pack remains
+   not the policy author. Where a deployment wants one seam, the Gate consults `tool.check`.
+3. **Fork pull requests (ADR-108 fork (d)).** `git.pr_review(approve)` and `git.pr_merge` on a pull
+   request whose head repository differs from the base are refused unless a policy row named
+   `git.pr_review.fork` or `git.pr_merge.fork` allows the actor; the administrator flag is never
+   passed on a fork pull request.
+4. **Checkout scope.** `git.checkout` is a read-only object read (`ls-tree` and object reads into
+   blobs); it is not the working-tree checkout ADR-108 left out of scope, and it leaves the
+   repository's working tree untouched.
+
+Acceptance arms added: 9 no response, receipt or table row contains a credential value (a decoy
+value planted in the keychain item is absent from every output); 10 a Gate deny produces a receipt
+with the Gate decision and no `tool.check` call; 11 approving a fork pull request without the row is
+refused, and a fork merge never carries the administrator flag; 12 `git status` is identical before
+and after `git.checkout`.
