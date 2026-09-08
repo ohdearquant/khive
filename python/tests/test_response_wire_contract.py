@@ -32,7 +32,7 @@ def _citation_rows() -> dict[str, list[tuple[str, str]]]:
 
 def test_response_contract_citation_inventory():
     rows = _citation_rows()
-    assert set(rows) == {f"R{index}" for index in range(1, 14)}
+    assert set(rows) == {f"R{index}" for index in range(1, 16)}
     assert all(rows.values()), "every rule must cite at least one source line"
     citation_lines = [line for line in DOC_TEXT.splitlines() if line.startswith("| R")]
     # Detect an unparsed quote instead of silently reducing the audit surface.

@@ -5044,11 +5044,12 @@ mod tests {
         // `scheduled_event` kind outright, and the runtime curation fence
         // refuses schedule-managed notes. Whichever layer fires first, the
         // rejection must name the scheduled-event trust boundary.
+        let update_error = update_response["results"][0]["error"]["message"]
+            .as_str()
+            .expect("error.message is text");
         assert!(
-            update_response["results"][0]["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("schedule-managed")
-                    || error.contains("scheduled_event notes are not editable")),
+            update_error.contains("schedule-managed")
+                || update_error.contains("scheduled_event notes are not editable"),
             "the generic mutation fence must reject executable schedule changes: \
              {update_response}"
         );
@@ -6184,7 +6185,9 @@ mod tests {
             op_result["ok"], false,
             "cancel of a claimed (firing) event must fail, not silently succeed: {cancel_json}"
         );
-        let cancel_err = op_result["error"].as_str().unwrap_or("");
+        let cancel_err = op_result["error"]["message"]
+            .as_str()
+            .expect("error.message is text");
         assert!(
             cancel_err.contains("not pending"),
             "cancel must report the event is no longer pending; got: {cancel_err}"
@@ -7097,7 +7100,9 @@ mod tests {
             "cancel of a stale-but-still-firing event must fail, not silently succeed \
              (reclaim happens on drain, not cancel): {cancel_json}"
         );
-        let cancel_err = op_result["error"].as_str().unwrap_or("");
+        let cancel_err = op_result["error"]["message"]
+            .as_str()
+            .expect("error.message is text");
         assert!(
             cancel_err.contains("not pending"),
             "cancel must report the event is no longer pending; got: {cancel_err}"

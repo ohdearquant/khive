@@ -36,9 +36,10 @@ use khive_request::{
     ParsedRequest, PrevFailure, TypedJsonOp,
 };
 use khive_runtime::{
-    prepare_format_value, present, render_format, InterceptedDispatchResult, KhiveRuntime,
-    OutputFormat, PackLoadError, PackRegistry, PresentationMode, RuntimeConfig, RuntimeError,
-    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
+    prepare_format_value, present, render_format, DispatchError, DomainDisposition,
+    InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError, PackRegistry,
+    PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
+    VerbRegistryBuilder,
 };
 use khive_types::RefusalReason;
 
@@ -46,6 +47,10 @@ use khive_storage::{EdgeRelation, StorageCapability};
 
 use crate::coordinator::{CoordSearchResult, CoordinatorService};
 use crate::tools::request::RequestParams;
+
+const _: () = assert!(
+    khive_runtime::daemon::ERROR_DETAIL_NESTING_DEPTH_LIMIT == khive_request::NESTING_DEPTH_LIMIT
+);
 
 const MAX_BACKEND_ERROR_ENTRIES: usize = 16;
 const MAX_BACKEND_ERROR_KEY_CHARS: usize = 256;
@@ -548,37 +553,116 @@ struct DispatchFailure {
 }
 
 impl DispatchFailure {
-    fn unclassified(tool: impl Into<String>, error: Value) -> Self {
+    fn before_dispatch(tool: impl Into<String>, error: Value) -> Self {
+        Self::with_disposition(tool, error, DomainDisposition::NotCommitted)
+    }
+
+    fn committed(tool: impl Into<String>, error: Value) -> Self {
+        Self::with_disposition(tool, error, DomainDisposition::Committed)
+    }
+
+    fn with_disposition(
+        tool: impl Into<String>,
+        error: Value,
+        disposition: DomainDisposition,
+    ) -> Self {
         Self {
             tool: tool.into(),
-            error,
+            error: error_with_disposition(error, disposition),
             reason: None,
         }
     }
 
-    fn from_runtime(tool: &str, error: RuntimeError) -> Self {
+    fn from_dispatch(tool: &str, error: DispatchError) -> Self {
+        let (error, disposition) = error.into_parts();
         let reason = match &error {
-            // `gate-refusal` is deliberately limited to the write-time secret
-            // gate. Authorization denials and gate infrastructure errors keep
-            // their established, unclassified shapes.
             RuntimeError::SecretDetected(_) => Some(RefusalReason::GateRefusal),
             RuntimeError::UnknownVerb(_) => Some(RefusalReason::VerbRefused),
             _ => None,
         };
         Self {
-            tool: tool.to_string(),
-            error: runtime_error_value(error),
+            tool: tool.into(),
+            error: runtime_error_value(error, disposition),
             reason,
         }
     }
 
     fn into_entry(self) -> Value {
-        let mut entry = json!({ "ok": false, "tool": self.tool, "error": self.error });
+        let disposition = error_disposition(&self.error);
+        let mut entry = failure_entry(self.tool, self.error, disposition);
         if let Some(reason) = self.reason {
             entry["reason"] = json!(reason.as_str());
         }
         entry
     }
+}
+
+/// One constructor for per-op failures. Moving values avoids recursively
+/// serializing a canonical result before its depth has been checked.
+fn failure_entry(tool: impl Into<String>, error: Value, disposition: DomainDisposition) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("ok".into(), Value::Bool(false));
+    entry.insert("tool".into(), Value::String(tool.into()));
+    entry.insert("error".into(), error_with_disposition(error, disposition));
+    Value::Object(entry)
+}
+
+fn aborted_entry(tool: impl Into<String>, message: Option<String>) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("ok".into(), Value::Bool(false));
+    entry.insert("tool".into(), Value::String(tool.into()));
+    entry.insert("aborted".into(), Value::Bool(true));
+    entry.insert(
+        "domain_disposition".into(),
+        json!(DomainDisposition::NotCommitted.as_str()),
+    );
+    if let Some(message) = message {
+        entry.insert("message".into(), Value::String(message));
+    }
+    Value::Object(entry)
+}
+
+/// Missing/foreign disposition is uncertainty, never permission to replay.
+fn error_disposition(error: &Value) -> DomainDisposition {
+    match error.get("domain_disposition").and_then(Value::as_str) {
+        Some("committed") => DomainDisposition::Committed,
+        Some("not_committed") => DomainDisposition::NotCommitted,
+        _ => DomainDisposition::Unknown,
+    }
+}
+
+fn error_with_disposition(error: Value, disposition: DomainDisposition) -> Value {
+    let mut error = match error {
+        Value::Object(map) => map,
+        Value::String(message) => serde_json::Map::from_iter([
+            ("kind".into(), json!("runtime_error")),
+            ("message".into(), Value::String(message)),
+        ]),
+        other => {
+            drop_value_iteratively(other);
+            serde_json::Map::from_iter([
+                ("kind".into(), json!("runtime_error")),
+                ("message".into(), json!("operation failed")),
+            ])
+        }
+    };
+    if let Some(result) = error.remove("domain_result") {
+        if disposition != DomainDisposition::Committed {
+            // A nested operation's result is not proof of the outer result.
+            drop_value_iteratively(result);
+        } else if !result_within_depth_limit(&result) {
+            drop_value_iteratively(result);
+            error.insert("code".into(), json!("result_too_deep"));
+            error.insert(
+                "message".into(),
+                json!("committed domain result omitted because it exceeds the nesting depth limit"),
+            );
+        } else {
+            error.insert("domain_result".into(), result);
+        }
+    }
+    error.insert("domain_disposition".into(), json!(disposition.as_str()));
+    Value::Object(error)
 }
 
 /// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
@@ -1856,7 +1940,7 @@ impl KhiveMcpServer {
                 // exactly when this is the chain's first op, so there is no
                 // preceding result to substitute from at all.
                 let prev = prev_result.ok_or_else(|| {
-                    DispatchFailure::unclassified(
+                    DispatchFailure::before_dispatch(
                         tool.clone(),
                         json!({
                             "kind": "substitution_error",
@@ -1873,7 +1957,7 @@ impl KhiveMcpServer {
                     )
                 })?;
                 let resolved_val = arg_val.resolve_all(prev).ok_or_else(|| {
-                    DispatchFailure::unclassified(
+                    DispatchFailure::before_dispatch(
                         tool.clone(),
                         substitution_error_payload(&name, &arg_val, prev),
                     )
@@ -1885,7 +1969,7 @@ impl KhiveMcpServer {
                     match &resolved_val {
                         Value::Object(map) => {
                             let fields: Vec<&str> = map.keys().map(String::as_str).collect();
-                            return Err(DispatchFailure::unclassified(
+                            return Err(DispatchFailure::before_dispatch(
                                 tool.clone(),
                                 json!({
                                     "kind": "substitution_error",
@@ -1900,7 +1984,7 @@ impl KhiveMcpServer {
                             ));
                         }
                         Value::Array(_) => {
-                            return Err(DispatchFailure::unclassified(
+                            return Err(DispatchFailure::before_dispatch(
                                 tool.clone(),
                                 json!({
                                     "kind": "substitution_error",
@@ -1937,7 +2021,7 @@ impl KhiveMcpServer {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if from_wire && !is_help && self.registry.is_subhandler_verb(&tool) {
-            return Err(DispatchFailure::unclassified(
+            return Err(DispatchFailure::before_dispatch(
                 tool.clone(),
                 json!(format!(
                     "permission denied for verb {tool:?}: verb '{tool}' is an internal \
@@ -1957,7 +2041,7 @@ impl KhiveMcpServer {
 
         match self
             .registry
-            .dispatch_with_identity(&tool, args_value, identity.cloned())
+            .dispatch_with_disposition(&tool, args_value, identity.cloned())
             .await
         {
             Ok(result) => {
@@ -1975,7 +2059,7 @@ impl KhiveMcpServer {
                     op_success_from_registry_result(&tool, is_help, result, vector_selected);
                 chain_ok_envelope_or_depth_error(tool, success)
             }
-            Err(error) => Err(DispatchFailure::from_runtime(&tool, error)),
+            Err(error) => Err(DispatchFailure::from_dispatch(&tool, error)),
         }
     }
 
@@ -2121,7 +2205,7 @@ impl KhiveMcpServer {
                         let tool = op.tool.clone();
                         // Conflicting ops get a per-op error; skip dispatch.
                         if let Some(msg) = conflict_with {
-                            return json!({ "ok": false, "tool": tool, "error": msg });
+                            return failure_entry(tool, json!(msg), DomainDisposition::NotCommitted);
                         }
                         // AlwaysVerbose verbs override the caller's presentation mode.
                         let effective_mode =
@@ -2143,13 +2227,9 @@ impl KhiveMcpServer {
                                     resolved.insert(name.clone(), v.clone());
                                 }
                             } else {
-                                prev_error = Some(json!({
-                                    "ok": false,
-                                    "tool": tool,
-                                    "error": format!(
-                                        "argument {name:?}: $prev reference is only valid in chain (|) mode"
-                                    )
-                                }));
+                                prev_error = Some(failure_entry(&tool, json!(format!(
+                                    "argument {name:?}: $prev reference is only valid in chain (|) mode"
+                                )), DomainDisposition::NotCommitted));
                                 break;
                             }
                         }
@@ -2168,15 +2248,10 @@ impl KhiveMcpServer {
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
                         if from_wire && !is_help && registry.is_subhandler_verb(&tool) {
-                            return json!({
-                                "ok": false,
-                                "tool": tool,
-                                "error": format!(
-                                    "permission denied for verb {tool:?}: verb '{tool}' is an \
-                                     internal subhandler and cannot be invoked via the MCP \
-                                     request surface"
-                                )
-                            });
+                            return failure_entry(tool.clone(), json!(format!(
+                                "permission denied for verb {tool:?}: verb '{tool}' is an \
+                                 internal subhandler and cannot be invoked via the MCP request surface"
+                            )), DomainDisposition::NotCommitted);
                         }
 
                         // Multi-backend interception: route link/search through the coordinator
@@ -2207,7 +2282,7 @@ impl KhiveMcpServer {
                         }
 
                         match registry
-                            .dispatch_with_identity(&tool, args_value, op_identity)
+                            .dispatch_with_disposition(&tool, args_value, op_identity)
                             .await
                         {
                             Ok(result) => {
@@ -2232,7 +2307,7 @@ impl KhiveMcpServer {
                                 )
                             }
                             Err(error) => {
-                                DispatchFailure::from_runtime(&tool, error).into_entry()
+                                DispatchFailure::from_dispatch(&tool, error).into_entry()
                             }
                         }
                         })
@@ -2268,17 +2343,11 @@ impl KhiveMcpServer {
                             .and_then(|r| r.get("tool"))
                             .and_then(Value::as_str)
                             .unwrap_or("<unknown>");
-                        results.push(json!({
-                            "ok": false,
-                            "tool": op.tool,
-                            "aborted": true,
-                            "message": format!(
-                                "not executed: op #{failed_index} ({failed_tool:?}) failed \
-                                 earlier in this chain, so the chain aborted before reaching \
-                                 this op. Fix op #{failed_index} — this op's own arguments, \
-                                 including any $prev reference, were never evaluated."
-                            ),
-                        }));
+                        results.push(aborted_entry(op.tool, Some(format!(
+                            "not executed: op #{failed_index} ({failed_tool:?}) failed earlier in this chain, \
+                             so the chain aborted before reaching this op. Fix op #{failed_index} — this \
+                             op's own arguments, including any $prev reference, were never evaluated."
+                        ))));
                         continue;
                     }
                     let op_mode = mode_for_op(i);
@@ -2398,7 +2467,7 @@ async fn dispatch_via_coordinator_inner(
             let metadata = args_value.get("metadata").cloned();
 
             let result = registry
-                .dispatch_intercepted_with_identity(
+                .dispatch_intercepted_with_metadata_and_disposition(
                     tool,
                     args_value,
                     identity,
@@ -2415,14 +2484,14 @@ async fn dispatch_via_coordinator_inner(
                                 obj.insert("target_id".to_string(), json!(target_id.to_string()));
                             }
                         }
-                        Ok(raw)
+                        Ok(InterceptedDispatchResult::new(raw, ()))
                     },
                 )
                 .await;
             Some(
                 result
-                    .map(OpSuccess::complete)
-                    .map_err(|error| DispatchFailure::from_runtime(tool, error)),
+                    .map(|outcome| OpSuccess::complete(outcome.result))
+                    .map_err(|error| DispatchFailure::from_dispatch(tool, error)),
             )
         }
         "search" => {
@@ -2437,7 +2506,7 @@ async fn dispatch_via_coordinator_inner(
             // normal registry dispatch path — see `coordinator_search_visibility`.
             let extra_visible = coordinator_search_visibility(registry, args_value, identity);
             let result = registry
-                .dispatch_intercepted_with_metadata_with_identity(
+                .dispatch_intercepted_with_metadata_and_disposition(
                     tool,
                     args_value,
                     identity,
@@ -2529,10 +2598,12 @@ async fn dispatch_via_coordinator_inner(
                     // "no match" reading is not established when the answer
                     // may be sitting on the backend that never responded.
                     if outcome.metadata.is_partial() && is_empty {
-                        Err(DispatchFailure::unclassified(
-                            tool,
-                            search_incomplete_error(outcome.metadata),
-                        ))
+                        let mut error = search_incomplete_error(outcome.metadata);
+                        error
+                            .as_object_mut()
+                            .expect("structured search error")
+                            .insert("domain_result".into(), outcome.result);
+                        Err(DispatchFailure::committed(tool, error))
                     } else {
                         Ok(OpSuccess {
                             result: outcome.result,
@@ -2540,7 +2611,7 @@ async fn dispatch_via_coordinator_inner(
                         })
                     }
                 }
-                Err(error) => Err(DispatchFailure::from_runtime(tool, error)),
+                Err(error) => Err(DispatchFailure::from_dispatch(tool, error)),
             })
         }
         _ => None,
@@ -2593,47 +2664,74 @@ fn coordinator_search_visibility(
     extra_visible
 }
 
-/// Preserve the established flat-string payload for ordinary runtime errors,
-/// while carrying typed write admission and writer-request finality through
-/// every MCP execution mode. Finality is independent of retryability: a proven
-/// rollback makes duplicate effects impossible but retains the source error's
-/// transient policy, while an unverified rollback remains terminal and
-/// ambiguous.
-fn runtime_error_value(error: RuntimeError) -> Value {
-    match error {
+/// Every runtime variant is explicitly covered. Dispatch provenance, not the
+/// variant, determines whether the domain handler ran successfully.
+fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
+    let payload = match error {
+        RuntimeError::AuditObligation {
+            failure,
+            domain_result,
+        } => {
+            let mut error = serde_json::Map::from_iter([
+                ("kind".into(), json!("obligation")),
+                ("code".into(), json!(failure.wire_code())),
+                ("message".into(), json!(failure.to_string())),
+            ]);
+            error.insert("domain_result".into(), domain_result);
+            Value::Object(error)
+        }
         RuntimeError::Khive(k) => serde_json::to_value(&k)
             .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
-        other => {
+        other @ (RuntimeError::Storage(_)
+        | RuntimeError::Sqlite(_)
+        | RuntimeError::Query(_)
+        | RuntimeError::NotFound(_)
+        | RuntimeError::InvalidInput(_)
+        | RuntimeError::UnknownVerb(_)
+        | RuntimeError::Unconfigured(_)
+        | RuntimeError::UnknownModel(_)
+        | RuntimeError::Embedding(_)
+        | RuntimeError::Ambiguous(_)
+        | RuntimeError::Fusion(_)
+        | RuntimeError::UnknownFusionStrategy(_)
+        | RuntimeError::Internal(_)
+        | RuntimeError::IncompatibleEventStore(_)
+        | RuntimeError::GuardedWriteFailed(_)
+        | RuntimeError::MissingPackDependency(_)
+        | RuntimeError::MissingPackDependencies(_)
+        | RuntimeError::CircularPackDependency(_)
+        | RuntimeError::PackRedeclared { .. }
+        | RuntimeError::VerbCollision { .. }
+        | RuntimeError::ReservedEnvelopeParam { .. }
+        | RuntimeError::PermissionDenied { .. }
+        | RuntimeError::GateUnavailable { .. }
+        | RuntimeError::NamespaceMismatch { .. }
+        | RuntimeError::AmbiguousPrefix { .. }
+        | RuntimeError::CrossBackendMergeUnsupported { .. }
+        | RuntimeError::UnknownRemote { .. }
+        | RuntimeError::RemoteCacheMissing { .. }
+        | RuntimeError::AmbiguousId { .. }
+        | RuntimeError::CrossNamespaceWrite { .. }
+        | RuntimeError::RemoteFetchError { .. }
+        | RuntimeError::WriteBudgetExceeded { .. }
+        | RuntimeError::SecretDetected(_)
+        | RuntimeError::DeadlineExceeded { .. }) => {
             if let Some(context) = other.writer_task_failure_context() {
-                return json!({
-                    "kind": "storage",
-                    "code": context.stage,
-                    "stage": context.stage,
-                    "message": other.to_string(),
-                    "retryable": context.retryable,
-                    "request_state": context.request_state.to_string(),
-                    "task_terminated": context.task_terminated,
-                });
+                json!({"kind":"storage", "code":context.stage, "stage":context.stage,
+                    "message":other.to_string(), "retryable":context.retryable,
+                    "request_state":context.request_state.to_string(), "task_terminated":context.task_terminated})
+            } else if let Some(context) = other.retryable_failure_context() {
+                let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
+                json!({"kind":"unavailable", "code":context.stage, "stage":context.stage,
+                    "message":other.to_string(), "retryable":true, "timeout_ms":timeout_ms,
+                    "capability":context.capability.map(storage_capability_wire_name),
+                    "operation":context.operation, "scope":context.scope, "retry_after_ms":context.retry_after_ms})
+            } else {
+                json!({"kind":"runtime_error", "message":other.to_string()})
             }
-            let Some(context) = other.retryable_failure_context() else {
-                return json!(other.to_string());
-            };
-            let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
-            let capability = context.capability.map(storage_capability_wire_name);
-            json!({
-                "kind": "unavailable",
-                "code": context.stage,
-                "stage": context.stage,
-                "message": other.to_string(),
-                "retryable": true,
-                "timeout_ms": timeout_ms,
-                "capability": capability,
-                "operation": context.operation,
-                "scope": context.scope,
-                "retry_after_ms": context.retry_after_ms,
-            })
         }
-    }
+    };
+    error_with_disposition(payload, disposition)
 }
 
 fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
@@ -2666,6 +2764,7 @@ fn result_within_depth_limit(result: &Value) -> bool {
 fn depth_error_payload(context: &str) -> Value {
     json!({
         "kind": "result_too_deep",
+        "code": "result_too_deep",
         "message": format!(
             "op result nesting depth exceeds max {}{context}",
             khive_request::NESTING_DEPTH_LIMIT
@@ -2843,7 +2942,7 @@ fn chain_ok_envelope_or_depth_error(
 ) -> Result<Value, DispatchFailure> {
     if !result_within_depth_limit(&success.result) {
         drop_value_iteratively(success.result);
-        return Err(DispatchFailure::unclassified(
+        return Err(DispatchFailure::committed(
             tool,
             depth_error_payload("; cannot be used as $prev chain context"),
         ));
@@ -2865,7 +2964,7 @@ fn present_ok_envelope_or_depth_error(
 ) -> Value {
     if !result_within_depth_limit(&success.result) {
         drop_value_iteratively(success.result);
-        return json!({ "ok": false, "tool": tool, "error": depth_error_payload("") });
+        return failure_entry(tool, depth_error_payload(""), DomainDisposition::Committed);
     }
     success.result = present(success.result, mode, now_unix);
     ok_envelope(tool, success)
@@ -2899,18 +2998,11 @@ fn chain_aggregation_depth_reject(result_obj: Value) -> Result<Value, Value> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let error_entry = json!({
-            "ok": false,
-            "tool": tool_name,
-            "error": {
-                "kind": "result_too_deep",
-                "message": format!(
-                    "op result nesting depth exceeds max {}; \
-                     cannot be used as $prev chain context",
-                    khive_request::NESTING_DEPTH_LIMIT
-                ),
-            },
-        });
+        let error_entry = failure_entry(
+            tool_name,
+            depth_error_payload("; cannot be used as $prev chain context"),
+            DomainDisposition::Committed,
+        );
         drop_value_iteratively(result_obj);
         return Err(error_entry);
     }
@@ -3193,7 +3285,10 @@ impl KhiveMcpServer {
         if khive_storage::request_read_is_cancelled() {
             return Err(McpError::internal_error(
                 "request cancelled before daemon dispatch",
-                None,
+                Some(error_with_disposition(
+                    json!({"kind":"cancelled", "message":"request cancelled before daemon dispatch"}),
+                    DomainDisposition::NotCommitted,
+                )),
             ));
         }
         #[cfg(unix)]
@@ -3284,14 +3379,7 @@ impl KhiveMcpServer {
                                  post-cancellation wait bound; reporting an unknown \
                                  outcome and leaving the forward to finish on its own"
                             );
-                            return Err(McpError::internal_error(
-                                "daemon forward outcome unknown after cancellation",
-                                Some(json!({
-                                    "outcome": "unknown",
-                                    "retryable": false,
-                                    "request_id": request_id,
-                                })),
-                            ));
+                            return Err(cancelled_forward_error(request_id));
                         }
                     }
                 }
@@ -3304,6 +3392,9 @@ impl KhiveMcpServer {
                     ),
                     Some(json!({
                         "outcome": "unknown",
+                        "kind": "transport",
+                        "message": format!("daemon forwarding task failed after admission ({error}); outcome is unknown and the request must not be retried blindly"),
+                                    "domain_disposition": "unknown",
                         "retryable": false,
                         "request_id": request_id,
                     })),
@@ -3338,6 +3429,9 @@ impl KhiveMcpServer {
                     "request cancelled before local fallback dispatch",
                     Some(json!({
                         "outcome": "not_dispatched",
+                        "kind": "cancelled",
+                        "message": "request cancelled before local fallback dispatch",
+                        "domain_disposition": "not_committed",
                         "retryable": true,
                         "request_id": request_id,
                     })),
@@ -3391,13 +3485,12 @@ fn attach_strict_refusal_reasons(result: &mut Value) {
 }
 
 fn batch_budget_error(tool: &str, response_budget: usize) -> Value {
-    json!({
-        "ok": false,
-        "tool": tool,
-        "error": format!(
-            "batch response budget of {response_budget} serialized bytes exceeded"
-        ),
-    })
+    failure_entry(
+        tool,
+        json!({"kind":"response_budget_exceeded", "code":"response_budget_exceeded",
+        "message":format!("batch response budget of {response_budget} serialized bytes exceeded")}),
+        DomainDisposition::NotCommitted,
+    )
 }
 
 async fn execute_bounded_batch<I, F>(
@@ -3516,16 +3609,26 @@ fn strict_fallback_envelope_response(
             .enumerate()
             .map(|(i, op)| {
                 if i == 0 {
-                    json!({ "ok": false, "tool": op.tool, "error": error_msg })
+                    failure_entry(
+                        op.tool.clone(),
+                        json!(error_msg),
+                        DomainDisposition::NotCommitted,
+                    )
                 } else {
-                    json!({ "ok": false, "tool": op.tool, "aborted": true })
+                    aborted_entry(op.tool.clone(), None)
                 }
             })
             .collect(),
         ExecutionMode::Single | ExecutionMode::Parallel => parsed
             .ops
             .iter()
-            .map(|op| json!({ "ok": false, "tool": op.tool, "error": error_msg }))
+            .map(|op| {
+                failure_entry(
+                    op.tool.clone(),
+                    json!(error_msg),
+                    DomainDisposition::NotCommitted,
+                )
+            })
             .collect(),
     };
 
@@ -3838,18 +3941,17 @@ impl KhiveMcpServer {
         });
 
         // Parse presentation strings → PresentationMode.
-        let presentation = parse_presentation_mode(p.presentation.as_deref())
-            .map_err(|e| McpError::invalid_params(e, None))?;
+        let presentation =
+            parse_presentation_mode(p.presentation.as_deref()).map_err(invalid_request_error)?;
         let presentation_per_op: Option<Vec<Option<PresentationMode>>> =
             if let Some(per_op_strs) = p.presentation_per_op {
                 let mut modes = Vec::with_capacity(per_op_strs.len());
                 for s in per_op_strs {
                     let mode = match s.as_deref() {
                         None => None,
-                        Some(v) => Some(
-                            parse_presentation_mode(Some(v))
-                                .map_err(|e| McpError::invalid_params(e, None))?,
-                        ),
+                        Some(v) => {
+                            Some(parse_presentation_mode(Some(v)).map_err(invalid_request_error)?)
+                        }
                     };
                     modes.push(mode);
                 }
@@ -3862,7 +3964,7 @@ impl KhiveMcpServer {
         // per-request `format` field → server default (already resolved from
         // env + toml + builtin by `serve.rs`).
         let batch_format = parse_output_format(p.format.as_deref())
-            .map_err(|e| McpError::invalid_params(e, None))?
+            .map_err(invalid_request_error)?
             .unwrap_or(self.default_output_format);
 
         // Per-op format overrides (ADR-078 §8.4).
@@ -3874,7 +3976,7 @@ impl KhiveMcpServer {
                         None => None,
                         Some(v) => Some(
                             parse_output_format(Some(v))
-                                .map_err(|e| McpError::invalid_params(e, None))?
+                                .map_err(invalid_request_error)?
                                 .unwrap_or(batch_format),
                         ),
                     };
@@ -3914,10 +4016,10 @@ impl KhiveMcpServer {
             // (`kkernel exec --save-file`, `from_wire = false`) is unrestricted,
             // matching its documented "write anywhere" behavior.
             let manifest = crate::save_sink::write_and_manifest(&result, path, from_wire)
-                .map_err(|e| McpError::internal_error(format!("save_to: {e}"), None))?;
+                .map_err(|e| request_internal_error(format!("save_to: {e}")))?;
             // Manifests are always compact JSON regardless of format (lossless metadata).
             return serde_json::to_string(&manifest)
-                .map_err(|e| McpError::internal_error(format!("serialize manifest: {e}"), None));
+                .map_err(|e| request_internal_error(format!("serialize manifest: {e}")));
         }
 
         // Apply per-op format rendering (ADR-078 §8.4 and §9).
@@ -3989,10 +4091,56 @@ fn attach_audit_persistence_advisories(response: &mut Value, registry: &VerbRegi
     }
 }
 
+fn invalid_request_error(message: String) -> McpError {
+    McpError::invalid_params(
+        message.clone(),
+        Some(error_with_disposition(
+            json!({
+                "kind":"invalid_input", "message":message,
+            }),
+            DomainDisposition::NotCommitted,
+        )),
+    )
+}
+
+#[cfg(unix)]
+fn cancelled_forward_error(request_id: Option<u64>) -> McpError {
+    McpError::internal_error(
+        "daemon forward outcome unknown after cancellation",
+        Some(error_with_disposition(
+            json!({
+                "outcome": "unknown",
+                "kind": "transport",
+                "message": "daemon forward outcome unknown after cancellation",
+                "retryable": false,
+                "request_id": request_id,
+            }),
+            DomainDisposition::Unknown,
+        )),
+    )
+}
+
+fn request_internal_error(message: String) -> McpError {
+    // Rendering/saving can follow a mixture of per-op outcomes.
+    McpError::internal_error(
+        message.clone(),
+        Some(error_with_disposition(
+            json!({
+                "kind":"internal", "message":message,
+            }),
+            DomainDisposition::Unknown,
+        )),
+    )
+}
+
 fn dsl_err_to_mcp(e: DslError) -> McpError {
     McpError::invalid_params(
         e.to_string(),
-        Some(json!({ "reason": RefusalReason::ParseError.as_str() })),
+        Some(error_with_disposition(
+            json!({ "reason": RefusalReason::ParseError.as_str(),
+            "kind":"parse_error", "message":e.to_string() }),
+            DomainDisposition::NotCommitted,
+        )),
     )
 }
 
@@ -4103,10 +4251,14 @@ fn render_result(
     if rendered_response_fits_daemon_frame(&compact, config_id) {
         return compact;
     }
-    serde_json::to_string(&json!({
-        "ok": false,
-        "error": "response payload omitted because it exceeds the daemon frame budget",
-    }))
+    serde_json::to_string(&failure_entry(
+        "request",
+        frame_budget_error(
+            "response payload omitted because it exceeds the daemon frame budget",
+            DomainDisposition::Unknown,
+        ),
+        DomainDisposition::Unknown,
+    ))
     .expect("static frame-budget error is serializable")
 }
 
@@ -4314,9 +4466,40 @@ fn empty_rendered_daemon_frame_len(served_config_id: &str) -> usize {
     rendered_response_daemon_frame_len("", served_config_id)
 }
 
+fn frame_budget_error(message: &str, disposition: DomainDisposition) -> Value {
+    error_with_disposition(
+        json!({"kind":"response_frame_budget_exceeded", "code":"response_frame_budget_exceeded",
+        "message":message, "retryable":false,
+        "max_frame_bytes":khive_runtime::daemon::MAX_FRAME_BYTES}),
+        disposition,
+    )
+}
+
 fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
     let ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    let mut omitted = serde_json::Map::new();
+    if entry.get("aborted").and_then(Value::as_bool) == Some(true) {
+        let mut aborted = aborted_entry(
+            entry
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            None,
+        );
+        for key in ["usage", "reason", "advisories"] {
+            if let Some(value) = entry.get(key) {
+                aborted[key] = value.clone();
+            }
+        }
+        return aborted;
+    }
+    let disposition = if ok {
+        DomainDisposition::Committed
+    } else {
+        error_disposition(&entry["error"])
+    };
+    let mut omitted = failure_entry(entry.get("tool").and_then(Value::as_str).unwrap_or_default(),
+        frame_budget_error("operation failed; error details omitted because the response frame budget was exceeded", disposition),
+        disposition).as_object().expect("error envelope").clone();
     // `reason` is stable machine metadata, not payload detail. It is tiny and
     // must survive even when a large result/error body is omitted to fit the
     // daemon frame.
@@ -4399,7 +4582,10 @@ fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
         if !search_fields.is_empty() {
             error.insert("search".to_string(), Value::Object(search_fields));
         }
-        omitted.insert("error".to_string(), Value::Object(error));
+        omitted.insert(
+            "error".to_string(),
+            error_with_disposition(Value::Object(error), disposition),
+        );
     } else {
         // ADR-130 §Compatibility (MCP envelope builder): `search_incomplete`
         // is small and typed — it must survive omission untransformed rather
@@ -4414,11 +4600,6 @@ fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
             if let Some(error) = entry.get("error") {
                 omitted.insert("error".to_string(), error.clone());
             }
-        } else {
-            omitted.insert(
-                "error".to_string(),
-                json!("operation failed; error details omitted because the response frame budget was exceeded"),
-            );
         }
     }
     Value::Object(omitted)
@@ -4472,6 +4653,7 @@ fn rendered_response_daemon_frame_len(rendered: &str, served_config_id: &str) ->
         ok: true,
         result: Some(rendered.to_string()),
         error: None,
+        error_detail: None,
         namespace_mismatch: false,
         config_mismatch: false,
         served_config_id: Some(served_config_id.to_string()),
@@ -6199,7 +6381,7 @@ mod tests {
             assert_eq!(serial_row["ok"], false);
             assert_eq!(serial_row["tool"], parallel_row["tool"]);
             assert_eq!(serial_row["error"], parallel_row["error"]);
-            assert!(serial_row["error"]
+            assert!(serial_row["error"]["message"]
                 .as_str()
                 .expect("conflict error")
                 .contains("writes overlap"));
@@ -6243,7 +6425,7 @@ mod tests {
         let first_serial_budget_error = serial_rows
             .iter()
             .position(|row| {
-                row["error"]
+                row["error"]["message"]
                     .as_str()
                     .is_some_and(|error| error.contains("batch response budget"))
             })
@@ -6257,7 +6439,7 @@ mod tests {
             .all(|row| row["ok"] == json!(true)));
         assert!(serial_rows[first_serial_budget_error..].iter().all(|row| {
             row["ok"] == json!(false)
-                && row["error"]
+                && row["error"]["message"]
                     .as_str()
                     .is_some_and(|error| error.contains(&BATCH_RESPONSE_BUDGET_BYTES.to_string()))
         }));
@@ -6266,10 +6448,10 @@ mod tests {
             .as_array()
             .expect("parallel rows")
             .iter()
-            .find_map(|row| row["error"].as_str())
+            .find_map(|row| row["error"]["message"].as_str())
             .expect("parallel undispatched tail must use the same budget error");
         assert_eq!(
-            serial_rows[first_serial_budget_error]["error"],
+            serial_rows[first_serial_budget_error]["error"]["message"],
             json!(parallel_budget_error),
             "serial and default typed scheduling must single-source the budget/error contract"
         );
@@ -6377,7 +6559,9 @@ mod tests {
             .skip(10)
         {
             assert_eq!(entry["ok"], false);
-            let error = entry["error"].as_str().expect("budget error string");
+            let error = entry["error"]["message"]
+                .as_str()
+                .expect("budget error message");
             assert!(error.contains("batch response budget"));
             assert!(error.contains(&budget.to_string()));
         }
@@ -7058,9 +7242,14 @@ mod tests {
         assert_eq!(omitted["ok"], json!(false));
         assert_eq!(
             omitted["error"],
-            json!(
-                "operation failed; error details omitted because the response frame budget was exceeded"
-            )
+            json!({
+                "kind": "response_frame_budget_exceeded",
+                "code": "response_frame_budget_exceeded",
+                "message": "operation failed; error details omitted because the response frame budget was exceeded",
+                "domain_disposition": "unknown",
+                "max_frame_bytes": khive_runtime::daemon::MAX_FRAME_BYTES,
+                "retryable": false
+            })
         );
     }
 
@@ -7151,7 +7340,7 @@ mod tests {
 
         assert_eq!(fitted["results"][0]["ok"], false);
         assert_eq!(fitted["results"][0]["reason"], "gate-refusal");
-        assert!(fitted["results"][0]["error"]
+        assert!(fitted["results"][0]["error"]["message"]
             .as_str()
             .is_some_and(|error| error.contains("frame budget was exceeded")));
         assert!(rendered_response_fits_daemon_frame(
@@ -7331,7 +7520,16 @@ mod tests {
             json!({"total": 3, "succeeded": 2, "failed": 1, "aborted": 0})
         );
         assert_eq!(fitted["status"], "partial");
-        assert_eq!(serialized_response_len(&fitted), 2_900_530);
+        assert_eq!(
+            fitted["results"][0]["error"]["domain_disposition"],
+            "committed"
+        );
+        // A3 adds this one field to the historic byte snapshot; omission
+        // selection, remaining payloads, and aggregate counts stay identical.
+        assert_eq!(
+            serialized_response_len(&fitted),
+            2_900_530 + r#","domain_disposition":"committed""#.len()
+        );
     }
 
     #[test]
@@ -7397,6 +7595,7 @@ mod tests {
             ok: true,
             result: Some(rendered),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some("test".to_string()),
@@ -9046,7 +9245,9 @@ mod tests {
         fn assert_fallback_error(entry: &Value, tool: &str) {
             assert_eq!(entry["ok"], json!(false), "entry: {entry}");
             assert_eq!(entry["tool"], json!(tool), "entry: {entry}");
-            let msg = entry["error"].as_str().expect("error must be a string");
+            let msg = entry["error"]["message"]
+                .as_str()
+                .expect("error must carry its message");
             assert!(
                 msg.contains("KHIVE_DAEMON_STRICT"),
                 "error must name the strict mode that rejected the fallback: {msg}"
@@ -9144,7 +9345,7 @@ mod tests {
         assert_fallback_error(&chain_results[0], "comm.send");
         assert_eq!(
             chain_results[1],
-            json!({ "ok": false, "tool": "comm.send", "aborted": true })
+            json!({ "ok": false, "tool": "comm.send", "aborted": true, "domain_disposition":"not_committed" })
         );
         assert_eq!(
             chain["summary"],
@@ -9504,7 +9705,7 @@ mod tests {
             .expect("dispatch failures remain in the per-operation envelope");
         let response: Value = serde_json::from_str(&response).expect("response envelope");
         assert!(
-            response["results"][0]["error"]
+            response["results"][0]["error"]["message"]
                 .as_str()
                 .is_some_and(|error| error.contains("invalid namespace")),
             "unexpected error: {response}"
@@ -10698,3 +10899,6 @@ mod request_read_cancellation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod disposition_tests;

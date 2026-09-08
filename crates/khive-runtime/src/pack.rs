@@ -209,7 +209,8 @@ pub trait DispatchHook: Send + Sync {
 }
 
 use crate::error::{
-    CircularPackDependency, MissingPackDependencies, MissingPackDependency, RuntimeError,
+    AuditObligationFailure, CircularPackDependency, DispatchError, MissingPackDependencies,
+    MissingPackDependency, RuntimeError,
 };
 use crate::KhiveRuntime;
 
@@ -1929,8 +1930,28 @@ impl VerbRegistry {
         F: FnOnce(Namespace) -> Fut,
         Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
     {
+        self.dispatch_intercepted_with_metadata_and_disposition(verb, params, identity, dispatch)
+            .await
+            .map_err(DispatchError::into_source)
+    }
+
+    /// Execute an intercepted operation while retaining this boundary's failure provenance.
+    /// Successful canonical results and typed metadata are returned unchanged.
+    pub async fn dispatch_intercepted_with_metadata_and_disposition<M, F, Fut>(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+        dispatch: F,
+    ) -> Result<InterceptedDispatchResult<M>, DispatchError>
+    where
+        F: FnOnce(Namespace) -> Fut,
+        Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
+    {
         let request_id = identity.and_then(|id| id.request_id);
-        let gate_req = self.gate_request_with_identity(verb, params, identity)?;
+        let gate_req = self
+            .gate_request_with_identity(verb, params, identity)
+            .map_err(DispatchError::before_dispatch)?;
         let mut deferred_audit = match self.gate.check(&gate_req) {
             Ok(decision) => {
                 let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
@@ -1963,22 +1984,26 @@ impl VerbRegistry {
                         )
                         .await;
                     }
-                    return Err(RuntimeError::PermissionDenied {
-                        verb: verb.to_string(),
-                        reason,
-                    });
+                    return Err(DispatchError::before_dispatch(
+                        RuntimeError::PermissionDenied {
+                            verb: verb.to_string(),
+                            reason,
+                        },
+                    ));
                 }
                 Some(audit)
             }
             Err(err) => {
-                return Err(self
-                    .gate_unavailable_error(&gate_req, &err, request_id)
-                    .await);
+                return Err(DispatchError::before_dispatch(
+                    self.gate_unavailable_error(&gate_req, &err, request_id)
+                        .await,
+                ));
             }
         };
 
         let started = Instant::now();
         let mut result = dispatch(gate_req.namespace.clone()).await;
+        let domain_succeeded = result.is_ok();
         let duration_us = started.elapsed().as_micros() as i64;
         let receipt_outcome = if verb == "git.digest" && result.is_ok() {
             let resource = result.as_ref().ok().map(|outcome| {
@@ -2034,10 +2059,10 @@ impl VerbRegistry {
                         request_id,
                     )
                     .await;
-                result = fold_audit_obligation(result, audit_outcome);
+                result = fold_audit_obligation(result, audit_outcome, |outcome| outcome.result);
             }
         }
-        result
+        result.map_err(|error| DispatchError::after_handler(error, domain_succeeded))
     }
 
     async fn persist_intercepted_audit(
@@ -2048,7 +2073,7 @@ impl VerbRegistry {
         result: Result<&Value, &RuntimeError>,
         duration_us: i64,
         request_id: Option<u64>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(), AuditObligationFailure> {
         let Some(store) = &self.event_store else {
             return Ok(());
         };
@@ -2217,9 +2242,24 @@ impl VerbRegistry {
         params: Value,
         identity: Option<RequestIdentity>,
     ) -> Result<Value, RuntimeError> {
+        self.dispatch_with_disposition(verb, params, identity)
+            .await
+            .map_err(DispatchError::into_source)
+    }
+
+    /// Dispatch with provenance for this operation's own domain result.
+    /// Errors returned by a nested dispatch remain handler errors at this boundary.
+    pub async fn dispatch_with_disposition(
+        &self,
+        verb: &str,
+        params: Value,
+        identity: Option<RequestIdentity>,
+    ) -> Result<Value, DispatchError> {
         // help=true interception: short-circuit before gate/pack.
         if params.get("help").and_then(Value::as_bool) == Some(true) {
-            return self.describe_verb(verb);
+            return self
+                .describe_verb(verb)
+                .map_err(DispatchError::before_dispatch);
         }
         // Resolve namespace before `params` is moved into pack.dispatch, so the
         // post-dispatch hook can reference it.
@@ -2241,7 +2281,9 @@ impl VerbRegistry {
         // Resolved once via the shared actor-identity policy and reused for
         // token minting below, so the gate's notion of "who is the caller"
         // and the storage token's notion can never drift apart.
-        let gate_req = self.gate_request_with_identity(verb, &params, identity.as_ref())?;
+        let gate_req = self
+            .gate_request_with_identity(verb, &params, identity.as_ref())
+            .map_err(DispatchError::before_dispatch)?;
         let ns = gate_req.namespace.clone();
         let resolved_actor = gate_req.actor.clone();
 
@@ -2365,18 +2407,21 @@ impl VerbRegistry {
                 (reason, deferred)
             }
             Err(err) => {
-                return Err(self
-                    .gate_unavailable_error(&gate_req, &err, request_id)
-                    .await);
+                return Err(DispatchError::before_dispatch(
+                    self.gate_unavailable_error(&gate_req, &err, request_id)
+                        .await,
+                ));
             }
         };
 
         // Hard enforcement: Deny is authoritative.
         if let Some(reason) = gate_blocked {
-            return Err(RuntimeError::PermissionDenied {
-                verb: verb.to_string(),
-                reason,
-            });
+            return Err(DispatchError::before_dispatch(
+                RuntimeError::PermissionDenied {
+                    verb: verb.to_string(),
+                    reason,
+                },
+            ));
         }
 
         // Mint the authorized storage token at the dispatch boundary.
@@ -2462,6 +2507,7 @@ impl VerbRegistry {
                 };
                 let dispatch_start = Instant::now();
                 let mut result = pack.dispatch(verb, params, self, &token).await;
+                let domain_succeeded = result.is_ok();
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
 
                 // Unlike ordinary audit rows, a successful `git.digest`
@@ -2514,7 +2560,7 @@ impl VerbRegistry {
                         // only needs `audit_outcome` afterward, and folding a
                         // failure into `result` requires a mutable borrow
                         // that cannot coexist with the `&result` match below.
-                        let audit_outcome: Result<(), RuntimeError> = match &result {
+                        let audit_outcome: Result<(), AuditObligationFailure> = match &result {
                             Ok(ok_val) if is_link_singleton => {
                                 // ADR-103 Amendment 1: `link` (singleton or
                                 // bulk) has no embedding-bearing path — edges
@@ -2645,7 +2691,8 @@ impl VerbRegistry {
                         // already-erroring dispatch (DispatchFailed producer)
                         // keeps its original error, matching
                         // `fold_audit_obligation`'s contract.
-                        result = fold_audit_obligation(result, audit_outcome);
+                        result =
+                            fold_audit_obligation(result, audit_outcome, std::convert::identity);
                     }
                 }
 
@@ -2743,7 +2790,8 @@ impl VerbRegistry {
                     }
                 }
 
-                return result;
+                return result
+                    .map_err(|error| DispatchError::after_handler(error, domain_succeeded));
             }
         }
 
@@ -2783,9 +2831,11 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(RuntimeError::UnknownVerb(format!(
-            "unknown verb {verb:?}; available: {}",
-            self.available_verbs.join(", ")
+        Err(DispatchError::before_dispatch(RuntimeError::UnknownVerb(
+            format!(
+                "unknown verb {verb:?}; available: {}",
+                self.available_verbs.join(", ")
+            ),
         )))
     }
 
@@ -3957,6 +4007,20 @@ enum GitDigestReceiptOutcome {
     PersistenceUnavailable,
 }
 
+fn fail_git_digest_receipt(
+    result: &mut Result<Value, RuntimeError>,
+    failure: AuditObligationFailure,
+) {
+    let Ok(value) = result else {
+        return;
+    };
+    let domain_result = std::mem::take(value);
+    *result = Err(RuntimeError::AuditObligation {
+        failure: Box::new(failure),
+        domain_result,
+    });
+}
+
 /// Persist the complete successful `git.digest` report as a schema-v2 audit
 /// event and add that event's UUID to the returned report as `receipt_id`.
 ///
@@ -3984,7 +4048,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "durable receipt store is not configured"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("event store is not configured"),
+        );
         return GitDigestReceiptOutcome::PersistenceUnavailable;
     };
     let Some(audit) = audit else {
@@ -3992,7 +4059,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "durable receipt cannot be built because the gate produced no audit decision"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("gate audit decision is absent"),
+        );
         return GitDigestReceiptOutcome::PersistenceUnavailable;
     };
 
@@ -4001,7 +4071,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "digest handler returned a non-object report"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("handler report is not an object"),
+        );
         return GitDigestReceiptOutcome::BuildRejected;
     };
     let Some(project_id) = report_object
@@ -4013,7 +4086,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "digest handler report omitted a valid project_id"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("handler report has no valid project_id"),
+        );
         return GitDigestReceiptOutcome::BuildRejected;
     };
 
@@ -4049,7 +4125,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "gate audit serialization did not produce an object"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("gate audit payload is not an object"),
+        );
         return GitDigestReceiptOutcome::BuildRejected;
     };
     if let Some(resource) = resource {
@@ -4073,11 +4152,14 @@ async fn persist_git_digest_receipt(
             })
             .await
             .map(|_outcome| ())
-            .map_err(|reason| format!("{reason:?}"))
+            .map_err(|reason| AuditObligationFailure::new("git.digest", reason))
     } else {
-        store.append_event(event).await.map_err(|e| e.to_string())
+        store
+            .append_event(event)
+            .await
+            .map_err(|error| AuditObligationFailure::from_store("git.digest", error))
     };
-    if let Err(store_err) = submit_result {
+    if let Err(mut failure) = submit_result {
         // `GitDigestReceipt` is always `DispatchObligation` (see
         // `crate::audit_batch::classify`) and this failure always
         // propagates below, so it belongs on the obligation counter, not
@@ -4085,11 +4167,15 @@ async fn persist_git_digest_receipt(
         AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::error!(
             verb = "git.digest",
-            error = %store_err,
+            error = %failure,
             receipt_id = %receipt_id,
             "durable digest receipt append failed"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        failure.message = format!(
+            "{GIT_DIGEST_RECEIPT_FAILURE}; audit submission failed ({})",
+            failure.wire_code()
+        );
+        fail_git_digest_receipt(result, failure);
         return GitDigestReceiptOutcome::PersistenceUnavailable;
     }
     GitDigestReceiptOutcome::Persisted
@@ -4147,7 +4233,7 @@ async fn append_audit_event_best_effort(
     verb: &str,
     producer: crate::audit_batch::AuditProducer,
     degrade_allowlisted: bool,
-) -> Result<(), RuntimeError> {
+) -> Result<(), AuditObligationFailure> {
     use crate::audit_batch::{
         classify, AuditBatchControl, AuditProducer, AuditProductionClass, AuditTerminalReason,
     };
@@ -4213,9 +4299,7 @@ async fn append_audit_event_best_effort(
                     reason = ?reason,
                     "audit obligation batch submission failed; failing dispatch"
                 );
-                return Err(RuntimeError::Internal(format!(
-                    "audit obligation commit failed for verb {verb:?}: {reason:?}"
-                )));
+                return Err(AuditObligationFailure::new(verb, reason));
             }
             AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
@@ -4235,9 +4319,7 @@ async fn append_audit_event_best_effort(
                 error = %store_err,
                 "audit obligation store write failed; failing dispatch"
             );
-            return Err(RuntimeError::Internal(format!(
-                "audit obligation commit failed for verb {verb:?}: {store_err}"
-            )));
+            return Err(AuditObligationFailure::from_store(verb, store_err));
         }
         AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
@@ -4258,11 +4340,15 @@ async fn append_audit_event_best_effort(
 /// not on replacing one error with another.
 fn fold_audit_obligation<T>(
     result: Result<T, RuntimeError>,
-    audit_outcome: Result<(), RuntimeError>,
+    audit_outcome: Result<(), AuditObligationFailure>,
+    domain_value: impl FnOnce(T) -> Value,
 ) -> Result<T, RuntimeError> {
     match (result, audit_outcome) {
         (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(audit_err)) => Err(audit_err),
+        (Ok(value), Err(failure)) => Err(RuntimeError::AuditObligation {
+            failure: Box::new(failure),
+            domain_result: domain_value(value),
+        }),
         (Err(err), _) => Err(err),
     }
 }
@@ -4363,6 +4449,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::ActorRef;
     use khive_types::Pack;
+
+    mod disposition {
+        include!("pack_disposition_tests.rs");
+    }
 
     /// Verbs known, by cross-pack source review (#2147/#2217), to have
     /// their own durable or accounting-bearing side effect despite being declared
@@ -7017,6 +7107,9 @@ pub(crate) mod tests {
         /// the audit submission, which is the only way to observe that the
         /// audit row is written after the handler rather than before it.
         trace: Option<Arc<std::sync::Mutex<Vec<TraceEntry>>>>,
+        /// Hold a real batch append across the caller's audit deadline.
+        append_started: Option<Arc<tokio::sync::Notify>>,
+        append_release: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl MemoryEventStore {
@@ -7119,6 +7212,12 @@ pub(crate) mod tests {
             events: Vec<Event>,
         ) -> khive_storage::StorageResult<khive_storage::event::IdempotentEventBatchResult>
         {
+            if let Some(started) = &self.append_started {
+                started.notify_one();
+            }
+            if let Some(release) = &self.append_release {
+                release.notified().await;
+            }
             self.trace_submission(&events);
             if self.fail_appends
                 || self
@@ -8017,8 +8116,8 @@ pub(crate) mod tests {
             .expect_err("malformed receipt identity must fail the response");
         assert!(matches!(
             err,
-            RuntimeError::Internal(ref message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
+            RuntimeError::AuditObligation { ref failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
         ));
 
         let event = only_git_digest_event(&store);
@@ -8057,9 +8156,9 @@ pub(crate) mod tests {
             .await
             .expect_err("receipt persistence failure must fail the response");
         assert!(
-            matches!(&err, RuntimeError::Internal(message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
-                    && message.contains("writes may have committed")),
+            matches!(&err, RuntimeError::AuditObligation { failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
+                    && failure.message.contains("writes may have committed")),
             "error is stable, safe, and retry-aware: {err}"
         );
         // The git.digest receipt is obligation-bearing (`GitDigestReceipt`
@@ -8087,8 +8186,8 @@ pub(crate) mod tests {
             .expect_err("a successful digest needs a durable store");
         assert!(matches!(
             err,
-            RuntimeError::Internal(ref message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
+            RuntimeError::AuditObligation { ref failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
         ));
     }
 
@@ -8343,8 +8442,8 @@ pub(crate) mod tests {
             .expect_err("malformed intercepted receipt must fail the response");
         assert!(matches!(
             err,
-            RuntimeError::Internal(ref message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
+            RuntimeError::AuditObligation { ref failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
         ));
 
         let event = only_git_digest_event(&store);
@@ -8652,8 +8751,8 @@ pub(crate) mod tests {
                 "a persistent obligation-bearing audit commit failure must fail the dispatch",
             );
         assert!(
-            matches!(&err, RuntimeError::Internal(message)
-                if message.contains("audit obligation commit failed")),
+            matches!(&err, RuntimeError::AuditObligation { failure, .. }
+                if failure.message.contains("audit obligation commit failed")),
             "error names the obligation failure so it is distinguishable from a handler error: {err}"
         );
 
@@ -8799,8 +8898,8 @@ pub(crate) mod tests {
             .await
             .expect_err("an obligation commit failure must fail the dispatch");
         assert!(
-            matches!(&err, RuntimeError::Internal(message)
-                if message.contains("audit obligation commit failed")),
+            matches!(&err, RuntimeError::AuditObligation { failure, .. }
+                if failure.message.contains("audit obligation commit failed")),
             "the error must name the obligation failure, since that string is what tells a \
              caller the effect landed: {err}"
         );

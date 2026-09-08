@@ -30,7 +30,12 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
-from .envelope import _decode_json_text, _envelope_from_payload, _validate_envelope_results
+from .envelope import (
+    _decode_json_text,
+    _envelope_from_payload,
+    _validate_envelope_results,
+    _validate_frame_error_detail,
+)
 from .errors import (
     ConfigMismatch,
     FrameTooLarge,
@@ -38,6 +43,7 @@ from .errors import (
     RequestRejected,
     TransportError,
 )
+from .models import OpError
 
 PROTOCOL_VERSION = 4
 MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -162,9 +168,15 @@ class Session:
             response = self.transport.round_trip(frame, timeout or self.timeout)
             self._check_version(response)
             if response.get("config_mismatch"):
-                raise ConfigMismatch(str(response.get("error")))
+                raise ConfigMismatch(
+                    str(response.get("error")),
+                    error_detail=_validate_frame_error_detail(response, "daemon"),
+                )
         if not response.get("ok"):
-            raise RequestRejected(str(response.get("error")))
+            raise RequestRejected(
+                str(response.get("error")),
+                error_detail=_validate_frame_error_detail(response, "daemon"),
+            )
         raw = response.get("result")
         parsed = _decode_json_text(raw, "daemon") if isinstance(raw, str) else raw
         envelope = _envelope_from_payload(parsed, "daemon")
@@ -190,8 +202,19 @@ class Session:
     @staticmethod
     def _check_version(response: dict[str, Any]) -> None:
         if response.get("version_mismatch"):
+            message = str(response.get("error") or "")
+            detail = _validate_frame_error_detail(response, "daemon")
+            fields = detail.model_dump(exclude_unset=True) if detail is not None else {}
+            fields.pop("domain_result", None)
+            fields.update(
+                kind="protocol",
+                code="version_mismatch",
+                message=message,
+                domain_disposition="unknown",
+            )
             raise ProtocolMismatch(
                 PROTOCOL_VERSION,
                 int(response.get("daemon_protocol_version") or 0),
-                str(response.get("error") or ""),
+                message,
+                OpError.model_validate(fields),
             )
