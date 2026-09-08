@@ -576,7 +576,7 @@ impl VamanaIndex {
     /// Uses `GsSq8Codec` for the acquisition-tier distance during graph construction
     /// (ADR-052 §1, Step 2: default-on for Vamana, algebraically exact in code space).
     ///
-    /// Runs inside the bounded build pool (see [`build_thread_count`]), so every
+    /// Runs inside the bounded build pool (see `build_thread_count`), so every
     /// nested `par_iter` in graph construction inherits that bound instead of the
     /// global pool's one-thread-per-core.
     pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<Self> {
