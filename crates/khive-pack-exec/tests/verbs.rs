@@ -88,6 +88,19 @@ impl Fixture {
         v["tree"].as_str().unwrap().to_string()
     }
 
+    async fn blob_text(&self, r: &Value) -> String {
+        use base64::Engine;
+        let v = self.call("blob.get", json!({ "content_ref": r })).await;
+        let b64 = v
+            .get("bytes")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("blob.get result has no bytes: {v}"));
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("blob bytes decode");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     async fn register_sh(&self, name: &str, decision: &str) {
         self.call(
             "tool.register",
@@ -386,4 +399,120 @@ async fn run_timeout_kills_the_group_and_output_tail_is_kept() {
     assert_eq!(r["stdout_produced_bytes"], 519);
     assert_eq!(r["stdout_retained_bytes"], 128);
     assert_eq!(r["stdout_capture"], "incomplete");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_declared_paths_cover_prefixes_at_slash_boundaries_only() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f
+        .tree(&[("a/x", b"x", 644), ("a.bak", b"bak", 644), ("b", b"b", 644)])
+        .await;
+    let out = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh",
+                "args": ["-c", "printf X > a/x; printf Y > a/y; printf BAK > a.bak; rm b"],
+                "actor": "local", "declared_write_paths": ["a", "b"]
+            }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["exit_code"], 0, "{receipt}");
+    assert_eq!(receipt["success"], false);
+    let ops: Vec<(String, String)> = receipt["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["path"].as_str().unwrap().into(),
+                c["op"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ops,
+        vec![
+            ("a/x".to_string(), "modified".to_string()),
+            ("a/y".to_string(), "added".to_string()),
+            ("b".to_string(), "deleted".to_string()),
+        ]
+    );
+    assert_eq!(receipt["undeclared_changes"], json!(["a.bak"]));
+    let entries = f
+        .call("exec.tree_get", json!({ "tree": receipt["tree_out"] }))
+        .await;
+    let bak = entries["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "a.bak")
+        .expect("undeclared write keeps the input entry");
+    assert_eq!(bak["ref"], json!(f.put(b"bak").await));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn concurrent_runs_in_one_session_get_distinct_seq() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[]).await;
+    let run = |i: u32| {
+        f.call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", format!("echo {i}")],
+                "actor": "local", "session_id": "s-seq"
+            }),
+        )
+    };
+    let (a, b) = tokio::join!(run(1), run(2));
+    let mut seqs = vec![
+        a["receipt"]["seq"].as_i64().unwrap(),
+        b["receipt"]["seq"].as_i64().unwrap(),
+    ];
+    seqs.sort_unstable();
+    assert_eq!(seqs, vec![1, 2]);
+    let runs = f
+        .call("exec.runs", json!({ "actor": "local", "session_id": "s-seq" }))
+        .await;
+    assert_eq!(runs["count"], 2);
+    let stored = f
+        .call("exec.receipt", json!({ "id": a["receipt"]["id"] }))
+        .await;
+    assert_eq!(stored["seq"], a["receipt"]["seq"], "readers report the column");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_denies_version_control_and_the_never_set_at_the_kernel() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[]).await;
+    let control = f
+        .call(
+            "exec.run",
+            json!({ "tree": tree, "tool": "sh", "args": ["-c", "/bin/echo ok"], "actor": "local" }),
+        )
+        .await;
+    assert_eq!(control["receipt"]["exit_code"], 0, "{}", control["receipt"]);
+    for cmd in ["git --version", "/usr/bin/true"] {
+        let out = f
+            .call(
+                "exec.run",
+                json!({ "tree": tree, "tool": "sh", "args": ["-c", cmd], "actor": "local" }),
+            )
+            .await;
+        let receipt = &out["receipt"];
+        assert_ne!(receipt["exit_code"], 0, "{cmd}: {receipt}");
+        assert_eq!(receipt["success"], false, "{cmd}");
+        let stderr = f.blob_text(&receipt["stderr_ref"]).await;
+        assert!(
+            stderr.contains("ermitted") || stderr.contains("ermission"),
+            "{cmd}: the kernel refusal is in stderr: {stderr:?}"
+        );
+    }
 }

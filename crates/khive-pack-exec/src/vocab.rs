@@ -9,7 +9,7 @@ pub const PACK_NAME: &str = "exec";
 pub const TREE_SCHEMA: &str = "khive-tree/v1";
 
 /// Pack-owned tables, applied idempotently at boot.
-pub static EXEC_SCHEMA_PLAN_STMTS: [&str; 5] = [
+pub static EXEC_SCHEMA_PLAN_STMTS: [&str; 6] = [
     "CREATE TABLE IF NOT EXISTS exec_runs (\
         id           TEXT PRIMARY KEY,\
         namespace    TEXT NOT NULL,\
@@ -21,7 +21,9 @@ pub static EXEC_SCHEMA_PLAN_STMTS: [&str; 5] = [
         created_at   INTEGER NOT NULL\
     )",
     "CREATE INDEX IF NOT EXISTS idx_exec_runs_actor ON exec_runs(namespace, actor, created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_exec_runs_session ON exec_runs(namespace, session_id, seq)",
+    "DROP INDEX IF EXISTS idx_exec_runs_session",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_exec_runs_session_seq \
+        ON exec_runs(namespace, session_id, seq) WHERE session_id IS NOT NULL",
     "CREATE TABLE IF NOT EXISTS exec_events (\
         id         INTEGER PRIMARY KEY AUTOINCREMENT,\
         namespace  TEXT NOT NULL,\
