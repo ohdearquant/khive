@@ -12,7 +12,7 @@
 
 mod handlers;
 mod pack;
-mod policy;
+pub mod policy;
 pub mod vocab;
 
 pub use pack::ToolPack;

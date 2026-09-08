@@ -8,14 +8,14 @@ use uuid::Uuid;
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 
-pub(crate) fn now_micros() -> i64 {
+pub fn now_micros() -> i64 {
     Utc::now().timestamp_micros()
 }
 
 /// The caller's actor as one label, `kind:id`, except that the plain `actor`
 /// kind collapses to its id so a configured `lambda:khive` reads back as
 /// itself.
-pub(crate) fn actor_label(token: &NamespaceToken) -> String {
+pub fn actor_label(token: &NamespaceToken) -> String {
     let actor = token.actor();
     if actor.kind == "actor" {
         actor.id.clone()
@@ -405,7 +405,7 @@ pub(crate) async fn set_grant_status(
 
 /// One policy decision and where it came from.
 #[derive(Debug, Clone)]
-pub(crate) struct Decision {
+pub struct Decision {
     pub decision: String,
     pub source: String,
     pub grant_id: Option<String>,
@@ -415,7 +415,7 @@ pub(crate) struct Decision {
 }
 
 impl Decision {
-    pub(crate) fn to_json(&self) -> Value {
+    pub fn to_json(&self) -> Value {
         json!({
             "decision": self.decision,
             "source": self.source,
@@ -430,7 +430,7 @@ impl Decision {
 /// Resolution order: an active grant allows; otherwise the most specific
 /// matching policy row decides (ties: deny over ask over allow); otherwise
 /// the side-effect default (read allows, everything else asks).
-pub(crate) async fn decide(
+pub async fn decide(
     rt: &KhiveRuntime,
     ns: &str,
     actor: &str,
