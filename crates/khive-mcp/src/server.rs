@@ -4710,7 +4710,10 @@ fn build_instructions(catalog: &str, builtins: &str) -> String {
     format!(
         "khive — request-only MCP surface. One tool, `request`, \
          dispatches verbs through the loaded pack registry. Configure packs via \
-         KHIVE_PACKS or --pack (built-ins: {builtins}). Verbs registered on this \
+         KHIVE_PACKS or --pack (built-ins: {builtins}). The kg pack's verbs are \
+         unprefixed (create, get, list, search, link, neighbors, ...); every other pack's \
+         verbs are written pack.verb. Read verbs return their record or hits directly \
+         unless the verb's help says it wraps them in an envelope. Verbs registered on this \
          server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \
          plugin's SKILL.md files.\n\
          Docs: https://ohdearquant.github.io/khive/ (hosted) or docs/*.md in the repo \

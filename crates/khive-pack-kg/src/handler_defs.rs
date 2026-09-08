@@ -136,7 +136,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Assertive: retrieves and presents a record
     HandlerDef {
         name: "get",
-        description: "Fetch any record by UUID",
+        description: "Fetch any record by UUID. Returns the bare record, no envelope: `kind` is \
+                      the granular kind (concept, task, observation, ...), `entity_type` is the \
+                      governed subtype when one is set, and an entity's vocabulary type lives \
+                      at `properties.type`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -784,7 +787,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors; each hit includes origin_id for the queried node",
+        description: "Immediate graph neighbors, returned as a bare array of hits rather than the \
+                      {\"items\": [...]} envelope `list` uses. Each hit carries origin_id for the \
+                      queried node, edge_id, relation, weight, and the neighbor's id, kind and \
+                      name; include_entity_type=true adds entity_type when the neighbor has one.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

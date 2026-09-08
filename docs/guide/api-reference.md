@@ -231,7 +231,7 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 ### `get` — Assertive
 
-Fetch any record by UUID (auto-detects entity/note/edge/event/proposal).
+Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
 | Param             | Type | Required | Notes                                                                  |
 | ----------------- | ---- | -------- | ---------------------------------------------------------------------- |
@@ -575,7 +575,7 @@ request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"ext
 
 ### `neighbors` — Assertive
 
-Immediate graph neighbors.
+Immediate graph neighbors, returned as a bare array of hits rather than the `{"items": [...]}` envelope that `list` uses. Each hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
 
 Each returned hit includes `origin_id`, the resolved queried node. This lets
 batch callers verify that every result is associated with the submitted root.
