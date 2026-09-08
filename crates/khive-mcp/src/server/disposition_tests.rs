@@ -214,6 +214,7 @@ impl Fixture {
             .server
             .dispatch_request_inner(
                 RequestParams {
+                    plan: None,
                     ops: ops.into(),
                     presentation: Some("verbose".into()),
                     format: Some("json".into()),
@@ -1393,6 +1394,10 @@ struct A3CapturingDispatch {
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl khive_runtime::daemon::DaemonDispatch for A3CapturingDispatch {
+    fn plan(&self, ops: &str) -> String {
+        self.server.plan_ops(ops)
+    }
+
     async fn dispatch(
         &self,
         _ops: String,
@@ -1519,6 +1524,7 @@ async fn a3_same_committed_failure_crosses_mcp_request_and_native_frame_once() {
         .server
         .request_with_forward(
             RequestParams {
+                plan: None,
                 ops: ops.into(),
                 presentation: Some("verbose".into()),
                 format: Some("json".into()),

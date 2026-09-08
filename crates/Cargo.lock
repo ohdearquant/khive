@@ -2448,6 +2448,7 @@ dependencies = [
  "khive-types",
  "serde",
  "serde_json",
+ "syn",
 ]
 
 [[package]]
@@ -2495,6 +2496,7 @@ dependencies = [
  "khive-gate",
  "khive-gate-rego",
  "khive-query",
+ "khive-request",
  "khive-score",
  "khive-storage",
  "khive-types",

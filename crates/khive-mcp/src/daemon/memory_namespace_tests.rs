@@ -32,6 +32,7 @@ async fn request(
         protocol_version: PROTOCOL_VERSION,
         probe_only: false,
         metrics_only: false,
+        plan: false,
         format: Some("json".into()),
         format_per_op: None,
         from_wire: true,
