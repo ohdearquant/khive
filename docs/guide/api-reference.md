@@ -75,7 +75,7 @@ capability concepts with `implements` edges, and answers what a caller may call 
 
 Pack selection resolves as `--pack` > `KHIVE_PACKS` > discovered `[runtime].packs` > the
 built-in production set. With no non-empty selection at any of the first three layers, the
-default binary loads all 12 packs. Use `verbs()` for the current aggregate rather than carrying
+default binary loads all 14 packs. Use `verbs()` for the current aggregate rather than carrying
 a second hand-maintained total here.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
