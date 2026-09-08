@@ -1646,3 +1646,40 @@ never runs a corpus-sized `COUNT`. Malformed/missing structure data degrades
 to `fts_segments_error`. `db_diagnostics.fts_maintenance` exposes the bounded
 maintenance counters. This adds derived-index writes only; it changes no
 logical records, migrations, recall ordering, or WAL escalation policy.
+
+### 2026-09-08 amendment (Amendment 17): stream-append write scope
+
+**What this adds.** Amendment 11's audit table is normative and exhaustive, and its review guard
+requires any new `SqlAccess::atomic_unit` caller to be entered in it. The stream ledger introduced
+with the `note_streams` migration adds one such caller, `KhiveRuntime::stream_append` in
+`crates/khive-runtime/src/streams.rs`. This amendment records its audit row rather than editing
+Amendment 11 in place, so the inventory grows by append and the earlier text stays readable as
+what was true when it was written.
+
+| Transaction owner                   | Production scopes/callers         | Work inside the transaction                                                                                                                                                                                   | Verdict  |
+| ----------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| Runtime/pack `AtomicUnitOp` callers | `runtime::streams::stream_append` | One head `SELECT COALESCE(MAX(seq), 0)`, a checked integer increment, a comparison against the caller's expected sequence, the note plan's prepared statements with their row guards, and one ledger `INSERT` | SQL-only |
+
+**Why the row holds.** Everything the append needs is materialized before the transaction opens:
+the record is serialized, and the note plan, with its content, index and vector statements, is
+produced by the shared note preparation path. The closure's only awaited value is the writer it
+is handed. It performs no filesystem, process or network work, calls into no other subsystem, and
+computes no embedding. The statement loop is bounded by the prepared plan for a single note. The
+sequence precondition is evaluated inside the same transaction that installs the row, which is the
+point of putting it there: a precondition checked outside the writer would be advisory.
+
+**Conflict is a return, not an error path.** A failed expected-sequence comparison returns a
+conflict outcome from the closure and lets the transaction end normally, so a losing conditional
+append does not roll back through the error path or hold the writer while a caller decides what to
+do. The refusal is reported after the transaction closes.
+
+**Metadata compare-and-set keeps its existing owner.** The stream work also updates record
+metadata through a single prepared statement under the transaction owners already inventoried in
+Amendment 11. That path adds no new scope and needs no row of its own; it is named here only so a
+reader auditing the stream surface does not go looking for a missing entry.
+
+**Basis, stated plainly.** This row was established by reading the caller through its commit edge.
+The first-poll enforcement arm and the fault-injection arms for this caller have not been executed;
+they run with the stream work's own gate. The row is entered under the same review guard it
+documents, and the guard's requirement is that the entry exists and the body respects the
+invariant, which is what was checked.
