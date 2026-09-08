@@ -65,6 +65,7 @@ fn policy(repo: &Path, branches: &[&str]) -> GitWriteSectionConfig {
             repo: repo.display().to_string(),
             branches: branches.iter().map(|b| b.to_string()).collect(),
         }],
+        ..GitWriteSectionConfig::default()
     }
 }
 
@@ -83,6 +84,24 @@ async fn pack_and_token_with_policy(git_write: GitWriteSectionConfig) -> (GitPac
     };
     let rt = KhiveRuntime::new(config).expect("in-memory runtime");
     let token = rt.authorize(Namespace::local()).expect("authorize");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(khive_pack_tool::ToolPack::new(rt.clone()));
+    builder.register(GitPack::new(rt.clone()));
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("legacy fixture audit store");
+    let registry = builder.build().expect("legacy fixture registry");
+    registry.apply_schema_plans(rt.backend());
+    registry
+        .dispatch(
+            "tool.policy",
+            json!({
+                "actor": "*", "tool": "git.branch", "decision": "allow"
+            }),
+        )
+        .await
+        .expect("legacy branch policy");
     (GitPack::new(rt), token)
 }
 

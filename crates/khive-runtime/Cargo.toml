@@ -12,6 +12,7 @@ categories.workspace = true
 description = "Composable Service API: entity/note CRUD, graph traversal, hybrid search, curation."
 
 [features]
+contract-faults = []
 fault-injection = []
 test-internals = []
 

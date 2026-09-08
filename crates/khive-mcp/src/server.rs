@@ -814,17 +814,11 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         .map(|fingerprint| format!(";gate={fingerprint}"))
         .unwrap_or_default();
     let mut git_write_hasher = Sha256::new();
-    git_write_hasher.update(b"khive.git-write-policy.v1");
-    git_write_hasher.update((config.git_write.allowed.len() as u64).to_be_bytes());
-    for entry in &config.git_write.allowed {
-        git_write_hasher.update((entry.repo.len() as u64).to_be_bytes());
-        git_write_hasher.update(entry.repo.as_bytes());
-        git_write_hasher.update((entry.branches.len() as u64).to_be_bytes());
-        for branch in &entry.branches {
-            git_write_hasher.update((branch.len() as u64).to_be_bytes());
-            git_write_hasher.update(branch.as_bytes());
-        }
-    }
+    git_write_hasher.update(b"khive.git-write-policy.v2");
+    git_write_hasher.update(
+        serde_json::to_vec(&config.git_write)
+            .expect("git-write configuration is JSON serializable"),
+    );
     let git_write = format!("{:x}", git_write_hasher.finalize());
 
     let backend = if storage_read_only {
@@ -5658,6 +5652,80 @@ mod tests {
             compute_config_id_with_ann_fresh_tail(&config, None, false),
             "opposite fresh-tail policies must not share one warm daemon"
         );
+    }
+
+    #[test]
+    fn config_id_separates_git_actor_resolver_and_fault_configuration() {
+        use khive_runtime::engine_config::GitWriteActorConfig;
+
+        let mut base = RuntimeConfig::no_embeddings();
+        base.git_write.actors.insert(
+            "example".to_string(),
+            GitWriteActorConfig {
+                name: "Example".to_string(),
+                email: "example@example.invalid".to_string(),
+                credential_ref: "example-reference".to_string(),
+                platform_identity: "example-login".to_string(),
+            },
+        );
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        let original = fingerprint(&base);
+        for field in [
+            "name",
+            "email",
+            "credential_ref",
+            "platform_identity",
+            "actor",
+            "resolver",
+            "contract_faults",
+            "fault",
+        ] {
+            let mut changed = base.clone();
+            match field {
+                "name" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .name
+                    .push('x'),
+                "email" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .email
+                    .push('x'),
+                "credential_ref" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .credential_ref
+                    .push('x'),
+                "platform_identity" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .platform_identity
+                    .push('x'),
+                "actor" => {
+                    changed.git_write.actors.clear();
+                }
+                "resolver" => changed.git_write.credential_resolver[0].push('x'),
+                "contract_faults" => changed.git_write.contract_faults = true,
+                "fault" => {
+                    changed.git_write.fault = Some("git.push:reply-lost-after-effect".to_string())
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(original, fingerprint(&changed), "changed {field}");
+        }
+        assert!(!original.contains("example-reference"));
+        assert_eq!(original, fingerprint(&base.clone()));
     }
 
     #[test]

@@ -24,11 +24,20 @@
 //! `kkernel git-ingest` remains the unbounded, all-kinds admin CLI path over
 //! the same shared `ingest::run_ingest` core.
 
+#[cfg(test)]
+mod backend_policy_tests;
 pub mod cache;
+mod credentials;
 pub mod handlers;
 pub mod hook;
 pub mod ingest;
+mod local_git;
+mod local_handlers;
+mod local_vocab;
 mod pack;
+#[cfg(test)]
+mod policy_tests;
+mod receipts;
 #[cfg(test)]
 mod recovery_tests;
 pub mod refs;

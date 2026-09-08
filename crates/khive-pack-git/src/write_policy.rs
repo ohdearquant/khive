@@ -112,32 +112,43 @@ impl GitWritePolicy {
     /// widens what is reachable, only normalizes how the same repo can be
     /// spelled.
     pub fn check(&self, repo: &Path, branch: &str) -> Result<PathBuf, GitWritePolicyError> {
+        self.match_entry(repo, Some(branch)).map(|(repo, _)| repo)
+    }
+
+    /// Match a canonical repository and, for mutations, its target branch.
+    /// The entry index is the stable identifier in the configured allowlist.
+    pub fn match_entry(
+        &self,
+        repo: &Path,
+        branch: Option<&str>,
+    ) -> Result<(PathBuf, usize), GitWritePolicyError> {
         if self.allowed.is_empty() {
             return Err(GitWritePolicyError::NotConfigured);
         }
-        let canonical_repo = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-        let entry = self.allowed.iter().find(|e| {
-            std::fs::canonicalize(&e.repo_path)
-                .map(|c| c == canonical_repo)
-                .unwrap_or(false)
+        let canonical_repo = std::fs::canonicalize(repo)
+            .map_err(|_| GitWritePolicyError::RepoNotAllowlisted(repo.display().to_string()))?;
+        let matched = self.allowed.iter().enumerate().find(|(_, entry)| {
+            std::fs::canonicalize(&entry.repo_path)
+                .is_ok_and(|candidate| candidate == canonical_repo)
         });
-        let Some(entry) = entry else {
+        let Some((index, entry)) = matched else {
             return Err(GitWritePolicyError::RepoNotAllowlisted(
                 repo.display().to_string(),
             ));
         };
-        if entry
-            .branch_patterns
-            .iter()
-            .any(|pattern| glob_match(pattern, branch))
-        {
-            Ok(canonical_repo)
-        } else {
-            Err(GitWritePolicyError::BranchNotAllowed {
-                repo: repo.display().to_string(),
-                branch: branch.to_string(),
-            })
+        if let Some(branch) = branch {
+            if !entry
+                .branch_patterns
+                .iter()
+                .any(|pattern| glob_match(pattern, branch))
+            {
+                return Err(GitWritePolicyError::BranchNotAllowed {
+                    repo: repo.display().to_string(),
+                    branch: branch.to_string(),
+                });
+            }
         }
+        Ok((canonical_repo, index))
     }
 }
 
@@ -305,6 +316,7 @@ mod tests {
                 repo: "/abs/path".to_string(),
                 branches: vec!["main".to_string()],
             }],
+            ..GitWriteSectionConfig::default()
         };
         let policy = GitWritePolicy::from_config(&section);
         assert_eq!(policy.allowed.len(), 1);

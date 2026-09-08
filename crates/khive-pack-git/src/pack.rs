@@ -137,9 +137,17 @@ impl PackRuntime for GitPack {
     ) -> Result<Value, RuntimeError> {
         match verb {
             "git.digest" => self.handle_digest(token, registry, params).await,
+            "git.commit" if params.get("tree").is_some() => {
+                self.handle_local(token, registry, verb, params).await
+            }
             "git.commit" => self.handle_commit(token, params).await,
-            "git.branch" => self.handle_branch(token, params).await,
+            "git.branch" => self.handle_local(token, registry, verb, params).await,
             "git.push" => self.handle_push(token, params).await,
+            "git.checkout" | "git.diff" | "git.reconcile" => {
+                self.handle_local(token, registry, verb, params).await
+            }
+            "git.receipts" => self.handle_receipts(token, registry, params).await,
+            "git.gates" => self.handle_gates(token, registry, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "git pack does not handle verb {verb:?}"
             ))),
