@@ -1,4 +1,4 @@
-# ADR-179: Operation Identity on `memory.remember` — Keyed Create-If-Absent
+# ADR-179: Operation Identity on `memory.remember`: Keyed Create, Conflict Names the Holder
 
 - **Status**: Proposed
 - **Date**: 2026-09-08
@@ -80,6 +80,12 @@ hard delete releases it too. `memory.prune` soft-deletes, so a pruned memory's k
 a later write. That is stated as a consequence rather than hidden: a client that needs a pruned key to
 stay refused must not reuse it.
 
+A replay that races a prune of the same key is a named consequence, not a discovered one: when the
+prune's soft delete commits between the original write and the replay, the key is released and the
+replay creates a second memory for one operation identity. Recovery runs in seconds and prune runs
+much later, so the window is small; the record accepts it and acceptance 11 measures it rather than
+hiding it.
+
 ### D4. `key` composes with `source_id`, and constrains nothing else
 
 The `annotates` edge to `source_id` is created only on the successful create; a `key_conflict`
@@ -92,6 +98,23 @@ The caller may treat `key_conflict.existing_id` as the id of its own earlier wri
 is the caller's and the namespace is the caller's. It may not treat the absence of a conflict as
 proof that no other memory annotates the same source; that is D4's point. An `unknown` disposition
 on the replay itself (ADR-133 Amendment 3) is resolved by replaying again; the key makes that safe.
+
+On a `key_conflict` the reconciliation terminates at `existing_id`. Its
+`domain_disposition: "not_committed"` describes this attempt only, never the keyed subject, whose
+earlier write did commit; a consumer that applied ADR-133 A3.2 mechanically would resend forever.
+The rule is therefore: a keyed request that returned `key_conflict` is never resent; the caller
+reads `existing_id` and is done.
+
+### D6. A key is an identity only within a pinned namespace
+
+D1 resolves the write namespace from an explicit `namespace`, else the actor's namespace for
+episodic memories, else `local`. A lost acknowledgement is usually recovered by a different process,
+and in a fleet where the actor is decided by the caller's working directory a recovering process can
+resolve a different namespace, miss the index partition entirely and create the duplicate this record
+exists to prevent. A recovery replay therefore carries the same explicit `namespace` the original
+carried, and a client that recovers on the caller's behalf pins it. A replay that resolves a
+different namespace is a different identity and produces a second row; acceptance 10 documents that
+outcome so no one mistakes it for a defect of the index.
 
 ## Consequences
 
@@ -107,8 +130,9 @@ on the replay itself (ADR-133 Amendment 3) is resolved by replaying again; the k
 1. **Lost acknowledgement.** `memory.remember(content, key=K, source_id=S)` commits; the identical
    request is sent again. The second call fails with `key_conflict` naming the first id; exactly one
    note and exactly one `annotates` edge exist. Control: the same pair without `key` produces two notes.
-2. **Concurrent recovery.** Two processes send the same keyed request at once against one daemon;
-   exactly one succeeds, the other gets `key_conflict` with the same id; one row exists.
+2. **Concurrent recovery.** Two processes send the same keyed request at once against two daemons
+   over one store; exactly one succeeds, the other gets `key_conflict` with the same id; one row
+   exists. The partial unique index is the mechanism and the claim; the daemon count is not.
 3. **Decoy annotation.** A different memory with a different key annotating the same `S` coexists with
    the keyed one; the keyed replay still names its own id, not the decoy's.
 4. **Unchanged without a key.** The existing `memory.remember` tests pass unmodified; a request
@@ -121,9 +145,16 @@ on the replay itself (ADR-133 Amendment 3) is resolved by replaying again; the k
    actor writing the same key twice holds one.
 8. **Disposition interplay.** Under a forced obligation failure the first keyed write returns
    `domain_disposition: "committed"` with the id; a replay returns `key_conflict` with that id and
-   `domain_disposition: "not_committed"`.
+   `domain_disposition: "not_committed"`, and the reconciliation ends there: the reference client
+   surfaces `existing_id` and issues no third call.
 9. **Three surfaces.** The MCP `request` tool, `kkernel exec` and the Python client return the same
    `key_conflict` object for the same replay; `Session.remember(key=)` passes the field through.
+10. **Namespace pin.** The same keyed request replayed from a process that resolves a different
+    actor namespace, without an explicit `namespace`, produces two rows; replayed with the original's
+    explicit `namespace` it returns `key_conflict`. Both outcomes are asserted.
+11. **Prune race.** A replay concurrent with `memory.prune` of the same key ends in one of two
+    states, one row when the replay won or two rows when the prune committed first, and never a
+    third; the test runs the race repeatedly and asserts the row count is 1 or 2 on every run.
 
 ## Implementation notes
 
