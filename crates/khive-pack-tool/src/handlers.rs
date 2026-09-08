@@ -20,9 +20,9 @@ use crate::vocab::{
 fn opt_str(params: &Value, key: &str) -> Result<Option<String>, RuntimeError> {
     match params.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) if s.trim().is_empty() => Err(RuntimeError::InvalidInput(
-            format!("{key} must be a non-empty string when provided"),
-        )),
+        Some(Value::String(s)) if s.trim().is_empty() => Err(RuntimeError::InvalidInput(format!(
+            "{key} must be a non-empty string when provided"
+        ))),
         Some(Value::String(s)) => Ok(Some(s.trim().to_string())),
         Some(other) => Err(RuntimeError::InvalidInput(format!(
             "{key} must be a string; got {other}"
@@ -31,17 +31,15 @@ fn opt_str(params: &Value, key: &str) -> Result<Option<String>, RuntimeError> {
 }
 
 fn req_str(params: &Value, key: &str) -> Result<String, RuntimeError> {
-    opt_str(params, key)?
-        .ok_or_else(|| RuntimeError::InvalidInput(format!("{key} is required")))
+    opt_str(params, key)?.ok_or_else(|| RuntimeError::InvalidInput(format!("{key} is required")))
 }
 
 fn opt_u32(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, RuntimeError> {
     match params.get(key) {
         None | Some(Value::Null) => Ok(default),
-        Some(v) => v
-            .as_u64()
-            .map(|n| (n as u32).clamp(1, max))
-            .ok_or_else(|| RuntimeError::InvalidInput(format!("{key} must be a non-negative integer"))),
+        Some(v) => v.as_u64().map(|n| (n as u32).clamp(1, max)).ok_or_else(|| {
+            RuntimeError::InvalidInput(format!("{key} must be a non-negative integer"))
+        }),
     }
 }
 
@@ -138,8 +136,14 @@ async fn registry_entities(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<Entity>, RuntimeError> {
-    rt.list_entities_tagged(token, Some(REGISTRY_ENTITY_KIND), Some(REGISTRY_TAG), limit, offset)
-        .await
+    rt.list_entities_tagged(
+        token,
+        Some(REGISTRY_ENTITY_KIND),
+        Some(REGISTRY_TAG),
+        limit,
+        offset,
+    )
+    .await
 }
 
 async fn find_by_name(
@@ -151,9 +155,7 @@ async fn find_by_name(
     if let Some(e) = all.iter().find(|e| e.name == name) {
         return Ok(Some(e.clone()));
     }
-    Ok(all
-        .into_iter()
-        .find(|e| e.name.eq_ignore_ascii_case(name)))
+    Ok(all.into_iter().find(|e| e.name.eq_ignore_ascii_case(name)))
 }
 
 async fn resolve_tool(
@@ -211,7 +213,14 @@ async fn link_implements(
     capability_id: Uuid,
 ) -> Result<(), RuntimeError> {
     match rt
-        .link(token, tool_id, capability_id, EdgeRelation::Implements, 1.0, None)
+        .link(
+            token,
+            tool_id,
+            capability_id,
+            EdgeRelation::Implements,
+            1.0,
+            None,
+        )
         .await
     {
         Ok(_) => Ok(()),
@@ -559,9 +568,14 @@ pub(crate) async fn suggest(
                 continue;
             }
         }
-        let decision =
-            policy::decide(rt, &ns, &actor, &entity.name, side_effect_of(&entity).as_deref())
-                .await?;
+        let decision = policy::decide(
+            rt,
+            &ns,
+            &actor,
+            &entity.name,
+            side_effect_of(&entity).as_deref(),
+        )
+        .await?;
         let mut item = summary(&entity);
         item["score"] = json!(score);
         item["via"] = json!(caps);
@@ -589,8 +603,14 @@ pub(crate) async fn describe(
     let ns = token.namespace().as_str().to_string();
     let entity = resolve_tool(rt, token, &reference).await?;
     let capabilities = capabilities_of(rt, token, entity_uuid(&entity)).await?;
-    let decision =
-        policy::decide(rt, &ns, &actor, &entity.name, side_effect_of(&entity).as_deref()).await?;
+    let decision = policy::decide(
+        rt,
+        &ns,
+        &actor,
+        &entity.name,
+        side_effect_of(&entity).as_deref(),
+    )
+    .await?;
     let mut v = full(&entity);
     v["capabilities"] = json!(capabilities);
     v["decision"] = decision.to_json();
@@ -610,9 +630,12 @@ pub(crate) async fn list(
     let limit = opt_u32(&params, "limit", 100, 1000)?;
     let offset = match params.get("offset") {
         None | Some(Value::Null) => 0,
-        Some(v) => v.as_u64().map(|n| n.min(u32::MAX as u64) as u32).ok_or_else(|| {
-            RuntimeError::InvalidInput("offset must be a non-negative integer".into())
-        })?,
+        Some(v) => v
+            .as_u64()
+            .map(|n| n.min(u32::MAX as u64) as u32)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput("offset must be a non-negative integer".into())
+            })?,
     };
     let entities = registry_entities(rt, token, limit, offset).await?;
     let tools: Vec<Value> = entities
@@ -643,8 +666,14 @@ async fn decision_for(
     let ns = token.namespace().as_str().to_string();
     match resolve_tool(rt, token, reference).await {
         Ok(entity) => {
-            let d = policy::decide(rt, &ns, actor, &entity.name, side_effect_of(&entity).as_deref())
-                .await?;
+            let d = policy::decide(
+                rt,
+                &ns,
+                actor,
+                &entity.name,
+                side_effect_of(&entity).as_deref(),
+            )
+            .await?;
             Ok((entity.name.clone(), true, d))
         }
         Err(RuntimeError::NotFound(_)) => {
@@ -695,15 +724,9 @@ pub(crate) async fn request(
         return Ok(v);
     }
 
-    let row = policy::insert_grant_request(
-        rt,
-        &ns,
-        &actor,
-        &name,
-        scope.as_deref(),
-        reason.as_deref(),
-    )
-    .await?;
+    let row =
+        policy::insert_grant_request(rt, &ns, &actor, &name, scope.as_deref(), reason.as_deref())
+            .await?;
 
     let mut notified = false;
     if let Some(to) = notify {

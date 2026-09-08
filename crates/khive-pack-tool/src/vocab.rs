@@ -1,6 +1,8 @@
 //! Vocabulary, schema plan and handler table for the tool pack.
 
-use khive_types::{EntityKind, EntityTypeDef, HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
+use khive_types::{
+    EntityKind, EntityTypeDef, HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility,
+};
 
 /// Canonical pack name; every verb is `tool.<name>`.
 pub const PACK_NAME: &str = "tool";

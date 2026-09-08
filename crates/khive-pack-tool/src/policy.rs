@@ -198,7 +198,10 @@ pub(crate) async fn list_policies(
                 "SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1 \
                  ORDER BY created_at DESC LIMIT ?2"
             ),
-            params: vec![SqlValue::Text(ns.to_string()), SqlValue::Integer(i64::from(limit))],
+            params: vec![
+                SqlValue::Text(ns.to_string()),
+                SqlValue::Integer(i64::from(limit)),
+            ],
             label: Some("tool_policy_list".into()),
         })
         .await?;
@@ -269,7 +272,10 @@ pub(crate) async fn list_grants(
         sql.push_str(&format!(" AND tool = ?{}", params.len()));
     }
     params.push(SqlValue::Integer(i64::from(limit)));
-    sql.push_str(&format!(" ORDER BY requested_at DESC LIMIT ?{}", params.len()));
+    sql.push_str(&format!(
+        " ORDER BY requested_at DESC LIMIT ?{}",
+        params.len()
+    ));
     let mut reader = rt.sql().reader().await?;
     let rows = reader
         .query_all(SqlStatement {
@@ -307,7 +313,9 @@ pub(crate) async fn get_grant(
         .await?;
     let mut found: Vec<GrantRow> = rows.iter().filter_map(GrantRow::from_row).collect();
     match found.len() {
-        0 => Err(RuntimeError::NotFound(format!("tool grant {id:?} not found"))),
+        0 => Err(RuntimeError::NotFound(format!(
+            "tool grant {id:?} not found"
+        ))),
         1 => Ok(found.remove(0)),
         _ => Err(RuntimeError::Ambiguous(format!(
             "tool grant prefix {id:?} matches more than one row"
@@ -388,7 +396,9 @@ pub(crate) async fn set_grant_status(
         .await?;
     drop(writer);
     if affected == 0 {
-        return Err(RuntimeError::NotFound(format!("tool grant {id:?} not found")));
+        return Err(RuntimeError::NotFound(format!(
+            "tool grant {id:?} not found"
+        )));
     }
     get_grant(rt, ns, id).await
 }
@@ -461,7 +471,11 @@ pub(crate) async fn decide(
             side_effect: side_effect.map(str::to_string),
         });
     }
-    let decision = if side_effect == Some("read") { "allow" } else { "ask" };
+    let decision = if side_effect == Some("read") {
+        "allow"
+    } else {
+        "ask"
+    };
     Ok(Decision {
         decision: decision.into(),
         source: "default".into(),

@@ -70,7 +70,10 @@ async fn register_is_idempotent_by_name() {
     assert!(tags.contains(&json!("tool-registry")) && tags.contains(&json!("tool")));
 
     let again = f
-        .call("tool.register", json!({"name": "fetch_url", "kind": "tool"}))
+        .call(
+            "tool.register",
+            json!({"name": "fetch_url", "kind": "tool"}),
+        )
         .await;
     assert_eq!(again["created"], json!(false));
     assert_eq!(again["tool"]["full_id"], tool["full_id"]);
@@ -96,7 +99,10 @@ async fn capabilities_are_created_once_and_linked() {
             json!({"name": "curl", "capabilities": ["http"]}),
         )
         .await;
-    assert_eq!(b["capabilities"][0]["id"], a["capabilities"][1]["id"], "http concept reused");
+    assert_eq!(
+        b["capabilities"][0]["id"], a["capabilities"][1]["id"],
+        "http concept reused"
+    );
 
     let described = f.call("tool.describe", json!({"tool": "fetch_url"})).await;
     let caps: Vec<String> = described["tool"]["capabilities"]
@@ -133,7 +139,10 @@ async fn suggest_reaches_tools_through_capabilities() {
         .find(|r| r["name"] == json!("fetch_url"))
         .unwrap_or_else(|| panic!("fetch_url not suggested: {hits}"));
     assert!(
-        hit["via"].as_array().unwrap().contains(&json!("web browsing")),
+        hit["via"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("web browsing")),
         "hit must name the capability it was reached through: {hit}"
     );
     assert!(hit["decision"]["decision"].is_string());
@@ -153,7 +162,10 @@ async fn suggest_reaches_tools_through_capabilities() {
         .unwrap()
         .iter()
         .any(|r| r["name"] == json!("fetch_url"));
-    assert!(!found, "control: without the capability the phrasing must not reach it: {hits}");
+    assert!(
+        !found,
+        "control: without the capability the phrasing must not reach it: {hits}"
+    );
 }
 
 // Arm 4: default and policy resolution order.
@@ -173,7 +185,10 @@ async fn check_resolves_default_then_policy_by_specificity() {
     )
     .await;
     let read = f
-        .call("tool.check", json!({"tool": "read_file", "actor": "agent:a"}))
+        .call(
+            "tool.check",
+            json!({"tool": "read_file", "actor": "agent:a"}),
+        )
         .await;
     assert_eq!(read["decision"], json!("allow"));
     assert_eq!(read["source"], json!("default"));
@@ -186,7 +201,10 @@ async fn check_resolves_default_then_policy_by_specificity() {
         )
         .await;
     let denied = f
-        .call("tool.check", json!({"tool": "read_file", "actor": "agent:a"}))
+        .call(
+            "tool.check",
+            json!({"tool": "read_file", "actor": "agent:a"}),
+        )
         .await;
     assert_eq!(denied["decision"], json!("deny"));
     assert_eq!(denied["source"], json!("policy"));
@@ -198,15 +216,25 @@ async fn check_resolves_default_then_policy_by_specificity() {
     )
     .await;
     let allowed = f
-        .call("tool.check", json!({"tool": "read_file", "actor": "agent:a"}))
+        .call(
+            "tool.check",
+            json!({"tool": "read_file", "actor": "agent:a"}),
+        )
         .await;
     assert_eq!(allowed["decision"], json!("allow"));
     assert_eq!(allowed["source"], json!("policy"));
 
     let other = f
-        .call("tool.check", json!({"tool": "read_file", "actor": "agent:b"}))
+        .call(
+            "tool.check",
+            json!({"tool": "read_file", "actor": "agent:b"}),
+        )
         .await;
-    assert_eq!(other["decision"], json!("deny"), "exact rule is scoped to its actor");
+    assert_eq!(
+        other["decision"],
+        json!("deny"),
+        "exact rule is scoped to its actor"
+    );
 
     let policies = f.call("tool.policies", json!({})).await;
     assert_eq!(policies["count"], json!(2));
@@ -216,8 +244,11 @@ async fn check_resolves_default_then_policy_by_specificity() {
 #[tokio::test]
 async fn request_grant_revoke_cycle() {
     let f = fixture();
-    f.call("tool.register", json!({"name": "send_mail", "side_effect": "egress"}))
-        .await;
+    f.call(
+        "tool.register",
+        json!({"name": "send_mail", "side_effect": "egress"}),
+    )
+    .await;
     let req = f
         .call(
             "tool.request",
@@ -236,21 +267,30 @@ async fn request_grant_revoke_cycle() {
     let granted = f.call("tool.grant", json!({"id": id})).await;
     assert_eq!(granted["grant"]["status"], json!("granted"));
     let check = f
-        .call("tool.check", json!({"tool": "send_mail", "actor": "agent:a"}))
+        .call(
+            "tool.check",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
         .await;
     assert_eq!(check["decision"], json!("allow"));
     assert_eq!(check["source"], json!("grant"));
     assert_eq!(check["grant_id"], json!(id));
 
     let fast = f
-        .call("tool.request", json!({"tool": "send_mail", "actor": "agent:a"}))
+        .call(
+            "tool.request",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
         .await;
     assert_eq!(fast["decision"], json!("allow"));
     assert!(fast["request_id"].is_null(), "fast path inserts no row");
 
     f.call("tool.revoke", json!({"id": id})).await;
     let after = f
-        .call("tool.check", json!({"tool": "send_mail", "actor": "agent:a"}))
+        .call(
+            "tool.check",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
         .await;
     assert_eq!(after["decision"], json!("ask"));
     assert_eq!(after["source"], json!("default"));
@@ -262,12 +302,19 @@ async fn expired_grant_is_ignored() {
     let f = fixture();
     f.call("tool.register", json!({"name": "send_mail"})).await;
     let req = f
-        .call("tool.request", json!({"tool": "send_mail", "actor": "agent:a"}))
+        .call(
+            "tool.request",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
         .await;
     let id = s(&req, "request_id");
-    f.call("tool.grant", json!({"id": id, "expires_in_s": 0})).await;
+    f.call("tool.grant", json!({"id": id, "expires_in_s": 0}))
+        .await;
     let check = f
-        .call("tool.check", json!({"tool": "send_mail", "actor": "agent:a"}))
+        .call(
+            "tool.check",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
         .await;
     assert_eq!(check["decision"], json!("ask"), "{check}");
     assert_eq!(check["source"], json!("default"));
@@ -279,13 +326,19 @@ async fn deny_on_revoked_is_refused() {
     let f = fixture();
     f.call("tool.register", json!({"name": "send_mail"})).await;
     let req = f
-        .call("tool.request", json!({"tool": "send_mail", "actor": "agent:a"}))
+        .call(
+            "tool.request",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
         .await;
     let id = s(&req, "request_id");
     f.call("tool.grant", json!({"id": id})).await;
     f.call("tool.revoke", json!({"id": id})).await;
     let err = f.call_err("tool.deny", json!({"id": id})).await;
-    assert!(err.contains("revoked"), "message names the current status: {err}");
+    assert!(
+        err.contains("revoked"),
+        "message names the current status: {err}"
+    );
     let err = f.call_err("tool.revoke", json!({"id": id})).await;
     assert!(err.contains("revoked"), "{err}");
 }
@@ -328,11 +381,16 @@ async fn self_grant_is_refused() {
     let id = s(&own, "request_id");
     let err = f.call_err("tool.grant", json!({"id": id})).await;
     assert!(err.contains("own request"), "{err}");
-    let still = f.call("tool.requests", json!({"status": "requested"})).await;
+    let still = f
+        .call("tool.requests", json!({"status": "requested"}))
+        .await;
     assert_eq!(still["count"], json!(1));
 
     let other = f
-        .call("tool.request", json!({"tool": "send_mail", "actor": "agent:z"}))
+        .call(
+            "tool.request",
+            json!({"tool": "send_mail", "actor": "agent:z"}),
+        )
         .await;
     let id2 = s(&other, "request_id");
     let granted = f.call("tool.grant", json!({"id": id2})).await;
