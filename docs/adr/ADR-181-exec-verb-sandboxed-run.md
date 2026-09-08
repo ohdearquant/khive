@@ -142,3 +142,39 @@ the named limit; 18 a run over `cpu_seconds` ends by signal 24 and one over `fil
 signal 25 or a failed write, with the receipt's `enforced` limits equal to the configuration; 19
 `exec.identity` and the receipt's `sandbox` agree on the read-roots digest, and the digest changes
 when a read root is added (control).
+
+## Amendment 3 (2026-09-08): declared write paths, sequence allocation, version control at the kernel boundary
+
+Adopted after the review that followed the first exec implementation. Each item makes exact a rule
+the implementation already followed loosely; nothing above is withdrawn.
+
+1. **Declared write paths are a prefix set at path boundaries.** Each entry of `declared_write_paths`
+   is a tree-relative path under the same validation as a tree entry (no leading `/`, no empty, `.`
+   or `..` segment). An entry covers exactly itself and every path below it separated by `/`: `src`
+   covers `src` and `src/main.rs`, never `src.bak`. A change is any path whose bytes or mode differ
+   from `tree_in`, any path added, and any path missing at the end of the run, and every change is
+   tested against the set. An undeclared change goes to the receipt's `undeclared_changes`, its bytes
+   are not stored, `tree_out` carries the `tree_in` entry for that path (a deleted file reappears
+   with its old content, an added file is absent), and `success` is false even when the exit status
+   is zero. An absent `declared_write_paths` declares every path.
+2. **Sequence numbers are allocated by the insert.** The per-session `seq` is computed inside the
+   statement that inserts the receipt row (`MAX(seq) + 1` over the namespace and session), and a
+   unique index over `(namespace, session_id, seq)` for session rows turns any duplicate into a
+   constraint failure instead of an overlap. The column is authoritative: `exec.run`, `exec.receipt`
+   and `exec.runs` all report it, a refusal consumes a number like a run, and a run without a session
+   carries `null`.
+3. **Version control is denied at the kernel boundary.** Beside the registered-binary refusal of
+   Amendment 1 item 8, the seatbelt profile denies `process-exec` for any executable whose file name
+   is `git` or `gh` or starts with `git-`, and for every canonical path in the `[exec] never` set. A
+   run whose registered binary is allowed but which reaches git from inside (a shell, a build script,
+   a package manager hook) gets an operation-not-permitted failure from the kernel, visible in the
+   child's exit status and captured stderr, and the receipt records it like any other failed run. The
+   profile template digest changes with this rule; `exec.identity` reports the `never` set beside it.
+
+Acceptance arms added: 20 with `declared_write_paths = ["a", "b"]` a write to `a/x`, a new `a/y`
+and a deletion of `b` are listed in `changed`, a write to `a.bak` is listed in `undeclared_changes`
+with its input entry kept in `tree_out`, and `success` is false with exit status zero; 21 two runs
+started concurrently in one session receive `seq` 1 and 2, `exec.runs` for the session lists both,
+and `exec.receipt` reports the same number as the run reply; 22 a shell run that invokes
+`git --version` and one that invokes a `never` path both end with a non-zero status and the kernel's
+refusal in stderr, while the same shell invoking `/bin/echo` exits zero (control).
