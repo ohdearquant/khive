@@ -60,7 +60,9 @@ impl KnowledgePack {
         let brain_profile = runtime.config().brain_profile.clone();
         Self {
             runtime,
-            ann: vamana::new_shared(),
+            // Serving processes build corpus indexes only when they are the warm
+            // daemon: see `AnnState::builds_corpus_indexes`.
+            ann: vamana::new_shared_for_role(khive_runtime::daemon::is_warm_index_host()),
             section_posteriors: Mutex::new(HashMap::new()),
             brain_profile,
         }

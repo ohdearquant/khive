@@ -957,6 +957,29 @@ fn checkpoint_task_specs(
 // presence that `drain()` waits on, exactly like the `active` counter does
 // for in-flight connections: the caller still only pays for the spawn +
 // counter increment, never the task's own work.
+/// Set once by the boot path that takes the daemon role, and never cleared: a
+/// process that is not the warm daemon has no path to becoming one except exec.
+static WARM_INDEX_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare this process the warm index host. Called by the serve path as soon as
+/// the daemon role is decided, before any runtime is built, so nothing warms
+/// under the wrong answer.
+pub fn mark_warm_index_host() {
+    WARM_INDEX_HOST.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether this process is the warm index host.
+///
+/// Building an ANN index from the full corpus is minutes of CPU and hundreds of
+/// megabytes of segment rewrite, and it pays for itself only across a process
+/// that outlives the request. A short-lived client that does it pays the whole
+/// cost, discards the result at exit, and publishes a checkpoint that every
+/// other reader on the root must then re-read. Consumers use this to decide
+/// whether to build or to serve degraded and let the daemon build.
+pub fn is_warm_index_host() -> bool {
+    WARM_INDEX_HOST.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static BACKGROUND_TASKS: std::sync::OnceLock<Arc<std::sync::atomic::AtomicUsize>> =
     std::sync::OnceLock::new();
 

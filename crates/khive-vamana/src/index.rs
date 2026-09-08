@@ -520,12 +520,80 @@ fn require_finite(values: &[f32], location: &str) -> Result<()> {
     Ok(())
 }
 
+/// Threads an index build may use. Half the machine's parallelism by default,
+/// at least one, overridable with `KHIVE_ANN_BUILD_THREADS`.
+///
+/// A build is not the only thing the machine is doing. On the default rayon pool
+/// it takes every core, so a build triggered while requests are in flight
+/// competes with the process serving them — and on a host where several
+/// processes share one index root, with the other builds too. Half leaves the
+/// machine responsive and costs build wall-clock, which is the right trade for
+/// work that is supposed to happen rarely.
+#[cfg(feature = "parallel")]
+fn build_thread_count() -> usize {
+    resolve_build_threads(
+        std::env::var("KHIVE_ANN_BUILD_THREADS").ok().as_deref(),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    )
+}
+
+/// Pure half of [`build_thread_count`], so the policy is testable without
+/// mutating process environment. A malformed or zero override falls back to the
+/// default rather than failing: this knob bounds a cost, it does not gate
+/// correctness, and a typo in it must not stop an index from building.
+#[cfg(feature = "parallel")]
+fn resolve_build_threads(override_value: Option<&str>, available: usize) -> usize {
+    if let Some(threads) = override_value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+    {
+        return threads;
+    }
+    available.div_ceil(2).max(1)
+}
+
+/// The bounded pool index builds run in. `None` if the pool could not be built,
+/// in which case the build runs on the caller's thread pool as it did before —
+/// a failure to bound parallelism is not a reason to fail the build.
+#[cfg(feature = "parallel")]
+fn build_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(build_thread_count())
+            .thread_name(|i| format!("khive-ann-build-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 impl VamanaIndex {
     /// Build from row-major flat slice. Errors if config invalid, empty, wrong length, non-finite, or N > u32::MAX.
     ///
     /// Uses `GsSq8Codec` for the acquisition-tier distance during graph construction
     /// (ADR-052 §1, Step 2: default-on for Vamana, algebraically exact in code space).
+    ///
+    /// Runs inside the bounded build pool (see [`build_thread_count`]), so every
+    /// nested `par_iter` in graph construction inherits that bound instead of the
+    /// global pool's one-thread-per-core.
     pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<Self> {
+        #[cfg(feature = "parallel")]
+        {
+            match build_pool() {
+                Some(pool) => pool.install(|| Self::build_on_current_pool(vectors, config)),
+                None => Self::build_on_current_pool(vectors, config),
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            Self::build_on_current_pool(vectors, config)
+        }
+    }
+
+    fn build_on_current_pool(vectors: &[f32], config: VamanaConfig) -> Result<Self> {
         config.validate()?;
         if vectors.is_empty() {
             return Err(VamanaError::EmptyInput);
@@ -5495,6 +5563,45 @@ mod tests {
         let persisted = VamanaIndex::load(dir.path()).unwrap();
         assert_eq!(persisted.last_applied_seq(), Some(200));
         assert_eq!(persisted.vectors().unwrap(), vectors);
+    }
+
+    /// The build pool bound: half the machine, at least one, and an override that
+    /// cannot break a build by being wrong.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn build_threads_default_to_half_the_machine_and_survive_a_bad_override() {
+        assert_eq!(resolve_build_threads(None, 10), 5);
+        // Odd counts round up: on a 1-core machine the answer must still be 1.
+        assert_eq!(resolve_build_threads(None, 9), 5);
+        assert_eq!(resolve_build_threads(None, 1), 1);
+        assert_eq!(resolve_build_threads(None, 0), 1);
+        assert_eq!(resolve_build_threads(Some(" 3 "), 10), 3);
+        // A build is not gated on the knob parsing: zero, negative and garbage
+        // all fall back to the default rather than to zero threads or an error.
+        assert_eq!(resolve_build_threads(Some("0"), 10), 5);
+        assert_eq!(resolve_build_threads(Some("-2"), 10), 5);
+        assert_eq!(resolve_build_threads(Some("half"), 10), 5);
+        assert_eq!(resolve_build_threads(Some(""), 10), 5);
+    }
+
+    /// The pool builds are installed into is actually bounded to that number, so
+    /// every nested `par_iter` in graph construction inherits the bound rather
+    /// than the global one-thread-per-core pool.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn the_build_pool_is_bounded_to_the_resolved_thread_count() {
+        let pool = build_pool().expect("build pool");
+        assert_eq!(pool.current_num_threads(), build_thread_count());
+        assert!(
+            pool.current_num_threads()
+                <= std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+            "the build pool must never exceed the machine"
+        );
+        // Observed from inside the pool, which is what a build sees.
+        let observed = pool.install(rayon::current_num_threads);
+        assert_eq!(observed, build_thread_count());
     }
 
     /// A reader must not be admitted into `save_atomic`'s critical section, because
