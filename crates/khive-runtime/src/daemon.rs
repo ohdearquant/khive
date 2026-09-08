@@ -3340,7 +3340,7 @@ mod tests {
         let legacy: LegacyV4Response = serde_json::from_slice(&encoded).expect("legacy v4 decode");
         assert!(!legacy.ok);
         assert_eq!(legacy.error.as_deref(), Some("audit failed"));
-        assert_eq!(legacy.daemon_protocol_version, 4);
+        assert_eq!(legacy.daemon_protocol_version, PROTOCOL_VERSION);
     }
 
     #[tokio::test]
