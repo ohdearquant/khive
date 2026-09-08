@@ -3339,6 +3339,7 @@ mod tests {
     fn secondary_config() -> RuntimeConfig {
         RuntimeConfig {
             git_write: Default::default(),
+            exec: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
