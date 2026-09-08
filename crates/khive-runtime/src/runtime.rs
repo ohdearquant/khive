@@ -2951,7 +2951,10 @@ mod tests {
         // needed, so its verbs are live in default deployments too (only an
         // in-memory backend leaves them unconfigured).
         assert!(cfg.packs.contains(&"blob".to_string()));
-        assert_eq!(cfg.packs.len(), 12);
+        // tool loads by default: the registry, discovery and use-policy verbs
+        // (ADR-180) are live in default deployments.
+        assert!(cfg.packs.contains(&"tool".to_string()));
+        assert_eq!(cfg.packs.len(), 13);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {

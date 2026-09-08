@@ -152,6 +152,8 @@ records what's connected, in which direction, and why.
 │                        rules (0 verbs)                        │
 │  khive-pack-blob:      content-addressed object storage       │
 │                        (3 verbs)                              │
+│  khive-pack-tool:      tool/skill/plugin registry, capability │
+│                        discovery, use policy (13 verbs)       │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -228,6 +230,7 @@ must follow the [cache-state and warm-up protocol](scripts/perf/README.md#benchm
 | `khive-pack-code`      | Code pack: L1 manifest + L1.5 import-scan source ingestion                                               |
 | `khive-pack-workspace` | Workspace pack: workspace entity kind + contains endpoint rules                                          |
 | `khive-pack-blob`      | Blob pack: content-addressed object storage                                                              |
+| `khive-pack-tool`      | Tool pack: registry of tools, skills, plugins and verbs; capability discovery; use policy and grants     |
 | `khive-mcp`            | MCP server library: single `request` tool dispatching through the VerbRegistry (served by `kkernel mcp`) |
 | `kkernel`              | The single shipped binary: `kkernel mcp` serves MCP; admin subcommands (exec, reindex, db, …)            |
 

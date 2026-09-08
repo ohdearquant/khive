@@ -35,6 +35,8 @@ pub use khive_pack_schedule::SchedulePack as _SchedulePack;
 #[doc(hidden)]
 pub use khive_pack_session::SessionPack as _SessionPack;
 #[doc(hidden)]
+pub use khive_pack_tool::ToolPack as _ToolPack;
+#[doc(hidden)]
 pub use khive_pack_web::WebPack as _WebPack;
 #[doc(hidden)]
 pub use khive_pack_workspace::WorkspacePack as _WorkspacePack;

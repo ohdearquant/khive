@@ -484,6 +484,7 @@ impl RuntimeConfig {
             "schedule",
             "knowledge",
             "session",
+            "tool",
             "git",
             "code",
             "workspace",
