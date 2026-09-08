@@ -133,10 +133,18 @@ failure occurred before queue acceptance. The model preserves `kind`, `code`,
 `stage`, `message`, `retryable`, `timeout_ms`, `capability`, `operation`, `scope`,
 and `retry_after_ms` when present.
 
-The `RuntimeError::Khive` arm serializes `KhiveError` directly. It has `kind` and
+The `RuntimeError::Khive` arm serializes the `KhiveError` fields. It has `kind` and
 `message`, with nullable `code` and `details`. A populated code is a string such
 as `runtime:10`; populated details are a string-to-string map. Retry hints are
 not serialized as a field on this type (R10).
+
+Two named keyed-memory outcomes additionally carry `domain_disposition`:
+`conflict` with `details.reason == "key_conflict"` carries `"not_committed"`,
+and `unavailable` with `details.reason == "key_holder_unresolved"` carries
+`"unknown"`. This does not classify other errors by their kind. A key conflict
+terminates reconciliation at `details.existing_id`; `not_committed` describes
+the replay attempt, not the earlier holder's write. The client preserves these
+fields and does not automatically retry the operation.
 
 ```json
 {
@@ -195,7 +203,7 @@ review those changes and use behavioral fixtures for the client obligations.
 | R7 | crates/khive-mcp/src/server.rs -- "if let Some(context) = other.writer_task_failure_context() {"; crates/khive-mcp/src/server.rs -- "\"kind\": \"storage\","; crates/khive-mcp/src/server.rs -- "\"code\": context.stage,"; crates/khive-mcp/src/server.rs -- "\"stage\": context.stage,"; crates/khive-mcp/src/server.rs -- "\"message\": other.to_string(),"; crates/khive-mcp/src/server.rs -- "\"retryable\": context.retryable,"; crates/khive-mcp/src/server.rs -- "\"request_state\": context.request_state.to_string(),"; crates/khive-mcp/src/server.rs -- "\"task_terminated\": context.task_terminated," |
 | R8 | crates/khive-storage/src/error.rs -- "Self::NotStarted => \"not_started\","; crates/khive-storage/src/error.rs -- "Self::TransactionRolledBack => \"transaction_rolled_back\","; crates/khive-storage/src/error.rs -- "Self::SideEffectsUnknown => \"side_effects_unknown\","; crates/khive-runtime/src/error.rs -- "/// not be inferred from rollback finality alone." |
 | R9 | crates/khive-mcp/src/server.rs -- "\"kind\": \"unavailable\","; crates/khive-mcp/src/server.rs -- "\"retryable\": true,"; crates/khive-mcp/src/server.rs -- "\"timeout_ms\": timeout_ms,"; crates/khive-mcp/src/server.rs -- "\"capability\": capability,"; crates/khive-mcp/src/server.rs -- "\"operation\": context.operation,"; crates/khive-mcp/src/server.rs -- "\"scope\": context.scope,"; crates/khive-mcp/src/server.rs -- "\"retry_after_ms\": context.retry_after_ms,"; crates/khive-runtime/src/error.rs -- "pub const WRITER_ADMISSION_SCOPE: &str = \"writer_admission\";" |
-| R10 | crates/khive-mcp/src/server.rs -- "RuntimeError::Khive(k) => serde_json::to_value(&k)"; crates/khive-types/src/khive_error.rs -- "pub struct KhiveError {"; crates/khive-types/src/khive_error.rs -- "code: Option<ErrorCode>,"; crates/khive-types/src/khive_error.rs -- "details: Option<Details>,"; crates/khive-types/src/khive_error.rs -- "s.serialize_str(&self.to_string())"; crates/khive-types/src/khive_error.rs -- "map.serialize_entry(k.as_ref(), v.as_ref())?;" |
+| R10 | crates/khive-mcp/src/server.rs -- "let mut value = serde_json::to_value(&k)"; crates/khive-mcp/src/server.rs -- "value[\"domain_disposition\"] = json!(disposition);"; crates/khive-types/src/khive_error.rs -- "pub struct KhiveError {"; crates/khive-types/src/khive_error.rs -- "code: Option<ErrorCode>,"; crates/khive-types/src/khive_error.rs -- "details: Option<Details>,"; crates/khive-types/src/khive_error.rs -- "s.serialize_str(&self.to_string())"; crates/khive-types/src/khive_error.rs -- "map.serialize_entry(k.as_ref(), v.as_ref())?;" |
 | R11 | crates/khive-mcp/src/server.rs -- "fn depth_error_payload(context: &str) -> Value {"; crates/khive-mcp/src/server.rs -- "\"kind\": \"result_too_deep\"," |
 | R12 | crates/khive-mcp/src/server.rs -- "\"aborted\": true,"; crates/khive-mcp/src/server.rs -- "\"message\": format!("; crates/khive-mcp/src/server.rs -- "json!({ \"ok\": false, \"tool\": op.tool, \"aborted\": true })" |
 | R13 | crates/khive-mcp/src/tools/request.rs -- "/// operation-unique id or a cross-attempt idempotency key."; crates/khive-mcp/src/tools/request.rs -- "pub request_id: Option<u64>," |

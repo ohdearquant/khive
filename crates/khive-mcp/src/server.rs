@@ -2601,8 +2601,23 @@ fn coordinator_search_visibility(
 /// ambiguous.
 fn runtime_error_value(error: RuntimeError) -> Value {
     match error {
-        RuntimeError::Khive(k) => serde_json::to_value(&k)
-            .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
+        RuntimeError::Khive(k) => {
+            let mut value = serde_json::to_value(&k)
+                .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
+            // These named outcomes carry their own domain proof. Do not infer
+            // general write disposition from a conflict or unavailable variant.
+            let disposition = match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
+                (khive_types::ErrorKind::Conflict, Some("key_conflict")) => Some("not_committed"),
+                (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => {
+                    Some("unknown")
+                }
+                _ => None,
+            };
+            if let Some(disposition) = disposition {
+                value["domain_disposition"] = json!(disposition);
+            }
+            value
+        }
         other => {
             if let Some(context) = other.writer_task_failure_context() {
                 return json!({
@@ -4550,6 +4565,42 @@ mod tests {
     use khive_runtime::Namespace;
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
+
+    #[test]
+    fn remember_key_named_disposition_preserves_details_and_other_errors() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let key = "k".repeat(512);
+        let error = khive_types::KhiveError::conflict("held").with_details(
+            khive_types::Details::new_owned([
+                ("reason", "key_conflict".to_owned()),
+                ("key", key.clone()),
+                ("existing_id", id.clone()),
+            ]),
+        );
+        let value = runtime_error_value(error.into());
+        assert_eq!(value["kind"], "conflict");
+        assert_eq!(value["domain_disposition"], "not_committed");
+        assert_eq!(value["details"]["key"], key);
+        assert_eq!(value["details"]["existing_id"], id);
+
+        let unresolved = khive_types::KhiveError::unavailable("holder missing").with_details(
+            khive_types::Details::new_owned([
+                ("reason", "key_holder_unresolved".to_owned()),
+                ("key", String::new()),
+            ]),
+        );
+        assert_eq!(
+            runtime_error_value(unresolved.into())["domain_disposition"],
+            "unknown"
+        );
+        for error in [
+            khive_types::KhiveError::conflict("unrelated"),
+            khive_types::KhiveError::unavailable("unrelated"),
+        ] {
+            let expected = serde_json::to_value(&error).unwrap();
+            assert_eq!(runtime_error_value(error.into()), expected);
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SearchCapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

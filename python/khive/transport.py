@@ -38,6 +38,7 @@ from .errors import (
     RequestRejected,
     TransportError,
 )
+from .ops import encode, op
 
 PROTOCOL_VERSION = 4
 MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -169,6 +170,48 @@ class Session:
         parsed = _decode_json_text(raw, "daemon") if isinstance(raw, str) else raw
         envelope = _envelope_from_payload(parsed, "daemon")
         return _validate_envelope_results(envelope, "daemon")["results"]
+
+    def remember(
+        self,
+        content: str,
+        *,
+        key: str | None = None,
+        memory_type: str | None = None,
+        salience: float | None = None,
+        decay_factor: float | None = None,
+        source_id: str | None = None,
+        tags: list[str] | None = None,
+        embedding_model: str | None = None,
+        namespace: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Return one raw memory.remember outcome, including unchanged per-op errors.
+
+        Recovery remains caller-controlled: this method does not infer a write
+        namespace or retry an operation error, including a key conflict.
+        """
+        results = self.request(
+            encode(
+                [
+                    op(
+                        "memory.remember",
+                        content=content,
+                        key=key,
+                        memory_type=memory_type,
+                        salience=salience,
+                        decay_factor=decay_factor,
+                        source_id=source_id,
+                        tags=tags,
+                        embedding_model=embedding_model,
+                        namespace=namespace,
+                    )
+                ]
+            ),
+            timeout=timeout,
+        )
+        if len(results) != 1 or results[0]["tool"] != "memory.remember":
+            raise TransportError("response from daemon is not a single memory.remember result")
+        return results[0]
 
     def _base_frame(self) -> dict[str, Any]:
         return {

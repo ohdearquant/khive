@@ -1146,6 +1146,91 @@ fn v27_adds_hot_property_indexes_to_a_pre_v27_database() {
 }
 
 #[test]
+fn v28_adds_nullable_note_keys_and_preserves_populated_v27_rows() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 27);
+    assert!(!column_exists(&conn, "notes", "key"));
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at, deleted_at) \
+         VALUES (?1, 'local', 'memory', 'old content', 100, 200, ?2)",
+        rusqlite::params!["legacy-live", Option::<i64>::None],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at, deleted_at) \
+         VALUES (?1, 'other', 'reference', 'old deleted content', 101, 201, ?2)",
+        rusqlite::params!["legacy-deleted", Some(300_i64)],
+    )
+    .unwrap();
+    let before: Vec<String> = conn.prepare(
+        "SELECT json_object('id', id, 'namespace', namespace, 'kind', kind, 'content', content, \
+         'created_at', created_at, 'updated_at', updated_at, 'deleted_at', deleted_at) \
+         FROM notes ORDER BY id",
+    ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert!(column_exists(&conn, "notes", "key"));
+    assert!(index_exists(&conn, "idx_notes_namespace_kind_key"));
+    let after: Vec<(String, Option<String>)> = conn.prepare(
+        "SELECT json_object('id', id, 'namespace', namespace, 'kind', kind, 'content', content, \
+         'created_at', created_at, 'updated_at', updated_at, 'deleted_at', deleted_at), key \
+         FROM notes ORDER BY id",
+    ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(after.len(), before.len());
+    for ((row, key), original) in after.into_iter().zip(before) {
+        assert_eq!(row, original);
+        assert_eq!(key, None);
+    }
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    let v28_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _schema_migrations WHERE version = 28 AND name = 'notes_key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v28_rows, 1);
+}
+
+#[test]
+fn v28_fresh_schema_has_the_exact_partial_note_key_index() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).unwrap();
+    let column: (String, i64, Option<String>) = conn.query_row(
+        "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('notes') WHERE name = 'key'",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(column, ("TEXT".to_string(), 0, None));
+    let index: (i64, i64) = conn
+        .query_row(
+            "SELECT \"unique\", partial FROM pragma_index_list('notes') \
+         WHERE name = 'idx_notes_namespace_kind_key'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(index, (1, 1));
+    let columns: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM pragma_index_info('idx_notes_namespace_kind_key') ORDER BY seqno",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(columns, ["namespace", "kind", "key"]);
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_notes_namespace_kind_key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(sql.contains("WHERE key IS NOT NULL AND deleted_at IS NULL"));
+}
+
+#[test]
 fn latest_schema_version_matches_the_newest_migrations_entry() {
     assert_eq!(
         MIGRATIONS.last().map(|m| m.version),
