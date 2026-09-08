@@ -26,6 +26,9 @@ use tokio::net::UnixStream;
 use crate::tools::request::RequestParams;
 
 #[cfg(test)]
+mod memory_namespace_tests;
+
+#[cfg(test)]
 mod test_harness;
 
 #[cfg(test)]
