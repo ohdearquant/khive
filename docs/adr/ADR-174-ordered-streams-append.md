@@ -336,8 +336,11 @@ keyed document write of ADR-172 §2 and §3). Common to both modes:
   as `existing_id` (ADR-179 D5), so the consumer rule of ADR-133 Amendment 3 reads it without a
   special case.
 - Authority is checked once for the batch, on the caller's namespace, before the first write.
-- Appends to one stream take consecutive numbers in list order; appends to different streams are
-  independent.
+- Appends to one stream are numbered in list order, so a batch's numbers on one stream increase
+  with list position; appends to different streams are independent. Adjacency is a property of
+  the mode: an atomic batch's appends to one stream take consecutive numbers, because they are one
+  transaction; a per-member batch's appends may have another process's append between them, and
+  only the union is dense (§3).
 - Reads (`get`, `stream.read`, `stream.head`) are not members: a batch is a write primitive. The
   consumer's case reads an unknown object inside its batch; on khive that read is issued beside
   the batch by the adapter, and the assertion on its value is unchanged.
@@ -355,12 +358,13 @@ present, is a list of `{"key": K, "version": V}` the caller read before composin
 entry is checked inside the transaction before the first write, and a mismatch refuses the batch
 with `version_conflict` naming the key. A member's own refusal (`unknown_op`, `seq_conflict`,
 `version_conflict`, `key_conflict`) refuses the whole batch: the transaction rolls back, nothing
-is written, and the error carries that member's refusal plus `member` (the list index) and
-`committed: false`. The caller may
-ignore the result list on success, because success means every member committed.
+is written, and the error carries that member's refusal plus `member` (the list index); the
+disposition is the `domain_disposition: not_committed` every member refusal already carries, and
+no parallel boolean rides beside it. The caller may ignore the result list on success, because
+success means every member committed.
 
-**Per-member (unfenced) mode.** Each member runs in its own writer transaction, in list order, and
-the numbering guarantee follows from that order. A member's own refusal (`unknown_op`, `seq_conflict`,
+**Per-member (unfenced) mode.** Each member runs in its own writer transaction, in list order, so
+one stream's numbers increase with list position but need not be adjacent. A member's own refusal (`unknown_op`, `seq_conflict`,
 `version_conflict`, `key_conflict`) is returned as that member's value and its siblings stand; the result is still
 `{"results": [...], "committed": true}`, where `committed` says the request as a whole ran to the
 end, and each member's outcome is its own entry. `observed` is refused in this mode
@@ -399,11 +403,17 @@ serial execution under the writer lock.
 5. **Authority once.** A batch whose caller lacks write authority on the namespace is refused as a
    whole before any member runs, in both modes; a control with authority and the same members
    commits.
-6. **Two processes.** Two processes issue atomic batches to one stream concurrently; each batch's
-   appends are consecutive within the batch, and the union of numbers is dense.
-7. **Mode arguments.** `atomic=false` with a `fence`, and `observed` without atomic mode, are each
+6. **Two processes, atomic.** Two processes issue atomic batches to one stream concurrently; each
+   batch's appends are consecutive within the batch, and the union of numbers is dense.
+7. **Two processes, per-member.** Two processes issue per-member batches to one stream concurrently
+   across repeats; the union is dense and each batch's numbers increase in list order, and the test
+   does not assert adjacency. A control counts the repeats in which another process's number fell
+   between two members of one batch and requires at least one, so the arm is known to exercise the
+   interleaving it permits.
+8. **Mode arguments.** `atomic=false` with a `fence`, and `observed` without atomic mode, are each
    refused as `invalid_input` and write nothing; `atomic=true` without a fence behaves as arm 2.
-8. **Mutation.** With atomic refusals demoted to member values, arm 2 goes red; with `observed`
+9. **Mutation.** With atomic refusals demoted to member values, arm 2 goes red; with `observed`
    checked after the first write, arm 3's unchanged-count assertion goes red; with per-member
    refusals promoted to whole-batch refusals, arm 4 goes red; with per-stream numbering assigned
-   outside the transaction, arm 6 goes red.
+   outside the transaction, arm 6 goes red; with per-member mode run as one transaction, arm 7's
+   interleaving control goes red.
