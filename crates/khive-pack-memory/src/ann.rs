@@ -1127,7 +1127,19 @@ pub(crate) async fn ensure_ann_for_model(
 
     let wall_us = phase_start.elapsed().as_micros() as i64;
     let cpu_us = khive_runtime::cpu_delta_us(cpu_start, khive_runtime::process_resource_usage());
-    match &result {
+    emit_ann_warm_terminal_phase(rt, token, model, &result, wall_us, cpu_us).await;
+    result
+}
+
+async fn emit_ann_warm_terminal_phase(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    model: &str,
+    result: &Result<AnnEnsureStatus, RuntimeError>,
+    wall_us: i64,
+    cpu_us: Option<i64>,
+) {
+    match result {
         Err(e) if is_benign_shutdown_cancellation(e) => {
             emit_ann_warm_phase_event(
                 rt,
@@ -1159,7 +1171,6 @@ pub(crate) async fn ensure_ann_for_model(
             .await;
         }
     }
-    result
 }
 
 /// Append a best-effort ANN warm phase event without changing the warm result.
@@ -4170,6 +4181,40 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    #[test]
+    fn cancelled_store_join_emits_phase_cancelled() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single-worker runtime");
+        executor.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("worker started");
+                release_rx.recv().expect("release blocker");
+            });
+            started_rx.await.expect("blocking slot is occupied");
+            let queued = tokio::task::spawn_blocking(|| Ok(AnnEnsureStatus::EmptyCorpus));
+            queued.abort();
+            release_tx.send(()).expect("release blocking slot");
+            blocker.await.expect("blocker joined");
+            let result = crate::store_access::join_store_task("memory.ann.vector_store", queued).await;
+
+            let rt = KhiveRuntime::memory().expect("in-memory runtime");
+            let token = rt.authorize(Namespace::local()).expect("authorize local");
+            emit_ann_warm_terminal_phase(&rt, &token, "cancelled-store-join", &result, 1, None).await;
+            let page = rt.events(&token).expect("event store").query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::types::PageRequest { limit: 10, offset: 0 },
+            ).await.expect("terminal events");
+            assert_eq!(page.items.len(), 1, "exactly one terminal event: {page:?}");
+            assert_eq!(page.items[0].kind, khive_types::EventKind::PhaseCancelled,
+                "a cancelled acquisition join must emit PhaseCancelled, not PhaseCompleted: {result:?}");
+        });
     }
 
     #[tokio::test]
