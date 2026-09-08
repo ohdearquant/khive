@@ -9287,6 +9287,134 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn issue_2427_scheduled_replay_does_not_gain_actor_visibility() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            actor_id: Some("lambda:daemon".to_string()),
+            visible_namespaces: vec![Namespace::parse("daemon-visible").unwrap()],
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory replay runtime");
+        let server = KhiveMcpServer::new(runtime).expect("replay server");
+
+        for actor_id in [Some("lambda:scheduled-replay"), None] {
+            let verified_actor = actor_id
+                .map(|actor| khive_runtime::VerifiedActor::new(actor).expect("verified creator"));
+            let raw = server
+                .dispatch_request_replay_as(
+                    RequestParams {
+                        ops: "whoami()".to_string(),
+                        presentation: Some("verbose".to_string()),
+                        format: Some("json".to_string()),
+                        ..Default::default()
+                    },
+                    "local",
+                    verified_actor,
+                )
+                .await
+                .expect("scheduled replay dispatch");
+            let envelope: Value = serde_json::from_str(&raw).expect("replay JSON envelope");
+            assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+            let identity = &envelope["results"][0]["result"];
+            assert_eq!(identity["actor_id"], actor_id.unwrap_or("local"));
+            assert_eq!(
+                identity["actor_kind"],
+                if actor_id.is_some() {
+                    "actor"
+                } else {
+                    "anonymous"
+                }
+            );
+            assert_eq!(identity["unattributed"], actor_id.is_none());
+            assert_eq!(identity["namespace"], "local");
+            assert_eq!(
+                identity["visible_namespaces"],
+                json!(["local"]),
+                "replay must inherit neither actor-derived nor daemon visibility: {identity}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn issue_2427_coordinator_search_consumes_normalized_identity_visibility() {
+        use crate::coordinator::tests::MockCoordinator;
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            actor_id: Some("lambda:daemon".to_string()),
+            visible_namespaces: vec![Namespace::parse("daemon-visible").unwrap()],
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory coordinator runtime");
+        let coordinator = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::new(runtime)
+            .expect("coordinator server")
+            .with_coordinator(Arc::clone(&coordinator) as Arc<dyn CoordinatorService>);
+
+        // Supply the boundary's normalized output directly; daemon-frame parsing
+        // and transport coverage belong to the daemon tests, not this fixture.
+        for (visible, explicit_namespace, mut expected) in [
+            (
+                vec!["lambda:request-actor", "client-visible"],
+                false,
+                vec!["lambda:request-actor", "client-visible", "local"],
+            ),
+            (vec![], false, vec!["local"]),
+            (vec!["lambda:request-actor", "client-visible"], true, vec![]),
+        ] {
+            let mut identity = request_identity_with_visible_namespaces(visible);
+            identity.actor_id = Some("lambda:request-actor".to_string());
+            let ops = if explicit_namespace {
+                r#"search(kind="entity", query="visibility", namespace="chosen")"#
+            } else {
+                r#"search(kind="entity", query="visibility")"#
+            };
+            coordinator.search_called.store(false, Ordering::SeqCst);
+            let raw = server
+                .dispatch_request_inner(
+                    RequestParams {
+                        ops: ops.to_string(),
+                        ..Default::default()
+                    },
+                    true,
+                    Some(identity),
+                    DispatchOrigin::Local,
+                )
+                .await
+                .expect("coordinator dispatch");
+            let envelope: Value = serde_json::from_str(&raw).expect("coordinator JSON envelope");
+            assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+            assert!(
+                coordinator.search_called.load(Ordering::SeqCst),
+                "search must reach the coordinator, not the single-backend registry"
+            );
+            let mut actual: Vec<String> = coordinator
+                .last_extra_visible
+                .lock()
+                .expect("captured coordinator visibility")
+                .iter()
+                .map(|namespace| namespace.as_str().to_string())
+                .collect();
+            actual.sort();
+            expected.sort();
+            assert_eq!(
+                actual, expected,
+                "coordinator must consume supplied visibility without widening internal identities"
+            );
+        }
+    }
+
     /// No per-request identity: falls back to the registry's operator-baked
     /// `visible_namespaces`, widened with `local` — mirrors the normal
     /// registry dispatch path's default-case widening.

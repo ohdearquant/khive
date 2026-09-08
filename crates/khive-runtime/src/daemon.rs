@@ -30,6 +30,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(unix)]
 use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
+#[cfg(unix)]
+use khive_types::Namespace;
 
 #[cfg(unix)]
 use crate::pack::RequestIdentity;
@@ -430,8 +432,10 @@ pub struct DaemonRequestFrame {
     /// The client's resolved extra read-visibility namespaces (ADR-007 Rule
     /// 3b), carried on the frame so the warm daemon widens read scope to
     /// match the caller's own configuration rather than its own baked
-    /// `visible_namespaces` (ADR-096). Empty means no extra visibility beyond
-    /// `namespace` itself.
+    /// `visible_namespaces` (ADR-096). At ingress, a valid non-`local`
+    /// `actor_id` is included if absent, matching config loading; an empty
+    /// list therefore still includes that actor in default reads. Explicit
+    /// `namespace=` operations remain scoped to exactly that namespace.
     #[serde(default)]
     pub visible_namespaces: Vec<String>,
     /// Fingerprint of the client's engine-coherence config: packs, db target,
@@ -1168,10 +1172,18 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
         // `actor_id`/`visible_namespaces` the client resolved (defaulting to
         // `None`/`vec![]` for an older, field-absent payload, which is
         // exactly the prior anonymous/no-extra-visibility behavior).
+        let mut visible_namespaces = frame.visible_namespaces.clone();
+        if let Some(actor_id) = frame.actor_id.as_deref().filter(|actor_id| {
+            *actor_id != Namespace::LOCAL
+                && Namespace::parse(actor_id).is_ok()
+                && !visible_namespaces.iter().any(|ns| ns == *actor_id)
+        }) {
+            visible_namespaces.push(actor_id.to_string());
+        }
         let identity = RequestIdentity {
             namespace: frame.namespace.clone(),
             actor_id: frame.actor_id.clone(),
-            visible_namespaces: frame.visible_namespaces.clone(),
+            visible_namespaces,
             process_ref: frame.process_ref.clone(),
             request_id: frame.request_id,
         };
