@@ -1727,9 +1727,10 @@ async fn collect_model_ann_hits_inner(
         }
 
         // Widen until enough visible hits survive or ANN reports corpus exhaustion.
+        let operation = "memory.recall.note_store";
         let note_result = khive_storage::await_request_read_phase(
-            "memory.recall.note_store",
-            crate::store_access::acquire_store("memory.recall.note_store", {
+            operation,
+            crate::store_access::acquire_store(operation, {
                 let runtime = runtime.clone();
                 let token = token.clone();
                 move || runtime.notes(&token)

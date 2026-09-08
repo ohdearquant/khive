@@ -295,7 +295,7 @@ pub enum RuntimeError {
     Storage(#[from] khive_storage::StorageError),
 
     #[error("sqlite: {0}")]
-    Sqlite(#[from] khive_db::SqliteError),
+    Sqlite(khive_db::SqliteError),
 
     #[error("query: {0}")]
     Query(#[from] khive_query::QueryError),
@@ -502,6 +502,15 @@ pub enum RuntimeError {
         budget_ms: u64,
         elapsed_ms: u64,
     },
+}
+
+impl From<khive_db::SqliteError> for RuntimeError {
+    fn from(error: khive_db::SqliteError) -> Self {
+        match error {
+            khive_db::SqliteError::RequestReadStopped(error) => Self::Storage(error),
+            error => Self::Sqlite(error),
+        }
+    }
 }
 
 impl RuntimeError {
