@@ -153,11 +153,11 @@ records what's connected, in which direction, and why.
 │  khive-pack-workspace: workspace entity + contains endpoint   │
 │                        rules (0 verbs)                        │
 │  khive-pack-blob:      content-addressed object storage       │
-│  khive-pack-tool:      capability registry + use policy       │
-│  khive-pack-exec:      sandboxed run over a materialized tree │
 │                        (3 verbs)                              │
 │  khive-pack-tool:      tool/skill/plugin registry, capability │
 │                        discovery, use policy (13 verbs)       │
+│  khive-pack-exec:      sandboxed run over a materialized tree │
+│                        (8 verbs)                              │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -273,7 +273,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 91-verb catalog.
+MCP client discovers the `request` tool with the full 112-verb catalog.
 
 ### Alternative: npm
 

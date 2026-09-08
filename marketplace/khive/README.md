@@ -2,7 +2,7 @@
 
 One plugin for the whole khive surface: a knowledge graph, GTD, memory, inter-agent comm,
 scheduling, and a domain-knowledge corpus, all served by a single MCP server (`kkernel mcp`)
-exposing one tool — `request` — that dispatches 91 verbs across 12 packs.
+exposing one tool — `request` — that dispatches 112 verbs across 14 packs.
 
 This plugin is **guidance, not a second runtime**. It ships the pattern skills that teach an
 agent how to use each pack well, plus the kg stewardship agents. The data and verbs live in the
@@ -50,8 +50,8 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 ## Requirements
 
 The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
-server config loads all twelve (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
-`session`, `git`, `code`, `workspace`, `blob` — `git` contributes note kinds, a batch ingester, the
+server config loads all fourteen (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
+`session`, `tool`, `exec`, `git`, `code`, `workspace`, `blob` — `git` contributes note kinds, a batch ingester, the
 `git.digest` verb, and three write verbs — `git.commit`/`git.branch`/`git.push` — that shell to
 system git with hardened, allowlisted argv construction and unconditional force-push denial
 (ADR-108); `code` contributes the `code.ingest` L1/L1.5 source-ingest verb plus a `finding`
