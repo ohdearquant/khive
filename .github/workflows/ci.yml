@@ -399,6 +399,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Scan whole tree for corpus files
         run: bash scripts/check-json-data.sh --all
+      - name: Guard fixture test (staged blobs judged from the index)
+        run: bash scripts/tests/check-json-data-test.sh
 
   secret-scan:
     name: Secret scan (gitleaks)
