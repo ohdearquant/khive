@@ -3049,6 +3049,7 @@ async fn dispatch_action(
     let result = server
         .dispatch_request_replay_as(
             RequestParams {
+                plan: None,
                 ops: ops_str,
                 presentation: None,
                 presentation_per_op: None,
@@ -3604,6 +3605,7 @@ mod tests {
     async fn agenda_ticker_last_tick_at(server: &KhiveMcpServer) -> Option<DateTime<Utc>> {
         let response = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "schedule.agenda()".to_string(),
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
@@ -6168,6 +6170,7 @@ mod tests {
         .expect("serialize cancel op");
         let cancel_result = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: cancel_ops,
                 presentation: None,
                 presentation_per_op: None,
@@ -7080,6 +7083,7 @@ mod tests {
         .expect("serialize cancel op");
         let cancel_result = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: cancel_ops,
                 presentation: None,
                 presentation_per_op: None,

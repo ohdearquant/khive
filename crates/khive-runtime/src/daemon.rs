@@ -45,7 +45,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// that names both sides so the operator knows exactly what to do
 /// (`make local` rebuilds the client binary).
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
@@ -406,7 +406,12 @@ pub(crate) fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
 #[derive(Serialize, Deserialize, Default)]
 pub struct DaemonRequestFrame {
     pub ops: String,
+    /// Parse and inspect the catalog without dispatch, identity, or storage access.
+    #[serde(default)]
+    pub plan: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation_per_op: Option<Vec<Option<String>>>,
     /// The client's resolved storage/gate default namespace for this request.
     ///
@@ -468,9 +473,11 @@ pub struct DaemonRequestFrame {
     /// Output format for this request (ADR-078). Forwarded to the daemon's
     /// serialization seam. `None` means use the daemon's resolved default.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// Per-operation output format overrides (ADR-078).
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format_per_op: Option<Vec<Option<String>>>,
     /// Whether this request originated from the agent-facing MCP `request`
     /// tool (the wire surface). When `true`, the daemon rejects
@@ -494,6 +501,7 @@ pub struct DaemonRequestFrame {
     /// `#[serde(default)]` matches `metrics_only`/`format`/`format_per_op`
     /// precedent, with no `PROTOCOL_VERSION` bump.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<u64>,
 }
 
@@ -693,6 +701,9 @@ where
 #[cfg(unix)]
 #[async_trait]
 pub trait DaemonDispatch: Clone + Send + Sync + 'static {
+    /// Describe syntax and loaded catalog membership without dispatching.
+    fn plan(&self, ops: &str) -> String;
+
     /// Dispatch a verb-DSL request string and return the rendered result.
     ///
     /// `from_wire` carries the origin discriminator from
@@ -1051,6 +1062,34 @@ async fn handle_conn<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
     handle_conn_with_shutdown(stream, dispatcher, None).await;
 }
 
+#[cfg(all(unix, feature = "fault-injection"))]
+#[doc(hidden)]
+pub async fn handle_conn_for_test<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
+    handle_conn_with_shutdown(stream, dispatcher, None).await;
+}
+
+#[cfg(unix)]
+fn plan_frame_companion(raw: &[u8]) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    if value.get("plan").and_then(serde_json::Value::as_bool) != Some(true)
+        || value
+            .get("protocol_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(PROTOCOL_VERSION))
+    {
+        return None;
+    }
+    [
+        "presentation",
+        "presentation_per_op",
+        "format",
+        "format_per_op",
+        "request_id",
+    ]
+    .into_iter()
+    .find(|field| value.get(*field).is_some())
+}
+
 #[cfg(unix)]
 async fn handle_conn_with_shutdown<D: DaemonDispatch>(
     mut stream: UnixStream,
@@ -1069,7 +1108,32 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             return;
         }
     };
-    let frame: DaemonRequestFrame = match serde_json::from_slice(&raw) {
+    let decoded: Result<DaemonRequestFrame, _> = serde_json::from_slice(&raw);
+    if decoded.as_ref().ok().is_none_or(|frame| frame.plan) {
+        if let Some(field) = plan_frame_companion(&raw) {
+            let response = DaemonResponseFrame {
+                ok: false,
+                result: None,
+                error: Some(format!(
+                    "invalid_params: plan=true cannot be combined with {field}"
+                )),
+                namespace_mismatch: false,
+                config_mismatch: false,
+                served_config_id: Some(dispatcher.config_id().to_string()),
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
+                request_id: None,
+            };
+            if let Ok(payload) = serde_json::to_vec(&response) {
+                if let Err(error) = write_frame(&mut stream, &payload).await {
+                    tracing::debug!(%error, "failed to write plan envelope refusal");
+                }
+            }
+            return;
+        }
+    }
+    let frame: DaemonRequestFrame = match decoded {
         Ok(f) => f,
         Err(e) => {
             tracing::debug!(error = %e, "failed to decode daemon request frame");
@@ -1102,7 +1166,7 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             metrics: None,
             request_id: frame.request_id,
         }
-    } else if frame.metrics_only {
+    } else if frame.metrics_only && !frame.plan {
         // Process-global gauge read: namespace/config-agnostic, so this is
         // handled BEFORE the `config_id` equality reject below (unlike every
         // other arm) — a metrics probe must work regardless of which
@@ -1143,6 +1207,19 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             metrics: None,
             request_id: frame.request_id,
         }
+    } else if frame.plan {
+        DaemonResponseFrame {
+            ok: true,
+            result: Some(dispatcher.plan(&frame.ops)),
+            error: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id,
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
+            request_id: None,
+        }
     } else if frame.probe_only {
         // Probe-only request: identity checks passed; return immediately without
         // dispatching any verb. The client uses this to confirm the daemon is
@@ -1175,6 +1252,10 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             process_ref: frame.process_ref.clone(),
             request_id: frame.request_id,
         };
+        tracing::debug!(
+            request_id = frame.request_id,
+            "daemon RequestIdentity constructed"
+        );
         let (read_cancel_tx, read_cancel_rx) = tokio::sync::watch::channel(false);
         let dispatch = khive_storage::scope_request_read_cancellation(
             shutdown,
@@ -2164,6 +2245,7 @@ mod khive_root_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
+    include!("daemon/plan_tests.rs");
     use super::*;
     use serial_test::serial;
 
@@ -2870,6 +2952,10 @@ mod tests {
 
     #[async_trait]
     impl DaemonDispatch for CancellationAwareDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -2900,6 +2986,10 @@ mod tests {
 
     #[async_trait]
     impl DaemonDispatch for MockDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -2935,6 +3025,7 @@ mod tests {
 
     fn base_request_frame(config_id: &str) -> DaemonRequestFrame {
         DaemonRequestFrame {
+            plan: false,
             ops: String::new(),
             presentation: None,
             presentation_per_op: None,
@@ -3003,7 +3094,12 @@ mod tests {
     /// requested provenance, and leave the caller unable to retry safely.
     #[tokio::test]
     async fn protocol_v3_frame_is_rejected_before_process_ref_dispatch() {
-        assert_eq!(PROTOCOL_VERSION, 4, "process_ref is the protocol-v4 change");
+        const {
+            assert!(
+                PROTOCOL_VERSION >= 4,
+                "process_ref requires protocol v4 or later"
+            )
+        };
         let dispatch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let dispatcher = MockDispatch {
             namespace: "local".to_string(),
@@ -3019,7 +3115,7 @@ mod tests {
         let response = round_trip(dispatcher, &request).await;
         assert!(!response.ok);
         assert!(response.version_mismatch);
-        assert_eq!(response.daemon_protocol_version, 4);
+        assert_eq!(response.daemon_protocol_version, PROTOCOL_VERSION);
         assert_eq!(
             dispatch_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -3027,7 +3123,7 @@ mod tests {
         );
         let error = response.error.expect("mismatch explains both versions");
         assert!(
-            error.contains("client=3") && error.contains("daemon=4"),
+            error.contains("client=3") && error.contains(&format!("daemon={PROTOCOL_VERSION}")),
             "mismatch must identify the exact rollout boundary; got {error:?}"
         );
     }

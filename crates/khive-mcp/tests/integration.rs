@@ -201,6 +201,7 @@ async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServe
         let server = KhiveMcpServer::new(runtime).expect("writable server");
         let seeded = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"create(kind="concept", name="snapshot entity")"#.to_string(),
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
@@ -240,6 +241,7 @@ async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advis
 
     let reads = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: r#"[stats(), list(kind="entity", limit=501)]"#.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -278,6 +280,7 @@ async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advis
 
     let mutation = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: r#"create(kind="concept", name="must fail")"#.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -308,6 +311,7 @@ async fn chmod_read_only_snapshot_default_list_keeps_items_envelope_and_sibling_
     let (_dir, server) = seeded_read_only_snapshot_server().await;
     let response = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: r#"list(kind="entity")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3733,6 +3737,7 @@ async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
     for verb in &["brain.state", "brain.config", "brain.events"] {
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!("{verb}()"),
                 presentation: None,
                 presentation_per_op: None,
@@ -5553,6 +5558,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
     // ── Step 1: create — output must be valid JSON ────────────────────────────
     let create_out = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: create_ops,
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -5573,6 +5579,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
     // ── Step 2: get — content round-trips byte-identical ─────────────────────
     let get_out = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: format!(r#"get(id="{note_id}")"#),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -5612,6 +5619,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
     );
     let update_out = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: update_ops,
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -6174,6 +6182,7 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     async fn dispatch_op(server: &KhiveMcpServer, ops: &str) -> Value {
         let out = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: ops.to_string(),
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
@@ -6293,6 +6302,7 @@ async fn format_auto_mixed_ok_error_batch_error_stays_compact() {
 
     // Batch: op0 succeeds (stats()), op1 fails (bad verb).
     let params = RequestParams {
+        plan: None,
         ops: r#"[stats(), no_such_verb()]"#.to_string(),
         presentation: None,
         presentation_per_op: None,
@@ -6356,6 +6366,7 @@ async fn format_per_op_override_selects_format_per_position() {
     // First build a state: two assign ops (both json), then one stats op (auto).
     // Simpler: two parallel stats() calls — one forced json, one forced auto.
     let params = RequestParams {
+        plan: None,
         ops: r#"[stats(), stats()]"#.to_string(),
         presentation: None,
         presentation_per_op: None,
@@ -6418,6 +6429,7 @@ async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
 
     let agent_raw = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: r#"gtd.assign(title="agent-json-dedup", priority="p1", assignee="lambda:test")"#
                 .to_string(),
             presentation: Some("agent".to_string()),
@@ -6441,6 +6453,7 @@ async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
 
     let verbose_raw = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops:
                 r#"gtd.assign(title="verbose-json-control", priority="p1", assignee="lambda:test")"#
                     .to_string(),
@@ -6465,6 +6478,7 @@ async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
 
     let target_raw = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: r#"create(kind="entity", entity_kind="concept", name="AgentJsonChainTarget")"#
                 .to_string(),
             presentation: Some("verbose".to_string()),
@@ -6488,6 +6502,7 @@ async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
     ] {
         let chain_raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(
                     r#"create(kind="entity", entity_kind="concept", name="{source_name}") | link(source_id=$prev.id, target_id="{target_id}", relation="extends")"#
                 ),
@@ -6524,6 +6539,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     // Create a GTD task so we have a record with duplicated properties
     // (assignee/priority/status echoed in both top-level and `properties`).
     let create_params = RequestParams {
+        plan: None,
         ops: r#"gtd.assign(title="verbose-pin-task", priority="p1", assignee="lambda:test")"#
             .to_string(),
         presentation: Some("verbose".to_string()),
@@ -6548,6 +6564,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     // We use gtd.tasks (which returns records with assignee/priority/status in both
     // top-level AND properties), then get the specific task in verbose mode.
     let batch_params = RequestParams {
+        plan: None,
         ops: format!(r#"[gtd.tasks(limit=10), get(id="{task_id}")]"#),
         // Batch default: agent (will apply redundancy drop).
         presentation: Some("agent".to_string()),
@@ -6644,6 +6661,7 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
     // Create a GTD task: assignee/priority/status are echoed in both top-level
     // and `properties`, and the record carries namespace="local".
     let create_params = RequestParams {
+        plan: None,
         ops: r#"gtd.assign(title="always-verbose-pin", priority="p1", assignee="lambda:test")"#
             .to_string(),
         presentation: Some("verbose".to_string()),
@@ -6667,6 +6685,7 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
     // AlwaysVerbose policy must force Verbose at the format seam, so the
     // redundancy-drop pre-pass is skipped and namespace/properties survive.
     let get_params = RequestParams {
+        plan: None,
         ops: format!(r#"get(id="{task_id}")"#),
         presentation: None,        // → default Agent
         presentation_per_op: None, // → no per-op override

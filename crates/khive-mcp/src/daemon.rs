@@ -428,6 +428,10 @@ fn fallback_or_reject(
 
 #[async_trait]
 impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
+    fn plan(&self, ops: &str) -> String {
+        self.plan_ops(ops)
+    }
+
     async fn dispatch(
         &self,
         ops: String,
@@ -439,6 +443,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         identity: Option<khive_runtime::RequestIdentity>,
     ) -> Result<String, String> {
         let params = RequestParams {
+            plan: None,
             ops,
             presentation,
             presentation_per_op,
@@ -1196,6 +1201,7 @@ enum ProbeOutcome {
 ///   `Timeout` → do NOT kill (daemon may be healthy-but-busy; NEVER-KILL-SLOW)
 async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64) -> ProbeOutcome {
     let probe = DaemonRequestFrame {
+        plan: false,
         ops: String::new(),
         presentation: None,
         presentation_per_op: None,
@@ -3275,6 +3281,7 @@ mod tests {
         std::env::set_var("KHIVE_NO_DAEMON", "1");
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3319,6 +3326,7 @@ mod tests {
 
     fn unreachable_daemon_frame(config_id: &str) -> DaemonRequestFrame {
         DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4272,6 +4280,7 @@ mod tests {
 
         // (a) valid same-namespace, same-config op
         let req = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -4302,6 +4311,7 @@ mod tests {
 
         let reference_result = reference
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
@@ -4344,6 +4354,7 @@ mod tests {
         // the frame's OWN namespace ("other") over the same shared warm
         // registry, instead of setting `namespace_mismatch`.
         let other = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4382,6 +4393,7 @@ mod tests {
         // config_id reject stays hard under ADR-096 Fork 1 — only the
         // namespace reject was softened.
         let mismatched_config = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4408,6 +4420,7 @@ mod tests {
 
         // (d) version mismatch → explicit error, NOT namespace/config mismatch
         let wrong_version = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4502,6 +4515,7 @@ mod tests {
         drop(ready);
 
         let request = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4571,6 +4585,7 @@ mod tests {
         drop(_ready);
 
         let alice_frame = DaemonRequestFrame {
+            plan: false,
             ops: "comm.send(to=\"bob\", content=\"hello from alice\") | comm.thread(id=$prev.full_id)"
                 .to_string(),
             presentation: None,
@@ -4589,6 +4604,7 @@ mod tests {
             request_id: None,
         };
         let bob_frame = DaemonRequestFrame {
+            plan: false,
             ops: "comm.send(to=\"alice\", content=\"hello from bob\") | comm.thread(id=$prev.full_id)"
                 .to_string(),
             presentation: None,
@@ -4607,6 +4623,7 @@ mod tests {
             request_id: None,
         };
         let charlie_frame = DaemonRequestFrame {
+            plan: false,
             ops: "comm.send(to=\"alice\", content=\"hello from charlie\") | comm.thread(id=$prev.full_id)"
                 .to_string(),
             presentation: None,
@@ -4753,6 +4770,7 @@ mod tests {
         drop(_ready);
 
         let frame = |ops: &str, actor: &str, visible: &[Namespace]| DaemonRequestFrame {
+            plan: false,
             ops: ops.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -4861,6 +4879,7 @@ mod tests {
         let server = make_comm_test_server(Some("baked-actor"));
         let result = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "comm.send(to=\"someone\", content=\"hello\")".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -4911,6 +4930,7 @@ mod tests {
         drop(_ready);
 
         let frame = |from_wire: bool| DaemonRequestFrame {
+            plan: false,
             ops: "brain.state()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5073,6 +5093,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_one_response(listener, old_resp));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5174,6 +5195,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_crash_on_dispatch(listener));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5275,6 +5297,7 @@ mod tests {
              outright before the timeout can be observed"
         );
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: big_ops,
             presentation: None,
             presentation_per_op: None,
@@ -5389,6 +5412,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_read_then_never_answer(listener));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5481,6 +5505,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_one_ok_response(listener, config_id.to_string()));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5910,6 +5935,10 @@ mod tests {
 
     #[async_trait]
     impl daemon::DaemonDispatch for BigDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -5974,6 +6003,7 @@ mod tests {
             .expect("daemon pid must be a u32");
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6077,6 +6107,10 @@ mod tests {
 
     #[async_trait]
     impl daemon::DaemonDispatch for CountingDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -6185,6 +6219,7 @@ mod tests {
 
         // Now forward the real request exactly once — the call site's single forward.
         let real_frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6548,6 +6583,7 @@ mod tests {
 
         drop(connect_when_ready(&sock).await);
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6699,6 +6735,7 @@ mod tests {
         });
 
         let frame = std::sync::Arc::new(DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6881,6 +6918,10 @@ mod tests {
 
     #[async_trait]
     impl daemon::DaemonDispatch for FailDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -6933,6 +6974,7 @@ mod tests {
         drop(_ready);
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7015,9 +7057,14 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn v4_client_rejects_warm_v3_daemon_before_accepting_result() {
+    async fn current_client_rejects_warm_v3_daemon_before_accepting_result() {
         clear_daemon_env();
-        assert_eq!(PROTOCOL_VERSION, 4, "process_ref is the protocol-v4 change");
+        const {
+            assert!(
+                PROTOCOL_VERSION >= 4,
+                "process_ref requires protocol v4 or later"
+            )
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");
@@ -7036,6 +7083,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7119,6 +7167,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7212,6 +7261,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7317,6 +7367,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7418,6 +7469,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7548,6 +7600,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,

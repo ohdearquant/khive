@@ -2429,6 +2429,7 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
     );
     let raw = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops,
             presentation: None,
             presentation_per_op: None,
@@ -2546,6 +2547,7 @@ async fn t2d_rego_gate_evaluator_failure_omits_canary_from_wire_and_logs() {
     let ops = format!(r#"list(kind="entity", canary="{CANARY}")"#);
     let raw = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops,
             presentation: None,
             presentation_per_op: None,
@@ -3303,6 +3305,7 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="T7aConcept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3362,6 +3365,7 @@ async fn multi_backend_and_direct_search_rows_have_exact_key_set_parity() {
     ) -> BTreeSet<String> {
         let raw = server
             .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+                plan: None,
                 ops: ops.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -3477,6 +3481,7 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="T7bTarget")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3540,6 +3545,7 @@ async fn coordinator_service_search_reports_vector_arm_error_in_json_envelope() 
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="FlashAttention")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3614,6 +3620,7 @@ async fn t7c_multi_backend_search_min_score_applied() {
     // min_score=1.0 is always above any real RRF score → result must be empty.
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="T7cMinScoreProbe", min_score=1.0)"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3672,6 +3679,7 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="session", query="standup")"#.to_string(),
             presentation: None,
             presentation_per_op: None,

@@ -9,6 +9,8 @@
 //!
 //! - **DSL mode** (default): `kkernel exec '<dsl>'` — executes a single verb DSL
 //!   expression or batch against the configured database and namespace.
+//! - **Plan mode**: `kkernel exec --plan '<dsl>'` — parses through an already
+//!   running daemon and prints its plan without dispatch or local construction.
 //! - **Pending-events mode**: `kkernel exec --pending-events` — one-shot drain that
 //!   fires all due `scheduled_event` notes. Mutually exclusive with the positional
 //!   `ops` argument. Cron-friendly: run every minute for minute-granularity delivery.
@@ -61,6 +63,8 @@ use khive_runtime::KhiveRuntime;
 use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
 use khive_runtime::{KhiveConfig, Namespace, RuntimeConfig};
 use khive_types::RefusalReason;
+
+mod plan;
 
 /// Stable stderr prefix for machine-classifiable exec refusals.
 const REFUSAL_PREFIX: &str = "kkernel-refusal: ";
@@ -397,6 +401,21 @@ pub struct ExecArgs {
     /// Mutually exclusive with `--pending-events` and `--ops-file`.
     pub ops: Option<String>,
 
+    /// Check grammar and list stages without executing operations.
+    ///
+    /// Requires an already-running daemon with matching configuration. Prints
+    /// the plan as JSON; a grammar error is a successful `parsed=false` result.
+    #[arg(
+        long,
+        requires = "ops",
+        conflicts_with_all = [
+            "presentation", "strict", "output_format", "save_file", "ops_file",
+            "pending_events", "dry_run", "serial", "atomic", "atomic_max_ops",
+            "verbose", "actor", "expect_actor", "namespace"
+        ]
+    )]
+    pub plan: bool,
+
     /// One-shot drain: fire all `scheduled_event` notes whose `trigger_at <= now`.
     ///
     /// Scans all namespaces, dispatches each event's action in its own namespace,
@@ -447,7 +466,11 @@ pub struct ExecArgs {
     /// canonical shape — unlike the MCP `request` tool, which defaults to
     /// `Agent` for token efficiency. Pass `--presentation agent` to opt into
     /// the trimmed shape, or `--presentation human` for pretty terminal output.
-    #[arg(long, default_value = "verbose")]
+    #[arg(
+        long,
+        default_value = "verbose",
+        default_value_if("plan", "true", None)
+    )]
     pub presentation: Option<String>,
 
     /// Output format for verb results (ADR-078 §2 precedence: this flag >
@@ -1682,6 +1705,12 @@ where
 /// skipped entirely, and all ops are dispatched through the in-process runtime
 /// in chunks (see module-level docs).
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
+    if args.plan {
+        let result = plan::run(&args).await?;
+        writeln!(std::io::stdout().lock(), "{result}")?;
+        return Ok(());
+    }
+
     // Clap enforces these relations for normal CLI entry. Keep the same
     // boundary for library callers that construct `ExecArgs` directly.
     if args.serial && (args.ops_file.is_none() || args.ops.is_some() || args.atomic) {
@@ -2292,6 +2321,7 @@ async fn run_exec_inline_with_forward(
                 compute_config_id(&cfg, Some(&khive_cfg))
             },
             protocol_version: PROTOCOL_VERSION,
+            plan: false,
             probe_only: false,
             metrics_only: false,
             format: output_format.clone(),
@@ -2375,6 +2405,7 @@ async fn run_exec_inline_with_forward(
     .await?;
 
     let params = RequestParams {
+        plan: None,
         ops,
         presentation,
         presentation_per_op: None,
@@ -3237,6 +3268,7 @@ mod tests {
             .unwrap();
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"comm.send(to="local", content="actor pin attribution")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -4059,6 +4091,7 @@ id = "lambda:fallback"
 
         let send = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"comm.send(to="actor-routing-test", content="routed-via-secondary", self_send=true)"#
                     .to_string(),
                 presentation: None,
@@ -4091,6 +4124,7 @@ id = "lambda:fallback"
             let probe = KhiveMcpServer::new(rt).expect("server on backend file");
             let raw = probe
                 .dispatch_request_local(RequestParams {
+                    plan: None,
                     ops: r#"list(kind="message")"#.to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -4287,6 +4321,7 @@ id = "lambda:fallback"
 
             for i in 0..count {
                 let params = RequestParams {
+                    plan: None,
                     ops: format!(
                         r#"create(kind="observation", content="{writer_label} note {i} — boot race marker")"#
                     ),
@@ -4717,6 +4752,7 @@ id = "lambda:fallback"
 
         // Verify all 3 entities are present.
         let params = RequestParams {
+            plan: None,
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5187,6 +5223,7 @@ id = "lambda:fallback"
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let server = isolated_server(&db_path);
         let params = RequestParams {
+            plan: None,
             ops: serde_json::json!({
                 "tool": "stats",
                 "args": {"payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1)},
@@ -5347,6 +5384,7 @@ id = "lambda:fallback"
         // it describes. The stable list contract wraps rows in `items` whether or
         // not the requested limit reaches the entity cap.
         let params = RequestParams {
+            plan: None,
             ops: r#"list(kind="concept", limit=200)"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5433,6 +5471,7 @@ id = "lambda:fallback"
             .contains("absent or an existing regular file"));
 
         let params = RequestParams {
+            plan: None,
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5693,6 +5732,7 @@ id = "lambda:fallback"
 
         async fn dispatch(server: &KhiveMcpServer, ops: &str) -> serde_json::Value {
             let params = RequestParams {
+                plan: None,
                 ops: ops.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -5836,6 +5876,7 @@ id = "lambda:fallback"
         // Verify nothing was written by checking with a fresh server.
         let server = isolated_server(&db_path);
         let params = RequestParams {
+            plan: None,
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7548,6 +7589,7 @@ backend = "sessions"
         // Because parse failed, no dispatch happened → DB is clean.
         let server = isolated_server(&db_path);
         let params = RequestParams {
+            plan: None,
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7584,6 +7626,7 @@ backend = "sessions"
         // need the real id back out so it can feed straight into `update`/
         // `delete`/`link` args.
         let params = RequestParams {
+            plan: None,
             ops: ops.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
