@@ -1,6 +1,6 @@
 # ADR-175: Web Pack — Site Ontology and Manifest Ingest for Agent-Readable Web Origins
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-09-07
 - **Extends**: [ADR-069](ADR-069-subject-model.md) (Subject model: OntologySpec, Scanner, Extractor,
   Layout), [ADR-085](ADR-085-code-pack.md) (the domain-ontology pack shape this record follows)
@@ -145,7 +145,8 @@ Following `khive-pack-code`'s shipped shape: crate `crates/khive-pack-web`, `NAM
 `REQUIRES = ["kg"]`, `ENTITY_KINDS = []` (tokens live in the registry, D2), `HANDLERS` = the D4 verb,
 `NOTE_KINDS = []`, `EDGE_RULES` = the D3 table, `SCHEMA_PLAN = None`. Self-registration via
 `inventory::submit!` plus the anchor import in the binaries (ADR-023). Not in the default pack set
-at v0; loaded opt-in via `KHIVE_PACKS=...,web` / `--pack web`. Promotion to the default set is a
+at v0; loaded opt-in via `KHIVE_PACKS=kg,web` / `--pack kg --pack web` (the pack requires `kg`).
+Promotion to the default set is a
 follow-up decision gated on one validated real ingest of a multi-site tree.
 
 ### D6: Hard constraints
