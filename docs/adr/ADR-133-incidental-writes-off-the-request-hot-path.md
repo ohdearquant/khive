@@ -762,8 +762,11 @@ carries `domain_disposition` with exactly one of three values:
   well as by parameter validation, and the secret gate is the standing example: it is invoked inside
   handlers (`crates/khive-runtime/src/operations.rs`, the code and git ingest
   handlers) at points where a handler may already have written, so a `SecretDetected` raised there
-  is `unknown`. A handler whose gate provably runs before every write on a path may claim
-  `not_committed` for that path by name, in a later amendment.
+  is `unknown`. One pack-raised class joins `not_committed`: a refusal the handler asserts wrote
+  nothing and that names the existing record, such as a keyed create-if-absent that found the
+  holder (`key_conflict`, the first member); the handler asserts it and arm 5 covers it. A handler
+  whose gate provably runs before every write on a path may claim `not_committed` for that path by
+  name, in a later amendment.
 - `unknown`: everything else. A domain handler's own error, an error the transport could not
   deliver, a daemon `version_mismatch`. The caller cannot learn the disposition from the error and
   must resolve it another way.
