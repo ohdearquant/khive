@@ -201,6 +201,7 @@ async fn seeded_read_only_snapshot_server() -> (tempfile::TempDir, KhiveMcpServe
         let server = KhiveMcpServer::new(runtime).expect("writable server");
         let seeded = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"create(kind="concept", name="snapshot entity")"#.to_string(),
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
@@ -240,6 +241,7 @@ async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advis
 
     let reads = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: r#"[stats(), list(kind="entity", limit=501)]"#.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -278,6 +280,7 @@ async fn chmod_read_only_snapshot_serves_stats_and_clamped_list_with_audit_advis
 
     let mutation = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: r#"create(kind="concept", name="must fail")"#.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -308,6 +311,7 @@ async fn chmod_read_only_snapshot_default_list_keeps_items_envelope_and_sibling_
     let (_dir, server) = seeded_read_only_snapshot_server().await;
     let response = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: r#"list(kind="entity")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -700,7 +704,7 @@ async fn invalid_kind_failure_does_not_abort_batch() -> anyhow::Result<()> {
     assert_eq!(body["summary"]["failed"], 1);
     assert_eq!(body["results"][0]["ok"], true);
     assert_eq!(body["results"][1]["ok"], false);
-    assert!(body["results"][1]["error"]
+    assert!(body["results"][1]["error"]["message"]
         .as_str()
         .unwrap()
         .contains("bogus"));
@@ -1131,7 +1135,10 @@ async fn transition_lifecycle_rejection_is_per_op_not_protocol_error() -> anyhow
     // Per P15 (PR #418), terminal states (done/cancelled) reject ALL outgoing
     // transitions with "task X is in terminal state Y; no further transitions allowed".
     assert!(
-        first["error"].as_str().unwrap().contains("terminal state"),
+        first["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("terminal state"),
         "expected terminal-state rejection, got: {}",
         first["error"]
     );
@@ -1159,7 +1166,10 @@ async fn unknown_verb_returns_per_op_failure_not_invalid_params() -> anyhow::Res
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = &body["results"][0];
     assert_eq!(first["ok"], false);
-    assert!(first["error"].as_str().unwrap().contains("unknown verb"));
+    assert!(first["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown verb"));
     Ok(())
 }
 
@@ -1242,7 +1252,7 @@ async fn pack_schedule_without_comm_rejects_only_remind_before_persisting() -> a
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let failed = &body["results"][0];
     assert_eq!(failed["ok"], json!(false), "remind must fail: {failed}");
-    let error = failed["error"].as_str().unwrap_or_default();
+    let error = failed["error"]["message"].as_str().unwrap_or_default();
     assert!(
         error.contains("comm.send") && error.contains("delivery"),
         "error must name the missing comm delivery capability: {error}"
@@ -1344,7 +1354,10 @@ async fn json_form_namespace_non_string_returns_invalid_input() -> anyhow::Resul
             json!(false),
             "case {label}: op must fail closed, got: {body}"
         );
-        let err = first["error"].as_str().unwrap_or_default().to_lowercase();
+        let err = first["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase();
         assert!(
             err.contains("namespace"),
             "case {label}: error must name the namespace, got: {first}"
@@ -1454,7 +1467,7 @@ async fn kg_create_note_kind_task_rejects_non_task_depends_on_before_write() -> 
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = &body["results"][0];
     assert_eq!(first["ok"], false, "expected rejection: {first}");
-    let err = first["error"].as_str().unwrap();
+    let err = first["error"]["message"].as_str().unwrap();
     assert!(
         err.contains("must be a task note"),
         "error must point to the GTD edge rule: {err}"
@@ -1523,7 +1536,7 @@ async fn kg_create_unknown_note_kind_lists_merged_pack_vocabulary() -> anyhow::R
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = &body["results"][0];
     assert_eq!(first["ok"], false);
-    let err = first["error"].as_str().unwrap();
+    let err = first["error"]["message"].as_str().unwrap();
     assert!(err.contains("bogus"), "error names the bad kind: {err}");
     // The merged vocabulary list must include "task" (gtd) alongside kg kinds.
     assert!(
@@ -1579,7 +1592,7 @@ async fn create_granular_kind_conflicts_with_legacy_subfield() -> anyhow::Result
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = &body["results"][0];
     assert_eq!(first["ok"], false, "expected contradiction error: {first}");
-    let err = first["error"].as_str().unwrap();
+    let err = first["error"]["message"].as_str().unwrap();
     assert!(
         err.contains("contradicts"),
         "error should explain the contradiction: {err}"
@@ -1732,7 +1745,7 @@ async fn search_unknown_kind_lists_all_valid_options() -> anyhow::Result<()> {
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = &body["results"][0];
     assert_eq!(first["ok"], false);
-    let err = first["error"].as_str().unwrap();
+    let err = first["error"]["message"].as_str().unwrap();
     assert!(err.contains("bogus"), "error names the bad kind: {err}");
     // The merged list must include substrate-level + pack-registered kinds.
     for expected in ["entity", "note", "edge", "concept", "task"] {
@@ -1828,7 +1841,7 @@ async fn search_granular_kind_contradicting_legacy_subfield_is_rejected() -> any
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = &body["results"][0];
     assert_eq!(first["ok"], false, "expected contradiction error: {first}");
-    let err = first["error"].as_str().unwrap();
+    let err = first["error"]["message"].as_str().unwrap();
     assert!(
         err.contains("contradicts"),
         "error should explain the contradiction: {err}"
@@ -2092,8 +2105,8 @@ async fn connect_error_inject(
 /// - `error.message` is present
 /// - `error.code` is present as a wire string (e.g. "runtime:10")
 /// - `error.details` is a non-null JSON object
-/// - Non-Khive errors still produce a flat string (backward-compat check via
-///   the existing `unknown_verb_returns_per_op_failure_not_invalid_params` test)
+/// - Ordinary runtime errors retain their display text in `error.message`
+///   (covered by `unknown_verb_returns_per_op_failure_not_invalid_params`)
 #[tokio::test]
 async fn runtime_khive_error_serializes_as_structured_object() -> anyhow::Result<()> {
     let client = connect_error_inject().await?;
@@ -2177,6 +2190,7 @@ async fn writer_pool_timeout_survives_storage_runtime_and_mcp_wire() -> anyhow::
             "kind": "unavailable",
             "code": "writer_pool_checkout_timeout",
             "stage": "writer_pool_checkout_timeout",
+            "domain_disposition": "unknown",
             "message": "storage: backend driver error in Notes during append_note: invalid data: timed out after 175ms waiting for sqlite writer connection",
             "retryable": true,
             "timeout_ms": 175,
@@ -2215,6 +2229,7 @@ async fn write_queue_full_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
             "kind": "unavailable",
             "code": "writer_queue_saturated",
             "stage": "writer_queue_saturated",
+            "domain_disposition": "unknown",
             "message": "storage: write queue full: timed out after 175ms waiting for writer task capacity",
             "retryable": true,
             "timeout_ms": 175,
@@ -2251,6 +2266,7 @@ async fn writer_task_busy_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
             "kind": "unavailable",
             "code": "writer_task_begin_busy",
             "stage": "writer_task_begin_busy",
+            "domain_disposition": "unknown",
             "message": "storage: writer task could not begin within 175ms because SQLite remained busy; request was not executed",
             "retryable": true,
             "timeout_ms": 175,
@@ -2286,6 +2302,7 @@ async fn writer_task_finality_survives_storage_runtime_and_mcp_wire() -> anyhow:
             "kind": "storage",
             "code": "writer_task_request_failed",
             "stage": "writer_task_request_failed",
+            "domain_disposition": "unknown",
             "message": "storage: writer task request failed (request_state=transaction_rolled_back): pool failure during writer_task_commit: commit refused",
             "retryable": true,
             "request_state": "transaction_rolled_back",
@@ -2306,6 +2323,7 @@ async fn writer_task_finality_survives_storage_runtime_and_mcp_wire() -> anyhow:
             "kind": "storage",
             "code": "writer_task_terminated",
             "stage": "writer_task_terminated",
+            "domain_disposition": "unknown",
             "message": "storage: writer task terminated (request_state=side_effects_unknown)",
             "retryable": false,
             "request_state": "side_effects_unknown",
@@ -2339,6 +2357,7 @@ async fn storage_admission_timeout_survives_storage_runtime_and_mcp_wire() -> an
             "kind": "unavailable",
             "code": "storage_admission_timeout",
             "stage": "storage_admission_timeout",
+            "domain_disposition": "unknown",
             "message": "storage: admission timeout during sql_bridge.writer_handle after 30000ms",
             "retryable": true,
             "timeout_ms": 30_000,
@@ -2379,6 +2398,7 @@ async fn read_tx_age_evicted_survives_storage_runtime_and_mcp_wire() -> anyhow::
             "kind": "unavailable",
             "code": "read_tx_age_evicted",
             "stage": "read_tx_age_evicted",
+            "domain_disposition": "unknown",
             "message": "storage: cached read-only transaction exceeded the maximum read-transaction age (120s) during sql_bridge.cached_reader and was rolled back; retry to open a fresh read snapshot",
             "retryable": true,
             "timeout_ms": 120_000,
@@ -2420,6 +2440,7 @@ async fn read_tx_age_eviction_cleanup_failure_survives_storage_runtime_and_mcp_w
             "kind": "unavailable",
             "code": "read_tx_age_evicted",
             "stage": "read_tx_age_evicted",
+            "domain_disposition": "unknown",
             "message": "storage: cached read-only transaction exceeded the maximum read-transaction age (120s) during sql_bridge.cached_reader but could not be cleanly rolled back (rollback failed: disk I/O error); the connection was discarded, retry to open a fresh read snapshot",
             "retryable": true,
             "timeout_ms": 120_000,
@@ -3708,7 +3729,7 @@ async fn subhandler_verbs_are_blocked_at_mcp_boundary() -> anyhow::Result<()> {
             first["ok"], false,
             "Subhandler verb {verb:?} must be blocked: got {first}"
         );
-        let err = first["error"].as_str().unwrap_or("");
+        let err = first["error"]["message"].as_str().unwrap_or("");
         assert!(
             err.contains("permission denied") || err.contains("subhandler"),
             "error for {verb:?} must mention permission/subhandler: {err}"
@@ -3733,6 +3754,7 @@ async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
     for verb in &["brain.state", "brain.config", "brain.events"] {
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!("{verb}()"),
                 presentation: None,
                 presentation_per_op: None,
@@ -3745,7 +3767,7 @@ async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
             .expect("operator dispatch must not RPC-fail");
         let body: Value = serde_json::from_str(&raw)?;
         let first = &body["results"][0];
-        let err = first["error"].as_str().unwrap_or("");
+        let err = first["error"]["message"].as_str().unwrap_or("");
         // The gate must NOT have fired: its signature message must be absent.
         // The handler may still succeed (ok=true) or fail for its own reasons,
         // but it must have been *reached*, not blocked at the visibility gate.
@@ -3971,7 +3993,7 @@ async fn parallel_link_bulk_conflict_is_rejected_before_storage_race() -> anyhow
     for i in 0..2 {
         let entry = &body["results"][i];
         assert_eq!(entry["ok"], json!(false), "op #{i} must fail: {entry}");
-        let err = entry["error"].as_str().unwrap_or("");
+        let err = entry["error"]["message"].as_str().unwrap_or("");
         assert!(
             err.contains("conflict"),
             "op #{i} error must mention conflict: {entry}"
@@ -4046,7 +4068,7 @@ async fn parallel_reversed_symmetric_link_conflict_is_rejected() -> anyhow::Resu
     for i in 0..2 {
         let entry = &body["results"][i];
         assert_eq!(entry["ok"], json!(false), "op #{i} must fail: {entry}");
-        let err = entry["error"].as_str().unwrap_or("");
+        let err = entry["error"]["message"].as_str().unwrap_or("");
         assert!(
             err.contains("conflict"),
             "op #{i} error must mention conflict: {entry}"
@@ -4741,7 +4763,7 @@ async fn update_rejects_unknown_kwarg() -> anyhow::Result<()> {
         json!(false),
         "update with unknown kwarg must fail; got: {first}"
     );
-    let err = first["error"].as_str().unwrap_or("");
+    let err = first["error"]["message"].as_str().unwrap_or("");
     assert!(
         err.contains("nonexistent_field") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
@@ -4767,7 +4789,7 @@ async fn remember_rejects_unknown_kwarg() -> anyhow::Result<()> {
         json!(false),
         "remember with unknown kwarg must fail; got: {first}"
     );
-    let err = first["error"].as_str().unwrap_or("");
+    let err = first["error"]["message"].as_str().unwrap_or("");
     assert!(
         err.contains("garbage_arg") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
@@ -4964,7 +4986,7 @@ async fn recall_rejects_unknown_kwarg() -> anyhow::Result<()> {
         json!(false),
         "recall with unknown kwarg must fail; got: {first}"
     );
-    let err = first["error"].as_str().unwrap_or("");
+    let err = first["error"]["message"].as_str().unwrap_or("");
     assert!(
         err.contains("typo_kwarg") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
@@ -4990,7 +5012,7 @@ async fn list_rejects_unknown_kwarg() -> anyhow::Result<()> {
         json!(false),
         "list with unknown kwarg must fail; got: {first}"
     );
-    let err = first["error"].as_str().unwrap_or("");
+    let err = first["error"]["message"].as_str().unwrap_or("");
     assert!(
         err.contains("typo_kwarg") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
@@ -5293,7 +5315,7 @@ async fn create_rejects_unknown_kwarg() -> anyhow::Result<()> {
         json!(false),
         "create with unknown kwarg must fail; got: {first}"
     );
-    let err = first["error"].as_str().unwrap_or("");
+    let err = first["error"]["message"].as_str().unwrap_or("");
     assert!(
         err.contains("unknownkw") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
@@ -5319,7 +5341,7 @@ async fn assign_rejects_unknown_kwarg() -> anyhow::Result<()> {
         json!(false),
         "assign with unknown kwarg must fail; got: {first}"
     );
-    let err = first["error"].as_str().unwrap_or("");
+    let err = first["error"]["message"].as_str().unwrap_or("");
     assert!(
         err.contains("unknownkw") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
@@ -5345,7 +5367,7 @@ async fn send_rejects_unknown_kwarg() -> anyhow::Result<()> {
         json!(false),
         "send with unknown kwarg must fail; got: {first}"
     );
-    let err = first["error"].as_str().unwrap_or("");
+    let err = first["error"]["message"].as_str().unwrap_or("");
     assert!(
         err.contains("unknownkw") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
@@ -5371,7 +5393,7 @@ async fn agenda_rejects_unknown_kwarg() -> anyhow::Result<()> {
         json!(false),
         "agenda with unknown kwarg must fail; got: {first}"
     );
-    let err = first["error"].as_str().unwrap_or("");
+    let err = first["error"]["message"].as_str().unwrap_or("");
     assert!(
         err.contains("unknownkw") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
@@ -5397,7 +5419,7 @@ async fn brain_profile_rejects_unknown_kwarg() -> anyhow::Result<()> {
         json!(false),
         "brain.profile with unknown kwarg must fail; got: {first}"
     );
-    let err = first["error"].as_str().unwrap_or("");
+    let err = first["error"]["message"].as_str().unwrap_or("");
     assert!(
         err.contains("unknownkw") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
@@ -5450,7 +5472,7 @@ async fn topic_rejects_unknown_kwarg() -> anyhow::Result<()> {
         json!(false),
         "topic with unknown kwarg must fail; got: {first}"
     );
-    let err = first["error"].as_str().unwrap_or("");
+    let err = first["error"]["message"].as_str().unwrap_or("");
     assert!(
         err.contains("unknownkw") || err.contains("unknown field"),
         "error must mention the unknown field; got: {err}"
@@ -5553,6 +5575,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
     // ── Step 1: create — output must be valid JSON ────────────────────────────
     let create_out = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: create_ops,
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -5573,6 +5596,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
     // ── Step 2: get — content round-trips byte-identical ─────────────────────
     let get_out = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: format!(r#"get(id="{note_id}")"#),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -5612,6 +5636,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
     );
     let update_out = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: update_ops,
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -6174,6 +6199,7 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     async fn dispatch_op(server: &KhiveMcpServer, ops: &str) -> Value {
         let out = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: ops.to_string(),
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
@@ -6293,6 +6319,7 @@ async fn format_auto_mixed_ok_error_batch_error_stays_compact() {
 
     // Batch: op0 succeeds (stats()), op1 fails (bad verb).
     let params = RequestParams {
+        plan: None,
         ops: r#"[stats(), no_such_verb()]"#.to_string(),
         presentation: None,
         presentation_per_op: None,
@@ -6331,10 +6358,10 @@ async fn format_auto_mixed_ok_error_batch_error_stays_compact() {
         "op1 (no_such_verb) must fail: {}",
         results[1]
     );
-    // The error entry must contain a string error field, not a rendered table.
+    // The structured error and its message must remain JSON, not a rendered table.
     assert!(
-        results[1]["error"].is_string(),
-        "error field must be a plain string, not reformatted: {}",
+        results[1]["error"].is_object() && results[1]["error"]["message"].is_string(),
+        "error object must retain its plain message without reformatting: {}",
         results[1]
     );
     // Summary must always be present and valid.
@@ -6356,6 +6383,7 @@ async fn format_per_op_override_selects_format_per_position() {
     // First build a state: two assign ops (both json), then one stats op (auto).
     // Simpler: two parallel stats() calls — one forced json, one forced auto.
     let params = RequestParams {
+        plan: None,
         ops: r#"[stats(), stats()]"#.to_string(),
         presentation: None,
         presentation_per_op: None,
@@ -6418,6 +6446,7 @@ async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
 
     let agent_raw = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: r#"gtd.assign(title="agent-json-dedup", priority="p1", assignee="lambda:test")"#
                 .to_string(),
             presentation: Some("agent".to_string()),
@@ -6441,6 +6470,7 @@ async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
 
     let verbose_raw = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops:
                 r#"gtd.assign(title="verbose-json-control", priority="p1", assignee="lambda:test")"#
                     .to_string(),
@@ -6465,6 +6495,7 @@ async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
 
     let target_raw = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops: r#"create(kind="entity", entity_kind="concept", name="AgentJsonChainTarget")"#
                 .to_string(),
             presentation: Some("verbose".to_string()),
@@ -6488,6 +6519,7 @@ async fn agent_json_deduplicates_gtd_and_preserves_chain_inputs() {
     ] {
         let chain_raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(
                     r#"create(kind="entity", entity_kind="concept", name="{source_name}") | link(source_id=$prev.id, target_id="{target_id}", relation="extends")"#
                 ),
@@ -6524,6 +6556,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     // Create a GTD task so we have a record with duplicated properties
     // (assignee/priority/status echoed in both top-level and `properties`).
     let create_params = RequestParams {
+        plan: None,
         ops: r#"gtd.assign(title="verbose-pin-task", priority="p1", assignee="lambda:test")"#
             .to_string(),
         presentation: Some("verbose".to_string()),
@@ -6548,6 +6581,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
     // We use gtd.tasks (which returns records with assignee/priority/status in both
     // top-level AND properties), then get the specific task in verbose mode.
     let batch_params = RequestParams {
+        plan: None,
         ops: format!(r#"[gtd.tasks(limit=10), get(id="{task_id}")]"#),
         // Batch default: agent (will apply redundancy drop).
         presentation: Some("agent".to_string()),
@@ -6644,6 +6678,7 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
     // Create a GTD task: assignee/priority/status are echoed in both top-level
     // and `properties`, and the record carries namespace="local".
     let create_params = RequestParams {
+        plan: None,
         ops: r#"gtd.assign(title="always-verbose-pin", priority="p1", assignee="lambda:test")"#
             .to_string(),
         presentation: Some("verbose".to_string()),
@@ -6667,6 +6702,7 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
     // AlwaysVerbose policy must force Verbose at the format seam, so the
     // redundancy-drop pre-pass is skipped and namespace/properties survive.
     let get_params = RequestParams {
+        plan: None,
         ops: format!(r#"get(id="{task_id}")"#),
         presentation: None,        // → default Agent
         presentation_per_op: None, // → no per-op override

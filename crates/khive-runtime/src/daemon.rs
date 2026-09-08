@@ -30,6 +30,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(unix)]
 use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
+#[cfg(unix)]
+use khive_types::Namespace;
 
 #[cfg(unix)]
 use crate::pack::RequestIdentity;
@@ -45,7 +47,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// that names both sides so the operator knows exactly what to do
 /// (`make local` rebuilds the client binary).
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
@@ -406,7 +408,12 @@ pub(crate) fn uid_is_permitted(peer: u32, daemon_euid: u32) -> bool {
 #[derive(Serialize, Deserialize, Default)]
 pub struct DaemonRequestFrame {
     pub ops: String,
+    /// Parse and inspect the catalog without dispatch, identity, or storage access.
+    #[serde(default)]
+    pub plan: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation_per_op: Option<Vec<Option<String>>>,
     /// The client's resolved storage/gate default namespace for this request.
     ///
@@ -430,8 +437,10 @@ pub struct DaemonRequestFrame {
     /// The client's resolved extra read-visibility namespaces (ADR-007 Rule
     /// 3b), carried on the frame so the warm daemon widens read scope to
     /// match the caller's own configuration rather than its own baked
-    /// `visible_namespaces` (ADR-096). Empty means no extra visibility beyond
-    /// `namespace` itself.
+    /// `visible_namespaces` (ADR-096). At ingress, a valid non-`local`
+    /// `actor_id` is included if absent, matching config loading; an empty
+    /// list therefore still includes that actor in default reads. Explicit
+    /// `namespace=` operations remain scoped to exactly that namespace.
     #[serde(default)]
     pub visible_namespaces: Vec<String>,
     /// Fingerprint of the client's engine-coherence config: packs, db target,
@@ -468,9 +477,11 @@ pub struct DaemonRequestFrame {
     /// Output format for this request (ADR-078). Forwarded to the daemon's
     /// serialization seam. `None` means use the daemon's resolved default.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// Per-operation output format overrides (ADR-078).
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format_per_op: Option<Vec<Option<String>>>,
     /// Whether this request originated from the agent-facing MCP `request`
     /// tool (the wire surface). When `true`, the daemon rejects
@@ -494,7 +505,102 @@ pub struct DaemonRequestFrame {
     /// `#[serde(default)]` matches `metrics_only`/`format`/`format_per_op`
     /// precedent, with no `PROTOCOL_VERSION` bump.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<u64>,
+}
+
+/// A dispatch failure whose domain outcome remains available to the transport.
+#[derive(Debug, Clone)]
+pub struct DaemonDispatchError {
+    pub message: String,
+    pub error_detail: serde_json::Value,
+}
+
+/// Per-field container limit, asserted equal to the request parser's bound by MCP.
+pub const ERROR_DETAIL_NESTING_DEPTH_LIMIT: usize = 64;
+
+fn error_detail_value_within_limit(value: &serde_json::Value) -> bool {
+    let mut pending = vec![(value, 0_usize)];
+    while let Some((value, depth)) = pending.pop() {
+        match value {
+            serde_json::Value::Array(items) if depth < ERROR_DETAIL_NESTING_DEPTH_LIMIT => {
+                pending.extend(items.iter().map(|child| (child, depth + 1)));
+            }
+            serde_json::Value::Object(fields) if depth < ERROR_DETAIL_NESTING_DEPTH_LIMIT => {
+                pending.extend(fields.values().map(|child| (child, depth + 1)));
+            }
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn drop_error_detail_iteratively(value: serde_json::Value) {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Array(items) => pending.extend(items),
+            serde_json::Value::Object(fields) => pending.extend(fields.into_values()),
+            _ => {}
+        }
+    }
+}
+
+impl DaemonDispatchError {
+    /// Missing or unrecognized disposition from a legacy implementation is unknown.
+    pub fn new(message: impl Into<String>, error_detail: Option<serde_json::Value>) -> Self {
+        let message = message.into();
+        let mut fields = match error_detail {
+            Some(serde_json::Value::Object(fields)) => fields,
+            Some(data) => serde_json::Map::from_iter([("data".to_string(), data)]),
+            None => serde_json::Map::new(),
+        };
+        let disposition = match fields
+            .get("domain_disposition")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("committed") => crate::DomainDisposition::Committed,
+            Some("not_committed") => crate::DomainDisposition::NotCommitted,
+            _ => crate::DomainDisposition::Unknown,
+        };
+        if disposition != crate::DomainDisposition::Committed {
+            if let Some(result) = fields.remove("domain_result") {
+                drop_error_detail_iteratively(result);
+            }
+        }
+        let rejected: Vec<String> = fields
+            .iter()
+            .filter(|(_, value)| !error_detail_value_within_limit(value))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let omitted_result = rejected.iter().any(|name| name == "domain_result");
+        let omitted_detail = !rejected.is_empty();
+        for name in rejected {
+            if let Some(value) = fields.remove(&name) {
+                drop_error_detail_iteratively(value);
+            }
+        }
+        let mut error_detail = serde_json::Value::Object(fields);
+        if error_detail["kind"].as_str().is_none() {
+            error_detail["kind"] = serde_json::json!("internal");
+        }
+        if error_detail["message"].as_str().is_none() {
+            error_detail["message"] = serde_json::json!(message);
+        }
+        error_detail["domain_disposition"] = serde_json::json!(disposition.as_str());
+        if omitted_detail {
+            error_detail["code"] = serde_json::json!(if omitted_result {
+                "result_too_deep"
+            } else {
+                "error_detail_too_deep"
+            });
+        }
+        Self {
+            message,
+            error_detail,
+        }
+    }
 }
 
 /// Response frame sent from the daemon back to a client.
@@ -503,6 +609,9 @@ pub struct DaemonResponseFrame {
     pub ok: bool,
     pub result: Option<String>,
     pub error: Option<String>,
+    /// Additive error metadata; legacy protocol-v4 peers still read `error` as text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<serde_json::Value>,
     pub namespace_mismatch: bool,
     /// Set when the request's `config_id` does not match the daemon's. Like
     /// `namespace_mismatch`, this signals the client to fall back to local
@@ -693,6 +802,9 @@ where
 #[cfg(unix)]
 #[async_trait]
 pub trait DaemonDispatch: Clone + Send + Sync + 'static {
+    /// Describe syntax and loaded catalog membership without dispatching.
+    fn plan(&self, ops: &str) -> String;
+
     /// Dispatch a verb-DSL request string and return the rendered result.
     ///
     /// `from_wire` carries the origin discriminator from
@@ -718,6 +830,31 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         from_wire: bool,
         identity: Option<RequestIdentity>,
     ) -> Result<String, String>;
+
+    /// Preserve structured dispatch errors without breaking string-only implementors.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_with_error_detail(
+        &self,
+        ops: String,
+        presentation: Option<String>,
+        presentation_per_op: Option<Vec<Option<String>>>,
+        format: Option<String>,
+        format_per_op: Option<Vec<Option<String>>>,
+        from_wire: bool,
+        identity: Option<RequestIdentity>,
+    ) -> Result<String, DaemonDispatchError> {
+        self.dispatch(
+            ops,
+            presentation,
+            presentation_per_op,
+            format,
+            format_per_op,
+            from_wire,
+            identity,
+        )
+        .await
+        .map_err(|message| DaemonDispatchError::new(message, None))
+    }
 
     /// Warm every pack's in-memory state (ANN indexes, etc.).
     async fn warm_all(&self);
@@ -1051,6 +1188,34 @@ async fn handle_conn<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
     handle_conn_with_shutdown(stream, dispatcher, None).await;
 }
 
+#[cfg(all(unix, feature = "fault-injection"))]
+#[doc(hidden)]
+pub async fn handle_conn_for_test<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
+    handle_conn_with_shutdown(stream, dispatcher, None).await;
+}
+
+#[cfg(unix)]
+fn plan_frame_companion(raw: &[u8]) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    if value.get("plan").and_then(serde_json::Value::as_bool) != Some(true)
+        || value
+            .get("protocol_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(PROTOCOL_VERSION))
+    {
+        return None;
+    }
+    [
+        "presentation",
+        "presentation_per_op",
+        "format",
+        "format_per_op",
+        "request_id",
+    ]
+    .into_iter()
+    .find(|field| value.get(*field).is_some())
+}
+
 #[cfg(unix)]
 async fn handle_conn_with_shutdown<D: DaemonDispatch>(
     mut stream: UnixStream,
@@ -1069,7 +1234,38 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             return;
         }
     };
-    let frame: DaemonRequestFrame = match serde_json::from_slice(&raw) {
+    let decoded: Result<DaemonRequestFrame, _> = serde_json::from_slice(&raw);
+    if decoded.as_ref().ok().is_none_or(|frame| frame.plan) {
+        if let Some(field) = plan_frame_companion(&raw) {
+            let response = DaemonResponseFrame {
+                ok: false,
+                result: None,
+                error: Some(format!(
+                    "invalid_params: plan=true cannot be combined with {field}"
+                )),
+                error_detail: Some(serde_json::json!({
+                    "kind": "protocol",
+                    "code": "invalid_params",
+                    "message": format!("plan=true cannot be combined with {field}"),
+                    "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
+                })),
+                namespace_mismatch: false,
+                config_mismatch: false,
+                served_config_id: Some(dispatcher.config_id().to_string()),
+                version_mismatch: false,
+                daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
+                request_id: None,
+            };
+            if let Ok(payload) = serde_json::to_vec(&response) {
+                if let Err(error) = write_frame(&mut stream, &payload).await {
+                    tracing::debug!(%error, "failed to write plan envelope refusal");
+                }
+            }
+            return;
+        }
+    }
+    let frame: DaemonRequestFrame = match decoded {
         Ok(f) => f,
         Err(e) => {
             tracing::debug!(error = %e, "failed to decode daemon request frame");
@@ -1093,7 +1289,13 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
         DaemonResponseFrame {
             ok: false,
             result: None,
-            error: Some(msg),
+            error: Some(msg.clone()),
+            error_detail: Some(serde_json::json!({
+                "kind": "protocol",
+                "code": "version_mismatch",
+                "message": msg,
+                "domain_disposition": crate::DomainDisposition::Unknown.as_str(),
+            })),
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id,
@@ -1102,7 +1304,7 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             metrics: None,
             request_id: frame.request_id,
         }
-    } else if frame.metrics_only {
+    } else if frame.metrics_only && !frame.plan {
         // Process-global gauge read: namespace/config-agnostic, so this is
         // handled BEFORE the `config_id` equality reject below (unlike every
         // other arm) — a metrics probe must work regardless of which
@@ -1113,6 +1315,7 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             ok: true,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id,
@@ -1135,6 +1338,12 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             ok: false,
             result: None,
             error: None,
+            error_detail: Some(serde_json::json!({
+                "kind": "protocol",
+                "code": "config_mismatch",
+                "message": "daemon configuration does not match the request",
+                "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
+            })),
             namespace_mismatch: false,
             config_mismatch: true,
             served_config_id,
@@ -1142,6 +1351,20 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
             request_id: frame.request_id,
+        }
+    } else if frame.plan {
+        DaemonResponseFrame {
+            ok: true,
+            result: Some(dispatcher.plan(&frame.ops)),
+            error: None,
+            error_detail: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id,
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
+            request_id: None,
         }
     } else if frame.probe_only {
         // Probe-only request: identity checks passed; return immediately without
@@ -1151,6 +1374,7 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             ok: true,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id,
@@ -1168,13 +1392,25 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
         // `actor_id`/`visible_namespaces` the client resolved (defaulting to
         // `None`/`vec![]` for an older, field-absent payload, which is
         // exactly the prior anonymous/no-extra-visibility behavior).
+        let mut visible_namespaces = frame.visible_namespaces.clone();
+        if let Some(actor_id) = frame.actor_id.as_deref().filter(|actor_id| {
+            *actor_id != Namespace::LOCAL
+                && Namespace::parse(actor_id).is_ok()
+                && !visible_namespaces.iter().any(|ns| ns == *actor_id)
+        }) {
+            visible_namespaces.push(actor_id.to_string());
+        }
         let identity = RequestIdentity {
             namespace: frame.namespace.clone(),
             actor_id: frame.actor_id.clone(),
-            visible_namespaces: frame.visible_namespaces.clone(),
+            visible_namespaces,
             process_ref: frame.process_ref.clone(),
             request_id: frame.request_id,
         };
+        tracing::debug!(
+            request_id = frame.request_id,
+            "daemon RequestIdentity constructed"
+        );
         let (read_cancel_tx, read_cancel_rx) = tokio::sync::watch::channel(false);
         let dispatch = khive_storage::scope_request_read_cancellation(
             shutdown,
@@ -1182,7 +1418,7 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
                 read_cancel_rx,
                 khive_storage::scope_request_read_deadline(
                     khive_storage::request_read_timeout_from_env(),
-                    dispatcher.dispatch(
+                    dispatcher.dispatch_with_error_detail(
                         frame.ops,
                         frame.presentation,
                         frame.presentation_per_op,
@@ -1207,6 +1443,7 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
                 ok: true,
                 result: Some(result),
                 error: None,
+                error_detail: None,
                 namespace_mismatch: false,
                 config_mismatch: false,
                 served_config_id,
@@ -1215,18 +1452,22 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
                 metrics: None,
                 request_id: frame.request_id,
             },
-            Err(e) => DaemonResponseFrame {
-                ok: false,
-                result: None,
-                error: Some(e),
-                namespace_mismatch: false,
-                config_mismatch: false,
-                served_config_id,
-                version_mismatch: false,
-                daemon_protocol_version: PROTOCOL_VERSION,
-                metrics: None,
-                request_id: frame.request_id,
-            },
+            Err(error) => {
+                let error = DaemonDispatchError::new(error.message, Some(error.error_detail));
+                DaemonResponseFrame {
+                    ok: false,
+                    result: None,
+                    error: Some(error.message),
+                    error_detail: Some(error.error_detail),
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id,
+                    version_mismatch: false,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    metrics: None,
+                    request_id: frame.request_id,
+                }
+            }
         }
     };
 
@@ -1244,14 +1485,22 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
                     limit = MAX_FRAME_BYTES,
                     "daemon response exceeds MAX_FRAME_BYTES; sending explicit error frame"
                 );
+                let message = format!(
+                    "response too large: {} bytes exceeds {} byte IPC cap",
+                    payload.len(),
+                    MAX_FRAME_BYTES,
+                );
+                // One frame may aggregate successful, failed, and aborted operations.
                 let err_resp = DaemonResponseFrame {
                     ok: false,
                     result: None,
-                    error: Some(format!(
-                        "response too large: {} bytes exceeds {} byte IPC cap",
-                        payload.len(),
-                        MAX_FRAME_BYTES,
-                    )),
+                    error: Some(message.clone()),
+                    error_detail: Some(serde_json::json!({
+                        "kind": "transport",
+                        "code": "response_frame_size_limit",
+                        "message": message,
+                        "domain_disposition": crate::DomainDisposition::Unknown.as_str(),
+                    })),
                     namespace_mismatch: false,
                     config_mismatch: false,
                     served_config_id: resp.served_config_id,
@@ -2162,8 +2411,20 @@ mod khive_root_tests {
     }
 }
 
+/// Serve one already-admitted test connection through the production frame handler.
+///
+/// This seam owns no socket path, PID, boot guard, background components, or
+/// process-wide shutdown state. The caller owns and joins the connection task.
+/// It deliberately does not exercise listener admission or daemon lifecycle.
+#[cfg(all(unix, any(test, feature = "test-internals")))]
+#[doc(hidden)]
+pub async fn serve_connection_for_test<D: DaemonDispatch>(stream: UnixStream, dispatcher: D) {
+    handle_conn_with_shutdown(stream, dispatcher, None).await;
+}
+
 #[cfg(all(test, unix))]
 mod tests {
+    include!("daemon/plan_tests.rs");
     use super::*;
     use serial_test::serial;
 
@@ -2870,6 +3131,10 @@ mod tests {
 
     #[async_trait]
     impl DaemonDispatch for CancellationAwareDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -2900,6 +3165,10 @@ mod tests {
 
     #[async_trait]
     impl DaemonDispatch for MockDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -2935,6 +3204,7 @@ mod tests {
 
     fn base_request_frame(config_id: &str) -> DaemonRequestFrame {
         DaemonRequestFrame {
+            plan: false,
             ops: String::new(),
             presentation: None,
             presentation_per_op: None,
@@ -2955,7 +3225,10 @@ mod tests {
 
     /// Drive `handle_conn` over an in-process `UnixStream::pair()` (no real
     /// socket file needed) and decode the response frame it writes back.
-    async fn round_trip(dispatcher: MockDispatch, req: &DaemonRequestFrame) -> DaemonResponseFrame {
+    async fn round_trip<D: DaemonDispatch>(
+        dispatcher: D,
+        req: &DaemonRequestFrame,
+    ) -> DaemonResponseFrame {
         let (mut client, server) = UnixStream::pair().expect("unix stream pair");
         let payload = serde_json::to_vec(req).expect("encode request frame");
         let handle = tokio::spawn(async move {
@@ -2967,6 +3240,208 @@ mod tests {
         let raw = read_frame(&mut client).await.expect("read response frame");
         handle.await.expect("handle_conn task panicked");
         serde_json::from_slice(&raw).expect("decode response frame")
+    }
+
+    #[derive(Clone)]
+    struct DetailedDispatch {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        detail: serde_json::Value,
+    }
+
+    #[async_trait]
+    impl DaemonDispatch for DetailedDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
+        async fn dispatch(
+            &self,
+            _ops: String,
+            _presentation: Option<String>,
+            _presentation_per_op: Option<Vec<Option<String>>>,
+            _format: Option<String>,
+            _format_per_op: Option<Vec<Option<String>>>,
+            _from_wire: bool,
+            _identity: Option<RequestIdentity>,
+        ) -> Result<String, String> {
+            panic!("the daemon must use the detailed dispatch seam");
+        }
+
+        async fn dispatch_with_error_detail(
+            &self,
+            _ops: String,
+            _presentation: Option<String>,
+            _presentation_per_op: Option<Vec<Option<String>>>,
+            _format: Option<String>,
+            _format_per_op: Option<Vec<Option<String>>>,
+            _from_wire: bool,
+            _identity: Option<RequestIdentity>,
+        ) -> Result<String, DaemonDispatchError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(DaemonDispatchError::new(
+                "audit failed",
+                Some(self.detail.clone()),
+            ))
+        }
+
+        async fn warm_all(&self) {}
+
+        fn namespace(&self) -> &str {
+            "local"
+        }
+
+        fn config_id(&self) -> &str {
+            "disposition-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn disposition_detail_survives_daemon_framing_and_legacy_v4_decoder() {
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize)]
+        struct LegacyV4Response {
+            ok: bool,
+            result: Option<String>,
+            error: Option<String>,
+            namespace_mismatch: bool,
+            #[serde(default)]
+            config_mismatch: bool,
+            #[serde(default)]
+            served_config_id: Option<String>,
+            #[serde(default)]
+            version_mismatch: bool,
+            #[serde(default)]
+            daemon_protocol_version: u32,
+            #[serde(default)]
+            metrics: Option<MetricsSnapshot>,
+            #[serde(default)]
+            request_id: Option<u64>,
+        }
+
+        let detail = serde_json::json!({
+            "kind": "obligation",
+            "code": "store_failure",
+            "message": "audit failed",
+            "domain_disposition": "committed",
+            "domain_result": { "id": "persisted-row" },
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let response = round_trip(
+            DetailedDispatch {
+                calls: Arc::clone(&calls),
+                detail: detail.clone(),
+            },
+            &base_request_frame("disposition-test"),
+        )
+        .await;
+        assert_eq!(response.error_detail.as_ref(), Some(&detail));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let encoded = serde_json::to_vec(&response).expect("serialize detailed response");
+        let legacy: LegacyV4Response = serde_json::from_slice(&encoded).expect("legacy v4 decode");
+        assert!(!legacy.ok);
+        assert_eq!(legacy.error.as_deref(), Some("audit failed"));
+        assert_eq!(legacy.daemon_protocol_version, 4);
+    }
+
+    #[tokio::test]
+    async fn disposition_legacy_dispatch_error_is_unknown_and_success_has_no_detail() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "disposition-test".to_string(),
+            dispatch_calls: Arc::clone(&calls),
+            pool: None,
+            dispatch_err: Some("legacy failure".to_string()),
+        };
+        let request = base_request_frame("disposition-test");
+        let failure = round_trip(dispatcher.clone(), &request).await;
+        assert_eq!(
+            failure.error_detail.as_ref().unwrap()["domain_disposition"],
+            "unknown"
+        );
+        assert_eq!(failure.error.as_deref(), Some("legacy failure"));
+        let success = round_trip(
+            MockDispatch {
+                dispatch_err: None,
+                ..dispatcher
+            },
+            &request,
+        )
+        .await;
+        assert!(success.ok);
+        assert!(serde_json::to_value(success)
+            .unwrap()
+            .get("error_detail")
+            .is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn disposition_new_decoder_accepts_legacy_v4_error_without_detail() {
+        let response: DaemonResponseFrame = serde_json::from_str(
+            r#"{
+            "ok":false,"result":null,"error":"legacy failure",
+            "namespace_mismatch":false,"config_mismatch":false,
+            "served_config_id":"cfg","version_mismatch":false,
+            "daemon_protocol_version":4,"request_id":null
+        }"#,
+        )
+        .expect("decode legacy v4 error frame");
+        assert!(response.error_detail.is_none());
+        assert_eq!(response.error.as_deref(), Some("legacy failure"));
+    }
+
+    #[test]
+    fn disposition_normalization_omits_unconfirmed_domain_results() {
+        for disposition in ["not_committed", "unknown", "unrecognized"] {
+            let error = DaemonDispatchError::new(
+                "failure",
+                Some(serde_json::json!({
+                    "message": "failure",
+                    "domain_disposition": disposition,
+                    "domain_result": { "id": "unconfirmed" },
+                })),
+            );
+            assert!(error.error_detail.get("domain_result").is_none());
+            assert_eq!(
+                error.error_detail["domain_disposition"],
+                if disposition == "not_committed" {
+                    "not_committed"
+                } else {
+                    "unknown"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn disposition_normalization_iteratively_discards_deep_owned_values() {
+        for disposition in ["committed", "not_committed", "unknown"] {
+            let mut value = serde_json::Value::Null;
+            for _ in 0..4096 {
+                value = serde_json::Value::Array(vec![value]);
+            }
+            let fields = serde_json::Map::from_iter([
+                ("domain_disposition".into(), serde_json::json!(disposition)),
+                ("domain_result".into(), value),
+            ]);
+            let error =
+                DaemonDispatchError::new("failure", Some(serde_json::Value::Object(fields)));
+            assert!(error.error_detail.get("domain_result").is_none());
+            assert_eq!(error.error_detail["domain_disposition"], disposition);
+            if disposition == "committed" {
+                assert_eq!(error.error_detail["code"], "result_too_deep");
+            }
+            serde_json::to_vec(&error.error_detail).expect("bounded error detail serializes");
+        }
+        let mut value = serde_json::Value::Null;
+        for _ in 0..4096 {
+            value = serde_json::Value::Array(vec![value]);
+        }
+        let error = DaemonDispatchError::new("failure", Some(value));
+        assert_eq!(error.error_detail["code"], "error_detail_too_deep");
+        assert_eq!(error.error_detail["domain_disposition"], "unknown");
+        assert!(error.error_detail.get("data").is_none());
     }
 
     #[tokio::test]
@@ -3003,7 +3478,12 @@ mod tests {
     /// requested provenance, and leave the caller unable to retry safely.
     #[tokio::test]
     async fn protocol_v3_frame_is_rejected_before_process_ref_dispatch() {
-        assert_eq!(PROTOCOL_VERSION, 4, "process_ref is the protocol-v4 change");
+        const {
+            assert!(
+                PROTOCOL_VERSION >= 4,
+                "process_ref requires protocol v4 or later"
+            )
+        };
         let dispatch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let dispatcher = MockDispatch {
             namespace: "local".to_string(),
@@ -3019,7 +3499,11 @@ mod tests {
         let response = round_trip(dispatcher, &request).await;
         assert!(!response.ok);
         assert!(response.version_mismatch);
-        assert_eq!(response.daemon_protocol_version, 4);
+        assert_eq!(
+            response.error_detail.as_ref().unwrap()["domain_disposition"],
+            "unknown"
+        );
+        assert_eq!(response.daemon_protocol_version, PROTOCOL_VERSION);
         assert_eq!(
             dispatch_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -3027,7 +3511,7 @@ mod tests {
         );
         let error = response.error.expect("mismatch explains both versions");
         assert!(
-            error.contains("client=3") && error.contains("daemon=4"),
+            error.contains("client=3") && error.contains(&format!("daemon={PROTOCOL_VERSION}")),
             "mismatch must identify the exact rollout boundary; got {error:?}"
         );
     }

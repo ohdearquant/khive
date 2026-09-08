@@ -19,12 +19,21 @@ Version history for `PROTOCOL_VERSION`:
 - 4 — added request-origin `process_ref` attribution. Although optional, it can affect durable
   comm message properties, so v3/v4 peers reject each other before dispatch instead of allowing a
   v3 daemon to execute a write while silently ignoring the new field.
+- 5 — added `plan` (default false). A true value returns syntax and loaded-catalog information
+  before request identity construction or dispatch. Older daemons reject v5 frames before they
+  could ignore the flag and execute the operations. Restart a warm daemon when upgrading clients.
 
 `process_ref` carries the originating client's opaque `KHIVE_PROCESS_REF`; it is request
 attribution, not identity, and prevents a shared daemon from substituting its own process
 environment. Its `serde(default)` preserves the meaning of an omitted value within protocol v4;
 it does not make a v3 daemon safe to use. `request_id` is the independent additive numeric
 audit-correlation field and does not alter dispatch or persisted verb output.
+
+Plan frames retain the protocol and configuration checks. They reject the presence of
+`presentation`, `presentation_per_op`, `format`, `format_per_op`, or `request_id`, including null
+values, with an `invalid_params` error naming the field. The response `result` contains the same
+JSON object as `request(ops, plan=true)` and `Session.plan(ops)`. A grammar error is a successful
+response whose result has `parsed=false`; planning never grants permission or resolves `$prev`.
 
 ## try_acquire_flock_until
 
