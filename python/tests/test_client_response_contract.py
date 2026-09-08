@@ -10,6 +10,7 @@ import pytest
 from khive import BatchError, Khive, OperationError, Transport, op
 from khive.envelope import _validate_envelope_results
 from khive.errors import TransportError
+from khive.models import OpError
 
 NOTE_ID = "00000000-0000-4000-8000-000000000001"
 NEXT_ID = "00000000-0000-4000-8000-000000000002"
@@ -226,10 +227,14 @@ def test_live_three_note_cursor_walk(scratch_daemon):
     assert set(seen) == {note.id for note in created}
 
 
-def test_live_missing_id_keeps_string_error_and_index(scratch_daemon):
+def test_live_missing_id_keeps_structured_error_and_index(scratch_daemon):
     db = Khive(socket_path=str(scratch_daemon["socket"]), actor_id="test-client")
     with pytest.raises(BatchError) as raised:
         db.batch([op("stats"), op("get", id="00000000-0000-0000-0000-000000000000")])
     index, tool, error = raised.value.failures[0]
     assert (index, tool) == (1, "get")
-    assert isinstance(error, str) and error
+    assert isinstance(error, OpError)
+    assert "not found" in error.message
+    assert "00000000-0000-0000-0000-000000000000" in error.message
+    assert error.domain_disposition == "unknown"
+    assert "domain_result" not in error.model_fields_set

@@ -107,6 +107,7 @@ async fn accept_and_reply(listener: &UnixListener) -> DaemonRequestFrame {
         ok: true,
         result: Some("{}".to_string()),
         error: None,
+        error_detail: None,
         namespace_mismatch: false,
         config_mismatch: false,
         served_config_id: Some(frame.config_id.clone()),

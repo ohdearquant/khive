@@ -409,7 +409,7 @@ fn fallback_or_reject(
 ) -> Option<Result<String, McpError>> {
     record_fallback(reason, config_id_client, config_id_daemon, namespace_client);
     if is_daemon_strict_mode() {
-        return Some(Err(McpError::internal_error(
+        return Some(Err(daemon_mcp_error(
             format!(
                 "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={}; \
                  refusing to complete the request via local dispatch",
@@ -438,6 +438,29 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         from_wire: bool,
         identity: Option<khive_runtime::RequestIdentity>,
     ) -> Result<String, String> {
+        self.dispatch_with_error_detail(
+            ops,
+            presentation,
+            presentation_per_op,
+            format,
+            format_per_op,
+            from_wire,
+            identity,
+        )
+        .await
+        .map_err(|error| error.message)
+    }
+
+    async fn dispatch_with_error_detail(
+        &self,
+        ops: String,
+        presentation: Option<String>,
+        presentation_per_op: Option<Vec<Option<String>>>,
+        format: Option<String>,
+        format_per_op: Option<Vec<Option<String>>>,
+        from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
+    ) -> Result<String, daemon::DaemonDispatchError> {
         let params = RequestParams {
             ops,
             presentation,
@@ -460,7 +483,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
             crate::server::DispatchOrigin::Daemon,
         )
         .await
-        .map_err(|e| e.message.to_string())
+        .map_err(|error| daemon::DaemonDispatchError::new(error.message.to_string(), error.data))
     }
 
     async fn warm_all(&self) {
@@ -682,6 +705,23 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
     }
 }
 
+fn daemon_mcp_error(message: impl Into<String>, data: Option<serde_json::Value>) -> McpError {
+    let error = daemon::DaemonDispatchError::new(message, data);
+    McpError::internal_error(error.message, Some(error.error_detail))
+}
+
+fn protocol_mismatch_error(message: String, data: Option<serde_json::Value>) -> McpError {
+    let mut error = daemon::DaemonDispatchError::new(message, data);
+    error.error_detail["domain_disposition"] =
+        serde_json::json!(khive_runtime::DomainDisposition::Unknown.as_str());
+    error.error_detail["code"] = serde_json::json!("version_mismatch");
+    error.error_detail["kind"] = serde_json::json!("protocol");
+    if let Some(fields) = error.error_detail.as_object_mut() {
+        fields.remove("domain_result");
+    }
+    McpError::internal_error(error.message, Some(error.error_detail))
+}
+
 fn map_response(
     resp: DaemonResponseFrame,
     expected_config_id: &str,
@@ -697,7 +737,7 @@ fn map_response(
                 PROTOCOL_VERSION, resp.daemon_protocol_version,
             )
         });
-        return Some(Err(McpError::internal_error(msg, None)));
+        return Some(Err(protocol_mismatch_error(msg, resp.error_detail)));
     }
 
     if resp.namespace_mismatch {
@@ -737,7 +777,7 @@ fn map_response(
                 resp.served_config_id.as_deref().unwrap_or("unknown"),
             )
         });
-        Some(Err(McpError::internal_error(msg, None)))
+        Some(Err(daemon_mcp_error(msg, resp.error_detail)))
     }
 }
 
@@ -1602,7 +1642,7 @@ where
 /// same daemon or a freshly-spawned one) and must never silently fall back to
 /// local dispatch, either of which could execute a mutation a second time.
 fn ambiguous_forward_error() -> McpError {
-    McpError::internal_error(
+    daemon_mcp_error(
         "daemon response lost after request was sent; not retrying or locally \
          dispatching to avoid duplicate execution",
         None,
@@ -1623,7 +1663,7 @@ fn daemon_unreachable_error(
         ?os_error_code,
         "daemon socket is unreachable from this process; lifecycle recovery suppressed"
     );
-    McpError::internal_error(
+    daemon_mcp_error(
         "cannot reach daemon socket from this process; refusing daemon lifecycle recovery \
          because the daemon may still be healthy",
         Some(serde_json::json!({
@@ -1702,7 +1742,7 @@ fn respawn_failed_error(failure: RespawnFailure) -> McpError {
     } else {
         serde_json::json!({"reason": "respawn_failed"})
     };
-    McpError::internal_error(
+    daemon_mcp_error(
         "daemon respawn failed (respawn_failed); rebuild with `make local` and retry",
         Some(data),
     )
@@ -1721,7 +1761,7 @@ fn incumbent_still_alive_error(pid: u32) -> McpError {
     if is_daemon_strict_mode() {
         data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
     }
-    McpError::internal_error(
+    daemon_mcp_error(
         format!("daemon recovery refused: incumbent PID {pid} is still alive after the deadline"),
         Some(data),
     )
@@ -2104,7 +2144,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
             drop(guard);
         }
         Ok(Err(e)) => {
-            return BootFenceOutcome::HardError(McpError::internal_error(
+            return BootFenceOutcome::HardError(daemon_mcp_error(
                 format!(
                     "failed to acquire daemon boot/recovery lock while waiting for \
                      cold-boot quiescence: {e}"
@@ -2113,7 +2153,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
             ));
         }
         Err(e) => {
-            return BootFenceOutcome::HardError(McpError::internal_error(
+            return BootFenceOutcome::HardError(daemon_mcp_error(
                 format!("boot-quiescence wait task failed: {e}"),
                 None,
             ));
@@ -2129,7 +2169,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
     {
         ProbeOutcome::Alive => BootFenceOutcome::DaemonReady,
         ProbeOutcome::Dead => BootFenceOutcome::SafeLocalFallback,
-        ProbeOutcome::Timeout => BootFenceOutcome::HardError(McpError::internal_error(
+        ProbeOutcome::Timeout => BootFenceOutcome::HardError(daemon_mcp_error(
             "daemon state uncertain after cold-boot quiescence; not falling back to \
              local dispatch to avoid racing a possibly still-initializing index",
             None,
@@ -2139,7 +2179,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
         // own. Handled here only for match exhaustiveness over the shared
         // `ProbeOutcome` type; same fail-safe HardError as `Timeout` if it
         // were ever reached.
-        ProbeOutcome::LockContended => BootFenceOutcome::HardError(McpError::internal_error(
+        ProbeOutcome::LockContended => BootFenceOutcome::HardError(daemon_mcp_error(
             "daemon state uncertain after cold-boot quiescence (lock probe unexpectedly \
              contended); not falling back to local dispatch",
             None,
@@ -2344,7 +2384,7 @@ where
             // process itself is the stale one. Trigger self-heal alongside
             // the hard error below, never in place of it.
             trigger_bridge_self_heal();
-            return Some(Err(McpError::internal_error(
+            return Some(Err(protocol_mismatch_error(
                 format!(
                     "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
                      run `make local` to rebuild the daemon binary"
@@ -2469,7 +2509,7 @@ where
                 // either arm can observe the mismatch depending on whether this
                 // was the first probe or a retry after a kill/respawn.
                 trigger_bridge_self_heal();
-                return Some(Err(McpError::internal_error(
+                return Some(Err(protocol_mismatch_error(
                     format!(
                         "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
                          run `make local` to rebuild the daemon binary"
@@ -2489,6 +2529,16 @@ where
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+/// Let sibling unit tests compose the real frame mapping with a captured dispatch.
+#[cfg(all(unix, test))]
+pub(crate) fn map_response_for_test(
+    response: DaemonResponseFrame,
+    expected_config_id: &str,
+    namespace: &str,
+) -> Option<Result<String, McpError>> {
+    map_response(response, expected_config_id, namespace)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2570,6 +2620,7 @@ mod tests {
             ok: true,
             result: Some(result.to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2585,6 +2636,7 @@ mod tests {
             ok: false,
             result: None,
             error: error.map(str::to_string),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2608,6 +2660,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: true,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2630,6 +2683,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: true,
             served_config_id: Some(CFG.to_string()),
@@ -2654,6 +2708,7 @@ mod tests {
             ok: true,
             result: Some("served-by-broad-registry".to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: None,
@@ -2680,6 +2735,7 @@ mod tests {
             ok: true,
             result: Some("served-by-other-config".to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(
@@ -2709,6 +2765,7 @@ mod tests {
             ok: true,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2734,6 +2791,80 @@ mod tests {
     }
 
     #[test]
+    fn disposition_map_response_preserves_error_detail_without_dispatch() {
+        let detail = serde_json::json!({
+            "kind": "obligation",
+            "code": "store_failure",
+            "message": "audit failed",
+            "domain_disposition": "committed",
+            "domain_result": { "id": "persisted-row" },
+        });
+        let mut frame = frame_err(Some("audit failed"));
+        frame.error_detail = Some(detail.clone());
+        let error = map_response(frame, CFG, NS).unwrap().unwrap_err();
+        assert_eq!(error.message, "audit failed");
+        assert_eq!(error.data, Some(detail));
+    }
+
+    #[test]
+    fn disposition_legacy_and_lost_responses_are_unknown() {
+        let legacy = map_response(frame_err(Some("legacy failure")), CFG, NS)
+            .unwrap()
+            .unwrap_err();
+        for error in [legacy, ambiguous_forward_error()] {
+            let detail = error.data.unwrap();
+            assert_eq!(detail["domain_disposition"], "unknown");
+            assert!(detail.get("domain_result").is_none());
+        }
+    }
+
+    #[test]
+    fn disposition_version_mismatch_is_unknown_even_with_untrusted_detail() {
+        let mut frame = frame_err(Some("protocol mismatch"));
+        frame.version_mismatch = true;
+        frame.error_detail = Some(serde_json::json!({
+            "message": "protocol mismatch",
+            "domain_disposition": "committed",
+            "domain_result": { "id": "uncertain-peer-result" },
+        }));
+        let detail = map_response(frame, CFG, NS)
+            .unwrap()
+            .unwrap_err()
+            .data
+            .unwrap();
+        assert_eq!(detail["domain_disposition"], "unknown");
+        assert_eq!(detail["code"], "version_mismatch");
+        assert!(detail.get("domain_result").is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn disposition_mcp_adapter_preserves_request_error_data() {
+        use daemon::DaemonDispatch;
+
+        let server = make_test_server();
+        let params = RequestParams {
+            ops: "[".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        };
+        let expected = server
+            .dispatch_request_inner(params, false, None, crate::server::DispatchOrigin::Daemon)
+            .await
+            .unwrap_err();
+        let actual = server
+            .dispatch_with_error_detail("[".to_string(), None, None, None, None, false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(actual.message, expected.message.to_string());
+        assert_eq!(Some(actual.error_detail), expected.data);
+    }
+
+    #[test]
     fn map_response_not_ok_without_message_yields_contextual_err() {
         match map_response(frame_err(None), CFG, NS) {
             Some(Err(McpError { message, .. })) => {
@@ -2753,6 +2884,7 @@ mod tests {
             ok: false,
             result: None,
             error: Some("daemon protocol mismatch: client=0 daemon=1 — rebuild/update the client binary (make local)".to_string()),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2782,6 +2914,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2985,6 +3118,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: true,
             served_config_id: Some(daemon.to_string()),
@@ -4944,7 +5078,8 @@ mod tests {
             first_wire["ok"], false,
             "from_wire=true subhandler must be blocked through the daemon: {first_wire}"
         );
-        let err_wire = first_wire["error"].as_str().unwrap_or("");
+        let err_wire = first_wire["error"]["message"].as_str().unwrap_or("");
+        assert_eq!(first_wire["error"]["domain_disposition"], "not_committed");
         assert!(
             err_wire.contains("permission denied") || err_wire.contains("subhandler"),
             "daemon-forward wire path must surface the subhandler gate error; got: {err_wire}"
@@ -4957,7 +5092,7 @@ mod tests {
             serde_json::from_str(resp_op.result.as_deref().expect("operator result body"))
                 .expect("decode operator result json");
         let first_op = &body_op["results"][0];
-        let err_op = first_op["error"].as_str().unwrap_or("");
+        let err_op = first_op["error"]["message"].as_str().unwrap_or("");
         assert!(
             !err_op.contains("permission denied") && !err_op.contains("subhandler"),
             "operator frame must NOT gate the subhandler through the daemon: {first_op}"
@@ -5019,6 +5154,7 @@ mod tests {
             ok: true,
             result: Some("stale-result".to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
@@ -5460,6 +5596,7 @@ mod tests {
                     ok: true,
                     result: Some(serde_json::json!({"results": [], "summary": {}}).to_string()),
                     error: None,
+                    error_detail: None,
                     namespace_mismatch: false,
                     config_mismatch: false,
                     served_config_id: Some(req.config_id.clone()),
@@ -5906,6 +6043,7 @@ mod tests {
     struct BigDispatch {
         namespace: String,
         config_id: String,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
@@ -5920,10 +6058,17 @@ mod tests {
             _from_wire: bool,
             _identity: Option<khive_runtime::RequestIdentity>,
         ) -> Result<String, String> {
-            // Return a string whose serialized DaemonResponseFrame JSON length
-            // exceeds MAX_FRAME_BYTES.  The frame JSON overhead is ~200 bytes so
-            // a result of this size is comfortably over the cap.
-            Ok("X".repeat(khive_runtime::daemon::MAX_FRAME_BYTES + 1))
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(serde_json::json!({"results": [
+                {"ok": true, "tool": "create", "result": {
+                    "payload": "X".repeat(khive_runtime::daemon::MAX_FRAME_BYTES + 1),
+                }},
+                {"ok": false, "tool": "create", "error": {
+                    "kind": "internal", "message": "handler failed",
+                    "domain_disposition": "unknown",
+                }},
+            ]})
+            .to_string())
         }
 
         async fn warm_all(&self) {}
@@ -5953,9 +6098,11 @@ mod tests {
         std::env::remove_var("KHIVE_NO_DAEMON");
 
         let config_id = "test-oversized-config";
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let dispatcher = BigDispatch {
             namespace: "test".to_string(),
             config_id: config_id.to_string(),
+            calls: std::sync::Arc::clone(&calls),
         };
 
         // Run the real daemon server (with handle_conn's oversized gate live).
@@ -6018,6 +6165,7 @@ mod tests {
             "KILL_COUNT must be 0 — oversized response must NOT trigger \
              kill_stale_daemon_inner (fails if handle_conn oversized gate is removed)"
         );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // The result must be Some(Err(..)) containing "too large" — the explicit
         // error frame the server sends when the real response is oversized.
@@ -6028,6 +6176,10 @@ mod tests {
                     "error must describe the oversized response; got: {}",
                     e.message
                 );
+                let detail = e.data.expect("frame-cap disposition");
+                assert_eq!(detail["domain_disposition"], "unknown");
+                assert_eq!(detail["code"], "response_frame_size_limit");
+                assert!(detail.get("domain_result").is_none());
             }
             Some(Ok(_)) => panic!("oversized response must not produce Ok result"),
             None => panic!(
@@ -6240,6 +6392,7 @@ mod tests {
                 ok: true,
                 result: None,
                 error: None,
+                error_detail: None,
                 namespace_mismatch: false,
                 config_mismatch: false,
                 served_config_id: Some(config_id.clone()),
@@ -6792,6 +6945,7 @@ mod tests {
             ok: false,
             result: None,
             error: Some("parse error: empty ops string".to_string()),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
@@ -7003,6 +7157,7 @@ mod tests {
                  rebuild/update the client binary (make local)",
                 PROTOCOL_VERSION
             )),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
@@ -7088,6 +7243,7 @@ mod tests {
                 PROTOCOL_VERSION,
                 PROTOCOL_VERSION + 1
             )),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
@@ -7404,6 +7560,7 @@ mod tests {
                     ok: true,
                     result: Some("daemon-handled-stats".to_string()),
                     error: None,
+                    error_detail: None,
                     namespace_mismatch: false,
                     config_mismatch: false,
                     served_config_id: Some(cfg_for_srv.clone()),

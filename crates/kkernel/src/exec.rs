@@ -4810,9 +4810,9 @@ id = "lambda:fallback"
             .as_array()
             .expect("failure rows")
             .iter()
-            .all(|failure| failure["error"]
+            .all(|failure| failure["error"]["message"]
                 .as_str()
-                .unwrap_or_default()
+                .expect("error.message is text")
                 .contains("sql_bridge.reader_open")));
 
         let (serial_server, _, serial_max) = concurrency_probe_server(true);

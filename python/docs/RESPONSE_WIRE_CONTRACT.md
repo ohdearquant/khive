@@ -67,18 +67,47 @@ entries (R5).
 {
   "results": [
     {"ok": true, "tool": "create", "result": {"id": "example-id"}},
-    {"ok": false, "tool": "get", "error": "not found: example-id"}
+    {"ok": false, "tool": "get", "error": {
+      "kind": "runtime_error", "message": "not found: example-id",
+      "domain_disposition": "unknown"
+    }}
   ],
   "summary": {"total": 2, "succeeded": 1, "failed": 1, "aborted": 0},
   "status": "partial"
 }
 ```
 
-The `error` field can be a string or an object. `OpError` preserves an object's
-fields, including unfamiliar fields, while `OpResult.error` also accepts strings
-and absent/null errors. A string error is not upgraded to a fabricated structured
-error. In particular, today's missing-ID `get` returns `RuntimeError::NotFound`,
-which the server emits as a string (R6).
+Per-operation errors are objects. `OpError` preserves their fields, including
+unfamiliar fields. `OpResult.error` also accepts legacy strings and absent/null
+errors; an old string error is not upgraded to a fabricated structured error.
+A missing-ID `get` returns `RuntimeError::NotFound` from its handler, which the
+server renders as a `runtime_error` object with unknown domain disposition (R6).
+
+Every current error object carries `domain_disposition` (R14):
+
+| Value | What this operation's dispatch boundary establishes |
+| --- | --- |
+| `committed` | Domain dispatch succeeded before later processing failed. |
+| `not_committed` | The operation was refused before dispatch or explicitly asserts no write. |
+| `unknown` | The domain outcome cannot be established from this failure. |
+
+Post-dispatch obligation failures retain the successful value in `domain_result`:
+
+```json
+{
+  "kind": "obligation",
+  "code": "store_failure",
+  "message": "audit failed",
+  "domain_disposition": "committed",
+  "domain_result": {"id": "persisted-row"}
+}
+```
+
+Depth or byte limits can omit a committed result; `code` names the limit.
+An absent result requires separate outcome resolution. A disposition other than
+`not_committed` never grants permission to replay. A legacy missing field supplies
+no evidence of non-commit. Success entries gain no disposition field. Python
+exposes these keys without adding retries or changing when per-op failures raise.
 
 Writer-task failures carry this object shape (R7):
 
@@ -90,7 +119,8 @@ Writer-task failures carry this object shape (R7):
   "message": "writer task terminated",
   "retryable": false,
   "request_state": "side_effects_unknown",
-  "task_terminated": true
+  "task_terminated": true,
+  "domain_disposition": "unknown"
 }
 ```
 
@@ -123,7 +153,8 @@ values are emitted as JSON null when unavailable (R9):
   "capability": null,
   "operation": null,
   "scope": "writer_admission",
-  "retry_after_ms": 100
+  "retry_after_ms": 100,
+  "domain_disposition": "unknown"
 }
 ```
 
@@ -133,8 +164,9 @@ failure occurred before queue acceptance. The model preserves `kind`, `code`,
 `stage`, `message`, `retryable`, `timeout_ms`, `capability`, `operation`, `scope`,
 and `retry_after_ms` when present.
 
-The `RuntimeError::Khive` arm serializes `KhiveError` directly. It has `kind` and
-`message`, with nullable `code` and `details`. A populated code is a string such
+The `RuntimeError::Khive` arm serializes `KhiveError`, then adds the disposition
+from its dispatch boundary. It has `kind` and `message`, with nullable `code` and
+`details`. A populated code is a string such
 as `runtime:10`; populated details are a string-to-string map. Retry hints are
 not serialized as a field on this type (R10).
 
@@ -143,23 +175,39 @@ not serialized as a field on this type (R10).
   "kind": "not_found",
   "message": "entity not found: example-id",
   "code": null,
-  "details": null
+  "details": null,
+  "domain_disposition": "unknown"
 }
 ```
 
-These error families are not exhaustive. For example, depth refusal emits
-`kind: "result_too_deep"` and `message`, without `code` or `stage`. Preserving
+These error families are not exhaustive. For example, post-dispatch depth refusal
+emits `kind` and `code` as `result_too_deep`, `message`, and a committed disposition
+without `domain_result`. Preserving
 extra fields and admitting a message-only object avoids imposing a closed
 client-side taxonomy on evolving server responses (R11).
+
+## Daemon errors
+
+Protocol v4 keeps the top-level frame `error` as text for unchanged peers. The
+optional additive `error_detail` carries the structured object. The MCP adapter
+preserves it as error data; native Python frame failures expose it as
+`exception.error_detail`, an `OpError` model. A legacy frame without detail keeps
+that attribute `None` (R15).
+
+Version mismatches are always unknown, including responses from an older peer.
+A frame-cap replacement can cover mixed per-op outcomes and therefore reports
+unknown with no `domain_result`. Neither error initiates a new Python retry.
+Existing config-mismatch recovery remains a separate handshake path.
 
 ## Aborted entries and correlation
 
 After a chain operation fails, later operations are not executed. The ordinary
-chain arm emits `ok: false`, `tool`, `aborted: true`, and a top-level `message`,
+chain arm emits `ok: false`, `tool`, `aborted: true`,
+`domain_disposition: "not_committed"`, and a top-level `message`,
 without an `error` field. The strict-fallback arm omits that message as well (R12):
 
 ```json
-{"ok": false, "tool": "get", "aborted": true}
+{"ok": false, "tool": "get", "aborted": true, "domain_disposition": "not_committed"}
 ```
 
 The existing Python envelope compatibility rule also admits the older minimal
@@ -191,11 +239,13 @@ review those changes and use behavioral fixtures for the client obligations.
 | R3 | crates/khive-pack-kg/src/handlers/list.rs -- "} else if raw_more && scanned >= MAX_SCAN_TOTAL {"; crates/khive-pack-kg/src/handlers/list.rs -- "!has_more_match && raw_more && scanned >= MAX_SCAN_TOTAL,"; crates/khive-pack-kg/src/handlers/list.rs -- "response[\"scan_incomplete\"] = Value::Bool(true);"; crates/khive-pack-kg/src/handlers/list.rs -- "let mut response = render_list_response(to_json(&remapped)?, requested, limit);" |
 | R4 | crates/khive-pack-kg/src/handlers/list.rs -- "const ENTITY_LIST_CAP: u32 = 500;"; crates/khive-pack-kg/src/handlers/list.rs -- "const NOTE_LIST_CAP: u32 = 200;"; crates/khive-runtime/src/operations.rs -- "pub const EDGE_LIST_MAX_LIMIT: u32 = 1000;" |
 | R5 | crates/khive-mcp/src/server.rs -- "results[index] = Some(entry);"; crates/khive-mcp/src/server.rs -- "\"summary\": { \"total\": total, \"succeeded\": succeeded, \"failed\": failed, \"aborted\": 0 },"; crates/khive-mcp/src/server.rs -- "if failed == 0 && aborted == 0 {"; crates/khive-mcp/src/server.rs -- "ops (reported as {\"ok\": false, \"aborted\": true}). Committed ops are not rolled back." |
-| R6 | crates/khive-pack-kg/src/handlers/get.rs -- "Err(RuntimeError::NotFound(format!(\"not found: {}\", p.id)))"; crates/khive-mcp/src/server.rs -- "let Some(context) = other.retryable_failure_context() else {"; crates/khive-mcp/src/server.rs -- "return json!(other.to_string());" |
-| R7 | crates/khive-mcp/src/server.rs -- "if let Some(context) = other.writer_task_failure_context() {"; crates/khive-mcp/src/server.rs -- "\"kind\": \"storage\","; crates/khive-mcp/src/server.rs -- "\"code\": context.stage,"; crates/khive-mcp/src/server.rs -- "\"stage\": context.stage,"; crates/khive-mcp/src/server.rs -- "\"message\": other.to_string(),"; crates/khive-mcp/src/server.rs -- "\"retryable\": context.retryable,"; crates/khive-mcp/src/server.rs -- "\"request_state\": context.request_state.to_string(),"; crates/khive-mcp/src/server.rs -- "\"task_terminated\": context.task_terminated," |
+| R6 | crates/khive-pack-kg/src/handlers/get.rs -- "Err(RuntimeError::NotFound(format!(\"not found: {}\", p.id)))"; crates/khive-mcp/src/server.rs -- "fn runtime_error_value("; crates/khive-mcp/src/server.rs -- "\"runtime_error\""; crates/khive-mcp/src/server.rs -- "error_with_disposition(payload, disposition)" |
+| R7 | crates/khive-mcp/src/server.rs -- "other.writer_task_failure_context()"; crates/khive-mcp/src/server.rs -- "\"storage\""; crates/khive-mcp/src/server.rs -- "context.stage"; crates/khive-mcp/src/server.rs -- "other.to_string()"; crates/khive-mcp/src/server.rs -- "context.retryable"; crates/khive-mcp/src/server.rs -- "context.request_state.to_string()"; crates/khive-mcp/src/server.rs -- "context.task_terminated" |
 | R8 | crates/khive-storage/src/error.rs -- "Self::NotStarted => \"not_started\","; crates/khive-storage/src/error.rs -- "Self::TransactionRolledBack => \"transaction_rolled_back\","; crates/khive-storage/src/error.rs -- "Self::SideEffectsUnknown => \"side_effects_unknown\","; crates/khive-runtime/src/error.rs -- "/// not be inferred from rollback finality alone." |
-| R9 | crates/khive-mcp/src/server.rs -- "\"kind\": \"unavailable\","; crates/khive-mcp/src/server.rs -- "\"retryable\": true,"; crates/khive-mcp/src/server.rs -- "\"timeout_ms\": timeout_ms,"; crates/khive-mcp/src/server.rs -- "\"capability\": capability,"; crates/khive-mcp/src/server.rs -- "\"operation\": context.operation,"; crates/khive-mcp/src/server.rs -- "\"scope\": context.scope,"; crates/khive-mcp/src/server.rs -- "\"retry_after_ms\": context.retry_after_ms,"; crates/khive-runtime/src/error.rs -- "pub const WRITER_ADMISSION_SCOPE: &str = \"writer_admission\";" |
+| R9 | crates/khive-mcp/src/server.rs -- "other.retryable_failure_context()"; crates/khive-mcp/src/server.rs -- "\"unavailable\""; crates/khive-mcp/src/server.rs -- "context.timeout.as_millis()"; crates/khive-mcp/src/server.rs -- "context.capability.map(storage_capability_wire_name)"; crates/khive-mcp/src/server.rs -- "context.operation"; crates/khive-mcp/src/server.rs -- "context.scope"; crates/khive-mcp/src/server.rs -- "context.retry_after_ms"; crates/khive-runtime/src/error.rs -- "pub const WRITER_ADMISSION_SCOPE: &str = \"writer_admission\";" |
 | R10 | crates/khive-mcp/src/server.rs -- "RuntimeError::Khive(k) => serde_json::to_value(&k)"; crates/khive-types/src/khive_error.rs -- "pub struct KhiveError {"; crates/khive-types/src/khive_error.rs -- "code: Option<ErrorCode>,"; crates/khive-types/src/khive_error.rs -- "details: Option<Details>,"; crates/khive-types/src/khive_error.rs -- "s.serialize_str(&self.to_string())"; crates/khive-types/src/khive_error.rs -- "map.serialize_entry(k.as_ref(), v.as_ref())?;" |
-| R11 | crates/khive-mcp/src/server.rs -- "fn depth_error_payload(context: &str) -> Value {"; crates/khive-mcp/src/server.rs -- "\"kind\": \"result_too_deep\"," |
-| R12 | crates/khive-mcp/src/server.rs -- "\"aborted\": true,"; crates/khive-mcp/src/server.rs -- "\"message\": format!("; crates/khive-mcp/src/server.rs -- "json!({ \"ok\": false, \"tool\": op.tool, \"aborted\": true })" |
+| R11 | crates/khive-mcp/src/server.rs -- "fn depth_error_payload("; crates/khive-mcp/src/server.rs -- "\"kind\": \"result_too_deep\""; crates/khive-mcp/src/server.rs -- "\"code\": \"result_too_deep\""; crates/khive-mcp/src/server.rs -- "fn error_with_disposition(" |
+| R12 | crates/khive-mcp/src/server.rs -- "fn aborted_entry("; crates/khive-mcp/src/server.rs -- "entry.insert(\"aborted\".into(), Value::Bool(true));"; crates/khive-mcp/src/server.rs -- "DomainDisposition::NotCommitted.as_str()"; crates/khive-mcp/src/server.rs -- "aborted_entry(op.tool.clone(), None)" |
 | R13 | crates/khive-mcp/src/tools/request.rs -- "/// operation-unique id or a cross-attempt idempotency key."; crates/khive-mcp/src/tools/request.rs -- "pub request_id: Option<u64>," |
+| R14 | crates/khive-runtime/src/error.rs -- "Self::Committed => \"committed\","; crates/khive-runtime/src/error.rs -- "Self::NotCommitted => \"not_committed\","; crates/khive-runtime/src/error.rs -- "Self::Unknown => \"unknown\","; crates/khive-mcp/src/server.rs -- "RuntimeError::AuditObligation"; crates/khive-mcp/src/server.rs -- "error.insert(\"domain_result\".into(), domain_result);"; python/khive/models.py -- "Literal[\"committed\", \"not_committed\", \"unknown\"]" |
+| R15 | crates/khive-runtime/src/daemon.rs -- "pub error: Option<String>,"; crates/khive-runtime/src/daemon.rs -- "pub error_detail: Option<serde_json::Value>,"; crates/khive-runtime/src/daemon.rs -- "pub const PROTOCOL_VERSION: u32 = 4;"; crates/khive-mcp/src/daemon.rs -- "fn daemon_mcp_error("; crates/khive-mcp/src/daemon.rs -- "fn protocol_mismatch_error("; python/khive/transport.py -- "error_detail=_validate_frame_error_detail(response, \"daemon\")" |
