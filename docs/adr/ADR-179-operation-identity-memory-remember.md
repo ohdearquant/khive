@@ -30,8 +30,8 @@ supplies that identity for the write that a memory-backed agent loop issues most
 The store already refuses duplicates by identity where it has one: `try_insert_note` is an
 `INSERT OR IGNORE` followed by an `external_id` verification, and the audit lane appends by generation
 id. `memory.remember` exposes no identity of its own. ADR-172 proposes a general `key` on notes with
-compare-and-set updates, fences and keyed listings; that record is under review and larger than this
-need. The narrow thing is stated here so it can land first, on ADR-172's storage shape, so that
+compare-and-set updates, fences and keyed listings; that record is Proposed on main and larger than
+this need. The narrow thing is stated here so it can land first, on ADR-172's storage shape, so that
 ADR-172 later finds the column in place rather than a fork of it.
 
 ## Decision
@@ -67,8 +67,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_namespace_kind_key
 
 Existing rows hold `NULL` and are untouched. Uniqueness is per note kind, so this record's use of it
 is confined to kind `memory`; the `create(key=)`, `get(key=)`, `key_ambiguous` and keyed-listing
-surfaces of ADR-172 are not landed here and ADR-172 keeps them. When ADR-172 lands it does not add the
-column or the index again; its migration text is reconciled to this one.
+surfaces of ADR-172 are not landed here and ADR-172 keeps them. ADR-172 names one migration 028
+carrying `version`, its trigger, `key` and the index. This record takes number 028 for `key` and the
+index alone; when ADR-172's implementation lands it does not add them again, and its `version` column
+and trigger take the next free number, recorded by an amendment to ADR-172.
 
 ### D3. The key is immutable and released by deletion
 
