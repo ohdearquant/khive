@@ -792,6 +792,12 @@ presentation mode and per-op override on the canonical machine result. A client 
 entries on its own side is outside this guarantee; the canonical request/outcome carrier for the
 Python client is separate work and cites this record.
 
+On the daemon frame the top-level `error` stays text, because unchanged peers deserialize it as a
+string; the frame gains an additive optional `error_detail` object of the same shape as the per-op
+error object (`kind`, `code`, `message`, `domain_disposition`, and `domain_result` when present),
+which the MCP side maps into its error data and the Python client exposes. No protocol version
+change for this amendment; a peer that ignores `error_detail` sees what it saw before.
+
 ### A3.2 A post-dispatch obligation error is UNKNOWN to the caller and never retry permission
 
 The consumer rule, stated once here so every client inherits it rather than rediscovering it: an
