@@ -100,6 +100,32 @@ response. Without `--strict`, a _partially_ failed request (`status: "partial"` 
 one success) retains its compatibility behavior and exits zero; `--strict` converts any failed
 or aborted op into a nonzero process exit.
 
+### Check grammar without execution
+
+Use `kkernel exec --plan '<ops>'` to parse an operations string and inspect its stages without
+executing any verb:
+
+```bash
+kkernel exec --plan 'create(kind="note", content="example") | get(id=$prev.id)'
+```
+
+This requires an already-running daemon using the same configuration. Start it with
+`kkernel mcp --daemon` first, using matching `--db` and `--config` selections when needed.
+Planning connects to that daemon directly; it does not start a daemon or construct a local
+runtime. An unavailable daemon or a protocol/configuration mismatch is a terminal error.
+`KHIVE_NO_DAEMON` does not select local execution for a plan.
+
+The command prints the decoded plan object as JSON. Both `parsed=true` and `parsed=false`
+exit successfully: a grammar error appears in the result's `error` field. A plan lists
+normalized arguments, literal `$prev` references, stage count and whether each verb is in
+the daemon's loaded catalog. It does not establish permission or resolve references.
+
+`--plan` requires positional operations and rejects explicit presentation, output, save,
+bulk-file, execution-mode and identity options, including `--presentation verbose` and
+`--strict`. The ordinary command's default verbose presentation does not affect plans.
+`--db` and `--config` select the matching daemon configuration; no actor or request identity
+is sent. Invalid options and transport failures exit nonzero.
+
 ### Bulk JSONL execution
 
 `kkernel exec --ops-file batch.jsonl` accepts one independent JSON operation per

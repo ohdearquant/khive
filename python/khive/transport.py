@@ -33,6 +33,7 @@ from typing import Any
 from .envelope import (
     _decode_json_text,
     _envelope_from_payload,
+    _plan_from_payload,
     _validate_envelope_results,
     _validate_frame_error_detail,
 )
@@ -45,7 +46,7 @@ from .errors import (
 )
 from .models import OpError
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 
@@ -130,9 +131,10 @@ class Session:
     # -- handshake ---------------------------------------------------------
 
     def handshake(self) -> str:
-        response = self.transport.round_trip(
-            self._base_frame() | {"metrics_only": True}, self.timeout
-        )
+        return self._handshake(self._base_frame())
+
+    def _handshake(self, frame: dict[str, Any]) -> str:
+        response = self.transport.round_trip(frame | {"metrics_only": True}, self.timeout)
         self._check_version(response)
         served = response.get("served_config_id")
         if not served:
@@ -181,6 +183,45 @@ class Session:
         parsed = _decode_json_text(raw, "daemon") if isinstance(raw, str) else raw
         envelope = _envelope_from_payload(parsed, "daemon")
         return _validate_envelope_results(envelope, "daemon")["results"]
+
+    def plan(self, ops: str, *, timeout: float | None = None) -> dict[str, Any]:
+        """Parse ops without dispatch; return a plan, including parsed=false errors.
+
+        A successful parse reports syntax and catalog information, not permission
+        to execute the operations or evidence that their references will resolve.
+        """
+        if self._config_id is None:
+            self._handshake(self._plan_frame())
+        frame = self._plan_frame() | {"ops": ops, "plan": True}
+        response = self.transport.round_trip(frame, timeout or self.timeout)
+        self._check_version(response)
+        if response.get("config_mismatch"):
+            self._handshake(self._plan_frame())
+            frame["config_id"] = self._config_id
+            response = self.transport.round_trip(frame, timeout or self.timeout)
+            self._check_version(response)
+            if response.get("config_mismatch"):
+                raise ConfigMismatch(
+                    str(response.get("error")),
+                    error_detail=_validate_frame_error_detail(response, "daemon"),
+                )
+        if not response.get("ok"):
+            raise RequestRejected(
+                str(response.get("error")),
+                error_detail=_validate_frame_error_detail(response, "daemon"),
+            )
+        raw = response.get("result")
+        parsed = _decode_json_text(raw, "daemon") if isinstance(raw, str) else raw
+        return _plan_from_payload(parsed, "daemon")
+
+    def _plan_frame(self) -> dict[str, Any]:
+        return {
+            "ops": "",
+            # Required by the frame codec; the plan path never resolves identity.
+            "namespace": "",
+            "config_id": self._config_id or "",
+            "protocol_version": PROTOCOL_VERSION,
+        }
 
     def _base_frame(self) -> dict[str, Any]:
         return {

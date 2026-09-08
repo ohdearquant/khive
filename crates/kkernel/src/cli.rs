@@ -2147,6 +2147,7 @@ mod tests {
                 // route around the coordinator's full-UUID-only interception.
                 let resp = server
                     .dispatch_request_local(RequestParams {
+                        plan: None,
                         ops,
                         presentation: Some("verbose".to_string()),
                         presentation_per_op: None,

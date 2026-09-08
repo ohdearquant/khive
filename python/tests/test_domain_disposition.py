@@ -1,4 +1,4 @@
-"""Disposition preservation across actual protocol-v4 socket frames."""
+"""Disposition preservation across actual daemon socket frames."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def framed_daemon(response, *, config_id="test-config", raw_response=None):
         def serve():
             try:
                 for index, reply in enumerate([
-                    {"ok": True, "served_config_id": config_id, "daemon_protocol_version": 4},
+                    {"ok": True, "served_config_id": config_id, "daemon_protocol_version": PROTOCOL_VERSION},
                     response,
                 ]):
                     with listener.accept()[0] as connection:
@@ -90,10 +90,10 @@ def test_daemon_error_detail_is_exposed_without_replaying(disposition):
         assert len(requests) == 2
         assert requests[0]["metrics_only"] is True
         assert requests[1]["ops"] == 'create(kind="note", content="once")'
-        assert requests[1]["protocol_version"] == PROTOCOL_VERSION == 4
+        assert requests[1]["protocol_version"] == PROTOCOL_VERSION
 
 
-def test_legacy_v4_text_error_is_accepted_without_inventing_a_disposition_or_replay():
+def test_legacy_text_error_is_accepted_without_inventing_a_disposition_or_replay():
     with framed_daemon({"ok": False, "error": "legacy failure"}) as (transport, requests):
         with pytest.raises(RequestRejected) as raised:
             Session(transport).request("create()")
@@ -118,7 +118,7 @@ def test_version_mismatch_remains_unknown_without_replaying(detail):
         error = raised.value.error_detail
         assert error.domain_disposition == "unknown"
         assert "domain_result" not in error.model_fields_set
-        assert (raised.value.client_version, raised.value.daemon_version) == (4, 3)
+        assert (raised.value.client_version, raised.value.daemon_version) == (PROTOCOL_VERSION, 3)
         assert len(requests) == 2
 
 

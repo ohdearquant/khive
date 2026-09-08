@@ -3109,6 +3109,12 @@ where
 impl KhiveMcpServer {
     #[tool(description = r#"Run one or more khive verbs in a single MCP call.
 
+Set plan=true with ops alone to check syntax without execution. The result has
+parsed, mode, stage_count, stages (verb, pack, known, args, prev_refs), and parser
+limits. A syntax error returns parsed=false and error, with no stages. Planning
+does not check permission or resolve references. presentation, presentation_per_op,
+format, format_per_op, save_to, and request_id cannot accompany plan=true.
+
 ops syntax:
 
   Single op   : verb(name=value, name=value)
@@ -3221,7 +3227,28 @@ fn forward_or_spawn_boxed(
 }
 
 impl KhiveMcpServer {
+    pub(crate) fn plan_ops(&self, ops: &str) -> String {
+        let catalog = self
+            .registry
+            .all_verbs_with_names()
+            .into_iter()
+            .map(|(pack, handler)| (handler.name.to_string(), pack.to_string()))
+            .collect();
+        khive_request::plan_request(ops, &catalog).to_string()
+    }
+
+    fn plan_response(&self, p: &RequestParams) -> Result<Option<String>, McpError> {
+        if p.plan != Some(true) {
+            return Ok(None);
+        }
+        p.validate_plan_envelope()?;
+        Ok(Some(self.plan_ops(&p.ops)))
+    }
+
     async fn request_with_cancellation(&self, p: RequestParams) -> Result<String, McpError> {
+        if let Some(plan) = self.plan_response(&p)? {
+            return Ok(plan);
+        }
         let mut p = p;
         let request_id = ensure_bridge_request_id(&mut p);
         tracing::debug!(
@@ -3244,6 +3271,9 @@ impl KhiveMcpServer {
         p: RequestParams,
         #[cfg(unix)] forward_fn: ForwardFnPtr,
     ) -> Result<String, McpError> {
+        if let Some(plan) = self.plan_response(&p)? {
+            return Ok(plan);
+        }
         // Parse before the daemon decision. The daemon protocol's historical
         // error channel is string-only, so forwarding malformed DSL would turn
         // `invalid_params` plus its structured `parse-error` reason into an
@@ -3651,6 +3681,7 @@ impl KhiveMcpServer {
     #[cfg(unix)]
     pub(crate) fn wire_daemon_frame(&self, p: &RequestParams) -> khive_runtime::DaemonRequestFrame {
         khive_runtime::DaemonRequestFrame {
+            plan: false,
             ops: p.ops.clone(),
             presentation: p.presentation.clone(),
             presentation_per_op: p.presentation_per_op.clone(),
@@ -3773,6 +3804,7 @@ impl KhiveMcpServer {
         debug_assert!(policy.max_batch_concurrency > 0);
         let parsed = parse_typed_json_batch(ops).map_err(dsl_err_to_mcp)?;
         let p = RequestParams {
+            plan: None,
             ops: String::new(),
             presentation,
             presentation_per_op: None,
@@ -3869,6 +3901,9 @@ impl KhiveMcpServer {
         origin: DispatchOrigin,
         strict_refusals: bool,
     ) -> Result<String, McpError> {
+        if let Some(plan) = self.plan_response(&p)? {
+            return Ok(plan);
+        }
         // `dispatch_request_inner_scoped` is the complete parse/dispatch/render
         // pipeline. Keep that large generator behind one pointer before handing
         // it to the generic task-local scope: otherwise the scope embeds the
@@ -4681,6 +4716,30 @@ fn build_instructions(catalog: &str, builtins: &str) -> String {
 
 #[tool_handler]
 impl ServerHandler for KhiveMcpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, McpError> {
+        // The router turns parameter-deserialization failures into tool errors.
+        // Plan isolation requires the JSON-RPC invalid_params response instead.
+        if request.name == "request" {
+            if let Some(args) = request.arguments.as_ref() {
+                if args.get("plan") == Some(&Value::Bool(true)) {
+                    for field in crate::tools::request::PLAN_COMPANIONS {
+                        if args.contains_key(field) {
+                            return Err(invalid_request_error(format!(
+                                "plan=true cannot be combined with {field}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        Self::tool_router().call(context).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         let catalog = self.verb_catalog();
         let builtins = builtin_pack_names().join(", ");
@@ -4723,6 +4782,7 @@ impl ServerHandler for KhiveMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("server/plan_tests.rs");
     use khive_runtime::Namespace;
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
@@ -4817,6 +4877,7 @@ mod tests {
         .expect("in-memory runtime");
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
         let params = RequestParams {
+            plan: None,
             ops: json!({
                 "tool": "stats",
                 "args": {"payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1)},
@@ -4897,6 +4958,7 @@ mod tests {
         SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
 
         let params = RequestParams {
+            plan: None,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5554,6 +5616,7 @@ mod tests {
         crate::daemon::test_forward_seam::arm();
 
         let params = RequestParams {
+            plan: None,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6647,6 +6710,7 @@ mod tests {
         let response = server
             .dispatch_request_inner(
                 RequestParams {
+                    plan: None,
                     ops: format!(
                         "[large_result(bytes={result_bytes}), large_result(bytes={result_bytes})]"
                     ),
@@ -6689,6 +6753,7 @@ mod tests {
         let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
         let response = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!("large_result(bytes={result_bytes})"),
                 presentation: None,
                 presentation_per_op: None,
@@ -9045,6 +9110,7 @@ mod tests {
         let resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "stats()".to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -9189,6 +9255,7 @@ mod tests {
 
         let baseline = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -9203,6 +9270,7 @@ mod tests {
         let resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "comm.send(to=\"bob\", content=\"double-forward-probe\")".to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -9233,6 +9301,7 @@ mod tests {
 
         let after = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -9299,6 +9368,7 @@ mod tests {
 
         let baseline = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -9334,6 +9404,7 @@ mod tests {
         let single_resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "comm.send(to=\"bob\", content=\"strict-single-probe\")".to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -9362,6 +9433,7 @@ mod tests {
         let batch_resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "[comm.send(to=\"bob\", content=\"strict-batch-1\"), \
                        comm.send(to=\"bob\", content=\"strict-batch-2\")]"
                         .to_string(),
@@ -9392,6 +9464,7 @@ mod tests {
         let chain_resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "comm.send(to=\"bob\", content=\"strict-chain-1\") | \
                       comm.send(to=\"bob\", content=\"strict-chain-2\")"
                         .to_string(),
@@ -9423,6 +9496,7 @@ mod tests {
         // ── no local dispatch ever happened for any of the three calls ─────
         let after = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -9470,6 +9544,7 @@ mod tests {
 
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"search(kind="entity", query="a deliberately long keyword dense query whose terms cannot all match any entity in this empty corpus")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -9500,6 +9575,7 @@ mod tests {
         // guarantee (bounded-concurrency ops have no relative ordering).
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "create(kind=\"entity\", entity_kind=\"concept\", name=\"kg-search-status\") \
                        | search(kind=\"entity\", query=\"kg-search-status\")"
                     .to_string(),
@@ -9790,6 +9866,7 @@ mod tests {
         let server = in_memory_kg_server();
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "[create(kind=\"entity\", entity_kind=\"concept\", name=\"status-ok-1\"), \
                        create(kind=\"entity\", entity_kind=\"concept\", name=\"status-ok-2\")]"
                     .to_string(),
@@ -9817,6 +9894,7 @@ mod tests {
         // The second op targets an unknown kind and fails; the first succeeds.
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops:
                     "[create(kind=\"entity\", entity_kind=\"concept\", name=\"status-partial-1\"), \
                        search(kind=\"not_a_real_kind\", query=\"x\")]"
@@ -9847,6 +9925,7 @@ mod tests {
         let server = in_memory_kg_server();
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "search(kind=\"not_a_real_kind\", query=\"x\") | \
                       create(kind=\"entity\", entity_kind=\"concept\", name=\"status-chain-aborted\")"
                     .to_string(),

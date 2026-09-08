@@ -10,6 +10,8 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "khive MCP server library — served via the kkernel binary"
+# The shared parser corpus is available only in a workspace checkout.
+exclude = ["tests/plan_conformance.rs"]
 
 [dependencies]
 khive-db = { version = "0.8.0", path = "../khive-db" }
