@@ -808,6 +808,61 @@ impl VamanaIndex {
     /// [`Self::load_or_build`] and crates/khive-vamana/docs/api/persistence.md#v2-crash-safe-save-load).
     #[cfg(feature = "mmap")]
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_with_lock_hook(path, |lock| lock.lock_shared().map_err(Into::into))
+    }
+
+    /// Reader half of the publication protocol, and the seam the concurrency tests
+    /// drive. `acquire_lock` receives the open (but unlocked) `.checkpoint.lock` and
+    /// must return only once this reader holds a shared lock on it; production passes
+    /// the blocking `lock_shared()` call.
+    ///
+    /// [`Self::save_atomic_with_lock_hook`] renames `metadata.bin` into place as the
+    /// commit record and only then renames the four segment files, so a reader that
+    /// opens the directory between those renames sees a new commit record against stale
+    /// segments and fails the checksum gate. That window is deliberate for crash
+    /// recovery, where it is reached once and the caller rebuilds. Under concurrent
+    /// processes it is reached on *every* publication, and the rebuild each reader
+    /// performs to recover from it publishes again — so the recovery path is also the
+    /// amplifier. Taking a shared lock on the same file the writer holds exclusively
+    /// puts the whole rename sequence outside anything a reader can observe.
+    ///
+    /// A directory with no lock file — a v1 layout, or a segment no `save_atomic` has
+    /// ever written — loads unlocked, because there is no writer using this protocol to
+    /// exclude. The lock releases when the guard drops at the end of the load; an mmap
+    /// taken during the load holds its own inode open, so a rename landing afterwards
+    /// cannot change what was loaded.
+    #[cfg(feature = "mmap")]
+    fn load_with_lock_hook(
+        path: &Path,
+        acquire_lock: impl FnOnce(&File) -> Result<()>,
+    ) -> Result<Self> {
+        let _publication_guard = Self::open_publication_lock(path, acquire_lock)?;
+        Self::load_unlocked(path)
+    }
+
+    /// Open `path`'s `.checkpoint.lock` and hand it to `acquire_lock`. `None` means the
+    /// directory has no lock file, which is not a failure: a v1 layout, or a segment no
+    /// `save_atomic` has ever written, has no writer using this protocol to exclude.
+    #[cfg(feature = "mmap")]
+    fn open_publication_lock(
+        path: &Path,
+        acquire_lock: impl FnOnce(&File) -> Result<()>,
+    ) -> Result<Option<File>> {
+        match OpenOptions::new()
+            .read(true)
+            .open(path.join(".checkpoint.lock"))
+        {
+            Ok(lock) => {
+                acquire_lock(&lock)?;
+                Ok(Some(lock))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(feature = "mmap")]
+    fn load_unlocked(path: &Path) -> Result<Self> {
         let metadata_path = path.join("metadata.bin");
         let head = fs::read(&metadata_path)?;
         if head.len() >= 8 && &head[..8] == V2_COMMIT_MAGIC {
@@ -1029,7 +1084,21 @@ impl VamanaIndex {
         rebuild_last_applied_seq: Option<u64>,
     ) -> Result<Self> {
         let metadata_path = path.join("metadata.bin");
-        let rebuild_and_persist = |config| {
+
+        // Every read below — the commit record and all four segments — happens under a
+        // shared publication lock, so it cannot observe `save_atomic`'s rename sequence
+        // half-applied. Without it a concurrent publication is seen as a new commit
+        // record against stale segments, the checksum gate rejects it, and the recovery
+        // is `rebuild_and_persist` — which publishes, tearing the next reader. See
+        // `load_with_lock_hook`.
+        let mut publication_guard =
+            Self::open_publication_lock(path, |lock| lock.lock_shared().map_err(Into::into))?;
+
+        // Takes the guard because `save_atomic` acquires the same file exclusively and
+        // file locks are not reentrant across descriptors: the read lock is released
+        // before anything publishes.
+        let rebuild_and_persist = |guard: &mut Option<File>, config| {
+            guard.take();
             let mut index = Self::rebuild_from_corpus(corpus_vectors, config)?;
             index.set_last_applied_seq(rebuild_last_applied_seq);
             index.save_atomic(path)?;
@@ -1047,20 +1116,20 @@ impl VamanaIndex {
                 ] {
                     let _ = fs::remove_file(path.join(suffix));
                 }
-                return rebuild_and_persist(fallback_config);
+                return rebuild_and_persist(&mut publication_guard, fallback_config);
             }
             Err(e) => return Err(e.into()),
         };
 
         if metadata_bytes.len() < 8 {
-            return rebuild_and_persist(fallback_config);
+            return rebuild_and_persist(&mut publication_guard, fallback_config);
         }
 
         if &metadata_bytes[..8] == V2_COMMIT_MAGIC {
             let commit = match parse_v2_commit(&metadata_bytes) {
                 Ok(c) => c,
                 Err(_) => {
-                    return rebuild_and_persist(fallback_config);
+                    return rebuild_and_persist(&mut publication_guard, fallback_config);
                 }
             };
 
@@ -1074,7 +1143,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    return rebuild_and_persist(config);
+                    return rebuild_and_persist(&mut publication_guard, config);
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1087,7 +1156,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    return rebuild_and_persist(config);
+                    return rebuild_and_persist(&mut publication_guard, config);
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1100,7 +1169,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    return rebuild_and_persist(config);
+                    return rebuild_and_persist(&mut publication_guard, config);
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1119,7 +1188,7 @@ impl VamanaIndex {
                     search_list_size: commit.index_meta.search_list_size,
                     alpha: commit.index_meta.alpha,
                 };
-                return rebuild_and_persist(config);
+                return rebuild_and_persist(&mut publication_guard, config);
             }
 
             // codes.bin is checksum-gated exactly like the other segments whenever the
@@ -1136,7 +1205,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    return rebuild_and_persist(config);
+                    return rebuild_and_persist(&mut publication_guard, config);
                 }
             }
 
@@ -1149,7 +1218,7 @@ impl VamanaIndex {
                     search_list_size: commit.index_meta.search_list_size,
                     alpha: commit.index_meta.alpha,
                 };
-                return rebuild_and_persist(config);
+                return rebuild_and_persist(&mut publication_guard, config);
             }
             let live_count = corpus_vectors.len() / dim;
             let live_content_hash = *blake3::hash(cast_slice(corpus_vectors)).as_bytes();
@@ -1165,7 +1234,7 @@ impl VamanaIndex {
                     search_list_size: commit.index_meta.search_list_size,
                     alpha: commit.index_meta.alpha,
                 };
-                return rebuild_and_persist(config);
+                return rebuild_and_persist(&mut publication_guard, config);
             }
 
             // Fast path: load all segments, restore lifecycle state.
@@ -1182,7 +1251,7 @@ impl VamanaIndex {
                         search_list_size: commit.index_meta.search_list_size,
                         alpha: commit.index_meta.alpha,
                     };
-                    rebuild_and_persist(config)
+                    rebuild_and_persist(&mut publication_guard, config)
                 }
                 Err(e) => Err(e),
             }
@@ -1199,13 +1268,16 @@ impl VamanaIndex {
             // Release the mmap before save_atomic overwrites the same files.
             index.ensure_owned()?;
             index.set_last_applied_seq(rebuild_last_applied_seq);
+            // Same reason as in `rebuild_and_persist`: this branch publishes, so the
+            // shared read lock must be gone before `save_atomic` asks for it exclusively.
+            publication_guard.take();
             index.save_atomic(path)?;
             Ok(index)
         } else {
             // Unknown or garbage magic: treat as corrupt snapshot and rebuild.
             // VamanaIndex::load (direct v1 callers) remains strict; load_or_build always
             // recovers because the caller supplies a corpus and fallback config.
-            rebuild_and_persist(fallback_config)
+            rebuild_and_persist(&mut publication_guard, fallback_config)
         }
     }
 
@@ -5423,6 +5495,164 @@ mod tests {
         let persisted = VamanaIndex::load(dir.path()).unwrap();
         assert_eq!(persisted.last_applied_seq(), Some(200));
         assert_eq!(persisted.vectors().unwrap(), vectors);
+    }
+
+    /// A reader must not be admitted into `save_atomic`'s critical section, because
+    /// every rename that publishes a checkpoint happens inside it: `metadata.bin` as the
+    /// commit record first, then the four segment files. A reader admitted between those
+    /// renames reads a new commit record against stale segments — the state seen in
+    /// production as `lifecycle.bin rev_num_nodes N != num_vectors M` and `v2 codes
+    /// segment checksum mismatch` — and every caller's recovery from it is a rebuild,
+    /// which publishes, which tears the next reader.
+    ///
+    /// The probe uses `try_lock_shared` while the writer holds the lock, so `WouldBlock`
+    /// is evidence of real exclusion rather than a timing guess.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn a_reader_cannot_enter_the_publication_critical_section() {
+        let vectors = rand_unit_vectors(30, 8, 0x1138_0300);
+        let config = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let mut index = VamanaIndex::build(&vectors, config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        index.set_last_applied_seq(Some(1));
+        index.save_atomic(dir.path()).unwrap();
+        index.set_last_applied_seq(Some(2));
+
+        let writer_path = dir.path().to_path_buf();
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let writer_handle = std::thread::spawn(move || {
+            index.save_atomic_with_lock_hook(&writer_path, |lock| {
+                lock.lock()?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        locked_rx.recv().unwrap();
+
+        enum ProbeOutcome {
+            Contended,
+            Uncontended,
+            ProbeFailed(String),
+        }
+        let reader_path = dir.path().to_path_buf();
+        let (probe_tx, probe_rx) = std::sync::mpsc::sync_channel(0);
+        let reader_handle = std::thread::spawn(move || {
+            VamanaIndex::load_with_lock_hook(&reader_path, |lock| {
+                match lock.try_lock_shared() {
+                    Ok(()) => {
+                        probe_tx.send(ProbeOutcome::Uncontended).unwrap();
+                        Ok(())
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        probe_tx.send(ProbeOutcome::Contended).unwrap();
+                        lock.lock_shared()?;
+                        Ok(())
+                    }
+                    Err(std::fs::TryLockError::Error(err)) => {
+                        probe_tx
+                            .send(ProbeOutcome::ProbeFailed(err.to_string()))
+                            .unwrap();
+                        Err(err.into())
+                    }
+                }
+            })
+        });
+        match probe_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("reader probe never signaled within 60s")
+        {
+            ProbeOutcome::Contended => {}
+            ProbeOutcome::Uncontended => {
+                panic!("a reader entered the publication critical section")
+            }
+            ProbeOutcome::ProbeFailed(err) => panic!("reader lock probe failed: {err}"),
+        }
+
+        release_tx.send(()).unwrap();
+        writer_handle.join().unwrap().unwrap();
+        // The reader was delayed, not failed: it completes once publication ends, and
+        // what it gets is the finished checkpoint rather than a torn one.
+        let loaded = reader_handle.join().unwrap().unwrap();
+        assert_eq!(loaded.last_applied_seq(), Some(2));
+        assert_eq!(loaded.vectors().unwrap(), vectors);
+    }
+
+    /// The reader lock is shared, so it excludes publication and nothing else. Without
+    /// this the fix would trade a rebuild storm for a read convoy across every process
+    /// on the index root.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn concurrent_readers_do_not_exclude_each_other() {
+        let vectors = rand_unit_vectors(24, 8, 0x1138_0400);
+        let config = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let index = VamanaIndex::build(&vectors, config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        index.save_atomic(dir.path()).unwrap();
+
+        let first_path = dir.path().to_path_buf();
+        let (holding_tx, holding_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let first = std::thread::spawn(move || {
+            VamanaIndex::load_with_lock_hook(&first_path, |lock| {
+                lock.lock_shared()?;
+                holding_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        holding_rx.recv().unwrap();
+
+        let second_path = dir.path().to_path_buf();
+        let (probe_tx, probe_rx) = std::sync::mpsc::sync_channel(0);
+        let second = std::thread::spawn(move || {
+            VamanaIndex::load_with_lock_hook(&second_path, |lock| {
+                let acquired = lock.try_lock_shared().is_ok();
+                probe_tx.send(acquired).unwrap();
+                if acquired {
+                    Ok(())
+                } else {
+                    lock.lock_shared().map_err(Into::into)
+                }
+            })
+        });
+        assert!(
+            probe_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("second reader never probed within 60s"),
+            "a shared publication lock must not exclude another reader"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap().vectors().unwrap(), vectors);
+        assert_eq!(second.join().unwrap().unwrap().vectors().unwrap(), vectors);
+    }
+
+    /// A directory with no `.checkpoint.lock` has no writer using this protocol, so the
+    /// load proceeds unlocked rather than failing. Covers v1 layouts and any segment
+    /// directory `save_atomic` has never written.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn load_succeeds_when_no_publication_lock_file_exists() {
+        let vectors = rand_unit_vectors(16, 8, 0x1138_0500);
+        let config = VamanaConfig::with_dimensions(8)
+            .with_max_degree(8)
+            .with_search_list_size(16);
+        let index = VamanaIndex::build(&vectors, config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        index.save_atomic(dir.path()).unwrap();
+
+        let lock_path = dir.path().join(".checkpoint.lock");
+        assert!(lock_path.exists(), "save_atomic must create the lock file");
+        fs::remove_file(&lock_path).unwrap();
+
+        let loaded = VamanaIndex::load(dir.path()).unwrap();
+        assert_eq!(loaded.vectors().unwrap(), vectors);
     }
 
     #[cfg(feature = "mmap")]
