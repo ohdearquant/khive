@@ -117,3 +117,28 @@ outside `declared_write_paths` yields `success: false` and the bytes are not ret
 over the cap retains the tail and the receipt's counts match the bytes produced; 13 each refusal
 class has a receipt row; 14 two runs with one `session_id` carry `seq` 1 and 2; 15 the sandbox object
 changes when the read roots change (control); 16 a tool registered at the `git` binary is refused.
+
+## Amendment 2 (2026-09-08): limits per platform, file-size semantics, profile identity
+
+Adopted on the first native run of the loop driver's exec contract on macOS.
+
+1. **Limits the platform cannot enforce per run are refused at load.** `[exec] limits` accepts
+   `cpu_seconds`, `address_space`, `file_size` and `nproc`. On macOS the address-space limit is not
+   settable and the process limit counts every process of the user, so a configuration naming either
+   is refused at config load with `[exec] limits.<name>: unsupported_on_platform`; the daemon does not
+   start and the reason is in the startup log. The receipt's `limits` carries `requested` (the config)
+   and `enforced` (the child's own report of the limits it received).
+2. **File-size semantics.** A write that crosses the file-size limit is truncated to the limit with no
+   signal; the signal fires on a write attempted at the limit. A run over the limit therefore ends by
+   signal 25 or, for a runtime that ignores that signal, by a failed write reported in its own stream.
+   The receipt's `exit_signal` and captured streams are the evidence, never the exit status alone.
+3. **Profile identity.** The seatbelt profile allows reads of the root directory, the system read
+   roots, the configured read roots and the run directory, and writes only under the run directory.
+   `exec.identity` reports the read roots, their digest, the profile template digest and the digest
+   algorithm, so a client can check its expectation of the sandbox before it runs anything.
+
+Acceptance arms added: 17 a configuration naming `address_space` or `nproc` refuses at startup with
+the named limit; 18 a run over `cpu_seconds` ends by signal 24 and one over `file_size` ends by
+signal 25 or a failed write, with the receipt's `enforced` limits equal to the configuration; 19
+`exec.identity` and the receipt's `sandbox` agree on the read-roots digest, and the digest changes
+when a read root is added (control).
