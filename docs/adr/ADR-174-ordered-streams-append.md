@@ -277,3 +277,86 @@ Stated before implementation, checked at the PR that lands the code; every arm n
 
 - ADR-007 (namespaces), ADR-088 (note kinds), ADR-172 (`version`, `key`, `fence`, durability), migration
   V7 (`notes_seq`) and V13 (list cursor ledgers).
+
+## Amendment 1 (2026-09-08): a fenced batch is one request, one transaction, per-op errors as values
+
+**Status**: Proposed.
+
+### The gap
+
+§5 says a request array of appends is dense but unordered, and that a caller wanting order on one
+stream sends a chain or carries `expected_seq`. A state layer built on streams needs a third shape
+that neither the array nor the chain gives: one request that appends to several streams in the
+order written, writes a document beside them, checks the caller's authority once, and reports a
+failing member as a value while every sibling still commits. A chain aborts the remainder after a
+failure; an array commits siblings but assigns numbers in admission order and returns nothing about
+a member's place in the caller's list. Neither form can be composed into the third by the caller,
+because the fence is per transaction and checking authority once is the point.
+
+The conformance case that decides it, from the consumer's own suite (a batch of two appends to one
+stream, a read of an unknown object, an unknown verb and a head write):
+
+```text
+res = store.batch([
+  ("append", {"stream": "b", "record": {"n": 1}}),
+  ("append", {"stream": "b", "record": {"n": 2}}),
+  ("get", {"ref": "0" * 64}),
+  ("nope", {}),
+  ("write_head", {"key": "h", "kind": "job", "doc": {}}),
+])
+assert [r.seq for r in res[:2]] == [1, 2]
+assert isinstance(res[2], NotFound) and isinstance(res[3], Refused) and res[4].version == 1
+assert [e.record["n"] for e in store.read("b")] == [1, 2]
+```
+
+### A1.1 `stream.batch`
+
+`stream.batch(ops, fence=None, namespace=None)` takes a list of member operations, each
+`{"op": "append", "stream": S, "record": R, "expected_seq": N | null}` or
+`{"op": "write", "key": K, "kind": <note kind>, "doc": D, "expected_version": V | null}` (the
+keyed document write of ADR-172 §2 and §3), and runs the whole list inside one writer transaction:
+
+- Members are validated before anything is written: an unknown `op`, a malformed member, or a
+  record over the note content limit refuses the whole batch with `KhiveError::invalid_input` and
+  writes nothing.
+- Authority is checked once for the batch, on the caller's namespace, before the first write; the
+  optional `fence` is ADR-172 §2b, evaluated once inside the same transaction; `fence_conflict`
+  refuses the whole batch and writes nothing.
+- Appends to one stream take consecutive numbers in list order; appends to different streams are
+  independent. Every member commits in the transaction unless the batch is refused as a whole.
+- A member's own refusal (`seq_conflict`, `version_conflict`, `key_conflict`) is returned as that
+  member's value, with the ADR-172 §2 error shape, and does not abort its siblings; the transaction
+  still commits the members that succeeded. This is the one place in khive where a per-op error is
+  a value inside a committed transaction, and the record says so here so no one reads it as the
+  request array's semantics.
+- The result is `{"results": [<member result or member error>...], "committed": true}` in list
+  order; a member result is the append's `{"seq", "id", "created_at"}` or the write's
+  `{"id", "version"}`.
+- Reads (`get`, `stream.read`) are not members: a batch is a write primitive. The consumer's case
+  above reads an unknown object inside its batch; on khive that read is issued beside the batch,
+  not inside it, and the consumer's adapter places it there.
+
+### A1.2 What does not change
+
+§5 stands for the request array and the chain. `stream.append` alone is unchanged. The density
+invariant (§3) holds inside the batch by construction: numbers are assigned by the same ledger
+insert, in one transaction.
+
+### Acceptance
+
+1. **Order and values.** The conformance case above, with the read issued beside the batch:
+   `results[0].seq == 1`, `results[1].seq == 2`, the unknown-op member refused as a value, the
+   document write at version 1, and `stream.read("b")` returning records 1 then 2.
+2. **Whole-batch refusal writes nothing.** A malformed member, a stale fence and a missing fence
+   row each refuse the batch; the note count, the ledger count and every named stream's head are
+   unchanged; the audit population is read as domain events only.
+3. **Member refusal commits siblings.** A batch of three appends where the second carries a stale
+   `expected_seq` returns `seq_conflict` for it as a value and commits the first and the third with
+   consecutive numbers; the stream reads two records.
+4. **Authority once.** A batch whose caller lacks write authority on the namespace is refused as a
+   whole before any member runs; a control with authority and the same members commits.
+5. **Two processes.** Two processes issue batches to one stream concurrently; each batch's appends
+   are consecutive within the batch, and the union of numbers is dense.
+6. **Mutation.** With member refusals promoted to whole-batch refusals, arm 3 goes red; with the
+   fence evaluated after the first write, arm 2's unchanged-count assertion goes red; with per-stream
+   numbering assigned outside the transaction, arm 5 goes red.
