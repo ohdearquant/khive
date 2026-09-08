@@ -897,7 +897,8 @@ neither is ever `null`.
 `audit_batch_flush_failures`, `audit_degraded_rows`, and `audit_degraded` are additive fields
 supplied by the runtime's audit-batch control once one is registered: accepted batch generations
 that reached a terminal non-commit outcome after retry, pure-observability rows released without a
-commit, and a monotonic process-lifetime degradation flag, respectively. Each carries a matching
+commit, and a monotonic process-lifetime degradation flag that either of the first two sets,
+respectively. Each carries a matching
 `_unavailable_reason` field and reports `null` — never a fabricated `0`/`false` — for a direct
 `khive-db` caller or a runtime with no audit-batch control registered.
 
