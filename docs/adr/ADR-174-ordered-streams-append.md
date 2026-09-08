@@ -326,9 +326,15 @@ operations, each `{"op": "append", "stream": S, "record": R, "expected_seq": N |
 `{"op": "write", "key": K, "kind": <note kind>, "doc": D, "expected_version": V | null}` (the
 keyed document write of ADR-172 §2 and §3). Common to both modes:
 
-- Members are validated before anything is written: an unknown `op`, a malformed member, or a
-  record over the note content limit refuses the whole batch with `KhiveError::invalid_input` and
-  writes nothing.
+- Members are validated for shape before anything is written: a member that is not an object, a
+  member without an `op` string, or a record over the note content limit refuses the whole batch
+  with `KhiveError::invalid_input` and writes nothing. An op string that names no member operation
+  is not a shape error: it is that member's refusal, `unknown_op`, and the mode below decides
+  whether it stops the batch or returns as the member's value.
+- A member refusal, wherever it surfaces, carries the ADR-172 §2 error shape plus
+  `domain_disposition: not_committed` (ADR-133 Amendment 3), and a `key_conflict` names the holder
+  as `existing_id` (ADR-179 D5), so the consumer rule of ADR-133 Amendment 3 reads it without a
+  special case.
 - Authority is checked once for the batch, on the caller's namespace, before the first write.
 - Appends to one stream take consecutive numbers in list order; appends to different streams are
   independent.
@@ -347,15 +353,15 @@ the consumer's production caller cannot detect. `atomic=true` without a fence is
 ADR-172 §2b, evaluated once inside that transaction before the first write. `observed`, when
 present, is a list of `{"key": K, "version": V}` the caller read before composing the batch; every
 entry is checked inside the transaction before the first write, and a mismatch refuses the batch
-with `version_conflict` naming the key. A member's own refusal (`seq_conflict`, `version_conflict`,
-`key_conflict`) refuses the whole batch: the transaction rolls back, nothing is written, and the
-error carries the member's ADR-172 §2 error shape plus `member` (the list index) and
-`committed: false`. Under ADR-133 Amendment 3 the disposition is `not_committed`. The caller may
+with `version_conflict` naming the key. A member's own refusal (`unknown_op`, `seq_conflict`,
+`version_conflict`, `key_conflict`) refuses the whole batch: the transaction rolls back, nothing
+is written, and the error carries that member's refusal plus `member` (the list index) and
+`committed: false`. The caller may
 ignore the result list on success, because success means every member committed.
 
 **Per-member (unfenced) mode.** Each member runs in its own writer transaction, in list order, and
-the numbering guarantee follows from that order. A member's own refusal is returned as that
-member's value, with the ADR-172 §2 error shape, and its siblings stand; the result is still
+the numbering guarantee follows from that order. A member's own refusal (`unknown_op`, `seq_conflict`,
+`version_conflict`, `key_conflict`) is returned as that member's value and its siblings stand; the result is still
 `{"results": [...], "committed": true}`, where `committed` says the request as a whole ran to the
 end, and each member's outcome is its own entry. `observed` is refused in this mode
 (`invalid_input`): an observation set is a precondition for a transaction, and there is none here.
@@ -367,7 +373,10 @@ further amendment; the adapter carries the divergence until then.
 
 ### A1.2 What does not change
 
-§5 stands for the request array and the chain. `stream.append` alone is unchanged. The density
+§5 stands for the request array and the chain. `stream.append` alone is unchanged. The `write`
+member depends on ADR-172's keyed create and versioned write (§2, §3) landing; the append-only
+form of the batch does not, and implementation lands appends first and the `write` member with the
+keyed write. The density
 invariant (§3) holds inside an atomic batch by construction and across a per-member batch by
 serial execution under the writer lock.
 
@@ -375,7 +384,7 @@ serial execution under the writer lock.
 
 1. **Per-member order and values.** The conformance case above, unfenced, with the read issued
    beside the batch: `results[0].seq == 1`, `results[1].seq == 2`, the unknown-op member refused
-   as a value, the document write at version 1, and `stream.read("b")` returning records 1 then 2.
+   as a value (`unknown_op`, `domain_disposition: not_committed`), the document write at version 1, and `stream.read("b")` returning records 1 then 2.
 2. **Atomic refusal writes nothing.** Under a fence, a batch of three appends where the second
    carries a stale `expected_seq` is refused as a whole with `seq_conflict` and `member: 1`; the
    note count, the ledger count and every named stream's head are unchanged; the audit population
