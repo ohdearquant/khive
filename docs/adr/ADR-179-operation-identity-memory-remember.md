@@ -127,6 +127,9 @@ on the replay itself (ADR-133 Amendment 3) is resolved by replaying again; the k
 
 ## Implementation notes
 
+- The insert-then-resolve step can miss when the holder is soft-deleted between the two statements;
+  the handler retries the insert once and otherwise returns an error with `domain_disposition:
+  "unknown"`.
 - `crates/khive-db/sql/028-notes-key.sql` and a `VersionedMigration` at version 28 in
   `crates/khive-db/src/migrations.rs`; the `Note` type gains `key: Option<String>`.
 - `crates/khive-pack-memory/src/handlers/common.rs`: `RememberParams` gains `key`; `remember.rs`
