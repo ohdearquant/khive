@@ -8,7 +8,7 @@
 # it. Omitting it did not make the gate lenient about a pack it never built; it
 # made the gate blind to seven verbs the artifact was already shipping, so
 # losing all of them still cleared a floor set below their count.
-FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal,moodboard
+FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal,moodboard,tool
 LOCAL_VERB_FLOOR := 98
 CARGO ?= cargo
 LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
