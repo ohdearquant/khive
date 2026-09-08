@@ -30,6 +30,7 @@ fn file_backed_registry(
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        exec: Default::default(),
     })
     .expect("file-backed runtime");
     let mut builder = VerbRegistryBuilder::new();

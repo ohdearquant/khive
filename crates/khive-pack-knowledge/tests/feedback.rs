@@ -54,6 +54,7 @@ fn make_rt_with_actor(actor: &str) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: Some(actor.to_string()),
+        exec: Default::default(),
     })
     .expect("runtime with actor")
 }

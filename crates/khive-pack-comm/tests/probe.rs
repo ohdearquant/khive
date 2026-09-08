@@ -1024,6 +1024,7 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     };
     let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
 
@@ -1210,6 +1211,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     };
     let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
 

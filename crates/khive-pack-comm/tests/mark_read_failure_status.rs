@@ -28,6 +28,7 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        exec: Default::default(),
     });
     match previous_write_queue {
         Some(value) => std::env::set_var("KHIVE_WRITE_QUEUE", value),

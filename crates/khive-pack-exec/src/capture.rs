@@ -70,10 +70,8 @@ pub async fn drain<R: AsyncRead + Unpin>(mut reader: R, cap: u64) -> Tail {
 /// A regular file found in the run directory after the run.
 #[derive(Debug, Clone)]
 pub struct Found {
-    pub path: String,
     pub abs: PathBuf,
     pub mode: u32,
-    pub len: u64,
 }
 
 /// Walk `root` without following symlinks. Symlinks are reported by relative
@@ -119,15 +117,7 @@ pub fn walk(root: &Path) -> std::io::Result<(BTreeMap<String, Found>, Vec<String
             } else {
                 644
             };
-            files.insert(
-                child_rel.clone(),
-                Found {
-                    path: child_rel,
-                    abs,
-                    mode,
-                    len: meta.len(),
-                },
-            );
+            files.insert(child_rel, Found { abs, mode });
         }
     }
     Ok((files, skipped))

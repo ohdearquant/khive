@@ -154,7 +154,8 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf]) -> String {
     for root in read_roots {
         maps.push(format!("(subpath {})", quote(root)));
     }
-    maps.push(format!("(subpath {})", quote(run_dir)));
+    let run = format!("(subpath {})", quote(run_dir));
+    maps.push(run.clone());
     format!(
         "(version 1)\n\
          (deny default)\n\
@@ -172,7 +173,7 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf]) -> String {
          (allow file-write-data (literal \"/dev/null\"))\n",
         reads = reads.join(" "),
         maps = maps.join(" "),
-        run = format!("(subpath {})", quote(run_dir)),
+        run = run,
     )
 }
 
