@@ -758,8 +758,9 @@ carries `domain_disposition` with exactly one of three values:
   an unknown verb, a request that failed parameter validation or `$prev` resolution, a conflict
   refusal, the permission refusal of an internal subhandler, and every aborted chain entry (an op
   never dispatched because an earlier op in its chain failed). No domain effect exists. The value
-  is assigned by raise site, never by error variant. The secret gate is the standing example: it is
-  invoked inside handlers (`crates/khive-runtime/src/operations.rs`, the code and git ingest
+  is assigned by raise site, never by error variant: `InvalidInput` is raised by pack handlers as
+  well as by parameter validation, and the secret gate is the standing example: it is invoked inside
+  handlers (`crates/khive-runtime/src/operations.rs`, the code and git ingest
   handlers) at points where a handler may already have written, so a `SecretDetected` raised there
   is `unknown`. A handler whose gate provably runs before every write on a path may claim
   `not_committed` for that path by name, in a later amendment.
@@ -815,8 +816,10 @@ before the fold and every `unknown` disposition stay genuinely unknown until it 
 4. **Degrade path unchanged.** An admission-degrade-safe read under the two transient reasons of
    Amendment 1 still returns `ok: true` with its result; no disposition field appears on a success.
 5. **Every error carries the field.** A test walks every error constructor reachable from the
-   envelope (the exhaustive match in `runtime_error_value`) and asserts the field is present; adding
-   an error variant without a disposition fails to compile or fails this test.
+   envelope, the exhaustive match in `runtime_error_value` and the envelope-layer sites that build an
+   error entry without it (the depth guard, the batch byte budget, the conflict, `$prev` and
+   permission refusals, the aborted-entry constructor), and asserts the field is present; adding an
+   error variant or an envelope-layer site without a disposition fails to compile or fails this test.
 6. **Three surfaces, one shape.** The MCP `request` tool, the daemon frame and the Python client
    return the same error object for the same forced failure; the Python client preserves the two
    new keys without validation errors.
