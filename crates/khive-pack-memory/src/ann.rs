@@ -66,6 +66,14 @@ pub(crate) struct AnnBridge {
 
 /// Shared model-index cache with single-flight and freshness coordination.
 pub(crate) struct AnnState {
+    /// Whether this process may build the memory index from the full corpus and
+    /// publish the result. A corpus build is minutes of CPU and a segment
+    /// rewrite every other reader on the index root must then absorb, and it
+    /// pays for itself only in a process that outlives the request. Serving
+    /// processes set this from the daemon role at construction; the admin
+    /// reindex path sets it unconditionally, because building is what it was
+    /// invoked to do.
+    pub(crate) builds_corpus_indexes: bool,
     indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
     /// Synchronous so `WarmingGuard::drop` can release it on every exit path.
     warming: std::sync::Mutex<HashSet<AnnKey>>,
@@ -110,8 +118,17 @@ pub(crate) struct AnnState {
 
 pub(crate) type SharedAnn = Arc<AnnState>;
 
+/// Shared ANN state for a process that builds corpus indexes: the warm daemon
+/// and the admin reindex path.
 pub(crate) fn new_shared() -> SharedAnn {
+    new_shared_for_role(true)
+}
+
+/// Shared ANN state whose corpus-build authority is stated explicitly. The
+/// serving pack passes the daemon role; see `AnnState::builds_corpus_indexes`.
+pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
     Arc::new(AnnState {
+        builds_corpus_indexes,
         indexes: RwLock::new(HashMap::new()),
         warming: std::sync::Mutex::new(HashSet::new()),
         model_locks: Mutex::new(HashMap::new()),
@@ -183,10 +200,38 @@ const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::f
 const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(0);
 
 /// Delay between chained rebuild tasks so continuous writes coalesce.
+///
+/// One second coalesces nothing against a fleet that writes continuously: the
+/// chain re-enqueues before the next write arrives, so it never idles and the
+/// index is rebuilt and republished on a cadence set by nothing in particular.
+/// The chain exists so a write converges without a reader, not to keep readers
+/// fresh — a recall warms on demand at request time — so the window it should
+/// use is the one that batches a burst of writes into one build. Override with
+/// `KHIVE_ANN_REBUILD_DEBOUNCE_MS`; a malformed value falls back to the default.
 #[cfg(not(test))]
-const REBUILD_CHAIN_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+const REBUILD_CHAIN_DEBOUNCE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(test)]
-const REBUILD_CHAIN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(5);
+const REBUILD_CHAIN_DEBOUNCE_DEFAULT: std::time::Duration = std::time::Duration::from_millis(5);
+
+fn rebuild_chain_debounce() -> std::time::Duration {
+    resolve_rebuild_chain_debounce(
+        std::env::var("KHIVE_ANN_REBUILD_DEBOUNCE_MS").ok().as_deref(),
+        REBUILD_CHAIN_DEBOUNCE_DEFAULT,
+    )
+}
+
+/// Pure half of [`rebuild_chain_debounce`], so the policy is testable without
+/// mutating process environment. Zero is a legal override: it means the caller
+/// asked for no coalescing at all.
+fn resolve_rebuild_chain_debounce(
+    override_value: Option<&str>,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    match override_value.and_then(|raw| raw.trim().parse::<u64>().ok()) {
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => default,
+    }
+}
 
 /// File-generation polling cadence for mmap bridges. Only the tiny commit
 /// record is read on an unchanged tick; vector/graph files are reopened only
@@ -582,6 +627,10 @@ pub(crate) enum AnnEnsureStatus {
     Built { vectors: usize },
     EmptyCorpus,
     DiscardedStaleBuild,
+    /// Nothing on disk was adoptable and this process does not build corpus
+    /// indexes. The caller serves its exact/lexical path for this request; the
+    /// daemon builds and publishes, and the next attempt adopts that segment.
+    DeclinedNotWarmHost,
 }
 
 // ── state operations ──────────────────────────────────────────────────────────
@@ -747,7 +796,7 @@ fn spawn_rebuild_task_inner(
     };
     khive_runtime::track_background_task(async move {
         if chained {
-            tokio::time::sleep(REBUILD_CHAIN_DEBOUNCE).await;
+            tokio::time::sleep(rebuild_chain_debounce()).await;
         }
         // Recheck after each build because writes that found this guard occupied were not queued.
         // Bound attempts so continuous writes cannot retain the guard indefinitely; daemon drain
@@ -1265,6 +1314,13 @@ async fn ensure_ann_for_model_inner(
                 SegmentOutcome::Cold => {}
             }
         }
+    }
+
+    if !ann.builds_corpus_indexes {
+        tracing::info!(namespace = %ns, model = %model,
+            "no adoptable memory ANN segment and this process does not build corpus \
+             indexes; serving degraded and leaving the build to the daemon");
+        return Ok(AnnEnsureStatus::DeclinedNotWarmHost);
     }
 
     // The fingerprint sandwich bounds scan races; generation ordering closes the
@@ -3349,6 +3405,83 @@ mod tests {
              empty set to keep over-fetching for eligible visible memories",
             bridge.namespace_set
         );
+    }
+
+    /// A process without corpus-build authority declines instead of scanning and
+    /// publishing. The second half is the control: the same corpus, the same
+    /// runtime, with the authority, builds — so the decline is caused by the role
+    /// and not by a fixture that could not have built anyway.
+    #[tokio::test]
+    async fn a_process_that_does_not_build_declines_instead_of_scanning_the_corpus() {
+        const MODEL: &str = "memory-non-building-process-declines-test-model";
+        const DIMS: usize = 4;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        rt.create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "a note the daemon will index",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+        let key = AnnKey::new(MODEL);
+        let client = new_shared_for_role(false);
+        let declined = ensure_ann_for_model(&rt, &token, &client, MODEL)
+            .await
+            .expect("ensure must not error, it must decline");
+        assert!(
+            matches!(declined, AnnEnsureStatus::DeclinedNotWarmHost),
+            "a process without corpus-build authority must decline, got {declined:?}"
+        );
+        assert!(
+            !client.indexes.read().await.contains_key(&key),
+            "a decline must install nothing"
+        );
+        if let Some(seg_dir) = ann_segment_dir(&rt, MODEL) {
+            assert!(
+                !seg_dir.join("metadata.bin").exists(),
+                "a decline must publish no segment"
+            );
+        }
+
+        let host = new_shared();
+        let built = ensure_ann_for_model(&rt, &token, &host, MODEL)
+            .await
+            .expect("control build");
+        assert!(
+            matches!(built, AnnEnsureStatus::Built { vectors: 1 }),
+            "control: with the authority the same corpus builds, got {built:?}"
+        );
+    }
+
+    /// The chain debounce is what decides how many writes one rebuild absorbs.
+    /// One second absorbed nothing against a fleet writing continuously, which is
+    /// how a coalescing window became a rebuild cadence.
+    #[test]
+    fn rebuild_chain_debounce_policy() {
+        let default = std::time::Duration::from_secs(30);
+        assert_eq!(resolve_rebuild_chain_debounce(None, default), default);
+        assert_eq!(
+            resolve_rebuild_chain_debounce(Some(" 2500 "), default),
+            std::time::Duration::from_millis(2500)
+        );
+        // Zero is a real answer: it means no coalescing was asked for.
+        assert_eq!(
+            resolve_rebuild_chain_debounce(Some("0"), default),
+            std::time::Duration::ZERO
+        );
+        // A malformed value must not silently become zero, which would restore
+        // the behaviour this default exists to fix.
+        assert_eq!(resolve_rebuild_chain_debounce(Some("soon"), default), default);
+        assert_eq!(resolve_rebuild_chain_debounce(Some("-1"), default), default);
+        assert_eq!(resolve_rebuild_chain_debounce(Some(""), default), default);
     }
 
     /// Mirrors the knowledge-pack invalid-rotation tests (issue #2340): a
