@@ -1727,7 +1727,16 @@ async fn collect_model_ann_hits_inner(
         }
 
         // Widen until enough visible hits survive or ANN reports corpus exhaustion.
-        let note_store = runtime.notes(token)?;
+        let note_result = khive_storage::await_request_read_phase(
+            "memory.recall.note_store",
+            crate::store_access::acquire_store("memory.recall.note_store", {
+                let runtime = runtime.clone();
+                let token = token.clone();
+                move || runtime.notes(&token)
+            }),
+        )
+        .await??;
+        let note_store = note_result?;
         let visible_set: HashSet<&str> = visible_namespaces.iter().map(String::as_str).collect();
 
         // Empty namespace metadata is conservative; a visible-only set skips retry.

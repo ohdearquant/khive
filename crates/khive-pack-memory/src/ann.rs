@@ -1171,7 +1171,13 @@ async fn emit_ann_warm_phase_event<P: serde::Serialize>(
     payload: P,
 ) {
     // A missing event store means auditing is unconfigured, not that warming failed.
-    let Ok(store) = rt.events(token) else {
+    let result = crate::store_access::acquire_store("memory.ann.event_store", {
+        let runtime = rt.clone();
+        let token = token.clone();
+        move || runtime.events(&token)
+    })
+    .await;
+    let Ok(Ok(store)) = result else {
         return;
     };
     let payload_value = match serde_json::to_value(&payload) {
@@ -1311,7 +1317,14 @@ async fn compute_memory_fingerprint(
     token: &NamespaceToken,
     model: &str,
 ) -> Option<CorpusFingerprint> {
-    let store = rt.vectors_for_model(token, model).ok()?;
+    let result = crate::store_access::acquire_store("memory.ann.fingerprint_store", {
+        let runtime = rt.clone();
+        let token = token.clone();
+        let model = model.to_owned();
+        move || runtime.vectors_for_model(&token, &model)
+    })
+    .await;
+    let store = result.ok()?.ok()?;
     let info = store.info().await.ok()?;
     let table_name = format!("vec_{}", sanitize_model_key(model));
     let sql = rt.sql();
@@ -1349,7 +1362,14 @@ async fn load_and_build_from_vector_store(
     token: &NamespaceToken,
     model: &str,
 ) -> Result<Option<AnnBridge>, RuntimeError> {
-    let store = match rt.vectors_for_model(token, model) {
+    let result = crate::store_access::acquire_store("memory.ann.vector_store", {
+        let runtime = rt.clone();
+        let token = token.clone();
+        let model = model.to_owned();
+        move || runtime.vectors_for_model(&token, &model)
+    })
+    .await?;
+    let store = match result {
         Ok(s) => s,
         Err(_) => return Ok(None),
     };
