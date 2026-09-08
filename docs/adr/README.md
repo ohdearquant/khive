@@ -193,6 +193,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-174](ADR-174-ordered-streams-append.md)                            | Ordered streams — dense per-stream append with `expected_seq` and a lease fence                            |
 | [ADR-175](ADR-175-web-pack.md)                                          | Web Pack — Site Ontology and Manifest Ingest for Agent-Readable Web Origins                                |
 | [ADR-178](ADR-178-plan-only-request.md)                                 | Plan-Only Request — Grammar Check Without Dispatch                                                         |
+| [ADR-179](ADR-179-operation-identity-memory-remember.md)                | Operation Identity on `memory.remember`: Keyed Create, Conflict Names the Holder                           |
 
 <!-- END GENERATED ADR CATALOG -->
 
