@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -196,6 +196,15 @@ class OpError(BaseModel):
     scope: str | None = None
     retry_after_ms: int | None = None
     details: dict[str, str] | None = None
+    domain_disposition: Literal["committed", "not_committed", "unknown"] | None = None
+    domain_result: Any = None
+
+    @field_validator("domain_disposition", mode="before")
+    @classmethod
+    def _non_null_disposition(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("domain_disposition must name a domain outcome when present")
+        return value
 
     def __str__(self) -> str:
         return f"{self.code}: {self.message}" if self.code else self.message
@@ -210,3 +219,11 @@ class OpResult(BaseModel):
     tool: str
     result: Any = None
     error: OpError | str | None = None
+    domain_disposition: Literal["committed", "not_committed", "unknown"] | None = None
+
+    @field_validator("domain_disposition", mode="before")
+    @classmethod
+    def _non_null_disposition(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("domain_disposition must name a domain outcome when present")
+        return value

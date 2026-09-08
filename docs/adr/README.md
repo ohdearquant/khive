@@ -195,6 +195,8 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-178](ADR-178-plan-only-request.md)                                 | Plan-Only Request — Grammar Check Without Dispatch                                                         |
 | [ADR-179](ADR-179-operation-identity-memory-remember.md)                | Operation Identity on `memory.remember`: Keyed Create, Conflict Names the Holder                           |
 | [ADR-180](ADR-180-tool-pack.md)                                         | Tool Pack: Capability Registry, Ontological Discovery and Use Policy                                       |
+| [ADR-181](ADR-181-exec-verb-sandboxed-run.md)                           | Exec Verb: One Declared Command in a Sandbox over a Materialized Tree                                      |
+| [ADR-182](ADR-182-git-dev-loop-verbs.md)                                | Git Verbs for the Dev Loop: Trees In and Out, Commit as Actor, Policy-Gated Push, Pull Requests            |
 
 <!-- END GENERATED ADR CATALOG -->
 

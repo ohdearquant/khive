@@ -78,7 +78,7 @@ def _validate_envelope_results(envelope: dict[str, Any], url: str) -> dict[str, 
 
 
 def _validate_op_errors(envelope: Any, url: str) -> Any:
-    """Validate structured errors without replacing their original payloads."""
+    """Validate disposition and domain result without replacing error payloads."""
     if not isinstance(envelope, dict):
         return envelope
     for index, entry in enumerate(envelope.get("results", [])):
@@ -94,3 +94,14 @@ def _validate_op_errors(envelope: Any, url: str) -> Any:
                 f"response from {url} has a malformed error object at index {index}: {exc}"
             ) from exc
     return envelope
+
+
+def _validate_frame_error_detail(response: dict[str, Any], url: str) -> OpError | None:
+    """Expose additive daemon error details while admitting legacy text-only frames."""
+    detail = response.get("error_detail")
+    if detail is None:
+        return None
+    try:
+        return OpError.model_validate(detail)
+    except ValidationError as exc:
+        raise TransportError(f"response from {url} has malformed error_detail: {exc}") from exc

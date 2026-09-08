@@ -6070,9 +6070,9 @@ id = "lambda:project-actor"
             "update forging `from_actor` on a message note must be refused on a served \
              multi-backend instance; response: {update_resp}"
         );
-        let error_msg = update_json["results"][0]["error"]
+        let error_msg = update_json["results"][0]["error"]["message"]
             .as_str()
-            .unwrap_or_default();
+            .expect("error.message is text");
         assert!(
             error_msg.contains("from_actor"),
             "refusal error must name `from_actor`; got: {error_msg}"
