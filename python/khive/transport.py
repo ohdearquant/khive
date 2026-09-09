@@ -228,6 +228,81 @@ class Session:
             raise TransportError("response from daemon is not a single memory.remember result")
         return results[0]
 
+    def send(
+        self,
+        to: str,
+        content: str,
+        *,
+        idempotency_key: str | None = None,
+        subject: str | None = None,
+        thread_id: str | None = None,
+        tags: list[str] | None = None,
+        self_send: bool | None = None,
+        namespace: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Return one raw comm.send outcome; operation recovery is caller-controlled.
+
+        Reuse the same key, actor, namespace and request after a lost response.
+        Successful replay returns the original pair IDs; conflicts and uncertain
+        outcomes remain unchanged per-operation errors, without automatic retry.
+        """
+        results = self.request(
+            encode(
+                [
+                    op(
+                        "comm.send",
+                        to=to,
+                        content=content,
+                        idempotency_key=idempotency_key,
+                        subject=subject,
+                        thread_id=thread_id,
+                        tags=tags,
+                        self_send=self_send,
+                        namespace=namespace,
+                    )
+                ]
+            ),
+            timeout=timeout,
+        )
+        if len(results) != 1 or results[0]["tool"] != "comm.send":
+            raise TransportError("response from daemon is not a single comm.send result")
+        return results[0]
+
+    def reply(
+        self,
+        id: str,
+        content: str,
+        *,
+        idempotency_key: str | None = None,
+        tags: list[str] | None = None,
+        namespace: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Return one raw comm.reply outcome without retrying operation errors.
+
+        A key identifies the resolved original message as well as the reply
+        payload. Successful replay does not mark the original read again.
+        """
+        results = self.request(
+            encode(
+                [
+                    op(
+                        "comm.reply",
+                        id=id,
+                        content=content,
+                        idempotency_key=idempotency_key,
+                        tags=tags,
+                        namespace=namespace,
+                    )
+                ]
+            ),
+            timeout=timeout,
+        )
+        if len(results) != 1 or results[0]["tool"] != "comm.reply":
+            raise TransportError("response from daemon is not a single comm.reply result")
+        return results[0]
+
     def recall(
         self,
         query: str,
