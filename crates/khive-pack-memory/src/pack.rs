@@ -203,14 +203,14 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum memories to return (default 10).",
+                description: "Maximum memories to return (default 10, max 100); 0 returns no hits.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "top_k",
                 param_type: "integer",
                 required: false,
-                description: "Override result limit (max 100). Takes priority over limit.",
+                description: "Override result limit (max 100); 0 returns no hits. Takes priority over limit.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
