@@ -345,6 +345,7 @@ pub(crate) async fn dual_write_message_with_identity(
             if !allowed {
                 return Err(RuntimeError::PermissionDenied {
                     verb: "comm.send".to_string(),
+                    receipt: Box::new(khive_runtime::DenialReceipt::not_audited()),
                     reason: format!(
                         "cross-namespace delivery to {recipient_ns_str:?} is not permitted; \
                          add {recipient_ns_str:?} to actor.allowed_outbound_namespaces in \
@@ -528,6 +529,7 @@ mod tests {
         let recipient_ns = format!("t460-recipient-{}", Uuid::new_v4().simple());
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -608,6 +610,7 @@ mod tests {
         use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -753,6 +756,7 @@ mod tests {
         let recipient_ns = format!("vecfail-recipient-{}", Uuid::new_v4().simple());
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -917,6 +921,7 @@ mod tests {
         use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,

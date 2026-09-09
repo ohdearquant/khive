@@ -1734,6 +1734,7 @@ fn rt_with_default_embedder() -> KhiveRuntime {
     use std::sync::Arc;
 
     KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -2413,6 +2414,7 @@ mod embed_failure_tests {
     /// with the given fake.
     fn rt_with_fake(fake: impl EmbedderProvider + 'static) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -2603,6 +2605,7 @@ mod embed_failure_tests {
         let secondary_calls = Arc::new(AtomicUsize::new(0));
 
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -2921,6 +2924,7 @@ mod ann_bypass_regression {
 
     fn rt_with_correct_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -3523,6 +3527,7 @@ mod edit_inline_reembed {
 
     fn rt_with_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -3930,6 +3935,7 @@ mod ann_type_filter_regression {
 
     fn rt_with_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -4338,6 +4344,7 @@ mod compose_explain_sections {
 
     fn rt_with_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,

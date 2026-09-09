@@ -18,6 +18,9 @@ use crate::{config::BackendId, presentation::OutputFormat};
 /// Errors produced while loading or validating a `KhiveConfig`.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("mount configuration: {reason}")]
+    InvalidMountConfig { reason: String },
+
     #[error("config file I/O: {0}")]
     Io(#[from] std::io::Error),
 
@@ -458,6 +461,22 @@ pub struct GitWriteRepositoryConfig {
     pub remote: String,
     pub slug: String,
     pub visibility: String,
+    /// Merge dispatch refusals for this repository (ADR-182 Amendment 7):
+    /// `opener` refuses a `git.pr_merge` dispatched by the account or actor
+    /// that opened the pull request; `last_pusher` refuses one dispatched by
+    /// the login on the newest push receipt for `expected_head`. Empty (the
+    /// default) refuses neither.
+    #[serde(default)]
+    pub merge_refusals: Vec<String>,
+}
+
+impl GitWriteRepositoryConfig {
+    pub const MERGE_REFUSALS: [&'static str; 2] = ["opener", "last_pusher"];
+
+    /// Whether this repository row lists the named merge refusal.
+    pub fn refuses_merge_by(&self, entry: &str) -> bool {
+        self.merge_refusals.iter().any(|listed| listed == entry)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -524,6 +543,19 @@ impl GitWriteSectionConfig {
             });
             if !valid {
                 return Err(invalid("fault", "unsupported contract fault selector"));
+            }
+        }
+        for (path, repository) in &self.repositories {
+            let key = format!("repositories.{path}.merge_refusals");
+            let mut seen: Vec<&str> = Vec::new();
+            for entry in &repository.merge_refusals {
+                if !GitWriteRepositoryConfig::MERGE_REFUSALS.contains(&entry.as_str()) {
+                    return Err(invalid(&key, "entries must be opener or last_pusher"));
+                }
+                if seen.contains(&entry.as_str()) {
+                    return Err(invalid(&key, "entries must not repeat"));
+                }
+                seen.push(entry);
             }
         }
         // The default keychain program is Unix-only. Legacy configurations with
@@ -695,6 +727,9 @@ pub struct ExecSectionConfig {
 /// `deny_unknown_fields` so a misspelled policy key always fails startup.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
+    #[serde(default)]
+    pub mounts: Vec<crate::mount_config::MountConfig>,
+
     /// Typed only so a top-level `db` key can be rejected loudly by
     /// [`KhiveConfig::validate`] instead of being silently ignored as an
     /// unknown key. Not a supported config-file storage selector: single-file
@@ -1044,6 +1079,7 @@ impl KhiveConfig {
     /// Model name validity is checked lazily at runtime (the config loader does
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
 
         // Reject a top-level `db` key loudly instead of letting serde's
@@ -2684,7 +2720,7 @@ grant_unattributed = false
         let runtime = crate::KhiveRuntime::new(denied).expect("runtime");
         assert!(matches!(
             runtime.authorize(Namespace::local()),
-            Err(crate::RuntimeError::PermissionDenied { ref verb, ref reason })
+            Err(crate::RuntimeError::PermissionDenied { ref verb, ref reason, .. })
                 if verb == "authorize" && reason == "actor is not enrolled"
         ));
     }
@@ -2980,6 +3016,56 @@ email = "example@example.invalid"
 credential_ref = "reference"
 platform_identity = "login"
 credential = "not-an-accepted-field""#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn git_repository_merge_refusals_accept_only_the_two_named_entries() {
+        let row = |refusals: &[&str]| GitWriteSectionConfig {
+            repositories: BTreeMap::from([(
+                "/repo".to_string(),
+                GitWriteRepositoryConfig {
+                    remote: "https://github.com/example/repo".to_string(),
+                    slug: "example/repo".to_string(),
+                    visibility: "private".to_string(),
+                    merge_refusals: refusals.iter().map(|entry| entry.to_string()).collect(),
+                },
+            )]),
+            ..Default::default()
+        };
+        for refusals in [
+            &[][..],
+            &["opener"][..],
+            &["last_pusher"][..],
+            &["opener", "last_pusher"][..],
+        ] {
+            row(refusals).validate_dev_loop().unwrap();
+        }
+        for refusals in [
+            &["author"][..],
+            &["Opener"][..],
+            &["opener", "opener"][..],
+            &["last_pusher", "opener", "last_pusher"][..],
+        ] {
+            assert!(matches!(
+                row(refusals).validate_dev_loop(),
+                Err(ConfigError::InvalidGitWriteConfig { key, .. })
+                    if key == "repositories./repo.merge_refusals"
+            ));
+        }
+        let parsed: GitWriteRepositoryConfig = toml::from_str(
+            r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private""#,
+        )
+        .unwrap();
+        assert!(parsed.merge_refusals.is_empty());
+        assert!(toml::from_str::<GitWriteRepositoryConfig>(
+            r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private"
+merge_refusal = ["opener"]"#
         )
         .is_err());
     }

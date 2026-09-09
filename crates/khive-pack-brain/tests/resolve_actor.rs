@@ -12,6 +12,7 @@ use serde_json::json;
 
 fn runtime_with_actor(actor_id: Option<&str>) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
         git_write: Default::default(),
         exec: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),

@@ -103,9 +103,10 @@ jobs:
     # so any slow runner day converted a green run into a timeout cancellation.
     timeout-minutes: 70
     strategy:
-      # A fast failure cancels the sibling OS to control runner cost. The tradeoff
-      # is that a macOS-only failure may need a second run after Linux is fixed.
-      fail-fast: true
+      # Every shard runs to completion so one head reports every arm. With
+      # fail-fast on, the first red shard cancelled its siblings and the Clippy
+      # step on the Linux shard did not run whenever another arm was red first.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         # The workspace test suite is nextest-partitioned 2-way per OS (see the

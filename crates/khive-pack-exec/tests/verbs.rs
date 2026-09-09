@@ -34,7 +34,9 @@ fn fixture() -> Fixture {
             keep: false,
             limits: Default::default(),
         },
-        ..RuntimeConfig::default()
+        // No embedding model: tool.register would otherwise build the default
+        // embedder, which needs a model file the test host may not have.
+        ..RuntimeConfig::no_embeddings()
     };
     let rt = KhiveRuntime::new(cfg).expect("file runtime");
     // A file-backed runtime installs no blob store on its own; the pack under
@@ -94,6 +96,8 @@ impl Fixture {
         v["tree"].as_str().unwrap().to_string()
     }
 
+    // Read only by the kernel-denial test below, which is macOS-only.
+    #[cfg(target_os = "macos")]
     async fn blob_text(&self, r: &Value) -> String {
         use base64::Engine;
         let v = self.call("blob.get", json!({ "content_ref": r })).await;

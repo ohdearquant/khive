@@ -20,6 +20,7 @@ fn actor_registry(
     let runtime = KhiveRuntime::from_backend(
         backend,
         RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             exec: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
