@@ -45,8 +45,21 @@ fn executable(path: &Path, source: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod fixture");
 }
 
+/// Directory name of the PATH shim one case installs. Named here because the resolver below has
+/// to know it.
+const SHIM_DIR: &str = "shim-bin";
+
+/// The native git binary, resolved from PATH but never from a fixture's shim directory.
+///
+/// One case puts a shim on PATH for the length of its own body and takes it off again. PATH is
+/// process-global, so a fixture built concurrently resolves git through the shim and CACHES that
+/// path; the shim's temporary directory is then removed with its fixture and every later spawn of
+/// the cached path fails with ENOENT. Skipping the shim directory here keeps that case's PATH
+/// mutation invisible to every other fixture, which is what serialising the whole file would
+/// otherwise be needed for.
 fn git_program() -> PathBuf {
     std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .filter(|dir| dir.file_name() != Some(std::ffi::OsStr::new(SHIM_DIR)))
         .map(|dir| dir.join("git"))
         .find(|path| path.is_file())
         .and_then(|path| std::fs::canonicalize(path).ok())
@@ -1890,7 +1903,7 @@ exit 0
 async fn init_reports_an_unestablished_outcome_when_it_leaves_a_repository_behind() {
     let f = Fixture::new(true, true).await;
     f.policy("git.init", "allow").await;
-    let shim_dir = f.dir.path().join("shim-bin");
+    let shim_dir = f.dir.path().join(SHIM_DIR);
     std::fs::create_dir(&shim_dir).expect("shim directory");
     executable(
         &shim_dir.join("git"),
@@ -1934,4 +1947,33 @@ async fn init_reports_an_unestablished_outcome_when_it_leaves_a_repository_behin
         json!(f.blank.to_str().unwrap()),
         "the receipt has to name the directory somebody now has to look at: {receipt}"
     );
+}
+
+/// The resolver's own guard, because the failure it prevents is invisible from any single test:
+/// PATH is process-global, so while the shim case above holds it, a fixture built concurrently
+/// resolves git through the shim and caches a path that is deleted with that case's fixture.
+#[test]
+#[serial_test::serial(git_dev_loop_env)]
+fn the_native_git_resolver_never_answers_a_fixture_shim() {
+    let native = git_program();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let shim_dir = dir.path().join(SHIM_DIR);
+    std::fs::create_dir(&shim_dir).expect("shim directory");
+    executable(&shim_dir.join("git"), "#!/bin/sh\nexit 7\n");
+    // Control: the shim IS what a PATH search would find first, so this arm is not vacuous.
+    assert!(shim_dir.join("git").is_file());
+    // The shim goes in FRONT of the real PATH rather than replacing it, so the only difference
+    // between the two resolutions is the shim itself.
+    let mut entries = vec![shim_dir.clone()];
+    entries.extend(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH"),
+    ));
+    let path = std::env::join_paths(entries).expect("shim PATH");
+    let _env = EnvGuard::set(&[("PATH", path)]);
+    let resolved = git_program();
+    assert!(
+        !resolved.starts_with(dir.path()),
+        "a fixture would have cached {resolved:?}, which disappears with this directory"
+    );
+    assert_eq!(resolved, native, "the resolver moved off the native binary");
 }
