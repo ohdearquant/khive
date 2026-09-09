@@ -312,6 +312,20 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "exclude_tags",
+                param_type: "array",
+                required: false,
+                description: "Drop memories whose stored tags include any of these values. Applied after tags/tag_mode and before ranking and limit, so a run can recall everything except its own writes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "include_source_id",
+                param_type: "boolean",
+                required: false,
+                description: "When true every hit carries source_id: the UUID the memory annotates (its source_id at remember time), or null when it has none. Default false.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,

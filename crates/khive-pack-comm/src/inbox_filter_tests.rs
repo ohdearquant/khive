@@ -32,6 +32,7 @@ fn actor_registry(
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: Some(actor.to_string()),
+            exec: Default::default(),
         },
     );
     let mut builder = VerbRegistryBuilder::new();
