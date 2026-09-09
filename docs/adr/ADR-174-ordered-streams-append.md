@@ -321,6 +321,8 @@ Both forms are load-bearing, so the verb carries both and names which one it is 
 
 ### A1.1 `stream.batch`
 
+**Implementation (2026-09-09):** Object fences and version observations execute in the atomic writer transaction; keyed `write` members execute in either batch mode.
+
 `stream.batch(ops, fence=None, observed=None, atomic=None, namespace=None)` takes a list of member
 operations, each `{"op": "append", "stream": S, "record": R, "expected_seq": N | null}` or
 `{"op": "write", "key": K, "kind": <note kind>, "doc": D, "tags": [...] | null, "embed": bool | null,
@@ -571,6 +573,8 @@ codes. ADR-172 Amendment 2 records the same arm for `expected_version` and `fenc
 ## Amendment 4 (2026-09-09): an `observed` entry may assert that a key is unheld
 
 **Status**: Proposed.
+
+**Implementation (2026-09-09):** `observed` entries with a version or `null` are checked inside the atomic writer transaction before member writes.
 
 ### The gap
 

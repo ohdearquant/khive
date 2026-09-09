@@ -152,7 +152,8 @@ pub enum AtomicOpFailure {
 
 /// Deferred effects whose owning atomic unit has committed successfully.
 ///
-/// Only [`run_atomic_unit`] can construct this token. Consumers may inspect
+/// Only this crate's atomic and stream-batch commit owners construct this token.
+/// Consumers may inspect
 /// its effects through [`CommittedPostCommitEffects::as_slice`], while the
 /// phase-3 executor takes the token by value; no public API exposes the owned
 /// effect collection or accepts a prepare-time [`PostCommitEffect`] in its
@@ -176,7 +177,7 @@ pub struct CommittedPostCommitEffects {
 }
 
 impl CommittedPostCommitEffects {
-    fn new(effects: Vec<PostCommitEffect>) -> Self {
+    pub(crate) fn new(effects: Vec<PostCommitEffect>) -> Self {
         Self { effects }
     }
 
@@ -275,12 +276,12 @@ async fn rollback_to_savepoint(writer: &mut dyn SqlWriter, name: &str) -> Result
 /// rule 2). Returns on the first statement that either errors or fails its
 /// guard — never applies a later statement once an earlier one in the same
 /// plan has failed.
-struct AppliedPlan {
-    effect: Option<PostCommitEffect>,
-    note_version: Option<i64>,
+pub(crate) struct AppliedPlan {
+    pub(crate) effect: Option<PostCommitEffect>,
+    pub(crate) note_version: Option<i64>,
 }
 
-async fn apply_plan(
+pub(crate) async fn apply_plan(
     writer: &mut dyn SqlWriter,
     plan: &AtomicOpPlan,
     capture_note_versions: bool,
@@ -498,17 +499,8 @@ pub(crate) async fn run_atomic_unit_with_note_versions(
         }
         Err(storage_err) => {
             // A recorded op failure does not prove the outer transaction rolled back.
-            match &storage_err {
-                StorageError::WriterTaskTerminated { .. } => {
-                    return Err(AtomicRunnerError(storage_err));
-                }
-                StorageError::WriterTaskRequestFailed { request_state, .. }
-                    if *request_state
-                        != khive_storage::WriterTaskRequestState::TransactionRolledBack =>
-                {
-                    return Err(AtomicRunnerError(storage_err));
-                }
-                _ => {}
+            if !atomic_unit_error_allows_recorded_refusal(&storage_err) {
+                return Err(AtomicRunnerError(storage_err));
             }
             let recorded = failure_slot
                 .lock()
@@ -525,6 +517,16 @@ pub(crate) async fn run_atomic_unit_with_note_versions(
                 None => Err(AtomicRunnerError(storage_err)),
             }
         }
+    }
+}
+
+pub(crate) fn atomic_unit_error_allows_recorded_refusal(error: &StorageError) -> bool {
+    match error {
+        StorageError::WriterTaskTerminated { .. } => false,
+        StorageError::WriterTaskRequestFailed { request_state, .. } => {
+            *request_state == khive_storage::WriterTaskRequestState::TransactionRolledBack
+        }
+        _ => true,
     }
 }
 

@@ -105,3 +105,240 @@ async fn stream_batch_atomic_refusal_carries_not_committed_on_the_wire() -> anyh
     assert_eq!(page["head_seq"], 0, "{page}");
     Ok(())
 }
+
+#[tokio::test]
+async fn stream_batch_predicates_preserve_refusal_details_on_the_wire() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let seeded = ok_one(
+        &client,
+        &json!([{"tool": "stream.batch", "args": {"ops": [
+            {"op": "write", "key": "guard", "kind": "head", "doc": {"held": true}},
+        ]}}])
+        .to_string(),
+    )
+    .await?;
+    assert_eq!(seeded["results"][0]["version"].as_i64(), Some(1));
+    let committed = ok_one(
+        &client,
+        &json!([{"tool": "stream.batch", "args": {
+            "fence": {"key": "guard", "kind": "head", "expected_version": 1},
+            "observed": [
+                {"key": "guard", "kind": "head", "version": 1},
+                {"key": "unheld", "kind": "head", "version": null},
+            ],
+            "ops": [{"op": "append", "stream": "predicates", "record": 1}],
+        }}])
+        .to_string(),
+    )
+    .await?;
+    assert_eq!(committed["committed"], true, "{committed}");
+    assert_eq!(committed["results"][0]["seq"], 1, "{committed}");
+
+    for (predicate, expected) in [
+        (
+            json!({"fence": {"key": "guard", "kind": "head", "expected_version": 2}}),
+            json!({"reason": "fence_conflict", "key": "guard", "expected_version": "2", "current_version": "1"}),
+        ),
+        (
+            json!({"fence": {"key": "missing", "kind": "head", "expected_version": 1}}),
+            json!({"reason": "fence_conflict", "key": "missing", "expected_version": "1"}),
+        ),
+        (
+            json!({"observed": [
+                {"key": "unheld", "kind": "head", "version": null},
+                {"key": "guard", "kind": "head", "version": 2},
+            ]}),
+            json!({"reason": "version_conflict", "key": "guard", "expected_version": "2", "current_version": "1", "index": "1"}),
+        ),
+        (
+            json!({"observed": [{"key": "missing", "kind": "head", "version": 1}]}),
+            json!({"reason": "version_conflict", "key": "missing", "expected_version": "1", "index": "0"}),
+        ),
+        (
+            json!({"observed": [{"key": "guard", "kind": "head", "version": null}]}),
+            json!({"reason": "version_conflict", "key": "guard", "current_version": "1", "index": "0"}),
+        ),
+    ] {
+        let mut args = predicate;
+        args["atomic"] = json!(true);
+        args["ops"] = json!([
+            {"op": "append", "stream": "predicates", "record": 2},
+            {"op": "write", "key": "guard", "kind": "head", "doc": {"held": false}, "expected_version": 1},
+        ]);
+        let refused = call(
+            &client,
+            "request",
+            json!({"presentation": "verbose", "ops": json!([
+                {"tool": "stream.batch", "args": args},
+            ]).to_string()}),
+        )
+        .await?;
+        let refused: Value = serde_json::from_str(&first_text(&refused))?;
+        assert_eq!(refused["results"][0]["ok"], false, "{refused}");
+        let error = &refused["results"][0]["error"];
+        assert_eq!(error["kind"], "conflict", "{refused}");
+        assert_eq!(error["domain_disposition"], "not_committed", "{refused}");
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(&error["details"][key], value, "{refused}");
+        }
+        assert!(error["details"].get("member").is_none(), "{refused}");
+        let page = ok_one(&client, r#"stream.read(stream="predicates")"#).await?;
+        assert_eq!(page["head_seq"], 1, "{page}");
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1, "{page}");
+        let holder = ok_one(&client, r#"get(key="guard", kind="head")"#).await?;
+        assert_eq!(holder["version"].as_i64(), Some(1), "{holder}");
+        assert_eq!(
+            serde_json::from_str::<Value>(holder["content"].as_str().unwrap())?,
+            json!({"held": true}),
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_batch_write_refusals_follow_mode_on_the_wire() -> anyhow::Result<()> {
+    for atomic in [true, false] {
+        for (failing_write, kind, reason) in [
+            (
+                json!({"op": "write", "key": "held", "kind": "head", "doc": null}),
+                "conflict",
+                "key_conflict",
+            ),
+            (
+                json!({"op": "write", "key": "held", "kind": "head", "doc": null, "expected_version": null}),
+                "conflict",
+                "key_conflict",
+            ),
+            (
+                json!({"op": "write", "key": "held", "kind": "head", "doc": null, "expected_version": 1}),
+                "conflict",
+                "version_conflict",
+            ),
+            (
+                json!({"op": "write", "key": "missing", "kind": "head", "doc": null, "expected_version": 1}),
+                "not_found",
+                "stream_write_not_found",
+            ),
+        ] {
+            let client = connect().await?;
+            let seeded = ok_one(
+                &client,
+                &json!([{"tool": "stream.batch", "args": {"atomic": atomic, "ops": [
+                    {"op": "write", "key": "held", "kind": "head", "doc": 1, "expected_version": null},
+                ]}}])
+                .to_string(),
+            )
+            .await?;
+            let holder_id = seeded["results"][0]["id"].as_str().unwrap();
+            assert_eq!(seeded["results"][0]["version"].as_i64(), Some(1));
+            let updated = ok_one(
+                &client,
+                &json!([{"tool": "stream.batch", "args": {"atomic": atomic, "ops": [
+                    {"op": "write", "key": "held", "kind": "head", "doc": 2, "expected_version": 1},
+                ]}}])
+                .to_string(),
+            )
+            .await?;
+            assert_eq!(updated["results"][0]["id"], holder_id, "{updated}");
+            assert_eq!(updated["results"][0]["version"].as_i64(), Some(2));
+
+            let response = call(
+                &client,
+                "request",
+                json!({"presentation": "verbose", "ops": json!([
+                    {"tool": "stream.batch", "args": {"atomic": atomic, "ops": [
+                        {"op": "write", "key": "candidate", "kind": "head", "doc": {"created": true}},
+                        {"op": "append", "stream": "writes", "record": 1},
+                        failing_write,
+                        {"op": "append", "stream": "writes", "record": 2},
+                    ]}},
+                ]).to_string()}),
+            )
+            .await?;
+            let response: Value = serde_json::from_str(&first_text(&response))?;
+            let row = &response["results"][0];
+            let error = if atomic {
+                assert_eq!(row["ok"], false, "{response}");
+                assert_eq!(row["error"]["details"]["member"], "2", "{response}");
+                &row["error"]
+            } else {
+                assert_eq!(row["ok"], true, "{response}");
+                assert_eq!(row["result"]["committed"], true, "{response}");
+                let members = row["result"]["results"].as_array().unwrap();
+                assert_eq!(members.len(), 4, "{response}");
+                assert_eq!(members[0]["version"].as_i64(), Some(1), "{response}");
+                assert_eq!(members[1]["seq"], 1, "{response}");
+                assert_eq!(members[3]["seq"], 2, "{response}");
+                &members[2]
+            };
+            assert_eq!(error["kind"], kind, "{response}");
+            assert_eq!(error["details"]["reason"], reason, "{response}");
+            assert_eq!(error["domain_disposition"], "not_committed", "{response}");
+            if reason == "key_conflict" {
+                assert_eq!(error["details"]["key"], "held", "{response}");
+                assert_eq!(error["details"]["existing_id"], holder_id, "{response}");
+            } else if reason == "version_conflict" {
+                assert_eq!(error["details"]["expected_version"], "1", "{response}");
+                assert_eq!(error["details"]["current_version"], "2", "{response}");
+            } else {
+                assert_eq!(error["details"]["key"], "missing", "{response}");
+            }
+
+            let page = ok_one(&client, r#"stream.read(stream="writes")"#).await?;
+            assert_eq!(page["head_seq"], if atomic { 0 } else { 2 }, "{page}");
+            assert_eq!(
+                page["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["record"].clone())
+                    .collect::<Vec<_>>(),
+                if atomic {
+                    vec![]
+                } else {
+                    vec![json!(1), json!(2)]
+                },
+                "{page}",
+            );
+            let holder = ok_one(&client, r#"get(key="held", kind="head")"#).await?;
+            assert_eq!(holder["version"].as_i64(), Some(2), "{holder}");
+            assert_eq!(holder["content"], "2", "{holder}");
+
+            let candidate = call(
+                &client,
+                "request",
+                json!({"presentation": "verbose", "ops": r#"get(key="candidate", kind="head")"#}),
+            )
+            .await?;
+            let candidate: Value = serde_json::from_str(&first_text(&candidate))?;
+            let candidate = &candidate["results"][0];
+            assert_eq!(candidate["ok"], !atomic, "{candidate}");
+            if atomic {
+                assert_eq!(candidate["error"]["kind"], "not_found", "{candidate}");
+                assert_eq!(
+                    candidate["error"]["domain_disposition"], "unknown",
+                    "ordinary keyed lookup must retain its own disposition: {candidate}",
+                );
+            } else {
+                assert_eq!(candidate["result"]["version"].as_i64(), Some(1));
+            }
+            let missing = call(
+                &client,
+                "request",
+                json!({"presentation": "verbose", "ops": r#"get(key="missing", kind="head")"#}),
+            )
+            .await?;
+            let missing: Value = serde_json::from_str(&first_text(&missing))?;
+            assert_eq!(missing["results"][0]["ok"], false, "{missing}");
+            assert_eq!(
+                missing["results"][0]["error"]["kind"], "not_found",
+                "{missing}"
+            );
+            assert_eq!(
+                missing["results"][0]["error"]["domain_disposition"], "unknown",
+                "ordinary not_found is not a batch refusal: {missing}",
+            );
+        }
+    }
+    Ok(())
+}

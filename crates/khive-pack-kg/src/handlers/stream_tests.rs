@@ -340,9 +340,8 @@ fn records(page: &Value) -> Vec<Value> {
 
 #[tokio::test]
 async fn stream_batch_per_member_order_values_and_refusals_as_values() {
-    // Amendment 1 acceptance 1, in process: two appends to one stream, an op
-    // naming no member operation, and the keyed write member this server
-    // refuses until versioned keyed notes land. The read is issued beside it.
+    // Interleaved appends and a keyed write retain their list positions;
+    // an unknown operation is a refusal value in per-member mode.
     let (_, registry) = surface();
     let result = registry
         .dispatch(
@@ -351,7 +350,7 @@ async fn stream_batch_per_member_order_values_and_refusals_as_values() {
                 {"op": "append", "stream": "b", "record": {"n": 1}},
                 {"op": "append", "stream": "b", "record": {"n": 2}},
                 {"op": "nope"},
-                {"op": "write", "key": "h", "kind": "head", "doc": {}},
+                {"op": "write", "key": "h", "kind": "observation", "doc": {}},
             ]}),
         )
         .await
@@ -367,13 +366,14 @@ async fn stream_batch_per_member_order_values_and_refusals_as_values() {
     assert_eq!(results[2]["details"]["op"], "nope");
     assert_eq!(results[2]["domain_disposition"], "not_committed");
     assert!(results[2]["details"].get("member").is_none());
-    assert_eq!(results[3]["kind"], "invalid_input");
-    assert_eq!(results[3]["details"]["reason"], "member_unavailable");
-    assert_eq!(results[3]["domain_disposition"], "not_committed");
-    assert!(results[3]["message"]
-        .as_str()
-        .unwrap()
-        .contains("versioned keyed notes"));
+    assert_eq!(results[3]["version"], 1);
+    uuid::Uuid::parse_str(results[3]["id"].as_str().unwrap()).unwrap();
+    let written = registry
+        .dispatch("get", json!({"key": "h", "kind": "observation"}))
+        .await
+        .unwrap();
+    assert_eq!(written["id"], results[3]["id"]);
+    assert_eq!(written["content"], "{}");
     let read = registry
         .dispatch("stream.read", json!({"stream": "b"}))
         .await
@@ -383,8 +383,7 @@ async fn stream_batch_per_member_order_values_and_refusals_as_values() {
 
 #[tokio::test]
 async fn stream_batch_atomic_refusal_writes_nothing() {
-    // Amendment 1 acceptance 2, the sequence and member arms; the fence arms
-    // wait on versioned keyed notes, and a fence is refused until then.
+    // Sequence and unknown-operation failures roll back earlier appends.
     let (rt, registry) = surface();
     registry
         .dispatch("stream.append", json!({"stream": "a", "record": 0}))
@@ -537,13 +536,13 @@ async fn stream_batch_mode_and_shape_refusals_write_nothing() {
     let (rt, registry) = surface();
     let before = population(&rt).await;
     let member = json!({"op": "append", "stream": "m", "record": null});
-    let fence = json!({"key": "lease", "kind": "head", "expected_version": 1});
+    let fence = json!({"key": "lease", "kind": "observation", "expected_version": 1});
     let observed = json!([{"key": "lease", "version": 1}]);
     for args in [
         json!({"ops": [member], "atomic": false, "fence": fence}),
         json!({"ops": [member], "observed": observed}),
         json!({"ops": [member], "observed": observed, "atomic": false}),
-        json!({"ops": [member], "fence": fence}),
+        json!({"ops": [member], "fence": [fence]}),
         json!({"ops": [member], "atomic": true, "observed": observed}),
         json!({"ops": "not a list"}),
         json!({"ops": [member, "not an object"]}),
@@ -594,6 +593,210 @@ async fn stream_batch_mode_and_shape_refusals_write_nothing() {
     assert_eq!(results[0]["seq"], 3);
     assert_eq!(results[1]["details"]["reason"], "seq_conflict");
     assert_eq!(results[2]["seq"], 4);
+}
+
+#[tokio::test]
+async fn stream_batch_fence_and_observed_predicates_run_before_members() {
+    let (rt, registry) = surface();
+    registry
+        .dispatch(
+            "stream.batch",
+            json!({"ops": [
+                {"op": "write", "key": "lease", "kind": "observation", "doc": {"held": true}}
+            ]}),
+        )
+        .await
+        .unwrap();
+    // Advance the held revision so a null observation cannot accidentally
+    // behave like an assertion against only the first revision.
+    for version in 1..5 {
+        registry
+            .dispatch(
+                "stream.batch",
+                json!({"ops": [
+                    {"op": "write", "key": "lease", "kind": "observation", "doc": version,
+                     "expected_version": version}
+                ]}),
+            )
+            .await
+            .unwrap();
+    }
+    let member = json!({"op": "append", "stream": "predicated", "record": true});
+    let result = registry
+        .dispatch(
+            "stream.batch",
+            json!({
+                "fence": {"key": "lease", "kind": "observation", "expected_version": 5},
+                "observed": [
+                    {"key": "lease", "kind": "observation", "version": 5},
+                    {"key": "absent", "kind": "observation", "version": null},
+                    {"key": "lease", "kind": "insight", "version": null}
+                ],
+                "ops": [member]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(seqs(&result), vec![1]);
+    let before = population(&rt).await;
+    for (predicate, expected_reason, index, key) in [
+        (
+            json!({"fence": {"key": "lease", "kind": "observation", "expected_version": 4}}),
+            "fence_conflict",
+            None,
+            "lease",
+        ),
+        (
+            json!({"fence": {"key": "absent", "kind": "observation", "expected_version": 1}}),
+            "fence_conflict",
+            None,
+            "absent",
+        ),
+        (
+            json!({"observed": [
+               {"key": "absent", "kind": "observation", "version": null},
+               {"key": "lease", "kind": "observation", "version": 4}
+            ]}),
+            "version_conflict",
+            Some("1"),
+            "lease",
+        ),
+        (
+            json!({"observed": [{"key": "lease", "kind": "observation", "version": null}]}),
+            "version_conflict",
+            Some("0"),
+            "lease",
+        ),
+        (
+            json!({"observed": [{"key": "absent", "kind": "observation", "version": 1}]}),
+            "version_conflict",
+            Some("0"),
+            "absent",
+        ),
+    ] {
+        let mut args = predicate;
+        args["atomic"] = json!(true);
+        args["ops"] = json!([member]);
+        let error = reason(
+            registry.dispatch("stream.batch", args).await.unwrap_err(),
+            expected_reason,
+        );
+        assert_eq!(error["details"]["key"], key);
+        assert_eq!(error["details"].get("index").and_then(Value::as_str), index);
+        assert!(error["details"].get("member").is_none());
+        if key == "lease" {
+            assert_eq!(error["details"]["current_version"], "5");
+        }
+        assert_eq!(population(&rt).await, before);
+        assert_eq!(heads(&registry, &["predicated"]).await, vec![1]);
+    }
+    // Observing absence is based on live rows, not historical key ownership.
+    let lease = registry
+        .dispatch("get", json!({"key": "lease", "kind": "observation"}))
+        .await
+        .unwrap();
+    registry
+        .dispatch("delete", json!({"id": lease["id"]}))
+        .await
+        .unwrap();
+    registry
+        .dispatch(
+            "stream.batch",
+            json!({"atomic": true,
+                "observed": [{"key": "lease", "kind": "observation", "version": null}],
+                "ops": [member]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(heads(&registry, &["predicated"]).await, vec![2]);
+}
+
+#[tokio::test]
+async fn stream_batch_late_write_refusal_obeys_transaction_mode() {
+    for atomic in [true, false] {
+        for update_first in [true, false] {
+            let (rt, registry) = surface();
+            registry
+                .dispatch(
+                    "stream.batch",
+                    json!({"ops": [
+                        {"op": "write", "key": "stale", "kind": "observation", "doc": "original"}
+                    ]}),
+                )
+                .await
+                .unwrap();
+            let mut first =
+                json!({"op": "write", "key": "candidate", "kind": "observation", "doc": "new"});
+            if update_first {
+                registry
+                    .dispatch(
+                        "stream.batch",
+                        json!({"ops": [
+                            {"op": "write", "key": "candidate", "kind": "observation", "doc": "old"}
+                        ]}),
+                    )
+                    .await
+                    .unwrap();
+                first["expected_version"] = json!(1);
+            }
+            let before = population(&rt).await;
+            let outcome = registry.dispatch("stream.batch", json!({"atomic": atomic, "ops": [
+                first,
+                {"op": "append", "stream": "rollback", "record": "before failure"},
+                {"op": "write", "key": "stale", "kind": "observation", "doc": "wrong", "expected_version": 9},
+                {"op": "append", "stream": "rollback", "record": "after failure"}
+            ]})).await;
+            if atomic {
+                let error = reason(outcome.unwrap_err(), "version_conflict");
+                assert_eq!(error["details"]["member"], "2");
+                assert_eq!(population(&rt).await, before);
+            } else {
+                let result = outcome.unwrap();
+                assert_eq!(
+                    result["results"][0]["version"],
+                    if update_first { 2 } else { 1 }
+                );
+                assert_eq!(result["results"][1]["seq"], 1);
+                assert_eq!(
+                    result["results"][2]["details"]["reason"],
+                    "version_conflict"
+                );
+                assert_eq!(result["results"][2]["domain_disposition"], "not_committed");
+                assert!(result["results"][2]["details"].get("member").is_none());
+                assert_eq!(result["results"][3]["seq"], 2);
+            }
+            assert_eq!(
+                heads(&registry, &["rollback"]).await,
+                vec![if atomic { 0 } else { 2 }]
+            );
+            let candidate = registry
+                .dispatch("get", json!({"key": "candidate", "kind": "observation"}))
+                .await;
+            if atomic && !update_first {
+                assert!(
+                    candidate.is_err(),
+                    "rolled-back keyed creation must not survive"
+                );
+            } else {
+                let candidate = candidate.unwrap();
+                assert_eq!(
+                    candidate["content"],
+                    if atomic { "\"old\"" } else { "\"new\"" }
+                );
+                assert_eq!(
+                    candidate["version"],
+                    if !atomic && update_first { 2 } else { 1 }
+                );
+            }
+            let stale = registry
+                .dispatch("get", json!({"key": "stale", "kind": "observation"}))
+                .await
+                .unwrap();
+            assert_eq!(stale["version"], 1);
+            assert_eq!(stale["content"], "\"original\"");
+        }
+    }
 }
 
 struct MemberRefusalEmbeddingService;
@@ -673,21 +876,12 @@ async fn schema(rt: &KhiveRuntime) -> i64 {
 
 #[tokio::test]
 async fn stream_batch_all_refused_members_prepare_nothing() {
-    // A batch whose every member is refused has no member to prepare. Both
-    // refusal shapes a member can carry, in both modes: atomic reads the
-    // refusal before it prepares anything, and per-member prepares an empty
-    // set, which must not read a first spec that is not there.
+    // No embedding setup is needed when every member is already refused.
     let (rt, registry) = surface_with_embedding_model();
     let before = population(&rt).await;
     let before_schema = schema(&rt).await;
-    for (member, kind, expected) in [
-        (
-            json!({"op": "write"}),
-            "invalid_input",
-            "member_unavailable",
-        ),
-        (json!({"op": "nope"}), "conflict", "unknown_op"),
-    ] {
+    let (member, kind, expected) = (json!({"op": "nope"}), "conflict", "unknown_op");
+    {
         let atomic_error = registry
             .dispatch("stream.batch", json!({"ops": [member], "atomic": true}))
             .await
@@ -767,4 +961,352 @@ async fn stream_batch_atomic_refuses_before_it_prepares_a_good_member() {
     assert_eq!(population(&rt).await, before);
     assert_eq!(schema(&rt).await, before_schema);
     assert_eq!(heads(&registry, &["guard"]).await, vec![0]);
+}
+
+#[tokio::test]
+async fn stream_batch_write_shapes_validate_the_entire_list_before_preparation() {
+    for atomic in [true, false] {
+        let (rt, registry) = surface_with_embedding_model();
+        let before = population(&rt).await;
+        let before_schema = schema(&rt).await;
+        let before_writers = rt.backend().pool().writer_acquisition_snapshot();
+        let mut malformed = vec![
+            json!({"op": "write", "key": "bad", "kind": "head"}),
+            json!({"op": "write", "kind": "head", "doc": null}),
+            json!({"op": "write", "key": "bad", "doc": null}),
+        ];
+        for (field, values) in [
+            (
+                "key",
+                vec![json!(null), json!(5), json!("a\0b"), json!("k".repeat(513))],
+            ),
+            (
+                "kind",
+                vec![
+                    json!(null),
+                    json!(5),
+                    json!(""),
+                    json!("no-such-kind"),
+                    json!("concept"),
+                ],
+            ),
+            (
+                "expected_version",
+                vec![
+                    json!(0),
+                    json!(-1),
+                    json!(1.5),
+                    json!("1"),
+                    json!(true),
+                    json!(u64::MAX),
+                ],
+            ),
+            ("tags", vec![json!("tag"), json!([1])]),
+            ("embed", vec![json!(1), json!("false")]),
+            ("extra", vec![json!(true)]),
+        ] {
+            for value in values {
+                let mut member = json!({"op": "write", "key": "bad", "kind": "head", "doc": null});
+                member[field] = value;
+                malformed.push(member);
+            }
+        }
+        for member in malformed {
+            let args = json!({"atomic": atomic, "ops": [
+                {"op": "append", "stream": "shape", "record": 1},
+                {"op": "write", "key": "valid", "kind": "head", "doc": null, "embed": true},
+                {"op": "nope"},
+                member,
+            ]});
+            let error = registry
+                .dispatch("stream.batch", args.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, RuntimeError::InvalidInput(_)),
+                "{args}: {error}"
+            );
+            assert_eq!(population(&rt).await, before, "{args}");
+            assert_eq!(schema(&rt).await, before_schema, "{args}");
+            assert_eq!(
+                rt.backend().pool().writer_acquisition_snapshot(),
+                before_writers,
+                "{args}"
+            );
+        }
+        let result = registry
+            .dispatch("stream.batch", json!({"atomic": atomic, "ops": [
+                {"op": "write", "key": "null-doc", "kind": "head", "doc": null, "expected_version": null},
+                {"op": "append", "stream": "shape", "record": null},
+                {"op": "append", "stream": "shape", "record": 2},
+            ]}))
+            .await
+            .unwrap();
+        assert_eq!(result["results"][0]["version"], 1);
+        assert_eq!(result["results"][1]["seq"], 1);
+        assert_eq!(result["results"][2]["seq"], 2);
+        let note = registry
+            .dispatch("get", json!({"key": "null-doc", "kind": "head"}))
+            .await
+            .unwrap();
+        assert_eq!(note["content"], "null");
+        assert_eq!(heads(&registry, &["shape"]).await, vec![2]);
+    }
+}
+
+#[derive(Debug)]
+struct StreamBatchPolicyProbe {
+    allow_batch: bool,
+    allow_list: bool,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+}
+
+impl khive_gate::Gate for StreamBatchPolicyProbe {
+    fn check(
+        &self,
+        request: &khive_gate::GateRequest,
+    ) -> Result<khive_gate::GateDecision, khive_gate::GateError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request.verb.clone(), request.args.clone()));
+        Ok(if request.verb == "stream.batch" && !self.allow_batch {
+            khive_gate::GateDecision::deny("batch denied by test policy")
+        } else if request.verb == "list" && !self.allow_list {
+            khive_gate::GateDecision::deny("listing denied by test policy")
+        } else {
+            khive_gate::GateDecision::allow()
+        })
+    }
+}
+
+#[derive(Clone)]
+struct StreamBatchEmbeddingProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for StreamBatchEmbeddingProbe {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![vec![1.0]; texts.len()])
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "stream-batch-validation-probe"
+    }
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for StreamBatchEmbeddingProbe {
+    fn name(&self) -> &str {
+        "stream-batch-validation-probe"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(
+        &self,
+    ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(std::sync::Arc::new(self.clone()))
+    }
+}
+
+#[tokio::test]
+async fn stream_batch_duplicate_writes_follow_policy_and_precede_preparation() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    for atomic in [true, false] {
+        for allow_batch in [false, true] {
+            let rt = KhiveRuntime::memory().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            rt.register_embedder(StreamBatchEmbeddingProbe(calls.clone()));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut builder = VerbRegistryBuilder::new();
+            builder.with_gate(Arc::new(StreamBatchPolicyProbe {
+                allow_batch,
+                allow_list: true,
+                seen: seen.clone(),
+            }));
+            builder.register(crate::KgPack::new(rt.clone()));
+            let registry = builder.build().unwrap();
+            let before = population(&rt).await;
+            let before_schema = schema(&rt).await;
+            let before_writers = rt.backend().pool().writer_acquisition_snapshot();
+            for other_kind in ["head", " HEAD "] {
+                seen.lock().unwrap().clear();
+                let args = json!({"atomic": atomic, "ops": [
+                    {"op": "append", "stream": "duplicates", "record": 1},
+                    {"op": "write", "key": "same", "kind": "head", "doc": null, "embed": true},
+                    {"op": "append", "stream": "duplicates", "record": 2},
+                    {"op": "write", "key": "same", "kind": other_kind, "doc": null, "expected_version": 1, "embed": true},
+                ]});
+                let error = registry
+                    .dispatch("stream.batch", args.clone())
+                    .await
+                    .unwrap_err();
+                if allow_batch {
+                    assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
+                    assert!(
+                        error.to_string().contains("repeats write target"),
+                        "{error}"
+                    );
+                } else {
+                    assert!(
+                        matches!(error, RuntimeError::PermissionDenied { .. }),
+                        "{error}"
+                    );
+                }
+                assert_eq!(
+                    *seen.lock().unwrap(),
+                    vec![("stream.batch".to_owned(), args)]
+                );
+                assert_eq!(population(&rt).await, before);
+                assert_eq!(schema(&rt).await, before_schema);
+                assert_eq!(
+                    rt.backend().pool().writer_acquisition_snapshot(),
+                    before_writers
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
+            if allow_batch {
+                let result = registry.dispatch("stream.batch", json!({"atomic": atomic, "ops": [
+                    {"op": "append", "stream": "duplicates", "record": 1},
+                    {"op": "write", "key": "same", "kind": "head", "doc": null, "embed": true},
+                    {"op": "append", "stream": "duplicates", "record": 2},
+                    {"op": "write", "key": "same", "kind": "observation", "doc": null, "embed": true},
+                ]})).await.unwrap();
+                assert_eq!(result["results"][0]["seq"], 1);
+                assert_eq!(result["results"][2]["seq"], 2);
+                assert_eq!(result["results"][1]["version"], 1);
+                assert_eq!(result["results"][3]["version"], 1);
+                assert_ne!(result["results"][1]["id"], result["results"][3]["id"]);
+                for (kind, member) in [("head", 1), ("observation", 3)] {
+                    let note = registry
+                        .dispatch("get", json!({"key": "same", "kind": kind}))
+                        .await
+                        .unwrap();
+                    assert_eq!(note["id"], result["results"][member]["id"]);
+                    assert_eq!(note["content"], "null");
+                }
+                assert!(calls.load(Ordering::SeqCst) > 0);
+                assert!(schema(&rt).await > before_schema);
+                assert!(
+                    rt.backend()
+                        .pool()
+                        .writer_acquisition_snapshot()
+                        .acquisitions
+                        > before_writers.acquisitions
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn stream_batch_key_conflicts_apply_list_disclosure_to_the_refused_member() {
+    use std::sync::{Arc, Mutex};
+
+    for atomic in [true, false] {
+        for allow_list in [true, false] {
+            let rt = KhiveRuntime::memory().unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut builder = VerbRegistryBuilder::new();
+            builder.with_gate(Arc::new(StreamBatchPolicyProbe {
+                allow_batch: true,
+                allow_list,
+                seen: seen.clone(),
+            }));
+            builder.register(crate::KgPack::new(rt.clone()));
+            let registry = builder.build().unwrap();
+            let holder = registry
+                .dispatch(
+                    "create",
+                    json!({"kind": "head", "key": "private/key", "content": "{}"}),
+                )
+                .await
+                .unwrap();
+            let before = population(&rt).await;
+            seen.lock().unwrap().clear();
+            let args = json!({"atomic": atomic, "ops": [
+                {"op": "append", "stream": "disclosure", "record": 1},
+                {"op": "write", "key": "new/key", "kind": "head", "doc": {"existing_id": "document-value"}},
+                {"op": "write", "key": "private/key", "kind": " HEAD ", "doc": null},
+                {"op": "append", "stream": "disclosure", "record": 2},
+            ]});
+            let outcome = registry.dispatch("stream.batch", args.clone()).await;
+            let conflict = if atomic {
+                let conflict = reason(outcome.unwrap_err(), "key_conflict");
+                assert_eq!(conflict["details"]["member"], "2");
+                assert_eq!(population(&rt).await, before);
+                conflict
+            } else {
+                let result = outcome.unwrap();
+                assert_eq!(result["committed"], true);
+                let members = result["results"].as_array().unwrap();
+                assert_eq!(members.len(), 4);
+                assert_eq!(members[0]["seq"], 1);
+                assert_eq!(members[1]["version"], 1);
+                assert_eq!(members[3]["seq"], 2);
+                for index in [0, 1, 3] {
+                    uuid::Uuid::parse_str(members[index]["id"].as_str().unwrap()).unwrap();
+                    assert!(members[index].get("details").is_none());
+                }
+                assert_eq!(members[2]["domain_disposition"], "not_committed");
+                assert!(members[2]["details"].get("member").is_none());
+                members[2].clone()
+            };
+            assert_eq!(conflict["kind"], "conflict");
+            assert_eq!(conflict["details"]["reason"], "key_conflict");
+            assert_eq!(conflict["details"]["key"], "private/key");
+            assert_eq!(
+                conflict["details"].get("existing_id"),
+                allow_list.then_some(&holder["id"])
+            );
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![
+                    ("stream.batch".to_owned(), args),
+                    (
+                        "list".to_owned(),
+                        json!({"kind": "note", "note_kind": "head", "key_prefix": "private/key"})
+                    ),
+                ]
+            );
+            assert_eq!(
+                heads(&registry, &["disclosure"]).await,
+                vec![if atomic { 0 } else { 2 }]
+            );
+            let unchanged = registry
+                .dispatch("get", json!({"key": "private/key", "kind": "head"}))
+                .await
+                .unwrap();
+            assert_eq!(unchanged["version"], 1);
+            assert_eq!(unchanged["content"], "{}");
+            let created = registry
+                .dispatch("get", json!({"key": "new/key", "kind": "head"}))
+                .await;
+            if atomic {
+                assert!(created.is_err());
+            } else {
+                let created = created.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(created["content"].as_str().unwrap()).unwrap(),
+                    json!({"existing_id": "document-value"})
+                );
+            }
+        }
+    }
 }
