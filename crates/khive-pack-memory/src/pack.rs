@@ -105,6 +105,13 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "key",
+                param_type: "string",
+                required: false,
+                description: "Immutable operation key, at most 512 UTF-8 bytes and no NUL (empty is allowed). Unique among live memories in the write namespace. Replay returns key_conflict with existing_id; pin the original namespace when reconciling across actors.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "salience",
                 param_type: "number",
                 required: false,

@@ -8,7 +8,8 @@
 //! calls (row + FTS + one vector insert per registered model each) plus a
 //! root-send `thread_id` patch. Shaped as `create_notes_atomic(Vec<AtomicNoteSpec>)`
 //! rather than a comm-specific pair primitive so other multi-write verbs
-//! (`memory.remember`, `gtd.assign`) can adopt it later without a new type.
+//! can share the same preparation. Keyed `memory.remember` appends a required
+//! annotation and final key claim before committing its prepared plan.
 //!
 //! # Embed-first
 //!
@@ -56,8 +57,8 @@ use crate::runtime::KhiveRuntime;
 /// One note to write as part of an atomic set. Mirrors the subset of
 /// `create_note_inner`'s parameters `comm.send`/`comm.reply` actually use —
 /// no `annotates`, `salience`, `decay_factor`, `embedding_content` override,
-/// or explicit `embedding_model` pin. A future caller needing those can grow
-/// this struct; none of khive-pack-comm's call sites need them today.
+/// or explicit `embedding_model` pin. Keyed-memory preparation carries those
+/// through internal options without changing the public multi-note spec.
 pub struct AtomicNoteSpec<'a> {
     /// Namespace + actor identity this note is written under.
     pub token: &'a NamespaceToken,
@@ -70,6 +71,19 @@ pub struct AtomicNoteSpec<'a> {
     pub name: Option<&'a str>,
     pub content: &'a str,
     pub properties: Option<Value>,
+}
+
+#[derive(Default)]
+pub(crate) struct AtomicNoteOptions<'a> {
+    pub salience: Option<f64>,
+    pub decay_factor: Option<f64>,
+    pub embedding_model: Option<&'a str>,
+}
+
+pub(crate) struct PreparedAtomicNotes {
+    pub notes: Vec<Note>,
+    pub plans: Vec<AtomicOpPlan>,
+    pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
 }
 
 /// Bit-identical to `khive-db`'s private `f32_slice_as_bytes` (native-endian
@@ -265,6 +279,46 @@ pub async fn create_notes_atomic_with_report(
     runtime: &KhiveRuntime,
     specs: Vec<AtomicNoteSpec<'_>>,
 ) -> RuntimeResult<(Vec<Note>, crate::retrieval::EmbeddingTruncationReport)> {
+    let prepared = prepare_atomic_notes(runtime, specs, AtomicNoteOptions::default()).await?;
+    match run_atomic_unit(runtime.sql().as_ref(), prepared.plans).await {
+        Ok(AtomicRunOutcome::Committed { .. }) => {
+            Ok((prepared.notes, prepared.embedding_truncation))
+        }
+        Ok(AtomicRunOutcome::RolledBack {
+            failed_op_index,
+            failure,
+        }) => Err(RuntimeError::Internal(format!(
+            "atomic multi-note write rolled back at op {failed_op_index}: {failure:?}"
+        ))),
+        Err(e) => Err(RuntimeError::Storage(e.0)),
+    }
+}
+
+pub(crate) async fn prepare_atomic_notes(
+    runtime: &KhiveRuntime,
+    specs: Vec<AtomicNoteSpec<'_>>,
+    options: AtomicNoteOptions<'_>,
+) -> RuntimeResult<PreparedAtomicNotes> {
+    if let Some(value) = options.salience {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(RuntimeError::InvalidInput(
+                "salience must be a finite value in [0.0, 1.0]".into(),
+            ));
+        }
+    }
+    if let Some(value) = options.decay_factor {
+        if !value.is_finite() || value < 0.0 {
+            return Err(RuntimeError::InvalidInput(
+                "decay_factor must be a finite value >= 0.0".into(),
+            ));
+        }
+    }
+    let embed_model_names = if let Some(model) = options.embedding_model {
+        runtime.resolve_embedding_model(Some(model))?;
+        vec![model.to_owned()]
+    } else {
+        runtime.registered_embedding_model_names()
+    };
     // ---- 1. Validate + build Note objects (all pre-write checks, same as
     // create_note_inner, before any embedding or DML is attempted). ----
     let mut notes: Vec<Note> = Vec::with_capacity(specs.len());
@@ -288,6 +342,12 @@ pub async fn create_notes_atomic_with_report(
 
         let ns = spec.token.namespace().as_str();
         let mut note = Note::new(ns, spec.kind, spec.content);
+        if let Some(salience) = options.salience {
+            note = note.with_salience(salience);
+        }
+        if let Some(decay_factor) = options.decay_factor {
+            note = note.with_decay(decay_factor);
+        }
         if let Some(id) = spec.id {
             note.id = id;
         }
@@ -303,7 +363,6 @@ pub async fn create_notes_atomic_with_report(
     // ---- 2. Embed every distinct (content, model) pair in parallel, BEFORE
     // opening any transaction. Any failure aborts here — no write has been
     // attempted. Identical note siblings reuse the same computed vector. ----
-    let embed_model_names = runtime.registered_embedding_model_names();
     let mut content_group_by_text: HashMap<&str, usize> = HashMap::new();
     let mut content_groups: Vec<Vec<usize>> = Vec::new();
     let mut note_content_groups: Vec<usize> = Vec::with_capacity(notes.len());
@@ -491,17 +550,11 @@ pub async fn create_notes_atomic_with_report(
         }));
     }
 
-    // ---- 4. One writer acquisition for the whole set. ----
-    match run_atomic_unit(runtime.sql().as_ref(), plans).await {
-        Ok(AtomicRunOutcome::Committed { .. }) => Ok((notes, embedding_truncation)),
-        Ok(AtomicRunOutcome::RolledBack {
-            failed_op_index,
-            failure,
-        }) => Err(RuntimeError::Internal(format!(
-            "atomic multi-note write rolled back at op {failed_op_index}: {failure:?}"
-        ))),
-        Err(e) => Err(RuntimeError::Storage(e.0)),
-    }
+    Ok(PreparedAtomicNotes {
+        notes,
+        plans,
+        embedding_truncation,
+    })
 }
 
 #[cfg(test)]

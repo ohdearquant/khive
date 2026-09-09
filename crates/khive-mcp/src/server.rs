@@ -2665,8 +2665,19 @@ fn coordinator_search_visibility(
 }
 
 /// Every runtime variant is explicitly covered. Dispatch provenance, not the
-/// variant, determines whether the domain handler ran successfully.
+/// variant, determines whether the domain handler ran successfully, except for
+/// the named keyed-memory outcomes, which carry their own domain proof.
 fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
+    // These named outcomes carry their own domain proof. Do not infer general
+    // write disposition from a conflict or unavailable variant.
+    let named_disposition = match &error {
+        RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
+            (khive_types::ErrorKind::Conflict, Some("key_conflict")) => Some("not_committed"),
+            (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => Some("unknown"),
+            _ => None,
+        },
+        _ => None,
+    };
     let payload = match error {
         RuntimeError::AuditObligation {
             failure,
@@ -2731,7 +2742,11 @@ fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> V
             }
         }
     };
-    error_with_disposition(payload, disposition)
+    let mut value = error_with_disposition(payload, disposition);
+    if let Some(named) = named_disposition {
+        value["domain_disposition"] = json!(named);
+    }
+    value
 }
 
 fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
@@ -4795,6 +4810,47 @@ mod tests {
     use khive_runtime::Namespace;
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
+
+    #[test]
+    fn remember_key_named_disposition_preserves_details_and_other_errors() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let key = "k".repeat(512);
+        let error = khive_types::KhiveError::conflict("held").with_details(
+            khive_types::Details::new_owned([
+                ("reason", "key_conflict".to_owned()),
+                ("key", key.clone()),
+                ("existing_id", id.clone()),
+            ]),
+        );
+        let value = runtime_error_value(error.into(), DomainDisposition::Committed);
+        assert_eq!(value["kind"], "conflict");
+        assert_eq!(value["domain_disposition"], "not_committed");
+        assert_eq!(value["details"]["key"], key);
+        assert_eq!(value["details"]["existing_id"], id);
+
+        let unresolved = khive_types::KhiveError::unavailable("holder missing").with_details(
+            khive_types::Details::new_owned([
+                ("reason", "key_holder_unresolved".to_owned()),
+                ("key", String::new()),
+            ]),
+        );
+        assert_eq!(
+            runtime_error_value(unresolved.into(), DomainDisposition::Committed)
+                ["domain_disposition"],
+            "unknown"
+        );
+        for error in [
+            khive_types::KhiveError::conflict("unrelated"),
+            khive_types::KhiveError::unavailable("unrelated"),
+        ] {
+            let mut expected = serde_json::to_value(&error).unwrap();
+            expected["domain_disposition"] = json!("unknown");
+            assert_eq!(
+                runtime_error_value(error.into(), DomainDisposition::Unknown),
+                expected
+            );
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SearchCapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

@@ -69,6 +69,7 @@ async fn plant_inbound_message(
 
     let id = Uuid::new_v4();
     let note = Note {
+        key: None,
         id,
         namespace: "local".into(),
         kind: "message".into(),
@@ -117,6 +118,7 @@ async fn plant_inbound_message_in_namespace(
 
     let id = Uuid::new_v4();
     let note = Note {
+        key: None,
         id,
         namespace: namespace.to_string(),
         kind: "message".into(),
@@ -514,6 +516,7 @@ async fn probe_ignores_outbound_messages() {
         .expect("authorize local namespace");
     let store = rt.notes(&token).expect("notes store");
     let note = Note {
+        key: None,
         id: Uuid::new_v4(),
         namespace: "local".into(),
         kind: "message".into(),

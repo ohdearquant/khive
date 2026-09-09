@@ -118,6 +118,7 @@ async fn cancel_rejects_fired_event_without_clobbering_fired_at() {
     let fired_at = "2026-01-01T00:00:00Z".to_string();
     let event_id = uuid::Uuid::new_v4();
     let fired = Note {
+        key: None,
         id: event_id,
         namespace: "local".to_string(),
         kind: "scheduled_event".to_string(),
@@ -202,6 +203,7 @@ async fn cancel_rejects_non_pending_statuses() {
 
         let event_id = uuid::Uuid::new_v4();
         let note = Note {
+            key: None,
             id: event_id,
             namespace: "local".to_string(),
             kind: "scheduled_event".to_string(),
@@ -271,6 +273,7 @@ async fn sch_aud_001_cancel_with_string_properties_returns_error() {
 
     let corrupt_id = uuid::Uuid::new_v4();
     let corrupt = Note {
+        key: None,
         id: corrupt_id,
         namespace: "local".to_string(),
         kind: "scheduled_event".to_string(),

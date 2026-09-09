@@ -24,6 +24,9 @@ mod event_store_guard;
 pub mod events_split;
 pub mod fusion;
 pub mod graph_traversal;
+pub mod keyed_memory;
+#[cfg(test)]
+mod keyed_memory_tests;
 mod note_store_guard;
 pub mod objectives;
 pub mod operations;
