@@ -169,7 +169,7 @@ outcome so no one mistakes it for a defect of the index.
   `(namespace, kind, key)` and return the conflict with it).
 - `python/khive`: `Session.remember(..., key=None)`; the conflict object is surfaced unchanged.
 
-## Amendment 1: Message-pair identity (Proposed, 2026-09-09)
+## Amendment 1: Message-pair identity (Accepted, 2026-09-09)
 
 This amendment extends D2–D3 and the exclusion of other note kinds only for `comm.send` and
 `comm.reply`. The accepted memory contract remains unchanged. Both verbs accept an optional
