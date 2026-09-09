@@ -388,6 +388,30 @@ pub trait PackRuntime: Send + Sync {
         Vec::new()
     }
 
+    fn mounted_namespace(&self) -> Option<&str> {
+        None
+    }
+
+    /// Advisory owned catalog only: no storage, process, gate, or audit work.
+    fn mounted_catalog_snapshot(&self) -> Vec<crate::mounted_verb::MountedVerb> {
+        Vec::new()
+    }
+
+    async fn mounted_catalog(&self) -> Result<Vec<crate::mounted_verb::MountedVerb>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
+    async fn dispatch_mounted(
+        &self,
+        _definition: &crate::mounted_verb::MountedVerb,
+        verb: &str,
+        params: Value,
+        registry: &VerbRegistry,
+        token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        self.dispatch(verb, params, registry, token).await
+    }
+
     /// Dispatch a verb call. Returns serialized JSON response.
     ///
     /// The `registry` parameter gives the handler access to the merged
@@ -669,6 +693,21 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// Register an owned mounted namespace without native-pack trust privileges.
+    pub fn register_mounted(
+        &mut self,
+        pack: Box<dyn PackRuntime>,
+    ) -> Result<&mut Self, RuntimeError> {
+        if pack.mounted_namespace() != Some(pack.name()) || !pack.handlers().is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "invalid mounted namespace registration".into(),
+            ));
+        }
+        self.packs.push(pack);
+        self.pack_trusted.push(false);
+        Ok(self)
+    }
+
     /// Test-only trusted registration, mirroring `register_boxed`'s trust
     /// grant for external test binaries (e.g.
     /// `tests/read_verb_admission_exhaustion.rs`) that cannot reach a
@@ -805,6 +844,22 @@ impl VerbRegistryBuilder {
                     first_idx: prev_idx,
                     second_idx: idx,
                 });
+            }
+        }
+
+        for mounted in packs
+            .iter()
+            .filter(|pack| pack.mounted_namespace().is_some())
+        {
+            let prefix = format!("{}.", mounted.name());
+            if packs
+                .iter()
+                .flat_map(|pack| pack.handlers())
+                .any(|handler| handler.name.starts_with(&prefix))
+            {
+                return Err(RuntimeError::InvalidInput(
+                    "mounted namespace collides with a native verb".into(),
+                ));
             }
         }
 
@@ -2257,9 +2312,17 @@ impl VerbRegistry {
     ) -> Result<Value, DispatchError> {
         // help=true interception: short-circuit before gate/pack.
         if params.get("help").and_then(Value::as_bool) == Some(true) {
-            return self
-                .describe_verb(verb)
-                .map_err(DispatchError::before_dispatch);
+            let result = match self.describe_verb(verb) {
+                Ok(value) => Ok(value),
+                Err(error) => match self.mounted_verb_catalog().await {
+                    Ok(catalog) => catalog
+                        .into_iter()
+                        .find(|entry| entry["verb"] == verb)
+                        .ok_or(error),
+                    Err(error) => Err(error),
+                },
+            };
+            return result.map_err(DispatchError::before_dispatch);
         }
         // Resolve namespace before `params` is moved into pack.dispatch, so the
         // post-dispatch hook can reference it.
@@ -2483,7 +2546,23 @@ impl VerbRegistry {
         });
 
         for pack in self.packs.iter() {
-            if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
+            let handler_def = pack.handlers().iter().find(|v| v.name == verb);
+            let mounted_name = pack.mounted_namespace().and_then(|prefix| {
+                verb.strip_prefix(prefix)
+                    .and_then(|suffix| suffix.strip_prefix('.'))
+            });
+            if handler_def.is_some() || mounted_name.is_some() {
+                let definition = if let Some(name) = mounted_name {
+                    pack.mounted_catalog().await.and_then(|catalog| {
+                        catalog
+                            .into_iter()
+                            .find(|definition| definition.name == name)
+                            .map(Some)
+                            .ok_or_else(|| RuntimeError::UnknownVerb(verb.to_owned()))
+                    })
+                } else {
+                    Ok(None)
+                };
                 // Strip `namespace` from params before forwarding to packs.
                 // The registry has already consumed it to mint the NamespaceToken.
                 //
@@ -2493,8 +2572,18 @@ impl VerbRegistry {
                 // — not a transport routing key — and must be passed through
                 // unchanged. Stripping it would silently default the binding to the
                 // "*" wildcard, broadening profile scope across namespaces.
-                let handler_accepts_namespace =
-                    handler_def.params.iter().any(|p| p.name == "namespace");
+                let handler_accepts_namespace = handler_def
+                    .is_some_and(|h| h.params.iter().any(|p| p.name == "namespace"))
+                    || definition
+                        .as_ref()
+                        .ok()
+                        .and_then(|value| value.as_ref())
+                        .is_some_and(|definition| {
+                            definition
+                                .input_schema
+                                .get("properties")
+                                .is_some_and(|properties| properties.get("namespace").is_some())
+                        });
                 let params = if !handler_accepts_namespace {
                     if let Value::Object(mut map) = params {
                         map.remove("namespace");
@@ -2506,7 +2595,17 @@ impl VerbRegistry {
                     params
                 };
                 let dispatch_start = Instant::now();
-                let mut result = pack.dispatch(verb, params, self, &token).await;
+                let mounted_audit = definition.as_ref().ok().and_then(|v| v.as_ref()).map(|v| {
+                    serde_json::json!({"mount": pack.name(), "effect": v.effect, "generation": v.generation})
+                });
+                let mut result = match definition {
+                    Ok(Some(definition)) => {
+                        pack.dispatch_mounted(&definition, verb, params, self, &token)
+                            .await
+                    }
+                    Ok(None) => pack.dispatch(verb, params, self, &token).await,
+                    Err(error) => Err(error),
+                };
                 let domain_succeeded = result.is_ok();
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
 
@@ -2672,9 +2771,12 @@ impl VerbRegistry {
                                 } else {
                                     crate::audit_batch::AuditProducer::DispatchFailed
                                 };
-                                let storage_event =
+                                let mut storage_event =
                                     build_audit_storage_event(&gate_req, &audit, outcome, resource)
                                         .with_duration_us(dispatch_us);
+                                if let Some(metadata) = &mounted_audit {
+                                    storage_event.payload["mounted_tool"] = metadata.clone();
+                                }
                                 append_audit_event_best_effort(
                                     self.audit_batch.as_ref(),
                                     store,
@@ -2991,6 +3093,28 @@ impl VerbRegistry {
             .iter()
             .flat_map(|p| p.handlers().iter())
             .any(|h| h.name == verb)
+    }
+
+    /// Advisory metadata for synchronous planning and MCP initialization.
+    pub fn mounted_verb_snapshot(&self) -> Vec<Value> {
+        self.packs
+            .iter()
+            .flat_map(|pack| {
+                pack.mounted_catalog_snapshot()
+                    .into_iter()
+                    .map(|verb| verb.describe(pack.name()))
+            })
+            .collect()
+    }
+
+    pub async fn mounted_verb_catalog(&self) -> Result<Vec<Value>, RuntimeError> {
+        let mut catalog = Vec::new();
+        for pack in self.packs.iter() {
+            for definition in pack.mounted_catalog().await? {
+                catalog.push(definition.describe(pack.name()));
+            }
+        }
+        Ok(catalog)
     }
 
     /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).

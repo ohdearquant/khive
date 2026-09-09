@@ -129,19 +129,35 @@ fn agent_pack_name_and_requires_are_stable() {
     assert!(AgentPack::ENTITY_KINDS.is_empty());
 }
 
-#[tokio::test]
-async fn spawn_observe_suspend_resume_kill_round_trips() {
-    let (registry, _store) = build_registry();
-
-    let spawn = registry
-        .dispatch(
-            "agent.spawn",
-            serde_json::json!({ "provider": "local", "task": "say hello" }),
-        )
+async fn seed(store: &MockAgentStore) -> String {
+    let id = "stored-agent".to_string();
+    store
+        .insert(&AgentRecord {
+            agent_id: id.clone(),
+            state: AgentState::Spawned,
+            terminal_reason: None,
+            provider: "local".into(),
+            provider_session_id: None,
+            checkpoint_session_id: None,
+            checkpoint_cursor: None,
+            owner_actor: "operator".into(),
+            owner_peer_class: "native".into(),
+            owner_write_namespace: "local".into(),
+            owner_visible_namespaces: vec!["local".into()],
+            spawn_fingerprint: "fixture".into(),
+            spawned_at: 1,
+            state_changed_at: 1,
+            idempotency_key: None,
+        })
         .await
-        .expect("agent.spawn dispatches");
-    let agent_id = spawn["agent_id"].as_str().expect("agent_id").to_string();
-    assert_eq!(spawn["state"], "spawned");
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn stored_observe_suspend_resume_kill_round_trips() {
+    let (registry, store) = build_registry();
+    let agent_id = seed(&store).await;
 
     let observed = registry
         .dispatch("agent.observe", serde_json::json!({ "id": agent_id }))
@@ -211,14 +227,7 @@ async fn observe_unknown_agent_id_is_a_per_operation_error() {
 async fn suspend_and_resume_round_trip_from_running() {
     let (registry, store) = build_registry();
 
-    let spawn = registry
-        .dispatch(
-            "agent.spawn",
-            serde_json::json!({ "provider": "local", "task": "long task" }),
-        )
-        .await
-        .expect("agent.spawn dispatches");
-    let agent_id = spawn["agent_id"].as_str().expect("agent_id").to_string();
+    let agent_id = seed(&store).await;
 
     // Drive `spawned` -> `running` directly on the store, standing in for
     // the automatic transition this pack's verb surface does not itself
@@ -256,67 +265,31 @@ async fn suspend_and_resume_round_trip_from_running() {
 }
 
 #[tokio::test]
-async fn a_bad_op_never_prevents_a_good_op_from_succeeding() {
-    // ADR-016: errors are per-operation, never batch-level aborts. The
-    // registry dispatch surface itself is single-op; this proves the two
-    // outcomes are fully independent — one call's failure never poisons
-    // state a following call on the same registry can observe.
-    let (registry, _store) = build_registry();
-
-    let bad = registry
-        .dispatch("agent.spawn", serde_json::json!({ "provider": "local" }))
-        .await;
-    assert!(bad.is_err());
-
-    let good = registry
-        .dispatch(
-            "agent.spawn",
-            serde_json::json!({ "provider": "local", "task": "still works" }),
-        )
-        .await
-        .expect("a prior bad op must not affect this good op");
-    assert_eq!(good["state"], "spawned");
-}
-
-#[tokio::test]
-async fn idempotent_spawn_replay_returns_the_same_record() {
-    let (registry, _store) = build_registry();
-
-    let first = registry
-        .dispatch(
-            "agent.spawn",
-            serde_json::json!({
-                "provider": "local",
-                "task": "idempotent task",
-                "idempotency_key": "key-1",
-            }),
-        )
-        .await
-        .expect("first spawn dispatches");
-
-    let second = registry
-        .dispatch(
-            "agent.spawn",
-            serde_json::json!({
-                "provider": "local",
-                "task": "idempotent task",
-                "idempotency_key": "key-1",
-            }),
-        )
-        .await
-        .expect("replay spawn dispatches");
-
-    assert_eq!(first["agent_id"], second["agent_id"]);
-
-    let mismatched = registry
-        .dispatch(
-            "agent.spawn",
-            serde_json::json!({
-                "provider": "local",
-                "task": "a different task",
-                "idempotency_key": "key-1",
-            }),
-        )
-        .await;
-    assert!(mismatched.is_err());
+async fn unavailable_providers_never_write_and_do_not_poison_observe() {
+    let (registry, store) = build_registry();
+    for provider in ["local", "x", "https://provider.invalid", "sk-secret"] {
+        let error = registry
+            .dispatch(
+                "agent.spawn",
+                serde_json::json!({"provider": provider, "task": "t", "idempotency_key": "same"}),
+            )
+            .await
+            .unwrap_err();
+        let khive_runtime::RuntimeError::Khive(error) = error else {
+            panic!("typed refusal")
+        };
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["details"]["reason"],
+            "provider_unavailable"
+        );
+        assert!(store.records.lock().unwrap().is_empty());
+    }
+    let id = seed(&store).await;
+    assert_eq!(
+        registry
+            .dispatch("agent.observe", serde_json::json!({"id": id}))
+            .await
+            .unwrap()["agent_id"],
+        id
+    );
 }

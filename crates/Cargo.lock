@@ -1992,6 +1992,8 @@ dependencies = [
  "khive-channel-email",
  "khive-channel-telegram",
  "khive-db",
+ "khive-mounts",
+ "khive-pack-agent",
  "khive-pack-blob",
  "khive-pack-brain",
  "khive-pack-code",
@@ -2030,11 +2032,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-mounts"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "jsonschema",
+ "khive-db",
+ "khive-gate",
+ "khive-pack-kg",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "khive-pack-agent"
 version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "inventory",
  "khive-pack-kg",
  "khive-runtime",
  "khive-storage",
@@ -2687,6 +2711,8 @@ dependencies = [
  "khive-db",
  "khive-gate-rego",
  "khive-mcp",
+ "khive-mounts",
+ "khive-pack-agent",
  "khive-pack-blob",
  "khive-pack-brain",
  "khive-pack-code",

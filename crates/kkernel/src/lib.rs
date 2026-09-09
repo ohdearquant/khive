@@ -10,6 +10,7 @@ pub mod engine;
 pub mod exec;
 pub mod git_ingest;
 pub mod kg;
+pub mod mount;
 pub mod pack_introspect;
 pub mod reindex;
 pub mod repo;
@@ -35,6 +36,7 @@ pub mod vector;
 #[doc(hidden)]
 #[allow(unused_imports)]
 mod _pack_links {
+    use khive_pack_agent::AgentPack as _;
     use khive_pack_blob::BlobPack as _;
     use khive_pack_brain::BrainPack as _;
     use khive_pack_code::CodePack as _;

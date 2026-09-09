@@ -5,8 +5,8 @@
 //! `agent.resume`, `agent.kill`, `agent.suspend`, and `agent.observe` with
 //! the verb registry... The pack owns the wire surface; the runtime owns
 //! the table." This crate is that wire surface: it validates parameters,
-//! computes the spawn fingerprint, and drives the lifecycle transition
-//! table, entirely through the `AgentStore` trait — it never opens a
+//! refuses unavailable providers, and drives the stored-record lifecycle
+//! table through the `AgentStore` trait — it never opens a
 //! khive-db connection of its own.
 
 pub mod handlers;
@@ -23,18 +23,10 @@ pub(crate) use pack::AGENT_HANDLERS;
 /// Canonical pack name. Verbs are exposed as `agent.<verb>`.
 pub(crate) const PACK_NAME: &str = "agent";
 
-/// Agent pack: the ADR-142 wire surface over the runtime-owned agent table.
-///
-/// `KhiveRuntime` has no accessor for the agent table to reach into — that
-/// accessor is not part of the shared contract this pack was built against
-/// — so `AgentStore` is supplied directly at construction: the same shape
-/// `BlobPack` uses for `BlobStore`, except sourced from the caller rather
-/// than resolved from `KhiveRuntime` config. Handlers never see anything
-/// but the trait object, and this pack holds no `KhiveRuntime` handle of
-/// its own — every ADR-142 §1 operation this pack performs goes through
-/// `AgentStore` alone.
+/// Agent verbs over a supplied store or the selected runtime's agent store.
 pub struct AgentPack {
-    store: Arc<dyn AgentStore>,
+    store: tokio::sync::OnceCell<Arc<dyn AgentStore>>,
+    runtime: Option<khive_runtime::KhiveRuntime>,
 }
 
 impl Pack for AgentPack {
@@ -46,12 +38,37 @@ impl Pack for AgentPack {
 }
 
 impl AgentPack {
-    /// Bind the agent pack to the runtime-owned agent store.
+    /// Bind the agent pack to an existing agent store.
     pub fn new(store: Arc<dyn AgentStore>) -> Self {
-        Self { store }
+        Self {
+            store: tokio::sync::OnceCell::new_with(Some(store)),
+            runtime: None,
+        }
     }
 
-    pub(crate) fn store(&self) -> &Arc<dyn AgentStore> {
-        &self.store
+    /// Resolve the selected runtime's store lazily, off the async executor.
+    pub fn from_runtime(runtime: khive_runtime::KhiveRuntime) -> Self {
+        Self {
+            store: tokio::sync::OnceCell::new(),
+            runtime: Some(runtime),
+        }
+    }
+
+    pub(crate) async fn store(&self) -> Result<&Arc<dyn AgentStore>, khive_runtime::RuntimeError> {
+        self.store
+            .get_or_try_init(|| async {
+                let runtime = self.runtime.clone().ok_or_else(|| {
+                    khive_runtime::RuntimeError::Internal("agent store unavailable".into())
+                })?;
+                tokio::task::spawn_blocking(move || runtime.backend().agents())
+                    .await
+                    .map_err(|_| {
+                        khive_runtime::RuntimeError::Internal(
+                            "agent store initialization failed".into(),
+                        )
+                    })?
+                    .map_err(khive_runtime::RuntimeError::from)
+            })
+            .await
     }
 }

@@ -12,6 +12,8 @@ categories.workspace = true
 description = "khive kernel — stdio MCP server binary and admin CLI (sync, pack introspection, db ops)"
 
 [dependencies]
+khive-mounts = { version = "0.8.0", path = "../khive-mounts" }
+khive-pack-agent = { version = "0.8.0", path = "../khive-pack-agent" }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
 khive-mcp = { version = "0.8.0", path = "../khive-mcp" }
 khive-score = { version = "0.8.0", path = "../khive-score" }
@@ -91,3 +93,8 @@ pack-moodboard = ["khive-mcp/pack-moodboard", "khive-pack-moodboard"]
 [[bin]]
 name = "kkernel"
 path = "src/main.rs"
+
+[[test]]
+name = "mount_fixture"
+path = "../khive-mounts/tests/fixture.rs"
+harness = false
