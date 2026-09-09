@@ -38,10 +38,13 @@
 //!
 //! ## Repeat advancement
 //!
-//! Named aliases are advanced as follows:
+//! One parser, `khive_pack_schedule::repeat`, decides what a `repeat` value
+//! means for creation and for this executor:
 //! - `"daily"`   → `trigger_at + 1 day`
 //! - `"weekly"`  → `trigger_at + 7 days`
 //! - `"monthly"` → `trigger_at + 1 calendar month`
+//! - `"every:<N><s|m|h|d>"` → `trigger_at + N units`
+//! - a five-field cron expression → the next match after `trigger_at`, in UTC
 //!
 //! Unsupported repeat expressions are rejected at schedule creation and fail
 //! closed for legacy rows rather than silently degrading to one-shot delivery.
@@ -57,7 +60,7 @@
 //! legacy row becomes `failed`, not `missed`, even when stale.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, FixedOffset, Months, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use serde_json::{json, Value};
 
 use crate::server::KhiveMcpServer;
@@ -849,11 +852,10 @@ async fn run_pending_events_on_with_lease(
                     continue;
                 };
 
-                if repeat
-                    .as_deref()
-                    .is_some_and(|repeat| !matches!(repeat, "daily" | "weekly" | "monthly"))
-                {
-                    let error = "scheduled event uses an unsupported repeat expression; only daily, weekly, and monthly are executable";
+                if repeat.as_deref().is_some_and(|repeat| {
+                    khive_pack_schedule::repeat::parse_repeat(repeat).is_err()
+                }) {
+                    let error = "scheduled event uses an unsupported repeat expression; it is not one the executor can advance";
                     summary.failed += 1;
                     let Some(expected_properties) =
                         current_properties_for_finalize(rt, ns_str, id, "unsupported-repeat").await
@@ -2598,20 +2600,12 @@ async fn finalize_firing_event(
 /// Compute the next `trigger_at` for a repeating event, given the current
 /// `trigger_at` and the `repeat` spec.
 ///
-/// Returns `Some(next)` for named aliases `"daily"` / `"weekly"` / `"monthly"`.
+/// Returns `Some(next)` for every form `khive_pack_schedule::repeat` parses.
 /// Returns `None` for an absent repeat. Unsupported expressions are rejected
 /// by schedule creation and fail closed before dispatch for legacy rows.
 fn next_trigger_at(repeat: &Option<String>, current: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    match repeat.as_deref() {
-        Some("daily") => Some(current + Duration::days(1)),
-        Some("weekly") => Some(current + Duration::weeks(1)),
-        Some("monthly") => {
-            // Add one calendar month. chrono::Months handles month-boundary
-            // arithmetic (e.g. Jan 31 + 1 month = Feb 28/29).
-            current.checked_add_months(Months::new(1))
-        }
-        _ => None,
-    }
+    let repeat = khive_pack_schedule::repeat::parse_repeat(repeat.as_deref()?).ok()?;
+    repeat.next_after(current)
 }
 
 /// Advance a missed repeating event's `trigger_at` past every occurrence at
@@ -2626,14 +2620,8 @@ fn advance_repeat_past_missed(
     current: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    let mut current = current;
-    loop {
-        let next = next_trigger_at(repeat, current)?;
-        if next > now {
-            return Some(next);
-        }
-        current = next;
-    }
+    let repeat = khive_pack_schedule::repeat::parse_repeat(repeat.as_deref()?).ok()?;
+    repeat.first_after(current, now)
 }
 
 fn reminder_delivery_action(actor: &str, content: &str) -> String {
@@ -6014,18 +6002,18 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
-    async fn legacy_cron_row_fails_closed_before_action_invocation() {
+    async fn legacy_unparseable_repeat_row_fails_closed_before_action_invocation() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).expect("server");
-        let marker = "legacy-cron-must-not-dispatch";
+        let marker = "legacy-repeat-must-not-dispatch";
         let action = format!("create(kind=\"observation\", content=\"{marker}\")");
         let id = create_scheduled_event(
             &rt,
             "local",
             &due_rfc3339(),
             Some(&action),
-            Some("0 9 * * 1"),
+            Some("hourly"),
             "schedule",
         )
         .await;
@@ -6089,17 +6077,17 @@ mod tests {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).expect("server");
-        let cron_id = create_scheduled_event(
+        let legacy_id = create_scheduled_event(
             &rt,
             "local",
             &due_rfc3339(),
             Some("stats()"),
-            Some("0 9 * * 1"),
+            Some("hourly"),
             "schedule",
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        let marker = "row-after-cron-finalize-failure";
+        let marker = "row-after-legacy-finalize-failure";
         let action = format!("create(kind=\"observation\", content=\"{marker}\")");
         let later_id = create_scheduled_event(
             &rt,
@@ -6118,15 +6106,15 @@ mod tests {
                     sql: format!(
                         "CREATE TRIGGER test_fail_unsupported_repeat_finalize \
                          BEFORE UPDATE OF properties ON notes \
-                         WHEN OLD.id = '{cron_id}' \
+                         WHEN OLD.id = '{legacy_id}' \
                            AND json_extract(OLD.properties, '$.status') = 'firing' \
                            AND json_extract(NEW.properties, '$.status') = 'failed' \
                          BEGIN \
-                           SELECT RAISE(FAIL, 'injected cron finalization failure'); \
+                           SELECT RAISE(FAIL, 'injected legacy finalization failure'); \
                          END"
                     ),
                     params: vec![],
-                    label: Some("test_install_cron_finalize_failure".into()),
+                    label: Some("test_install_legacy_finalize_failure".into()),
                 })
                 .await
                 .expect("install finalization failure trigger");
@@ -6140,7 +6128,7 @@ mod tests {
         assert_eq!(summary.fired, 1);
         assert_eq!(summary.failed, 1);
         assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
-        assert_eq!(get_note_props(&rt, cron_id).await["status"], "firing");
+        assert_eq!(get_note_props(&rt, legacy_id).await["status"], "firing");
         assert_eq!(get_note_props(&rt, later_id).await["status"], "fired");
     }
 
@@ -7153,10 +7141,30 @@ mod tests {
     }
 
     #[test]
-    fn next_trigger_at_cron_returns_none() {
+    fn next_trigger_at_every_adds_the_interval_to_the_previous_trigger() {
         let base: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
-        // Write-time validation rejects cron; legacy rows fail closed before dispatch.
-        assert!(next_trigger_at(&Some("0 9 * * 1".to_string()), base).is_none());
+        let next = next_trigger_at(&Some("every:15m".to_string()), base).unwrap();
+        assert_eq!(next, base + Duration::minutes(15));
+        let next = next_trigger_at(&Some("every:2h".to_string()), base).unwrap();
+        assert_eq!(next, base + Duration::hours(2));
+    }
+
+    #[test]
+    fn next_trigger_at_cron_advances_to_the_next_match_in_utc() {
+        // 2026-06-01 is a Monday; the next Monday 09:00 is a week later.
+        let base: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
+        let next = next_trigger_at(&Some("0 9 * * 1".to_string()), base).unwrap();
+        let expected: DateTime<Utc> = "2026-06-08T09:00:00Z".parse().unwrap();
+        assert_eq!(next, expected);
+        let next = next_trigger_at(&Some("*/15 * * * *".to_string()), base).unwrap();
+        assert_eq!(next, base + Duration::minutes(15));
+    }
+
+    #[test]
+    fn next_trigger_at_unparseable_legacy_row_fails_closed() {
+        let base: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
+        assert!(next_trigger_at(&Some("99 * * * *".to_string()), base).is_none());
+        assert!(next_trigger_at(&Some("every:0s".to_string()), base).is_none());
     }
 
     // ── ADR-106 missed-event policy ─────────────────────────────────────────
@@ -7180,6 +7188,33 @@ mod tests {
             original + Duration::days(15),
             "must be exactly the first daily occurrence after now (single advance, no burst)"
         );
+    }
+
+    #[test]
+    fn advance_repeat_past_missed_interval_lands_on_the_first_future_occurrence() {
+        let original: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
+        let now: DateTime<Utc> = "2026-06-15T09:07:00Z".parse().unwrap();
+        let next =
+            advance_repeat_past_missed(&Some("every:15m".to_string()), original, now).unwrap();
+        let expected: DateTime<Utc> = "2026-06-15T09:15:00Z".parse().unwrap();
+        assert_eq!(
+            next, expected,
+            "phase-locked to the original trigger, strictly after now"
+        );
+        let on_the_dot: DateTime<Utc> = "2026-06-15T09:15:00Z".parse().unwrap();
+        let next = advance_repeat_past_missed(&Some("every:15m".to_string()), original, on_the_dot)
+            .unwrap();
+        assert_eq!(next, on_the_dot + Duration::minutes(15));
+    }
+
+    #[test]
+    fn advance_repeat_past_missed_cron_asks_the_pattern_from_now() {
+        let original: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
+        let now: DateTime<Utc> = "2026-06-17T10:00:00Z".parse().unwrap();
+        let next =
+            advance_repeat_past_missed(&Some("0 9 * * 1".to_string()), original, now).unwrap();
+        let expected: DateTime<Utc> = "2026-06-22T09:00:00Z".parse().unwrap();
+        assert_eq!(next, expected);
     }
 
     /// No `repeat` never advances, so the caller marks a stale one-shot missed.

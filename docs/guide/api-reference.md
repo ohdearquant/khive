@@ -1726,11 +1726,11 @@ Time-triggered reminders and deferred verb dispatch. Optional; load with
 
 Create a time-triggered reminder.
 
-| Param     | Type   | Required | Notes                                                                                                 |
-| --------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
-| `content` | string | yes      | Non-empty reminder message.                                                                           |
-| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                 |
-| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`. Cron expressions are rejected because the executor cannot advance them. |
+| Param     | Type   | Required | Notes                                                                                                |
+| --------- | ------ | -------- | ---------------------------------------------------------------------------------------------------- |
+| `content` | string | yes      | Non-empty reminder message.                                                                          |
+| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                |
+| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`, `every:<N><s\|m\|h\|d>` (e.g. `every:15m`), or five-field cron in UTC. |
 
 ```
 request(ops="schedule.remind(content=\"check PR #600 CI\", at=\"2026-07-05T09:00:00Z\")")
