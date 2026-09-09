@@ -97,7 +97,7 @@ def assert_no_identity_or_rendering(frames):
 
 
 def test_plan_protocol_version_refuses_daemons_that_cannot_plan():
-    assert PROTOCOL_VERSION == 5
+    assert PROTOCOL_VERSION == 6
 
 
 @pytest.mark.parametrize("encoded", [True, False])
@@ -109,12 +109,12 @@ def test_plan_sends_isolated_frame_and_preserves_the_complete_result(encoded):
     assert session.plan(OPS) == PLAN
     assert transport.frames == [
         {
-            "ops": "", "namespace": "", "config_id": "", "protocol_version": 5,
+            "ops": "", "namespace": "", "config_id": "", "protocol_version": 6,
             "metrics_only": True,
         },
         {
             "ops": OPS, "namespace": "", "config_id": "catalog-config",
-            "protocol_version": 5, "plan": True,
+            "protocol_version": 6, "plan": True,
         },
     ]
     assert_no_identity_or_rendering(transport.frames)
