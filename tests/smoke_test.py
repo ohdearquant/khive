@@ -21,31 +21,35 @@ import json
 import subprocess
 import sys
 import os
+import re
 import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from documented_verb_counts import validate_documented_counts
-from kkernel_binary import resolve_binary_path
+from kkernel_binary import REPO_ROOT, resolve_binary_path
 
 BINARY = resolve_binary_path()
 
-DEFAULT_PACKS = frozenset(
-    {
-        "kg",
-        "gtd",
-        "memory",
-        "brain",
-        "comm",
-        "schedule",
-        "knowledge",
-        "session",
-        "git",
-        "code",
-        "workspace",
-        "blob",
-    }
-)
+def shipped_pack_set() -> frozenset[str]:
+    """The pack set the binary ships when nothing selects packs, read from its
+    declaration (`RuntimeConfig::built_in_packs` in
+    crates/khive-runtime/src/config.rs) rather than from a list typed here.
+    A typed copy drifted from the declaration by two packs and reddened this
+    check a day after the packs landed; reading the declaration keeps the pin
+    on what the registry is compared against, and a declaration that fails to
+    parse fails this test instead of passing an empty set."""
+    source = (REPO_ROOT / "crates" / "khive-runtime" / "src" / "config.rs").read_text()
+    match = re.search(r"pub fn built_in_packs\(\) -> Vec<String> \{\s*\[(.*?)\]", source, re.S)
+    assert match, "RuntimeConfig::built_in_packs declaration not found in config.rs"
+    packs = frozenset(re.findall(r'"([a-z_]+)"', match.group(1)))
+    assert {"kg", "workspace"} <= packs, (
+        f"built_in_packs parse produced an implausible set: {sorted(packs)}"
+    )
+    return packs
+
+
+DEFAULT_PACKS = shipped_pack_set()
 _SMOKE_HOME = tempfile.TemporaryDirectory(prefix="khive-smoke-home-")
 
 
@@ -286,10 +290,16 @@ def main():
         # contributes three verbs (blob.put / blob.get / blob.stat, ADR-111)
         # over the `BlobStore` CAS trait, unconfigured (erroring at dispatch)
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
+        # The kg pack also carries its one documented sub-namespace,
+        # stream.append / stream.read / stream.stat (ADR-174 §2); git grew
+        # from four verbs to twelve with the dev-loop surface (checkout, diff,
+        # gates, receipts, reconcile, pr_open, pr_review, pr_merge; ADR-182);
+        # tool contributes thirteen verbs and exec eight (the tool registry
+        # with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 91, (
-            f"expected 91 user-facing verbs from the 12 default packs "
+        assert verbs_result["total"] == 123, (
+            f"expected 123 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
@@ -306,6 +316,9 @@ def main():
             f"comm.unread lists unread inbound messages; comm.mark_read is the "
             f"named atomic-capable mark-read surface; comm.delivered confirms "
             f"the internal inbound sibling after an ambiguous atomic write), "
+            f"kg also carries stream.append/stream.read/stream.stat (ADR-174); "
+            f"git contributes twelve verbs with the ADR-182 dev-loop surface; "
+            f"tool contributes thirteen verbs and exec eight; "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
@@ -1033,6 +1046,8 @@ def epistemic_smoke():
             f"got ok=True: {neg_result}"
         )
         err_msg = neg_result.get("error", "")
+        if isinstance(err_msg, dict):  # structured per-op error: read its message text
+            err_msg = str(err_msg.get("message") or err_msg)
         assert "allowlist" in err_msg or "concept" in err_msg, (
             f"rejection error must mention 'allowlist' or 'concept'; got: {err_msg!r}"
         )
