@@ -321,13 +321,22 @@ Decision left open.
    before the platform call both for the actor that opened the pull request and for a different actor
    whose credential row resolves to the same platform login, read from the platform. The same pre-check,
    on `git.pr_review(approve)` and on `git.pr_merge`'s required-review read, also refuses when the
-   reviewer's platform login equals the login that performed the last push to `expected_head` (the
-   platform's triggering actor for that head), because the platform's last-push rule disqualifies
-   exactly that approval and a merge that relies on it strands.
+   reviewer's platform login equals the login that last pushed `expected_head`, because the platform's
+   last-push rule disqualifies exactly that approval and a merge that relies on it strands. That login
+   is read from the pack's own ledger, never inferred: it is the platform login on the newest `git.push`
+   receipt whose acknowledged head equals `expected_head`; a commit's author or committer, a workflow's
+   triggering actor and the platform's events feed do not name the pusher of a ref. With no such receipt
+   the pre-check refuses nothing and the receipt records `last_pusher` as unknown with reason
+   `no_push_receipt`. Independently, `git.pr_merge`'s required-review read takes the platform's own
+   review decision: the pull request's `reviewDecision` must read `APPROVED`, never a count of approving
+   reviews, so an approval the platform has disqualified under its last-push rule (an approving review
+   under `REVIEW_REQUIRED`) is refused before the merge call even when the push happened outside the
+   pack.
 4. **Grant scope is recorded, not evaluated.** The tool policy decision matches actor, tool pattern and
-   expiry; a grant's `scope` is free text and is carried on the receipt as data. A grant whose tool
-   pattern does not match the verb refuses in the same receipt shape as no grant; no repository-scoped
-   authorization is derived from the scope text.
+   expiry; a grant's `scope` is free text that stays on the grant row, and the receipt cites that row by
+   its grant id beside the policy decision and its source, without copying the scope. A grant whose
+   tool pattern does not match the verb refuses in the same receipt shape as no grant; no
+   repository-scoped authorization is derived from the scope text.
 5. **Repository configuration.** The expectation a pull-request verb asserts before any platform
    write comes from `[git_write.repositories."<absolute repository path>"]` with `remote`, `slug` and
    `visibility`; at call time the key must match an ADR-108 allow-list row or the call refuses. A
@@ -347,8 +356,16 @@ second actor whose credential resolves to the author's platform login is refused
 platform call; 38 a merge whose head moved between the check and the platform call is refused by the
 platform as `not_committed` and not retried; 39 a repository key absent from the allow-list refuses at
 call time; 40 `help` on every git verb returns the schema table and a pack without one keeps its
-parameter rendering; 41 an approval by the login that last pushed `expected_head` is refused before
-the platform call, and an approval by a third login proceeds (control). Mutation controls stated before they ran and both failed at their effects:
+parameter rendering; 41 an approval by the login on the newest `git.push` receipt for `expected_head` is refused before
+the platform call citing that receipt; a head with no push receipt takes the approval and records
+`last_pusher` unknown; a merge whose `reviewDecision` reads other than `APPROVED` is refused before the
+merge call; an approval by a third login under `reviewDecision` `APPROVED` proceeds (control). Mutation controls stated before they ran and both failed at their effects:
 removing the preflight together with the remote comparison overwrote a rival bare ref with the
 candidate; removing only the platform-login check let an alias actor submit an approval as the author
 account.
+
+Corrected the same day, after the slice read the record against its implementation: item 3 names the
+source of the last pusher (the pack's push receipts, and the platform's own review decision at merge)
+where the first text named a workflow's triggering actor, which is not the pusher; item 4 places the
+scope on the grant row the receipt cites, where the first text said the receipt carried it; arm 41
+follows item 3.
