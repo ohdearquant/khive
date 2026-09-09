@@ -298,6 +298,7 @@ pub(crate) async fn dual_write_message(
             if !allowed {
                 return Err(RuntimeError::PermissionDenied {
                     verb: "comm.send".to_string(),
+                    receipt: Box::new(khive_runtime::DenialReceipt::not_audited()),
                     reason: format!(
                         "cross-namespace delivery to {recipient_ns_str:?} is not permitted; \
                          add {recipient_ns_str:?} to actor.allowed_outbound_namespaces in \

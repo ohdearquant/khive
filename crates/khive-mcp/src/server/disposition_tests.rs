@@ -1645,3 +1645,41 @@ async fn a3_same_committed_failure_crosses_mcp_request_and_native_frame_once() {
         file.write_all(b"\n").unwrap();
     }
 }
+
+#[test]
+#[serial_test::serial(config_ledger)]
+fn a_gate_refusal_projects_its_audit_receipt_beside_the_denial_text() {
+    let id = uuid::Uuid::new_v4();
+    let error = runtime_error_value(
+        RuntimeError::PermissionDenied {
+            verb: "create".into(),
+            reason: "denied for test".into(),
+            receipt: Box::new(khive_runtime::DenialReceipt {
+                audit_event_id: Some(id),
+                audit_outcome: khive_runtime::DenialAuditOutcome::Committed,
+            }),
+        },
+        DomainDisposition::NotCommitted,
+    );
+    assert_eq!(error["kind"], "runtime_error");
+    assert_eq!(error["code"], "permission_denied");
+    assert_eq!(
+        error["message"],
+        "permission denied for verb \"create\": denied for test"
+    );
+    assert_eq!(error["verb"], "create");
+    assert_eq!(error["reason"], "denied for test");
+    assert_eq!(error["audit_event_id"], id.to_string());
+    assert_eq!(error["audit_outcome"], "committed");
+
+    let unaudited = runtime_error_value(
+        RuntimeError::permission_denied("authorize", "gate denied"),
+        DomainDisposition::NotCommitted,
+    );
+    assert_eq!(unaudited["audit_event_id"], Value::Null);
+    assert_eq!(unaudited["audit_outcome"], "not_audited");
+    assert!(unaudited["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("permission denied for verb"));
+}

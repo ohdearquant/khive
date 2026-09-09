@@ -1947,14 +1947,10 @@ impl VerbRegistry {
         let req = GateRequest::new(actor, ns, "authorize", serde_json::Value::Null);
         match self.gate.check(&req) {
             Ok(decision) if decision.is_allow() => Ok(()),
-            Ok(GateDecision::Deny { reason }) => Err(RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason,
-            }),
-            Ok(_) => Err(RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason: "gate denied".to_string(),
-            }),
+            Ok(GateDecision::Deny { reason }) => {
+                Err(RuntimeError::permission_denied("authorize", reason))
+            }
+            Ok(_) => Err(RuntimeError::permission_denied("authorize", "gate denied")),
             Err(e) => {
                 tracing::warn!(
                     error = %crate::secret_gate::bounded_masked_log_text(&e.to_string()),
@@ -2024,6 +2020,36 @@ impl VerbRegistry {
             .map_err(DispatchError::into_source)
     }
 
+    /// Append the `GateDenied` row of a refused dispatch and report what the
+    /// caller may cite: the row's id when it committed, otherwise why not.
+    async fn append_gate_denied_row(
+        &self,
+        store: &Arc<dyn EventStore>,
+        event: Event,
+        verb: &str,
+    ) -> crate::error::DenialReceipt {
+        let audit_event_id = event.id;
+        match append_audit_event_best_effort(
+            self.audit_batch.as_ref(),
+            store,
+            event,
+            verb,
+            crate::audit_batch::AuditProducer::GateDenied,
+            false,
+        )
+        .await
+        {
+            Ok(()) => crate::error::DenialReceipt {
+                audit_event_id: Some(audit_event_id),
+                audit_outcome: crate::error::DenialAuditOutcome::Committed,
+            },
+            Err(failure) => crate::error::DenialReceipt {
+                audit_event_id: None,
+                audit_outcome: crate::error::DenialAuditOutcome::NotCommitted(failure.wire_code()),
+            },
+        }
+    }
+
     /// Execute an intercepted operation while retaining this boundary's failure provenance.
     /// Successful canonical results and typed metadata are returned unchanged.
     pub async fn dispatch_intercepted_with_metadata_and_disposition<M, F, Fut>(
@@ -2050,33 +2076,29 @@ impl VerbRegistry {
                     "gate.check"
                 );
                 if let GateDecision::Deny { reason } = decision {
-                    if let Some(store) = &self.event_store {
-                        let event = build_audit_storage_event(
-                            &gate_req,
-                            &audit,
-                            EventOutcome::Denied,
-                            Some(crate::cost_unit::base_resource_payload(request_id)),
-                        );
-                        // The dispatch already returns `PermissionDenied`
-                        // below regardless of whether this row commits — a
-                        // deny never reports success — so a persistent
-                        // commit failure here has no caller-visible outcome
-                        // to fold into; it is still logged and counted by
-                        // the helper.
-                        let _ = append_audit_event_best_effort(
-                            self.audit_batch.as_ref(),
-                            store,
-                            event,
-                            verb,
-                            crate::audit_batch::AuditProducer::GateDenied,
-                            false,
-                        )
-                        .await;
-                    }
+                    let receipt = match &self.event_store {
+                        Some(store) => {
+                            let event = build_audit_storage_event(
+                                &gate_req,
+                                &audit,
+                                EventOutcome::Denied,
+                                Some(crate::cost_unit::base_resource_payload(request_id)),
+                            );
+                            // The dispatch returns `PermissionDenied` below
+                            // whether or not this row commits — a deny never
+                            // reports success — so a commit failure has no
+                            // caller-visible outcome to fold into; the receipt
+                            // on the refusal says whether the row the caller
+                            // could cite exists.
+                            self.append_gate_denied_row(store, event, verb).await
+                        }
+                        None => crate::error::DenialReceipt::no_store(),
+                    };
                     return Err(DispatchError::before_dispatch(
                         RuntimeError::PermissionDenied {
                             verb: verb.to_string(),
                             reason,
+                            receipt: Box::new(receipt),
                         },
                     ));
                 }
@@ -2462,41 +2484,37 @@ impl VerbRegistry {
                 // ingest writes with no response and no completed receipt.
                 let defer_audit = !is_deny;
 
-                // Persist to EventStore immediately only for denied calls.
-                if !defer_audit {
-                    if let Some(store) = &self.event_store {
-                        // ADR-103 Decision (a): the closed `work_class` enum
-                        // is stamped on every event, denial included -- only
-                        // `resource.cost_unit` is scoped to a successful
-                        // dispatch by Amendment 1. `base_resource_payload()`
-                        // carries `work_class` alone, no `cost_unit` key.
-                        let storage_event = build_audit_storage_event(
-                            &gate_req,
-                            &audit,
-                            EventOutcome::Denied,
-                            Some(crate::cost_unit::base_resource_payload(request_id)),
-                        );
-                        // As above (line ~1513): this path always returns
-                        // `PermissionDenied` below regardless, so there is no
-                        // success outcome to fold a commit failure into.
-                        let _ = append_audit_event_best_effort(
-                            self.audit_batch.as_ref(),
-                            store,
-                            storage_event,
-                            verb,
-                            crate::audit_batch::AuditProducer::GateDenied,
-                            false,
-                        )
-                        .await;
-                    }
-                }
-
+                // Persist to EventStore immediately only for denied calls;
+                // the receipt rides on the refusal so the caller can cite
+                // the row.
                 let reason = if is_deny {
                     let reason = match decision {
                         GateDecision::Deny { reason } => reason,
                         _ => String::new(),
                     };
-                    Some(reason)
+                    let receipt = match &self.event_store {
+                        Some(store) => {
+                            // ADR-103 Decision (a): the closed `work_class` enum
+                            // is stamped on every event, denial included -- only
+                            // `resource.cost_unit` is scoped to a successful
+                            // dispatch by Amendment 1. `base_resource_payload()`
+                            // carries `work_class` alone, no `cost_unit` key.
+                            let storage_event = build_audit_storage_event(
+                                &gate_req,
+                                &audit,
+                                EventOutcome::Denied,
+                                Some(crate::cost_unit::base_resource_payload(request_id)),
+                            );
+                            // This path always returns `PermissionDenied`
+                            // below, so there is no success outcome to fold a
+                            // commit failure into; the receipt says whether
+                            // the row exists.
+                            self.append_gate_denied_row(store, storage_event, verb)
+                                .await
+                        }
+                        None => crate::error::DenialReceipt::no_store(),
+                    };
+                    Some((reason, receipt))
                 } else {
                     None
                 };
@@ -2512,11 +2530,12 @@ impl VerbRegistry {
         };
 
         // Hard enforcement: Deny is authoritative.
-        if let Some(reason) = gate_blocked {
+        if let Some((reason, receipt)) = gate_blocked {
             return Err(DispatchError::before_dispatch(
                 RuntimeError::PermissionDenied {
                     verb: verb.to_string(),
                     reason,
+                    receipt: Box::new(receipt),
                 },
             ));
         }
@@ -6229,6 +6248,97 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn denied_dispatch_returns_the_id_of_its_committed_gate_denied_row() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        let RuntimeError::PermissionDenied { receipt, .. } = err else {
+            panic!("expected PermissionDenied, got {err:?}");
+        };
+        assert_eq!(
+            receipt.audit_outcome,
+            crate::error::DenialAuditOutcome::Committed
+        );
+        let audit_event_id = receipt
+            .audit_event_id
+            .expect("a committed row carries its id");
+        let events = store.events.lock().unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.id == audit_event_id)
+            .expect("the receipt names a row the store holds");
+        assert_eq!(row.outcome, EventOutcome::Denied);
+        assert_eq!(row.kind, EventKind::Audit);
+        assert_eq!(row.verb, "create");
+    }
+
+    #[tokio::test]
+    async fn denied_dispatch_without_an_event_store_reports_no_store() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate);
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RuntimeError::PermissionDenied { ref receipt, .. }
+                    if **receipt == crate::error::DenialReceipt::no_store()
+            ),
+            "expected a no-store receipt, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    #[serial_test::serial(audit_append_failures)]
+    #[serial_test::serial(audit_obligation_append_failures)]
+    async fn denied_dispatch_whose_row_fails_to_commit_still_refuses_and_names_no_row() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        let RuntimeError::PermissionDenied { verb, receipt, .. } = err else {
+            panic!("expected PermissionDenied, got {err:?}");
+        };
+        assert_eq!(verb, "create");
+        assert_eq!(
+            receipt.audit_event_id, None,
+            "a row that did not commit is not cited"
+        );
+        assert_eq!(
+            receipt.audit_outcome,
+            crate::error::DenialAuditOutcome::NotCommitted("store_failure")
+        );
+        assert!(store.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn dispatch_allow_verb_succeeds_even_with_deny_gate_for_other_verb() {
         // Deny only "create" — "list" must still work.
         let gate = Arc::new(CountingGate {
@@ -6807,7 +6917,7 @@ pub(crate) mod tests {
 
         let err = reg.dispatch("create", Value::Null).await.unwrap_err();
         assert!(
-            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason }
+            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason, .. }
                 if verb == "create" && reason == "policy evaluation failed"),
             "expected PermissionDenied with the static classified reason for a missing rego entrypoint, got {err:?}"
         );
@@ -8507,15 +8617,30 @@ pub(crate) mod tests {
             .await
             .expect_err("explicit gate denial must refuse intercepted dispatch");
 
-        assert!(matches!(
-            err,
-            RuntimeError::PermissionDenied { ref verb, ref reason }
-                if verb == "list" && reason == "intercepted policy denied"
-        ));
+        let RuntimeError::PermissionDenied {
+            verb,
+            reason,
+            receipt,
+        } = err
+        else {
+            panic!("expected PermissionDenied, got {err:?}");
+        };
+        assert_eq!(verb, "list");
+        assert_eq!(reason, "intercepted policy denied");
+        assert_eq!(
+            receipt.audit_outcome,
+            crate::error::DenialAuditOutcome::Committed,
+            "the intercepted path commits its denial row before refusing"
+        );
         assert_eq!(invoked.load(Ordering::SeqCst), 0);
 
         let events = store.events.lock().unwrap();
         assert_eq!(events.len(), 1);
+        assert_eq!(
+            Some(events[0].id),
+            receipt.audit_event_id,
+            "the receipt names the committed row"
+        );
         assert_eq!(events[0].outcome, EventOutcome::Denied);
         assert_eq!(events[0].payload["decision"], "deny");
         assert_eq!(
@@ -8712,7 +8837,7 @@ pub(crate) mod tests {
 
         let err = reg.dispatch("guarded", Value::Null).await.unwrap_err();
         assert!(
-            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason } if verb == "guarded" && reason.contains("always deny")),
+            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason, .. } if verb == "guarded" && reason.contains("always deny")),
             "expected PermissionDenied with verb=guarded and reason, got: {err:?}"
         );
         assert_eq!(
@@ -8825,7 +8950,7 @@ pub(crate) mod tests {
             .expect_err("denied absent-id update must not resolve the id");
 
         let denial = |error: RuntimeError| match error {
-            RuntimeError::PermissionDenied { verb, reason } => (verb, reason),
+            RuntimeError::PermissionDenied { verb, reason, .. } => (verb, reason),
             other => panic!("expected gate refusal, got {other:?}"),
         };
         let present_denial = denial(present_error);
