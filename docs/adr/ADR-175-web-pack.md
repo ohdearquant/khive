@@ -285,7 +285,8 @@ too, for the reason in A1.2.7.
 
 1. **Scheme.** `http` and `https` only. Everything else refuses, including `file`, `ftp` and `data`.
 2. **Address, after resolution.** The host is resolved and every returned address is checked; a
-   loopback, link-local, private, unique-local, or unspecified address refuses. The check is on the
+   loopback, link-local, private, unique-local, multicast, broadcast or unspecified address refuses;
+   the shared address space 100.64.0.0/10 counts as private. The check is on the
    resolved address rather than on the hostname, because a name that resolves into private space is
    the whole shape of the attack, and it is re-applied on every redirect hop rather than once. The
    connection is then made to an address that passed, never to a fresh resolution of the name: a
@@ -305,9 +306,15 @@ too, for the reason in A1.2.7.
    decompressed bytes, because a small compressed response can expand without limit and a bound on
    the encoded stream bounds nothing the caller ever sees; decoding stops at the bound and the
    result is stored truncated like any other over-long response.
-6. **Credentials are never arguments.** `credential` names an entry the operator has configured; the
-   value is read from the process environment at request time. A secret in the verb's arguments would
-   be in the receipt, the audit event, and every log that carries either.
+6. **Credentials are never arguments, and each is bound to a host set.** `credential` names an entry
+   the operator has configured; the value is read from the process environment at request time. A
+   secret in the verb's arguments would be in the receipt, the audit event, and every log that carries
+   either. Every configured credential also carries the set of hosts it may be presented to (exact
+   hosts or suffixes, operator configuration), because a secret bound only to a name is presented to
+   whatever host the caller names. A request naming a credential for a host outside its set refuses
+   before any request is made, naming the credential and the host. On a redirect whose next hop is
+   outside the set the hop refuses; the credential is never sent to the hop, and rule 4's address
+   re-check does not stand in for this one, since it checks address class and not credential scope.
 7. **Request headers, allow-listed, with the credential-bearing ones refused by name.** `headers`
    accepts `Accept`, `Accept-Language`, `If-None-Match`, `If-Modified-Since` and `User-Agent`; any
    other header refuses with the header named. `Authorization`, `Cookie` and `Proxy-Authorization`
@@ -346,20 +353,22 @@ changes nothing here.
 D6.1, D6.2, D6.3, D6.5 and D6.6 stand as written. `web.ingest` is untouched and remains local-only.
 No new entity kind, note kind or edge relation is introduced; neither verb writes the graph.
 
-Acceptance arms, stated before implementation: 12 a `file://` URL refuses and stores nothing; 13 a
+Acceptance arms, continuing the base numbering (the base ADR's acceptance ends at 7), stated before
+implementation; the suite reaches no real network per D6.6, so the resolver and the listener in every
+arm are fixture stubs and the public hostnames are stub-resolved names: 8 a `file://` URL refuses and stores nothing; 9 a
 hostname resolving to loopback refuses naming the resolved address, with a public hostname as a
-positive control in the same test; 14 a redirect chain whose second hop points into private address
-space refuses at that hop, with a same-length public chain as control; 15 a response larger than the
+positive control in the same test; 10 a redirect chain whose second hop points into private address
+space refuses at that hop, with a same-length public chain as control; 11 a response larger than the
 byte bound is stored truncated with `truncated: true` and its digest matches the stored prefix;
-16 a response slower than the time bound refuses and the blob store holds no new object; 17 a
+12 a response slower than the time bound refuses and the blob store holds no new object; 13 a
 configured allowlist makes a host outside it refuse while a host inside it succeeds, both in one
-test; 18 a `credential` name that is not configured refuses without the request being made, proved
-by a request counter that does not move; 19 `web.search` with no provider configured refuses with
-its own reason rather than an empty result list; 20 a fetch receipt records the requested URL, the
+test; 14 a `credential` name that is not configured refuses without the request being made, proved
+by a request counter that does not move; 15 `web.search` with no provider configured refuses with
+its own reason rather than an empty result list; 16 a fetch receipt records the requested URL, the
 final URL after redirects, the status and the content digest, and the digest matches what `blob.get`
-returns for the reference in the reply; 21 a fetch whose `headers` carries `Authorization` refuses
+returns for the reference in the reply; 17 a fetch whose `headers` carries `Authorization` refuses
 naming `credential` without the request being made, proved by a request counter that does not move,
-with an allow-listed header succeeding in the same test as the control; 22 a host whose resolution
+with an allow-listed header succeeding in the same test as the control; 18 a host whose resolution
 changes between the check and the connect refuses, with a stable-resolution host as the positive
-control in the same test; 23 a compressed response whose decompressed size exceeds the byte bound is
-stored truncated with `truncated: true`, and the stored object is no larger than the bound.
+control in the same test; 19 a compressed response whose decompressed size exceeds the byte bound is
+stored truncated with `truncated: true`, and the stored object is no larger than the bound. Two arms for the credential host set: 20 a request naming a credential for a host outside its configured set refuses naming the credential and the host, proved by a request counter that does not move, with the same credential to a host inside the set succeeding as the control; 21 a redirect whose second hop is outside the credential's set refuses at that hop, and the counter shows the first hop was made and the second was not.
