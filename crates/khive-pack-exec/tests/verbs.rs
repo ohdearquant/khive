@@ -15,6 +15,7 @@ struct Fixture {
     registry: VerbRegistry,
     _dir: tempfile::TempDir,
     root: std::path::PathBuf,
+    blobs: std::path::PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -41,8 +42,9 @@ fn fixture() -> Fixture {
     let rt = KhiveRuntime::new(cfg).expect("file runtime");
     // A file-backed runtime installs no blob store on its own; the pack under
     // test materializes trees from blob refs, so give it a real one.
-    let blobs = khive_db::stores::blob::FsBlobStore::new(dir.path().join("blobs"), 0)
-        .expect("fs blob store");
+    let blob_root = dir.path().join("blobs");
+    let blobs =
+        khive_db::stores::blob::FsBlobStore::new(blob_root.clone(), 0).expect("fs blob store");
     rt.install_blob_store(std::sync::Arc::new(blobs))
         .expect("install blob store");
     let mut builder = VerbRegistryBuilder::new();
@@ -57,6 +59,7 @@ fn fixture() -> Fixture {
         registry,
         _dir: dir,
         root,
+        blobs: blob_root,
     }
 }
 
@@ -130,6 +133,325 @@ impl Fixture {
         )
         .await;
     }
+}
+
+/// Count the objects the blob store holds. `exec.tree_put` promises that a refused call leaves
+/// no new object behind, and that is a claim about the store, not about the call's return value,
+/// so the arm asserting it has to look at the store itself.
+fn blob_object_count(f: &Fixture) -> usize {
+    fn walk(dir: &std::path::Path, seen: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => walk(&entry.path(), seen),
+                Ok(_) => *seen += 1,
+                Err(_) => {}
+            }
+        }
+    }
+    let mut seen = 0;
+    walk(&f.blobs, &mut seen);
+    seen
+}
+
+async fn entries_of(f: &Fixture, tree: &str) -> Vec<(String, String, u64)> {
+    f.call("exec.tree_get", json!({ "tree": tree })).await["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["path"].as_str().unwrap().to_string(),
+                e["ref"].as_str().unwrap().to_string(),
+                e["mode"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn tree_put_applies_edits_and_leaves_the_base_tree_alone() {
+    let f = fixture();
+    let base = f
+        .tree(&[("a.txt", b"one", 644), ("keep/b.txt", b"two", 755)])
+        .await;
+    let replacement = f.put(b"three").await;
+    let out = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [
+                { "path": "a.txt", "content": "ONE" },
+                { "path": "keep/b.txt", "ref": replacement },
+                { "path": "new/c.txt", "content": "four", "mode": 755 },
+                // A new path with no mode is the only edit that reaches the default, so it is the
+                // only one that can tell 644 from the octal literal 0o644, which is 420.
+                { "path": "new/d.txt", "content": "five" },
+            ]}),
+        )
+        .await;
+    let head = out["tree"].as_str().unwrap();
+    assert_ne!(head, base, "a put mints a new tree");
+    assert_eq!(out["base"], json!(base));
+    assert_eq!(out["entries"], json!(4));
+
+    let head_entries = entries_of(&f, head).await;
+    assert_eq!(
+        head_entries
+            .iter()
+            .map(|(path, _, mode)| (path.as_str(), *mode))
+            .collect::<Vec<_>>(),
+        vec![
+            ("a.txt", 644),
+            ("keep/b.txt", 755),
+            ("new/c.txt", 755),
+            ("new/d.txt", 644)
+        ],
+        "an edit without a mode keeps the mode the entry already had, and a new entry takes the \
+         mode it was given"
+    );
+    assert_eq!(
+        head_entries[1].1, replacement,
+        "a ref edit stores the ref it was handed"
+    );
+
+    // Trees are immutable: reading the base back must show the pre-edit content.
+    let base_entries = entries_of(&f, &base).await;
+    assert_eq!(base_entries.len(), 2);
+    assert_ne!(
+        base_entries[0].1, head_entries[0].1,
+        "the base still names the old content"
+    );
+    assert_eq!(
+        f.call("exec.tree_diff", json!({ "base": base, "head": head }))
+            .await["changed"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+
+    // The new content is readable, so `content` really did store a blob rather than only a name.
+    let rewritten = f
+        .call("blob.get", json!({ "content_ref": head_entries[0].1 }))
+        .await;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(rewritten["bytes"].as_str().unwrap())
+        .expect("decode");
+    assert_eq!(bytes, b"ONE");
+}
+
+#[tokio::test]
+async fn tree_put_deletes_only_paths_the_tree_holds() {
+    let f = fixture();
+    let base = f.tree(&[("a", b"1", 644), ("b", b"2", 644)]).await;
+    let out = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [{ "path": "a", "delete": true }] }),
+        )
+        .await;
+    let left = entries_of(&f, out["tree"].as_str().unwrap()).await;
+    assert_eq!(
+        left.iter().map(|(p, _, _)| p.as_str()).collect::<Vec<_>>(),
+        vec!["b"]
+    );
+    assert_eq!(out["entries"], json!(1));
+
+    // A delete of a path the tree does not hold is refused rather than treated as done, because a
+    // caller who believes it removed something is exactly the failure this verb must not produce.
+    let err = f
+        .call_err(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [{ "path": "absent", "delete": true }] }),
+        )
+        .await;
+    assert!(err.contains("absent"), "the refusal names the path: {err}");
+    // And a delete cannot carry a mode, which would otherwise read as a chmod that never happens.
+    let err = f
+        .call_err(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [{ "path": "a", "delete": true, "mode": 755 }] }),
+        )
+        .await;
+    assert!(err.contains("mode"), "{err}");
+}
+
+#[tokio::test]
+async fn tree_put_refuses_duplicate_paths_naming_both_edits() {
+    let f = fixture();
+    let base = f.tree(&[("a", b"1", 644)]).await;
+    let err = f
+        .call_err(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [
+                { "path": "a", "content": "first" },
+                { "path": "b", "content": "unrelated" },
+                { "path": "a", "content": "second" },
+            ]}),
+        )
+        .await;
+    assert!(
+        err.contains("edits[0]") && err.contains("edits[2]") && err.contains("\"a\""),
+        "the refusal names both offending indices and the path: {err}"
+    );
+    // Last-one-wins is the behaviour being refused, so assert the tree did not quietly take one.
+    assert_eq!(entries_of(&f, &base).await.len(), 1);
+}
+
+#[tokio::test]
+async fn tree_put_refuses_an_empty_edit_list_rather_than_echoing_the_tree() {
+    let f = fixture();
+    let base = f.tree(&[("a", b"1", 644)]).await;
+    let err = f
+        .call_err("exec.tree_put", json!({ "tree": base, "edits": [] }))
+        .await;
+    assert!(err.contains("empty"), "{err}");
+}
+
+#[tokio::test]
+async fn tree_put_refuses_edits_that_do_not_name_exactly_one_action() {
+    let f = fixture();
+    let base = f.tree(&[("a", b"1", 644)]).await;
+    let r = f.put(b"x").await;
+    for (edits, expect) in [
+        (json!([{ "path": "a" }]), "0 of ref"),
+        (
+            json!([{ "path": "a", "ref": r, "content": "both" }]),
+            "2 of ref",
+        ),
+        (
+            json!([{ "path": "a", "ref": r, "delete": true }]),
+            "2 of ref",
+        ),
+        (
+            json!([{ "path": "a", "content": "x", "mode": 777 }]),
+            "644 or 755",
+        ),
+        (json!([{ "path": "../escape", "content": "x" }]), "escape"),
+        (
+            json!([{ "path": "a", "content": "x", "mode": 0o644 }]),
+            "644 or 755",
+        ),
+    ] {
+        let err = f
+            .call_err("exec.tree_put", json!({ "tree": base, "edits": edits }))
+            .await;
+        assert!(err.contains(expect), "expected {expect:?} in: {err}");
+    }
+    // A mode written as an octal literal is 420, not 644, and must be refused rather than stored:
+    // `exec.tree` would later reject the manifest this verb had already minted.
+    assert_eq!(entries_of(&f, &base).await, entries_of(&f, &base).await);
+}
+
+#[tokio::test]
+async fn tree_put_refuses_a_file_that_would_become_a_directory_prefix() {
+    let f = fixture();
+    // `a` is a file. Adding `a/b` would make the manifest name `a` as both a file and a directory,
+    // which `exec.tree` refuses on the way in; `tree_put` builds entries directly, so without
+    // routing the candidate manifest through the same validator it could mint one `exec.tree_get`
+    // would then refuse to load.
+    let base = f.tree(&[("a", b"1", 644)]).await;
+    let err = f
+        .call_err(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [{ "path": "a/b", "content": "nested" }] }),
+        )
+        .await;
+    assert!(!err.is_empty(), "a file cannot also be a directory prefix");
+    // The inverse: replacing the file with the directory in one call is legitimate, because the
+    // candidate manifest the validator sees no longer holds `a` as a file.
+    let out = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [
+                { "path": "a", "delete": true },
+                { "path": "a/b", "content": "nested" },
+            ]}),
+        )
+        .await;
+    assert_eq!(
+        entries_of(&f, out["tree"].as_str().unwrap())
+            .await
+            .iter()
+            .map(|(p, _, _)| p.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a/b"]
+    );
+}
+
+#[tokio::test]
+async fn tree_put_that_refuses_stores_nothing_including_blobs_for_the_good_entries() {
+    let f = fixture();
+    let base = f.tree(&[("a", b"1", 644)]).await;
+    let before = blob_object_count(&f);
+    assert!(
+        before > 0,
+        "the store is non-empty, so a count of zero would be an instrument fault"
+    );
+
+    // The first two entries are fine and carry content that is not yet in the store. The LAST one
+    // fails normalization. Atomicity is a property of the result: one call yields exactly one new
+    // tree or none, and a refusal stores nothing, including the blobs for the entries that were
+    // fine. An implementation that put blobs as it validated them would pass every other arm here.
+    let err = f
+        .call_err(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [
+                { "path": "good-one", "content": "content that appears in no other test" },
+                { "path": "good-two", "content": "a second body unique to this arm" },
+                { "path": "/absolute", "content": "the entry that fails normalization" },
+            ]}),
+        )
+        .await;
+    assert!(!err.is_empty());
+    assert_eq!(
+        blob_object_count(&f),
+        before,
+        "a refused put left a new object in the blob store"
+    );
+
+    // Positive control on the same instrument: the identical list minus the bad entry DOES store
+    // its blobs, so the count above is measuring something that can move.
+    let out = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [
+                { "path": "good-one", "content": "content that appears in no other test" },
+                { "path": "good-two", "content": "a second body unique to this arm" },
+            ]}),
+        )
+        .await;
+    assert!(out["tree"].is_string());
+    assert!(
+        blob_object_count(&f) > before,
+        "the control must move the count the refusal arm asserts is still"
+    );
+}
+
+#[tokio::test]
+async fn tree_put_refuses_a_ref_that_names_no_stored_object_before_writing_anything() {
+    let f = fixture();
+    let base = f.tree(&[("a", b"1", 644)]).await;
+    let before = blob_object_count(&f);
+    let absent = "0".repeat(64);
+    let err = f
+        .call_err(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [
+                { "path": "written-first", "content": "a body unique to the dangling-ref arm" },
+                { "path": "dangling", "ref": absent },
+            ]}),
+        )
+        .await;
+    assert!(!err.is_empty());
+    assert_eq!(
+        blob_object_count(&f),
+        before,
+        "the good entry's blob was stored anyway"
+    );
 }
 
 fn root_is_empty(f: &Fixture) -> bool {

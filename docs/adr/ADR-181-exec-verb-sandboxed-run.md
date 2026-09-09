@@ -178,3 +178,59 @@ started concurrently in one session receive `seq` 1 and 2, `exec.runs` for the s
 and `exec.receipt` reports the same number as the run reply; 22 a shell run that invokes
 `git --version` and one that invokes a `never` path both end with a non-zero status and the kernel's
 refusal in stderr, while the same shell invoking `/bin/echo` exits zero (control).
+
+## Amendment 4 (2026-09-09): `exec.tree_put`, a batch edit that mints one tree or none
+
+A tree is an immutable manifest blob, so every edit mints a new manifest. Callers today build the
+whole entry list themselves and call `exec.tree`, which means an agent editing a checkout has to
+read the old tree, splice its own changes into the entry array, and re-declare every path it did
+not touch. `exec.tree_put(tree, edits)` does that splice, and it takes a list rather than a single
+path because a caller that edits several files per step would otherwise mint one throwaway tree per
+file, each of which nothing ever reads.
+
+1. **The shape.** `exec.tree_put(tree, edits)` returns `{tree, base, entries, changed}`, where
+   `changed` is the `exec.tree_diff` of the base against the result. Each edit is an object with a
+   `path` and exactly one of `ref` (an existing blob reference), `content` (bytes to store), or
+   `delete: true`. An edit that names none of the three, or more than one, is refused and the
+   refusal says how many it named. `mode` is optional on a put and forbidden on a delete: an edit
+   that omits it keeps the mode the path already had, and a new path takes 644. The modes a
+   manifest stores are the decimal 644 and 755, never octal literals.
+
+2. **One new tree or none.** The atomicity is a property of the result, not of the loop that
+   produces it: a call yields exactly one new tree reference or none, and a refusal on any edit
+   leaves the blob store with no new object from the call, including objects for the edits that
+   were fine. That is why `content` bytes are hashed rather than written while the call is being
+   validated. `digest_hex` is the same BLAKE3 the blob store keys on, so a content edit's reference
+   is known before its byte is stored, and only a call that will succeed writes anything.
+
+3. **The candidate manifest goes through the pack's own validator.** After the edits are applied,
+   the complete entry list is validated by `parse_entries`, the same function `exec.tree` uses. This
+   is not tidiness. `parse_entries` enforces that a file cannot also be a directory prefix of
+   another entry, and a verb that builds `TreeEntry` values directly and stores them would happily
+   mint a manifest containing both `a` and `a/b` that `exec.tree_get` would then refuse to load.
+   Deleting `a` and adding `a/b` in one call is legitimate and passes, because the candidate the
+   validator sees no longer holds `a` as a file.
+
+4. **Refusals that a quiet success would hide.** Duplicate paths in one list are refused and the
+   refusal names both indices, rather than last-one-wins: these lists are produced by generated code
+   and by models, both of which produce duplicates, and last-one-wins makes the caller's second
+   intent vanish where nothing downstream can observe that it happened. A delete of a path the tree
+   does not hold is refused, because a silent no-op is how a caller comes to believe it removed
+   something. An empty `edits` list is refused rather than returning the input tree, because an
+   empty edit is almost always a caller bug and echoing the input makes a no-op look like work.
+
+5. **Degrade safety.** `exec.tree_put` is a Declaration and a writer, so it is not on the admission
+   degrade-safe list beside `exec.tree_get` and `exec.tree_diff`.
+
+Acceptance arms added: 23 a call that rewrites one path by content, replaces another by ref, and
+adds two new paths returns a new tree whose entries carry the expected modes (kept, given, and the
+644 default), leaves the base tree readable at its pre-edit content, and stores the new bytes so
+they read back; 24 a delete removes only the named path, a delete of an absent path is refused
+naming it, and a delete carrying a mode is refused; 25 duplicate paths are refused with both
+indices and the path in the message; 26 an empty edits list is refused; 27 an edit naming zero or
+two of ref/content/delete is refused counting them, an out-of-range mode is refused, an octal
+literal mode is refused as the 420 it is, and an escaping path is refused; 28 adding `a/b` where
+`a` is a file is refused, while deleting `a` and adding `a/b` in one call succeeds; 29 a list whose
+last edit fails normalization leaves the blob store object count unchanged, with the same list
+minus that edit as a positive control that moves the count; 30 a `ref` naming no stored object is
+refused with the count unchanged, so the good edit's blob was not written first.

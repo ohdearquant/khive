@@ -1706,8 +1706,8 @@ impl VerbRegistry {
         // agent
         ("agent", "agent.observe"),
         // exec (reads of the blob store, the run receipt and event tables, or
-        // the resolved configuration; the writers are exec.tree, a Declaration,
-        // and exec.run, a Directive)
+        // the resolved configuration; the writers are exec.tree and
+        // exec.tree_put, Declarations, and exec.run, a Directive)
         ("exec", "exec.tree_get"),
         ("exec", "exec.tree_diff"),
         ("exec", "exec.receipt"),
