@@ -252,6 +252,7 @@ async fn next_resolves_deps_older_than_500_task_window() {
     let blocker_id = uuid::Uuid::new_v4();
     let old_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000;
     let blocker = Note {
+        version: 1,
         key: None,
         id: blocker_id,
         namespace: "local".to_string(),
@@ -275,6 +276,7 @@ async fn next_resolves_deps_older_than_500_task_window() {
     let now = chrono::Utc::now().timestamp_micros();
     let fillers: Vec<Note> = (0..500_u32)
         .map(|i| Note {
+            version: 1,
             key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),

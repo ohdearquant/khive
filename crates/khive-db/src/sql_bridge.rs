@@ -3011,8 +3011,9 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
 // =============================================================================
 
 /// A purely-synchronous `SqlReader`/`SqlWriter` over a borrowed connection,
-/// used ONLY to drive an [`AtomicUnitOp`] on the flag-on path, where the
-/// closure body runs inside the writer task's `spawn_blocking` (synchronous
+/// used ONLY to drive an [`AtomicUnitOp`] on the queued file-backed path,
+/// where the closure body runs inside the writer task's `spawn_blocking`
+/// (synchronous
 /// `FnOnce(&rusqlite::Connection) -> ...`) rather than a real async context.
 ///
 /// Every method here does plain, non-suspending rusqlite work — there is no
@@ -3196,8 +3197,8 @@ fn block_on_sync<F: std::future::Future>(fut: F) -> Result<F::Output, StorageErr
 
 /// Run `op` under a manual `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` on `writer`
 /// — the pre-ADR-067 shape, used by [`SqlBridge::atomic_unit`] whenever no
-/// writer task applies (flag off, no runtime, or an in-memory pool),
-/// preserving that path byte-for-byte.
+/// writer task applies: no runtime, a read-only pool, or an in-memory pool,
+/// which this branch preserves byte-for-byte.
 async fn run_manual_atomic_unit(
     writer: &mut dyn khive_storage::SqlWriter,
     op: AtomicUnitOp,
@@ -3382,7 +3383,8 @@ impl khive_storage::SqlAccess for SqlBridge {
     }
 
     /// Implements the trait's atomic-unit suspend-free invariant
-    /// (`SqlAccess::atomic_unit`'s doc comment): on the flag-on branch below,
+    /// (`SqlAccess::atomic_unit`'s doc comment): on the queued file-backed
+    /// branch below,
     /// `op` is driven through `block_on_sync` on an `InlineWriter` — a
     /// single-poll driver that returns `Err` the instant `op`'s future is
     /// `Pending` instead of ever actually suspending. `op` must therefore

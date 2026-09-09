@@ -1155,7 +1155,7 @@ async fn parallel_assign_batch_creates_n_tasks() -> anyhow::Result<()> {
     ]"#;
     let result = call(&client, "request", json!({"ops": ops})).await?;
     let body: Value = serde_json::from_str(&first_text(&result))?;
-    assert_eq!(body["summary"]["succeeded"], 3);
+    assert_eq!(body["summary"]["succeeded"], 3, "{body}");
     Ok(())
 }
 
