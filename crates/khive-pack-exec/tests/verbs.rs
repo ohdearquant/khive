@@ -135,9 +135,11 @@ impl Fixture {
     }
 }
 
-/// Count the objects the blob store holds. `exec.tree_put` promises that a refused call leaves
-/// no new object behind, and that is a claim about the store, not about the call's return value,
-/// so the arm asserting it has to look at the store itself.
+/// Count the objects the blob store holds. `exec.tree_put` promises that a call refused during
+/// validation leaves no new object behind, and that is a claim about the store, not about the
+/// call's return value, so the arm asserting it has to look at the store itself. The promise is
+/// scoped to validation: once validation passes, the blobs are published one at a time, and a
+/// backend failure partway through leaves the objects already published, referenced by no tree.
 fn blob_object_count(f: &Fixture) -> usize {
     fn walk(dir: &std::path::Path, seen: &mut usize) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -223,13 +225,29 @@ async fn tree_put_applies_edits_and_leaves_the_base_tree_alone() {
         base_entries[0].1, head_entries[0].1,
         "the base still names the old content"
     );
+    // `changed` is the verb's own answer for what it did, so the arm reads it rather than a count
+    // of a diff taken afterwards: four edits produce four changed paths whatever the four are, and
+    // a count cannot tell a rewrite of `a.txt` from a rewrite of something else.
+    let changed: Vec<(&str, &str)> = out["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["path"].as_str().unwrap(), c["op"].as_str().unwrap()))
+        .collect();
     assert_eq!(
+        changed,
+        vec![
+            ("a.txt", "modified"),
+            ("keep/b.txt", "modified"),
+            ("new/c.txt", "added"),
+            ("new/d.txt", "added"),
+        ]
+    );
+    assert_eq!(
+        out["changed"],
         f.call("exec.tree_diff", json!({ "base": base, "head": head }))
-            .await["changed"]
-            .as_array()
-            .unwrap()
-            .len(),
-        4
+            .await["changed"],
+        "the verb's `changed` is the diff of its base against its result"
     );
 
     // The new content is readable, so `content` really did store a blob rather than only a name.

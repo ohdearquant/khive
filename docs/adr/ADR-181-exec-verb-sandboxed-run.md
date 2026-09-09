@@ -202,6 +202,13 @@ file, each of which nothing ever reads.
    were fine. That is why `content` bytes are hashed rather than written while the call is being
    validated. `digest_hex` is the same BLAKE3 the blob store keys on, so a content edit's reference
    is known before its byte is stored, and only a call that will succeed writes anything.
+   The guarantee is scoped to refusals: it covers every refusal the verb raises, all of which are
+   raised during validation, and it does not cover a blob store that fails partway through
+   publication. Once validation passes, the content blobs are published one at a time and the
+   manifest last, so a backend failure during publication leaves the objects already published and
+   mints no tree. Those objects are referenced by no manifest, which is the same state an
+   interrupted `blob.put` leaves and is what the store's own reclamation is for; a caller reading
+   the refusal still knows no new tree exists, which is the property the atomicity claim is about.
 
 3. **The candidate manifest goes through the pack's own validator.** After the edits are applied,
    the complete entry list is validated by `parse_entries`, the same function `exec.tree` uses. This
