@@ -9838,7 +9838,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
-    async fn issue_2427_scheduled_replay_does_not_gain_actor_visibility() {
+    async fn scheduled_replay_reads_its_own_actor_namespace_and_never_the_daemons_visibility() {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             default_namespace: Namespace::local(),
@@ -9935,6 +9935,14 @@ mod tests {
                 vec!["lambda:request-actor", "client-visible", "local"],
             ),
             (vec![], false, vec!["local"]),
+            // A reconstructed list that omits the actor gains exactly the
+            // actor's own namespace (ADR-007 Rev 4 Rule 3b at the mint) and
+            // nothing from the daemon's configured visibility.
+            (
+                vec!["client-visible"],
+                false,
+                vec!["client-visible", "lambda:request-actor", "local"],
+            ),
             (vec!["lambda:request-actor", "client-visible"], true, vec![]),
         ] {
             let mut identity = request_identity_with_visible_namespaces(visible);
