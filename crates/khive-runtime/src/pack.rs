@@ -1667,6 +1667,9 @@ impl VerbRegistry {
     /// - `knowledge.search`, `knowledge.suggest`, and auto
     ///   `knowledge.compose` may start persistent ANN consumer/checkpoint
     ///   maintenance from their nominal read path.
+    /// - `git.checkout`, `git.diff` and `git.reconcile` persist a durable
+    ///   receipt on every dispatch (checkout and diff also write a manifest
+    ///   or diff blob), so their accounting row is not droppable.
     ///
     /// What membership here means, precisely: the verb performs no domain
     /// mutation, so its OWN per-dispatch audit/accounting row may be dropped
@@ -1702,6 +1705,19 @@ impl VerbRegistry {
     const ADMISSION_DEGRADE_SAFE_VERBS: &'static [(&'static str, &'static str)] = &[
         // agent
         ("agent", "agent.observe"),
+        // exec (reads of the blob store, the run receipt and event tables, or
+        // the resolved configuration; the writers are exec.tree, a Declaration,
+        // and exec.run, a Directive)
+        ("exec", "exec.tree_get"),
+        ("exec", "exec.tree_diff"),
+        ("exec", "exec.receipt"),
+        ("exec", "exec.runs"),
+        ("exec", "exec.events"),
+        ("exec", "exec.identity"),
+        // git (receipt list and allowlist reads; checkout, diff and reconcile
+        // persist receipts and are excluded)
+        ("git", "git.receipts"),
+        ("git", "git.gates"),
         // blob
         ("blob", "blob.get"),
         ("blob", "blob.stat"),
@@ -1733,6 +1749,8 @@ impl VerbRegistry {
         ("kg", "resolve"),
         ("kg", "whoami"),
         ("kg", "verbs"),
+        ("kg", "stream.read"),
+        ("kg", "stream.stat"),
         // knowledge (ANN-maintaining search/suggest/compose are excluded)
         ("knowledge", "knowledge.get"),
         ("knowledge", "knowledge.list"),
@@ -1749,6 +1767,14 @@ impl VerbRegistry {
         ("session", "session.list"),
         ("session", "session.resume"),
         ("session", "session.export"),
+        // tool (registry, grant and policy reads; tool.suggest runs the same
+        // hybrid search as the kg search and context verbs above)
+        ("tool", "tool.suggest"),
+        ("tool", "tool.describe"),
+        ("tool", "tool.list"),
+        ("tool", "tool.check"),
+        ("tool", "tool.requests"),
+        ("tool", "tool.policies"),
     ];
 
     /// Sorted copy of [`Self::ADMISSION_DEGRADE_SAFE_VERBS`], built once, so
@@ -4611,6 +4637,9 @@ pub(crate) mod tests {
     /// any name were re-added to the allowlist.
     const KNOWN_INCIDENTAL_WRITE_VERBS: &[&str] = &[
         "db_diagnostics",
+        "git.checkout",
+        "git.diff",
+        "git.reconcile",
         "knowledge.compose",
         "knowledge.search",
         "knowledge.suggest",
