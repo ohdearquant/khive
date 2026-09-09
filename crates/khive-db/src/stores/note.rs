@@ -1974,3 +1974,7 @@ pub(crate) fn repair_notes_seq(conn: &rusqlite::Connection) -> Result<(), rusqli
 #[cfg(test)]
 #[path = "note_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "comm_filter_plan_tests.rs"]
+mod comm_filter_plan_tests;
