@@ -47,7 +47,7 @@ from .errors import (
 from .ops import encode, op
 from .models import OpError
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 
