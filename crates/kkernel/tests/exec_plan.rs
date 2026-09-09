@@ -111,7 +111,7 @@ mod daemon {
             "config_mismatch": false,
             "served_config_id": frame["config_id"],
             "version_mismatch": false,
-            "daemon_protocol_version": 5
+            "daemon_protocol_version": 6
         })
     }
 
