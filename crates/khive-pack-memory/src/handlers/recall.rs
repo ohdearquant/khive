@@ -4875,6 +4875,90 @@ mod tests {
         (registry, local_id_1, local_id_2, bench_id)
     }
 
+    /// A bound actor that remembers an episodic memory recalls it on the same
+    /// identity without naming a namespace: the actor namespace joins the
+    /// default read set where the token is minted (ADR-007 Rev 4 Rule 3b), so
+    /// the write scope of `memory.remember` and the read scope of
+    /// `memory.recall` agree for one identity. An anonymous caller keeps
+    /// exactly `local`, and an explicit `namespace=local` stays precise.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn bound_actor_recalls_its_episodic_memory_without_a_namespace_param() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+        let identity = || khive_runtime::RequestIdentity {
+            namespace: "local".to_string(),
+            actor_id: Some("lambda:probe".to_string()),
+            visible_namespaces: vec![],
+            ..Default::default()
+        };
+        let remembered = registry
+            .dispatch_with_identity(
+                "memory.remember",
+                json!({
+                    "content": "bound actor probe term episodic arm",
+                    "memory_type": "episodic",
+                    "tags": ["bound-actor-run"],
+                }),
+                Some(identity()),
+            )
+            .await
+            .expect("memory.remember as the bound actor");
+        let id = remembered["id"].as_str().expect("id").to_string();
+        let recall = json!({
+            "query": "bound actor probe term",
+            "tags": ["bound-actor-run"],
+            "limit": 10,
+        });
+        let has = |result: &Value| {
+            result
+                .as_array()
+                .map(|hits| hits.iter().any(|h| h["id"].as_str() == Some(id.as_str())))
+                .unwrap_or(false)
+        };
+
+        let mut result = Value::Null;
+        for _ in 0..300 {
+            result = registry
+                .dispatch_with_identity("memory.recall", recall.clone(), Some(identity()))
+                .await
+                .expect("memory.recall as the bound actor");
+            if has(&result) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            has(&result),
+            "the bound actor must recall its own episodic memory with no namespace param: {result:?}"
+        );
+
+        // Controls run after the positive arm so the index is warm: an absence
+        // below is scope, not consistency.
+        let anonymous = registry
+            .dispatch("memory.recall", recall.clone())
+            .await
+            .expect("memory.recall anonymous");
+        assert!(
+            !has(&anonymous),
+            "an anonymous caller keeps exactly the local read set: {anonymous:?}"
+        );
+        let mut precise = recall.clone();
+        precise["namespace"] = json!("local");
+        let scoped = registry
+            .dispatch_with_identity("memory.recall", precise, Some(identity()))
+            .await
+            .expect("memory.recall namespace=local as the bound actor");
+        assert!(
+            !has(&scoped),
+            "an explicit namespace=local is a precise scope, never widened: {scoped:?}"
+        );
+    }
+
     /// With no override, recall uses exactly the caller token's visible namespaces.
     #[tokio::test]
     #[serial(background_tasks)]
