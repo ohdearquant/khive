@@ -35,6 +35,37 @@ db.diagnostics()          # writer/WAL/checkpoint counters
 - A `batch()` is one request, not a transaction: ops succeed or fail
   individually and the per-op results say which.
 
+## Check request syntax
+
+`Session.plan(ops)` sends the original request text to the daemon's parser without
+executing any operations:
+
+```python
+from khive import Session
+
+session = Session()
+plan = session.plan('create(kind="note", content="sample") | get(id=$prev.id)')
+if plan["parsed"]:
+    print(plan["mode"], plan["stage_count"], plan["stages"])
+else:
+    print(plan["error"])
+```
+
+The returned dictionary preserves the daemon's plan: each stage includes its
+index, verb, pack, whether the verb is known, normalized arguments and unresolved
+`prev_refs`. `limits` contains `max_ops`, `max_depth` and `max_input_len`. An unknown
+verb has `known: false` and `pack: null`; it can still parse successfully.
+
+A syntax error returns `parsed: false` and an error string, with no `stages`.
+Transport failures and rejected frames still raise the usual client exceptions.
+A plan is not permission to execute or a check that references will resolve.
+
+Planning requires daemon protocol version 5. Older daemons raise
+`ProtocolMismatch`; the client never falls back to sending the operations as an
+ordinary request. Plan frames omit caller identity and rendering options; the
+required namespace field is sent empty. `session.request(...)` retains its
+ordinary dispatch behavior and returns per-operation results.
+
 ## Scratch database
 
 Experiments should run against a scratch daemon, not a production store:

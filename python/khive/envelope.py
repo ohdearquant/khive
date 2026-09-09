@@ -1,6 +1,4 @@
-"""Envelope-normalization functions for the request envelope's response
-shape (`{"results": [...]}`), each `OpResult`-shaped per the daemon's wire
-contract.
+"""Validation for request results and plan-only responses from the daemon.
 
 This module provides the steps a transport needs to turn raw response
 bytes into validated `OpResult` entries: decode JSON, check the result is a
@@ -37,6 +35,45 @@ def _envelope_from_payload(payload: Any, url: str) -> dict[str, Any]:
     runs after it (`_validate_op_errors`/`_validate_envelope_results`)."""
     if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
         raise TransportError(f"response from {url} is not a request envelope: {str(payload)[:200]}")
+    return payload
+
+
+def _plan_from_payload(payload: Any, url: str) -> dict[str, Any]:
+    """Validate a plan without normalizing its fields or interpreting admission."""
+    if not isinstance(payload, dict) or type(payload.get("parsed")) is not bool:
+        raise TransportError(f"response from {url} is not a plan: parsed must be a boolean")
+    limits = payload.get("limits")
+    if not isinstance(limits, dict) or any(
+        type(limits.get(key)) is not int or limits[key] < 0
+        for key in ("max_ops", "max_depth", "max_input_len")
+    ):
+        raise TransportError(f"response from {url} has malformed plan limits")
+    if payload["parsed"] is False:
+        if not isinstance(payload.get("error"), str) or "stages" in payload:
+            raise TransportError(f"response from {url} has a malformed plan parse error")
+        return payload
+    stages = payload.get("stages")
+    if (
+        payload.get("mode") not in ("single", "parallel", "chain")
+        or type(payload.get("stage_count")) is not int
+        or not isinstance(stages, list)
+        or payload["stage_count"] != len(stages)
+    ):
+        raise TransportError(f"response from {url} has malformed plan stages")
+    for index, stage in enumerate(stages):
+        if (
+            not isinstance(stage, dict)
+            or type(stage.get("index")) is not int
+            or stage["index"] != index
+            or not isinstance(stage.get("verb"), str)
+            or "pack" not in stage
+            or (stage["pack"] is not None and not isinstance(stage["pack"], str))
+            or type(stage.get("known")) is not bool
+            or not isinstance(stage.get("args"), dict)
+            or not isinstance(stage.get("prev_refs"), list)
+            or any(not isinstance(ref, str) for ref in stage["prev_refs"])
+        ):
+            raise TransportError(f"response from {url} has a malformed plan stage at index {index}")
     return payload
 
 
@@ -78,7 +115,7 @@ def _validate_envelope_results(envelope: dict[str, Any], url: str) -> dict[str, 
 
 
 def _validate_op_errors(envelope: Any, url: str) -> Any:
-    """Validate structured errors without replacing their original payloads."""
+    """Validate disposition and domain result without replacing error payloads."""
     if not isinstance(envelope, dict):
         return envelope
     for index, entry in enumerate(envelope.get("results", [])):
@@ -94,3 +131,14 @@ def _validate_op_errors(envelope: Any, url: str) -> Any:
                 f"response from {url} has a malformed error object at index {index}: {exc}"
             ) from exc
     return envelope
+
+
+def _validate_frame_error_detail(response: dict[str, Any], url: str) -> OpError | None:
+    """Expose additive daemon error details while admitting legacy text-only frames."""
+    detail = response.get("error_detail")
+    if detail is None:
+        return None
+    try:
+        return OpError.model_validate(detail)
+    except ValidationError as exc:
+        raise TransportError(f"response from {url} has malformed error_detail: {exc}") from exc

@@ -81,3 +81,100 @@ The sandbox is macOS seatbelt only; a Linux profile is a later slice. Toolchain 
 configuration and a missing root reads as a tool failure, not a policy refusal. Every run materializes
 from scratch; build caches across runs are a later slice. Output caps and run retention are config,
 not policy.
+
+## Amendment 1 (2026-09-08): run parameters, capture, refusal receipts, sandbox identity
+
+Adopted on the first whole-file read against the loop driver's contract page. Each item is a
+contract the driver's tests bind to; the record above stands where not restated.
+
+1. **`cwd`.** `exec.run` takes `cwd`, a path relative to the tree, default `.`. An absolute path, a
+   `..` component or a symlink escape is refused before materialization.
+2. **Environment.** The caller supplies the environment values; the `[exec] env` config allow-lists
+   the keys that may pass; the server sets `HOME` to the run directory; nothing is inherited from the
+   host. The receipt records `env_keys`.
+3. **`declared_write_paths`** (optional). When given, a change outside the declared set makes the run
+   `success: false`, names the offending paths in `undeclared_changes`, and drops their bytes: they
+   are neither stored nor part of `tree_out`.
+4. **Capture over the cap keeps the tail.** For each stream the receipt carries `produced_bytes`,
+   `retained_bytes` and `capture: complete | incomplete`; a test runner's closing summary survives.
+5. **Every refusal writes a receipt.** An unregistered tool, a `deny` or `ask` decision, an invalid
+   tree and a `cwd` escape each write an `exec_runs` row with `decision` and `reason`, `tree_out`
+   null, and no run directory is created.
+6. **Session identity.** `exec.run` takes an optional `session_id`, echoed in the receipt with a
+   per-session `seq`; `exec.runs` filters on it. The driver's command identity is `session:seq`.
+7. **Sandbox object.** The receipt carries `sandbox: {profile_digest, tool_binary_digest,
+   read_roots_digest}` (the resolved read roots and the registered binary hashed at run time), not a
+   bare profile digest.
+8. **Version control never runs here.** A registered tool whose binary resolves, after
+   canonicalization, to `git` or `gh`, or to any path in the `[exec] never` config set, is refused;
+   repository operations go through ADR-182 only.
+9. **Driver mapping.** An `argv` from the driver binds `argv[0]` to a registered tool label and passes
+   `argv[1..]` as `args`; this lives in the driver's test file and changes nothing here.
+
+Acceptance arms added: 9 `cwd` escape refused with no run directory; 10 an env key outside the
+allow-list is absent inside the run and a caller value for an allowed key is present; 11 a write
+outside `declared_write_paths` yields `success: false` and the bytes are not retrievable; 12 output
+over the cap retains the tail and the receipt's counts match the bytes produced; 13 each refusal
+class has a receipt row; 14 two runs with one `session_id` carry `seq` 1 and 2; 15 the sandbox object
+changes when the read roots change (control); 16 a tool registered at the `git` binary is refused.
+
+## Amendment 2 (2026-09-08): limits per platform, file-size semantics, profile identity
+
+Adopted on the first native run of the loop driver's exec contract on macOS.
+
+1. **Limits the platform cannot enforce per run are refused at load.** `[exec] limits` accepts
+   `cpu_seconds`, `address_space`, `file_size` and `nproc`. On macOS the address-space limit is not
+   settable and the process limit counts every process of the user, so a configuration naming either
+   is refused at config load with `[exec] limits.<name>: unsupported_on_platform`; the daemon does not
+   start and the reason is in the startup log. The receipt's `limits` carries `requested` (the config)
+   and `enforced` (the child's own report of the limits it received).
+2. **File-size semantics.** A write that crosses the file-size limit is truncated to the limit with no
+   signal; the signal fires on a write attempted at the limit. A run over the limit therefore ends by
+   signal 25 or, for a runtime that ignores that signal, by a failed write reported in its own stream.
+   The receipt's `exit_signal` and captured streams are the evidence, never the exit status alone.
+3. **Profile identity.** The seatbelt profile allows reads of the root directory, the system read
+   roots, the configured read roots and the run directory, and writes only under the run directory.
+   `exec.identity` reports the read roots, their digest, the profile template digest and the digest
+   algorithm, so a client can check its expectation of the sandbox before it runs anything.
+
+Acceptance arms added: 17 a configuration naming `address_space` or `nproc` refuses at startup with
+the named limit; 18 a run over `cpu_seconds` ends by signal 24 and one over `file_size` ends by
+signal 25 or a failed write, with the receipt's `enforced` limits equal to the configuration; 19
+`exec.identity` and the receipt's `sandbox` agree on the read-roots digest, and the digest changes
+when a read root is added (control).
+
+## Amendment 3 (2026-09-08): declared write paths, sequence allocation, version control at the kernel boundary
+
+Adopted after the review that followed the first exec implementation. Each item makes exact a rule
+the implementation already followed loosely; nothing above is withdrawn.
+
+1. **Declared write paths are a prefix set at path boundaries.** Each entry of `declared_write_paths`
+   is a tree-relative path under the same validation as a tree entry (no leading `/`, no empty, `.`
+   or `..` segment). An entry covers exactly itself and every path below it separated by `/`: `src`
+   covers `src` and `src/main.rs`, never `src.bak`. A change is any path whose bytes or mode differ
+   from `tree_in`, any path added, and any path missing at the end of the run, and every change is
+   tested against the set. An undeclared change goes to the receipt's `undeclared_changes`, its bytes
+   are not stored, `tree_out` carries the `tree_in` entry for that path (a deleted file reappears
+   with its old content, an added file is absent), and `success` is false even when the exit status
+   is zero. An absent `declared_write_paths` declares every path.
+2. **Sequence numbers are allocated by the insert.** The per-session `seq` is computed inside the
+   statement that inserts the receipt row (`MAX(seq) + 1` over the namespace and session), and a
+   unique index over `(namespace, session_id, seq)` for session rows turns any duplicate into a
+   constraint failure instead of an overlap. The column is authoritative: `exec.run`, `exec.receipt`
+   and `exec.runs` all report it, a refusal consumes a number like a run, and a run without a session
+   carries `null`.
+3. **Version control is denied at the kernel boundary.** Beside the registered-binary refusal of
+   Amendment 1 item 8, the seatbelt profile denies `process-exec` for any executable whose file name
+   is `git` or `gh` or starts with `git-`, and for every canonical path in the `[exec] never` set. A
+   run whose registered binary is allowed but which reaches git from inside (a shell, a build script,
+   a package manager hook) gets an operation-not-permitted failure from the kernel, visible in the
+   child's exit status and captured stderr, and the receipt records it like any other failed run. The
+   profile template digest changes with this rule; `exec.identity` reports the `never` set beside it.
+
+Acceptance arms added: 20 with `declared_write_paths = ["a", "b"]` a write to `a/x`, a new `a/y`
+and a deletion of `b` are listed in `changed`, a write to `a.bak` is listed in `undeclared_changes`
+with its input entry kept in `tree_out`, and `success` is false with exit status zero; 21 two runs
+started concurrently in one session receive `seq` 1 and 2, `exec.runs` for the session lists both,
+and `exec.receipt` reports the same number as the run reply; 22 a shell run that invokes
+`git --version` and one that invokes a `never` path both end with a non-zero status and the kernel's
+refusal in stderr, while the same shell invoking `/bin/echo` exits zero (control).

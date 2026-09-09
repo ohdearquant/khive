@@ -88,8 +88,9 @@ pub use engine_config::{
     StorageSectionConfig,
 };
 pub use error::{
-    fts_text_leg_or_err, AdmissionFailureContext, ChannelIngestFailureClass, GuardedWriteFailure,
-    RuntimeError, RuntimeResult, WriterPoolCheckoutTimeoutContext, WriterTaskFailureContext,
+    fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
+    ChannelIngestFailureClass, DispatchError, DomainDisposition, GuardedWriteFailure, RuntimeError,
+    RuntimeResult, WriterPoolCheckoutTimeoutContext, WriterTaskFailureContext,
     WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
     WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };

@@ -412,7 +412,7 @@ fn fallback_or_reject(
 ) -> Option<Result<String, McpError>> {
     record_fallback(reason, config_id_client, config_id_daemon, namespace_client);
     if is_daemon_strict_mode() {
-        return Some(Err(McpError::internal_error(
+        return Some(Err(daemon_mcp_error(
             format!(
                 "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={}; \
                  refusing to complete the request via local dispatch",
@@ -431,6 +431,10 @@ fn fallback_or_reject(
 
 #[async_trait]
 impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
+    fn plan(&self, ops: &str) -> String {
+        self.plan_ops(ops)
+    }
+
     async fn dispatch(
         &self,
         ops: String,
@@ -441,7 +445,31 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         from_wire: bool,
         identity: Option<khive_runtime::RequestIdentity>,
     ) -> Result<String, String> {
+        self.dispatch_with_error_detail(
+            ops,
+            presentation,
+            presentation_per_op,
+            format,
+            format_per_op,
+            from_wire,
+            identity,
+        )
+        .await
+        .map_err(|error| error.message)
+    }
+
+    async fn dispatch_with_error_detail(
+        &self,
+        ops: String,
+        presentation: Option<String>,
+        presentation_per_op: Option<Vec<Option<String>>>,
+        format: Option<String>,
+        format_per_op: Option<Vec<Option<String>>>,
+        from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
+    ) -> Result<String, daemon::DaemonDispatchError> {
         let params = RequestParams {
+            plan: None,
             ops,
             presentation,
             presentation_per_op,
@@ -463,7 +491,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
             crate::server::DispatchOrigin::Daemon,
         )
         .await
-        .map_err(|e| e.message.to_string())
+        .map_err(|error| daemon::DaemonDispatchError::new(error.message.to_string(), error.data))
     }
 
     async fn warm_all(&self) {
@@ -512,13 +540,17 @@ enum ForwardOutcome {
     /// daemon speaking a different wire format.
     ParseFailure,
     /// Connected and decoded a response, but the daemon's `daemon_protocol_version`
-    /// does not match [`PROTOCOL_VERSION`] even though `version_mismatch` is false.
-    /// This is the new-client + old-daemon (pre-versioning) scenario: the old daemon
-    /// ignores the unknown request field and returns a decodable response whose
-    /// protocol fields default to `false`/`0`. Since the real request was already
-    /// written, the client must treat this exactly like `ParseFailure`: return a
-    /// hard error without retrying, locally dispatching, killing, or respawning.
-    ProtocolMismatch,
+    /// does not match [`PROTOCOL_VERSION`], in either direction. Below: the
+    /// new-client + old-daemon scenario, implicit (a pre-versioning daemon ignores
+    /// the unknown request field and returns a decodable response whose protocol
+    /// fields default to `false`/`0`) or explicit (`version_mismatch=true` with the
+    /// daemon's lower number). Above: this bridge is the stale side, a rebuild
+    /// swapped the on-disk binary and respawned the daemon under a newer protocol
+    /// while this process kept running the old one. Since the real request was
+    /// already written, the client treats both exactly like `ParseFailure`: a hard
+    /// error without retrying, locally dispatching, killing, or respawning; the
+    /// consumer arms the #714 self-heal beside it.
+    ProtocolMismatch { daemon_protocol_version: u32 },
 }
 
 fn classify_socket_connect_error(error: std::io::Error) -> ForwardOutcome {
@@ -658,18 +690,24 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
             // with `version_mismatch=true` and its own (lower) version number.
             // `daemon_protocol_version < PROTOCOL_VERSION` means the daemon is
             // stale — route through the same terminal error as the implicit case
-            // above. If `daemon_protocol_version > PROTOCOL_VERSION` the client
-            // binary is behind; let `map_response` return its hard error too.
-            let is_stale_daemon = frame.daemon_protocol_version != PROTOCOL_VERSION
-                && (!frame.version_mismatch || frame.daemon_protocol_version < PROTOCOL_VERSION);
-            if is_stale_daemon {
+            // above. `daemon_protocol_version > PROTOCOL_VERSION` means this bridge
+            // binary is behind: a rebuild swapped the on-disk binary and respawned
+            // the daemon under a newer protocol while this process kept running the
+            // old one. That is the scenario the #714 self-heal exists for, so it
+            // takes the same terminal path and the consumer arms the re-exec, which
+            // picks up the on-disk binary the daemon itself was spawned from.
+            // Leaving that direction to `map_response` returned the hard error on
+            // every request for the rest of the process's life and never re-exec'd.
+            if frame.daemon_protocol_version != PROTOCOL_VERSION {
                 tracing::warn!(
                     daemon_version = frame.daemon_protocol_version,
                     expected = PROTOCOL_VERSION,
                     explicit_mismatch = frame.version_mismatch,
                     "daemon protocol version mismatch after request write — rejecting without retry",
                 );
-                return ForwardOutcome::ProtocolMismatch;
+                return ForwardOutcome::ProtocolMismatch {
+                    daemon_protocol_version: frame.daemon_protocol_version,
+                };
             }
             ForwardOutcome::Response(Box::new(frame))
         }
@@ -683,6 +721,42 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
             ForwardOutcome::ParseFailure
         }
     }
+}
+
+fn daemon_mcp_error(message: impl Into<String>, data: Option<serde_json::Value>) -> McpError {
+    let error = daemon::DaemonDispatchError::new(message, data);
+    McpError::internal_error(error.message, Some(error.error_detail))
+}
+
+/// The operator-facing text for a protocol mismatch, by direction. A daemon ahead
+/// of this bridge is the rebuilt-binary case: the bridge re-execs the on-disk binary
+/// once this response has flushed (#714), so the caller's next request reaches a
+/// bridge that matches.
+fn protocol_mismatch_message(daemon_protocol_version: u32) -> String {
+    if daemon_protocol_version > PROTOCOL_VERSION {
+        format!(
+            "daemon protocol mismatch: this bridge speaks version {PROTOCOL_VERSION}, the \
+             daemon speaks {daemon_protocol_version}; the bridge re-execs the current binary \
+             after this response, retry the request"
+        )
+    } else {
+        format!(
+            "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+             run `make local` to rebuild the daemon binary"
+        )
+    }
+}
+
+fn protocol_mismatch_error(message: String, data: Option<serde_json::Value>) -> McpError {
+    let mut error = daemon::DaemonDispatchError::new(message, data);
+    error.error_detail["domain_disposition"] =
+        serde_json::json!(khive_runtime::DomainDisposition::Unknown.as_str());
+    error.error_detail["code"] = serde_json::json!("version_mismatch");
+    error.error_detail["kind"] = serde_json::json!("protocol");
+    if let Some(fields) = error.error_detail.as_object_mut() {
+        fields.remove("domain_result");
+    }
+    McpError::internal_error(error.message, Some(error.error_detail))
 }
 
 fn map_response(
@@ -700,7 +774,7 @@ fn map_response(
                 PROTOCOL_VERSION, resp.daemon_protocol_version,
             )
         });
-        return Some(Err(McpError::internal_error(msg, None)));
+        return Some(Err(protocol_mismatch_error(msg, resp.error_detail)));
     }
 
     if resp.namespace_mismatch {
@@ -740,7 +814,7 @@ fn map_response(
                 resp.served_config_id.as_deref().unwrap_or("unknown"),
             )
         });
-        Some(Err(McpError::internal_error(msg, None)))
+        Some(Err(daemon_mcp_error(msg, resp.error_detail)))
     }
 }
 
@@ -1199,6 +1273,7 @@ enum ProbeOutcome {
 ///   `Timeout` → do NOT kill (daemon may be healthy-but-busy; NEVER-KILL-SLOW)
 async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64) -> ProbeOutcome {
     let probe = DaemonRequestFrame {
+        plan: false,
         ops: String::new(),
         presentation: None,
         presentation_per_op: None,
@@ -1268,7 +1343,7 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         Ok(
             ForwardOutcome::NoSocket
             | ForwardOutcome::ParseFailure
-            | ForwardOutcome::ProtocolMismatch,
+            | ForwardOutcome::ProtocolMismatch { .. },
         ) => ProbeOutcome::Dead,
         Ok(ForwardOutcome::Unreachable {
             kind,
@@ -1605,7 +1680,7 @@ where
 /// same daemon or a freshly-spawned one) and must never silently fall back to
 /// local dispatch, either of which could execute a mutation a second time.
 fn ambiguous_forward_error() -> McpError {
-    McpError::internal_error(
+    daemon_mcp_error(
         "daemon response lost after request was sent; not retrying or locally \
          dispatching to avoid duplicate execution",
         None,
@@ -1626,7 +1701,7 @@ fn daemon_unreachable_error(
         ?os_error_code,
         "daemon socket is unreachable from this process; lifecycle recovery suppressed"
     );
-    McpError::internal_error(
+    daemon_mcp_error(
         "cannot reach daemon socket from this process; refusing daemon lifecycle recovery \
          because the daemon may still be healthy",
         Some(serde_json::json!({
@@ -1705,7 +1780,7 @@ fn respawn_failed_error(failure: RespawnFailure) -> McpError {
     } else {
         serde_json::json!({"reason": "respawn_failed"})
     };
-    McpError::internal_error(
+    daemon_mcp_error(
         "daemon respawn failed (respawn_failed); rebuild with `make local` and retry",
         Some(data),
     )
@@ -1724,7 +1799,7 @@ fn incumbent_still_alive_error(pid: u32) -> McpError {
     if is_daemon_strict_mode() {
         data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
     }
-    McpError::internal_error(
+    daemon_mcp_error(
         format!("daemon recovery refused: incumbent PID {pid} is still alive after the deadline"),
         Some(data),
     )
@@ -2107,7 +2182,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
             drop(guard);
         }
         Ok(Err(e)) => {
-            return BootFenceOutcome::HardError(McpError::internal_error(
+            return BootFenceOutcome::HardError(daemon_mcp_error(
                 format!(
                     "failed to acquire daemon boot/recovery lock while waiting for \
                      cold-boot quiescence: {e}"
@@ -2116,7 +2191,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
             ));
         }
         Err(e) => {
-            return BootFenceOutcome::HardError(McpError::internal_error(
+            return BootFenceOutcome::HardError(daemon_mcp_error(
                 format!("boot-quiescence wait task failed: {e}"),
                 None,
             ));
@@ -2132,7 +2207,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
     {
         ProbeOutcome::Alive => BootFenceOutcome::DaemonReady,
         ProbeOutcome::Dead => BootFenceOutcome::SafeLocalFallback,
-        ProbeOutcome::Timeout => BootFenceOutcome::HardError(McpError::internal_error(
+        ProbeOutcome::Timeout => BootFenceOutcome::HardError(daemon_mcp_error(
             "daemon state uncertain after cold-boot quiescence; not falling back to \
              local dispatch to avoid racing a possibly still-initializing index",
             None,
@@ -2142,7 +2217,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
         // own. Handled here only for match exhaustiveness over the shared
         // `ProbeOutcome` type; same fail-safe HardError as `Timeout` if it
         // were ever reached.
-        ProbeOutcome::LockContended => BootFenceOutcome::HardError(McpError::internal_error(
+        ProbeOutcome::LockContended => BootFenceOutcome::HardError(daemon_mcp_error(
             "daemon state uncertain after cold-boot quiescence (lock probe unexpectedly \
              contended); not falling back to local dispatch",
             None,
@@ -2334,7 +2409,9 @@ where
             );
             return Some(Err(ambiguous_forward_error()));
         }
-        ForwardOutcome::ProtocolMismatch => {
+        ForwardOutcome::ProtocolMismatch {
+            daemon_protocol_version,
+        } => {
             let config_id = opaque_config_id(&frame.config_id);
             tracing::warn!(
                 config_id = %config_id,
@@ -2347,11 +2424,8 @@ where
             // process itself is the stale one. Trigger self-heal alongside
             // the hard error below, never in place of it.
             trigger_bridge_self_heal();
-            return Some(Err(McpError::internal_error(
-                format!(
-                    "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                     run `make local` to rebuild the daemon binary"
-                ),
+            return Some(Err(protocol_mismatch_error(
+                protocol_mismatch_message(daemon_protocol_version),
                 None,
             )));
         }
@@ -2460,7 +2534,9 @@ where
                 );
                 return Some(Err(ambiguous_forward_error()));
             }
-            ForwardOutcome::ProtocolMismatch => {
+            ForwardOutcome::ProtocolMismatch {
+                daemon_protocol_version,
+            } => {
                 let config_id = opaque_config_id(&frame.config_id);
                 tracing::warn!(
                     config_id = %config_id,
@@ -2472,11 +2548,8 @@ where
                 // either arm can observe the mismatch depending on whether this
                 // was the first probe or a retry after a kill/respawn.
                 trigger_bridge_self_heal();
-                return Some(Err(McpError::internal_error(
-                    format!(
-                        "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                         run `make local` to rebuild the daemon binary"
-                    ),
+                return Some(Err(protocol_mismatch_error(
+                    protocol_mismatch_message(daemon_protocol_version),
                     None,
                 )));
             }
@@ -2492,6 +2565,16 @@ where
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+/// Let sibling unit tests compose the real frame mapping with a captured dispatch.
+#[cfg(all(unix, test))]
+pub(crate) fn map_response_for_test(
+    response: DaemonResponseFrame,
+    expected_config_id: &str,
+    namespace: &str,
+) -> Option<Result<String, McpError>> {
+    map_response(response, expected_config_id, namespace)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2573,6 +2656,7 @@ mod tests {
             ok: true,
             result: Some(result.to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2588,6 +2672,7 @@ mod tests {
             ok: false,
             result: None,
             error: error.map(str::to_string),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2611,6 +2696,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: true,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2633,6 +2719,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: true,
             served_config_id: Some(CFG.to_string()),
@@ -2657,6 +2744,7 @@ mod tests {
             ok: true,
             result: Some("served-by-broad-registry".to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: None,
@@ -2683,6 +2771,7 @@ mod tests {
             ok: true,
             result: Some("served-by-other-config".to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(
@@ -2712,6 +2801,7 @@ mod tests {
             ok: true,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2737,6 +2827,81 @@ mod tests {
     }
 
     #[test]
+    fn disposition_map_response_preserves_error_detail_without_dispatch() {
+        let detail = serde_json::json!({
+            "kind": "obligation",
+            "code": "store_failure",
+            "message": "audit failed",
+            "domain_disposition": "committed",
+            "domain_result": { "id": "persisted-row" },
+        });
+        let mut frame = frame_err(Some("audit failed"));
+        frame.error_detail = Some(detail.clone());
+        let error = map_response(frame, CFG, NS).unwrap().unwrap_err();
+        assert_eq!(error.message, "audit failed");
+        assert_eq!(error.data, Some(detail));
+    }
+
+    #[test]
+    fn disposition_legacy_and_lost_responses_are_unknown() {
+        let legacy = map_response(frame_err(Some("legacy failure")), CFG, NS)
+            .unwrap()
+            .unwrap_err();
+        for error in [legacy, ambiguous_forward_error()] {
+            let detail = error.data.unwrap();
+            assert_eq!(detail["domain_disposition"], "unknown");
+            assert!(detail.get("domain_result").is_none());
+        }
+    }
+
+    #[test]
+    fn disposition_version_mismatch_is_unknown_even_with_untrusted_detail() {
+        let mut frame = frame_err(Some("protocol mismatch"));
+        frame.version_mismatch = true;
+        frame.error_detail = Some(serde_json::json!({
+            "message": "protocol mismatch",
+            "domain_disposition": "committed",
+            "domain_result": { "id": "uncertain-peer-result" },
+        }));
+        let detail = map_response(frame, CFG, NS)
+            .unwrap()
+            .unwrap_err()
+            .data
+            .unwrap();
+        assert_eq!(detail["domain_disposition"], "unknown");
+        assert_eq!(detail["code"], "version_mismatch");
+        assert!(detail.get("domain_result").is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn disposition_mcp_adapter_preserves_request_error_data() {
+        use daemon::DaemonDispatch;
+
+        let server = make_test_server();
+        let params = RequestParams {
+            plan: None,
+            ops: "[".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        };
+        let expected = server
+            .dispatch_request_inner(params, false, None, crate::server::DispatchOrigin::Daemon)
+            .await
+            .unwrap_err();
+        let actual = server
+            .dispatch_with_error_detail("[".to_string(), None, None, None, None, false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(actual.message, expected.message.to_string());
+        assert_eq!(Some(actual.error_detail), expected.data);
+    }
+
+    #[test]
     fn map_response_not_ok_without_message_yields_contextual_err() {
         match map_response(frame_err(None), CFG, NS) {
             Some(Err(McpError { message, .. })) => {
@@ -2756,6 +2921,7 @@ mod tests {
             ok: false,
             result: None,
             error: Some("daemon protocol mismatch: client=0 daemon=1 — rebuild/update the client binary (make local)".to_string()),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2785,6 +2951,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2988,6 +3155,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: true,
             served_config_id: Some(daemon.to_string()),
@@ -3278,6 +3446,7 @@ mod tests {
         std::env::set_var("KHIVE_NO_DAEMON", "1");
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3322,6 +3491,7 @@ mod tests {
 
     fn unreachable_daemon_frame(config_id: &str) -> DaemonRequestFrame {
         DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4275,6 +4445,7 @@ mod tests {
 
         // (a) valid same-namespace, same-config op
         let req = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -4305,6 +4476,7 @@ mod tests {
 
         let reference_result = reference
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
@@ -4347,6 +4519,7 @@ mod tests {
         // the frame's OWN namespace ("other") over the same shared warm
         // registry, instead of setting `namespace_mismatch`.
         let other = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4385,6 +4558,7 @@ mod tests {
         // config_id reject stays hard under ADR-096 Fork 1 — only the
         // namespace reject was softened.
         let mismatched_config = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4411,6 +4585,7 @@ mod tests {
 
         // (d) version mismatch → explicit error, NOT namespace/config mismatch
         let wrong_version = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4429,8 +4604,20 @@ mod tests {
         };
         let resp_ver = exchange(&sock, &wrong_version).await;
         assert!(
-            resp_ver.version_mismatch,
-            "wrong protocol version must set version_mismatch"
+            !resp_ver.version_mismatch,
+            "a client below the daemon's protocol is refused with version_mismatch=false: \
+             the flag is reserved for a client that is ahead, and the deployed bridges \
+             re-exec on this shape. The typed code below carries the fact instead."
+        );
+        assert_eq!(
+            resp_ver
+                .error_detail
+                .as_ref()
+                .and_then(|detail| detail.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("version_mismatch"),
+            "the refusal must stay typed as a version mismatch; got: {:?}",
+            resp_ver.error_detail
         );
         assert!(!resp_ver.ok);
         assert!(
@@ -4505,6 +4692,7 @@ mod tests {
         drop(ready);
 
         let request = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4574,6 +4762,7 @@ mod tests {
         drop(_ready);
 
         let alice_frame = DaemonRequestFrame {
+            plan: false,
             ops: "comm.send(to=\"bob\", content=\"hello from alice\") | comm.thread(id=$prev.full_id)"
                 .to_string(),
             presentation: None,
@@ -4592,6 +4781,7 @@ mod tests {
             request_id: None,
         };
         let bob_frame = DaemonRequestFrame {
+            plan: false,
             ops: "comm.send(to=\"alice\", content=\"hello from bob\") | comm.thread(id=$prev.full_id)"
                 .to_string(),
             presentation: None,
@@ -4610,6 +4800,7 @@ mod tests {
             request_id: None,
         };
         let charlie_frame = DaemonRequestFrame {
+            plan: false,
             ops: "comm.send(to=\"alice\", content=\"hello from charlie\") | comm.thread(id=$prev.full_id)"
                 .to_string(),
             presentation: None,
@@ -4756,6 +4947,7 @@ mod tests {
         drop(_ready);
 
         let frame = |ops: &str, actor: &str, visible: &[Namespace]| DaemonRequestFrame {
+            plan: false,
             ops: ops.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -4864,6 +5056,7 @@ mod tests {
         let server = make_comm_test_server(Some("baked-actor"));
         let result = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "comm.send(to=\"someone\", content=\"hello\")".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -4914,6 +5107,7 @@ mod tests {
         drop(_ready);
 
         let frame = |from_wire: bool| DaemonRequestFrame {
+            plan: false,
             ops: "brain.state()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4947,7 +5141,8 @@ mod tests {
             first_wire["ok"], false,
             "from_wire=true subhandler must be blocked through the daemon: {first_wire}"
         );
-        let err_wire = first_wire["error"].as_str().unwrap_or("");
+        let err_wire = first_wire["error"]["message"].as_str().unwrap_or("");
+        assert_eq!(first_wire["error"]["domain_disposition"], "not_committed");
         assert!(
             err_wire.contains("permission denied") || err_wire.contains("subhandler"),
             "daemon-forward wire path must surface the subhandler gate error; got: {err_wire}"
@@ -4960,7 +5155,7 @@ mod tests {
             serde_json::from_str(resp_op.result.as_deref().expect("operator result body"))
                 .expect("decode operator result json");
         let first_op = &body_op["results"][0];
-        let err_op = first_op["error"].as_str().unwrap_or("");
+        let err_op = first_op["error"]["message"].as_str().unwrap_or("");
         assert!(
             !err_op.contains("permission denied") && !err_op.contains("subhandler"),
             "operator frame must NOT gate the subhandler through the daemon: {first_op}"
@@ -5022,6 +5217,7 @@ mod tests {
             ok: true,
             result: Some("stale-result".to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
@@ -5076,6 +5272,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_one_response(listener, old_resp));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5120,6 +5317,125 @@ mod tests {
             ),
         }
 
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── bridge behind the daemon: the self-heal must arm ─────────────────────
+    //
+    // A binary swap that carries a protocol bump respawns the daemon under the
+    // new number while every running bridge keeps the old one. The daemon
+    // refuses each request with `version_mismatch=true` and its higher number.
+    // Before the fix `try_forward_inner` classified that as `Response` and
+    // `map_response` returned the hard error on every request for the rest of
+    // the bridge's life; the #714 re-exec, built for exactly this scenario, was
+    // armed only for the daemon-behind direction. Now both directions classify
+    // as `ProtocolMismatch`, the error names the direction, and the re-exec is
+    // armed so the next flush re-execs the on-disk binary the daemon came from.
+
+    fn newer_daemon_response(config_id: &str) -> DaemonResponseFrame {
+        DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: Some(format!(
+                "daemon protocol mismatch: client={} daemon={} — \
+                 rebuild/update the client binary (make local)",
+                PROTOCOL_VERSION,
+                PROTOCOL_VERSION + 1
+            )),
+            error_detail: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some(config_id.to_string()),
+            version_mismatch: true,
+            daemon_protocol_version: PROTOCOL_VERSION + 1,
+            metrics: None,
+            request_id: None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_behind_a_newer_daemon_returns_the_error_and_arms_reexec() {
+        clear_daemon_env();
+        clear_pending_self_heal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind fake newer-daemon socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let fake_handle = tokio::spawn(serve_one_response(
+            listener,
+            newer_daemon_response(config_id),
+        ));
+
+        let frame = DaemonRequestFrame {
+            plan: false,
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+
+        let result = forward_or_spawn(&frame).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+
+        match result {
+            Some(Err(McpError { message, .. })) => {
+                assert!(
+                    message.contains("protocol mismatch"),
+                    "error must name 'protocol mismatch'; got: {message}"
+                );
+                assert!(
+                    message.contains("re-execs"),
+                    "error must say this bridge re-execs itself, not send the operator to \
+                     rebuild a daemon that is already current; got: {message}"
+                );
+            }
+            Some(Ok(v)) => {
+                panic!("forward_or_spawn must NOT accept a newer daemon's refusal; got Ok({v:?})")
+            }
+            None => panic!(
+                "forward_or_spawn must return Some(Err(..)) for protocol mismatch, \
+                 not None (which would cause silent fallback to local dispatch)"
+            ),
+        }
+
+        let armed = *PENDING_SELF_HEAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            armed,
+            Some(MismatchRecovery::ReexecScheduled),
+            "a bridge behind the daemon must arm the in-place re-exec"
+        );
+        // The pid file belongs to the live daemon; the terminal path leaves it alone.
+        assert!(
+            pid_file.exists(),
+            "the newer daemon's pid file must survive"
+        );
+
+        clear_pending_self_heal();
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
     }
@@ -5177,6 +5493,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_crash_on_dispatch(listener));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5278,6 +5595,7 @@ mod tests {
              outright before the timeout can be observed"
         );
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: big_ops,
             presentation: None,
             presentation_per_op: None,
@@ -5392,6 +5710,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_read_then_never_answer(listener));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5463,6 +5782,7 @@ mod tests {
                     ok: true,
                     result: Some(serde_json::json!({"results": [], "summary": {}}).to_string()),
                     error: None,
+                    error_detail: None,
                     namespace_mismatch: false,
                     config_mismatch: false,
                     served_config_id: Some(req.config_id.clone()),
@@ -5484,6 +5804,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_one_ok_response(listener, config_id.to_string()));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5909,10 +6230,15 @@ mod tests {
     struct BigDispatch {
         namespace: String,
         config_id: String,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
     impl daemon::DaemonDispatch for BigDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -5923,10 +6249,17 @@ mod tests {
             _from_wire: bool,
             _identity: Option<khive_runtime::RequestIdentity>,
         ) -> Result<String, String> {
-            // Return a string whose serialized DaemonResponseFrame JSON length
-            // exceeds MAX_FRAME_BYTES.  The frame JSON overhead is ~200 bytes so
-            // a result of this size is comfortably over the cap.
-            Ok("X".repeat(khive_runtime::daemon::MAX_FRAME_BYTES + 1))
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(serde_json::json!({"results": [
+                {"ok": true, "tool": "create", "result": {
+                    "payload": "X".repeat(khive_runtime::daemon::MAX_FRAME_BYTES + 1),
+                }},
+                {"ok": false, "tool": "create", "error": {
+                    "kind": "internal", "message": "handler failed",
+                    "domain_disposition": "unknown",
+                }},
+            ]})
+            .to_string())
         }
 
         async fn warm_all(&self) {}
@@ -5956,9 +6289,11 @@ mod tests {
         std::env::remove_var("KHIVE_NO_DAEMON");
 
         let config_id = "test-oversized-config";
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let dispatcher = BigDispatch {
             namespace: "test".to_string(),
             config_id: config_id.to_string(),
+            calls: std::sync::Arc::clone(&calls),
         };
 
         // Run the real daemon server (with handle_conn's oversized gate live).
@@ -5977,6 +6312,7 @@ mod tests {
             .expect("daemon pid must be a u32");
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6021,6 +6357,7 @@ mod tests {
             "KILL_COUNT must be 0 — oversized response must NOT trigger \
              kill_stale_daemon_inner (fails if handle_conn oversized gate is removed)"
         );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // The result must be Some(Err(..)) containing "too large" — the explicit
         // error frame the server sends when the real response is oversized.
@@ -6031,6 +6368,10 @@ mod tests {
                     "error must describe the oversized response; got: {}",
                     e.message
                 );
+                let detail = e.data.expect("frame-cap disposition");
+                assert_eq!(detail["domain_disposition"], "unknown");
+                assert_eq!(detail["code"], "response_frame_size_limit");
+                assert!(detail.get("domain_result").is_none());
             }
             Some(Ok(_)) => panic!("oversized response must not produce Ok result"),
             None => panic!(
@@ -6080,6 +6421,10 @@ mod tests {
 
     #[async_trait]
     impl daemon::DaemonDispatch for CountingDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -6188,6 +6533,7 @@ mod tests {
 
         // Now forward the real request exactly once — the call site's single forward.
         let real_frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6243,6 +6589,7 @@ mod tests {
                 ok: true,
                 result: None,
                 error: None,
+                error_detail: None,
                 namespace_mismatch: false,
                 config_mismatch: false,
                 served_config_id: Some(config_id.clone()),
@@ -6551,6 +6898,7 @@ mod tests {
 
         drop(connect_when_ready(&sock).await);
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6702,6 +7050,7 @@ mod tests {
         });
 
         let frame = std::sync::Arc::new(DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6795,6 +7144,7 @@ mod tests {
             ok: false,
             result: None,
             error: Some("parse error: empty ops string".to_string()),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
@@ -6884,6 +7234,10 @@ mod tests {
 
     #[async_trait]
     impl daemon::DaemonDispatch for FailDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -6936,6 +7290,7 @@ mod tests {
         drop(_ready);
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7006,6 +7361,7 @@ mod tests {
                  rebuild/update the client binary (make local)",
                 PROTOCOL_VERSION
             )),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
@@ -7018,9 +7374,14 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn v4_client_rejects_warm_v3_daemon_before_accepting_result() {
+    async fn current_client_rejects_warm_v3_daemon_before_accepting_result() {
         clear_daemon_env();
-        assert_eq!(PROTOCOL_VERSION, 4, "process_ref is the protocol-v4 change");
+        const {
+            assert!(
+                PROTOCOL_VERSION >= 4,
+                "process_ref requires protocol v4 or later"
+            )
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");
@@ -7039,6 +7400,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7061,7 +7423,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
 
         assert!(
-            matches!(outcome, ForwardOutcome::ProtocolMismatch),
+            matches!(outcome, ForwardOutcome::ProtocolMismatch { .. }),
             "explicit version_mismatch=true with daemon_protocol_version < PROTOCOL_VERSION \
              must classify as ProtocolMismatch (terminal no-retry path), not Response \
              (which would lose the stable stale-daemon classification)"
@@ -7081,29 +7443,9 @@ mod tests {
     // This test asserts try_forward_inner returns ForwardOutcome::Response
     // (not ProtocolMismatch) so map_response produces the hard error.
 
-    fn newer_daemon_version_mismatch_response(config_id: &str) -> DaemonResponseFrame {
-        DaemonResponseFrame {
-            ok: false,
-            result: None,
-            error: Some(format!(
-                "daemon protocol mismatch: client={} daemon={} — \
-                 rebuild/update the client binary (make local)",
-                PROTOCOL_VERSION,
-                PROTOCOL_VERSION + 1
-            )),
-            namespace_mismatch: false,
-            config_mismatch: false,
-            served_config_id: Some(config_id.to_string()),
-            version_mismatch: true,
-            daemon_protocol_version: PROTOCOL_VERSION + 1,
-            metrics: None,
-            request_id: None,
-        }
-    }
-
     #[tokio::test]
     #[serial]
-    async fn try_forward_inner_newer_daemon_mismatch_yields_response_not_recovery() {
+    async fn try_forward_inner_behind_a_newer_daemon_yields_protocol_mismatch() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -7118,10 +7460,11 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&sock).expect("bind newer-daemon socket");
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
 
-        let mismatch_resp = newer_daemon_version_mismatch_response(config_id);
+        let mismatch_resp = newer_daemon_response(config_id);
         let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7144,10 +7487,15 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
 
         assert!(
-            matches!(outcome, ForwardOutcome::Response(_)),
-            "version_mismatch=true with daemon_protocol_version > PROTOCOL_VERSION \
-             must yield Response (hard error via map_response), not ProtocolMismatch \
-             (the client binary, not the daemon, is stale)"
+            matches!(
+                outcome,
+                ForwardOutcome::ProtocolMismatch {
+                    daemon_protocol_version
+                } if daemon_protocol_version == PROTOCOL_VERSION + 1
+            ),
+            "a daemon ahead of this bridge yields ProtocolMismatch carrying the daemon's \
+             version, so the bridge answers the caller and then re-execs the current \
+             binary; the version_mismatch flag on the frame does not decide this"
         );
 
         clear_daemon_env();
@@ -7215,6 +7563,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7320,6 +7669,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7407,6 +7757,7 @@ mod tests {
                     ok: true,
                     result: Some("daemon-handled-stats".to_string()),
                     error: None,
+                    error_detail: None,
                     namespace_mismatch: false,
                     config_mismatch: false,
                     served_config_id: Some(cfg_for_srv.clone()),
@@ -7421,6 +7772,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7551,6 +7903,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,

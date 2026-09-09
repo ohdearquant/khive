@@ -5,10 +5,28 @@
 //! `src/conflict.rs` under `#[cfg(test)] mod tests`.
 
 use khive_request::{
-    parse_request, parse_typed_json_batch, ArgValue, DslError, ExecutionMode, TypedJsonOp, MAX_OPS,
-    MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT, RESERVED_ENVELOPE_ARGS,
+    parse_request as parse_request_unplanned, parse_typed_json_batch, plan_request, ArgValue,
+    DslError, ExecutionMode, TypedJsonOp, MAX_OPS, MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT,
+    RESERVED_ENVELOPE_ARGS,
 };
 use serde_json::json;
+
+/// Standalone default; including this corpus as a module lets a transport test
+/// supply its own crate-root callback over the same inputs.
+pub fn plan_for_parser_corpus(input: &str) -> serde_json::Value {
+    plan_request(input, &std::collections::BTreeMap::new())
+}
+
+fn parse_request(input: &str) -> Result<khive_request::ParsedRequest, DslError> {
+    let parsed = parse_request_unplanned(input);
+    if let Err(error) = &parsed {
+        let plan = crate::plan_for_parser_corpus(input);
+        assert_eq!(plan["parsed"], false);
+        assert_eq!(plan["error"], error.to_string());
+        assert!(plan.get("stages").is_none());
+    }
+    parsed
+}
 
 fn req(s: &str) -> khive_request::ParsedRequest {
     parse_request(s).unwrap_or_else(|e| panic!("parse({s:?}) failed: {e}"))

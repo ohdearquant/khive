@@ -151,6 +151,9 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     // before `build_server` runs migrations/FTS DDL unguarded — see
     // `acquire_daemon_boot_guard`. Non-daemon callers keep the best-effort
     // lock (dropped right after construction below).
+    if args.daemon {
+        khive_runtime::daemon::mark_warm_index_host();
+    }
     #[cfg(unix)]
     let boot_guard = if args.daemon {
         Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
@@ -5921,6 +5924,7 @@ id = "lambda:project-actor"
         // kg round-trip: create an entity on the main backend.
         let kg_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"create(kind="concept", name="MultiBackendTestEntity")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -5945,6 +5949,7 @@ id = "lambda:project-actor"
         // comm round-trip: send a message on the secondary backend.
         let comm_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"comm.send(to="local", content="multi-backend-test")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -6008,6 +6013,7 @@ id = "lambda:project-actor"
 
         let send_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"comm.send(to="local", content="adr-124 multi-backend boot probe")"#
                     .to_string(),
                 presentation: None,
@@ -6033,6 +6039,7 @@ id = "lambda:project-actor"
 
         let get_before_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(r#"get(id="{full_id}")"#),
                 presentation: None,
                 presentation_per_op: None,
@@ -6050,6 +6057,7 @@ id = "lambda:project-actor"
 
         let update_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(
                     r#"update(id="{full_id}", properties={{"from_actor": "forged-actor"}})"#
                 ),
@@ -6070,9 +6078,9 @@ id = "lambda:project-actor"
             "update forging `from_actor` on a message note must be refused on a served \
              multi-backend instance; response: {update_resp}"
         );
-        let error_msg = update_json["results"][0]["error"]
+        let error_msg = update_json["results"][0]["error"]["message"]
             .as_str()
-            .unwrap_or_default();
+            .expect("error.message is text");
         assert!(
             error_msg.contains("from_actor"),
             "refusal error must name `from_actor`; got: {error_msg}"
@@ -6080,6 +6088,7 @@ id = "lambda:project-actor"
 
         let get_after_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(r#"get(id="{full_id}")"#),
                 presentation: None,
                 presentation_per_op: None,
@@ -6161,6 +6170,7 @@ id = "lambda:project-actor"
 
         let send_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"comm.send(to="local", content="adr-124 boot-occupancy actor probe")"#
                     .to_string(),
                 presentation: None,
@@ -6186,6 +6196,7 @@ id = "lambda:project-actor"
 
         let get_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(r#"get(id="{full_id}")"#),
                 presentation: None,
                 presentation_per_op: None,
@@ -6202,6 +6213,7 @@ id = "lambda:project-actor"
 
         let create_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"create(kind="message", content="adr-124 boot-occupancy create probe", properties={"from_actor": "forged-actor"})"#
                     .to_string(),
                 presentation: None,
@@ -7998,6 +8010,7 @@ region = "us-east-1"
             async move {
                 let resp = server
                     .dispatch_request_local(RequestParams {
+                        plan: None,
                         ops,
                         presentation: None,
                         presentation_per_op: None,
@@ -9213,6 +9226,7 @@ region = "us-east-1"
             async move {
                 server
                     .dispatch_request_local(RequestParams {
+                        plan: None,
                         ops,
                         presentation: None,
                         presentation_per_op: None,
