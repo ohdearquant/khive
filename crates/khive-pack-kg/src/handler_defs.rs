@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (23 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (24 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     HandlerDef {
         name: "stream.append",
         description: "Append one immutable JSON record with a dense per-stream sequence; expected_seq is checked in the same transaction as note and ledger insertion.",
@@ -49,6 +49,19 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.batch",
+        description: "Run several append members in one request. Atomic mode (the default whenever fence is present) runs the list in one writer transaction: appends to one stream take consecutive numbers, every expected_seq is checked before the first write, and any member refusal refuses the whole batch with details.member set and nothing written. Per-member mode runs each member in its own transaction in list order: a refusal is returned as that member's value with domain_disposition not_committed and its siblings stand; numbers on one stream increase with list position but another writer's append may fall between them. Reads are not members. Result {results: [...], committed: true} in list order.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "ops", param_type: "array of object", required: true, description: "Members in order. {op: \"append\", stream, record, expected_seq?}: record is any JSON value, including null. {op: \"write\", ...} is the keyed document write and is refused until versioned keyed notes land on this server. An op naming no member operation is that member's unknown_op refusal, placed by the mode.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object", required: false, description: "{key, kind, expected_version}: a keyed note whose version must match, checked once inside the atomic transaction before the first write. Selects atomic mode; atomic=false beside a fence is refused. Refused until versioned keyed notes land on this server.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "observed", param_type: "array of object", required: false, description: "Atomic mode only: [{key, version}] the caller read before composing the batch, each checked inside the transaction before the first write; a mismatch refuses the batch with version_conflict naming the key. Refused in per-member mode, and until versioned keyed notes land on this server.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "atomic", param_type: "boolean", required: false, description: "true: one transaction, all or nothing. false: one transaction per member, refusals as member values. Defaults to whether fence is present.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
         ],
     },

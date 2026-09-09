@@ -567,3 +567,82 @@ codes. ADR-172 Amendment 2 records the same arm for `expected_version` and `fenc
    from `MIN(seq)` instead of persisted, arm 5's `floor_seq` reads 1 (red). With the truncation row
    left in place after commit, a later direct ledger delete succeeds (red), which is what proves the
    row is the authorization.
+
+## Amendment 4 (2026-09-09): an `observed` entry may assert that a key is unheld
+
+**Status**: Proposed.
+
+### The gap
+
+Amendment 1 A1.1 gives an atomic batch an `observed` list of `{"key": K, "version": V}` entries, each
+checked inside the transaction before the first write. An exact version says "this key is held, at this
+version". It cannot say "this key is not held", and the consumer's state layer needs exactly that.
+
+Its publication fence has three forms beside the lease generation. Two of them are versions of a live
+row and map onto `observed` as written: a claim that a `(run, holder, generation)` is a live lease
+becomes one entry per claim, and a release claim is the same entry on the release key. The third does
+not. A handle opened while a run had no lease publishes under the predicate _the lease is still absent,
+or it is still held by the holder this handle captured_. Its suite asserts that a foreign lease
+appearing after the handle opened refuses the publication and writes nothing. An exact-version entry
+cannot express the absent half, and the caller cannot decompose the disjunction by sending two batches:
+the point of the fence is that the predicate and the writes share one transaction.
+
+### A4.1 `version: null`
+
+An `observed` entry is `{"key": K, "kind": <note kind>, "version": V | null}`.
+
+`kind` completes A1.1's two-field spelling rather than leaving it to the implementation. A key is
+unique among live notes of one kind in one namespace (ADR-172 §3), so a key alone does not name a row:
+without `kind` an entry either resolves ambiguously, or it reads across kinds and lets a note some other
+pack keyed the same way refuse a batch it has nothing to do with. `fence` (ADR-172 §2b) already carries
+the kind for the same reason, and the batch's own `write` member names one, so this is the shape the
+rest of the surface already uses.
+
+- `version: V` is unchanged: the entry holds when a live note of that kind holds `K` in the caller's
+  primary namespace at exactly version `V`. A missing row or a different version refuses the batch with
+  `version_conflict` naming the key, as A1.1 says.
+- `version: null` holds when **no** live note of that kind holds `K` in that namespace. A live holder at
+  any version refuses the batch with `version_conflict`, `details` naming the key and the holder's
+  `current_version`; nothing is written. A soft-deleted note has released its key (ADR-172 §3), so it
+  does not hold it here either.
+
+Everything else about `observed` stands: it is atomic mode only, refused with `invalid_input` in
+per-member mode, and every entry is checked inside the writer transaction before the first write.
+
+### A4.2 The disjunction decomposes on the caller's side
+
+The caller reads the lease before composing the batch, so by the time it composes it has observed one of
+two concrete states, and it sends the entry for the state it saw: its own generation, or null. What the
+batch has to guarantee is not the disjunction but that the state it observed still holds at the write.
+A holder that appears between the read and the batch refuses the null entry; a holder that renews
+between them refuses the version entry; a lease released between them refuses the version entry, and the
+caller re-reads and re-composes. That is the same contract every other `observed` entry has, so `null`
+adds a value, not a rule.
+
+No `key_conflict` case is added. A `write` member that creates a key another live note holds still
+refuses with `key_conflict` and `existing_id` exactly as A1.1 says; an `observed` entry never creates
+anything, so it can only ever produce `version_conflict`.
+
+### Acceptance
+
+Every arm names its command; the atomic-mode counts are read as domain events only, as in Amendment 1
+acceptance 2.
+
+1. **Unheld and observed unheld.** A batch carrying `{"key": K, "kind": <k>, "version": null}` for a key
+   no live note holds commits every member; the stream heads move by exactly the members' appends.
+2. **Held and observed unheld.** With a live note holding `K` at version 1, the same batch is refused
+   with `version_conflict` naming `K` and `current_version` 1; the note count, the ledger count and
+   every named stream's head are unchanged. Repeated with the holder at version 5, to show the refusal
+   does not depend on the version being the initial one.
+3. **Kind is part of the key.** A live note of kind `A` holding `K` does not refuse an entry naming
+   kind `B` and the same `K`; the batch commits. The control is arm 2 with the kinds equal.
+4. **Released key.** A soft-deleted note that held `K` does not refuse a null entry; a hard-deleted one
+   does not either. The control is arm 2 with the note live.
+5. **Mixed list.** One batch carrying a null entry and a version entry commits when both hold, and is
+   refused naming the offending key when either does not, in both directions, with nothing written.
+6. **Cross-process.** Arms 1 and 2 through the socket, with the holder created by a second OS process
+   between the caller's read and its batch, so the refusal is a real race and not a self-inflicted one.
+7. **Mutation.** With a null entry treated as no check at all, arm 2 goes red. With a null entry
+   compiled as `version = 0`, arm 1 goes red. With the null check moved after the first insert, arm 2's
+   statement-trace assertion goes red (Amendment 3 A3.3: the trace is the order control, the unchanged
+   counts are the rollback control). Both runs quoted with exit codes.

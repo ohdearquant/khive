@@ -19,3 +19,18 @@ def test_stream_explicit_null_fence_reaches_server_for_refusal():
 
 def test_non_stream_optional_none_still_omitted():
     assert op("create", kind="observation", name=None)["args"] == {"kind": "observation"}
+
+
+def test_stream_batch_omits_none_fence_but_keeps_member_nulls():
+    # The batch defaults its mode by fence presence, so a Python None fence is
+    # absent; inside a member, a null record or expected_seq is part of the shape.
+    args = op(
+        "stream.batch",
+        ops=[{"op": "append", "stream": "s", "record": None, "expected_seq": None}],
+        fence=None,
+        observed=None,
+        atomic=None,
+    )["args"]
+    assert set(args) == {"ops"}
+    assert args["ops"][0]["record"] is None
+    assert args["ops"][0]["expected_seq"] is None
