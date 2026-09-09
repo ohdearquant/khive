@@ -9935,13 +9935,14 @@ mod tests {
                 vec!["lambda:request-actor", "client-visible", "local"],
             ),
             (vec![], false, vec!["local"]),
-            // A reconstructed list that omits the actor gains exactly the
-            // actor's own namespace (ADR-007 Rev 4 Rule 3b at the mint) and
-            // nothing from the daemon's configured visibility.
+            // A reconstructed token carrying an explicit list is consumed as
+            // given: the coordinator adds `local` and nothing else, so neither
+            // the request actor's own namespace nor the daemon's configured
+            // visibility is folded in behind the caller's back.
             (
                 vec!["client-visible"],
                 false,
-                vec!["client-visible", "lambda:request-actor", "local"],
+                vec!["client-visible", "local"],
             ),
             (vec!["lambda:request-actor", "client-visible"], true, vec![]),
         ] {
