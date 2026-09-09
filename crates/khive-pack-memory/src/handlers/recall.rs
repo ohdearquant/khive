@@ -15,7 +15,7 @@ use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
     SearchSource, VerbRegistry,
 };
-use khive_storage::types::EdgeFilter;
+use khive_storage::types::{Direction, EdgeFilter, NeighborQuery};
 use khive_storage::EdgeRelation;
 
 use crate::config::{RecallConfig, ScoreBreakdown};
@@ -27,11 +27,11 @@ use crate::scoring::{
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, plog, plog_n,
-    recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
-    RecallStageTimings, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC,
-    DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID,
-    RECALL_SLOW_THRESHOLD_MS,
+    compute_score, deser, fuse_candidates, make_pipeline, note_has_any_tag, note_matches_tags,
+    plog, plog_n, recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams,
+    RecallParams, RecallStageTimings, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC,
+    DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID,
+    RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
 
 /// Bounded storage page for inbound supersession checks. This is deliberately
@@ -637,6 +637,11 @@ impl MemoryPack {
                     continue;
                 }
             }
+            if let Some(excluded) = p.exclude_tags.as_ref().filter(|tags| !tags.is_empty()) {
+                if note_has_any_tag(note.properties.as_ref(), excluded) {
+                    continue;
+                }
+            }
             // Same predicate the widening loop counts with; one definition so
             // a boundary change cannot drift between the two paths.
             if !in_window(&note) {
@@ -884,6 +889,31 @@ impl MemoryPack {
         let full_content = p.full_content.unwrap_or(true);
         const PREVIEW_CHARS: usize = 200;
 
+        // Source provenance is the memory's `annotates` edge (never a property);
+        // read it only when asked, one edge query per returned hit.
+        let mut source_ids: HashMap<Uuid, Option<String>> = HashMap::new();
+        if p.include_source_id.unwrap_or(false) {
+            for id in ranked.iter().map(|sn| sn.id) {
+                let source = self
+                    .runtime
+                    .neighbors_with_query(
+                        &effective_token,
+                        id,
+                        NeighborQuery {
+                            direction: Direction::Out,
+                            relations: Some(vec![EdgeRelation::Annotates]),
+                            limit: Some(1),
+                            min_weight: None,
+                        },
+                    )
+                    .await?
+                    .into_iter()
+                    .next()
+                    .map(|hit| hit.node_id.to_string());
+                source_ids.insert(id, source);
+            }
+        }
+
         let mut results: Vec<Value> = ranked
             .into_iter()
             .map(|sn| {
@@ -906,6 +936,9 @@ impl MemoryPack {
                     "memory_type": sn.resolved_memory_type,
                     "created_at": micros_to_iso(sn.note.created_at),
                 });
+                if let Some(source) = source_ids.get(&sn.id) {
+                    result["source_id"] = json!(source);
+                }
                 if is_verbose {
                     result["breakdown"] = json!(sn.breakdown);
                 }
