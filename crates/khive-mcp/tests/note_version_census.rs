@@ -414,6 +414,9 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         ),
         (CURATION, "merge_note_sql", "memory", "{}"),
         (CREATE, "prepare_note_create", "memory", "{}"),
+        // The keyed pair stamps the caller key onto an already-inserted
+        // outbound note, so the fixture is a keyless message row.
+        (MESSAGE, "create_keyed_message_pair", "message", "{}"),
         (FAULT, "injected_failure_statement", "memory", "{}"),
     ];
     assert_eq!(
@@ -444,6 +447,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             SCHEDULE => conn.execute(sql, params!["2026-09-09T00:00:00Z", 200_i64, ID, "local"]),
             CURATION => conn.execute(sql, params![200_i64, "local", ID]),
             CREATE => conn.execute(sql, params!["census/key", ID, "local", "memory"]),
+            MESSAGE => conn.execute(sql, params!["census/key", ID, "local"]),
             FAULT => conn.execute(sql, []),
             _ => unreachable!(),
         }
