@@ -434,8 +434,8 @@ A write may depend on several keyed notes at once. Singleton note `create`, note
 
 Each entry follows §2b: resolve a live keyed note in the caller's primary namespace and compare its
 version. All entries are checked in supplied order inside the same writer transaction as the guarded
-write, before its statements. The first missing or stale entry refuses the whole write. Fence checks
-only read the lease notes. The target's own `expected_version` or stream `expected_seq` still applies.
+write, before its statements. The first missing or stale entry refuses the whole write. A fence entry may name any keyed note of any kind; fence checks only read the fenced
+notes. The target's own `expected_version` or stream `expected_seq` still applies.
 A prior write inside an atomic unit is visible to its later fence checks; a later refusal rolls back
 that entire unit.
 
@@ -460,8 +460,10 @@ unknown outcomes retain their existing disposition; a fence parameter alone prov
 An explicit null, an empty list, a malformed entry, an unknown entry field, an invalid key or note kind,
 or a non-positive expected version is `invalid_input` before opening the write transaction. A list
 cannot name the same `(kind, key)` twice, even with different versions; the error names both zero-based
-indices. Identical keys in different note kinds remain distinct. Omitting `fence` preserves an
-unconditional fence policy. A list never changes the successful response or adds writes to a lease.
+indices. This whole class is an `invalid_input` error carried in the message text, with no
+`details.reason` discriminator: the base ADR promises `reason` only for `conflict` and `not_found`, and a
+client must not look for one here. Identical keys in different note kinds remain distinct. Omitting `fence` keeps today's
+unfenced behaviour. A list never changes the successful response or adds writes to a lease.
 
 The Python client accepts a dictionary or list of dictionaries and preserves entry order. Its generic
 `stream.append` builder preserves explicitly supplied null so the server can reject it.
