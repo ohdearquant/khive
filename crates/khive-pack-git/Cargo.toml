@@ -11,7 +11,14 @@ keywords.workspace = true
 categories.workspace = true
 description = "Git-lifecycle pack — commit/issue/pull_request provenance notes over the notes substrate (ADR-088)"
 
+[features]
+contract-faults = ["khive-runtime/contract-faults"]
+
 [dependencies]
+khive-pack-exec = { version = "0.8.0", path = "../khive-pack-exec" }
+khive-pack-tool = { version = "0.8.0", path = "../khive-pack-tool" }
+tempfile = { workspace = true }
+zeroize = "1"
 khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
 inventory = { workspace = true }
@@ -40,6 +47,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+khive-pack-blob = { version = "0.8.0", path = "../khive-pack-blob" }
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
 tempfile = { workspace = true }

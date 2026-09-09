@@ -41,8 +41,8 @@ use khive_storage::event::Event;
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
 use crate::write_argv::{
-    build_add_argv, build_branch_argv, build_commit_argv, build_push_argv, reject_force,
-    validate_repo_path, GitArgError,
+    build_add_argv, build_commit_argv, build_push_argv, reject_force, validate_repo_path,
+    GitArgError,
 };
 use crate::write_policy::{GitWritePolicy, GitWritePolicyError};
 use crate::GitPack;
@@ -63,7 +63,7 @@ fn to_policy_denied(e: GitWritePolicyError) -> RuntimeError {
 /// review r2 High finding).
 static REPO_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
 
-fn repo_write_lock(repo: &Path) -> Arc<AsyncMutex<()>> {
+pub(crate) fn repo_write_lock(repo: &Path) -> Arc<AsyncMutex<()>> {
     let key = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let registry = REPO_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -248,33 +248,6 @@ fn prepare_commit(repo: &Path, params: &Value) -> Result<CommitPreflight, WriteP
         branch,
         add_argv,
         commit_argv,
-    })
-}
-
-struct BranchPreflight {
-    name: String,
-    from: Option<String>,
-    argv: Vec<String>,
-}
-
-fn prepare_branch(repo: &Path, params: &Value) -> Result<BranchPreflight, WritePreflightError> {
-    validate_repo_path(repo)
-        .map_err(to_invalid_input)
-        .map_err(|e| WritePreflightError::denied(e, None))?;
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::InvalidInput("git.branch requires name".into()))
-        .map_err(|e| WritePreflightError::denied(e, None))?;
-    let from = parse_optional_string(params, "from")
-        .map_err(|e| WritePreflightError::denied(e, Some(name)))?;
-    let argv = build_branch_argv(name, from)
-        .map_err(to_invalid_input)
-        .map_err(|e| WritePreflightError::denied(e, Some(name)))?;
-    Ok(BranchPreflight {
-        name: name.to_string(),
-        from: from.map(str::to_string),
-        argv,
     })
 }
 
@@ -464,81 +437,23 @@ impl GitPack {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn handle_branch(
         &self,
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let repo = self
-            .parse_audited_repo(token, "git.branch", &params)
-            .await?;
-        let lock = repo_write_lock(&repo);
-        let _guard = lock.lock().await;
-        let BranchPreflight { name, from, argv } = match prepare_branch(&repo, &params) {
-            Ok(preflight) => preflight,
-            Err(failure) => {
-                return Err(self
-                    .audit_early_failure(
-                        token,
-                        "git.branch",
-                        &repo,
-                        failure.branch.as_deref(),
-                        failure.outcome,
-                        failure.error,
-                    )
-                    .await)
-            }
-        };
-
-        let canonical_repo = match self.enforce_write_policy(&repo, &name) {
-            Ok(p) => p,
-            Err(e) => {
-                self.emit_write_audit(
-                    token,
-                    "git.branch",
-                    &repo,
-                    Some(&name),
-                    "deny",
-                    EventOutcome::Denied,
-                    None,
-                )
-                .await;
-                return Err(e);
-            }
-        };
-
-        match run_git(&canonical_repo, &argv) {
-            Ok(_) => {
-                self.emit_write_audit(
-                    token,
-                    "git.branch",
-                    &canonical_repo,
-                    Some(&name),
-                    "allow",
-                    EventOutcome::Success,
-                    None,
-                )
-                .await;
-                Ok(json!({
-                    "repo": canonical_repo.display().to_string(),
-                    "name": name,
-                    "from": from,
-                }))
-            }
-            Err(e) => {
-                self.emit_write_audit(
-                    token,
-                    "git.branch",
-                    &canonical_repo,
-                    Some(&name),
-                    "allow",
-                    EventOutcome::Error,
-                    None,
-                )
-                .await;
-                Err(e)
-            }
-        }
+        // Legacy unit tests call this crate-private convenience directly; production
+        // dispatch always supplies the actual registry and its per-pack backends.
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(self.runtime().clone()));
+        builder.register(khive_pack_tool::ToolPack::new(self.runtime().clone()));
+        builder
+            .with_runtime_event_store(self.runtime())
+            .expect("fixture audit store");
+        let registry = builder.build().expect("fixture registry");
+        self.handle_local(token, &registry, "git.branch", params)
+            .await
     }
 
     pub(crate) async fn handle_push(
@@ -637,7 +552,7 @@ impl GitPack {
     /// write in this codebase (ADR-018 "audit storage failures don't
     /// propagate") — it must never fail a write that git itself completed.
     #[allow(clippy::too_many_arguments)]
-    async fn emit_write_audit(
+    pub(crate) async fn emit_write_audit(
         &self,
         token: &NamespaceToken,
         verb: &str,

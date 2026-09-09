@@ -236,7 +236,6 @@ must follow the [cache-state and warm-up protocol](scripts/perf/README.md#benchm
 | `khive-pack-tool`      | Tool pack: capability registry, discovery, use policy (ADR-180)                                          |
 | `khive-pack-exec`      | Exec pack: sandboxed run of a registered tool over a materialized tree (ADR-181)                         |
 | `khive-pack-blob`      | Blob pack: content-addressed object storage                                                              |
-| `khive-pack-tool`      | Tool pack: registry of tools, skills, plugins and verbs; capability discovery; use policy and grants     |
 | `khive-mcp`            | MCP server library: single `request` tool dispatching through the VerbRegistry (served by `kkernel mcp`) |
 | `kkernel`              | The single shipped binary: `kkernel mcp` serves MCP; admin subcommands (exec, reindex, db, …)            |
 

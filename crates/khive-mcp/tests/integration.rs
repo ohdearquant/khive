@@ -6073,6 +6073,7 @@ fn compute_config_id_fingerprints_git_write_policy_deterministically_and_in_entr
                 branches: vec!["release/*".to_string()],
             },
         ],
+        ..Default::default()
     };
     let configured = RuntimeConfig {
         git_write: policy.clone(),
@@ -6088,12 +6089,14 @@ fn compute_config_id_fingerprints_git_write_policy_deterministically_and_in_entr
                 repo: "/srv/repos/alpha".to_string(),
                 branches: vec!["fix/*".to_string()],
             }],
+            ..Default::default()
         },
         ..base.clone()
     };
     let reordered = RuntimeConfig {
         git_write: GitWriteSectionConfig {
             allowed: policy.allowed.into_iter().rev().collect(),
+            ..Default::default()
         },
         ..base
     };

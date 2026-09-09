@@ -4,11 +4,11 @@
 //! `[[engines]]` array for arbitrary-N embedding engine registration. Falls back
 //! to `KHIVE_EMBEDDING_MODEL` env vars when no config file is present.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use khive_types::{namespace::Namespace, SubstrateKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{config::BackendId, presentation::OutputFormat};
@@ -82,6 +82,9 @@ pub enum ConfigError {
 
     #[error("[[git_write.allowed]] entry {repo:?}: {reason}")]
     InvalidGitWriteEntry { repo: String, reason: String },
+
+    #[error("[git_write] {key}: {reason}")]
+    InvalidGitWriteConfig { key: String, reason: String },
 
     #[error("[exec] {key}: {reason}")]
     InvalidExecConfig { key: String, reason: String },
@@ -413,7 +416,7 @@ pub struct StorageSectionConfig {
 /// repo = "/abs/path/repo"
 /// branches = ["feat/*", "fix/*"]
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitWriteEntryConfig {
     /// Absolute local path to the allowlisted repository.
     pub repo: String,
@@ -433,10 +436,179 @@ pub struct GitWriteEntryConfig {
 /// repo = "/abs/path/repo"
 /// branches = ["feat/*", "fix/*"]
 /// ```
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitWriteSectionConfig {
     #[serde(default)]
     pub allowed: Vec<GitWriteEntryConfig>,
+    #[serde(default)]
+    pub actors: BTreeMap<String, GitWriteActorConfig>,
+    #[serde(default = "default_git_credential_resolver")]
+    pub credential_resolver: Vec<String>,
+    #[serde(default)]
+    pub contract_faults: bool,
+    #[serde(default)]
+    pub fault: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitWriteActorConfig {
+    pub name: String,
+    pub email: String,
+    pub credential_ref: String,
+    pub platform_identity: String,
+}
+
+fn default_git_credential_resolver() -> Vec<String> {
+    [
+        "/usr/bin/security",
+        "find-generic-password",
+        "-w",
+        "-s",
+        "{ref}",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+impl Default for GitWriteSectionConfig {
+    fn default() -> Self {
+        Self {
+            allowed: Vec::new(),
+            actors: BTreeMap::new(),
+            credential_resolver: default_git_credential_resolver(),
+            contract_faults: false,
+            fault: None,
+        }
+    }
+}
+
+impl GitWriteSectionConfig {
+    pub fn validate_dev_loop(&self) -> Result<(), ConfigError> {
+        let invalid = |key: &str, reason: &str| ConfigError::InvalidGitWriteConfig {
+            key: key.to_string(),
+            reason: reason.to_string(),
+        };
+        if self.contract_faults && !cfg!(feature = "contract-faults") {
+            tracing::error!(
+                target: "khive.boot",
+                "[git_write] contract_faults requires the test-only contract-faults build feature"
+            );
+            return Err(invalid(
+                "contract_faults",
+                "requires the test-only contract-faults build feature",
+            ));
+        }
+        if let Some(fault) = &self.fault {
+            if !self.contract_faults {
+                return Err(invalid("fault", "requires contract_faults = true"));
+            }
+            let valid = fault.split_once(':').is_some_and(|(verb, point)| {
+                matches!(verb, "git.push" | "git.pr_merge")
+                    && matches!(
+                        point,
+                        "reply-lost-after-effect" | "audit-fails-after-effect"
+                    )
+            });
+            if !valid {
+                return Err(invalid("fault", "unsupported contract fault selector"));
+            }
+        }
+        // The default keychain program is Unix-only. Legacy configurations with
+        // no actor mappings cannot invoke it, so they remain loadable elsewhere.
+        if !cfg!(unix)
+            && self.actors.is_empty()
+            && self.credential_resolver == default_git_credential_resolver()
+        {
+            return Ok(());
+        }
+        let argv = &self.credential_resolver;
+        let Some(program) = argv.first() else {
+            return Err(invalid("credential_resolver", "argv must not be empty"));
+        };
+        let program_path = Path::new(program);
+        if !program_path.is_absolute() {
+            return Err(invalid(
+                "credential_resolver",
+                "argv[0] must be an absolute path",
+            ));
+        }
+        let program_name = program_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(
+            program_name.trim_end_matches(".exe"),
+            "sh" | "bash"
+                | "dash"
+                | "zsh"
+                | "ksh"
+                | "fish"
+                | "csh"
+                | "tcsh"
+                | "cmd"
+                | "powershell"
+                | "pwsh"
+                | "env"
+        ) {
+            return Err(invalid(
+                "credential_resolver",
+                "shell or env launcher is not allowed",
+            ));
+        }
+        if argv.iter().any(|arg| arg.chars().any(char::is_control)) {
+            return Err(invalid(
+                "credential_resolver",
+                "argv must not contain control characters",
+            ));
+        }
+        if program.contains(['{', '}'])
+            || argv[1..]
+                .iter()
+                .any(|arg| arg != "{ref}" && arg.contains(['{', '}']))
+        {
+            return Err(invalid(
+                "credential_resolver",
+                "{ref} must be a complete argument and is the only allowed template",
+            ));
+        }
+        if !argv[1..].iter().any(|arg| arg == "{ref}") {
+            return Err(invalid(
+                "credential_resolver",
+                "argv must contain a {ref} argument",
+            ));
+        }
+        for (actor, identity) in &self.actors {
+            if actor.trim().is_empty() || actor.chars().any(char::is_control) {
+                return Err(invalid(
+                    "actors",
+                    "actor labels must be nonempty and contain no control characters",
+                ));
+            }
+            for (field, value) in [
+                ("name", &identity.name),
+                ("email", &identity.email),
+                ("credential_ref", &identity.credential_ref),
+                ("platform_identity", &identity.platform_identity),
+            ] {
+                if value.trim().is_empty() || value.chars().any(char::is_control) {
+                    return Err(invalid(
+                        &format!("actors.{actor}.{field}"),
+                        "must be nonempty and contain no control characters",
+                    ));
+                }
+            }
+            if identity.name.contains(['<', '>']) || identity.email.contains(['<', '>']) {
+                return Err(invalid(
+                    &format!("actors.{actor}"),
+                    "name and email must not contain Git identity delimiters",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---- exec sandbox (ADR-181) ----
@@ -861,6 +1033,8 @@ impl KhiveConfig {
     /// Model name validity is checked lazily at runtime (the config loader does
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.git_write.validate_dev_loop()?;
+
         // Reject a top-level `db` key loudly instead of letting serde's
         // forward-compatible unknown-key tolerance silently swallow it: a
         // config author expecting `db=` to select the database would
@@ -2703,6 +2877,142 @@ branches = []
             matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "/abs/path"),
             "expected InvalidGitWriteEntry, got {err:?}"
         );
+    }
+
+    #[test]
+    fn git_actor_mapping_and_resolver_defaults_parse_without_resolution() {
+        let cfg: KhiveConfig = toml::from_str(
+            r#"
+[git_write.actors."lambda:example"]
+name = "Example"
+email = "example@example.invalid"
+credential_ref = "example-reference"
+platform_identity = "example-login"
+"#,
+        )
+        .unwrap();
+        if cfg!(unix) {
+            cfg.validate().unwrap();
+        } else {
+            assert!(cfg.validate().is_err());
+        }
+        let identity = &cfg.git_write.actors["lambda:example"];
+        assert_eq!(identity.name, "Example");
+        assert_eq!(identity.credential_ref, "example-reference");
+        assert_eq!(
+            cfg.git_write.credential_resolver,
+            GitWriteSectionConfig::default().credential_resolver
+        );
+    }
+
+    #[test]
+    fn git_resolver_accepts_only_absolute_argv_with_ref_template() {
+        for argv in [
+            vec![],
+            vec!["relative-resolver", "{ref}"],
+            vec!["/bin/sh", "-c", "{ref}"],
+            vec!["/usr/bin/env", "sh", "{ref}"],
+            vec!["/absolute/resolver", "{token}"],
+            vec!["/absolute/resolver", "--service={ref}"],
+            vec!["/absolute/resolver"],
+            vec!["/absolute/resolver", "{ref}", "bad\0arg"],
+        ] {
+            let config = GitWriteSectionConfig {
+                credential_resolver: argv.into_iter().map(str::to_string).collect(),
+                ..Default::default()
+            };
+            assert!(matches!(
+                config.validate_dev_loop(),
+                Err(ConfigError::InvalidGitWriteConfig { key, .. }) if key == "credential_resolver"
+            ));
+        }
+        let config = GitWriteSectionConfig {
+            credential_resolver: vec![
+                std::env::temp_dir()
+                    .join("not-installed-yet/resolver")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--reference".to_string(),
+                "{ref}".to_string(),
+            ],
+            ..Default::default()
+        };
+        config.validate_dev_loop().unwrap();
+    }
+
+    #[test]
+    fn git_actor_mapping_rejects_invalid_identity_and_unknown_fields() {
+        let actor = GitWriteActorConfig {
+            name: "Example".to_string(),
+            email: "example@example.invalid".to_string(),
+            credential_ref: "example-reference".to_string(),
+            platform_identity: "example-login".to_string(),
+        };
+        for field in ["name", "email", "credential_ref", "platform_identity"] {
+            let mut invalid = actor.clone();
+            match field {
+                "name" => invalid.name.clear(),
+                "email" => invalid.email = "bad\nemail".to_string(),
+                "credential_ref" => invalid.credential_ref.clear(),
+                "platform_identity" => invalid.platform_identity.clear(),
+                _ => unreachable!(),
+            }
+            let config = GitWriteSectionConfig {
+                actors: BTreeMap::from([("example".to_string(), invalid)]),
+                ..Default::default()
+            };
+            assert!(config.validate_dev_loop().is_err());
+        }
+        assert!(toml::from_str::<GitWriteActorConfig>(
+            r#"name = "Example"
+email = "example@example.invalid"
+credential_ref = "reference"
+platform_identity = "login"
+credential = "not-an-accepted-field""#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn git_contract_faults_are_feature_gated_before_empty_engines_return() {
+        let cfg = KhiveConfig {
+            git_write: GitWriteSectionConfig {
+                contract_faults: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if cfg!(feature = "contract-faults") {
+            cfg.validate().unwrap();
+        } else {
+            let error = cfg.validate().unwrap_err();
+            assert!(matches!(error, ConfigError::InvalidGitWriteConfig { .. }));
+            assert!(error.to_string().contains("contract-faults"));
+        }
+    }
+
+    #[test]
+    fn git_unmapped_legacy_default_remains_valid_on_every_platform() {
+        GitWriteSectionConfig::default()
+            .validate_dev_loop()
+            .unwrap();
+        let config = GitWriteSectionConfig {
+            credential_resolver: vec!["relative-resolver".to_string(), "{ref}".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate_dev_loop().is_err());
+    }
+
+    #[test]
+    fn git_fault_selectors_require_opt_in() {
+        let config = GitWriteSectionConfig {
+            fault: Some("git.push:reply-lost-after-effect".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.validate_dev_loop(),
+            Err(ConfigError::InvalidGitWriteConfig { key, .. }) if key == "fault"
+        ));
     }
 
     // ── [storage.blob] section (ADR-111 Amendment 2) ─────────────────────────

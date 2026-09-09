@@ -2185,7 +2185,10 @@ dependencies = [
  "chrono",
  "clap",
  "inventory",
+ "khive-pack-blob",
+ "khive-pack-exec",
  "khive-pack-kg",
+ "khive-pack-tool",
  "khive-runtime",
  "khive-storage",
  "khive-types",
@@ -2199,6 +2202,7 @@ dependencies = [
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

@@ -4668,6 +4668,7 @@ mod tests {
                 repo: "/srv/repos/alpha".to_string(),
                 branches: vec!["feat/*".to_string()],
             }],
+            ..Default::default()
         };
         let revoked_config = RuntimeConfig {
             git_write: GitWriteSectionConfig::default(),
