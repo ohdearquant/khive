@@ -1114,6 +1114,7 @@ mod tests {
             "notes": [],
             "edges": [],
             "results": [],
+            "entries": [],
             "next_after": null,
             "requested_limit": 10,
             "effective_limit": 10,
