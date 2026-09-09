@@ -34,7 +34,7 @@ runtime warm.
 | **schedule**  | 4     | Reminders and scheduled verb execution                                                                                                           |
 | **knowledge** | 19    | Atom-based KB with embedding rerank search                                                                                                       |
 | **session**   | 4     | Session record persistence (store/list/resume/export)                                                                                            |
-| **git**       | 12    | Git-lifecycle note kinds (commit/issue/pull_request) + batch ingester + `git.digest`; write verbs `git.commit`/`git.branch`/`git.push` (ADR-108) |
+| **git**       | 15    | Git-lifecycle note kinds (commit/issue/pull_request) + batch ingester + `git.digest`; write verbs `git.commit`/`git.branch`/`git.push` (ADR-108) |
 | **code**      | 1     | `code.ingest` L1/L1.5 source ingest; `findings.json` stays admin-CLI (`kkernel code-ingest`)                                                     |
 | **workspace** | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)                                                     |
 | **blob**      | 3     | Content-addressed blob storage (`blob.put` / `blob.get` / `blob.stat`)                                                                           |
