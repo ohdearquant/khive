@@ -51,6 +51,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         category: khive_types::VerbCategory::Commissive,
         params: &[
             ParamDef {
+                name: "idempotency_key",
+                param_type: "string",
+                required: false,
+                description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "to",
                 param_type: "string",
                 required: true,
@@ -296,6 +303,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
+            ParamDef {
+                name: "idempotency_key",
+                param_type: "string",
+                required: false,
+                description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "id",
                 param_type: "string",

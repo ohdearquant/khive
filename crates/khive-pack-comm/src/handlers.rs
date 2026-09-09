@@ -14,10 +14,12 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
+use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
 use crate::message::{
-    dual_write_message, note_to_message_json, project_message_json, resolve_id, short_id,
-    validate_message_projection_fields, COMM_SCHEMA_VERSION, COMM_STABLE_PROPERTY_KEYS,
+    dual_write_message_with_identity, note_to_message_json, project_message_json, resolve_id,
+    short_id, validate_message_projection_fields, MessageWrite, COMM_SCHEMA_VERSION,
+    COMM_STABLE_PROPERTY_KEYS,
 };
 use crate::params::{
     deser, CursorCommitParams, CursorGetParams, DeliveredParams, HeartbeatParams, InboxParams,
@@ -291,15 +293,8 @@ fn canonicalize_ingest_sent_at(raw: &str) -> Result<String, RuntimeError> {
 /// deliver an inbound copy addressed to the actor label in `to` (ADR-057).
 /// Both copies land in the caller's namespace; no cross-namespace write occurs.
 ///
-/// Known gap (external desk review, 2026-07-21): there is no idempotency
-/// guard here, so a retrying caller that repeats an identical `send` (same
-/// `to`/`content`) produces a fresh duplicate outbound+inbound pair every
-/// call. `comm.ingest`'s `external_id` dedup key is a different mechanism
-/// (transport-level dedup for channel-delivered inbound mail) and does not
-/// apply to caller-composed sends. Fixing this needs a caller-supplied
-/// idempotency key param on `SendParams` (additive) — a content-hash dedup
-/// invented here would risk collapsing legitimate repeated messages, so this
-/// is left as a design decision rather than implemented speculatively.
+/// Caller-keyed sends reconcile through the atomic outbound claim and its
+/// intact recipient sibling. Without a key each call creates a new message.
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
@@ -362,7 +357,18 @@ pub(crate) async fn handle_send(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let (outbound_note, embedding_truncation) = dual_write_message(
+    let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
+        json!({
+            "version": 1, "op": "send", "to": to_actor, "content": p.content,
+            "subject": p.subject, "thread_id": thread_id,
+            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": null,
+        })
+    })?;
+    let MessageWrite {
+        outbound: outbound_note,
+        embedding_truncation,
+        replayed,
+    } = dual_write_message_with_identity(
         runtime,
         token,
         &caller_ns,
@@ -377,9 +383,12 @@ pub(crate) async fn handle_send(
         None,
         None,
         p.tags.as_deref(),
+        identity.as_ref(),
     )
     .await?;
-    inbox_signal.publish();
+    if !replayed {
+        inbox_signal.publish();
+    }
 
     // `thread_id` is a strict full-UUID input on a later send. Surface the
     // canonical value persisted by `dual_write_message` so this response can
@@ -398,6 +407,9 @@ pub(crate) async fn handle_send(
         "subject": p.subject,
         "sent_at": sent_at,
     });
+    if let Some(identity) = identity {
+        identity.annotate_response(&mut response, &outbound_note, replayed);
+    }
     add_embedding_truncation_warning(&mut response, &embedding_truncation);
     Ok(response)
 }
@@ -1587,7 +1599,18 @@ pub(crate) async fn handle_reply(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let (reply_note, embedding_truncation) = dual_write_message(
+    let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
+        json!({
+            "version": 1, "op": "reply", "to": reply_to, "content": p.content,
+            "subject": reply_subject_opt, "thread_id": thread_id,
+            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": id,
+        })
+    })?;
+    let MessageWrite {
+        outbound: reply_note,
+        embedding_truncation,
+        replayed,
+    } = dual_write_message_with_identity(
         runtime,
         token,
         &caller_ns,
@@ -1602,9 +1625,12 @@ pub(crate) async fn handle_reply(
         in_reply_to_message_id.as_deref(),
         references_chain.as_deref(),
         p.tags.as_deref(),
+        identity.as_ref(),
     )
     .await?;
-    inbox_signal.publish();
+    if !replayed {
+        inbox_signal.publish();
+    }
 
     // Replying is the strongest possible read signal, and callers universally
     // chained `reply | read` to say so — fold it in. Skips only an explicitly
@@ -1628,7 +1654,7 @@ pub(crate) async fn handle_reply(
     let caller_is_addressee = original_to_actor
         .as_deref()
         .is_none_or(|addressee| addressee == from_actor_label);
-    let marked_read = if original_direction == "outbound" || !caller_is_addressee {
+    let marked_read = if replayed || original_direction == "outbound" || !caller_is_addressee {
         None
     } else {
         let updated_at = Utc::now().timestamp_micros();
@@ -1654,6 +1680,9 @@ pub(crate) async fn handle_reply(
         "sent_at": sent_at,
         "marked_read": marked_read,
     });
+    if let Some(identity) = identity {
+        identity.annotate_response(&mut response, &reply_note, replayed);
+    }
     add_embedding_truncation_warning(&mut response, &embedding_truncation);
     Ok(response)
 }
