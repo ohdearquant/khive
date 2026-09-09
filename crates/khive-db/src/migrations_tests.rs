@@ -4048,3 +4048,75 @@ fn v21_finalize_revalidates_model_coverage_and_attachment_claim_fences() {
         .expect_err("an attachment cannot acquire a claimed digest");
     assert!(insert_error.to_string().contains("active blob sweep"));
 }
+
+#[test]
+fn stream_migration_empty_and_populated_previous_version() {
+    let stream_version = MIGRATIONS
+        .iter()
+        .find(|m| m.name == "note_streams")
+        .expect("streams migration")
+        .version;
+    let previous = MIGRATIONS
+        .iter()
+        .rfind(|m| m.version < stream_version)
+        .expect("previous migration")
+        .version;
+    for populated in [false, true] {
+        let mut conn = open_memory();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        migrate_through(&mut conn, previous);
+        if populated {
+            insert_dependency_test_note(&conn, "existing", "observation", "{}", None);
+        }
+        run_migrations(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM note_streams", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            i64::from(populated)
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'refuse_stream_%'", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        insert_dependency_test_note(&conn, "entry", "observation", "{}", None);
+        insert_dependency_test_note(&conn, "second", "observation", "{}", None);
+        conn.execute(
+            "INSERT INTO note_streams VALUES ('local','s',1,'entry')",
+            [],
+        )
+        .unwrap();
+        for sql in [
+            "UPDATE notes SET content='changed' WHERE id='entry'",
+            "DELETE FROM notes WHERE id='entry'",
+            "UPDATE notes SET deleted_at=1 WHERE id='entry'",
+            "UPDATE notes SET namespace='other' WHERE id='entry'",
+            "UPDATE notes SET kind='insight' WHERE id='entry'",
+            "UPDATE notes SET id='replacement' WHERE id='entry'",
+            "UPDATE note_streams SET seq=8",
+            "DELETE FROM note_streams",
+            "INSERT OR REPLACE INTO note_streams VALUES ('local','s',2,'entry')",
+            "INSERT INTO note_streams VALUES ('local','s',3,'second')",
+        ] {
+            assert!(conn.execute(sql, []).is_err(), "{sql}");
+        }
+        conn.execute("UPDATE notes SET salience=0.8 WHERE id='entry'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO note_streams VALUES ('local','s',2,'second')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*),MAX(seq) FROM note_streams", [], |r| Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?
+            )))
+            .unwrap(),
+            (2, 2)
+        );
+        run_migrations(&mut conn).unwrap();
+    }
+}

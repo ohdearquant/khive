@@ -1486,6 +1486,11 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
+        if patch.content.is_some() || patch.properties.is_some() {
+            if let Some(error) = self.stream_member_error(&note).await? {
+                return Err(error);
+            }
+        }
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref content) = patch.content {
             crate::secret_gate::check(content)?;
@@ -1686,9 +1691,24 @@ impl KhiveRuntime {
             .prepare_update_note_from_snapshot(token, snapshot, patch)
             .await?;
 
-        let persisted = store
-            .replace_note_if_unchanged(note.clone(), expected_updated_at, expected_deleted_at)
-            .await?;
+        let persisted = if self.stream_member_error(&note).await?.is_some() {
+            self.sql()
+                .writer()
+                .await?
+                .execute(
+                    khive_db::stores::note::note_metadata_replace_if_unchanged_statement(
+                        &note,
+                        expected_updated_at,
+                        expected_deleted_at,
+                    ),
+                )
+                .await?
+                == 1
+        } else {
+            store
+                .replace_note_if_unchanged(note.clone(), expected_updated_at, expected_deleted_at)
+                .await?
+        };
         if !persisted {
             return Err(stale_note_snapshot_error(id));
         }
@@ -2179,6 +2199,13 @@ impl KhiveRuntime {
             .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
         Self::ensure_namespace(&from_note.namespace, &ns)?;
 
+        if !dry_run {
+            for note in [&into_note, &from_note] {
+                if let Some(error) = self.stream_member_error(note).await? {
+                    return Err(error);
+                }
+            }
+        }
         reject_pack_managed_schedule_mutation(&into_note, "merge")?;
         reject_pack_managed_schedule_mutation(&from_note, "merge")?;
 

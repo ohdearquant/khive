@@ -791,6 +791,16 @@ async fn prepare_note_update_plan_from_snapshot(
         )
         .await?;
 
+    let statement = if runtime.stream_member_error(&note).await?.is_some() {
+        khive_db::stores::note::note_metadata_replace_if_unchanged_statement(
+            &note,
+            expected_updated_at,
+            expected_deleted_at,
+        )
+    } else {
+        note_replace_if_unchanged_statement(&note, expected_updated_at, expected_deleted_at)
+    };
+
     let post_commit = if text_changed {
         PostCommitEffect::ReindexNote { note_id: id }
     } else {
@@ -799,11 +809,7 @@ async fn prepare_note_update_plan_from_snapshot(
     Ok(AtomicOpPlan::Update(UpdatePlan {
         target_id: id,
         statements: vec![PlanStatement {
-            statement: note_replace_if_unchanged_statement(
-                &note,
-                expected_updated_at,
-                expected_deleted_at,
-            ),
+            statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         }],
         post_commit,
@@ -1354,6 +1360,9 @@ pub async fn prepare_delete(
                 Some(AtomicDeleteKind::Edge) => {
                     return Err(RuntimeError::NotFound(format!("edge {id}")));
                 }
+            }
+            if let Some(error) = runtime.stream_member_error(&note).await? {
+                return Err(error);
             }
             let namespace = note.namespace.clone();
             // Storage parity: `note_soft_delete_statement`/

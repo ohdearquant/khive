@@ -43,6 +43,7 @@ pub mod retrieval;
 pub mod runtime;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
+mod streams;
 pub mod time_anchor;
 pub use khive_storage::usage;
 pub mod validation;

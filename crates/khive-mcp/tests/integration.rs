@@ -6748,3 +6748,6 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
         "AlwaysVerbose get: properties.priority must survive redundancy-drop; rendered: {rendered}"
     );
 }
+
+#[path = "streams/contract.rs"]
+mod stream_contract;
