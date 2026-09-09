@@ -1,6 +1,7 @@
 //! pack-comm — Communication pack providing ten public `comm.*` verbs.
 
 pub mod handlers;
+pub(crate) mod idempotency;
 pub(crate) mod inbox_signal;
 pub(crate) mod message;
 pub(crate) mod pack;
@@ -9,6 +10,8 @@ pub(crate) mod vocab;
 
 pub use pack::CommPack;
 
+#[cfg(test)]
+mod idempotency_tests;
 #[cfg(test)]
 mod inbox_filter_tests;
 
