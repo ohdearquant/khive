@@ -58,12 +58,36 @@ class KhiveOperationError(KhiveMcpError):
         message: str,
         index: int,
         envelope: Mapping[str, Any],
+        detail: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(f"verb '{tool}' (index {index}) failed: {message}")
         self.tool = tool
         self.message = message
         self.index = index
         self.envelope = envelope
+        # The structured fields beside the message (kind, domain_disposition,
+        # domain_result) when the server sent an object rather than a string.
+        self.detail: Mapping[str, Any] = detail or {}
+
+
+def error_text(op_result: Mapping[str, Any]) -> str:
+    """Return the human-readable text of a per-op error.
+
+    A per-op error is an object carrying `message` alongside its disposition
+    fields; the daemon text protocol still sends a bare string. Callers that
+    want to assert on the wording read it through here so both shapes work,
+    and so an assertion failure quotes the text rather than a dict repr.
+    """
+    err = op_result.get("error")
+    if isinstance(err, Mapping):
+        return str(err.get("message", ""))
+    return str(err or "")
+
+
+def error_detail(op_result: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the structured fields of a per-op error, empty for the text form."""
+    err = op_result.get("error")
+    return err if isinstance(err, Mapping) else {}
 
 
 def _find_repo_root(start: Path) -> Path | None:
@@ -400,9 +424,10 @@ class KhiveMcpSession:
         if not first.get("ok", False):
             raise KhiveOperationError(
                 tool=first.get("tool", name),
-                message=first.get("error", "<no error string>"),
+                message=error_text(first) or "<no error string>",
                 index=0,
                 envelope=envelope,
+                detail=error_detail(first),
             )
         return first.get("result")
 
