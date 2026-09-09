@@ -16,6 +16,7 @@ async fn arm26_gate_precedes_exactly_one_real_policy_decision() {
         let repo = std::fs::canonicalize(directory.path()).expect("canonical directory");
         let actor = format!("policy-order:{}", uuid::Uuid::new_v4());
         let config = RuntimeConfig {
+            db_path: None,
             git_write: GitWriteSectionConfig {
                 allowed: if gate_allows {
                     vec![GitWriteEntryConfig {
@@ -27,7 +28,7 @@ async fn arm26_gate_precedes_exactly_one_real_policy_decision() {
                 },
                 ..Default::default()
             },
-            ..Default::default()
+            ..RuntimeConfig::no_embeddings()
         };
         let rt = KhiveRuntime::new(config).expect("runtime");
         let mut builder = VerbRegistryBuilder::new();
@@ -138,6 +139,7 @@ async fn reconcile_corrupt_owned_receipt_reports_storage_uncertainty_without_pol
     let repo = std::fs::canonicalize(directory.path()).expect("canonical directory");
     let actor = format!("corrupt-receipt:{}", uuid::Uuid::new_v4());
     let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
         git_write: GitWriteSectionConfig {
             allowed: vec![GitWriteEntryConfig {
                 repo: repo.display().to_string(),
@@ -145,7 +147,7 @@ async fn reconcile_corrupt_owned_receipt_reports_storage_uncertainty_without_pol
             }],
             ..Default::default()
         },
-        ..Default::default()
+        ..RuntimeConfig::no_embeddings()
     })
     .expect("runtime");
     let mut builder = VerbRegistryBuilder::new();

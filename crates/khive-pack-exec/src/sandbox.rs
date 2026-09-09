@@ -138,7 +138,7 @@ pub fn read_roots_digest(read_roots: &[PathBuf]) -> String {
 /// Render the seatbelt profile for one run. `run_dir` must already be
 /// canonical; both the canonical form and any `/tmp` alias resolve to it
 /// because seatbelt matches canonical paths.
-pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf]) -> String {
+pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf], never: &[PathBuf]) -> String {
     let mut reads: Vec<String> = SYSTEM_READ_ROOTS
         .iter()
         .map(|p| format!("(subpath {})", quote(Path::new(p))))
@@ -156,10 +156,20 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf]) -> String {
     }
     let run = format!("(subpath {})", quote(run_dir));
     maps.push(run.clone());
+    // ADR-181 Amendment 3 item 3: version control and the never set are
+    // refused by the kernel, not only at the registered binary.
+    let mut denies: Vec<String> = vec![
+        "(regex #\"(^|/)(git|gh)$\")".to_string(),
+        "(regex #\"/git-[^/]+$\")".to_string(),
+    ];
+    for path in never {
+        denies.push(format!("(literal {})", quote(path)));
+    }
     format!(
         "(version 1)\n\
          (deny default)\n\
          (allow process-exec)\n\
+         (deny process-exec {denies})\n\
          (allow process-fork)\n\
          (allow signal (target same-sandbox))\n\
          (allow process-info* (target same-sandbox))\n\
@@ -171,6 +181,7 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf]) -> String {
          (allow file-map-executable {maps})\n\
          (allow file-write* {run})\n\
          (allow file-write-data (literal \"/dev/null\"))\n",
+        denies = denies.join(" "),
         reads = reads.join(" "),
         maps = maps.join(" "),
         run = run,
@@ -180,7 +191,7 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf]) -> String {
 /// Digest of the template with an empty run directory and no roots: names
 /// the profile shape independently of any run.
 pub fn template_digest() -> String {
-    digest_hex(render_profile(Path::new("/"), &[]).as_bytes())
+    digest_hex(render_profile(Path::new("/"), &[], &[]).as_bytes())
 }
 
 /// Why a registered binary may not run.
@@ -244,8 +255,15 @@ mod tests {
 
     #[test]
     fn profile_names_run_dir_and_roots_only() {
-        let p = render_profile(Path::new("/private/tmp/run-1"), &[PathBuf::from("/opt/py")]);
+        let p = render_profile(
+            Path::new("/private/tmp/run-1"),
+            &[PathBuf::from("/opt/py")],
+            &[PathBuf::from("/opt/never/tool")],
+        );
         assert!(p.contains("(deny default)"));
+        assert!(p.contains(
+            "(deny process-exec (regex #\"(^|/)(git|gh)$\") (regex #\"/git-[^/]+$\") (literal \"/opt/never/tool\"))"
+        ));
         assert!(p.contains("(subpath \"/private/tmp/run-1\")"));
         assert!(p.contains("(subpath \"/opt/py\")"));
         assert!(!p.contains("/Users"));
@@ -275,7 +293,7 @@ mod tests {
         std::fs::write(&other, b"x").unwrap();
         let canonical = std::fs::canonicalize(&other).unwrap();
         assert!(matches!(
-            check_binary(other.to_str().unwrap(), &[canonical.clone()]),
+            check_binary(other.to_str().unwrap(), std::slice::from_ref(&canonical)),
             Err(BinaryRefusal::Never { .. })
         ));
         assert_eq!(

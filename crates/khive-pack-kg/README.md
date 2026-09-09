@@ -80,8 +80,9 @@ Over MCP, the same call is issued as a DSL string:
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"RoPE\")")
 ```
 
-`khive-mcp` loads a default set of twelve packs: `kg`, `gtd`, `memory`, `brain`,
-`comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, `blob`,
+`khive-mcp` loads a default set of fourteen packs: `kg`, `gtd`, `memory`, `brain`,
+`comm`, `schedule`, `knowledge`, `session`, `tool`, `exec`, `git`, `code`,
+`workspace`, `blob`,
 with `kg` always present; `KHIVE_PACKS` / `--pack` select a subset.
 
 ## Where this sits

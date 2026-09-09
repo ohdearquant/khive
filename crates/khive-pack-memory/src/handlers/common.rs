@@ -346,6 +346,7 @@ pub(super) fn balanced_recall_state_from_profile_response(
 #[serde(deny_unknown_fields)]
 pub(super) struct RememberParams {
     pub(super) content: String,
+    pub(super) key: Option<String>,
     pub(super) memory_type: Option<String>,
     pub(super) salience: Option<f64>,
     #[serde(alias = "decay")]

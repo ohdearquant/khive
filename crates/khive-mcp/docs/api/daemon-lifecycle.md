@@ -136,7 +136,12 @@ post-write outcome), which stay RPC-level errors.
 ## `trigger_bridge_self_heal` — concurrency accepted-risk note (#714)
 
 Called from both `forward_or_spawn`'s `ProtocolMismatch` arms (first-attempt
-and post-recovery-retry). If the bridge is mid-flight on more than one
+and post-recovery-retry). `ProtocolMismatch` covers both directions: a daemon
+behind this bridge and a daemon ahead of it. The second is the rebuilt-binary
+case the re-exec exists for (the on-disk binary was swapped and the daemon
+respawned from it while this process kept the old one); before it was routed
+here, that direction returned the hard error on every request and never
+re-exec'd. If the bridge is mid-flight on more than one
 outstanding client request when the mismatch fires, only the request that
 triggered this arm gets the ambiguous-error-then-resume treatment; any other
 in-flight request loses its response the same way it would if the process

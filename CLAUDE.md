@@ -62,10 +62,10 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  12 default packs (`RuntimeConfig::built_in_packs()`):        │
+│  14 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
-│  git, code, workspace, blob — together exposing               │
-│  91 public verbs (see the verb-catalog paragraph below        │
+│  tool, exec, git, code, workspace, blob — together exposing   │
+│  112 public verbs (see the verb-catalog paragraph below       │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039, forward-deployed,  │
@@ -120,6 +120,8 @@ not shipped.
 | `crates/khive-pack-git`         | Git pack: commit/issue/pull_request note kinds, `git.digest`, and write verbs `git.commit`/`git.branch`/`git.push` ([ADR-088](docs/adr/ADR-088-git-lifecycle-pack.md), [ADR-108](docs/adr/ADR-108-git-write-surface.md))                                                                                                                                                          |
 | `crates/khive-pack-code`        | Code pack: code concept vocabulary, finding-note lifecycle, `code.ingest` ([ADR-085](docs/adr/ADR-085-code-pack.md))                                                                                                                                                                                                                                                              |
 | `crates/khive-pack-workspace`   | Workspace pack: `workspace` entity vocabulary and membership rules; zero verbs                                                                                                                                                                                                                                                                                                    |
+| `crates/khive-pack-tool`        | Tool pack: capability registry (`tool.register`/`describe`/`list`/`suggest`/`ingest`) and use policy (`tool.check`/`policy`/`request`/`grant`/`deny`/`revoke`) ([ADR-180](docs/adr/ADR-180-tool-pack.md))                                                                                                                                                                         |
+| `crates/khive-pack-exec`        | Exec pack: `exec.tree`/`tree_get`/`tree_diff`, `exec.run` of one registered tool in a seatbelt sandbox over a materialized tree, `exec.receipt`/`runs`/`events`/`identity` ([ADR-181](docs/adr/ADR-181-exec-verb-sandboxed-run.md))                                                                                                                                               |
 | `crates/khive-pack-blob`        | Blob pack: `blob.put`/`blob.get`/`blob.stat` over the `BlobStore` CAS trait ([ADR-111](docs/adr/ADR-111-blob-store.md))                                                                                                                                                                                                                                                           |
 | `crates/khive-pack-moodboard`   | Opt-in experimental visual-asset ingest, exact descriptor-space retrieval, and actor-scoped calibrated pairwise preference learning using BlobStore, Lattice embeddings, named Khive vectors, and a FANN serving head ([ADR-148](docs/adr/ADR-148-moodboard-visual-retrieval-pack.md), [ADR-149](docs/adr/ADR-149-moodboard-preference-learning.md)); not in the default pack set |
 | `crates/khive-pack-agent`       | Agent pack: spawn/resume/suspend/observe wire surface; not self-registered — an embedder constructs it and registers it manually via `RegistryBuilder::register`, and it is outside the default pack set ([ADR-142](docs/adr/ADR-142-agentic-process-runtime.md))                                                                                                                 |
@@ -201,7 +203,7 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 ```
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
-loads all 12 production packs: kg, gtd, memory, brain, comm, schedule, knowledge, session, git,
+loads all 14 production packs: kg, gtd, memory, brain, comm, schedule, knowledge, session, tool, exec, git,
 code, workspace, blob (the aggregate is registry-discovered with `verbs()`; the `code` pack contributes one verb, `code.ingest`
 (ADR-085 Amendment 2, PR #1039 — L1 manifest + L1.5 import-scan source ingest into a
 dedicated map database); its `finding` note kind and `findings.json` batch ingest are

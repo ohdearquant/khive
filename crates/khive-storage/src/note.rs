@@ -26,6 +26,9 @@ pub struct Note {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+    /// Immutable caller-chosen identity, unique among live notes of the same namespace and kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 impl Note {
@@ -50,6 +53,7 @@ impl Note {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            key: None,
         }
     }
 
@@ -120,6 +124,21 @@ mod tests {
 
     fn base_note() -> Note {
         Note::new("ns:test", "memory", "hello world")
+    }
+
+    #[test]
+    fn note_key_is_optional_and_unkeyed_wire_shape_is_unchanged() {
+        let note = base_note();
+        assert_eq!(note.key, None);
+        let legacy = serde_json::to_value(&note).unwrap();
+        assert!(legacy.get("key").is_none());
+        assert_eq!(serde_json::from_value::<Note>(legacy).unwrap(), note);
+
+        let mut keyed = note;
+        keyed.key = Some("operation-1".to_string());
+        let encoded = serde_json::to_value(&keyed).unwrap();
+        assert_eq!(encoded["key"], "operation-1");
+        assert_eq!(serde_json::from_value::<Note>(encoded).unwrap(), keyed);
     }
 
     // -- with_salience --
@@ -572,7 +591,7 @@ pub struct NoteFilter {
 /// Temporal-referential note CRUD over the notes substrate table.
 #[async_trait]
 pub trait NoteStore: Send + Sync + 'static {
-    /// Insert or update a single note.
+    /// Insert or update a single note. Updates preserve the stored immutable key.
     async fn upsert_note(&self, note: Note) -> StorageResult<()>;
     /// Replace a note only when the persisted row still matches the caller's
     /// read snapshot.
@@ -624,7 +643,7 @@ pub trait NoteStore: Send + Sync + 'static {
             message: "this backend does not implement guarded note insertion".into(),
         })
     }
-    /// Insert or update a batch of notes.
+    /// Insert or update a batch of notes. Updates preserve each stored immutable key.
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary>;
     /// Fetch a note by UUID, returning `None` if absent.
     async fn get_note(&self, id: Uuid) -> StorageResult<Option<Note>>;

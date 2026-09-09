@@ -3968,8 +3968,10 @@ pub fn audit_admission_refused_obligation_count() -> u64 {
 
 /// Process-wide count of `DispatchObligation` rows that were **already
 /// enqueued but had not resolved by the time the caller's admission wait
-/// deadline elapsed** (`AuditTerminalReason::AdmissionDeadlineExpired`) for an
-/// [`VerbRegistry::admission_degrade_safe`] verb (#2147/#2217).
+/// deadline elapsed** (`AuditTerminalReason::AdmissionDeadlineExpired`) for a
+/// succeeded dispatch of any verb (#2147/#2217 introduced the count for
+/// [`VerbRegistry::admission_degrade_safe`] reads; writes joined it once a
+/// committed write stopped reporting failure over a row that still commits).
 /// Unlike [`AUDIT_ADMISSION_REFUSED_OBLIGATIONS`], a row counted here is not
 /// a confirmed loss: per `AuditTerminalReason::AdmissionDeadlineExpired`'s own
 /// doc, the row may still be committed (or terminally failed) by the
@@ -4216,8 +4218,13 @@ async fn persist_git_digest_receipt(
 /// derives eligibility from `producer` itself rather than trusting the
 /// caller's `degrade_allowlisted` answer in isolation, so a `DispatchFailed`
 /// row can never take the degrade path no matter what a caller passes: every
-/// failed dispatch, every write verb, every gate-denial/unknown-verb/git.digest
-/// row stays strictly obligation-bearing.
+/// failed dispatch and every gate-denial/unknown-verb/git.digest row stays
+/// strictly obligation-bearing. A succeeded write degrades on exactly one
+/// reason, `AdmissionDeadlineExpired`: its row is already enqueued and its
+/// generation commits it independently of the caller's wait, so failing the
+/// dispatch would report a committed domain write as failed while changing
+/// nothing about the row. `QueueAdmissionExhausted` (refused before enqueue,
+/// a confirmed loss) still fails a write's dispatch.
 ///
 /// When the registry has an audit-batch seam configured (it is whenever
 /// `store` is), the row routes through
@@ -4241,6 +4248,13 @@ async fn append_audit_event_best_effort(
     let is_obligation = classify(producer) == AuditProductionClass::DispatchObligation;
     let admission_degrade_eligible =
         degrade_allowlisted && producer == AuditProducer::DispatchSucceeded;
+    // A row that was enqueued before the caller's admission wait elapsed is
+    // committed by its generation independently of this response, so the
+    // only thing failing the dispatch would do is report a committed domain
+    // write as failed. That holds for every succeeded dispatch, allowlisted
+    // read or not; the refused-before-enqueue arm below stays strict for
+    // writes because that one is a confirmed audit loss.
+    let enqueued_row_outlives_deadline = producer == AuditProducer::DispatchSucceeded;
 
     if let Some(audit_batch) = audit_batch {
         if let Err(reason) = audit_batch
@@ -4263,35 +4277,35 @@ async fn append_audit_event_best_effort(
                 // `AdmissionDeadlineExpired` was already enqueued and may still
                 // commit later — see `AuditTerminalReason::AdmissionDeadlineExpired`'s
                 // own doc.
-                if admission_degrade_eligible {
-                    match reason {
-                        AuditTerminalReason::QueueAdmissionExhausted => {
-                            AUDIT_ADMISSION_REFUSED_OBLIGATIONS
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                verb,
-                                reason = ?reason,
-                                "read verb's audit obligation row was refused before \
-                                 enqueue under audit-lane admission pressure; dispatch \
-                                 still reports its own result (non-fatal)"
-                            );
-                            return Ok(());
-                        }
-                        AuditTerminalReason::AdmissionDeadlineExpired => {
-                            AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                verb,
-                                reason = ?reason,
-                                "read verb's audit obligation row was still enqueued and \
-                                 unresolved when the caller's admission wait deadline \
-                                 elapsed; it may still commit. Dispatch still reports its \
-                                 own result (non-fatal)"
-                            );
-                            return Ok(());
-                        }
-                        _ => {}
-                    }
+                if enqueued_row_outlives_deadline
+                    && reason == AuditTerminalReason::AdmissionDeadlineExpired
+                {
+                    AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        verb,
+                        reason = ?reason,
+                        degrade_allowlisted,
+                        "audit obligation row was still enqueued and unresolved when \
+                         the caller's admission wait deadline elapsed; its generation \
+                         commits it independently of this response. Dispatch reports \
+                         its own committed result (non-fatal)"
+                    );
+                    return Ok(());
+                }
+                if admission_degrade_eligible
+                    && reason == AuditTerminalReason::QueueAdmissionExhausted
+                {
+                    AUDIT_ADMISSION_REFUSED_OBLIGATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        verb,
+                        reason = ?reason,
+                        "read verb's audit obligation row was refused before \
+                         enqueue under audit-lane admission pressure; dispatch \
+                         still reports its own result (non-fatal)"
+                    );
+                    return Ok(());
                 }
                 AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(

@@ -351,10 +351,6 @@ pub async fn run(
     // Parse failures before the actor is known cannot be attributed; they
     // are plain invalid input, not refusals.
     let req = parse_request(&params, cfg)?;
-    let seq = match &req.session_id {
-        Some(s) => Some(receipts::next_seq(rt, &ns, s).await?),
-        None => None,
-    };
     let mut receipt = Receipt {
         id: id.clone(),
         actor: req.actor.clone(),
@@ -383,7 +379,7 @@ pub async fn run(
         cwd: req.cwd.clone(),
         env_keys: vec![],
         session_id: req.session_id.clone(),
-        seq,
+        seq: None,
         sandbox: None,
         profile_ref: None,
         limits: json!({ "requested": cfg.limits.to_json(), "enforced": Value::Null }),
@@ -395,8 +391,9 @@ pub async fn run(
     match preflight(rt, token, cfg, &req, &mut receipt).await {
         Ok(ready) => {
             execute(rt, &ns, cfg, &req, ready, &mut receipt).await?;
-            let value = receipt.to_json();
-            receipts::insert(rt, &ns, &value).await?;
+            let mut value = receipt.to_json();
+            let seq = receipts::insert(rt, &ns, &value).await?;
+            value["seq"] = seq.map_or(Value::Null, Value::from);
             Ok(json!({
                 "receipt": value,
                 "changed": receipt.changed.iter().map(Change::to_json).collect::<Vec<_>>(),
@@ -564,7 +561,7 @@ async fn execute(
 
     // Profile: rendered per run, stored as a blob, written beside the run
     // directory for sandbox-exec to read, removed with it.
-    let profile = render_profile(&run_dir, &cfg.read_roots);
+    let profile = render_profile(&run_dir, &cfg.read_roots, &cfg.never);
     let profile_ref = store.put(profile.clone().into_bytes()).await?;
     let profile_path = root.join(format!("{}.sb", receipt.id));
     std::fs::write(&profile_path, &profile).map_err(|e| {

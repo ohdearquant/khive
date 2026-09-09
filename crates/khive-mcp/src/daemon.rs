@@ -540,13 +540,17 @@ enum ForwardOutcome {
     /// daemon speaking a different wire format.
     ParseFailure,
     /// Connected and decoded a response, but the daemon's `daemon_protocol_version`
-    /// does not match [`PROTOCOL_VERSION`] even though `version_mismatch` is false.
-    /// This is the new-client + old-daemon (pre-versioning) scenario: the old daemon
-    /// ignores the unknown request field and returns a decodable response whose
-    /// protocol fields default to `false`/`0`. Since the real request was already
-    /// written, the client must treat this exactly like `ParseFailure`: return a
-    /// hard error without retrying, locally dispatching, killing, or respawning.
-    ProtocolMismatch,
+    /// does not match [`PROTOCOL_VERSION`], in either direction. Below: the
+    /// new-client + old-daemon scenario, implicit (a pre-versioning daemon ignores
+    /// the unknown request field and returns a decodable response whose protocol
+    /// fields default to `false`/`0`) or explicit (`version_mismatch=true` with the
+    /// daemon's lower number). Above: this bridge is the stale side, a rebuild
+    /// swapped the on-disk binary and respawned the daemon under a newer protocol
+    /// while this process kept running the old one. Since the real request was
+    /// already written, the client treats both exactly like `ParseFailure`: a hard
+    /// error without retrying, locally dispatching, killing, or respawning; the
+    /// consumer arms the #714 self-heal beside it.
+    ProtocolMismatch { daemon_protocol_version: u32 },
 }
 
 fn classify_socket_connect_error(error: std::io::Error) -> ForwardOutcome {
@@ -686,18 +690,24 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
             // with `version_mismatch=true` and its own (lower) version number.
             // `daemon_protocol_version < PROTOCOL_VERSION` means the daemon is
             // stale — route through the same terminal error as the implicit case
-            // above. If `daemon_protocol_version > PROTOCOL_VERSION` the client
-            // binary is behind; let `map_response` return its hard error too.
-            let is_stale_daemon = frame.daemon_protocol_version != PROTOCOL_VERSION
-                && (!frame.version_mismatch || frame.daemon_protocol_version < PROTOCOL_VERSION);
-            if is_stale_daemon {
+            // above. `daemon_protocol_version > PROTOCOL_VERSION` means this bridge
+            // binary is behind: a rebuild swapped the on-disk binary and respawned
+            // the daemon under a newer protocol while this process kept running the
+            // old one. That is the scenario the #714 self-heal exists for, so it
+            // takes the same terminal path and the consumer arms the re-exec, which
+            // picks up the on-disk binary the daemon itself was spawned from.
+            // Leaving that direction to `map_response` returned the hard error on
+            // every request for the rest of the process's life and never re-exec'd.
+            if frame.daemon_protocol_version != PROTOCOL_VERSION {
                 tracing::warn!(
                     daemon_version = frame.daemon_protocol_version,
                     expected = PROTOCOL_VERSION,
                     explicit_mismatch = frame.version_mismatch,
                     "daemon protocol version mismatch after request write — rejecting without retry",
                 );
-                return ForwardOutcome::ProtocolMismatch;
+                return ForwardOutcome::ProtocolMismatch {
+                    daemon_protocol_version: frame.daemon_protocol_version,
+                };
             }
             ForwardOutcome::Response(Box::new(frame))
         }
@@ -716,6 +726,25 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
 fn daemon_mcp_error(message: impl Into<String>, data: Option<serde_json::Value>) -> McpError {
     let error = daemon::DaemonDispatchError::new(message, data);
     McpError::internal_error(error.message, Some(error.error_detail))
+}
+
+/// The operator-facing text for a protocol mismatch, by direction. A daemon ahead
+/// of this bridge is the rebuilt-binary case: the bridge re-execs the on-disk binary
+/// once this response has flushed (#714), so the caller's next request reaches a
+/// bridge that matches.
+fn protocol_mismatch_message(daemon_protocol_version: u32) -> String {
+    if daemon_protocol_version > PROTOCOL_VERSION {
+        format!(
+            "daemon protocol mismatch: this bridge speaks version {PROTOCOL_VERSION}, the \
+             daemon speaks {daemon_protocol_version}; the bridge re-execs the current binary \
+             after this response, retry the request"
+        )
+    } else {
+        format!(
+            "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+             run `make local` to rebuild the daemon binary"
+        )
+    }
 }
 
 fn protocol_mismatch_error(message: String, data: Option<serde_json::Value>) -> McpError {
@@ -1314,7 +1343,7 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         Ok(
             ForwardOutcome::NoSocket
             | ForwardOutcome::ParseFailure
-            | ForwardOutcome::ProtocolMismatch,
+            | ForwardOutcome::ProtocolMismatch { .. },
         ) => ProbeOutcome::Dead,
         Ok(ForwardOutcome::Unreachable {
             kind,
@@ -2380,7 +2409,9 @@ where
             );
             return Some(Err(ambiguous_forward_error()));
         }
-        ForwardOutcome::ProtocolMismatch => {
+        ForwardOutcome::ProtocolMismatch {
+            daemon_protocol_version,
+        } => {
             let config_id = opaque_config_id(&frame.config_id);
             tracing::warn!(
                 config_id = %config_id,
@@ -2394,10 +2425,7 @@ where
             // the hard error below, never in place of it.
             trigger_bridge_self_heal();
             return Some(Err(protocol_mismatch_error(
-                format!(
-                    "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                     run `make local` to rebuild the daemon binary"
-                ),
+                protocol_mismatch_message(daemon_protocol_version),
                 None,
             )));
         }
@@ -2506,7 +2534,9 @@ where
                 );
                 return Some(Err(ambiguous_forward_error()));
             }
-            ForwardOutcome::ProtocolMismatch => {
+            ForwardOutcome::ProtocolMismatch {
+                daemon_protocol_version,
+            } => {
                 let config_id = opaque_config_id(&frame.config_id);
                 tracing::warn!(
                     config_id = %config_id,
@@ -2519,10 +2549,7 @@ where
                 // was the first probe or a retry after a kill/respawn.
                 trigger_bridge_self_heal();
                 return Some(Err(protocol_mismatch_error(
-                    format!(
-                        "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                         run `make local` to rebuild the daemon binary"
-                    ),
+                    protocol_mismatch_message(daemon_protocol_version),
                     None,
                 )));
             }
@@ -4577,8 +4604,20 @@ mod tests {
         };
         let resp_ver = exchange(&sock, &wrong_version).await;
         assert!(
-            resp_ver.version_mismatch,
-            "wrong protocol version must set version_mismatch"
+            !resp_ver.version_mismatch,
+            "a client below the daemon's protocol is refused with version_mismatch=false: \
+             the flag is reserved for a client that is ahead, and the deployed bridges \
+             re-exec on this shape. The typed code below carries the fact instead."
+        );
+        assert_eq!(
+            resp_ver
+                .error_detail
+                .as_ref()
+                .and_then(|detail| detail.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("version_mismatch"),
+            "the refusal must stay typed as a version mismatch; got: {:?}",
+            resp_ver.error_detail
         );
         assert!(!resp_ver.ok);
         assert!(
@@ -5279,6 +5318,125 @@ mod tests {
             ),
         }
 
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── bridge behind the daemon: the self-heal must arm ─────────────────────
+    //
+    // A binary swap that carries a protocol bump respawns the daemon under the
+    // new number while every running bridge keeps the old one. The daemon
+    // refuses each request with `version_mismatch=true` and its higher number.
+    // Before the fix `try_forward_inner` classified that as `Response` and
+    // `map_response` returned the hard error on every request for the rest of
+    // the bridge's life; the #714 re-exec, built for exactly this scenario, was
+    // armed only for the daemon-behind direction. Now both directions classify
+    // as `ProtocolMismatch`, the error names the direction, and the re-exec is
+    // armed so the next flush re-execs the on-disk binary the daemon came from.
+
+    fn newer_daemon_response(config_id: &str) -> DaemonResponseFrame {
+        DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: Some(format!(
+                "daemon protocol mismatch: client={} daemon={} — \
+                 rebuild/update the client binary (make local)",
+                PROTOCOL_VERSION,
+                PROTOCOL_VERSION + 1
+            )),
+            error_detail: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some(config_id.to_string()),
+            version_mismatch: true,
+            daemon_protocol_version: PROTOCOL_VERSION + 1,
+            metrics: None,
+            request_id: None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_behind_a_newer_daemon_returns_the_error_and_arms_reexec() {
+        clear_daemon_env();
+        clear_pending_self_heal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind fake newer-daemon socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let fake_handle = tokio::spawn(serve_one_response(
+            listener,
+            newer_daemon_response(config_id),
+        ));
+
+        let frame = DaemonRequestFrame {
+            plan: false,
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+
+        let result = forward_or_spawn(&frame).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+
+        match result {
+            Some(Err(McpError { message, .. })) => {
+                assert!(
+                    message.contains("protocol mismatch"),
+                    "error must name 'protocol mismatch'; got: {message}"
+                );
+                assert!(
+                    message.contains("re-execs"),
+                    "error must say this bridge re-execs itself, not send the operator to \
+                     rebuild a daemon that is already current; got: {message}"
+                );
+            }
+            Some(Ok(v)) => {
+                panic!("forward_or_spawn must NOT accept a newer daemon's refusal; got Ok({v:?})")
+            }
+            None => panic!(
+                "forward_or_spawn must return Some(Err(..)) for protocol mismatch, \
+                 not None (which would cause silent fallback to local dispatch)"
+            ),
+        }
+
+        let armed = *PENDING_SELF_HEAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            armed,
+            Some(MismatchRecovery::ReexecScheduled),
+            "a bridge behind the daemon must arm the in-place re-exec"
+        );
+        // The pid file belongs to the live daemon; the terminal path leaves it alone.
+        assert!(
+            pid_file.exists(),
+            "the newer daemon's pid file must survive"
+        );
+
+        clear_pending_self_heal();
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
     }
@@ -7266,7 +7424,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
 
         assert!(
-            matches!(outcome, ForwardOutcome::ProtocolMismatch),
+            matches!(outcome, ForwardOutcome::ProtocolMismatch { .. }),
             "explicit version_mismatch=true with daemon_protocol_version < PROTOCOL_VERSION \
              must classify as ProtocolMismatch (terminal no-retry path), not Response \
              (which would lose the stable stale-daemon classification)"
@@ -7286,30 +7444,9 @@ mod tests {
     // This test asserts try_forward_inner returns ForwardOutcome::Response
     // (not ProtocolMismatch) so map_response produces the hard error.
 
-    fn newer_daemon_version_mismatch_response(config_id: &str) -> DaemonResponseFrame {
-        DaemonResponseFrame {
-            ok: false,
-            result: None,
-            error: Some(format!(
-                "daemon protocol mismatch: client={} daemon={} — \
-                 rebuild/update the client binary (make local)",
-                PROTOCOL_VERSION,
-                PROTOCOL_VERSION + 1
-            )),
-            error_detail: None,
-            namespace_mismatch: false,
-            config_mismatch: false,
-            served_config_id: Some(config_id.to_string()),
-            version_mismatch: true,
-            daemon_protocol_version: PROTOCOL_VERSION + 1,
-            metrics: None,
-            request_id: None,
-        }
-    }
-
     #[tokio::test]
     #[serial]
-    async fn try_forward_inner_newer_daemon_mismatch_yields_response_not_recovery() {
+    async fn try_forward_inner_behind_a_newer_daemon_yields_protocol_mismatch() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -7324,7 +7461,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&sock).expect("bind newer-daemon socket");
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
 
-        let mismatch_resp = newer_daemon_version_mismatch_response(config_id);
+        let mismatch_resp = newer_daemon_response(config_id);
         let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
 
         let frame = DaemonRequestFrame {
@@ -7351,10 +7488,15 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
 
         assert!(
-            matches!(outcome, ForwardOutcome::Response(_)),
-            "version_mismatch=true with daemon_protocol_version > PROTOCOL_VERSION \
-             must yield Response (hard error via map_response), not ProtocolMismatch \
-             (the client binary, not the daemon, is stale)"
+            matches!(
+                outcome,
+                ForwardOutcome::ProtocolMismatch {
+                    daemon_protocol_version
+                } if daemon_protocol_version == PROTOCOL_VERSION + 1
+            ),
+            "a daemon ahead of this bridge yields ProtocolMismatch carrying the daemon's \
+             version, so the bridge answers the caller and then re-execs the current \
+             binary; the version_mismatch flag on the frame does not decide this"
         );
 
         clear_daemon_env();

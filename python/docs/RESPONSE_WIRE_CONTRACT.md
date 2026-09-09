@@ -165,10 +165,20 @@ failure occurred before queue acceptance. The model preserves `kind`, `code`,
 and `retry_after_ms` when present.
 
 The `RuntimeError::Khive` arm serializes `KhiveError`, then adds the disposition
-from its dispatch boundary. It has `kind` and `message`, with nullable `code` and
+from its dispatch boundary; a keyed-memory `key_conflict` reads `not_committed` and a
+`key_holder_unresolved` reads `unknown` whatever the boundary says, because those
+outcomes carry their own domain proof. It has `kind` and `message`, with nullable `code` and
 `details`. A populated code is a string such
 as `runtime:10`; populated details are a string-to-string map. Retry hints are
 not serialized as a field on this type (R10).
+
+Two named keyed-memory outcomes additionally carry `domain_disposition`:
+`conflict` with `details.reason == "key_conflict"` carries `"not_committed"`,
+and `unavailable` with `details.reason == "key_holder_unresolved"` carries
+`"unknown"`. This does not classify other errors by their kind. A key conflict
+terminates reconciliation at `details.existing_id`; `not_committed` describes
+the replay attempt, not the earlier holder's write. The client preserves these
+fields and does not automatically retry the operation.
 
 ```json
 {

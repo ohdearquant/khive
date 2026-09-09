@@ -957,6 +957,29 @@ fn checkpoint_task_specs(
 // presence that `drain()` waits on, exactly like the `active` counter does
 // for in-flight connections: the caller still only pays for the spawn +
 // counter increment, never the task's own work.
+/// Set once by the boot path that takes the daemon role, and never cleared: a
+/// process that is not the warm daemon has no path to becoming one except exec.
+static WARM_INDEX_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare this process the warm index host. Called by the serve path as soon as
+/// the daemon role is decided, before any runtime is built, so nothing warms
+/// under the wrong answer.
+pub fn mark_warm_index_host() {
+    WARM_INDEX_HOST.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether this process is the warm index host.
+///
+/// Building an ANN index from the full corpus is minutes of CPU and hundreds of
+/// megabytes of segment rewrite, and it pays for itself only across a process
+/// that outlives the request. A short-lived client that does it pays the whole
+/// cost, discards the result at exit, and publishes a checkpoint that every
+/// other reader on the root must then re-read. Consumers use this to decide
+/// whether to build or to serve degraded and let the daemon build.
+pub fn is_warm_index_host() -> bool {
+    WARM_INDEX_HOST.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static BACKGROUND_TASKS: std::sync::OnceLock<Arc<std::sync::atomic::AtomicUsize>> =
     std::sync::OnceLock::new();
 
@@ -1299,7 +1322,19 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id,
-            version_mismatch: true,
+            // A client below this protocol is a bridge that predates the binary this
+            // daemon was spawned from. Through protocol 5 the bridge treats an
+            // explicit `version_mismatch` from a higher-numbered daemon as a terminal
+            // error it repeats on every request, and re-execs itself onto the on-disk
+            // binary only for the implicit shape: an unequal `daemon_protocol_version`
+            // with the flag clear. Answering older clients in that shape, still
+            // refused and still carrying the code in `error_detail`, lets every
+            // pre-swap bridge replace itself on its first request instead of staying
+            // refused until a person reconnects the session. A client above this
+            // protocol keeps the explicit flag. Remove at the next protocol bump:
+            // bridges built with the two-direction re-exec in khive-mcp no longer
+            // read the flag.
+            version_mismatch: frame.protocol_version > PROTOCOL_VERSION,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
             request_id: frame.request_id,
@@ -3340,7 +3375,7 @@ mod tests {
         let legacy: LegacyV4Response = serde_json::from_slice(&encoded).expect("legacy v4 decode");
         assert!(!legacy.ok);
         assert_eq!(legacy.error.as_deref(), Some("audit failed"));
-        assert_eq!(legacy.daemon_protocol_version, 4);
+        assert_eq!(legacy.daemon_protocol_version, PROTOCOL_VERSION);
     }
 
     #[tokio::test]
@@ -3498,7 +3533,14 @@ mod tests {
 
         let response = round_trip(dispatcher, &request).await;
         assert!(!response.ok);
-        assert!(response.version_mismatch);
+        assert!(
+            !response.version_mismatch,
+            "a client below this protocol is answered in the implicit shape its bridge re-execs on"
+        );
+        assert_eq!(
+            response.error_detail.as_ref().unwrap()["code"],
+            "version_mismatch"
+        );
         assert_eq!(
             response.error_detail.as_ref().unwrap()["domain_disposition"],
             "unknown"
@@ -3513,6 +3555,42 @@ mod tests {
         assert!(
             error.contains("client=3") && error.contains(&format!("daemon={PROTOCOL_VERSION}")),
             "mismatch must identify the exact rollout boundary; got {error:?}"
+        );
+    }
+
+    /// A client above this protocol is answered with the explicit flag: that
+    /// direction is the warm-old-daemon case, where the newer client's own
+    /// handling replaces the daemon, and the implicit shape reserved for older
+    /// bridges must not reach it. A matching client is served (the round-trip
+    /// tests above).
+    #[tokio::test]
+    async fn newer_client_frame_is_refused_with_the_explicit_flag() {
+        let dispatch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-v4".to_string(),
+            dispatch_calls: Arc::clone(&dispatch_calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let mut request = base_request_frame("cfg-v4");
+        request.protocol_version = PROTOCOL_VERSION + 1;
+
+        let response = round_trip(dispatcher, &request).await;
+        assert!(!response.ok);
+        assert!(
+            response.version_mismatch,
+            "a client above this protocol keeps the explicit flag"
+        );
+        assert_eq!(response.daemon_protocol_version, PROTOCOL_VERSION);
+        assert_eq!(
+            response.error_detail.as_ref().unwrap()["code"],
+            "version_mismatch"
+        );
+        assert_eq!(
+            dispatch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a newer client's frame must not dispatch"
         );
     }
 

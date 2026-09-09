@@ -68,6 +68,8 @@ enum AnnWarmFailure {
     EmptyCorpus,
     Operational,
     Interrupted,
+    /// Not the warm index host; the build belongs to the daemon.
+    NotWarmHost,
 }
 
 /// Result of one load/rebuild worker. Kept separate from `AnnWarmState` so a
@@ -78,6 +80,10 @@ pub(crate) enum AnnWarmOutcome {
     Ready,
     Empty,
     Failed,
+    /// This process is not the warm index host and the only way forward was a
+    /// corpus-scale build. Retryable exactly like `Failed`: the caller serves
+    /// its degraded path for this request and the daemon builds.
+    Declined,
 }
 
 /// Lifecycle for one per-{namespace, model} warm slot.
@@ -156,6 +162,15 @@ pub(crate) struct AnnState {
     checkpoint_locks: std::sync::Mutex<HashMap<AnnKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Idempotence guard for the pack-lifetime file-generation watcher.
     rotation_watch_started: AtomicBool,
+    /// Whether this process may build an ANN index from the full corpus and
+    /// publish the result. A corpus build is minutes of CPU and a segment
+    /// rewrite every other reader on the index root must then absorb, and it
+    /// pays for itself only in a process that outlives the request. Serving
+    /// processes set this from the daemon role at construction; the admin
+    /// reindex path sets it unconditionally, because building is what it was
+    /// invoked to do. A process without it serves what is already persisted,
+    /// or serves degraded and leaves the build to the daemon.
+    builds_corpus_indexes: bool,
     /// Test-only rendezvous for `finish_warm`'s Ready publish (issue #2340
     /// regression coverage) — see `run_finish_warm_ready_test_hook`.
     #[cfg(test)]
@@ -174,8 +189,17 @@ pub(crate) struct FinishWarmReadyTestHook {
 
 pub(crate) type SharedAnn = Arc<AnnState>;
 
+/// Shared ANN state for a process that builds corpus indexes: the warm daemon
+/// and the admin reindex path.
 pub(crate) fn new_shared() -> SharedAnn {
+    new_shared_for_role(true)
+}
+
+/// Shared ANN state whose corpus-build authority is stated explicitly. Serving
+/// packs pass the daemon role; see `AnnState::builds_corpus_indexes`.
+pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
     Arc::new(AnnState {
+        builds_corpus_indexes,
         indexes: RwLock::new(HashMap::new()),
         warm_states: std::sync::Mutex::new(HashMap::new()),
         next_warm_attempt_id: AtomicU64::new(1),
@@ -469,6 +493,13 @@ async fn finish_warm(mut permit: AnnWarmPermit, outcome: AnnWarmOutcome) {
             let next = AnnWarmState::Failed {
                 generation: permit.generation,
                 error: AnnWarmFailure::Operational,
+            };
+            finish_warm_state(&mut permit, next);
+        }
+        AnnWarmOutcome::Declined => {
+            let next = AnnWarmState::Failed {
+                generation: permit.generation,
+                error: AnnWarmFailure::NotWarmHost,
             };
             finish_warm_state(&mut permit, next);
         }
@@ -3139,6 +3170,14 @@ async fn classify_and_adopt_segment(
             return SegmentOutcome::Cold;
         }
         bridge.set_applied_seq(new_s);
+        // Replay is cheap and in memory; the checkpoint that follows it is a full
+        // segment publication. A process that is not the warm index host serves the
+        // replayed bridge and publishes nothing — same answers, no rewrite for every
+        // other reader on the root to absorb.
+        if !ann.builds_corpus_indexes {
+            install_if_fresher(ann, key, bridge.with_generation(target_generation)).await;
+            return SegmentOutcome::Installed;
+        }
         let checkpointed = checkpoint_raise_compact_readopt(
             rt,
             ann,
@@ -3162,6 +3201,12 @@ async fn classify_and_adopt_segment(
             tracing::info!(namespace = %ns, model = %model, tail, live,
                 "tail above rebuild threshold; serving stale segment during rebuild");
             install_if_fresher(ann, key, bridge.with_generation(target_generation)).await;
+            // Rule 8 serves stale and lets the caller rebuild. Only the warm index
+            // host has a rebuild to fall through to; for anyone else the stale
+            // segment IS the answer for this request.
+            if !ann.builds_corpus_indexes {
+                return SegmentOutcome::Installed;
+            }
         }
         Err(e) => {
             tracing::warn!(error = %e, dir = %seg_dir.display(),
@@ -3191,6 +3236,15 @@ pub(crate) async fn ensure_ann_for_model(
     let ns = token.namespace().as_str().to_owned();
     let key = AnnKey::new(&ns, model);
 
+    // A corpus-scale build is minutes of CPU and a segment rewrite every other
+    // reader on the root must then take. It pays for itself only in a process
+    // that outlives the request, so only the warm daemon does it; everyone else
+    // serves what is already persisted, or serves degraded and lets the daemon
+    // build. The same answer gates the registry writes below: publishing a
+    // rebuild sentinel is an authority act, and a process that will not do the
+    // rebuild must not claim it.
+    let warm_host = ann.builds_corpus_indexes;
+
     // Registration precedes every scan or legacy serve. Local absence of a
     // bridge cannot prove global first use: a peer may still hold stale v1 or
     // Owned state after this row was administratively removed. Every absent
@@ -3199,11 +3253,23 @@ pub(crate) async fn ensure_ann_for_model(
     let mut force_rebuild = force_rebuild_required(ann, &key);
     match read_own_watermark(rt, &ns, model).await {
         Ok(Some(watermark)) if watermark < 0 => {
+            if !warm_host {
+                tracing::debug!(namespace = %ns, model = %model,
+                    "ANN rebuild is pending and this process is not the warm index host; \
+                     declining");
+                return AnnWarmOutcome::Declined;
+            }
             mark_force_rebuild(ann, &key);
             force_rebuild = true;
         }
         Ok(Some(_)) => {}
         Ok(None) => {
+            if !warm_host {
+                tracing::debug!(namespace = %ns, model = %model,
+                    "ANN registry row absent and this process is not the warm index host; \
+                     declining rather than claiming the rebuild");
+                return AnnWarmOutcome::Declined;
+            }
             if let Err(error) = prepare_authoritative_rebuild(rt, ann, &key).await {
                 tracing::warn!(error = %error, "failed to fence ANN registry loss");
                 return AnnWarmOutcome::Failed;
@@ -3307,6 +3373,12 @@ pub(crate) async fn ensure_ann_for_model(
 
     // 4. Rebuild fallthrough — build from vector store, persist and re-adopt
     // the v2 segment, then raise the registry watermark and compact the log.
+    if !warm_host {
+        tracing::info!(namespace = %ns, model = %model,
+            "no adoptable ANN segment and this process is not the warm index host; \
+             serving degraded and leaving the corpus build to the daemon");
+        return AnnWarmOutcome::Declined;
+    }
     let scan_authority = match prepare_full_corpus_scan(rt, ann, &key).await {
         Ok(authority) => authority,
         Err(error) => {
@@ -6371,6 +6443,42 @@ mod tests {
             ready,
             "after a rebuild error the wait must keep polling and observe the \
              retry's install, not short-circuit false"
+        );
+    }
+
+    /// A process that is not the warm index host must not build the corpus, and —
+    /// the part that matters on a shared index root — must not publish a segment or
+    /// claim the rebuild in the registry on its way to declining. Claiming without
+    /// building would fence every other consumer behind a rebuild nobody is doing.
+    #[tokio::test]
+    async fn a_non_warm_host_declines_the_corpus_build_and_writes_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 3).await;
+
+        let ann = new_shared_for_role(false);
+        let outcome = ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        assert_eq!(outcome, AnnWarmOutcome::Declined);
+
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "a declined warm must not install an index"
+        );
+        if let Some(seg_dir) = ann_segment_dir(&rt, "local", WARM_TEST_MODEL) {
+            assert!(
+                !seg_dir.join("metadata.bin").exists(),
+                "a declined warm must not publish a segment"
+            );
+        }
+        assert!(
+            matches!(
+                read_own_watermark(&rt, "local", WARM_TEST_MODEL).await,
+                Ok(None)
+            ),
+            "a declined warm must leave the registry untouched: no row, and in \
+             particular no rebuild sentinel this process will never satisfy"
         );
     }
 

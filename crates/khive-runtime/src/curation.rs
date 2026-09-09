@@ -3124,7 +3124,7 @@ fn read_merge_note(
     let id_str = id.to_string();
     let mut stmt = conn.prepare(
         "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-         expires_at, properties, created_at, updated_at, deleted_at \
+         expires_at, properties, created_at, updated_at, deleted_at, key \
          FROM notes WHERE id = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -3145,6 +3145,7 @@ fn read_merge_note(
     let created_at: i64 = row.get(10)?;
     let updated_at: i64 = row.get(11)?;
     let deleted_at: Option<i64> = row.get(12)?;
+    let key: Option<String> = row.get(13)?;
 
     if ns != namespace {
         return Err(SqliteError::InvalidData(format!(
@@ -3171,6 +3172,7 @@ fn read_merge_note(
         created_at,
         updated_at,
         deleted_at,
+        key,
     })
 }
 
@@ -3599,6 +3601,7 @@ fn merge_note_sql(
                 into_note.created_at,
                 now,
                 into_note.deleted_at,
+                &into_note.key,
             ])?;
 
         let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
@@ -3695,6 +3698,7 @@ fn merge_note_sql(
         created_at: into_note.created_at,
         updated_at: now,
         deleted_at: into_note.deleted_at,
+        key: into_note.key.clone(),
     };
 
     Ok((
@@ -7986,6 +7990,63 @@ mod tests {
             from_store.get_note(from_id).await.unwrap().is_none(),
             "merged-from note should be soft-deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn merge_note_preserves_the_kept_memory_key() {
+        use crate::keyed_memory::{create_keyed_memory, KeyedMemorySpec};
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let (into, _) = create_keyed_memory(
+            &rt,
+            &tok,
+            KeyedMemorySpec {
+                content: "Into keyed memory",
+                key: "kept-memory-key",
+                salience: 0.7,
+                decay_factor: 0.0,
+                properties: serde_json::json!({}),
+                source_id: None,
+                embedding_model: None,
+            },
+        )
+        .await
+        .unwrap();
+        let from = rt
+            .create_note(&tok, "memory", None, "From memory", None, None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .expect("merge binds every stored note field");
+        assert_eq!(summary.kept_id, into.id);
+        let stored = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(into.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.key.as_deref(), Some("kept-memory-key"));
+        assert!(stored.content.contains("Into keyed memory"));
+        assert!(stored.content.contains("From memory"));
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(from.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // Note merge must absorb a conflicting edge natural key exactly like entity

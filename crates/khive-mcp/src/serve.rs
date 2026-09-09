@@ -151,6 +151,9 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     // before `build_server` runs migrations/FTS DDL unguarded — see
     // `acquire_daemon_boot_guard`. Non-daemon callers keep the best-effort
     // lock (dropped right after construction below).
+    if args.daemon {
+        khive_runtime::daemon::mark_warm_index_host();
+    }
     #[cfg(unix)]
     let boot_guard = if args.daemon {
         Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
