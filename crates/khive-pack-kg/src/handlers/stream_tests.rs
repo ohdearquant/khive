@@ -595,3 +595,176 @@ async fn stream_batch_mode_and_shape_refusals_write_nothing() {
     assert_eq!(results[1]["details"]["reason"], "seq_conflict");
     assert_eq!(results[2]["seq"], 4);
 }
+
+struct MemberRefusalEmbeddingService;
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for MemberRefusalEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(vec![vec![1.0]; texts.len()])
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "stream-batch-member-refusal"
+    }
+}
+
+struct MemberRefusalEmbedderProvider;
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for MemberRefusalEmbedderProvider {
+    fn name(&self) -> &str {
+        "stream-batch-member-refusal"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(
+        &self,
+    ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+    {
+        Ok(std::sync::Arc::new(MemberRefusalEmbeddingService))
+    }
+}
+
+/// `surface()` registers no embedding model, and with none registered a
+/// prepared note set is never read for a token. A registered model is the
+/// condition under which preparation reads the first spec, so it is the
+/// condition every arm below needs.
+fn surface_with_embedding_model() -> (KhiveRuntime, VerbRegistry) {
+    let rt = KhiveRuntime::memory().unwrap();
+    rt.register_embedder(MemberRefusalEmbedderProvider);
+    assert!(
+        !rt.registered_embedding_model_names().is_empty(),
+        "the arm needs a registered model to reach the preparation path"
+    );
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    (rt, builder.build().unwrap())
+}
+
+/// Schema rows, so an arm asserting that nothing was written also covers the
+/// lazy vector-table create preparation performs.
+async fn schema(rt: &KhiveRuntime) -> i64 {
+    let mut reader = rt.sql().reader().await.unwrap();
+    let value = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM sqlite_master".into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .unwrap();
+    let Some(SqlValue::Integer(n)) = value else {
+        panic!("integer count")
+    };
+    n
+}
+
+#[tokio::test]
+async fn stream_batch_all_refused_members_prepare_nothing() {
+    // A batch whose every member is refused has no member to prepare. Both
+    // refusal shapes a member can carry, in both modes: atomic reads the
+    // refusal before it prepares anything, and per-member prepares an empty
+    // set, which must not read a first spec that is not there.
+    let (rt, registry) = surface_with_embedding_model();
+    let before = population(&rt).await;
+    let before_schema = schema(&rt).await;
+    for (member, kind, expected) in [
+        (
+            json!({"op": "write"}),
+            "invalid_input",
+            "member_unavailable",
+        ),
+        (json!({"op": "nope"}), "conflict", "unknown_op"),
+    ] {
+        let atomic_error = registry
+            .dispatch("stream.batch", json!({"ops": [member], "atomic": true}))
+            .await
+            .unwrap_err();
+        let RuntimeError::Khive(atomic_error) = atomic_error else {
+            panic!("structured refusal: {atomic_error:?}")
+        };
+        let value = serde_json::to_value(atomic_error).unwrap();
+        assert_eq!(value["kind"], kind, "{member}");
+        assert_eq!(value["details"]["reason"], expected, "{member}");
+        assert_eq!(value["details"]["member"], "0", "{member}");
+
+        let per_member = registry
+            .dispatch("stream.batch", json!({"ops": [member], "atomic": false}))
+            .await
+            .unwrap();
+        let results = per_member["results"].as_array().unwrap();
+        assert_eq!(results[0]["kind"], kind, "{member}");
+        assert_eq!(results[0]["details"]["reason"], expected, "{member}");
+        assert_eq!(
+            results[0]["domain_disposition"], "not_committed",
+            "{member}"
+        );
+        assert!(results[0]["details"].get("member").is_none(), "{member}");
+    }
+    assert_eq!(population(&rt).await, before);
+    assert_eq!(schema(&rt).await, before_schema);
+}
+
+#[tokio::test]
+async fn stream_batch_refuses_an_empty_member_list() {
+    // An empty list is a shape refusal, not a batch that takes the writer to
+    // commit nothing and reports `committed: true`.
+    let (rt, registry) = surface_with_embedding_model();
+    let before = population(&rt).await;
+    let before_schema = schema(&rt).await;
+    for atomic in [true, false] {
+        let error = registry
+            .dispatch("stream.batch", json!({"ops": [], "atomic": atomic}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(_)),
+            "atomic={atomic}: {error}"
+        );
+        assert_eq!(population(&rt).await, before, "atomic={atomic}");
+        assert_eq!(schema(&rt).await, before_schema, "atomic={atomic}");
+    }
+}
+
+#[tokio::test]
+async fn stream_batch_atomic_refuses_before_it_prepares_a_good_member() {
+    // An atomic refusal writes nothing, and preparing a member is a write: it
+    // embeds the record and lazily creates the vector table that embedding
+    // needs. So a batch that is going to refuse must read the refusal before
+    // it prepares the members that were fine, and the schema count is what
+    // sees the difference.
+    let (rt, registry) = surface_with_embedding_model();
+    let before = population(&rt).await;
+    let before_schema = schema(&rt).await;
+    let error = registry
+        .dispatch(
+            "stream.batch",
+            json!({"ops": [
+                {"op": "append", "stream": "guard", "record": 1},
+                {"op": "nope"},
+            ], "atomic": true}),
+        )
+        .await
+        .unwrap_err();
+    let RuntimeError::Khive(error) = error else {
+        panic!("structured refusal: {error:?}")
+    };
+    let value = serde_json::to_value(error).unwrap();
+    assert_eq!(value["details"]["reason"], "unknown_op");
+    assert_eq!(value["details"]["member"], "1");
+    assert_eq!(population(&rt).await, before);
+    assert_eq!(schema(&rt).await, before_schema);
+    assert_eq!(heads(&registry, &["guard"]).await, vec![0]);
+}

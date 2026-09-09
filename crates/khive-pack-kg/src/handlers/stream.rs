@@ -165,6 +165,11 @@ impl KgPack {
                 "stream.batch observed {MISSING_KEYED_SURFACE}"
             )));
         }
+        if p.ops.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "stream.batch requires at least one member: an empty ops list takes the writer for a batch that writes nothing".into(),
+            ));
+        }
         let note_kind = canonical_note_kind("observation", registry)?;
         let mut members = Vec::with_capacity(p.ops.len());
         for (index, member) in p.ops.into_iter().enumerate() {

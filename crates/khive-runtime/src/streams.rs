@@ -304,14 +304,10 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         members: Vec<StreamBatchMember>,
     ) -> RuntimeResult<Result<Vec<Value>, StreamBatchRefusal>> {
-        let specs: Vec<&StreamAppendSpec> = members
-            .iter()
-            .filter_map(|member| match member {
-                StreamBatchMember::Append(spec) => Some(spec),
-                StreamBatchMember::Refused(_) => None,
-            })
-            .collect();
-        let prepared = self.prepare_stream_appends(token, &specs).await?;
+        // A member's refusal refuses the whole batch, so it is read before
+        // anything is prepared: preparation embeds every member and creates
+        // each model's vector table, which is work for a write this batch is
+        // no longer going to make.
         for (member, item) in members.iter().enumerate() {
             if let StreamBatchMember::Refused(error) = item {
                 return Ok(Err(StreamBatchRefusal {
@@ -320,6 +316,14 @@ impl KhiveRuntime {
                 }));
             }
         }
+        let specs: Vec<&StreamAppendSpec> = members
+            .iter()
+            .filter_map(|member| match member {
+                StreamBatchMember::Append(spec) => Some(spec),
+                StreamBatchMember::Refused(_) => None,
+            })
+            .collect();
+        let prepared = self.prepare_stream_appends(token, &specs).await?;
         match self.run_stream_appends(token, &prepared).await? {
             BatchOutcome::Appended(seqs) => Ok(Ok(prepared
                 .iter()
