@@ -52,7 +52,7 @@ const P_TREE: ParamDef = ParamDef {
 };
 
 #[rustfmt::skip]
-pub static EXEC_HANDLERS: [HandlerDef; 8] = [
+pub static EXEC_HANDLERS: [HandlerDef; 9] = [
     HandlerDef {
         name: "exec.tree",
         description: "Store a tree manifest from entries [{path, ref, mode}] and return its reference. Paths are relative and normalized, modes are 644 or 755, duplicates and symlinks are refused.",
@@ -69,6 +69,17 @@ pub static EXEC_HANDLERS: [HandlerDef; 8] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[P_TREE, P_NAMESPACE],
+    },
+    HandlerDef {
+        name: "exec.tree_put",
+        description: "Apply edits [{path, ref|content|delete, mode}] to a tree and return the new tree. Trees are immutable, so this mints a new manifest and never changes the input. One call yields exactly one new tree or none: any refusal stores nothing, including blobs for entries that were fine. Duplicate paths, an empty edits list, and a delete of a path the tree does not hold are refused.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
+        params: &[
+            P_TREE,
+            ParamDef { name: "edits", param_type: "array", required: true, description: "Edits [{path, and exactly one of ref | content | delete:true, plus optional mode}]; an empty array is refused.", resolution_mode: IdResolutionMode::NotApplicable },
+            P_NAMESPACE,
+        ],
     },
     HandlerDef {
         name: "exec.tree_diff",

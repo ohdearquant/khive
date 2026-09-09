@@ -295,12 +295,12 @@ def main():
         # §2); git grew from four verbs to fifteen with the dev-loop surface
         # (checkout, diff, gates, receipts, reconcile, status, log, init,
         # pr_open, pr_review, pr_merge; ADR-182);
-        # tool contributes thirteen verbs and exec eight (the tool registry
+        # tool contributes thirteen verbs and exec nine (the tool registry
         # with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 127, (
-            f"expected 127 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 128, (
+            f"expected 128 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
@@ -320,7 +320,7 @@ def main():
             f"kg also carries stream.append/stream.batch/stream.read/stream.stat "
             f"(ADR-174); "
             f"git contributes fifteen verbs with the ADR-182 dev-loop surface; "
-            f"tool contributes thirteen verbs and exec eight; "
+            f"tool contributes thirteen verbs and exec nine; "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
