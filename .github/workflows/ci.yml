@@ -171,6 +171,23 @@ jobs:
       - name: Install khive-contract scan dependency (Linux)
         if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
         run: |
+          # The runner image carries third-party apt lists this job needs
+          # nothing from, and `apt-get update` exits 100 when any one of them
+          # serves a bad index. Google's chrome list did exactly that on
+          # 2026-09-09 (Hash Sum mismatch) and reddened every full-suite
+          # shard. ripgrep comes from the Ubuntu archive, so disable that list
+          # instead of retrying into the same mismatch. apt reads only .list
+          # and .sources files, so a renamed copy is inert, and the Ubuntu
+          # archive itself lives in ubuntu.sources and is untouched. A different
+          # third-party list failing this way needs its own line here, by
+          # name: this is deliberately not a blanket sweep of the directory.
+          for f in /etc/apt/sources.list.d/google-chrome.list \
+                   /etc/apt/sources.list.d/google-chrome.sources; do
+            if [ -e "$f" ]; then sudo mv "$f" "$f.disabled"; fi
+          done
+          # Print what still points at the chrome repo: empty is the pass, a
+          # non-empty line says the rename missed a filename this does not know.
+          sudo grep -rl 'dl[.]google[.]com/linux/chrome' /etc/apt/ || true
           sudo apt-get update
           sudo apt-get install --yes ripgrep
           rg --version
@@ -347,6 +364,20 @@ jobs:
         run: |
           printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "3";\nDPkg::Lock::Timeout "120";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-download-timeouts
+          # The timeouts above bound a stalled mirror. They do not bound a
+          # mirror that answers promptly with a bad index: that fails
+          # `apt-get update` for the whole run, and the retry on the
+          # dependency step re-reads the same index, so the retry cannot
+          # clear it. The browser OS dependencies come from the Ubuntu
+          # archive and Playwright ships its own chromium build, so nothing
+          # in this job needs Google's chrome list.
+          for f in /etc/apt/sources.list.d/google-chrome.list \
+                   /etc/apt/sources.list.d/google-chrome.sources; do
+            if [ -e "$f" ]; then sudo mv "$f" "$f.disabled"; fi
+          done
+          # Print what still points at the chrome repo: empty is the pass, a
+          # non-empty line says the rename missed a filename this does not know.
+          sudo grep -rl 'dl[.]google[.]com/linux/chrome' /etc/apt/ || true
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
