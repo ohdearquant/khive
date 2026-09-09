@@ -179,16 +179,16 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG pack must expose exactly 23 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/db_diagnostics
+// KG pack must expose exactly 24 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/db_diagnostics
 #[test]
-fn kg_pack_exposes_23_handlers() {
+fn kg_pack_exposes_24_handlers() {
     use crate::KgPack;
     use khive_types::Pack;
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        23,
-        "kg pack must expose 23 handlers including ordered streams"
+        24,
+        "kg pack must expose 24 handlers including ordered streams and stream.batch"
     );
     let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
     assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
