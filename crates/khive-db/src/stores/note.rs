@@ -9,13 +9,15 @@ use uuid::Uuid;
 
 use khive_storage::attachment::AttachmentSubstrate;
 use khive_storage::error::{StorageError, WriterTaskRequestState};
-use khive_storage::note::{FilterOp, Note, NoteFilter, NoteSeekAfter, SortDir};
+use khive_storage::note::{
+    FilterOp, Note, NoteFilter, NoteKeyCursor, NoteSeekAfter, NoteTagMode, SortDir,
+};
 use khive_storage::types::{
     BatchWriteSummary, BoundedCount, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
     SqlStatement, SqlValue,
 };
 use khive_storage::NoteStore;
-use khive_storage::StorageCapability;
+use khive_storage::{StorageCapability, StorageResult};
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
@@ -32,6 +34,23 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
 }
 
 const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
+
+pub fn note_key_prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        if last == char::MAX {
+            continue;
+        }
+        let next = if last == '\u{d7ff}' {
+            '\u{e000}'
+        } else {
+            char::from_u32(u32::from(last) + 1).expect("incremented non-max scalar")
+        };
+        chars.push(next);
+        return Some(chars.into_iter().collect());
+    }
+    None
+}
 
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
@@ -87,6 +106,19 @@ pub fn note_insert_if_absent_statement(note: &Note) -> SqlStatement {
     let mut statement = note_upsert_statement(note);
     statement.sql = NOTE_INSERT_IF_ABSENT_SQL.to_string();
     statement.label = Some("note-insert-if-absent".to_string());
+    statement
+}
+
+/// The live key index is the arbiter; an occupied key changes no row.
+pub fn note_insert_keyed_statement(note: &Note) -> SqlStatement {
+    let mut statement = note_upsert_statement(note);
+    statement.sql = "INSERT INTO notes \
+        (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+         properties, created_at, updated_at, deleted_at, key) \
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
+        ON CONFLICT(namespace,kind,key) WHERE key IS NOT NULL AND deleted_at IS NULL DO NOTHING"
+        .into();
+    statement.label = Some("note-keyed-create".into());
     statement
 }
 
@@ -483,6 +515,7 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
     let updated_at: i64 = row.get(11)?;
     let deleted_at: Option<i64> = row.get(12)?;
     let key: Option<String> = row.get(13)?;
+    let version: i64 = row.get(14)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -513,6 +546,7 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
         updated_at,
         deleted_at,
         key,
+        version,
     })
 }
 
@@ -801,6 +835,28 @@ fn build_note_filter_where(
         conditions.push(format!("kind = ?{}", params.len()));
     }
 
+    if let Some(since) = filter.min_updated_at {
+        params.push(Box::new(since));
+        conditions.push(format!("updated_at >= ?{}", params.len()));
+    }
+    if !filter.tags.is_empty() {
+        let mut tag_predicates = Vec::new();
+        for tag in &filter.tags {
+            params.push(Box::new(tag.clone()));
+            tag_predicates.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_type(properties,'$.tags')='array' \
+                 THEN json_extract(properties,'$.tags') ELSE '[]' END) AS tag \
+                 WHERE tag.type='text' AND tag.value = ?{} COLLATE NOCASE)",
+                params.len()
+            ));
+        }
+        let join = match filter.tag_mode {
+            NoteTagMode::Any => " OR ",
+            NoteTagMode::All => " AND ",
+        };
+        conditions.push(format!("({})", tag_predicates.join(join)));
+    }
+
     for pf in &filter.property_filters {
         match &pf.op {
             FilterOp::EqOrMissing => {
@@ -940,7 +996,7 @@ fn build_note_filter_where(
 /// `query_notes_filtered_after`, `query_notes_filtered_bounded`) still spell
 /// the same column list out inline.
 const NOTE_COLUMNS: &str = "id, namespace, kind, status, name, content, salience, decay_factor, \
-     expires_at, properties, created_at, updated_at, deleted_at, key";
+     expires_at, properties, created_at, updated_at, deleted_at, key, version";
 
 /// Fetch up to `limit` rows strictly after `after` in the notes store's
 /// default `created_at DESC, id ASC` total order, for `NoteFilter.after`
@@ -1054,6 +1110,86 @@ fn execute_filtered_note_property_patch(
 
 #[async_trait]
 impl NoteStore for SqlNoteStore {
+    async fn get_live_notes_by_key(
+        &self,
+        namespace: &str,
+        key: &str,
+        kind: Option<&str>,
+    ) -> StorageResult<Vec<Note>> {
+        let namespace = namespace.to_owned();
+        let key = key.to_owned();
+        let kind = kind.map(str::to_owned);
+        self.with_reader("get_live_notes_by_key", move |conn| {
+            let (mut clause, mut params) = build_note_where(&namespace, kind.as_deref());
+            params.push(Box::new(key));
+            clause.push_str(&format!(" AND key = ?{}", params.len()));
+            let sql = format!("SELECT {NOTE_COLUMNS} FROM notes{clause} ORDER BY kind ASC");
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(params.as_slice(), read_note)?.collect();
+            rows
+        })
+        .await
+    }
+
+    async fn query_keyed_notes(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
+        prefix: &str,
+        after: Option<&NoteKeyCursor>,
+        page: PageRequest,
+    ) -> StorageResult<(Vec<Note>, Option<NoteKeyCursor>)> {
+        if !filter.namespaces.is_empty()
+            || filter.order_by.is_some()
+            || filter.after.is_some()
+            || (after.is_some() && page.offset != 0)
+            || page.limit == 0
+        {
+            return Err(StorageError::InvalidInput { capability: StorageCapability::Notes,
+                operation: "query_keyed_notes".into(), message: "keyed paging requires primary namespace, keyed order and a positive limit; cursor excludes offset".into() });
+        }
+        for property in &filter.property_filters {
+            validate_json_path(&property.json_path)?;
+        }
+        let offset = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: "query_keyed_notes".into(),
+            message: "offset exceeds the supported integer range".into(),
+        })?;
+        let namespace = namespace.to_owned();
+        let filter = filter.clone();
+        let prefix = prefix.to_owned();
+        let after = after.cloned();
+        self.with_reader("query_keyed_notes", move |conn| {
+            let (mut clause, mut params) = build_note_filter_where(&namespace, &filter)?;
+            params.push(Box::new(prefix.clone()));
+            clause.push_str(&format!(" AND key IS NOT NULL AND key >= ?{}", params.len()));
+            if let Some(upper) = note_key_prefix_successor(&prefix) {
+                params.push(Box::new(upper));
+                clause.push_str(&format!(" AND key < ?{}", params.len()));
+            }
+            if let Some(after) = after {
+                params.push(Box::new(after.updated_at)); let u = params.len();
+                params.push(Box::new(after.key)); let k = params.len();
+                params.push(Box::new(after.id.to_string())); let id = params.len();
+                clause.push_str(&format!(" AND (updated_at < ?{u} OR (updated_at = ?{u} AND key < ?{k}) \
+                    OR (updated_at = ?{u} AND key = ?{k} AND id > ?{id}))"));
+            }
+            params.push(Box::new(i64::from(page.limit) + 1)); let limit = params.len();
+            params.push(Box::new(offset)); let offset = params.len();
+            let sql = format!("SELECT {NOTE_COLUMNS} FROM notes{clause} ORDER BY updated_at DESC, key DESC, id ASC LIMIT ?{limit} OFFSET ?{offset}");
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let mut notes = stmt.query_map(params.as_slice(), read_note)?.collect::<Result<Vec<_>, _>>()?;
+            let has_more = notes.len() > page.limit as usize;
+            notes.truncate(page.limit as usize);
+            let next = if has_more { notes.last().map(NoteKeyCursor::from) } else { None };
+            Ok((notes, next))
+        }).await
+    }
+
     async fn upsert_note(&self, note: Note) -> Result<(), StorageError> {
         let id_str = note.id.to_string();
         let statement = note_upsert_statement(&note);
@@ -1328,7 +1464,7 @@ impl NoteStore for SqlNoteStore {
         self.with_reader("get_note", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                 properties, created_at, updated_at, deleted_at, key \
+                 properties, created_at, updated_at, deleted_at, key, version \
                  FROM notes WHERE id = ?1 AND deleted_at IS NULL",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -1346,7 +1482,7 @@ impl NoteStore for SqlNoteStore {
         self.with_reader("get_note_including_deleted", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                 properties, created_at, updated_at, deleted_at, key \
+                 properties, created_at, updated_at, deleted_at, key, version \
                  FROM notes WHERE id = ?1",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -1391,7 +1527,7 @@ impl NoteStore for SqlNoteStore {
                         .join(", ");
                     let sql = format!(
                         "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                         properties, created_at, updated_at, deleted_at, key \
+                         properties, created_at, updated_at, deleted_at, key, version \
                          FROM notes WHERE id IN ({placeholders}) AND deleted_at IS NULL"
                     );
                     let mut stmt = conn.prepare(&sql)?;
@@ -1476,7 +1612,7 @@ impl NoteStore for SqlNoteStore {
 
             let data_sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                 properties, created_at, updated_at, deleted_at, key \
+                 properties, created_at, updated_at, deleted_at, key, version \
                  FROM notes{} ORDER BY created_at DESC, id ASC LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
             );
@@ -1520,7 +1656,7 @@ impl NoteStore for SqlNoteStore {
             let offset_idx = params.len();
             let sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-                 expires_at, properties, created_at, updated_at, deleted_at, key \
+                 expires_at, properties, created_at, updated_at, deleted_at, key, version \
                  FROM notes{where_sql} ORDER BY created_at DESC, id ASC \
                  LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
             );
@@ -1594,7 +1730,7 @@ impl NoteStore for SqlNoteStore {
             let offset_idx = data_params.len();
             let data_sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-                 expires_at, properties, created_at, updated_at, deleted_at, key \
+                 expires_at, properties, created_at, updated_at, deleted_at, key, version \
                  FROM notes{}{order_clause} LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
             );
@@ -1830,7 +1966,7 @@ impl NoteStore for SqlNoteStore {
             // indexed `seq > boundary` scan with no full-match sort.
             let sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-                 expires_at, properties, created_at, updated_at, deleted_at, key, notes_seq.seq \
+                 expires_at, properties, created_at, updated_at, deleted_at, key, version, notes_seq.seq \
                  FROM notes_seq CROSS JOIN notes ON notes.id = notes_seq.note_id{where_sql} \
                  ORDER BY notes_seq.seq ASC LIMIT ?{limit_idx}"
             );
@@ -1838,7 +1974,7 @@ impl NoteStore for SqlNoteStore {
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|param| param.as_ref()).collect();
             let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                Ok((read_note(row)?, row.get::<_, i64>(14)?))
+                Ok((read_note(row)?, row.get::<_, i64>(15)?))
             })?;
             let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
             let has_more = entries.len() > limit_usize;
@@ -1897,7 +2033,7 @@ impl NoteStore for SqlNoteStore {
 
             let data_sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-                 expires_at, properties, created_at, updated_at, deleted_at, key \
+                 expires_at, properties, created_at, updated_at, deleted_at, key, version \
                  FROM notes{where_sql}{order_clause} LIMIT ?{limit_idx}",
             );
 

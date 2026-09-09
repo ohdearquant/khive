@@ -2556,6 +2556,7 @@ pub(crate) async fn handle_heartbeat(
     };
 
     let note = Note {
+        version: 1,
         key: None,
         id,
         namespace: ns.to_string(),
@@ -4699,6 +4700,7 @@ mod tests {
         let created_at = chrono::Utc::now().timestamp_micros();
         store
             .upsert_note(Note {
+                version: 1,
                 key: None,
                 id,
                 namespace: ns.clone(),
@@ -4818,6 +4820,7 @@ mod tests {
             let id = Uuid::new_v4();
             let created_at = chrono::Utc::now().timestamp_micros();
             let note = Note {
+                version: 1,
                 key: None,
                 id,
                 namespace: ns.clone(),

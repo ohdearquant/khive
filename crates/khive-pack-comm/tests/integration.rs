@@ -1065,6 +1065,7 @@ async fn test_short_id_collision_errors_clearly() {
 
     store
         .upsert_note(Note {
+            version: 1,
             key: None,
             id: uuid_a,
             namespace: ns.clone(),
@@ -1085,6 +1086,7 @@ async fn test_short_id_collision_errors_clearly() {
 
     store
         .upsert_note(Note {
+            version: 1,
             key: None,
             id: uuid_b,
             namespace: ns.clone(),
@@ -1548,6 +1550,7 @@ async fn test_reply_marks_directionless_legacy_original() {
 
     store
         .upsert_note(Note {
+            version: 1,
             key: None,
             id,
             namespace: token.namespace().as_str().to_string(),
@@ -1608,6 +1611,7 @@ async fn test_reply_read_patch_preserves_concurrent_properties() {
 
     store
         .upsert_note(Note {
+            version: 1,
             key: None,
             id,
             namespace: token.namespace().as_str().to_string(),
@@ -5906,6 +5910,7 @@ async fn ingest_routing_reply_routes_to_original_sender() {
         let now = chrono::Utc::now().timestamp_micros();
         let thread_uuid = uuid::Uuid::new_v4();
         let note = Note {
+            version: 1,
             key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
@@ -5970,6 +5975,7 @@ async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = Note {
+            version: 1,
             key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
@@ -6092,6 +6098,7 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = Note {
+            version: 1,
             key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
@@ -6165,6 +6172,7 @@ async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = khive_storage::note::Note {
+            version: 1,
             key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
@@ -6279,6 +6287,7 @@ async fn plant_message_note(
     let now = chrono::Utc::now().timestamp_micros();
     let id = uuid::Uuid::new_v4();
     let note = Note {
+        version: 1,
         key: None,
         id,
         namespace: "local".into(),
@@ -7103,6 +7112,7 @@ async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() 
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = Note {
+            version: 1,
             key: None,
             id: outbound_id,
             namespace: "local".into(),
@@ -7196,6 +7206,7 @@ async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup(
         let now = chrono::Utc::now().timestamp_micros();
         store
             .upsert_note(Note {
+                version: 1,
                 key: None,
                 id: root_id,
                 namespace: "local".into(),
@@ -7224,6 +7235,7 @@ async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup(
             .expect("seed legacy outbound root");
         store
             .upsert_note(Note {
+                version: 1,
                 key: None,
                 id: legacy_child_id,
                 namespace: "local".into(),
@@ -7422,6 +7434,7 @@ async fn thread_includes_root_message_without_thread_id_property() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let root_note = Note {
+            version: 1,
             key: None,
             id: root_id,
             namespace: "local".into(),
@@ -7445,6 +7458,7 @@ async fn thread_includes_root_message_without_thread_id_property() {
         store.upsert_note(root_note).await.expect("upsert root");
 
         let child_note = Note {
+            version: 1,
             key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
@@ -7909,6 +7923,7 @@ async fn plant_healthy_channel_rows(rt: &KhiveRuntime, count: usize) {
         .map(|index| {
             let slug = format!("heartbeat-{index:03}");
             Note {
+                version: 1,
                 key: None,
                 id: uuid::Uuid::new_v4(),
                 namespace: "local".to_string(),
@@ -8155,6 +8170,7 @@ async fn health_reports_null_stalled_for_malformed_or_missing_failure_count() {
         let now = chrono::Utc::now().timestamp_micros();
         store
             .upsert_note(Note {
+                version: 1,
                 key: None,
                 id: uuid::Uuid::new_v4(),
                 namespace: "local".to_string(),
@@ -8467,6 +8483,7 @@ async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
             let store = rt.notes(&token).expect("notes store");
             let now = chrono::Utc::now().timestamp_micros();
             let note = Note {
+                version: 1,
                 key: None,
                 id: uuid::Uuid::new_v4(),
                 namespace: ns.to_string(),
@@ -8992,6 +9009,7 @@ async fn insert_thread_message(
     let store = rt.notes(&token).expect("notes store");
     store
         .upsert_note(khive_storage::note::Note {
+            version: 1,
             key: None,
             id,
             namespace: ns.to_string(),
@@ -10537,6 +10555,7 @@ async fn insert_i1422_message(
     }
     store
         .upsert_note(Note {
+            version: 1,
             key: None,
             id,
             namespace: "local".to_string(),

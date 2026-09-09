@@ -2524,7 +2524,8 @@ async fn dispatch_via_coordinator_inner(
                                 .note_hits
                                 .iter()
                                 .filter(|h| h.score.to_f64() >= request.min_score())
-                                .map(|h| {
+                                .filter_map(|h| {
+                                    let version = coord_result.note_versions.get(&h.note_id)?;
                                     let note_kind = coord_result.note_kinds.get(&h.note_id);
                                     let name =
                                         coord_result.note_names.get(&h.note_id).cloned().flatten();
@@ -2532,7 +2533,7 @@ async fn dispatch_via_coordinator_inner(
                                         .note_created_at
                                         .get(&h.note_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
-                                    json!({
+                                    Some(json!({
                                         "id": h.note_id.to_string(),
                                         "kind": note_kind,
                                         "note_kind": note_kind,
@@ -2542,7 +2543,8 @@ async fn dispatch_via_coordinator_inner(
                                         "title": h.title,
                                         "snippet": h.snippet,
                                         "created_at": created_at,
-                                    })
+                                        "version": version,
+                                    }))
                                 })
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
@@ -7207,6 +7209,7 @@ mod tests {
                 note_kinds: std::collections::HashMap::new(),
                 entity_created_at: std::collections::HashMap::new(),
                 note_created_at: std::collections::HashMap::new(),
+                note_versions: std::collections::HashMap::new(),
                 note_names: std::collections::HashMap::new(),
             }
         }
@@ -7280,6 +7283,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
+            note_versions: std::collections::HashMap::new(),
             note_names: std::collections::HashMap::new(),
         };
 
@@ -7316,6 +7320,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
+            note_versions: std::collections::HashMap::new(),
             note_names: std::collections::HashMap::new(),
         };
         let captured = SearchCapturedLog::default();

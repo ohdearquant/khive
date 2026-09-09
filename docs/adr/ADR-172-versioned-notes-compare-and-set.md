@@ -382,6 +382,15 @@ note is not a similarity candidate, while lexical indexing and listing are uncha
 without them stays unembedded; `embed=true` or `false` on an update overrides that once. ADR-174
 Amendment 3 gives stream entries the same field with `false` as the default.
 
+Clarification (2026-09-09): `update(embed=false)` on an embedded note performs no inference or new
+embedding insertion and deletes existing embedding and vector rows in the same writer transaction
+as the note update. The no-vector-index-work clause excludes synchronous ANN work: stale segment
+entries are removed at the next rebuild, without delaying the write, and cannot make the note a
+similarity candidate meanwhile. Acceptance covers embedded-to-off (zero vector rows, absent from
+similarity results, still present in lexical search and listing), unembedded-to-on (vector rows and
+similarity candidacy restored), and a deletion-removal mutation that makes the off-transition
+control fail.
+
 ### A2.4 The check is inside the transaction, proven by mutation
 
 `expected_version` (§2) and `fence` (§2b) are evaluated inside the writer transaction, as one

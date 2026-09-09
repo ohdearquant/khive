@@ -104,6 +104,8 @@ pub struct CoordSearchResult {
     /// `created_at` (micros) for each note hit, keyed by note UUID. Same
     /// parity purpose and resolution rule as `entity_created_at`.
     pub note_created_at: std::collections::HashMap<uuid::Uuid, i64>,
+    /// Persisted note revisions; a hit without hydrated metadata is not returned.
+    pub note_versions: std::collections::HashMap<uuid::Uuid, i64>,
     /// Stored `name` for each note hit, keyed by note UUID — distinct from
     /// `title` (the search-hit display title). Same parity purpose and
     /// resolution rule as `entity_created_at`.
@@ -406,6 +408,7 @@ pub(crate) mod tests {
                 note_kinds: std::collections::HashMap::from([(id, "observation".to_string())]),
                 entity_created_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
                 note_created_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
+                note_versions: std::collections::HashMap::from([(id, 1)]),
                 note_names: std::collections::HashMap::from([(
                     id,
                     Some("note result".to_string()),

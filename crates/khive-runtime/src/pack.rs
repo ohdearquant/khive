@@ -2158,6 +2158,24 @@ impl VerbRegistry {
         .await
     }
 
+    /// A create refusal may reveal its key holder only when the same caller can list it.
+    pub fn allows_note_key_disclosure(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        key: &str,
+    ) -> bool {
+        let request = GateRequest::new(
+            token.actor().clone(),
+            token.namespace().clone(),
+            "list",
+            serde_json::json!({"kind":"note", "note_kind":kind, "key_prefix":key}),
+        );
+        self.gate
+            .check(&request)
+            .is_ok_and(|decision| decision.is_allow())
+    }
+
     fn gate_request_with_identity(
         &self,
         verb: &str,

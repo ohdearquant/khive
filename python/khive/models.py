@@ -85,6 +85,8 @@ class Note(_Record):
     kind: str = "observation"
     subject: str
     content: str
+    key: str | None = None
+    version: int = Field(default=1, ge=1)
 
     @field_validator("kind", mode="before")
     def _validate_kind(cls, v: Any) -> str:
