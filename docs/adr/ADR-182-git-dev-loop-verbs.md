@@ -1,6 +1,6 @@
 # ADR-182: Git Verbs for the Dev Loop: Trees In and Out, Commit as Actor, Policy-Gated Push, Pull Requests
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-09, implemented by the git pack dev-loop verbs)
 - **Date**: 2026-09-08
 - **Extends**: [ADR-108](ADR-108-git-write-surface.md) and its Amendment 1 (write verbs over an
   allow-listed repo set, force-push denied, hooks disabled; all of it stands),

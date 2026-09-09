@@ -1,6 +1,6 @@
 # ADR-180: Tool Pack: Capability Registry, Ontological Discovery and Use Policy
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-09, implemented by the tool pack)
 - **Date**: 2026-09-08
 - **Extends**: [ADR-002](ADR-002-edge-ontology.md) (edge ontology; the registry reuses `project`,
   `concept` and the `implements` edge),
