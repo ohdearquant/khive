@@ -29,12 +29,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(unix)]
-use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
-#[cfg(unix)]
-use khive_types::Namespace;
-
-#[cfg(unix)]
 use crate::pack::RequestIdentity;
+#[cfg(unix)]
+use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
 
 /// Maximum frame size accepted in either direction.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -437,9 +434,9 @@ pub struct DaemonRequestFrame {
     /// The client's resolved extra read-visibility namespaces (ADR-007 Rule
     /// 3b), carried on the frame so the warm daemon widens read scope to
     /// match the caller's own configuration rather than its own baked
-    /// `visible_namespaces` (ADR-096). At ingress, a valid non-`local`
-    /// `actor_id` is included if absent, matching config loading; an empty
-    /// list therefore still includes that actor in default reads. Explicit
+    /// `visible_namespaces` (ADR-096). A non-`local` `actor_id` joins default
+    /// reads where the registry mints the token (ADR-007 Rev 4 Rule 3b), so
+    /// an empty list still includes that actor in default reads. Explicit
     /// `namespace=` operations remain scoped to exactly that namespace.
     #[serde(default)]
     pub visible_namespaces: Vec<String>,
@@ -1429,18 +1426,13 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
         // `actor_id`/`visible_namespaces` the client resolved (defaulting to
         // `None`/`vec![]` for an older, field-absent payload, which is
         // exactly the prior anonymous/no-extra-visibility behavior).
-        let mut visible_namespaces = frame.visible_namespaces.clone();
-        if let Some(actor_id) = frame.actor_id.as_deref().filter(|actor_id| {
-            *actor_id != Namespace::LOCAL
-                && Namespace::parse(actor_id).is_ok()
-                && !visible_namespaces.iter().any(|ns| ns == *actor_id)
-        }) {
-            visible_namespaces.push(actor_id.to_string());
-        }
+        // The caller's actor namespace joins default reads where the registry
+        // mints the token (ADR-007 Rev 4 Rule 3b), the one seam every identity
+        // path shares; the frame's list is forwarded as sent.
         let identity = RequestIdentity {
             namespace: frame.namespace.clone(),
             actor_id: frame.actor_id.clone(),
-            visible_namespaces,
+            visible_namespaces: frame.visible_namespaces.clone(),
             process_ref: frame.process_ref.clone(),
             request_id: frame.request_id,
         };
