@@ -181,6 +181,9 @@ Identity is the tuple `(write namespace, sending actor, client key)`. The logica
 exact validation: at most 512 UTF-8 bytes and no U+0000; empty strings and other control characters
 are allowed. Its physical encoding is `comm-v1:` followed by the compact JSON array
 `[namespace, actor, key]`, preserving tuple boundaries even when components contain colons.
+The 512-byte bound applies to the logical key and is validated at the verb boundary before
+encoding; the stored physical key is longer by the prefix, namespace, actor and JSON quoting, and
+the `notes.key` column (migration 028, `TEXT`) carries no store-level length bound.
 Recovery must pin the same namespace and actor.
 
 Public sends and replies store both notes in the caller namespace. Only the outbound note holds
@@ -213,12 +216,14 @@ projection. `comm.read` exposes it on its permitted inbound response; its outbou
 Read-back and replay do not promise transport delivery. Soft or hard deletion of the outbound
 claim releases the key; a later call may create another pair even if the old inbound survives.
 This is live-record reconciliation, not permanent exactly-once delivery. No migration is added;
-older binaries leave these keys and properties inert and do not support the new argument.
+older binaries leave these keys and properties inert and refuse a keyed call as bad params (unknown
+field `idempotency_key`), so a client is never silently unkeyed.
 
 Acceptance must demonstrate same-payload replay, different-payload refusal, concurrent send and
 reply, lost acknowledgement, tuple-boundary collisions, namespace/actor separation, approved
 self-send, unchanged unkeyed duplication, key validation, thread/parent normalization, mutation-free
-reply replay and both-copy read-back. Missing or altered recipient siblings must refuse without
+reply replay and both-copy read-back. A keyed call against a handler without the field must be
+refused as bad params, never accepted unkeyed (mixed-version control). Missing or altered recipient siblings must refuse without
 repair; ordinary read/delivery changes must allow replay. Deleting the outbound must demonstrate
 the stated release limit. Removing the final physical key claim must make the duplicate-population
 test fail; restore it and rerun. The amendment requires independent review and acceptance before
