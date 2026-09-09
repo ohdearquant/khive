@@ -96,6 +96,8 @@ impl Fixture {
         v["tree"].as_str().unwrap().to_string()
     }
 
+    // Read only by the kernel-denial test below, which is macOS-only.
+    #[cfg(target_os = "macos")]
     async fn blob_text(&self, r: &Value) -> String {
         use base64::Engine;
         let v = self.call("blob.get", json!({ "content_ref": r })).await;
