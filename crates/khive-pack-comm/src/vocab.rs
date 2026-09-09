@@ -137,7 +137,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 param_type: "uuid",
                 required: false,
                 description: "Full thread UUID matched against properties.thread_id in either box before offset and limit. Alternate UUID spellings are canonicalized; short prefixes are rejected.",
-                resolution_mode: IdResolutionMode::NotApplicable,
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {
                 name: "limit",
