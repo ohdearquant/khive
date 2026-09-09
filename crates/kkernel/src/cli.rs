@@ -55,6 +55,10 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Manage operator-configured tool sources.
+    #[command(subcommand)]
+    Mount(crate::mount::MountCommand),
+
     /// Build a working SQLite DB from .khive/kg/*.ndjson sources (issue #174).
     Sync(SyncArgs),
 
@@ -290,6 +294,7 @@ pub async fn cli_main() -> Result<()> {
     let command = resolve_command(args.exec, args.command);
 
     match command {
+        Command::Mount(command) => crate::mount::run(command).await,
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
         Command::Kg(k) => kg::run_kg(k).await,

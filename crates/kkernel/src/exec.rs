@@ -2443,7 +2443,8 @@ async fn build_local_fallback_server(
     if khive_cfg.backends.is_empty() {
         let rt = build_single_backend_runtime(cfg, khive_cfg).await?;
         let env_fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
-        Ok(KhiveMcpServer::new(rt)
+        Ok(KhiveMcpServer::new_with_mounts(rt)
+            .await
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_default_output_format(env_fmt))
     } else {

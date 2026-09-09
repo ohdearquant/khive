@@ -3142,6 +3142,8 @@ async fn build_registry_for_multi_backend_inner(
     )
     .map_err(|e| anyhow::anyhow!("pack registration: {e}"))?;
 
+    khive_mounts::register_mounts(&default_runtime, &mut builder).await?;
+
     let registry = builder
         .build()
         .map_err(|e| anyhow::anyhow!("registry build: {e}"))?;
@@ -3435,7 +3437,8 @@ pub async fn build_server_with_explicit_namespace(
                 .then(|| runtime.clone()),
         );
         let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
-        let server = KhiveMcpServer::new(runtime)
+        let server = KhiveMcpServer::new_with_mounts(runtime)
+            .await
             .map(|s| s.with_default_output_format(fmt))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         return Ok((server, schedule_rt));

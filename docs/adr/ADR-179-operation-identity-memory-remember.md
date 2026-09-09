@@ -1,6 +1,6 @@
 # ADR-179: Operation Identity on `memory.remember`: Keyed Create, Conflict Names the Holder
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-09, implemented by keyed memory.remember)
 - **Date**: 2026-09-08
 - **Extends**: [ADR-021](ADR-021-memory-pack.md) (memory pack: `memory.remember` creates one note
   of kind `memory`)

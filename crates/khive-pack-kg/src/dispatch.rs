@@ -166,7 +166,7 @@ impl PackRuntime for KgPack {
         // The `verbs` introspection verb has no namespace side-effect and is routed
         // before graph dispatch.
         if verb == "verbs" {
-            return handle_verbs(params, registry);
+            return handle_verbs(params, registry).await;
         }
 
         // KG graph operations honor the NamespaceToken minted by VerbRegistry::dispatch.

@@ -13,6 +13,7 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
     let previous_write_queue: Option<OsString> = std::env::var_os("KHIVE_WRITE_QUEUE");
     std::env::set_var("KHIVE_WRITE_QUEUE", "0");
     let runtime = KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
