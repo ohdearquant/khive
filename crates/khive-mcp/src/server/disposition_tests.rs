@@ -1009,6 +1009,12 @@ impl ErrorConstructorCensus {
     }
 }
 
+const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[(
+    "khive-mcp/src/daemon.rs",
+    "executable",
+    "khive-mcp/src/daemon/executable.rs",
+)];
+
 impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
         if !is_test_only(&item.attrs) {
@@ -1029,11 +1035,15 @@ impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
         if is_test_only(&item.attrs) {
             return;
         }
-        if item.content.is_none() {
-            // None of the current three production roots delegates its error
-            // builders to a separate file. A new such module must expand this
-            // census explicitly; silently visiting its empty AST would turn a
-            // source split into a coverage bypass.
+        if item.content.is_none()
+            && !(self.modules.is_empty()
+                && item.attrs.is_empty()
+                && EXTERNAL_ERROR_MODULES
+                    .iter()
+                    .any(|(source, module, _)| self.source == *source && item.ident == *module))
+        {
+            // External modules must join the scanned source set. Reject path
+            // overrides and nested declarations that would change that target.
             self.reject(&format!("unscanned production submodule {}; add its source to the census before delegating envelope construction", item.ident));
         }
         self.modules.push(item.ident.to_string());
@@ -1229,7 +1239,11 @@ fn a3_production_error_constructor_census_is_closed_and_runtime_match_is_total()
     ];
     let mut emitted = 0;
     let mut runtime_variants = std::collections::BTreeSet::new();
-    for source in sources {
+    for source in sources.into_iter().chain(
+        EXTERNAL_ERROR_MODULES
+            .iter()
+            .map(|(_, _, path)| manifest.parent().unwrap().join(path)),
+    ) {
         let census = census_source(&source);
         assert!(
             census.offenders.is_empty(),
@@ -1261,6 +1275,25 @@ fn a3_production_error_constructor_census_is_closed_and_runtime_match_is_total()
         })
         .expect("RuntimeError declaration must be present");
     assert_eq!(runtime_variants, variants, "every real runtime variant must have an explicit projection arm; adding a catch-all is not coverage");
+}
+
+#[test]
+fn a3_constructor_census_rejects_redirected_registered_modules() {
+    use syn::visit::Visit;
+    for source in [
+        r#"#[path = "other.rs"] mod executable;"#,
+        r#"mod nested { mod executable; }"#,
+    ] {
+        let mut census = ErrorConstructorCensus {
+            source: "khive-mcp/src/daemon.rs".into(),
+            ..Default::default()
+        };
+        census.visit_file(&syn::parse_file(source).unwrap());
+        assert!(
+            !census.offenders.is_empty(),
+            "module redirected outside the scanned population"
+        );
+    }
 }
 
 #[test]

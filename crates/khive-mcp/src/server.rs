@@ -1134,6 +1134,8 @@ impl ChannelLoopAdmission {
 #[derive(Clone)]
 pub struct KhiveMcpServer {
     registry: VerbRegistry,
+    #[cfg(unix)]
+    bridge_executable: Option<Arc<std::sync::Mutex<crate::daemon::executable::BridgeExecutable>>>,
     /// Namespace this registry was built for. The stdio client passes it to the
     /// daemon; a namespace mismatch triggers local-dispatch fallback.
     default_namespace: String,
@@ -1563,6 +1565,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(unix)]
+            bridge_executable: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: Some(runtime.clone()),
             runtime: Some(runtime),
@@ -1590,6 +1594,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(unix)]
+            bridge_executable: None,
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: None,
@@ -1616,6 +1622,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(unix)]
+            bridge_executable: None,
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: None,
@@ -1861,9 +1869,11 @@ impl KhiveMcpServer {
     /// shares rmcp's root cancellation token so disconnect cancels every
     /// per-request child before rmcp starts its graceful drain.
     #[cfg(unix)]
-    pub async fn serve_stdio(self) -> anyhow::Result<()> {
+    pub async fn serve_stdio(mut self) -> anyhow::Result<()> {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
+        self.bridge_executable = crate::daemon::executable::BridgeExecutable::current()
+            .map(|executable| Arc::new(std::sync::Mutex::new(executable)));
         let root = tokio_util::sync::CancellationToken::new();
         let idle_timeout = stdio_bridge_idle_timeout_from_env();
         let response_deadline = stdio_bridge_response_deadline_from_env()?;
@@ -3319,6 +3329,13 @@ impl KhiveMcpServer {
     }
 
     async fn request_with_cancellation(&self, p: RequestParams) -> Result<String, McpError> {
+        #[cfg(unix)]
+        if let Some(executable) = &self.bridge_executable {
+            executable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .check()?;
+        }
         if let Some(plan) = self.plan_response(&p)? {
             return Ok(plan);
         }
@@ -4968,6 +4985,47 @@ mod tests {
             error.data.as_ref().and_then(|data| data["reason"].as_str()),
             Some("parse-error")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
+    async fn bridge_executable_replacement_refuses_at_request_boundary() {
+        use crate::daemon::{
+            fire_pending_self_heal, reset_self_heal_counters, REEXEC_INVOKED_COUNT,
+        };
+
+        reset_self_heal_counters();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge");
+        std::fs::write(&path, b"binary image").unwrap();
+        let executable = crate::daemon::executable::BridgeExecutable::at(path.clone()).unwrap();
+        let mut server = KhiveMcpServer::from_registry(VerbRegistryBuilder::new().build().unwrap());
+        server.bridge_executable = Some(Arc::new(std::sync::Mutex::new(executable)));
+        std::fs::copy(&path, dir.path().join("next")).unwrap();
+        std::fs::rename(dir.path().join("next"), path).unwrap();
+
+        for params in [
+            RequestParams {
+                ops: "stats()".to_string(),
+                plan: Some(true),
+                ..Default::default()
+            },
+            RequestParams {
+                ops: "stats(".to_string(),
+                ..Default::default()
+            },
+        ] {
+            let error = server.request_with_cancellation(params).await.expect_err(
+                "the stale stdio bridge must refuse before planning, parsing or dispatch",
+            );
+            assert_eq!(error.data.unwrap()["reason"], "executable_replaced");
+        }
+        assert_eq!(REEXEC_INVOKED_COUNT.load(Ordering::SeqCst), 0);
+        fire_pending_self_heal();
+        fire_pending_self_heal();
+        assert_eq!(REEXEC_INVOKED_COUNT.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -133,6 +133,21 @@ never reached and strict mode rejected the fallback" from every other
 daemon-forward `McpError` (protocol mismatch, oversized frame, ambiguous
 post-write outcome), which stay RPC-level errors.
 
+## Bridge executable replacement
+
+The Unix stdio bridge snapshots its resolved executable path and device/inode
+before configuration and database boot; filesystems without an inode use mtime.
+Each request checks the installed file before admission, at most once per second
+across requests. A replacement returns the protocol recovery error shape with
+`reason: "executable_replaced"` and a retry instruction, then re-execs the saved
+path through the existing post-flush hook. Missing files or failed metadata reads
+only produce a debug log. Daemon and one-shot execution do not activate this guard.
+
+Each resumed process captures its own image again, so repeated installations can
+heal without changing the wire protocol version. The protocol mismatch trigger
+and its resumed-generation loop-breaker remain separate and unchanged. The same
+concurrent-flush limitation below applies to executable replacement.
+
 ## `trigger_bridge_self_heal` — concurrency accepted-risk note (#714)
 
 Called from both `forward_or_spawn`'s `ProtocolMismatch` arms (first-attempt
