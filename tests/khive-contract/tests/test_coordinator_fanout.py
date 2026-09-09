@@ -40,7 +40,7 @@ from typing import Iterator
 
 import pytest
 
-from khive_contract.client import KhiveMcpSession
+from khive_contract.client import KhiveMcpSession, error_text
 
 VERBS_UNDER_TEST = {"create", "search", "link"}
 
@@ -421,7 +421,7 @@ def test_search_malformed_tags_rejected_as_per_op_error(
         "tags=[42] (non-string element) must produce ok=false per-op error; "
         f"got ok={first.get('ok')!r}. Full entry: {first}"
     )
-    assert first.get("error"), (
+    assert error_text(first), (
         "per-op error entry must carry a non-empty error message string; "
         f"got: {first}"
     )
