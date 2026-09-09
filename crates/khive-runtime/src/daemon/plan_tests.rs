@@ -82,7 +82,16 @@ async fn plan_daemon_protocol_rejects_previous_version_without_dispatch() {
     }))
     .await;
     assert!(!response.ok);
-    assert!(response.version_mismatch);
+    assert!(
+        !response.version_mismatch,
+        "a client below this daemon's protocol is refused with the flag clear: it is \
+         reserved for a client that is ahead, and deployed bridges recover on this shape"
+    );
+    assert_eq!(
+        response.error_detail.as_ref().unwrap()["code"],
+        "version_mismatch",
+        "the refusal stays typed even though the flag is clear"
+    );
     assert_eq!(calls, 0);
 }
 

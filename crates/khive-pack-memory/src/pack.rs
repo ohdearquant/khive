@@ -14,7 +14,7 @@ use khive_types::{HandlerDef, IdResolutionMode, Pack, ParamDef, VerbCategory, Vi
 
 use khive_brain_core::BalancedRecallState;
 
-use crate::ann::{new_shared, SharedAnn, MEMORY_SCHEMA_PLAN_STMTS};
+use crate::ann::{new_shared_for_role, SharedAnn, MEMORY_SCHEMA_PLAN_STMTS};
 use crate::config::RecallConfig;
 use crate::query_cache::QueryEmbeddingCache;
 
@@ -43,11 +43,22 @@ impl MemoryPack {
     ///
     /// See `crates/khive-pack-memory/docs/api/pack-integration.md`.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        Self::new_with_index_role(runtime, true)
+    }
+
+    /// As [`Self::new`], but states whether this process may build the memory
+    /// index from the full corpus. The serving factory passes the daemon role:
+    /// a corpus build is minutes of CPU and a segment rewrite every other reader
+    /// on the index root must absorb, so a short-lived client serves what is
+    /// persisted and leaves the build to the daemon. Direct constructions —
+    /// admin reindex, benches, tests — build, because building is what they are
+    /// for.
+    pub fn new_with_index_role(runtime: KhiveRuntime, builds_corpus_indexes: bool) -> Self {
         let brain_profile = runtime.config().brain_profile.clone();
         Self {
             runtime,
             config: Mutex::new(RecallConfig::default()),
-            ann: new_shared(),
+            ann: new_shared_for_role(builds_corpus_indexes),
             query_cache: QueryEmbeddingCache::with_default_capacity(),
             recall_state: Mutex::new(BalancedRecallState::new(10_000)),
             brain_profile,
@@ -405,7 +416,10 @@ impl khive_runtime::PackFactory for MemoryPackFactory {
     }
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
-        Box::new(MemoryPack::new(runtime))
+        Box::new(MemoryPack::new_with_index_role(
+            runtime,
+            khive_runtime::daemon::is_warm_index_host(),
+        ))
     }
 }
 

@@ -57,10 +57,18 @@ impl Pack for KnowledgePack {
 impl KnowledgePack {
     /// Create a new pack bound to the given runtime, initializing a shared ANN index.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        Self::new_with_index_role(runtime, true)
+    }
+
+    /// As [`Self::new`], but states whether this process may build the atom
+    /// index from the full corpus. See `MemoryPack::new_with_index_role` for the
+    /// reasoning; the two packs share one index root per model family and the
+    /// same cost.
+    pub fn new_with_index_role(runtime: KhiveRuntime, builds_corpus_indexes: bool) -> Self {
         let brain_profile = runtime.config().brain_profile.clone();
         Self {
             runtime,
-            ann: vamana::new_shared(),
+            ann: vamana::new_shared_for_role(builds_corpus_indexes),
             section_posteriors: Mutex::new(HashMap::new()),
             brain_profile,
         }
@@ -79,7 +87,10 @@ impl khive_runtime::PackFactory for KnowledgePackFactory {
     }
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
-        Box::new(KnowledgePack::new(runtime))
+        Box::new(KnowledgePack::new_with_index_role(
+            runtime,
+            khive_runtime::daemon::is_warm_index_host(),
+        ))
     }
 
     fn create_resolver(

@@ -226,3 +226,64 @@ Acceptance arms added: 27 two processes resolved as different actors get differe
 references for the same call, a process whose resolved actor has no row refuses `actor_unmapped`
 while the same call from a mapped actor proceeds (control), and the receipt's `actor` equals the
 resolved label in every case.
+
+## Amendment 4 (2026-09-08): symbolic refs, reconcile evidence, the tool pack at call time, gates on reads
+
+Adopted during the first implementation of the local slice, from findings the implementer read off
+the source before running anything. Each item records a ruling already given; nothing above is
+withdrawn.
+
+1. **Symbolic refs.** Every `update-ref` compare-and-swap runs with `--no-deref`, so the compare and
+   the move apply to the named ref itself; a branch ref observed as symbolic refuses before any move
+   with reason `ref_symbolic`. The expected-old semantics of Amendment 2 item 1 are unchanged.
+2. **Reconcile evidence.** Every ref move runs `update-ref --create-reflog -m
+   khive-receipt:<receipt-id>`. `git.reconcile` settles an `unknown` row to `committed` only when the
+   reflog of the moved ref carries the marker for that receipt together with the new sha. Equality of
+   the current head with the intended sha never settles anything, because a rival can install the
+   same sha (a deterministic commit, a concurrent create), and a pruned or absent reflog leaves
+   `unknown`.
+3. **The tool pack at call time.** The git pack keeps its kg dependency for the legacy verbs. The
+   verbs of this record require the tool pack when called and, when its tables are absent, fail
+   closed after the gate evaluated, with reason `policy_unavailable` and receipt
+   `policy: {decision: "deny", source: "policy_unavailable", id: null}`, so `policy` is null exactly
+   when the gate denied (Amendment 2 item 7). A boot-time dependency is a later decision.
+4. **Gates on reads, and `git.branch` without a credential.** `git.checkout`, `git.diff` and
+   `git.gates` gate on a repo-only match of the allow-list, and `gate.id` is the lowest matching entry
+   index; `git.reconcile` gates on the repo stored in the receipt; `git.receipts` is an audit read
+   scoped to the calling actor, is not filtered by the current allow-list (removing a row never hides
+   history) and writes no receipt of its own, as `git.gates` writes none. `git.branch` takes no
+   credential and no actor row; its receipt carries `credential: null`.
+5. **Daemon fingerprint.** The daemon's configuration fingerprint covers the whole `[git_write]`
+   section (allowed rows, actors, resolver, faults), so any change to it retires the running daemon.
+
+Acceptance arms added: 28 a branch ref made symbolic refuses `git.branch` and `git.commit` with
+`ref_symbolic` and nothing moves, while the same call on a plain ref proceeds (control); 29 a receipt
+left `unknown` after a rival installed the intended sha stays `unknown` under `git.reconcile`, and
+one whose reflog carries its marker settles to `committed`; 30 with the tool pack absent,
+`git.commit` with a tree refuses `policy_unavailable` with the gate decision recorded, while the
+legacy `git.commit` with `paths` still runs.
+
+## Amendment 5 (2026-09-08): reconcile needs the marker and the ref, policy through the registry
+
+Adopted the same day as Amendment 4, from two further source readings by the implementer. Item 1
+tightens Amendment 4 item 2; item 2 fixes the mechanism behind Amendment 4 item 3.
+
+1. **The marker is necessary, not sufficient.** Git's files backend appends the reflog entry before
+   it installs the ref, and a failed install does not remove the entry, so a process lost between the
+   two leaves the marker with no ref move. `git.reconcile` settles an `unknown` row to `committed`
+   only when both hold: the reflog of the ref carries `khive-receipt:<receipt-id>` with the new sha,
+   and that sha is the current head of the ref or an ancestor of it. A marker without the ref
+   installed, and a head equal to the sha without the marker, both leave `unknown`. No claim of
+   crash atomicity is made anywhere in help or receipts.
+2. **Policy through the registry.** Pack backends may differ (ADR-028), so a decision read through
+   the git pack's own backend handle could see stale tool rows. The verbs of this record obtain their
+   policy decision through the registry dispatch of `tool.check`, carrying the caller's identity and
+   namespace, never by reading the tool tables directly; the decision is taken before any write
+   begins and no writer or lock is held across the dispatch. A failed or absent dispatch is the
+   receipted `policy_unavailable` of Amendment 4 item 3.
+
+Acceptance arms added: 31 a hand-appended reflog entry carrying a receipt's marker while the ref
+still points elsewhere leaves that receipt `unknown` under `git.reconcile`, and the same marker with
+the ref advanced past the sha settles to `committed`; 32 with the git and tool packs on different
+backends and a stale allow row planted in the git backend beside a deny row in the tool backend, the
+verb refuses with the tool pack's decision and id.
