@@ -444,8 +444,20 @@ impl GitPack {
                 return Err(Failure::refused("fork_policy_denied"));
             }
         }
+        let last_pusher = if verb == "git.pr_merge" || params["verdict"] == "approve" {
+            self.last_pusher(receipt, &pr, &expected).await?
+        } else {
+            Value::Null
+        };
+        receipt.result = json!({"number":n, "head_sha":expected, "last_pusher":last_pusher});
         if verb == "git.pr_review" {
             if params["verdict"] == "approve" {
+                if last_pusher["platform_identity"]
+                    .as_str()
+                    .is_some_and(|pusher| login.eq_ignore_ascii_case(pusher))
+                {
+                    return Err(Failure::refused("last_pusher"));
+                }
                 // A different runtime actor on the same platform account is not a reviewer.
                 if login.eq_ignore_ascii_case(author) {
                     return Err(Failure::refused("self_approval"));
@@ -462,7 +474,7 @@ impl GitPack {
                 "request_changes" => "REQUEST_CHANGES",
                 _ => "COMMENT",
             };
-            receipt.result = json!({"number":n, "head_sha":expected, "reviewer":login});
+            receipt.result["reviewer"] = json!(login);
             receipts::persist(self.runtime(), receipt).await?;
             let reply = self
                 .api(
@@ -492,13 +504,31 @@ impl GitPack {
             {
                 return Err(Failure::unknown("remote_response"));
             }
-            let result = json!({"review_id":id, "head_sha":sha, "state":state});
+            let result =
+                json!({"review_id":id, "head_sha":sha, "state":state, "last_pusher":last_pusher});
             receipt.result = result.clone();
             return Ok(result);
         }
-        self.require_review(secret, &target.slug, n, &expected, author)
+        let review = self
+            .remote_transport()
+            .review_decision(secret, &target.slug, n)
             .await?;
-        receipt.result = json!({"number":n, "merged_head_sha":expected, "slug":target.slug, "remote":target.remote});
+        receipt.result["review_decision"] = json!({
+            "source":"github.pullRequest.reviewDecision",
+            "value":review.get("reviewDecision"),
+            "head_sha":review.get("headRefOid"),
+        });
+        if observed_sha(&review, "/headRefOid")? != expected {
+            return Err(Failure::refused("expected_head_mismatch"));
+        }
+        if review.get("reviewDecision").and_then(Value::as_str) != Some("APPROVED") {
+            return Err(Failure::refused("review_decision"));
+        }
+        self.require_review(secret, &target.slug, n, &expected, author, &last_pusher)
+            .await?;
+        receipt.result["merged_head_sha"] = json!(expected);
+        receipt.result["slug"] = json!(target.slug);
+        receipt.result["remote"] = json!(target.remote);
         receipts::persist(self.runtime(), receipt).await?;
         let merged = self.api(secret, "PUT", endpoint(&target.slug, &format!("pulls/{n}/merge")), Some(json!({"merge_method":params["method"], "commit_title":params["subject"], "commit_message":params["body"], "sha":expected}))).await?;
         match merged.get("merged").and_then(Value::as_bool) {
@@ -507,9 +537,8 @@ impl GitPack {
             None => return Err(Failure::unknown("remote_response")),
         }
         let sha = observed_sha(&merged, "/sha").map_err(after_effect)?;
-        let result = json!({"number":n,"merged_head_sha":expected,"merged_sha":sha,"slug":target.slug,"remote":target.remote});
-        receipt.result = result.clone();
-        Ok(result)
+        receipt.result["merged_sha"] = json!(sha);
+        Ok(receipt.result.clone())
     }
 
     async fn push_exact(
@@ -644,6 +673,70 @@ impl GitPack {
         Ok(false)
     }
 
+    /// Cross-actor evidence is intentionally restricted to this namespace and
+    /// the PR's exact head repository/ref/SHA, including fork heads.
+    async fn last_pusher(
+        &self,
+        receipt: &Receipt,
+        pr: &Value,
+        expected: &str,
+    ) -> Result<Value, Failure> {
+        let slug = observed_string(pr, "/head/repo/full_name")?;
+        let branch = observed_string(pr, "/head/ref")?;
+        let remote = format!("https://github.com/{slug}").to_ascii_lowercase();
+        let mut reader = self
+            .runtime()
+            .sql()
+            .reader()
+            .await
+            .map_err(RuntimeError::from)?;
+        let rows = reader.query_all(SqlStatement {
+            sql: "SELECT id, repo, disposition, credential FROM git_receipts \
+                  WHERE namespace=?1 AND verb='git.push' AND disposition IN ('committed','unknown') \
+                  AND lower(json_extract(result,'$.sha'))=?2 AND json_extract(result,'$.ref')=?3 \
+                  AND lower(json_extract(result,'$.remote')) IN (?4,?5) \
+                  ORDER BY rowid DESC LIMIT 1001".into(),
+            params: vec![SqlValue::Text(receipt.namespace.clone()),SqlValue::Text(expected.into()),
+                SqlValue::Text(format!("refs/heads/{branch}")),SqlValue::Text(remote.clone()),
+                SqlValue::Text(format!("{remote}.git"))],
+            label: Some("git_last_pusher".into()),
+        }).await.map_err(RuntimeError::from)?;
+        // No SQL reader is held across local Git process execution.
+        drop(reader);
+        for row in rows.iter().take(1000) {
+            let column = |key| match row.get(key) {
+                Some(SqlValue::Text(value)) => Ok(value.as_str()),
+                _ => Err(Failure::refused("push_evidence_invalid")),
+            };
+            let id = column("id")?;
+            if column("disposition")? != "committed"
+                && !local_git::operation_recorded(Path::new(column("repo")?), branch, expected, id)
+                    .await
+                    .unwrap_or(false)
+            {
+                // A durable intent or a lost transport ACK is not push evidence.
+                continue;
+            }
+            let credential = match row.get("credential") {
+                Some(SqlValue::Text(value)) => serde_json::from_str::<Value>(value)
+                    .map_err(|_| Failure::refused("push_evidence_invalid"))?,
+                Some(SqlValue::Json(value)) => value.clone(),
+                _ => return Err(Failure::refused("push_evidence_invalid")),
+            };
+            let login = credential
+                .get("platform_identity")
+                .and_then(Value::as_str)
+                .filter(|login| !login.is_empty())
+                .ok_or_else(|| Failure::refused("push_evidence_invalid"))?;
+            return Ok(json!({"state":"known","source":"git.push.receipt",
+                "platform_identity":login,"push_receipt_id":id}));
+        }
+        if rows.len() > 1000 {
+            return Err(Failure::refused("push_evidence_limit"));
+        }
+        Ok(json!({"state":"unknown","reason":"no_push_receipt"}))
+    }
+
     async fn require_review(
         &self,
         secret: &str,
@@ -651,6 +744,7 @@ impl GitPack {
         number: u64,
         expected: &str,
         author: &str,
+        last_pusher: &Value,
     ) -> Result<(), Failure> {
         let mut latest = BTreeMap::<String, (String, String)>::new();
         for page in 1..=10 {
@@ -677,10 +771,23 @@ impl GitPack {
                 }
             }
             if rows.len() < 100 {
-                if latest.iter().any(|(login, (state, sha))| {
-                    !login.eq_ignore_ascii_case(author) && state == "APPROVED" && sha == expected
+                let approved: Vec<_> = latest
+                    .iter()
+                    .filter(|(login, (state, sha))| {
+                        !login.eq_ignore_ascii_case(author)
+                            && state == "APPROVED"
+                            && sha == expected
+                    })
+                    .collect();
+                if approved.iter().any(|(login, _)| {
+                    !last_pusher["platform_identity"]
+                        .as_str()
+                        .is_some_and(|pusher| login.eq_ignore_ascii_case(pusher))
                 }) {
                     return Ok(());
+                }
+                if !approved.is_empty() {
+                    return Err(Failure::refused("last_pusher"));
                 }
                 return Err(Failure::refused("missing_review"));
             }
@@ -740,7 +847,9 @@ impl GitPack {
                     && observed_sha(&pr, "/head/sha")?
                         == required(&prior.inputs, "expected_head")?.to_ascii_lowercase()
                 {
-                    prior.result = json!({"number":n,"merged_head_sha":pr["head"]["sha"],"merged_sha":observed_sha(&pr,"/merge_commit_sha")?});
+                    prior.result["number"] = json!(n);
+                    prior.result["merged_head_sha"] = pr["head"]["sha"].clone();
+                    prior.result["merged_sha"] = json!(observed_sha(&pr, "/merge_commit_sha")?);
                     true
                 } else {
                     false

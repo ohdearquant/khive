@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use zeroize::Zeroizing;
@@ -38,6 +38,13 @@ pub struct PushRequest {
 #[async_trait]
 pub trait RemoteTransport: Send + Sync {
     async fn api(&self, token: &str, request: ApiRequest) -> Result<Value, RemoteError>;
+    /// Read the platform's aggregate review decision and the head it describes.
+    async fn review_decision(
+        &self,
+        token: &str,
+        slug: &str,
+        number: u64,
+    ) -> Result<Value, RemoteError>;
     async fn remote_ref(
         &self,
         token: &str,
@@ -162,11 +169,14 @@ fn valid_oid(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-#[async_trait]
-impl RemoteTransport for GhTransport {
-    async fn api(&self, token: &str, request: ApiRequest) -> Result<Value, RemoteError> {
+impl GhTransport {
+    async fn call_api(
+        &self,
+        token: &str,
+        request: ApiRequest,
+        effect: bool,
+    ) -> Result<Value, RemoteError> {
         let dir = tempfile::tempdir().map_err(|_| RemoteError::Unavailable)?;
-        let effect = request.method != "GET";
         let mut command = isolated("gh");
         command
             .current_dir(dir.path())
@@ -194,6 +204,44 @@ impl RemoteTransport for GhTransport {
         command.arg(request.path);
         let (success, bytes) = run(command, input, effect).await?;
         parse_api_response(success, bytes, token, effect)
+    }
+}
+
+#[async_trait]
+impl RemoteTransport for GhTransport {
+    async fn api(&self, token: &str, request: ApiRequest) -> Result<Value, RemoteError> {
+        let effect = request.method != "GET";
+        self.call_api(token, request, effect).await
+    }
+
+    async fn review_decision(
+        &self,
+        token: &str,
+        slug: &str,
+        number: u64,
+    ) -> Result<Value, RemoteError> {
+        let (owner, name) = slug.split_once('/').ok_or(RemoteError::InvalidResponse)?;
+        let number = i32::try_from(number).map_err(|_| RemoteError::InvalidResponse)?;
+        let response = self.call_api(token, ApiRequest {
+            method: "POST",
+            path: "graphql".into(),
+            body: Some(json!({
+                "query": "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { headRefOid reviewDecision } } }",
+                "variables": {"owner":owner, "name":name, "number":number}
+            })),
+        }, false).await?;
+        // GraphQL can return HTTP 200 with partial data and errors. Neither that
+        // nor a missing/inaccessible PR is an affirmative review decision.
+        if response.get("errors").is_some_and(|errors| {
+            !errors.is_null() && errors.as_array().is_none_or(|errors| !errors.is_empty())
+        }) {
+            return Err(RemoteError::InvalidResponse);
+        }
+        response
+            .pointer("/data/repository/pullRequest")
+            .filter(|pr| pr.is_object())
+            .cloned()
+            .ok_or(RemoteError::InvalidResponse)
     }
 
     async fn remote_ref(
@@ -351,6 +399,87 @@ fn redact(value: Value, token: &str) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graphql_review_read_binds_variables_and_rejects_partial_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::cache::ENV_MUTEX.lock().await;
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                if let Some(path) = &self.0 {
+                    std::env::set_var("PATH", path);
+                } else {
+                    std::env::remove_var("PATH");
+                }
+            }
+        }
+        let _restore = RestorePath(std::env::var_os("PATH"));
+        let dir = tempfile::tempdir().unwrap();
+        let quoted = |name: &str| {
+            format!(
+                "'{}'",
+                dir.path()
+                    .join(name)
+                    .display()
+                    .to_string()
+                    .replace('\'', "'\\''")
+            )
+        };
+        std::fs::write(dir.path().join("gh"), format!(
+            "#!/bin/sh\n[ \"$GH_TOKEN\" = 'fixture-secret' ] || exit 91\n/bin/cat > {}\nprintf '%s\\n' \"$@\" > {}\n/bin/cat {}\n",
+            quoted("request"), quoted("argv"), quoted("response"),
+        )).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("gh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::env::set_var("PATH", dir.path());
+        let pr = json!({"headRefOid":"a".repeat(40),"reviewDecision":"APPROVED"});
+        let data = json!({"data":{"repository":{"pullRequest":pr}}});
+        for (response, expected) in [
+            (format!("HTTP/2.0 200 OK\n\n{data}"), Ok(pr.clone())),
+            (
+                format!(
+                    "HTTP/2.0 200 OK\n\n{}",
+                    json!({"data":data["data"],"errors":[{"message":"denied fixture-secret"}]})
+                ),
+                Err(RemoteError::InvalidResponse),
+            ),
+            (
+                "HTTP/2.0 200 OK\n\n{\"data\":{\"repository\":null}}".into(),
+                Err(RemoteError::InvalidResponse),
+            ),
+            (
+                "HTTP/2.0 503 Unavailable\n\n{}".into(),
+                Err(RemoteError::Unavailable),
+            ),
+        ] {
+            std::fs::write(dir.path().join("response"), response).unwrap();
+            let actual = GhTransport
+                .review_decision("fixture-secret", "owner/project", 42)
+                .await;
+            assert_eq!(actual, expected);
+            assert!(!format!("{actual:?}").contains("fixture-secret"));
+            let request: Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("request")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                request["variables"],
+                json!({"owner":"owner","name":"project","number":42})
+            );
+            let query = request["query"].as_str().unwrap();
+            assert!(query.starts_with("query("));
+            assert!(query.contains("headRefOid reviewDecision"));
+            assert!(!request.to_string().contains("fixture-secret"));
+            let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+            assert!(argv.contains("--method\nPOST\n"));
+            assert!(argv.ends_with("--input\n-\ngraphql\n"));
+            assert!(!argv.contains("fixture-secret"));
+        }
+    }
 
     #[test]
     fn api_redacts_json_escaped_credentials_in_keys_and_values() {
