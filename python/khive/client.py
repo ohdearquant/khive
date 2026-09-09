@@ -225,7 +225,7 @@ class _Notes:
         note: Note | None = None,
         /,
         *,
-        fence: dict[str, Any] | None = None,
+        fence: dict[str, Any] | list[dict[str, Any]] | None = None,
         embed: bool | None = None,
         **fields: Any,
     ) -> Note:

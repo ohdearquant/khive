@@ -27,11 +27,76 @@ impl NoteFence {
     }
 }
 
+/// An object retains the original refusal shape; a list identifies its failing entry.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum NoteFences {
+    One(NoteFence),
+    Many(Vec<NoteFence>),
+}
+
+impl From<NoteFence> for NoteFences {
+    fn from(fence: NoteFence) -> Self {
+        Self::One(fence)
+    }
+}
+
+impl NoteFences {
+    pub fn entries(&self) -> &[NoteFence] {
+        match self {
+            Self::One(fence) => std::slice::from_ref(fence),
+            Self::Many(fences) => fences,
+        }
+    }
+
+    pub fn validate(&self) -> RuntimeResult<()> {
+        if self.entries().is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "fence list must not be empty".into(),
+            ));
+        }
+        let mut seen = std::collections::HashMap::new();
+        for (index, fence) in self.entries().iter().enumerate() {
+            fence.validate()?;
+            if let Some(first) = seen.insert((&fence.kind, &fence.key), index) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "duplicate fence (kind, key) at indices {first} and {index}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for NoteFences {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            One(NoteFence),
+            Many(Vec<NoteFence>),
+        }
+        let fences = match Shape::deserialize(deserializer)? {
+            Shape::One(fence) => Self::One(fence),
+            Shape::Many(fences) => Self::Many(fences),
+        };
+        fences.validate().map_err(serde::de::Error::custom)?;
+        Ok(fences)
+    }
+}
+
+/// Missing optional fences default to None; explicitly supplied null is invalid.
+pub fn deserialize_optional_fences<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<NoteFences>, D::Error> {
+    NoteFences::deserialize(deserializer).map(Some)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct NoteWriteOptions {
     pub key: Option<String>,
     pub expected_version: Option<i64>,
-    pub fence: Option<NoteFence>,
+    pub fence: Option<NoteFences>,
     pub embed: Option<bool>,
 }
 
@@ -57,7 +122,7 @@ pub(crate) struct NoteWriteGuard {
     pub namespace: String,
     pub target_id: Uuid,
     pub expected_version: Option<i64>,
-    pub fence: Option<NoteFence>,
+    pub fence: Option<NoteFences>,
     pub create_key: Option<(String, String)>,
 }
 
@@ -167,6 +232,7 @@ pub enum NoteWriteConflict {
         key: String,
         expected: i64,
         current: Option<i64>,
+        index: Option<usize>,
     },
     Key {
         key: String,
@@ -189,6 +255,7 @@ impl NoteWriteConflict {
                 key,
                 expected,
                 current,
+                index,
             } => {
                 let mut fields = vec![
                     ("reason", "fence_conflict".into()),
@@ -197,6 +264,9 @@ impl NoteWriteConflict {
                 ];
                 if let Some(current) = current {
                     fields.push(("current_version", current.to_string()));
+                }
+                if let Some(index) = index {
+                    fields.push(("index", index.to_string()));
                 }
                 ("note fence precondition failed", fields)
             }
@@ -226,30 +296,34 @@ impl NoteWriteGuard {
         &self,
         writer: &mut dyn SqlWriter,
     ) -> Result<Option<NoteWriteConflict>, StorageError> {
-        let Some(fence) = &self.fence else {
+        let Some(fences) = &self.fence else {
             return Ok(None);
         };
-        let current = writer.query_scalar(statement(
+        for (index, fence) in fences.entries().iter().enumerate() {
+            let current = writer.query_scalar(statement(
             "SELECT version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL",
             vec![SqlValue::Text(self.namespace.clone()), SqlValue::Text(fence.kind.clone()),
                  SqlValue::Text(fence.key.clone())],
         )).await?;
-        let current = match current {
-            None => None,
-            Some(SqlValue::Integer(version)) => Some(version),
-            Some(_) => {
-                return Err(StorageError::Internal(
-                    "invalid persisted note version".into(),
-                ))
+            let current = match current {
+                None => None,
+                Some(SqlValue::Integer(version)) => Some(version),
+                Some(_) => {
+                    return Err(StorageError::Internal(
+                        "invalid persisted note version".into(),
+                    ))
+                }
+            };
+            if current != Some(fence.expected_version) {
+                return Ok(Some(NoteWriteConflict::Fence {
+                    key: fence.key.clone(),
+                    expected: fence.expected_version,
+                    current,
+                    index: matches!(fences, NoteFences::Many(_)).then_some(index),
+                }));
             }
-        };
-        Ok(
-            (current != Some(fence.expected_version)).then(|| NoteWriteConflict::Fence {
-                key: fence.key.clone(),
-                expected: fence.expected_version,
-                current,
-            }),
-        )
+        }
+        Ok(None)
     }
 
     pub(crate) async fn classify_refusal(
@@ -370,8 +444,10 @@ impl KhiveRuntime {
         if options.key.is_some() {
             return Err(RuntimeError::InvalidInput("key is immutable".into()));
         }
-        if let Some(fence) = &options.fence {
-            self.validate_note_kind(&fence.kind)?;
+        if let Some(fences) = &options.fence {
+            for fence in fences.entries() {
+                self.validate_note_kind(&fence.kind)?;
+            }
         }
         let expected_updated_at = snapshot.updated_at;
         let expected_deleted_at = snapshot.deleted_at;
@@ -491,8 +567,10 @@ impl KhiveRuntime {
                 "expected_version applies only to update".into(),
             ));
         }
-        if let Some(fence) = &options.fence {
-            self.validate_note_kind(&fence.kind)?;
+        if let Some(fences) = &options.fence {
+            for fence in fences.entries() {
+                self.validate_note_kind(&fence.kind)?;
+            }
         }
         if let Some(prefix) = embedding_content {
             if prefix.is_empty() || prefix.len() >= content.len() || !content.starts_with(prefix) {

@@ -116,6 +116,8 @@ Three verbs, registered by the kg pack because the entries are its notes:
     checked only when supplied. Whether an unfenced append to a stream that belongs to a leased run
     should be refused is policy above khive: the layer that knows which streams belong to which run
     decides it, and passes the fence when it applies.
+    Clarification (2026-09-09): ADR-172 Amendment 3 adds a non-empty ordered list of fence objects;
+    list refusals include a zero-based string `details.index`, including for a one-element list.
 - `stream.read(stream, after=0, limit=1000, namespace=None)` returns
   `{"entries": [{"seq", "id", "record", "created_at"}...], "head_seq": H, "next_after": N | null}`:
   the entries with `seq > after` in ascending `seq`, at most `limit` of them, straight off the primary

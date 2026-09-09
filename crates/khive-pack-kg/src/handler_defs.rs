@@ -24,7 +24,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
             ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "record", param_type: "JSON value", required: true, description: "Required JSON value, including scalar or null; stored as note content.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "expected_seq", param_type: "integer", required: false, description: "Append only if this entry would receive this sequence; conflict details include next_seq.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "fence", param_type: "object", required: false, description: "Reserved: any supplied fence, including null, is refused until the later slice with versioned leases.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "A fence object {key, kind, expected_version} or a non-empty list of distinct (kind, key) objects, checked in order in the same writer transaction. Missing or stale returns fence_conflict; list refusals also carry string index (zero-based). Explicit null is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "note_kind", param_type: "string", required: false, description: "Registered note kind; defaults to observation.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "tags", param_type: "array of string", required: false, description: "Immutable entry tags stored in properties.tags.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
@@ -61,7 +61,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
         params: &[
             ParamDef { name: "key", param_type: "string", required: false, description: "Singleton notes only: immutable live namespace/kind identity, at most 512 UTF-8 bytes without U+0000. An occupied key fails with key_conflict; existing_id is disclosed only when list is allowed.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "embed", param_type: "bool", required: false, description: "Singleton notes only: defaults false for head and true otherwise. False skips inference and vector insertion while retaining lexical indexing.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "fence", param_type: "object", required: false, description: "Singleton notes only: {key, kind, expected_version}; the primary-namespace fence must exist at that positive version inside the writer transaction or the whole write fails with fence_conflict.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version} or a non-empty list of distinct (kind, key) objects, checked in order in the same writer transaction. Missing or stale returns fence_conflict; list refusals also carry string index (zero-based). Explicit null is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "kind",
                 param_type: "string",
@@ -447,7 +447,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
         category: VerbCategory::Declaration,
         params: &[
             ParamDef { name: "expected_version", param_type: "integer", required: false, description: "Notes only: positive persisted version required inside the writer transaction. A stale version fails without mutation, with reason=version_conflict and expected_version/current_version details. Omission preserves unconditional caller semantics.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "fence", param_type: "object", required: false, description: "Notes only: {key, kind, expected_version}; primary-namespace fence checked in the same writer transaction. Missing or stale fails with fence_conflict and neither note changes.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version} or a non-empty list of distinct (kind, key) objects, checked in order in the same writer transaction. Missing or stale returns fence_conflict; list refusals also carry string index (zero-based). Explicit null is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "embed", param_type: "bool", required: false, description: "Notes only: omission retains embedding state. True enables reindexing; false performs no inference, removes existing vector rows transactionally and retains lexical indexing. Delayed reindex work cannot restore a stale revision.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",

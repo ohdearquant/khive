@@ -2725,7 +2725,9 @@ fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> V
     // write disposition from a conflict or unavailable variant.
     let named_disposition = match &error {
         RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
-            (khive_types::ErrorKind::Conflict, Some("key_conflict")) => Some("not_committed"),
+            (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
+                Some("not_committed")
+            }
             (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => Some("unknown"),
             _ => None,
         },

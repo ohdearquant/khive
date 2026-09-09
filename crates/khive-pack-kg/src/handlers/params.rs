@@ -44,7 +44,11 @@ pub(crate) struct CreateParams {
     pub(crate) embedding_content: Option<String>,
     pub(crate) key: Option<String>,
     pub(crate) embed: Option<bool>,
-    pub(crate) fence: Option<khive_runtime::note_write::NoteFence>,
+    #[serde(
+        default,
+        deserialize_with = "khive_runtime::note_write::deserialize_optional_fences"
+    )]
+    pub(crate) fence: Option<khive_runtime::note_write::NoteFences>,
 }
 
 #[derive(Deserialize)]
@@ -140,7 +144,11 @@ pub struct UpdateParams {
     pub(crate) weight: Option<f64>,
     pub(crate) entity_kind: Option<Value>,
     pub(crate) expected_version: Option<i64>,
-    pub(crate) fence: Option<khive_runtime::note_write::NoteFence>,
+    #[serde(
+        default,
+        deserialize_with = "khive_runtime::note_write::deserialize_optional_fences"
+    )]
+    pub(crate) fence: Option<khive_runtime::note_write::NoteFences>,
     pub(crate) embed: Option<bool>,
 }
 

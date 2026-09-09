@@ -81,7 +81,7 @@ pub(crate) struct AtomicNoteOptions<'a> {
     pub embedding_content: Option<&'a str>,
     pub embed: Option<bool>,
     pub key: Option<&'a str>,
-    pub fence: Option<&'a crate::note_write::NoteFence>,
+    pub fence: Option<&'a crate::note_write::NoteFences>,
 }
 
 pub(crate) struct PreparedAtomicNotes {

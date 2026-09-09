@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use crate::atomic_message::{prepare_atomic_notes, AtomicNoteOptions, AtomicNoteSpec};
 use crate::atomic_runner::AtomicOpPlan;
+use crate::note_write::{NoteFences, NoteWriteConflict};
 use crate::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 
 fn statement(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
@@ -58,11 +59,13 @@ fn write_failure(message: &str) -> StorageError {
 enum AppendOutcome {
     Appended(i64),
     Conflict(i64),
+    FenceConflict(NoteWriteConflict),
 }
 
 impl KhiveRuntime {
     /// Append a JSON value as an immutable note. The sequence precondition and
     /// every note/index/ledger statement share the same writer transaction.
+    #[allow(clippy::too_many_arguments)]
     pub async fn stream_append(
         &self,
         token: &NamespaceToken,
@@ -71,8 +74,15 @@ impl KhiveRuntime {
         expected_seq: Option<i64>,
         note_kind: &str,
         tags: Option<Vec<String>>,
+        fence: Option<NoteFences>,
     ) -> RuntimeResult<Value> {
         validate_stream(stream)?;
+        if let Some(fences) = &fence {
+            fences.validate()?;
+            for entry in fences.entries() {
+                self.validate_note_kind(&entry.kind)?;
+            }
+        }
         let content =
             serde_json::to_string(record).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
         let mut prepared = prepare_atomic_notes(
@@ -85,7 +95,10 @@ impl KhiveRuntime {
                 content: &content,
                 properties: tags.map(|tags| json!({"tags": tags})),
             }],
-            AtomicNoteOptions::default(),
+            AtomicNoteOptions {
+                fence: fence.as_ref(),
+                ..Default::default()
+            },
         )
         .await?;
         let note = prepared.notes.remove(0);
@@ -101,6 +114,13 @@ impl KhiveRuntime {
         // completed. Only bounded statement driving occurs while the writer is held.
         let op: AtomicUnitOp = Box::new(move |writer| {
             Box::pin(async move {
+                if let Some(guard) = &plan.note_guard {
+                    if let Some(conflict) = guard.check_fence(writer).await? {
+                        return Ok(
+                            Box::new(AppendOutcome::FenceConflict(conflict)) as Box<dyn Any + Send>
+                        );
+                    }
+                }
                 let scope = vec![
                     SqlValue::Text(ns.clone()),
                     SqlValue::Text(stream_owned.clone()),
@@ -140,6 +160,7 @@ impl KhiveRuntime {
             .downcast::<AppendOutcome>()
             .map_err(|_| RuntimeError::Internal("invalid stream append outcome".into()))?;
         match *outcome {
+            AppendOutcome::FenceConflict(conflict) => Err(conflict.into_error().into()),
             AppendOutcome::Appended(seq) => {
                 Ok(json!({"seq": seq, "id": note.id, "created_at": micros_to_iso(note.created_at)}))
             }
@@ -259,7 +280,15 @@ mod tests {
         let rt = KhiveRuntime::memory().unwrap();
         let token = rt.authorize(Namespace::local()).unwrap();
         let appended = rt
-            .stream_append(&token, "cas", &json!({"n": 1}), None, "observation", None)
+            .stream_append(
+                &token,
+                "cas",
+                &json!({"n": 1}),
+                None,
+                "observation",
+                None,
+                None,
+            )
             .await
             .unwrap();
         let id = uuid::Uuid::parse_str(appended["id"].as_str().unwrap()).unwrap();
@@ -329,6 +358,7 @@ mod tests {
                     &json!(token.namespace().as_str()),
                     Some(1),
                     "observation",
+                    None,
                     None
                 )
                 .await

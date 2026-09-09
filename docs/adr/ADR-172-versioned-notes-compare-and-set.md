@@ -415,3 +415,60 @@ quoted with exit codes.
    kind-scoped); an `update` without `embed` on the unembedded head leaves it unembedded, and on the
    embedded control re-embeds it.
 5. A2.4's mutation arm, both runs quoted.
+
+## Amendment 3 (2026-09-09): ordered fence lists
+
+**Status**: Proposed.
+
+A write may depend on several keyed notes at once. Singleton note `create`, note `update`, and
+`stream.append` accept either the existing fence object or a non-empty list of fence objects:
+
+```json
+{
+  "fence": [
+    { "kind": "head", "key": "run/lease", "expected_version": 3 },
+    { "kind": "head", "key": "fleet/epoch", "expected_version": 8 }
+  ]
+}
+```
+
+Each entry follows §2b: resolve a live keyed note in the caller's primary namespace and compare its
+version. All entries are checked in supplied order inside the same writer transaction as the guarded
+write, before its statements. The first missing or stale entry refuses the whole write. Fence checks
+only read the lease notes. The target's own `expected_version` or stream `expected_seq` still applies.
+A prior write inside an atomic unit is visible to its later fence checks; a later refusal rolls back
+that entire unit.
+
+The object form's message and details remain unchanged. The list form always adds `details.index`,
+a zero-based decimal string, including for a one-element list. This is the only difference between
+an object refusal and the equivalent one-element-list refusal. For example:
+
+```json
+{
+  "reason": "fence_conflict",
+  "key": "fleet/epoch",
+  "expected_version": "8",
+  "current_version": "9",
+  "index": "1"
+}
+```
+
+`current_version` is omitted when the row is missing. The message remains `note fence precondition
+failed`; `domain_disposition` is `not_committed` for a confirmed fence refusal. Storage failures with
+unknown outcomes retain their existing disposition; a fence parameter alone proves no outcome.
+
+An explicit null, an empty list, a malformed entry, an unknown entry field, an invalid key or note kind,
+or a non-positive expected version is `invalid_input` before opening the write transaction. A list
+cannot name the same `(kind, key)` twice, even with different versions; the error names both zero-based
+indices. Identical keys in different note kinds remain distinct. Omitting `fence` preserves an
+unconditional fence policy. A list never changes the successful response or adds writes to a lease.
+
+The Python client accepts a dictionary or list of dictionaries and preserves entry order. Its generic
+`stream.append` builder preserves explicitly supplied null so the server can reject it.
+
+Acceptance extends the existing object-form controls with one-element and two-element lists, valid,
+stale and missing entries, first-failure ordering, unchanged target content/version and stream head on
+refusal, unchanged lease rows, and malformed-input domain-population controls. Transaction controls
+must distinguish a check before transaction admission from one inside the admitted writer transaction,
+including another process renewing a lease at that boundary. Checking only the first entry or omitting
+`index` must each fail their corresponding list control.
