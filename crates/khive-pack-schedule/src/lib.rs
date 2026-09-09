@@ -7,6 +7,7 @@
 //! property is display metadata only and is never an authorization source.
 pub mod handlers;
 mod pack;
+pub mod repeat;
 mod tests;
 mod vocab;
 

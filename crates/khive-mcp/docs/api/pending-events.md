@@ -197,9 +197,11 @@ bound, not the last word.
 
 ## Executable recurrence boundary
 
-Creation accepts only `daily`, `weekly`, and `monthly`, exactly the forms
-`next_trigger_at` advances. Five-field cron is rejected instead of being stored
-and silently consumed as a one-shot. A legacy cron row fails closed before action
+Creation and `next_trigger_at` share one parser, `khive_pack_schedule::repeat`:
+`daily`, `weekly`, `monthly`, `every:<N><s|m|h|d>` intervals from the previous
+trigger, and five-field cron expressions evaluated in UTC. Anything else is
+rejected at creation instead of being stored and silently consumed as a
+one-shot, and a legacy row the parser refuses fails closed before action
 invocation.
 
 ## `advance_repeat_past_missed` — no catch-up bursts (ADR-106 missed-event amendment)
@@ -208,6 +210,8 @@ Advances a missed repeating event's `trigger_at` past every occurrence at or
 before `now`, landing on the first occurrence strictly after `now`. This is
 what makes a missed repeat re-arm without ever firing a catch-up burst: a
 daily reminder that was due 10 times while the daemon was down skips straight
-to tomorrow's occurrence instead of firing 10 times in a row. Terminates
-because `next_trigger_at`'s named-alias arms are always strictly increasing,
-so `now` fixed plus a bounded number of forward steps reaches `next > now`.
+to tomorrow's occurrence instead of firing 10 times in a row. The calendar
+aliases step one occurrence at a time and terminate because each step is
+strictly later than the last; an interval jumps arithmetically to the first
+phase-locked occurrence after `now`; cron asks the pattern for the next match
+after `now`.
