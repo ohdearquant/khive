@@ -18,6 +18,9 @@ use crate::{config::BackendId, presentation::OutputFormat};
 /// Errors produced while loading or validating a `KhiveConfig`.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("mount configuration: {reason}")]
+    InvalidMountConfig { reason: String },
+
     #[error("config file I/O: {0}")]
     Io(#[from] std::io::Error),
 
@@ -684,6 +687,9 @@ pub struct ExecSectionConfig {
 /// `deny_unknown_fields` so a misspelled policy key always fails startup.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
+    #[serde(default)]
+    pub mounts: Vec<crate::mount_config::MountConfig>,
+
     /// Typed only so a top-level `db` key can be rejected loudly by
     /// [`KhiveConfig::validate`] instead of being silently ignored as an
     /// unknown key. Not a supported config-file storage selector: single-file
@@ -1033,6 +1039,7 @@ impl KhiveConfig {
     /// Model name validity is checked lazily at runtime (the config loader does
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
 
         // Reject a top-level `db` key loudly instead of letting serde's

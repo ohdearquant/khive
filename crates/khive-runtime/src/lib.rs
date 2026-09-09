@@ -156,3 +156,10 @@ pub use validation::{
     GraphPatch, GraphSnapshot, RuleFn, RuleId, Severity, ValidationContext, ValidationReport,
     ValidationRule, Violation,
 };
+
+#[cfg(test)]
+mod mount_config_tests;
+
+pub mod mount_config;
+
+pub mod mounted_verb;

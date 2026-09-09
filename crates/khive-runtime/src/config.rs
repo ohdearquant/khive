@@ -275,6 +275,8 @@ pub fn process_ref_from_env() -> Option<String> {
 /// shorthand beside the provider registry.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
+    pub mounts: Vec<crate::mount_config::MountConfig>,
+
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
     /// Production boot passes this value to the async khive-mcp/kkernel host
@@ -469,6 +471,7 @@ impl Default for RuntimeConfig {
             actor_id,
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             exec: crate::engine_config::ExecSectionConfig::default(),
+            mounts: Vec::new(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
         }
@@ -732,6 +735,7 @@ pub fn runtime_config_from_khive_config(
     // `[actor] id` never becomes the storage namespace (writes always pin to
     // `local`); it only widens the read visible-set below.
     let default_namespace = base.default_namespace.clone();
+    let mounts = khive_cfg.mounts.clone();
 
     // base.brain_profile must carry only the explicit CLI tier, never an env
     // value: env sits below toml in precedence and is applied later by the MCP resolver.
@@ -843,6 +847,7 @@ pub fn runtime_config_from_khive_config(
             gate,
             git_write,
             exec,
+            mounts,
             blob_hydration_bytes,
             display_timezone,
             ..base
@@ -882,6 +887,7 @@ pub fn runtime_config_from_khive_config(
         gate,
         git_write,
         exec,
+        mounts,
         blob_hydration_bytes,
         display_timezone,
         ..base
