@@ -287,3 +287,68 @@ still points elsewhere leaves that receipt `unknown` under `git.reconcile`, and 
 the ref advanced past the sha settles to `committed`; 32 with the git and tool packs on different
 backends and a stale allow row planted in the git backend beside a deny row in the tool backend, the
 verb refuses with the tool pack's decision and id.
+
+## Amendment 6 (2026-09-08): the remote marker after acknowledgement, `reflog write`, match-head merge, recorded scope, repository configuration, published schema
+
+Adopted from the second implementation slice (push with exact compares, pull-request verbs, fork
+rows, the pack schema table). Nothing above is withdrawn; items 1 and 2 tighten Amendment 4 item 2
+and Amendment 5 item 1 for the remote case, items 3 to 6 record decisions the slice needed and the
+Decision left open.
+
+1. **The remote marker is written after acknowledgement and exact readback.** For `git.push` the
+   local marker is appended only after the remote has acknowledged the push and a readback of the
+   remote ref returns exactly the pushed sha. A reply lost before the acknowledgement leaves the
+   receipt `unknown` with no marker, and `git.reconcile`'s remote arm settles an `unknown` push to
+   `committed` only when both hold: the remote ref reads back at the pushed sha, and the marker is
+   present; either alone leaves `unknown`. The preflight compares are exact (Amendment 2): the local
+   branch head must equal `expected_local`, the remote ref must equal `expected_remote`, and the
+   remote must not already equal the candidate, which refuses as `already_at_target` with a receipt
+   and no remote effect, so a push that would move nothing is a refusal, never a silent success.
+2. **The marker mechanism is `reflog write`, not a ref update.** `update-ref` with identical old and
+   new shas appends no reflog entry (measured on the host Git during the slice), and after a push the
+   local ref does not move, so the marker is written with
+   `git reflog write refs/heads/<branch> <sha> <sha> khive-receipt:<receipt-id>`, which changes no ref,
+   index or worktree. A capability probe runs before the resolver and before any network use: a Git
+   that does not advertise `reflog write` refuses the push before any remote effect, with a receipt
+   naming the Git version and the missing capability, in the toolchain-identity refusal shape the pack
+   already uses. No compatibility with older Git is claimed from source; the receipt is the claim.
+3. **Merge by match-head compare-and-set, no administrator bypass.** `git.pr_merge` merges through
+   the platform's REST endpoint `PUT /repos/{slug}/pulls/{number}/merge` with `sha` set to
+   `expected_head`, so a head that moves between the verb's own check and the platform call is
+   refused by the platform; the refusal is receipted with disposition `not_committed` and nothing is
+   retried. The administrator bypass is not requested by this slice even where a `git.pr_merge.admin`
+   row allows it; a later slice that needs the bypass re-states the arm. Self-approval is refused
+   before the platform call both for the actor that opened the pull request and for a different actor
+   whose credential row resolves to the same platform login, read from the platform. The same pre-check,
+   on `git.pr_review(approve)` and on `git.pr_merge`'s required-review read, also refuses when the
+   reviewer's platform login equals the login that performed the last push to `expected_head` (the
+   platform's triggering actor for that head), because the platform's last-push rule disqualifies
+   exactly that approval and a merge that relies on it strands.
+4. **Grant scope is recorded, not evaluated.** The tool policy decision matches actor, tool pattern and
+   expiry; a grant's `scope` is free text and is carried on the receipt as data. A grant whose tool
+   pattern does not match the verb refuses in the same receipt shape as no grant; no repository-scoped
+   authorization is derived from the scope text.
+5. **Repository configuration.** The expectation a pull-request verb asserts before any platform
+   write comes from `[git_write.repositories."<absolute repository path>"]` with `remote`, `slug` and
+   `visibility`; at call time the key must match an ADR-108 allow-list row or the call refuses. A
+   repository without a row is refused by the pull-request verbs, never guessed from the remote.
+6. **The schema table is published through a runtime hook.** The pack publishes an input schema for
+   every git verb through a defaulted runtime hook, `input_schema(verb)` returning the table when the
+   pack has one; `help` and the MCP tool list read it, and a pack without a table keeps the parameter
+   rendering it has today. No handler definition shape changes.
+
+Acceptance arms added: 33 a push whose remote already equals the candidate refuses `already_at_target`
+with a receipt, no marker and no remote effect; 34 a transport cut after the send and before the
+acknowledgement leaves the receipt `unknown` with no marker, and `git.reconcile` settles it only when
+both the remote readback and the marker hold; 35 `update-ref` with identical shas appends no reflog
+entry while `reflog write` does, the control behind item 2; 36 a simulated Git without `reflog write`
+refuses before the resolver and the network with the version and the capability in the receipt; 37 a
+second actor whose credential resolves to the author's platform login is refused approval before the
+platform call; 38 a merge whose head moved between the check and the platform call is refused by the
+platform as `not_committed` and not retried; 39 a repository key absent from the allow-list refuses at
+call time; 40 `help` on every git verb returns the schema table and a pack without one keeps its
+parameter rendering; 41 an approval by the login that last pushed `expected_head` is refused before
+the platform call, and an approval by a third login proceeds (control). Mutation controls stated before they ran and both failed at their effects:
+removing the preflight together with the remote comparison overwrote a rival bare ref with the
+candidate; removing only the platform-login check let an alias actor submit an approval as the author
+account.
