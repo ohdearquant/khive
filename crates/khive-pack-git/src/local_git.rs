@@ -21,7 +21,68 @@ const HARDENING: &[&str] = &[
     "credential.helper=",
     "core.sshCommand=/usr/bin/false",
     "protocol.allow=never",
+    // Signature display and verification run a program the REPOSITORY names. `log` reads
+    // `log.showSignature`, and every verifier path resolves through one of the `gpg*.program`
+    // keys, so a repository whose config points them at a script executes that script the moment
+    // a read verb touches it. The read verbs never report a signature, so nothing here is a
+    // feature being turned off: this closes a program-execution door the verbs never used.
+    "log.showSignature=false",
+    "merge.verifySignatures=false",
+    "gpg.program=/usr/bin/false",
+    "gpg.openpgp.program=/usr/bin/false",
+    "gpg.x509.program=/usr/bin/false",
+    "gpg.ssh.program=/usr/bin/false",
 ];
+
+/// Config keys that neutralise one content-filter driver, in the form `git -c` takes.
+///
+/// A clean, smudge or process filter is a program named by repository config, and git runs it
+/// whenever it has to convert worktree content: `status` hashes a file whose stat data changed,
+/// so the driver executes on a plain read. There is no single switch that turns filtering off,
+/// and driver names are arbitrary, so the drivers the repository DECLARES are enumerated and each
+/// one is overridden. An empty command is git's own "no filter" (`convert.c` applies a driver
+/// only `if (cmd && *cmd)`), and `required=false` keeps the empty driver from being fatal.
+///
+/// The cost of this is honest and worth naming: content that a filter would have converted is
+/// read as the bytes on disk, so a repository using a required filter can report a file as
+/// modified that its own `git status` calls clean. Reading a repository must not run its code.
+const FILTER_NEUTRALIZED: &[&str] = &["clean", "smudge", "process"];
+
+fn filter_overrides(repo: &Path) -> Vec<String> {
+    let mut command = base_command();
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(["config", "-z", "--get-regexp", "--name-only", "^filter\\."])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(output) = command.output() else {
+        return Vec::new();
+    };
+    let mut drivers: Vec<String> = Vec::new();
+    for name in String::from_utf8_lossy(&output.stdout).split('\0') {
+        // `filter.<driver>.<key>`; a driver name is a config subsection and may itself hold dots,
+        // so the KEY is split from the right and everything between is the driver.
+        let Some(rest) = name.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some((driver, _)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if !driver.is_empty() && !drivers.iter().any(|seen| seen == driver) {
+            drivers.push(driver.to_owned());
+        }
+    }
+    let mut overrides = Vec::with_capacity(drivers.len() * (FILTER_NEUTRALIZED.len() + 1));
+    for driver in drivers {
+        for key in FILTER_NEUTRALIZED {
+            overrides.push(format!("filter.{driver}.{key}="));
+        }
+        overrides.push(format!("filter.{driver}.required=false"));
+    }
+    overrides
+}
 
 #[derive(Debug)]
 pub(crate) struct LocalGitError {
@@ -104,7 +165,11 @@ pub(crate) struct DiffResult {
     pub summary: DiffSummary,
 }
 
-fn git_command(repo: &Path, argv: &[&str], identity: Option<(&str, &str)>) -> Command {
+/// The environment and config every git invocation runs under, with no repository selected yet.
+///
+/// Split out so the config READ that enumerates filter drivers runs under the same hardening as
+/// the operation it is hardening, without recursing into the enumeration it exists to feed.
+fn base_command() -> Command {
     let mut command = Command::new("git");
     // Inherited GIT_DIR, index/object paths, config injection, and identities
     // must not redirect an operation away from the caller's authorized repo.
@@ -122,6 +187,14 @@ fn git_command(repo: &Path, argv: &[&str], identity: Option<(&str, &str)>) -> Co
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_OPTIONAL_LOCKS", "0");
+    for setting in HARDENING {
+        command.arg("-c").arg(setting);
+    }
+    command
+}
+
+fn git_command(repo: &Path, argv: &[&str], identity: Option<(&str, &str)>) -> Command {
+    let mut command = base_command();
     if let Some((name, email)) = identity {
         command
             .env("GIT_AUTHOR_NAME", name)
@@ -129,7 +202,9 @@ fn git_command(repo: &Path, argv: &[&str], identity: Option<(&str, &str)>) -> Co
             .env("GIT_COMMITTER_NAME", name)
             .env("GIT_COMMITTER_EMAIL", email);
     }
-    for setting in HARDENING {
+    // Every invocation, not only the ones known today to convert content: a verb added later that
+    // reads or writes the worktree inherits this rather than having to remember it.
+    for setting in filter_overrides(repo) {
         command.arg("-c").arg(setting);
     }
     command.arg("-C").arg(repo).args(argv);
@@ -1219,8 +1294,32 @@ pub(crate) async fn init(repo: &Path, branch: &str) -> Result<String> {
             "init target already holds a repository",
         ));
     }
-    run_async(repo, &["init", "-q", "--template=", "-b", branch], None).await?;
-    resolve_head_branch(repo).await
+    // Everything past this point can leave a repository directory behind. `git init` creates
+    // `.git` and then writes HEAD, and reading HEAD back is a second process: either can fail
+    // after the directory exists. A `not_committed` receipt over a half-made repository is a
+    // receipt that is wrong, and this call must not delete a `.git` it may not have created (the
+    // check above is a moment earlier, and `git init` is idempotent over an existing repository),
+    // so the outcome is reported as unestablished with the path that has to be looked at.
+    let created = run_async(repo, &["init", "-q", "--template=", "-b", branch], None).await;
+    let partial = |error: LocalGitError| {
+        if !repo.join(".git").exists() {
+            return error;
+        }
+        // The code is the part a caller reads: an ambiguous failure settles as `Internal`, and
+        // that path carries no detail, so the condition has to be IN the code. The receipt names
+        // the repository in its own `repo` column, which is where the path to inspect comes from.
+        LocalGitError {
+            code: "init_partial_repository",
+            message: format!(
+                "git init left a repository directory at {} and its completion could not be \
+                 established ({error}); inspect or remove that directory before retrying",
+                repo.join(".git").display()
+            ),
+            ambiguous: true,
+        }
+    };
+    created.map_err(partial)?;
+    resolve_head_branch(repo).await.map_err(partial)
 }
 
 async fn resolve_head_branch(repo: &Path) -> Result<String> {
@@ -1256,6 +1355,10 @@ pub(crate) async fn log(
         "log",
         "-z",
         "--no-color",
+        // Beside `log.showSignature=false` in HARDENING. The config key closes the door for any
+        // caller of this builder; the flag closes it on the one command that reads that key, so
+        // neither a config override nor a future change to the hardening list re-opens it alone.
+        "--no-show-signature",
         "--format=%H%n%an%n%ae%n%aI%n%cI%n%s",
         "-n",
         &count,
