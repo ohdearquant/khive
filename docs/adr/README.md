@@ -221,3 +221,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 - **No stubs**: every ADR claim must be implementable; stubs and placeholders are not acceptable.
 - **Closed taxonomies**: entity kinds, edge relations, note kinds are closed enums. Extension requires ADR amendment.
 - **ADRs are desired-state specs**: ADRs describe the intended v1 design, not the state of any specific deployment context.
+
+## Proposed amendments
+
+- [ADR-179 Amendment 1: Message-pair identity](ADR-179-operation-identity-memory-remember.md#amendment-1-message-pair-identity-proposed-2026-09-09).
