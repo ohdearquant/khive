@@ -47,7 +47,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// that names both sides so the operator knows exactly what to do
 /// (`make local` rebuilds the client binary).
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
@@ -1331,9 +1331,11 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             // refused and still carrying the code in `error_detail`, lets every
             // pre-swap bridge replace itself on its first request instead of staying
             // refused until a person reconnects the session. A client above this
-            // protocol keeps the explicit flag. Remove at the next protocol bump:
-            // bridges built with the two-direction re-exec in khive-mcp no longer
-            // read the flag.
+            // protocol keeps the explicit flag. Remove once no live bridge predates
+            // the two-direction re-exec in khive-mcp (an inode census of `kkernel mcp`
+            // processes before the swap): bridges built with it no longer read the
+            // flag, but a bump while older bridges still run must keep this shape so
+            // they replace themselves too.
             version_mismatch: frame.protocol_version > PROTOCOL_VERSION,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,

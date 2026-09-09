@@ -15,7 +15,7 @@ use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
     SearchSource, VerbRegistry,
 };
-use khive_storage::types::EdgeFilter;
+use khive_storage::types::{Direction, EdgeFilter, NeighborQuery};
 use khive_storage::EdgeRelation;
 
 use crate::config::{RecallConfig, ScoreBreakdown};
@@ -27,11 +27,11 @@ use crate::scoring::{
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, plog, plog_n,
-    recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
-    RecallStageTimings, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC,
-    DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID,
-    RECALL_SLOW_THRESHOLD_MS,
+    compute_score, deser, fuse_candidates, make_pipeline, note_has_any_tag, note_matches_tags,
+    plog, plog_n, recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams,
+    RecallParams, RecallStageTimings, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC,
+    DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID,
+    RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
 
 /// Bounded storage page for inbound supersession checks. This is deliberately
@@ -219,13 +219,16 @@ impl MemoryPack {
             normalize_min_score(raw).map_err(RuntimeError::from)?
         };
 
+        // `limit` and `top_k` agree on zero: both mean no hits. A caller that
+        // computes a limit which reaches zero gets an empty page, never a
+        // single result smuggled in by a lower clamp.
         let limit = if let Some(k) = p.top_k {
             k.min(crate::scoring::MAX_RECALL_LIMIT)
         } else {
             p.limit
                 .map(|v| v as usize)
                 .unwrap_or(10)
-                .clamp(1, crate::scoring::MAX_RECALL_LIMIT)
+                .min(crate::scoring::MAX_RECALL_LIMIT)
         };
         let limit_u32 = u32::try_from(limit).unwrap_or(u32::MAX);
 
@@ -637,6 +640,11 @@ impl MemoryPack {
                     continue;
                 }
             }
+            if let Some(excluded) = p.exclude_tags.as_ref().filter(|tags| !tags.is_empty()) {
+                if note_has_any_tag(note.properties.as_ref(), excluded) {
+                    continue;
+                }
+            }
             // Same predicate the widening loop counts with; one definition so
             // a boundary change cannot drift between the two paths.
             if !in_window(&note) {
@@ -884,6 +892,31 @@ impl MemoryPack {
         let full_content = p.full_content.unwrap_or(true);
         const PREVIEW_CHARS: usize = 200;
 
+        // Source provenance is the memory's `annotates` edge (never a property);
+        // read it only when asked, one edge query per returned hit.
+        let mut source_ids: HashMap<Uuid, Option<String>> = HashMap::new();
+        if p.include_source_id.unwrap_or(false) {
+            for id in ranked.iter().map(|sn| sn.id) {
+                let source = self
+                    .runtime
+                    .neighbors_with_query(
+                        &effective_token,
+                        id,
+                        NeighborQuery {
+                            direction: Direction::Out,
+                            relations: Some(vec![EdgeRelation::Annotates]),
+                            limit: Some(1),
+                            min_weight: None,
+                        },
+                    )
+                    .await?
+                    .into_iter()
+                    .next()
+                    .map(|hit| hit.node_id.to_string());
+                source_ids.insert(id, source);
+            }
+        }
+
         let mut results: Vec<Value> = ranked
             .into_iter()
             .map(|sn| {
@@ -906,6 +939,9 @@ impl MemoryPack {
                     "memory_type": sn.resolved_memory_type,
                     "created_at": micros_to_iso(sn.note.created_at),
                 });
+                if let Some(source) = source_ids.get(&sn.id) {
+                    result["source_id"] = json!(source);
+                }
                 if is_verbose {
                     result["breakdown"] = json!(sn.breakdown);
                 }
@@ -1356,6 +1392,67 @@ mod tests {
         fn enter(&self, _: &tracing::span::Id) {}
 
         fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// `limit=0` returns no hits, the same as `top_k=0`; a lower clamp of one
+    /// used to turn it into a single hit.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn recall_limit_zero_returns_no_hits_like_top_k_zero() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+        for i in 0..3 {
+            rt.create_note(
+                &token,
+                "memory",
+                None,
+                &format!("limit zero probe note {i}"),
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let hits_for = |params: serde_json::Value| {
+            let registry = &registry;
+            async move {
+                let out = registry
+                    .dispatch("memory.recall", params)
+                    .await
+                    .expect("recall dispatch");
+                match out {
+                    serde_json::Value::Array(items) => items.len(),
+                    serde_json::Value::Object(map) => map
+                        .get("results")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                    _ => panic!("unexpected recall shape"),
+                }
+            }
+        };
+
+        let control =
+            hits_for(serde_json::json!({"query": "limit zero probe note", "limit": 2})).await;
+        assert_eq!(
+            control, 2,
+            "limit=2 is the control and must return two hits"
+        );
+        let by_top_k =
+            hits_for(serde_json::json!({"query": "limit zero probe note", "top_k": 0})).await;
+        assert_eq!(by_top_k, 0, "top_k=0 returns no hits");
+        let by_limit =
+            hits_for(serde_json::json!({"query": "limit zero probe note", "limit": 0})).await;
+        assert_eq!(by_limit, 0, "limit=0 returns no hits, the same as top_k=0");
     }
 
     /// Exercises `$` sanitization; serialized because non-empty recall tracks background work.

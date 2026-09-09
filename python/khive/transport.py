@@ -40,14 +40,15 @@ from .envelope import (
 from .errors import (
     ConfigMismatch,
     FrameTooLarge,
+    OperationError,
     ProtocolMismatch,
     RequestRejected,
     TransportError,
 )
+from .models import OpError, RecallOutcome
 from .ops import encode, op
-from .models import OpError
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 
@@ -226,6 +227,73 @@ class Session:
         if len(results) != 1 or results[0]["tool"] != "memory.remember":
             raise TransportError("response from daemon is not a single memory.remember result")
         return results[0]
+
+    def recall(
+        self,
+        query: str,
+        *,
+        limit: int | None = None,
+        top_k: int | None = None,
+        min_score: float | None = None,
+        score_floor: float | None = None,
+        min_salience: float | None = None,
+        memory_type: str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+        tags: list[str] | None = None,
+        tag_mode: str | None = None,
+        exclude_tags: list[str] | None = None,
+        include_source_id: bool | None = None,
+        full_content: bool | None = None,
+        profile_id: str | None = None,
+        embedding_model: str | None = None,
+        namespace: str | None = None,
+        timeout: float | None = None,
+    ) -> RecallOutcome:
+        """Run one memory.recall and return its typed outcome.
+
+        The outcome keeps the server's response class (clean, degraded,
+        budget-capped, or both, empty or not) instead of flattening to rows;
+        see `RecallOutcome`. A failed op raises `OperationError` with the
+        server's error object unchanged.
+        """
+        results = self.request(
+            encode(
+                [
+                    op(
+                        "memory.recall",
+                        query=query,
+                        limit=limit,
+                        top_k=top_k,
+                        min_score=min_score,
+                        score_floor=score_floor,
+                        min_salience=min_salience,
+                        memory_type=memory_type,
+                        created_after=created_after,
+                        created_before=created_before,
+                        tags=tags,
+                        tag_mode=tag_mode,
+                        exclude_tags=exclude_tags,
+                        include_source_id=include_source_id,
+                        full_content=full_content,
+                        profile_id=profile_id,
+                        embedding_model=embedding_model,
+                        namespace=namespace,
+                    )
+                ]
+            ),
+            timeout=timeout,
+        )
+        if len(results) != 1 or results[0]["tool"] != "memory.recall":
+            raise TransportError("response from daemon is not a single memory.recall result")
+        entry = results[0]
+        if not entry.get("ok"):
+            raise OperationError("memory.recall", entry.get("error") or "unknown error")
+        try:
+            return RecallOutcome.from_result(entry.get("result"))
+        except (TypeError, ValueError) as exc:
+            raise TransportError(f"response from daemon: {exc}") from exc
+
     def plan(self, ops: str, *, timeout: float | None = None) -> dict[str, Any]:
         """Parse ops without dispatch; return a plan, including parsed=false errors.
 

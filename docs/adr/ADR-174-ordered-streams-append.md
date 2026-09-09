@@ -323,8 +323,9 @@ Both forms are load-bearing, so the verb carries both and names which one it is 
 
 `stream.batch(ops, fence=None, observed=None, atomic=None, namespace=None)` takes a list of member
 operations, each `{"op": "append", "stream": S, "record": R, "expected_seq": N | null}` or
-`{"op": "write", "key": K, "kind": <note kind>, "doc": D, "expected_version": V | null}` (the
-keyed document write of ADR-172 §2 and §3). Common to both modes:
+`{"op": "write", "key": K, "kind": <note kind>, "doc": D, "tags": [...] | null, "embed": bool | null,
+"expected_version": V | null}` (the keyed document write of ADR-172 §2 and §3; `tags` and `embed` as
+its Amendment 2 defines them, `embed` defaulting by the note kind). Common to both modes:
 
 - Members are validated for shape before anything is written: a member that is not an object, a
   member without an `op` string, or a record over the note content limit refuses the whole batch
@@ -341,7 +342,7 @@ keyed document write of ADR-172 §2 and §3). Common to both modes:
   the mode: an atomic batch's appends to one stream take consecutive numbers, because they are one
   transaction; a per-member batch's appends may have another process's append between them, and
   only the union is dense (§3).
-- Reads (`get`, `stream.read`, `stream.head`) are not members: a batch is a write primitive. The
+- Reads (`get`, `stream.read`, `stream.stat`) are not members: a batch is a write primitive. The
   consumer's case reads an unknown object inside its batch; on khive that read is issued beside
   the batch by the adapter, and the assertion on its value is unchanged.
 - The result is `{"results": [<member result>...], "committed": true}` in list order; a member
@@ -455,3 +456,114 @@ read.
 3. **Count and head are read from one snapshot.** `stream.stat` reads `COUNT(*)` and `MAX(seq)` in
 one statement over the same rows, so the equality acceptance 7 asserts compares two readings of
 one snapshot, and a divergence between them is a ledger defect, never a race between two reads.
+
+## Amendment 3 (2026-09-08): entries are not embedded by default, prefix truncation, two acceptance corrections
+
+**Status**: Proposed.
+
+### The gap
+
+§1 makes an entry a note, and the note path embeds every note it inserts with every registered
+embedding model unless one model is named. That default is right for a note a caller wants back by
+similarity and wrong for a record stream: `stream.read` walks by sequence and never by similarity, and
+the consumer this ADR serves appends one record per run event. On the reference deployment the vector
+index segments of the busiest namespace were measured being rewritten every two to three minutes, about
+440 MiB a cycle, under ordinary write load (#2446); a recorder stream would multiply that without a
+single reader ever asking for a stream entry by vector. §3 and §6 leave retention to a later ADR; the
+consumer's state layer now names its recorder as the largest caller, so the retention shape has to exist
+before that recorder moves.
+
+Two acceptance items are corrected here on findings from the first implementation of Amendment 1.
+
+### A3.1 `embed` on `stream.append` and on batch append members
+
+`stream.append(..., embed=false, embedding_model=None)`. `embed` defaults to `false`. An entry appended
+with `embed=false` gets no embedding rows and no vector-index work, and is never a candidate for
+similarity `search` or `recall`; lexical indexing and `list` are unchanged, so it stays findable by text
+and by walk. With `embed=true` the entry is embedded exactly as `create(kind="note")` embeds: every
+registered model, or the one `embedding_model` names. `embedding_model` without `embed=true` is refused
+as `invalid_input` and nothing is written. A `stream.batch` append member carries the same two fields
+with the same defaults, and the keyed `write` member carries `tags` and `embed` as ADR-172 Amendment 2
+defines them (A1.1's member shape lists both), `embed` defaulting to `false` for the `head` kind and
+`true` for every other kind.
+
+The note's content limit, the audit event and the ledger row are unchanged; an unembedded entry is a
+whole entry in every respect this ADR defines.
+
+### A3.2 `stream.truncate`
+
+`stream.truncate(stream, before_seq, namespace=None)` removes every entry of the stream whose `seq` is
+below `before_seq`, ledger row and note together, as a hard delete inside one writer transaction, and
+returns `{"removed": N, "floor_seq": F, "head_seq": H}`. Numbering continues from `head_seq`; density
+holds from `floor_seq`; `expected_seq` is unaffected because the head does not move. The call is
+idempotent and never fails for a range: `before_seq` at or below the floor removes nothing, `before_seq`
+above `head_seq + 1` is clipped to it, and an unknown stream returns `removed: 0, floor_seq: 1,
+head_seq: 0`. Write authority on the namespace is required, as for `append`. One audit event records the
+call with `stream`, `before_seq` and `removed`, not one per entry.
+
+The floor is persisted, not derived: one row per truncated stream in
+`note_stream_floors(namespace, stream, floor_seq)`, written in the truncate transaction, so a stream
+emptied by truncation still knows where its numbering stands, which `MIN(seq)` cannot say. `stream.read`
+and `stream.stat` gain `floor_seq` (`1` when never truncated). A reader whose `after + 1` is below the
+floor receives entries from the floor and learns from `floor_seq` that a prefix it never saw is gone.
+That is the only truncation signal and it is enough: a reader that must not miss entries reads before
+the writer truncates, and arranging that is the retention policy's job, not khive's. `count` becomes
+`head_seq - floor_seq + 1`, still read from the one snapshot Amendment 2 item 3 requires; §2's
+`count == head_seq` holds exactly for a stream never truncated.
+
+§3's triggers refuse every delete of a member note and Amendment 2's ledger guards refuse every ledger
+delete; truncation is the one authorized path, and its authorization is a row, not a bypass. The
+truncate transaction first inserts `(namespace, stream, before_seq)` into `note_stream_truncations`; the
+ledger delete trigger's `WHEN` exempts a row whose `(namespace, stream)` has an open truncation with
+`seq < before_seq`; the transaction deletes the ledger rows, then the notes (whose member trigger no
+longer fires, the ledger rows being gone), then the truncation row, and commits. A direct `DELETE`
+outside a truncate transaction sees no truncation row and is refused as today; a truncation row cannot
+outlive its transaction. Embedding and lexical rows of the removed notes go the way any hard delete takes
+them.
+
+Retention policy stays outside: which streams to truncate, at what age or count, is decided by the
+layer that named the streams (a scheduled job or the consumer itself); khive does not decide what to
+keep. Drop of a whole stream remains out of scope: truncating to `head_seq + 1` leaves an empty stream
+with its floor, which is exactly what a later reader needs to see.
+
+### A3.3 Amendment 1 acceptance 9, corrected
+
+Acceptance 9 says that with `observed` checked after the first write, arm 3's unchanged-count assertion
+goes red. It does not: the transaction still rolls back on the conflict and the counts stay unchanged
+whichever order the statements ran in. What reddens is arm 3's statement-trace assertion, that every
+observation check precedes the first insert. Acceptance 9 reads accordingly: the trace assertion is the
+order control and the unchanged-count assertion is the rollback control, two controls, not one.
+
+### A3.4 The check is inside the transaction, proven by mutation
+
+The property the consumer's state layer depends on is that a stale generation writes nothing, and that
+property lives in the transaction boundary, not in the fence's shape. For `stream.append` with a
+`fence` and for an atomic `stream.batch` with a `fence` or `observed`, the check is evaluated inside the
+writer transaction before the first insert. Mutation arm: move the check outside the transaction (read
+the version, then begin, then insert) and the stale-fence and stale-observed arms must go red, meaning
+something was written or a count moved; restore, and they go green. Both runs are quoted with exit
+codes. ADR-172 Amendment 2 records the same arm for `expected_version` and `fence` on documents.
+
+### Acceptance
+
+1. **No embedding by default.** After a default `stream.append`, the entry's note has no embedding row
+   for any registered model and the vector-index queue is empty; the `embed=true` control yields one
+   row per registered model, the count named.
+2. **Not a similarity candidate.** The unembedded entry's own content as a `search` query returns no
+   hit for it; the `embed=true` control returns it.
+3. **Still listed and found by text.** The default entry is returned by `list` and by lexical search.
+4. **Truncate keeps numbering.** Five appends, `truncate(before_seq=3)`: `removed 2, floor_seq 3,
+   head_seq 5`; `stat` count 3; `read(after=0)` returns 3, 4, 5 with `floor_seq 3`; the next append
+   is 6.
+5. **Whole prefix.** `truncate(before_seq=6)` on the same stream: `removed 3, floor_seq 6, head_seq 5`,
+   count 0, the next append is 6.
+6. **Idempotent and clipped.** Repeating arm 5 removes 0; `before_seq=100` on a five-entry stream
+   removes 5 and reports `floor_seq 6`; an unknown stream removes 0 with `floor_seq 1, head_seq 0`.
+7. **Guards unchanged.** Outside a truncate, a direct delete of a member note or ledger row is refused
+   as in §3 and Amendment 2, count and head unchanged.
+8. **Atomic.** A failure injected between the ledger delete and the note delete leaves count, floor and
+   head unchanged.
+9. **Mutation.** With `embed` ignored, arm 1's two counts read the same (red). With the floor derived
+   from `MIN(seq)` instead of persisted, arm 5's `floor_seq` reads 1 (red). With the truncation row
+   left in place after commit, a later direct ledger delete succeeds (red), which is what proves the
+   row is the authorization.

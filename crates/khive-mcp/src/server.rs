@@ -1456,6 +1456,7 @@ impl KhiveMcpServer {
     }
 
     /// Build a prepared runtime's native registry and start its configured sources.
+    #[allow(clippy::result_large_err)]
     pub async fn new_with_mounts(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
         let packs = runtime.config().packs.clone();
         let mounted = khive_mounts::start_mounts(&runtime).await;

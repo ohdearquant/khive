@@ -77,7 +77,7 @@ pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
 /// still `Commissive` — the speaker commits a persistent change, exactly the
 /// same illocutionary force as `create`/`link`, just against a different
 /// substrate (a git repo instead of khive's own storage).
-pub(crate) static GIT_HANDLERS: [HandlerDef; 9] = [
+pub(crate) static GIT_HANDLERS: [HandlerDef; 12] = [
     crate::local_vocab::CHECKOUT,
     crate::local_vocab::DIFF,
     crate::local_vocab::RECEIPTS,
@@ -209,45 +209,8 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 9] = [
             },
         ],
     },
-    HandlerDef {
-        name: "git.push",
-        description: "Push a branch to a remote (ADR-108). Force-push is always denied — no \
-                       policy or argument combination can authorize it through this verb.",
-        visibility: Visibility::Verb,
-        category: VerbCategory::Commissive,
-        params: &[
-            ParamDef {
-                name: "repo",
-                param_type: "string",
-                required: true,
-                description: "Absolute local path to a git repository (must contain a .git \
-                               entry).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "branch",
-                param_type: "string",
-                required: true,
-                description: "Branch to push.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "remote",
-                param_type: "string",
-                required: false,
-                description: "Remote to push to (default: origin).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "force",
-                param_type: "bool",
-                required: false,
-                description: "Always rejected when true — force-push is never permitted through \
-                               this verb (ADR-108 hard rule 1). Present only so a caller's \
-                               explicit force=true request fails loudly rather than being \
-                               silently ignored.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-        ],
-    },
+    crate::remote_vocab::PUSH,
+    crate::remote_vocab::PR_OPEN,
+    crate::remote_vocab::PR_REVIEW,
+    crate::remote_vocab::PR_MERGE,
 ];

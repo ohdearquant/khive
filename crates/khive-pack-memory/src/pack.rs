@@ -203,14 +203,14 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum memories to return (default 10).",
+                description: "Maximum memories to return (default 10, max 100); 0 returns no hits.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "top_k",
                 param_type: "integer",
                 required: false,
-                description: "Override result limit (max 100). Takes priority over limit.",
+                description: "Override result limit (max 100); 0 returns no hits. Takes priority over limit.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -309,6 +309,20 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 param_type: "string",
                 required: false,
                 description: "Tag filter mode: \"any\" (OR, default) or \"all\" (AND). Only applies when tags is non-empty.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "exclude_tags",
+                param_type: "array",
+                required: false,
+                description: "Drop memories whose stored tags include any of these values. Applied after tags/tag_mode and before ranking and limit, so a run can recall everything except its own writes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "include_source_id",
+                param_type: "boolean",
+                required: false,
+                description: "When true every hit carries source_id: the UUID the memory annotates (its source_id at remember time), or null when it has none. Default false.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

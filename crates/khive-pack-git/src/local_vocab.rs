@@ -63,8 +63,8 @@ pub(crate) const GATES: HandlerDef = HandlerDef {
 };
 pub(crate) const RECONCILE: HandlerDef = HandlerDef {
     name: "git.reconcile",
-    description: "Settle a caller-owned unknown local receipt only when its receipt marker and SHA appear in the ref reflog and that SHA is the current head or an ancestor. Missing evidence leaves unknown. Never retries a repository write or accesses a remote.",
+    description: "Settle a caller-owned unknown receipt using observed evidence. Local receipts require the receipt marker and SHA in the ref reflog, with that SHA at the current head or an ancestor. Push receipts require an acknowledged local marker and exact remote SHA; merge receipts read platform merged state and SHA. Missing evidence leaves unknown. Never repeats a write.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
-    params: &[param("receipt", true, "Caller-owned receipt UUID of a local branch or tree commit operation.")],
+    params: &[param("receipt", true, "Caller-owned receipt UUID of a branch, tree commit, push or PR merge operation.")],
 };

@@ -445,12 +445,22 @@ pub struct GitWriteSectionConfig {
     pub allowed: Vec<GitWriteEntryConfig>,
     #[serde(default)]
     pub actors: BTreeMap<String, GitWriteActorConfig>,
+    #[serde(default)]
+    pub repositories: BTreeMap<String, GitWriteRepositoryConfig>,
     #[serde(default = "default_git_credential_resolver")]
     pub credential_resolver: Vec<String>,
     #[serde(default)]
     pub contract_faults: bool,
     #[serde(default)]
     pub fault: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitWriteRepositoryConfig {
+    pub remote: String,
+    pub slug: String,
+    pub visibility: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -480,6 +490,7 @@ impl Default for GitWriteSectionConfig {
         Self {
             allowed: Vec::new(),
             actors: BTreeMap::new(),
+            repositories: BTreeMap::new(),
             credential_resolver: default_git_credential_resolver(),
             contract_faults: false,
             fault: None,

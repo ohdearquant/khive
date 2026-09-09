@@ -338,3 +338,71 @@ Acceptance, added to the list above:
     `create(key=K)` answers `key_conflict` with `key` and no `existing_id`; under a policy that admits
     both, `existing_id` is present. Mutation: with the second gate question removed, the deny arm
     carries `existing_id` (red).
+
+## Amendment 2 (2026-09-08): a `head` note kind for keyed documents, the document kind as a tag, `embed`, and the in-transaction arm
+
+**Status**: Proposed.
+
+### The gap
+
+The consumer whose state layer this record serves writes keyed documents under fourteen document
+kinds of its own (`job`, `lease`, `admission`, `fleet/epoch` among them), none of which is a registered
+note kind and two of which carry a slash, and it lists by that kind first and pages by key. §3 keys a
+note within a registered note kind, so the consumer has no place for its kind except the key string,
+which would turn its kind filter into a prefix convention and break a read that knows only the key.
+Separately, §1's version and §2's compare-and-set are silent on embedding, and a lease document
+rewritten on every renewal would be re-embedded on every renewal.
+
+### A2.1 `head`
+
+The kg pack registers the note kind `head` for keyed documents. Any note kind may still carry a key
+(ADR-179 keys memories); `head` is the kind a consumer uses when the note is a document it addresses by
+key and nothing else. A `head` note's document is its content as JSON text, as a stream record is
+(ADR-174 §2); `properties.tags` carries its tags. `get(kind="note", key=K, note_kind="head")` is the
+read and a keyed listing with `note_kind="head"` is the walk. A `head` has no `name`.
+
+### A2.2 The document kind is a tag
+
+The consumer's document kind is the tag `kind:<value>` in `properties.tags`: an open string of at most
+64 bytes, no U+0000, slashes allowed. `list(kind="note", note_kind="head", key_prefix=P,
+tags=["kind:job"], tag_mode="all", updated_after=T)` is the consumer's list-by-kind. The tag predicate
+is evaluated per row inside the keyed index range (namespace, note kind, key prefix), so its cost is
+bounded by that range; a deployment whose head population outgrows it gets a column and an index by a
+further amendment, with the tag kept. Nothing about the key changes: a key identifies one live `head`
+per namespace whatever its document kind, which is what a read by key alone requires.
+
+### A2.3 `embed`
+
+`create(kind="note", ...)` and `update(...)` accept `embed` (boolean). On `create` the default is
+scoped by the note kind: `false` for `head`, because a head is the document addressed by key and nothing
+else and the gap above names the lease re-embedded on every renewal; `true` for every other kind,
+today's behaviour. With `false` the write produces no embedding rows and no vector-index work and the
+note is not a similarity candidate, while lexical indexing and listing are unchanged. On
+`update` the default keeps the note's current state: a note with embedding rows is re-embedded, a note
+without them stays unembedded; `embed=true` or `false` on an update overrides that once. ADR-174
+Amendment 3 gives stream entries the same field with `false` as the default.
+
+### A2.4 The check is inside the transaction, proven by mutation
+
+`expected_version` (§2) and `fence` (§2b) are evaluated inside the writer transaction, as one
+conditional statement or as a check under `BEGIN IMMEDIATE`, never as a read followed by a separate
+write. Mutation arm: move the check outside the transaction (read the version, then begin, then write)
+and the stale-version and stale-fence arms must go red; restore, and they go green. Both runs are
+quoted with exit codes.
+
+### Acceptance
+
+1. `create(kind="note", note_kind="head", key="run/1/lease", content="{}", tags=["kind:lease"])`
+   returns version 1; `get(key="run/1/lease", note_kind="head")` returns it at version 1;
+   `update(id, content=..., expected_version=1)` returns version 2; `expected_version=1` again is
+   `version_conflict` with `current_version "2"` and the content unchanged.
+2. Three heads of kinds `job`, `job`, `lease` under one prefix: `tags=["kind:job"]` returns two,
+   `tags=["kind:fleet/epoch"]` returns none, the prefix alone returns three, order and cursor per §4.
+3. A key held by a `head` and the same key held by a `memory` coexist; `get(key=K)` without
+   `note_kind` is `key_ambiguous` naming both kinds.
+4. A `head` created without `embed`: no embedding rows, not returned for its own content by similarity
+   search, returned by `list` and lexical search; the `embed=true` control has one row per registered
+   model, and an `observation` created without `embed` has one row per model too (the default is
+   kind-scoped); an `update` without `embed` on the unembedded head leaves it unembedded, and on the
+   embedded control re-embeds it.
+5. A2.4's mutation arm, both runs quoted.

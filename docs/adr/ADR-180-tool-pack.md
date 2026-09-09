@@ -4,7 +4,7 @@
 - **Date**: 2026-09-08
 - **Extends**: [ADR-002](ADR-002-edge-ontology.md) (edge ontology; the registry reuses `project`,
   `concept` and the `implements` edge),
-  [ADR-023](ADR-023-declarative-pack-format.md) (declarative pack format; the handlers below
+  [ADR-023](ADR-023-declarative-pack-format.md) (pack verb surface, visibility and composition, the file keeping its original name; the handlers below
   are declared there and are wire surfaces)
 - **Relates to**: [ADR-007](ADR-007-namespace.md) (registry, policy and grants are namespace scoped),
   [ADR-096](ADR-096-warm-daemon-per-request-identity.md) (per-request identity: the actor a

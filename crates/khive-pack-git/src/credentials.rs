@@ -51,9 +51,27 @@ pub(crate) async fn resolve_actor(
 }
 
 #[cfg(any(unix, test))]
-struct Secret {
+pub(crate) struct Secret {
     bytes: Zeroizing<Box<[u8]>>,
     len: usize,
+}
+
+#[cfg(any(unix, test))]
+impl Secret {
+    pub(crate) fn value(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("validated resolver UTF-8")
+    }
+}
+
+#[cfg(unix)]
+pub(crate) async fn resolve_remote(
+    config: &GitWriteSectionConfig,
+    actor: &str,
+) -> Result<(GitWriteActorConfig, Secret), CredentialError> {
+    config.validate_dev_loop().map_err(|_| CredentialError)?;
+    let identity = config.actors.get(actor).ok_or(CredentialError)?.clone();
+    let secret = resolve_reference(config, &identity.credential_ref).await?;
+    Ok((identity, secret))
 }
 
 #[cfg(any(unix, test))]

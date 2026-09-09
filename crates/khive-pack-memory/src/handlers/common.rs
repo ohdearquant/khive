@@ -384,6 +384,19 @@ pub(super) fn note_matches_tags(props: Option<&Value>, expected: &[String], mode
     }
 }
 
+/// True when the note's stored tags include any of `excluded`. A note without
+/// tags is never excluded.
+pub(super) fn note_has_any_tag(props: Option<&Value>, excluded: &[String]) -> bool {
+    let Some(stored) = props
+        .and_then(|p| p.get("tags"))
+        .and_then(|tags| tags.as_array())
+    else {
+        return false;
+    };
+    let stored: HashSet<&str> = stored.iter().filter_map(Value::as_str).collect();
+    excluded.iter().any(|tag| stored.contains(tag.as_str()))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RecallParams {
@@ -404,6 +417,15 @@ pub(super) struct RecallParams {
     pub(super) tags: Option<Vec<String>>,
     #[serde(default)]
     pub(super) tag_mode: TagMode,
+    /// Drop memories whose stored tags include any of these values. Applied
+    /// after `tags`/`tag_mode` and before ranking and `limit`, so a run can
+    /// recall everything except its own writes.
+    #[serde(default)]
+    pub(super) exclude_tags: Option<Vec<String>>,
+    /// When true every hit carries `source_id`: the target of the memory's
+    /// `annotates` edge, or null when the memory has none.
+    #[serde(default)]
+    pub(super) include_source_id: Option<bool>,
     /// Entity names to boost in scoring.
     #[serde(default)]
     pub(super) entity_names: Option<Vec<String>>,

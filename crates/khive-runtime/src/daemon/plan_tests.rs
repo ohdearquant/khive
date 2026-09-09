@@ -75,7 +75,7 @@ async fn plan_daemon_refuses_each_present_companion_including_null() {
 
 #[tokio::test]
 async fn plan_daemon_protocol_rejects_previous_version_without_dispatch() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(PROTOCOL_VERSION, 6);
     let (response, calls) = plan_raw_round_trip(serde_json::json!({
         "ops":"missing_verb()", "namespace":"", "plan":true,
         "config_id":"plan-config", "protocol_version":4
