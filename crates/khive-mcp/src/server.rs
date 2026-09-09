@@ -2727,6 +2727,18 @@ fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> V
         RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
             (khive_types::ErrorKind::Conflict, Some("key_conflict")) => Some("not_committed"),
             (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => Some("unknown"),
+            // ADR-174 A1.1: a stream member refusal carries
+            // `domain_disposition: not_committed` wherever it surfaces. In
+            // per-member mode it is the member's own value and the runtime
+            // writes the field itself; in atomic mode the refusal is raised
+            // as the call's error, where without these rows the boundary's
+            // `unknown` would stand and the caller could not tell a batch
+            // that wrote nothing from one whose outcome is unestablished.
+            (khive_types::ErrorKind::Conflict, Some("seq_conflict")) => Some("not_committed"),
+            (khive_types::ErrorKind::Conflict, Some("unknown_op")) => Some("not_committed"),
+            (khive_types::ErrorKind::InvalidInput, Some("member_unavailable")) => {
+                Some("not_committed")
+            }
             _ => None,
         },
         _ => None,

@@ -1,5 +1,7 @@
 //! Ordered note streams. Embedding preparation precedes one SQL-only writer
-//! transaction containing the sequence predicate, note/index writes and ledger.
+//! transaction containing the sequence predicates, note/index writes and ledger
+//! rows. A batch is that transaction over several members (atomic mode) or one
+//! such transaction per member, in list order (per-member mode).
 use std::any::Any;
 
 use khive_storage::{
@@ -9,8 +11,11 @@ use khive_types::{Details, KhiveError};
 use serde_json::{json, Value};
 
 use crate::atomic_message::{prepare_atomic_notes, AtomicNoteOptions, AtomicNoteSpec};
+use crate::atomic_plan::PlanStatement;
 use crate::atomic_runner::AtomicOpPlan;
-use crate::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
+use crate::{
+    micros_to_iso, DomainDisposition, KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult,
+};
 
 fn statement(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
     SqlStatement {
@@ -55,12 +60,210 @@ fn write_failure(message: &str) -> StorageError {
     }
 }
 
-enum AppendOutcome {
-    Appended(i64),
-    Conflict(i64),
+/// One append, shape-validated by the verb layer; the runtime validates the
+/// stream name and the record's serialization before any write.
+pub struct StreamAppendSpec {
+    pub stream: String,
+    pub record: Value,
+    pub expected_seq: Option<i64>,
+    pub note_kind: String,
+    pub tags: Option<Vec<String>>,
+}
+
+/// A batch member as the verb layer resolved it: an append to run, or the
+/// refusal the member already earned (an op naming no member operation, a
+/// member kind this server does not carry). The mode places the refusal.
+pub enum StreamBatchMember {
+    Append(StreamAppendSpec),
+    Refused(KhiveError),
+}
+
+/// The member refusal that stopped an atomic batch; nothing was written.
+pub struct StreamBatchRefusal {
+    pub member: usize,
+    pub error: KhiveError,
+}
+
+/// A member refusal as a value: the error object a refused op carries, plus
+/// the disposition the consumer rule reads without a special case.
+pub fn refusal_value(error: &KhiveError) -> RuntimeResult<Value> {
+    let mut value = serde_json::to_value(error)
+        .map_err(|e| RuntimeError::Internal(format!("stream refusal serialization: {e}")))?;
+    value["domain_disposition"] = json!(DomainDisposition::NotCommitted.as_str());
+    Ok(value)
+}
+
+fn seq_conflict(stream: &str, expected: i64, next: i64, member: Option<usize>) -> KhiveError {
+    let mut pairs = vec![
+        ("reason", "seq_conflict".to_string()),
+        ("stream", stream.to_string()),
+        ("expected_seq", expected.to_string()),
+        ("next_seq", next.to_string()),
+    ];
+    if let Some(member) = member {
+        pairs.push(("member", member.to_string()));
+    }
+    KhiveError::conflict("stream sequence precondition failed")
+        .with_details(Details::new_owned(pairs))
+}
+
+/// A prepared append: the note, its planned statements and the ledger key.
+struct PreparedAppend {
+    stream: String,
+    expected_seq: Option<i64>,
+    note: Note,
+    statements: Vec<PlanStatement>,
+}
+
+fn append_result(prepared: &PreparedAppend, seq: i64) -> Value {
+    json!({"seq": seq, "id": prepared.note.id, "created_at": micros_to_iso(prepared.note.created_at)})
+}
+
+enum BatchOutcome {
+    Appended(Vec<i64>),
+    Conflict { member: usize, next: i64 },
 }
 
 impl KhiveRuntime {
+    /// Validate every spec and prepare every note before any write. All
+    /// allocations for embedding, note normalization and SQL plans complete
+    /// here, so only bounded statement driving occurs while the writer is held.
+    async fn prepare_stream_appends(
+        &self,
+        token: &NamespaceToken,
+        specs: &[&StreamAppendSpec],
+    ) -> RuntimeResult<Vec<PreparedAppend>> {
+        let mut contents = Vec::with_capacity(specs.len());
+        for spec in specs {
+            validate_stream(&spec.stream)?;
+            contents.push(
+                serde_json::to_string(&spec.record)
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
+            );
+        }
+        let atomic_specs = specs
+            .iter()
+            .zip(&contents)
+            .map(|(spec, content)| AtomicNoteSpec {
+                token,
+                id: None,
+                kind: &spec.note_kind,
+                name: None,
+                content,
+                properties: spec.tags.clone().map(|tags| json!({"tags": tags})),
+            })
+            .collect();
+        let prepared =
+            prepare_atomic_notes(self, atomic_specs, AtomicNoteOptions::default()).await?;
+        let mut out = Vec::with_capacity(specs.len());
+        for ((spec, note), plan) in specs.iter().zip(prepared.notes).zip(prepared.plans) {
+            let AtomicOpPlan::AddNote(plan) = plan else {
+                return Err(RuntimeError::Internal(
+                    "stream preparation did not produce a note".into(),
+                ));
+            };
+            out.push(PreparedAppend {
+                stream: spec.stream.clone(),
+                expected_seq: spec.expected_seq,
+                note,
+                statements: plan.statements,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Run prepared appends as one writer transaction. Every stream head is
+    /// read, every number assigned in list order and every `expected_seq`
+    /// checked before the first write; then notes and ledger rows land in
+    /// list order, so appends to one stream take consecutive numbers.
+    async fn run_stream_appends(
+        &self,
+        token: &NamespaceToken,
+        appends: &[PreparedAppend],
+    ) -> RuntimeResult<BatchOutcome> {
+        let ns = token.namespace().as_str().to_string();
+        let entries: Vec<(String, Option<i64>, String, Vec<PlanStatement>)> = appends
+            .iter()
+            .map(|a| {
+                (
+                    a.stream.clone(),
+                    a.expected_seq,
+                    a.note.id.to_string(),
+                    a.statements.clone(),
+                )
+            })
+            .collect();
+        let op: AtomicUnitOp = Box::new(move |writer| {
+            Box::pin(async move {
+                let mut heads: Vec<(String, i64)> = Vec::new();
+                for (stream, _, _, _) in &entries {
+                    if heads.iter().any(|(known, _)| known == stream) {
+                        continue;
+                    }
+                    let head = writer
+                        .query_scalar(statement(
+                            "SELECT COALESCE(MAX(seq), 0) FROM note_streams WHERE namespace=?1 AND stream=?2",
+                            vec![SqlValue::Text(ns.clone()), SqlValue::Text(stream.clone())],
+                        ))
+                        .await?;
+                    let Some(SqlValue::Integer(head)) = head else {
+                        return Err(write_failure("invalid stream head"));
+                    };
+                    heads.push((stream.clone(), head));
+                }
+                let mut assigned = Vec::with_capacity(entries.len());
+                for (member, (stream, expected_seq, _, _)) in entries.iter().enumerate() {
+                    let head = heads
+                        .iter_mut()
+                        .find(|(known, _)| known == stream)
+                        .map(|(_, head)| head)
+                        .ok_or_else(|| write_failure("stream head missing"))?;
+                    let next = head
+                        .checked_add(1)
+                        .ok_or_else(|| write_failure("stream sequence exhausted"))?;
+                    if expected_seq.is_some_and(|expected| expected != next) {
+                        return Ok(Box::new(BatchOutcome::Conflict { member, next })
+                            as Box<dyn Any + Send>);
+                    }
+                    *head = next;
+                    assigned.push(next);
+                }
+                for ((stream, _, note_id, statements), seq) in
+                    entries.into_iter().zip(assigned.iter().copied())
+                {
+                    for planned in statements {
+                        let affected = writer.execute(planned.statement).await?;
+                        if planned
+                            .guard
+                            .is_some_and(|guard| !guard.holds_for(affected))
+                        {
+                            return Err(write_failure("prepared note write guard failed"));
+                        }
+                    }
+                    writer
+                        .execute(statement(
+                            "INSERT INTO note_streams(namespace,stream,seq,note_id) VALUES (?1,?2,?3,?4)",
+                            vec![
+                                SqlValue::Text(ns.clone()),
+                                SqlValue::Text(stream),
+                                SqlValue::Integer(seq),
+                                SqlValue::Text(note_id),
+                            ],
+                        ))
+                        .await?;
+                }
+                Ok(Box::new(BatchOutcome::Appended(assigned)) as Box<dyn Any + Send>)
+            })
+        });
+        let outcome = self
+            .sql()
+            .atomic_unit(op)
+            .await?
+            .downcast::<BatchOutcome>()
+            .map_err(|_| RuntimeError::Internal("invalid stream append outcome".into()))?;
+        Ok(*outcome)
+    }
+
     /// Append a JSON value as an immutable note. The sequence precondition and
     /// every note/index/ledger statement share the same writer transaction.
     pub async fn stream_append(
@@ -72,93 +275,125 @@ impl KhiveRuntime {
         note_kind: &str,
         tags: Option<Vec<String>>,
     ) -> RuntimeResult<Value> {
-        validate_stream(stream)?;
-        let content =
-            serde_json::to_string(record).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        let mut prepared = prepare_atomic_notes(
-            self,
-            vec![AtomicNoteSpec {
-                token,
-                id: None,
-                kind: note_kind,
-                name: None,
-                content: &content,
-                properties: tags.map(|tags| json!({"tags": tags})),
-            }],
-            AtomicNoteOptions::default(),
-        )
-        .await?;
-        let note = prepared.notes.remove(0);
-        let AtomicOpPlan::AddNote(plan) = prepared.plans.remove(0) else {
-            return Err(RuntimeError::Internal(
-                "stream preparation did not produce a note".into(),
-            ));
+        let spec = StreamAppendSpec {
+            stream: stream.to_string(),
+            record: record.clone(),
+            expected_seq,
+            note_kind: note_kind.to_string(),
+            tags,
         };
-        let ns = token.namespace().as_str().to_string();
-        let stream_owned = stream.to_string();
-        let note_id = note.id.to_string();
-        // All allocations for embedding, note normalization and SQL plans have
-        // completed. Only bounded statement driving occurs while the writer is held.
-        let op: AtomicUnitOp = Box::new(move |writer| {
-            Box::pin(async move {
-                let scope = vec![
-                    SqlValue::Text(ns.clone()),
-                    SqlValue::Text(stream_owned.clone()),
-                ];
-                let head = writer.query_scalar(statement(
-                "SELECT COALESCE(MAX(seq), 0) FROM note_streams WHERE namespace=?1 AND stream=?2", scope,
-            )).await?;
-                let Some(SqlValue::Integer(head)) = head else {
-                    return Err(write_failure("invalid stream head"));
-                };
-                let next = head
-                    .checked_add(1)
-                    .ok_or_else(|| write_failure("stream sequence exhausted"))?;
-                if expected_seq.is_some_and(|expected| expected != next) {
-                    return Ok(Box::new(AppendOutcome::Conflict(next)) as Box<dyn Any + Send>);
-                }
-                for planned in plan.statements {
-                    let affected = writer.execute(planned.statement).await?;
-                    if planned
-                        .guard
-                        .is_some_and(|guard| !guard.holds_for(affected))
-                    {
-                        return Err(write_failure("prepared note write guard failed"));
-                    }
-                }
-                writer.execute(statement(
-                "INSERT INTO note_streams(namespace,stream,seq,note_id) VALUES (?1,?2,?3,?4)",
-                vec![SqlValue::Text(ns), SqlValue::Text(stream_owned), SqlValue::Integer(next), SqlValue::Text(note_id)],
-            )).await?;
-                Ok(Box::new(AppendOutcome::Appended(next)) as Box<dyn Any + Send>)
-            })
-        });
-        let outcome = self
-            .sql()
-            .atomic_unit(op)
-            .await?
-            .downcast::<AppendOutcome>()
-            .map_err(|_| RuntimeError::Internal("invalid stream append outcome".into()))?;
-        match *outcome {
-            AppendOutcome::Appended(seq) => {
-                Ok(json!({"seq": seq, "id": note.id, "created_at": micros_to_iso(note.created_at)}))
-            }
-            AppendOutcome::Conflict(next) => {
-                Err(KhiveError::conflict("stream sequence precondition failed")
-                    .with_details(Details::new_owned([
-                        ("reason", "seq_conflict".into()),
-                        ("stream", stream.into()),
-                        (
-                            "expected_seq",
-                            expected_seq
-                                .expect("only conditional appends conflict")
-                                .to_string(),
-                        ),
-                        ("next_seq", next.to_string()),
-                    ]))
-                    .into())
+        let prepared = self.prepare_stream_appends(token, &[&spec]).await?;
+        match self.run_stream_appends(token, &prepared).await? {
+            BatchOutcome::Appended(seqs) => Ok(append_result(&prepared[0], seqs[0])),
+            BatchOutcome::Conflict { next, .. } => Err(seq_conflict(
+                stream,
+                expected_seq.expect("only conditional appends conflict"),
+                next,
+                None,
+            )
+            .into()),
+        }
+    }
+
+    /// One writer transaction over every member. Shape and content are
+    /// validated for every member before anything is written; a refused member
+    /// (its own refusal or a sequence conflict) refuses the whole batch with
+    /// nothing written, and success means every member committed.
+    pub async fn stream_batch_atomic(
+        &self,
+        token: &NamespaceToken,
+        members: Vec<StreamBatchMember>,
+    ) -> RuntimeResult<Result<Vec<Value>, StreamBatchRefusal>> {
+        // A member's refusal refuses the whole batch, so it is read before
+        // anything is prepared: preparation embeds every member and creates
+        // each model's vector table, which is work for a write this batch is
+        // no longer going to make.
+        for (member, item) in members.iter().enumerate() {
+            if let StreamBatchMember::Refused(error) = item {
+                return Ok(Err(StreamBatchRefusal {
+                    member,
+                    error: error.clone(),
+                }));
             }
         }
+        let specs: Vec<&StreamAppendSpec> = members
+            .iter()
+            .filter_map(|member| match member {
+                StreamBatchMember::Append(spec) => Some(spec),
+                StreamBatchMember::Refused(_) => None,
+            })
+            .collect();
+        let prepared = self.prepare_stream_appends(token, &specs).await?;
+        match self.run_stream_appends(token, &prepared).await? {
+            BatchOutcome::Appended(seqs) => Ok(Ok(prepared
+                .iter()
+                .zip(seqs)
+                .map(|(append, seq)| append_result(append, seq))
+                .collect())),
+            BatchOutcome::Conflict { member, next } => Ok(Err(StreamBatchRefusal {
+                member,
+                error: seq_conflict(
+                    &prepared[member].stream,
+                    prepared[member]
+                        .expected_seq
+                        .expect("only conditional appends conflict"),
+                    next,
+                    Some(member),
+                ),
+            })),
+        }
+    }
+
+    /// One writer transaction per member, in list order. Every member is
+    /// prepared before the first write; a member's refusal is returned as its
+    /// value and its siblings stand, so numbers on one stream increase with
+    /// list position but another writer's append may fall between them.
+    pub async fn stream_batch_per_member(
+        &self,
+        token: &NamespaceToken,
+        members: Vec<StreamBatchMember>,
+    ) -> RuntimeResult<Vec<Value>> {
+        let specs: Vec<&StreamAppendSpec> = members
+            .iter()
+            .filter_map(|member| match member {
+                StreamBatchMember::Append(spec) => Some(spec),
+                StreamBatchMember::Refused(_) => None,
+            })
+            .collect();
+        let mut prepared = self
+            .prepare_stream_appends(token, &specs)
+            .await?
+            .into_iter();
+        let mut results = Vec::with_capacity(members.len());
+        for member in &members {
+            match member {
+                StreamBatchMember::Refused(error) => results.push(refusal_value(error)?),
+                StreamBatchMember::Append(_) => {
+                    let append = prepared
+                        .next()
+                        .ok_or_else(|| RuntimeError::Internal("prepared append missing".into()))?;
+                    match self
+                        .run_stream_appends(token, std::slice::from_ref(&append))
+                        .await?
+                    {
+                        BatchOutcome::Appended(seqs) => {
+                            results.push(append_result(&append, seqs[0]))
+                        }
+                        BatchOutcome::Conflict { next, .. } => {
+                            results.push(refusal_value(&seq_conflict(
+                                &append.stream,
+                                append
+                                    .expected_seq
+                                    .expect("only conditional appends conflict"),
+                                next,
+                                None,
+                            ))?)
+                        }
+                    }
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// Read one ordered page and its head from one SQL snapshot.

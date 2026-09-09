@@ -2335,6 +2335,7 @@ dependencies = [
  "chrono",
  "criterion",
  "inventory",
+ "khive-gate",
  "khive-pack-formal",
  "khive-pack-gtd",
  "khive-query",
