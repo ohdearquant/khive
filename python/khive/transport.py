@@ -30,7 +30,13 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
-from .envelope import _decode_json_text, _envelope_from_payload, _validate_envelope_results
+from .envelope import (
+    _decode_json_text,
+    _envelope_from_payload,
+    _plan_from_payload,
+    _validate_envelope_results,
+    _validate_frame_error_detail,
+)
 from .errors import (
     ConfigMismatch,
     FrameTooLarge,
@@ -38,8 +44,10 @@ from .errors import (
     RequestRejected,
     TransportError,
 )
+from .ops import encode, op
+from .models import OpError
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 
@@ -124,9 +132,10 @@ class Session:
     # -- handshake ---------------------------------------------------------
 
     def handshake(self) -> str:
-        response = self.transport.round_trip(
-            self._base_frame() | {"metrics_only": True}, self.timeout
-        )
+        return self._handshake(self._base_frame())
+
+    def _handshake(self, frame: dict[str, Any]) -> str:
+        response = self.transport.round_trip(frame | {"metrics_only": True}, self.timeout)
         self._check_version(response)
         served = response.get("served_config_id")
         if not served:
@@ -162,13 +171,99 @@ class Session:
             response = self.transport.round_trip(frame, timeout or self.timeout)
             self._check_version(response)
             if response.get("config_mismatch"):
-                raise ConfigMismatch(str(response.get("error")))
+                raise ConfigMismatch(
+                    str(response.get("error")),
+                    error_detail=_validate_frame_error_detail(response, "daemon"),
+                )
         if not response.get("ok"):
-            raise RequestRejected(str(response.get("error")))
+            raise RequestRejected(
+                str(response.get("error")),
+                error_detail=_validate_frame_error_detail(response, "daemon"),
+            )
         raw = response.get("result")
         parsed = _decode_json_text(raw, "daemon") if isinstance(raw, str) else raw
         envelope = _envelope_from_payload(parsed, "daemon")
         return _validate_envelope_results(envelope, "daemon")["results"]
+
+    def remember(
+        self,
+        content: str,
+        *,
+        key: str | None = None,
+        memory_type: str | None = None,
+        salience: float | None = None,
+        decay_factor: float | None = None,
+        source_id: str | None = None,
+        tags: list[str] | None = None,
+        embedding_model: str | None = None,
+        namespace: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Return one raw memory.remember outcome, including unchanged per-op errors.
+
+        Recovery remains caller-controlled: this method does not infer a write
+        namespace or retry an operation error, including a key conflict.
+        """
+        results = self.request(
+            encode(
+                [
+                    op(
+                        "memory.remember",
+                        content=content,
+                        key=key,
+                        memory_type=memory_type,
+                        salience=salience,
+                        decay_factor=decay_factor,
+                        source_id=source_id,
+                        tags=tags,
+                        embedding_model=embedding_model,
+                        namespace=namespace,
+                    )
+                ]
+            ),
+            timeout=timeout,
+        )
+        if len(results) != 1 or results[0]["tool"] != "memory.remember":
+            raise TransportError("response from daemon is not a single memory.remember result")
+        return results[0]
+    def plan(self, ops: str, *, timeout: float | None = None) -> dict[str, Any]:
+        """Parse ops without dispatch; return a plan, including parsed=false errors.
+
+        A successful parse reports syntax and catalog information, not permission
+        to execute the operations or evidence that their references will resolve.
+        """
+        if self._config_id is None:
+            self._handshake(self._plan_frame())
+        frame = self._plan_frame() | {"ops": ops, "plan": True}
+        response = self.transport.round_trip(frame, timeout or self.timeout)
+        self._check_version(response)
+        if response.get("config_mismatch"):
+            self._handshake(self._plan_frame())
+            frame["config_id"] = self._config_id
+            response = self.transport.round_trip(frame, timeout or self.timeout)
+            self._check_version(response)
+            if response.get("config_mismatch"):
+                raise ConfigMismatch(
+                    str(response.get("error")),
+                    error_detail=_validate_frame_error_detail(response, "daemon"),
+                )
+        if not response.get("ok"):
+            raise RequestRejected(
+                str(response.get("error")),
+                error_detail=_validate_frame_error_detail(response, "daemon"),
+            )
+        raw = response.get("result")
+        parsed = _decode_json_text(raw, "daemon") if isinstance(raw, str) else raw
+        return _plan_from_payload(parsed, "daemon")
+
+    def _plan_frame(self) -> dict[str, Any]:
+        return {
+            "ops": "",
+            # Required by the frame codec; the plan path never resolves identity.
+            "namespace": "",
+            "config_id": self._config_id or "",
+            "protocol_version": PROTOCOL_VERSION,
+        }
 
     def _base_frame(self) -> dict[str, Any]:
         return {
@@ -190,8 +285,19 @@ class Session:
     @staticmethod
     def _check_version(response: dict[str, Any]) -> None:
         if response.get("version_mismatch"):
+            message = str(response.get("error") or "")
+            detail = _validate_frame_error_detail(response, "daemon")
+            fields = detail.model_dump(exclude_unset=True) if detail is not None else {}
+            fields.pop("domain_result", None)
+            fields.update(
+                kind="protocol",
+                code="version_mismatch",
+                message=message,
+                domain_disposition="unknown",
+            )
             raise ProtocolMismatch(
                 PROTOCOL_VERSION,
                 int(response.get("daemon_protocol_version") or 0),
-                str(response.get("error") or ""),
+                message,
+                OpError.model_validate(fields),
             )

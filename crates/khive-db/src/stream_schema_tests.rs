@@ -1,16 +1,25 @@
 //! Schema acceptance and isolated mutation controls for ordered streams.
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
-const DDL: &str = include_str!("../sql/030-note-streams.sql");
+const DDL: &str = include_str!("../sql/029-note-streams.sql");
 
 fn fixture(ddl: &str) -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=OFF; CREATE TABLE notes (id TEXT PRIMARY KEY, namespace TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, properties TEXT, deleted_at INTEGER, salience REAL, name TEXT, decay_factor REAL);").unwrap();
     conn.execute_batch(ddl).unwrap();
-    for (id, namespace, deleted) in [("member", "local", None), ("next", "local", None), ("foreign", "other", None), ("deleted", "local", Some(1))] {
+    for (id, namespace, deleted) in [
+        ("member", "local", None),
+        ("next", "local", None),
+        ("foreign", "other", None),
+        ("deleted", "local", Some(1)),
+    ] {
         conn.execute("INSERT INTO notes(id,namespace,kind,content,deleted_at) VALUES (?1,?2,'observation','null',?3)", params![id, namespace, deleted]).unwrap();
     }
-    conn.execute("INSERT INTO note_streams VALUES ('local','s',1,'member')", []).unwrap();
+    conn.execute(
+        "INSERT INTO note_streams VALUES ('local','s',1,'member')",
+        [],
+    )
+    .unwrap();
     conn
 }
 
@@ -40,11 +49,19 @@ fn stream_schema_rejects_every_forbidden_direct_write() {
         "INSERT INTO note_streams VALUES ('local','s',2,'deleted')",
         "INSERT OR REPLACE INTO note_streams VALUES ('local','s',2,'member')",
     ] {
-        assert!(conn.execute(sql, []).is_err(), "forbidden statement succeeded: {sql}");
+        assert!(
+            conn.execute(sql, []).is_err(),
+            "forbidden statement succeeded: {sql}"
+        );
         assert_eq!(density(&conn), (1, 1), "after {sql}");
     }
-    conn.execute("UPDATE notes SET salience=0.8,name='display',decay_factor=0.2 WHERE id='member'", []).unwrap();
-    conn.execute("INSERT INTO note_streams VALUES ('local','s',2,'next')", []).unwrap();
+    conn.execute(
+        "UPDATE notes SET salience=0.8,name='display',decay_factor=0.2 WHERE id='member'",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO note_streams VALUES ('local','s',2,'next')", [])
+        .unwrap();
     assert_eq!(density(&conn), (2, 2));
 }
 
@@ -67,16 +84,22 @@ fn stream_schema_mutations_isolate_six_triggers_check_and_foreign_key() {
         conn.execute_batch(sql).unwrap_or_else(|e| panic!("mutation {trigger} not isolated: {e}"));
     }
     let conn = fixture(DDL);
-    conn.execute_batch("DROP TRIGGER refuse_stream_gap;").unwrap();
-    assert!(conn.execute("INSERT INTO note_streams VALUES ('local','s',0,'next')", []).is_err());
+    conn.execute_batch("DROP TRIGGER refuse_stream_gap;")
+        .unwrap();
+    assert!(conn
+        .execute("INSERT INTO note_streams VALUES ('local','s',0,'next')", [])
+        .is_err());
     let no_check = DDL.replace("CHECK (seq > 0)", "");
     assert_ne!(no_check, DDL, "mutation must change the exact schema");
     let conn = fixture(&no_check);
-    conn.execute_batch("DROP TRIGGER refuse_stream_gap;").unwrap();
-    conn.execute("INSERT INTO note_streams VALUES ('local','s',0,'next')", []).unwrap();
+    conn.execute_batch("DROP TRIGGER refuse_stream_gap;")
+        .unwrap();
+    conn.execute("INSERT INTO note_streams VALUES ('local','s',0,'next')", [])
+        .unwrap();
     let conn = fixture(DDL);
     conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-    conn.execute("UPDATE notes SET id='replacement' WHERE id='member'", []).unwrap();
+    conn.execute("UPDATE notes SET id='replacement' WHERE id='member'", [])
+        .unwrap();
 }
 
 #[test]
@@ -85,6 +108,10 @@ fn stream_schema_replacement_mutation_exposes_count_head_divergence() {
     let mutant = DDL.replace(clause, "");
     assert_ne!(mutant, DDL);
     let conn = fixture(&mutant);
-    conn.execute("INSERT OR REPLACE INTO note_streams VALUES ('local','s',2,'member')", []).unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO note_streams VALUES ('local','s',2,'member')",
+        [],
+    )
+    .unwrap();
     assert_eq!(density(&conn), (1, 2));
 }

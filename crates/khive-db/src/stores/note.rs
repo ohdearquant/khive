@@ -49,11 +49,12 @@ const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
 /// primary-key conflict instead. `created_at` is deliberately absent from
 /// the `DO UPDATE SET` list — it is bound for the INSERT branch only and
 /// left untouched by the UPDATE branch, so an existing row keeps its
-/// original `created_at` across any number of upserts.
+/// original `created_at` across any number of upserts. The caller-chosen
+/// `key` is likewise insert-only: updates cannot replace or clear its identity.
 pub const NOTE_UPSERT_SQL: &str = "INSERT INTO notes \
      (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-      properties, created_at, updated_at, deleted_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+      properties, created_at, updated_at, deleted_at, key) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
      ON CONFLICT(id) DO UPDATE SET \
        namespace = excluded.namespace, \
        kind = excluded.kind, \
@@ -77,8 +78,8 @@ pub const NOTE_UPSERT_SQL: &str = "INSERT INTO notes \
 /// answer to "did I insert it", which `DO UPDATE` cannot report.
 pub const NOTE_INSERT_IF_ABSENT_SQL: &str = "INSERT INTO notes \
      (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-      properties, created_at, updated_at, deleted_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+      properties, created_at, updated_at, deleted_at, key) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
      ON CONFLICT(id) DO NOTHING";
 
 /// The exact statement this store's `insert_note_if_absent` issues.
@@ -127,6 +128,10 @@ pub fn note_upsert_statement(note: &Note) -> SqlStatement {
             SqlValue::Integer(note.updated_at),
             match note.deleted_at {
                 Some(d) => SqlValue::Integer(d),
+                None => SqlValue::Null,
+            },
+            match &note.key {
+                Some(key) => SqlValue::Text(key.clone()),
                 None => SqlValue::Null,
             },
         ],
@@ -206,7 +211,8 @@ pub fn note_metadata_replace_if_unchanged_statement(
     expected_updated_at: i64,
     expected_deleted_at: Option<i64>,
 ) -> SqlStatement {
-    let mut statement = note_replace_if_unchanged_statement(note, expected_updated_at, expected_deleted_at);
+    let mut statement =
+        note_replace_if_unchanged_statement(note, expected_updated_at, expected_deleted_at);
     statement.sql = "UPDATE notes SET status=?3, name=?4, salience=?6, decay_factor=?7, expires_at=?8, updated_at=?10 \
                      WHERE id=?12 AND updated_at=?13 AND deleted_at IS ?14 AND ?10 > updated_at \
                        AND namespace=?1 AND kind=?2 AND content=?5 AND properties IS ?9 AND deleted_at IS ?11".into();
@@ -476,6 +482,7 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
     let created_at: i64 = row.get(10)?;
     let updated_at: i64 = row.get(11)?;
     let deleted_at: Option<i64> = row.get(12)?;
+    let key: Option<String> = row.get(13)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -505,6 +512,7 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
         created_at,
         updated_at,
         deleted_at,
+        key,
     })
 }
 
@@ -598,6 +606,7 @@ fn batch_upsert_notes(
             note.created_at,
             note.updated_at,
             note.deleted_at,
+            note.key,
         ]) {
             Ok(_) => {
                 assign_note_seq(conn, &id_str)?;
@@ -931,7 +940,7 @@ fn build_note_filter_where(
 /// `query_notes_filtered_after`, `query_notes_filtered_bounded`) still spell
 /// the same column list out inline.
 const NOTE_COLUMNS: &str = "id, namespace, kind, status, name, content, salience, decay_factor, \
-     expires_at, properties, created_at, updated_at, deleted_at";
+     expires_at, properties, created_at, updated_at, deleted_at, key";
 
 /// Fetch up to `limit` rows strictly after `after` in the notes store's
 /// default `created_at DESC, id ASC` total order, for `NoteFilter.after`
@@ -1230,8 +1239,8 @@ impl NoteStore for SqlNoteStore {
             let rows = conn.execute(
                 "INSERT OR IGNORE INTO notes \
                  (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                  properties, created_at, updated_at, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  properties, created_at, updated_at, deleted_at, key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
                     id_str,
                     namespace,
@@ -1246,6 +1255,7 @@ impl NoteStore for SqlNoteStore {
                     note.created_at,
                     note.updated_at,
                     note.deleted_at,
+                    note.key,
                 ],
             )?;
 
@@ -1318,7 +1328,7 @@ impl NoteStore for SqlNoteStore {
         self.with_reader("get_note", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                 properties, created_at, updated_at, deleted_at \
+                 properties, created_at, updated_at, deleted_at, key \
                  FROM notes WHERE id = ?1 AND deleted_at IS NULL",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -1336,7 +1346,7 @@ impl NoteStore for SqlNoteStore {
         self.with_reader("get_note_including_deleted", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                 properties, created_at, updated_at, deleted_at \
+                 properties, created_at, updated_at, deleted_at, key \
                  FROM notes WHERE id = ?1",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -1381,7 +1391,7 @@ impl NoteStore for SqlNoteStore {
                         .join(", ");
                     let sql = format!(
                         "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                         properties, created_at, updated_at, deleted_at \
+                         properties, created_at, updated_at, deleted_at, key \
                          FROM notes WHERE id IN ({placeholders}) AND deleted_at IS NULL"
                     );
                     let mut stmt = conn.prepare(&sql)?;
@@ -1466,7 +1476,7 @@ impl NoteStore for SqlNoteStore {
 
             let data_sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                 properties, created_at, updated_at, deleted_at \
+                 properties, created_at, updated_at, deleted_at, key \
                  FROM notes{} ORDER BY created_at DESC, id ASC LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
             );
@@ -1510,7 +1520,7 @@ impl NoteStore for SqlNoteStore {
             let offset_idx = params.len();
             let sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-                 expires_at, properties, created_at, updated_at, deleted_at \
+                 expires_at, properties, created_at, updated_at, deleted_at, key \
                  FROM notes{where_sql} ORDER BY created_at DESC, id ASC \
                  LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
             );
@@ -1584,7 +1594,7 @@ impl NoteStore for SqlNoteStore {
             let offset_idx = data_params.len();
             let data_sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-                 expires_at, properties, created_at, updated_at, deleted_at \
+                 expires_at, properties, created_at, updated_at, deleted_at, key \
                  FROM notes{}{order_clause} LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
             );
@@ -1820,7 +1830,7 @@ impl NoteStore for SqlNoteStore {
             // indexed `seq > boundary` scan with no full-match sort.
             let sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-                 expires_at, properties, created_at, updated_at, deleted_at, notes_seq.seq \
+                 expires_at, properties, created_at, updated_at, deleted_at, key, notes_seq.seq \
                  FROM notes_seq CROSS JOIN notes ON notes.id = notes_seq.note_id{where_sql} \
                  ORDER BY notes_seq.seq ASC LIMIT ?{limit_idx}"
             );
@@ -1828,7 +1838,7 @@ impl NoteStore for SqlNoteStore {
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|param| param.as_ref()).collect();
             let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                Ok((read_note(row)?, row.get::<_, i64>(13)?))
+                Ok((read_note(row)?, row.get::<_, i64>(14)?))
             })?;
             let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
             let has_more = entries.len() > limit_usize;
@@ -1887,7 +1897,7 @@ impl NoteStore for SqlNoteStore {
 
             let data_sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-                 expires_at, properties, created_at, updated_at, deleted_at \
+                 expires_at, properties, created_at, updated_at, deleted_at, key \
                  FROM notes{where_sql}{order_clause} LIMIT ?{limit_idx}",
             );
 
