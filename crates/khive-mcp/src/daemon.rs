@@ -25,6 +25,14 @@ use tokio::net::UnixStream;
 
 use crate::tools::request::RequestParams;
 
+pub(crate) mod executable;
+
+/// Snapshot the stdio bridge image before config discovery or database boot can
+/// wait across an installation. Daemon and one-shot exec entrypoints omit this.
+pub fn capture_bridge_executable() {
+    executable::capture_at_startup();
+}
+
 #[cfg(test)]
 mod memory_namespace_tests;
 
@@ -1840,13 +1848,30 @@ fn incumbent_still_alive_error(pid: u32) -> McpError {
 /// Pending self-heal action, armed by [`arm_pending_self_heal`] and taken by
 /// [`fire_pending_self_heal`]. `None` on a healthy bridge for its entire
 /// lifetime — the overwhelmingly common case.
-static PENDING_SELF_HEAL: std::sync::Mutex<Option<MismatchRecovery>> = std::sync::Mutex::new(None);
+struct PendingSelfHeal {
+    action: MismatchRecovery,
+    executable: Option<std::path::PathBuf>,
+}
+
+static PENDING_SELF_HEAL: std::sync::Mutex<Option<PendingSelfHeal>> = std::sync::Mutex::new(None);
+
+fn arm_executable_self_heal(executable: std::path::PathBuf) {
+    *PENDING_SELF_HEAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PendingSelfHeal {
+        action: MismatchRecovery::ReexecScheduled,
+        executable: Some(executable),
+    });
+}
 
 fn arm_pending_self_heal(action: MismatchRecovery) {
     let mut slot = PENDING_SELF_HEAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *slot = Some(action);
+    *slot = Some(PendingSelfHeal {
+        action,
+        executable: None,
+    });
 }
 
 /// Take and perform whatever self-heal action is armed, if any. Called by
@@ -1860,8 +1885,14 @@ pub(crate) fn fire_pending_self_heal() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     match action {
-        Some(MismatchRecovery::ReexecScheduled) => reexec_in_place(),
-        Some(MismatchRecovery::DrainAndExit) => exit_process(),
+        Some(PendingSelfHeal {
+            action: MismatchRecovery::ReexecScheduled,
+            executable,
+        }) => reexec_in_place(executable),
+        Some(PendingSelfHeal {
+            action: MismatchRecovery::DrainAndExit,
+            ..
+        }) => exit_process(),
         None => {}
     }
 }
@@ -1978,7 +2009,8 @@ pub(crate) fn schedule_reexec_on_mismatch() {
     schedule_drain_and_exit();
 }
 
-/// Perform the actual re-exec: resolve the on-disk binary at *exec time* via
+/// Perform the actual re-exec: use the recorded path for an executable
+/// replacement, or resolve the on-disk binary at *exec time* via
 /// [`std::env::current_exe`] (the same primitive `spawn_daemon` already uses
 /// for "pick up whatever `make local` just replaced" — see `spawn_daemon`
 /// above), preserve the original argv, append the `--resumed-generation=1`
@@ -1992,20 +2024,18 @@ pub(crate) fn schedule_reexec_on_mismatch() {
 /// already sent to the client for this request; there is nothing safe to
 /// retry from here).
 #[cfg(all(unix, not(test)))]
-fn reexec_in_place() {
+fn reexec_in_place(executable: Option<std::path::PathBuf>) {
     use std::os::unix::process::CommandExt;
 
-    let exe = match std::env::current_exe() {
+    let exe = match executable.map(Ok).unwrap_or_else(std::env::current_exe) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "bridge self-heal re-exec failed: could not resolve current_exe");
             return;
         }
     };
-    // Drop any pre-existing marker defensively (should never be present here —
-    // `trigger_bridge_self_heal` only reaches this path for a first-generation
-    // process — but argv should never accumulate duplicates if that invariant
-    // is ever violated).
+    // Identity-triggered re-execs can recur across installs; retain one marker
+    // so protocol mismatches still apply the existing resumed loop-breaker.
     let args: Vec<String> = std::env::args()
         .skip(1)
         .filter(|a| !a.starts_with(RESUMED_GENERATION_ARG_PREFIX))
@@ -2079,7 +2109,7 @@ fn clear_pending_self_heal() {
 /// calls it (`schedule_reexec_on_mismatch`'s `not(unix)` arm never reaches
 /// `reexec_in_place` at all).
 #[cfg(all(test, unix))]
-fn reexec_in_place() {
+fn reexec_in_place(_executable: Option<std::path::PathBuf>) {
     REEXEC_INVOKED_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
@@ -5422,12 +5452,14 @@ mod tests {
             ),
         }
 
-        let armed = *PENDING_SELF_HEAL
+        let armed = PENDING_SELF_HEAL
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|pending| (pending.action, pending.executable.clone()));
         assert_eq!(
             armed,
-            Some(MismatchRecovery::ReexecScheduled),
+            Some((MismatchRecovery::ReexecScheduled, None)),
             "a bridge behind the daemon must arm the in-place re-exec"
         );
         // The pid file belongs to the live daemon; the terminal path leaves it alone.

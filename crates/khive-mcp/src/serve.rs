@@ -140,11 +140,15 @@ pub fn db_override_refusal_envelope(error: &anyhow::Error) -> Option<serde_json:
 /// the same database file at the same time — see
 /// [`khive_runtime::daemon::run_daemon_with_boot_guard`].
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if !args.daemon && args.transport.as_deref().unwrap_or("stdio") == "stdio" {
+        crate::daemon::capture_bridge_executable();
+    }
     if let Some(generation) = args.resumed_generation {
         tracing::warn!(
             generation,
             "bridge self-heal: this process is a resumed generation of an \
-             in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
+             in-place re-exec triggered by bridge self-heal"
         );
     }
     // #667: in daemon mode, failing to acquire the boot guard must abort
@@ -2090,7 +2094,7 @@ pub async fn serve_server(
         tracing::warn!(
             generation,
             "bridge self-heal: this process is a resumed generation of an \
-             in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
+             in-place re-exec triggered by bridge self-heal"
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));

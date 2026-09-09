@@ -335,6 +335,10 @@ pub async fn cli_main() -> Result<()> {
             anyhow::bail!("the events daemon requires a Unix platform (Unix-socket transport)")
         }
         Command::Mcp(a) => {
+            #[cfg(unix)]
+            if !a.daemon && a.transport.as_deref().unwrap_or("stdio") == "stdio" {
+                khive_mcp::daemon::capture_bridge_executable();
+            }
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
 
             // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
