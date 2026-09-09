@@ -1052,6 +1052,7 @@ mod tests {
         // `embedding_model` to a real on-disk model, which is absent on CI
         // runners and fails entity creation with `ModelInitialization`.
         let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,

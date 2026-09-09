@@ -496,3 +496,10 @@ make ci             # full gate (fmt, clippy -D warnings, tests, contract + smok
 ```
 
 After `make local`, run `/mcp` in Claude Code to reconnect to the rebuilt server.
+
+### Tool-source catalog management
+
+`kkernel mount repin <name> [--config <path>] [--db <path>]` refreshes an
+operator-configured stdio source and atomically replaces its pinned catalog with one
+audit record. Calls use ordinary `kkernel exec '<mount>.<tool>(...)'` dispatch.
+See [mounted tool sources](../../../docs/packs/mounts.md) for configuration and lifecycle.

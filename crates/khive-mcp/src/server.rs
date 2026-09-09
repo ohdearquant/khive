@@ -816,6 +816,9 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     let mut git_write_hasher = Sha256::new();
     git_write_hasher.update(b"khive.git-write-policy.v2");
     git_write_hasher.update(
+        serde_json::to_vec(&config.mounts).expect("mount configuration is JSON serializable"),
+    );
+    git_write_hasher.update(
         serde_json::to_vec(&config.git_write)
             .expect("git-write configuration is JSON serializable"),
     );
@@ -1441,6 +1444,31 @@ impl KhiveMcpServer {
     // deref for no real benefit.
     #[allow(clippy::result_large_err)]
     pub fn with_packs(runtime: KhiveRuntime, packs: &[String]) -> Result<Self, PackRegError> {
+        if !runtime.config().mounts.is_empty() {
+            return Err(PackRegError {
+                failure: PackRegFailure::Registry(RuntimeError::InvalidInput(
+                    "configured mounts require the async server constructor".into(),
+                )),
+                runtime,
+            });
+        }
+        Self::with_mounted_packs(runtime, packs, Vec::new())
+    }
+
+    /// Build a prepared runtime's native registry and start its configured sources.
+    #[allow(clippy::result_large_err)]
+    pub async fn new_with_mounts(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
+        let packs = runtime.config().packs.clone();
+        let mounted = khive_mounts::start_mounts(&runtime).await;
+        Self::with_mounted_packs(runtime, &packs, mounted)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn with_mounted_packs(
+        runtime: KhiveRuntime,
+        packs: &[String],
+        mounted: Vec<khive_mounts::MountedPack>,
+    ) -> Result<Self, PackRegError> {
         #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
         let channel_loop_admission = ChannelLoopAdmission::for_single_runtime(&runtime, packs);
         let gate = runtime.config().gate.clone();
@@ -1474,6 +1502,14 @@ impl KhiveMcpServer {
                 PackLoadError::NoPublicVerbs { pack } => PackRegFailure::NoPublicVerbs { pack },
             };
             return Err(PackRegError { failure, runtime });
+        }
+        for mount in mounted {
+            builder
+                .register_mounted(Box::new(mount))
+                .map_err(|source| PackRegError {
+                    failure: PackRegFailure::Registry(source),
+                    runtime: runtime.clone(),
+                })?;
         }
         let registry = builder.build().map_err(|source| PackRegError {
             failure: PackRegFailure::Registry(source),
@@ -1906,7 +1942,18 @@ impl KhiveMcpServer {
             .all_verbs_with_names()
             .into_iter()
             .map(|(pack, v)| (pack.to_owned(), v.name.to_owned(), v.description.to_owned()));
-        build_verb_catalog(verbs)
+        let mounted = self
+            .registry
+            .mounted_verb_snapshot()
+            .into_iter()
+            .map(|verb| {
+                (
+                    verb["pack"].as_str().unwrap_or_default().to_owned(),
+                    verb["verb"].as_str().unwrap_or_default().to_owned(),
+                    verb["description"].as_str().unwrap_or_default().to_owned(),
+                )
+            });
+        build_verb_catalog(verbs.chain(mounted))
     }
 
     /// Dispatch a single [`ParsedOp`] by resolving its args (potentially
@@ -3248,6 +3295,17 @@ impl KhiveMcpServer {
             .all_verbs_with_names()
             .into_iter()
             .map(|(pack, handler)| (handler.name.to_string(), pack.to_string()))
+            .chain(
+                self.registry
+                    .mounted_verb_snapshot()
+                    .into_iter()
+                    .map(|verb| {
+                        (
+                            verb["verb"].as_str().unwrap_or_default().to_owned(),
+                            verb["pack"].as_str().unwrap_or_default().to_owned(),
+                        )
+                    }),
+            )
             .collect();
         khive_request::plan_request(ops, &catalog).to_string()
     }
@@ -4780,6 +4838,19 @@ impl ServerHandler for KhiveMcpServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, McpError> {
         let mut tools = Self::tool_router().list_all();
+        self.registry.mounted_verb_catalog().await.map_err(|_| {
+            McpError::internal_error(
+                "mounted catalog unavailable",
+                Some(error_with_disposition(
+                    json!({
+                        "kind": "unavailable",
+                        "message": "mounted catalog unavailable",
+                        "details": {"class": "tool_error", "reason": "catalog_drift"},
+                    }),
+                    DomainDisposition::NotCommitted,
+                )),
+            )
+        })?;
         let catalog = self.verb_catalog();
         for t in &mut tools {
             if t.name == "request" {
