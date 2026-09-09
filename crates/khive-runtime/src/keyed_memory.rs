@@ -1,18 +1,16 @@
 //! Memory identity is published only by the final DML of its atomic create.
 
 use khive_storage::note::Note;
-use khive_storage::types::{Edge, LinkId, SqlValue};
-use khive_storage::{EdgeRelation, SqlStatement};
+use khive_storage::types::SqlValue;
+use khive_storage::SqlStatement;
 use khive_types::{Details, KhiveError};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::atomic_message::{prepare_atomic_notes, AtomicNoteOptions, AtomicNoteSpec};
-use crate::atomic_plan::{AffectedRowGuard, PlanStatement};
-use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
+use crate::atomic_message::{AtomicNoteOptions, AtomicNoteSpec};
+use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicRunOutcome};
+use crate::note_create::{prepare_note_create, KeyPublication, KEY_CLAIM};
 use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
-
-const KEY_CLAIM: &str = "memory-key-claim";
 
 pub struct KeyedMemorySpec<'a> {
     pub content: &'a str,
@@ -85,76 +83,29 @@ pub async fn create_keyed_memory(
             "content must not be empty".into(),
         ));
     }
-    if let Some(target) = spec.source_id {
-        if !runtime.substrate_exists_by_id(token, target).await? {
-            return Err(RuntimeError::NotFound(format!(
-                "create_note annotates target {target} not found"
-            )));
-        }
-    }
-    let mut prepared = prepare_atomic_notes(
+    let (mut prepared, annotation_ids) = prepare_note_create(
         runtime,
-        vec![AtomicNoteSpec {
+        AtomicNoteSpec {
             token,
             id: None,
             kind: "memory",
             name: None,
             content: spec.content,
             properties: Some(spec.properties),
-        }],
+        },
         AtomicNoteOptions {
             salience: Some(spec.salience),
             decay_factor: Some(spec.decay_factor),
             embedding_model: spec.embedding_model,
+            key: Some(spec.key),
+            ..Default::default()
         },
+        &spec.source_id.into_iter().collect::<Vec<_>>(),
+        KeyPublication::AfterDependents,
     )
     .await?;
     let mut note = prepared.notes.remove(0);
-    let AtomicOpPlan::AddNote(plan) = &mut prepared.plans[0] else {
-        return Err(RuntimeError::Internal(
-            "expected prepared memory note".into(),
-        ));
-    };
-    plan.statements[0].statement = khive_db::stores::note::note_insert_if_absent_statement(&note);
-    let edge_id = spec.source_id.map(|target_id| {
-        let now = chrono::Utc::now();
-        let id = Uuid::new_v4();
-        let edge = Edge {
-            id: LinkId::from(id),
-            namespace: note.namespace.clone(),
-            source_id: note.id,
-            target_id,
-            relation: EdgeRelation::Annotates,
-            weight: 1.0,
-            created_at: now,
-            updated_at: now,
-            deleted_at: None,
-            metadata: None,
-            target_backend: None,
-        };
-        plan.statements.push(PlanStatement {
-            statement: khive_db::stores::graph::edge_insert_only_guarded_by_endpoints_statement(
-                &edge,
-            ),
-            guard: Some(AffectedRowGuard::exactly(1)),
-        });
-        id
-    });
-    // A competing claim rolls back all provisional rows, including FTS and annotations.
-    plan.statements.push(PlanStatement {
-        statement: SqlStatement {
-            sql: "UPDATE OR IGNORE notes SET key = ?1 WHERE id = ?2 AND namespace = ?3 \
-                  AND kind = 'memory' AND key IS NULL AND deleted_at IS NULL"
-                .into(),
-            params: vec![
-                SqlValue::Text(spec.key.to_owned()),
-                SqlValue::Text(note.id.to_string()),
-                SqlValue::Text(note.namespace.clone()),
-            ],
-            label: Some(KEY_CLAIM.into()),
-        },
-        guard: Some(AffectedRowGuard::exactly(1)),
-    });
+    let edge_id = annotation_ids.first().copied();
 
     for _attempt in 0..2 {
         #[cfg(test)]
@@ -162,6 +113,7 @@ pub async fn create_keyed_memory(
         match run_atomic_unit(runtime.sql().as_ref(), prepared.plans.clone()).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 note.key = Some(spec.key.to_owned());
+                note.version = 2;
                 return Ok((note, edge_id));
             }
             Ok(AtomicRunOutcome::RolledBack {

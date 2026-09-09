@@ -1193,6 +1193,57 @@ fn v28_adds_nullable_note_keys_and_preserves_populated_v27_rows() {
 }
 
 #[test]
+fn note_version_migration_preserves_populated_rows_and_bumps_every_update() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 29);
+    assert!(!column_exists(&conn, "notes", "version"));
+    for (id, deleted) in [("live", None), ("deleted", Some(300_i64))] {
+        conn.execute(
+            "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at, deleted_at) \
+             VALUES (?1, 'local', 'memory', 'before', 100, 200, ?2)",
+            rusqlite::params![id, deleted],
+        )
+        .unwrap();
+    }
+    run_migrations(&mut conn).unwrap();
+    let rows: Vec<(String, String, i64, i64, Option<i64>, i64)> = conn.prepare(
+        "SELECT id, content, created_at, updated_at, deleted_at, version FROM notes ORDER BY id",
+    ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+        .unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("deleted".into(), "before".into(), 100, 200, Some(300), 1),
+            ("live".into(), "before".into(), 100, 200, None, 1),
+        ]
+    );
+    for (index, sql) in [
+        "UPDATE notes SET content = 'after' WHERE id = 'live'",
+        "UPDATE notes SET content = content WHERE id = 'live'",
+        "UPDATE notes SET properties = '{\"status\":\"done\"}' WHERE id = 'live'",
+        "UPDATE notes SET key = 'key' WHERE id = 'live'",
+        "UPDATE notes SET deleted_at = 400 WHERE id = 'live'",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(conn.execute(sql, []).unwrap(), 1);
+        let version: i64 = conn
+            .query_row("SELECT version FROM notes WHERE id = 'live'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, index as i64 + 2, "{sql}");
+    }
+    assert_eq!(
+        conn.execute("UPDATE notes SET content = '' WHERE id = 'missing'", [])
+            .unwrap(),
+        0
+    );
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+}
+
+#[test]
 fn v28_fresh_schema_has_the_exact_partial_note_key_index() {
     let mut conn = open_memory();
     run_migrations(&mut conn).unwrap();

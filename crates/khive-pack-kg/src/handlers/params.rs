@@ -42,12 +42,18 @@ pub(crate) struct CreateParams {
     /// present, `content` is still stored/FTS-indexed in full; only the text
     /// sent to the embedder is replaced with this value.
     pub(crate) embedding_content: Option<String>,
+    pub(crate) key: Option<String>,
+    pub(crate) embed: Option<bool>,
+    pub(crate) fence: Option<khive_runtime::note_write::NoteFence>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetParams {
-    pub(crate) id: String,
+    pub(crate) id: Option<String>,
+    pub(crate) key: Option<String>,
+    pub(crate) kind: Option<String>,
+    pub(crate) note_kind: Option<String>,
     pub(crate) include_deleted: Option<bool>,
 }
 
@@ -70,6 +76,11 @@ pub(crate) struct ListParams {
     /// page. An empty string starts cursor mode from the beginning.
     pub(crate) after: Option<String>,
     pub(crate) note_kind: Option<String>,
+    pub(crate) key_prefix: Option<String>,
+    pub(crate) after_key: Option<String>,
+    pub(crate) created_after: Option<String>,
+    pub(crate) updated_after: Option<String>,
+    pub(crate) tag_mode: Option<khive_storage::note::NoteTagMode>,
     pub(crate) thread_id: Option<String>,
     pub(crate) direction: Option<String>,
     pub(crate) from: Option<String>,
@@ -128,6 +139,9 @@ pub struct UpdateParams {
     pub(crate) relation: Option<String>,
     pub(crate) weight: Option<f64>,
     pub(crate) entity_kind: Option<Value>,
+    pub(crate) expected_version: Option<i64>,
+    pub(crate) fence: Option<khive_runtime::note_write::NoteFence>,
+    pub(crate) embed: Option<bool>,
 }
 
 /// ADR-099 B3: `pub` for the same reason as `UpdateParams` above — reused

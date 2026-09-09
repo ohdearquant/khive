@@ -46,6 +46,7 @@
   --color-ontology-question: var(--khive-color-ontology-question);
   --color-ontology-decision: var(--khive-color-ontology-decision);
   --color-ontology-reference: var(--khive-color-ontology-reference);
+  --color-ontology-head: var(--khive-color-ontology-head);
   --color-ontology-edge-neutral: var(--khive-color-ontology-edge-neutral);
   --color-ontology-derived: var(--khive-color-ontology-derived);
   --color-ontology-derived-soft: var(--khive-color-ontology-derived-soft);
@@ -188,6 +189,7 @@
   --ontology-question: var(--khive-color-ontology-question);
   --ontology-decision: var(--khive-color-ontology-decision);
   --ontology-reference: var(--khive-color-ontology-reference);
+  --ontology-head: var(--khive-color-ontology-head);
   --ontology-edge-neutral: var(--khive-color-ontology-edge-neutral);
   --ontology-support: var(--khive-color-support);
   --ontology-refute: var(--khive-color-refute);
@@ -241,6 +243,7 @@
   --khive-color-ontology-question: #d3aa68;
   --khive-color-ontology-decision: #82b7a4;
   --khive-color-ontology-reference: #91a9d0;
+  --khive-color-ontology-head: #8fa6a0;
   --khive-color-ontology-edge-neutral: #9ba7ad;
 }
 
@@ -289,5 +292,6 @@
   --khive-color-ontology-question: #8b601f;
   --khive-color-ontology-decision: #3d705f;
   --khive-color-ontology-reference: #566c99;
+  --khive-color-ontology-head: #4a6f68;
   --khive-color-ontology-edge-neutral: #69767c;
 }

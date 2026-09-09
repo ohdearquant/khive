@@ -843,35 +843,34 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         model_name: &str,
     ) -> RuntimeResult<Arc<dyn khive_storage::VectorStore>> {
+        let (model_name, dims) = self.vector_model_metadata(model_name)?;
+        Ok(self.backend.vectors_for_namespace(
+            &sanitize_key(&model_name),
+            &model_name,
+            dims,
+            token.namespace().as_str(),
+        )?)
+    }
+
+    /// Resolve the storage identity and declared dimensions together so guarded
+    /// SQL publication agrees with VectorStore, including built-in aliases.
+    pub(crate) fn vector_model_metadata(&self, model_name: &str) -> RuntimeResult<(String, usize)> {
+        let registry = self
+            .embedder_registry
+            .read()
+            .map_err(|_| crate::RuntimeError::Internal("embedder registry lock poisoned".into()))?;
         if let Some(model) = parse_embedding_model_alias(model_name) {
             // Only proceed via the lattice path if this model is actually in the
             // registry; otherwise fall through to the custom-provider path.
             let key = model.to_string();
-            let in_registry = self
-                .embedder_registry
-                .read()
-                .map(|reg| reg.contains(&key))
-                .unwrap_or(false);
-            if in_registry {
-                return self.vectors_for_embedding_model(token, model);
+            if registry.contains(&key) {
+                return Ok((key, model.dimensions()));
             }
         }
-        let dims = {
-            let registry = self.embedder_registry.read().map_err(|_| {
-                crate::RuntimeError::Internal("embedder registry lock poisoned".into())
-            })?;
-            registry
-                .get_provider(model_name)
-                .map(|p| p.dimensions())
-                .ok_or_else(|| crate::RuntimeError::UnknownModel(model_name.to_string()))?
-        };
-        let model_key = sanitize_key(model_name);
-        Ok(self.backend.vectors_for_namespace(
-            &model_key,
-            model_name,
-            dims,
-            token.namespace().as_str(),
-        )?)
+        registry
+            .get_provider(model_name)
+            .map(|provider| (model_name.to_owned(), provider.dimensions()))
+            .ok_or_else(|| crate::RuntimeError::UnknownModel(model_name.to_string()))
     }
 
     /// Get a namespace-scoped vector store for a pack-owned immutable identity.

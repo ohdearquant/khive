@@ -439,13 +439,15 @@ async fn create_all_note_kinds() {
         "question",
         "decision",
         "reference",
+        "head",
     ] {
-        rt.create_note(&tok, kind, None, "content", Some(0.5), None, vec![])
+        let content = if kind == "head" { "{}" } else { "content" };
+        rt.create_note(&tok, kind, None, content, Some(0.5), None, vec![])
             .await
             .unwrap();
     }
     let all = rt.list_notes(&tok, None, 50, 0).await.unwrap();
-    assert_eq!(all.len(), 5);
+    assert_eq!(all.len(), 6);
 }
 
 // =============================================================================

@@ -18,8 +18,16 @@ CREATE TABLE IF NOT EXISTS notes (
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL,
     deleted_at   INTEGER,
-    key          TEXT
+    key          TEXT,
+    version      INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TRIGGER IF NOT EXISTS bump_note_version
+AFTER UPDATE ON notes
+WHEN NEW.version = OLD.version
+BEGIN
+    UPDATE notes SET version = OLD.version + 1 WHERE id = NEW.id;
+END;
 
 CREATE INDEX IF NOT EXISTS idx_notes_namespace ON notes(namespace);
 CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(namespace, kind);

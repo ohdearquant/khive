@@ -19,6 +19,13 @@ use crate::KgPack;
 // docs/api/note-crud-fields.md#reject_inapplicable_fields-handlersupdaters. MUST be updated
 // whenever UpdateParams or a patch struct changes.
 fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), RuntimeError> {
+    if !matches!(spec, KindSpec::Note { .. })
+        && (p.expected_version.is_some() || p.fence.is_some() || p.embed.is_some())
+    {
+        return Err(RuntimeError::InvalidInput(
+            "expected_version, fence and embed apply only to notes".into(),
+        ));
+    }
     let (bad_field, valid): (Option<&str>, &str) = match spec {
         KindSpec::Entity { .. } => {
             let bad = if p.content.is_some() {
@@ -272,7 +279,13 @@ impl KgPack {
                     p.salience,
                     p.decay_factor,
                     p.properties,
-                );
+                )
+                .with_write_options(khive_runtime::note_write::NoteWriteOptions {
+                    expected_version: p.expected_version,
+                    fence: p.fence,
+                    embed: p.embed,
+                    key: None,
+                });
                 let (note, report) = self
                     .runtime
                     .update_note_from_snapshot_with_embedding_report(token, note, patch)

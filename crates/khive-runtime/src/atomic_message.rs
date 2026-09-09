@@ -28,7 +28,7 @@
 //! # One writer acquisition
 //!
 //! Each note becomes its own [`AddNotePlan`]; every spec's plan is applied by
-//! ONE [`run_atomic_unit`] call — one [`khive_storage::SqlAccess::atomic_unit`],
+//! ONE [`crate::atomic_runner::run_atomic_unit`] commit pass — one [`khive_storage::SqlAccess::atomic_unit`],
 //! one writer checkout, one WAL commit for the whole set. A failure on any
 //! note's plan rolls back the ENTIRE unit (`atomic_runner`'s documented
 //! guarantee: a later op's failure unwinds even an earlier op's own
@@ -48,7 +48,7 @@ use khive_storage::{SqlStatement, StorageCapability, StorageError};
 use khive_types::SubstrateKind;
 
 use crate::atomic_plan::{AddNotePlan, AffectedRowGuard, PlanStatement, PostCommitEffect};
-use crate::atomic_runner::{run_atomic_unit, AtomicOpPlan, AtomicRunOutcome};
+use crate::atomic_runner::{AtomicOpPlan, AtomicRunOutcome};
 use crate::config::NamespaceToken;
 use crate::curation::note_fts_document;
 use crate::error::{RuntimeError, RuntimeResult};
@@ -78,6 +78,10 @@ pub(crate) struct AtomicNoteOptions<'a> {
     pub salience: Option<f64>,
     pub decay_factor: Option<f64>,
     pub embedding_model: Option<&'a str>,
+    pub embedding_content: Option<&'a str>,
+    pub embed: Option<bool>,
+    pub key: Option<&'a str>,
+    pub fence: Option<&'a crate::note_write::NoteFence>,
 }
 
 pub(crate) struct PreparedAtomicNotes {
@@ -112,7 +116,7 @@ fn non_finite_index(data: &[f32]) -> Option<usize> {
 /// private `non_finite_vector_error("vec_insert", ..)` — the atomic path
 /// must reject a non-finite embedding exactly as the raw `VectorStore::insert`
 /// DML does, not silently write it.
-fn non_finite_vector_error(idx: usize, value: f32) -> RuntimeError {
+pub(crate) fn non_finite_vector_error(idx: usize, value: f32) -> RuntimeError {
     RuntimeError::Storage(StorageError::InvalidInput {
         capability: StorageCapability::Vectors,
         operation: "vec_insert".into(),
@@ -176,7 +180,7 @@ fn maybe_inject_vector_failure(_namespace: &str, _label: &str) -> Option<PlanSta
 /// `atomic_prepare::prepare_add_note` (the row's existence guard is carried by
 /// the plan's primary note-row statement, applied first).
 #[allow(clippy::too_many_arguments)]
-fn vector_insert_statements(
+pub(crate) fn vector_insert_statements(
     table: &str,
     namespace: &str,
     subject_id: Uuid,
@@ -263,7 +267,7 @@ fn vector_insert_statements(
 /// validation, embedding, or the atomic commit pass itself — NO note, FTS
 /// document, or vector row from any spec is left behind (embed failures
 /// occur before any write is attempted; commit-pass failures roll back the
-/// whole unit per [`run_atomic_unit`]'s guarantee).
+/// whole unit per [`crate::atomic_runner::run_atomic_unit`]'s guarantee).
 pub async fn create_notes_atomic(
     runtime: &KhiveRuntime,
     specs: Vec<AtomicNoteSpec<'_>>,
@@ -279,15 +283,32 @@ pub async fn create_notes_atomic_with_report(
     runtime: &KhiveRuntime,
     specs: Vec<AtomicNoteSpec<'_>>,
 ) -> RuntimeResult<(Vec<Note>, crate::retrieval::EmbeddingTruncationReport)> {
-    let prepared = prepare_atomic_notes(runtime, specs, AtomicNoteOptions::default()).await?;
-    match run_atomic_unit(runtime.sql().as_ref(), prepared.plans).await {
-        Ok(AtomicRunOutcome::Committed { .. }) => {
+    let mut prepared = prepare_atomic_notes(runtime, specs, AtomicNoteOptions::default()).await?;
+    match crate::atomic_runner::run_atomic_unit_with_note_versions(
+        runtime.sql().as_ref(),
+        prepared.plans,
+        true,
+    )
+    .await
+    {
+        Ok((AtomicRunOutcome::Committed { .. }, versions)) => {
+            assert_eq!(
+                prepared.notes.len(),
+                versions.len(),
+                "one revision receipt per prepared note"
+            );
+            for (note, version) in prepared.notes.iter_mut().zip(versions) {
+                note.version = version;
+            }
             Ok((prepared.notes, prepared.embedding_truncation))
         }
-        Ok(AtomicRunOutcome::RolledBack {
-            failed_op_index,
-            failure,
-        }) => Err(RuntimeError::Internal(format!(
+        Ok((
+            AtomicRunOutcome::RolledBack {
+                failed_op_index,
+                failure,
+            },
+            _,
+        )) => Err(RuntimeError::Internal(format!(
             "atomic multi-note write rolled back at op {failed_op_index}: {failure:?}"
         ))),
         Err(e) => Err(RuntimeError::Storage(e.0)),
@@ -313,7 +334,9 @@ pub(crate) async fn prepare_atomic_notes(
             ));
         }
     }
-    let embed_model_names = if let Some(model) = options.embedding_model {
+    let embed_model_names = if options.embed == Some(false) {
+        Vec::new()
+    } else if let Some(model) = options.embedding_model {
         runtime.resolve_embedding_model(Some(model))?;
         vec![model.to_owned()]
     } else {
@@ -342,6 +365,7 @@ pub(crate) async fn prepare_atomic_notes(
 
         let ns = spec.token.namespace().as_str();
         let mut note = Note::new(ns, spec.kind, spec.content);
+        note.key = options.key.map(str::to_owned);
         if let Some(salience) = options.salience {
             note = note.with_salience(salience);
         }
@@ -367,7 +391,9 @@ pub(crate) async fn prepare_atomic_notes(
     let mut content_groups: Vec<Vec<usize>> = Vec::new();
     let mut note_content_groups: Vec<usize> = Vec::with_capacity(notes.len());
     for (note_idx, note) in notes.iter().enumerate() {
-        let text = crate::curation::note_embedding_text_ref(note);
+        let text = options
+            .embedding_content
+            .unwrap_or_else(|| crate::curation::note_embedding_text_ref(note));
         let content_group_idx = match content_group_by_text.get(text) {
             Some(&idx) => {
                 content_groups[idx].push(note_idx);
@@ -411,7 +437,11 @@ pub(crate) async fn prepare_atomic_notes(
             let note = &notes[note_idx];
             // Spawned tasks need owned text; share one content allocation across
             // every model instead of cloning the note body per task.
-            let text: Arc<str> = Arc::from(crate::curation::note_embedding_text_ref(note));
+            let text: Arc<str> = Arc::from(
+                options
+                    .embedding_content
+                    .unwrap_or_else(|| crate::curation::note_embedding_text_ref(note)),
+            );
             for (model_idx, model_name) in embed_model_names.iter().enumerate() {
                 let rt = runtime.clone();
                 let token = spec.token.clone();
@@ -487,7 +517,11 @@ pub(crate) async fn prepare_atomic_notes(
     for (note_idx, note) in notes.iter().enumerate() {
         let outcomes_for_note = &embedding_outcomes[note_content_groups[note_idx]];
         let mut statements = vec![PlanStatement {
-            statement: khive_db::stores::note::note_upsert_statement(note),
+            statement: if note.key.is_some() {
+                khive_db::stores::note::note_insert_keyed_statement(note)
+            } else {
+                khive_db::stores::note::note_upsert_statement(note)
+            },
             guard: Some(AffectedRowGuard::exactly(1)),
         }];
 
@@ -548,6 +582,16 @@ pub(crate) async fn prepare_atomic_notes(
         }
 
         plans.push(AtomicOpPlan::AddNote(AddNotePlan {
+            note_guard: Some(crate::note_write::NoteWriteGuard {
+                namespace: specs[note_idx].token.namespace().as_str().into(),
+                target_id: note.id,
+                expected_version: None,
+                fence: options.fence.cloned(),
+                create_key: note
+                    .key
+                    .as_ref()
+                    .map(|key| (note.kind.clone(), key.clone())),
+            }),
             note_id: note.id,
             statements,
             post_commit: PostCommitEffect::None,
@@ -951,7 +995,7 @@ mod tests {
     /// that id, reflecting the latest content — not an append of two
     /// documents (the note row is already an upsert; the FTS half must match).
     #[tokio::test]
-    async fn create_notes_atomic_upserts_fts_document_for_reused_note_id() {
+    async fn version_create_notes_atomic_upserts_fts_document_for_reused_note_id() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = "atomic-message-fts-upsert-test";
         let token = runtime
@@ -959,7 +1003,7 @@ mod tests {
             .expect("authorize");
         let id = Uuid::new_v4();
 
-        create_notes_atomic(
+        let first = create_notes_atomic(
             &runtime,
             vec![AtomicNoteSpec {
                 token: &token,
@@ -972,8 +1016,9 @@ mod tests {
         )
         .await
         .expect("first write with supplied id");
+        assert_eq!(first[0].version, 1);
 
-        create_notes_atomic(
+        let second = create_notes_atomic(
             &runtime,
             vec![AtomicNoteSpec {
                 token: &token,
@@ -986,6 +1031,48 @@ mod tests {
         )
         .await
         .expect("second write reusing the same id");
+        assert_eq!(second[0].version, 2);
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            2
+        );
+        let repeated = create_notes_atomic(
+            &runtime,
+            (0..2)
+                .map(|_| AtomicNoteSpec {
+                    token: &token,
+                    id: Some(id),
+                    kind: "observation",
+                    name: None,
+                    content: "second content replacing the first",
+                    properties: None,
+                })
+                .collect(),
+        )
+        .await
+        .expect("equal-value upserts in the same batch");
+        assert_eq!(
+            repeated.iter().map(|note| note.version).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            4
+        );
 
         assert_eq!(
             fts_row_count(&runtime, ns).await,

@@ -30,7 +30,7 @@ async fn stream_mcp_request_chain_array_and_error_objects() -> anyhow::Result<()
         .unwrap()
         .iter()
         .map(|row| {
-            assert_eq!(row["ok"], true);
+            assert_eq!(row["ok"], true, "{array}");
             row["result"]["seq"].as_i64().unwrap()
         })
         .collect();
