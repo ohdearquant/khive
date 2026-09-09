@@ -373,9 +373,11 @@ per namespace whatever its document kind, which is what a read by key alone requ
 
 ### A2.3 `embed`
 
-`create(kind="note", ...)` and `update(...)` accept `embed` (boolean). On `create` it defaults to
-`true`, today's behaviour; with `false` the write produces no embedding rows and no vector-index work
-and the note is not a similarity candidate, while lexical indexing and listing are unchanged. On
+`create(kind="note", ...)` and `update(...)` accept `embed` (boolean). On `create` the default is
+scoped by the note kind: `false` for `head`, because a head is the document addressed by key and nothing
+else and the gap above names the lease re-embedded on every renewal; `true` for every other kind,
+today's behaviour. With `false` the write produces no embedding rows and no vector-index work and the
+note is not a similarity candidate, while lexical indexing and listing are unchanged. On
 `update` the default keeps the note's current state: a note with embedding rows is re-embedded, a note
 without them stays unembedded; `embed=true` or `false` on an update overrides that once. ADR-174
 Amendment 3 gives stream entries the same field with `false` as the default.
@@ -398,8 +400,9 @@ quoted with exit codes.
    `tags=["kind:fleet/epoch"]` returns none, the prefix alone returns three, order and cursor per §4.
 3. A key held by a `head` and the same key held by a `memory` coexist; `get(key=K)` without
    `note_kind` is `key_ambiguous` naming both kinds.
-4. `embed=false` on create: no embedding rows, not returned for its own content by similarity search,
-   returned by `list` and lexical search; the `embed=true` control has one row per registered model;
-   an `update` without `embed` on the unembedded head leaves it unembedded, and on the embedded control
-   re-embeds it.
+4. A `head` created without `embed`: no embedding rows, not returned for its own content by similarity
+   search, returned by `list` and lexical search; the `embed=true` control has one row per registered
+   model, and an `observation` created without `embed` has one row per model too (the default is
+   kind-scoped); an `update` without `embed` on the unembedded head leaves it unembedded, and on the
+   embedded control re-embeds it.
 5. A2.4's mutation arm, both runs quoted.

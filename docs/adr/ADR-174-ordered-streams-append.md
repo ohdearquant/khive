@@ -323,8 +323,9 @@ Both forms are load-bearing, so the verb carries both and names which one it is 
 
 `stream.batch(ops, fence=None, observed=None, atomic=None, namespace=None)` takes a list of member
 operations, each `{"op": "append", "stream": S, "record": R, "expected_seq": N | null}` or
-`{"op": "write", "key": K, "kind": <note kind>, "doc": D, "expected_version": V | null}` (the
-keyed document write of ADR-172 §2 and §3). Common to both modes:
+`{"op": "write", "key": K, "kind": <note kind>, "doc": D, "tags": [...] | null, "embed": bool | null,
+"expected_version": V | null}` (the keyed document write of ADR-172 §2 and §3; `tags` and `embed` as
+its Amendment 2 defines them, `embed` defaulting by the note kind). Common to both modes:
 
 - Members are validated for shape before anything is written: a member that is not an object, a
   member without an `op` string, or a record over the note content limit refuses the whole batch
@@ -341,7 +342,7 @@ keyed document write of ADR-172 §2 and §3). Common to both modes:
   the mode: an atomic batch's appends to one stream take consecutive numbers, because they are one
   transaction; a per-member batch's appends may have another process's append between them, and
   only the union is dense (§3).
-- Reads (`get`, `stream.read`, `stream.head`) are not members: a batch is a write primitive. The
+- Reads (`get`, `stream.read`, `stream.stat`) are not members: a batch is a write primitive. The
   consumer's case reads an unknown object inside its batch; on khive that read is issued beside
   the batch by the adapter, and the assertion on its value is unchanged.
 - The result is `{"results": [<member result>...], "committed": true}` in list order; a member
@@ -482,8 +483,9 @@ similarity `search` or `recall`; lexical indexing and `list` are unchanged, so i
 and by walk. With `embed=true` the entry is embedded exactly as `create(kind="note")` embeds: every
 registered model, or the one `embedding_model` names. `embedding_model` without `embed=true` is refused
 as `invalid_input` and nothing is written. A `stream.batch` append member carries the same two fields
-with the same defaults. The keyed `write` member is ADR-172's document and takes ADR-172's own `embed`
-(its Amendment 2, default `true`); a consumer writing lease or run documents passes `false`.
+with the same defaults, and the keyed `write` member carries `tags` and `embed` as ADR-172 Amendment 2
+defines them (A1.1's member shape lists both), `embed` defaulting to `false` for the `head` kind and
+`true` for every other kind.
 
 The note's content limit, the audit event and the ledger row are unchanged; an unembedded entry is a
 whole entry in every respect this ADR defines.
