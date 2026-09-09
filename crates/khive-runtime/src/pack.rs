@@ -2590,6 +2590,18 @@ impl VerbRegistry {
                     .collect(),
                 None => self.visible_namespaces.clone(),
             };
+            // ADR-007 Rev 4 Rule 3b, applied once at the seam every identity
+            // path shares: a non-`local` actor reads its own namespace by
+            // default (its episodic memories land there), whether the identity
+            // came from the config loader, a daemon frame, a scheduled replay
+            // or an embedding host. Writes stay pinned to `local` (Rule 0).
+            if let Some(actor_namespace) = resolved_actor
+                .binding_id()
+                .filter(|id| *id != Namespace::LOCAL)
+                .and_then(|id| Namespace::parse(id).ok())
+            {
+                extra_visible.push(actor_namespace);
+            }
             extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
             NamespaceToken::mint_with_visibility(primary, extra_visible, resolved_actor)
         }
@@ -6720,6 +6732,126 @@ pub(crate) mod tests {
             "gate request actor and storage token actor must carry the same id"
         );
         assert_eq!(gate_actor.id, "actor-alpha");
+    }
+
+    struct VisibilityCapturingPack {
+        visible: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl Pack for VisibilityCapturingPack {
+        const NAME: &'static str = "alpha";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = AlphaPack::HANDLERS;
+    }
+
+    #[async_trait]
+    impl PackRuntime for VisibilityCapturingPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            self.visible.lock().unwrap().push(
+                token
+                    .visible_namespace_strs()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            );
+            Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
+        }
+    }
+
+    /// ADR-007 Rev 4 Rule 3b at the token seam: a per-request identity that
+    /// names a non-`local` actor reads that actor's namespace by default even
+    /// when its `visible_namespaces` list is empty, the actor appears once when
+    /// the list already names it, an anonymous identity keeps exactly `local`,
+    /// and an explicit `namespace=` stays a precise single-namespace scope.
+    #[tokio::test]
+    async fn dispatch_with_identity_folds_the_actor_namespace_into_default_reads() {
+        let visible = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(VisibilityCapturingPack {
+            visible: visible.clone(),
+        });
+        let reg = builder.build().expect("registry builds");
+        let identity = |actor: Option<&str>, listed: &[&str]| RequestIdentity {
+            namespace: "local".to_string(),
+            actor_id: actor.map(str::to_string),
+            visible_namespaces: listed.iter().map(|ns| ns.to_string()).collect(),
+            ..Default::default()
+        };
+
+        reg.dispatch_with_identity(
+            "list",
+            Value::Null,
+            Some(identity(Some("lambda:probe"), &[])),
+        )
+        .await
+        .unwrap();
+        reg.dispatch_with_identity(
+            "list",
+            Value::Null,
+            Some(identity(Some("lambda:probe"), &["lambda:probe"])),
+        )
+        .await
+        .unwrap();
+        reg.dispatch_with_identity("list", Value::Null, Some(identity(None, &[])))
+            .await
+            .unwrap();
+        reg.dispatch_with_identity(
+            "list",
+            serde_json::json!({"namespace": "lambda:probe"}),
+            Some(identity(Some("lambda:probe"), &[])),
+        )
+        .await
+        .unwrap();
+
+        let captured = visible.lock().unwrap();
+        let count = |set: &Vec<String>, ns: &str| set.iter().filter(|s| s.as_str() == ns).count();
+        assert_eq!(
+            count(&captured[0], "lambda:probe"),
+            1,
+            "empty list: {:?}",
+            captured[0]
+        );
+        assert_eq!(
+            count(&captured[0], "local"),
+            1,
+            "empty list: {:?}",
+            captured[0]
+        );
+        assert_eq!(
+            count(&captured[1], "lambda:probe"),
+            1,
+            "listed once: {:?}",
+            captured[1]
+        );
+        assert_eq!(
+            captured[2],
+            vec!["local".to_string()],
+            "anonymous keeps exactly local"
+        );
+        assert_eq!(
+            captured[3],
+            vec!["lambda:probe".to_string()],
+            "explicit namespace is a precise scope, never widened"
+        );
     }
 
     /// Same identity check with no configured `actor_id`: both the gate and

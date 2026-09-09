@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 20    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 23    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -27,16 +27,18 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 4     | `KHIVE_PACKS=kg,git`                       | Yes                 |
+| `git`       | 12    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its four verbs are `git.digest` (read/ingest) plus three
-write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that shell to system git
-with hardened, allowlisted argv construction. A remote `git.digest` source whose initial
+`kkernel git-ingest` CLI drive. Its twelve verbs are `git.digest` (read/ingest), the three
+write verbs `git.commit` / `git.branch` / `git.push` (ADR-108) that shell to system git
+with hardened, allowlisted argv construction, and the dev-loop verbs `git.checkout` /
+`git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
+`git.pr_merge` (ADR-182). A remote `git.digest` source whose initial
 clone or fetch setup fails returns a typed `RemoteFetchError` naming the redacted remote
 to in-process callers; the MCP `request` envelope renders it as a plain error message
 rather than structured fields (ADR-088 Amendment 1, Remote-URL mode, point 5). A
@@ -200,7 +202,7 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 20 verbs
+## `kg` pack — 23 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -2165,7 +2167,11 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 ---
 
-## `git` pack — 4 verbs
+## `git` pack — 12 verbs
+
+The entries below cover the ingest and write surface; the dev-loop verbs
+(`git.checkout`, `git.diff`, `git.gates`, `git.receipts`, `git.reconcile`, `git.pr_open`,
+`git.pr_review`, `git.pr_merge`) are specified in ADR-182 and its amendments.
 
 Git-history ingester plus a hardened write surface (ADR-088,
 [ADR-088 Amendment 1](../adr/ADR-088-amendment-1-git-digest.md),

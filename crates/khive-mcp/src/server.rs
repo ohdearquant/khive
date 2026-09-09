@@ -9882,10 +9882,25 @@ mod tests {
             );
             assert_eq!(identity["unattributed"], actor_id.is_none());
             assert_eq!(identity["namespace"], "local");
+            // A replay reads exactly what its verified actor reads on every
+            // other path: `local` plus the actor's own namespace (ADR-007 Rev 4
+            // Rule 3b, folded where the token is minted), and nothing from the
+            // daemon's configured visibility. An anonymous replay keeps `local`.
+            let expected = match actor_id {
+                Some(actor) => json!(["local", actor]),
+                None => json!(["local"]),
+            };
             assert_eq!(
                 identity["visible_namespaces"],
-                json!(["local"]),
-                "replay must inherit neither actor-derived nor daemon visibility: {identity}"
+                expected,
+                "replay inherits its own actor namespace and never the daemon's visibility: {identity}"
+            );
+            assert!(
+                !identity["visible_namespaces"]
+                    .as_array()
+                    .map(|v| v.iter().any(|ns| ns == "daemon-visible"))
+                    .unwrap_or(true),
+                "daemon visibility leaked into a scheduled replay: {identity}"
             );
         }
     }

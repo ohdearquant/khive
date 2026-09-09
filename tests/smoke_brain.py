@@ -91,7 +91,13 @@ def call_verb_expect_error(proc, name, args):
         raise RuntimeError(
             f"expected {name} to fail but it succeeded: {first.get('result')}"
         )
-    return first.get("error", "<no error string>")
+    err = first.get("error", "")
+    # Since the runtime started preserving domain outcomes, a per-op error is a
+    # structured object ({"kind", "message", "domain_disposition", ...}); the
+    # assertions below read its message text.
+    if isinstance(err, dict):
+        err = str(err.get("message") or err)
+    return err
 
 
 def spawn_brain_proc():
