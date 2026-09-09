@@ -28,7 +28,13 @@ pub mod keyed_memory;
 #[cfg(test)]
 mod keyed_memory_tests;
 pub mod keyed_message;
+mod note_create;
+mod note_index;
+mod note_read;
 mod note_store_guard;
+pub mod note_write;
+#[cfg(test)]
+mod note_write_tests;
 pub mod objectives;
 pub mod operations;
 pub mod pack;

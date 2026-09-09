@@ -86,6 +86,7 @@ def test_stream_python_cli_same_result_and_error_objects(scratch_daemon):
         ops = encode([op(verb, **args)])
         expected = client.request(ops)[0]
         proc = subprocess.run([binary, "exec", ops, "--config", str(scratch_daemon["root"] / "khive.toml"), "--db", str(scratch_daemon["root"] / "scratch.db"), "--presentation", "verbose", "--output-format", "json"], env=env, cwd=scratch_daemon["root"], capture_output=True, text=True, timeout=60)
+        assert proc.stdout.strip(), (proc.returncode, proc.stderr)
         envelope = json.loads(proc.stdout)
         actual = envelope["results"][0]
         assert actual["ok"] == expected["ok"], (actual, expected, proc.stderr)

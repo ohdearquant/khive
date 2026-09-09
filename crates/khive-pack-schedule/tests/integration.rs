@@ -807,6 +807,7 @@ async fn h2_agenda_finds_valid_event_past_corrupt_legacy_rows() {
     // need to control ordering precisely, so use the storage layer too.
     let valid_at = "2099-11-11T11:11:11Z";
     let valid_note = Note {
+        version: 1,
         key: None,
         id: uuid::Uuid::new_v4(),
         namespace: "local".to_string(),
@@ -841,6 +842,7 @@ async fn h2_agenda_finds_valid_event_past_corrupt_legacy_rows() {
     let now_micros = Utc::now().timestamp_micros();
     for i in 0..250u32 {
         let corrupt = Note {
+            version: 1,
             key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),
@@ -1099,6 +1101,7 @@ async fn sch_aud_001_cancel_with_string_properties_returns_error() {
     // a corrupt row that would previously cause a panic in handle_cancel.
     let corrupt_id = uuid::Uuid::new_v4();
     let corrupt = Note {
+        version: 1,
         key: None,
         id: corrupt_id,
         namespace: "local".to_string(),
