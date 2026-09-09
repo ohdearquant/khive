@@ -4604,8 +4604,20 @@ mod tests {
         };
         let resp_ver = exchange(&sock, &wrong_version).await;
         assert!(
-            resp_ver.version_mismatch,
-            "wrong protocol version must set version_mismatch"
+            !resp_ver.version_mismatch,
+            "a client below the daemon's protocol is refused with version_mismatch=false: \
+             the flag is reserved for a client that is ahead, and the deployed bridges \
+             re-exec on this shape. The typed code below carries the fact instead."
+        );
+        assert_eq!(
+            resp_ver
+                .error_detail
+                .as_ref()
+                .and_then(|detail| detail.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("version_mismatch"),
+            "the refusal must stay typed as a version mismatch; got: {:?}",
+            resp_ver.error_detail
         );
         assert!(!resp_ver.ok);
         assert!(
@@ -7431,30 +7443,9 @@ mod tests {
     // This test asserts try_forward_inner returns ForwardOutcome::Response
     // (not ProtocolMismatch) so map_response produces the hard error.
 
-    fn newer_daemon_version_mismatch_response(config_id: &str) -> DaemonResponseFrame {
-        DaemonResponseFrame {
-            ok: false,
-            result: None,
-            error: Some(format!(
-                "daemon protocol mismatch: client={} daemon={} — \
-                 rebuild/update the client binary (make local)",
-                PROTOCOL_VERSION,
-                PROTOCOL_VERSION + 1
-            )),
-            error_detail: None,
-            namespace_mismatch: false,
-            config_mismatch: false,
-            served_config_id: Some(config_id.to_string()),
-            version_mismatch: true,
-            daemon_protocol_version: PROTOCOL_VERSION + 1,
-            metrics: None,
-            request_id: None,
-        }
-    }
-
     #[tokio::test]
     #[serial]
-    async fn try_forward_inner_newer_daemon_mismatch_yields_response_not_recovery() {
+    async fn try_forward_inner_behind_a_newer_daemon_yields_protocol_mismatch() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -7469,7 +7460,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&sock).expect("bind newer-daemon socket");
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
 
-        let mismatch_resp = newer_daemon_version_mismatch_response(config_id);
+        let mismatch_resp = newer_daemon_response(config_id);
         let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
 
         let frame = DaemonRequestFrame {
@@ -7496,10 +7487,15 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
 
         assert!(
-            matches!(outcome, ForwardOutcome::Response(_)),
-            "version_mismatch=true with daemon_protocol_version > PROTOCOL_VERSION \
-             must yield Response (hard error via map_response), not ProtocolMismatch \
-             (the client binary, not the daemon, is stale)"
+            matches!(
+                outcome,
+                ForwardOutcome::ProtocolMismatch {
+                    daemon_protocol_version
+                } if daemon_protocol_version == PROTOCOL_VERSION + 1
+            ),
+            "a daemon ahead of this bridge yields ProtocolMismatch carrying the daemon's \
+             version, so the bridge answers the caller and then re-execs the current \
+             binary; the version_mismatch flag on the frame does not decide this"
         );
 
         clear_daemon_env();
