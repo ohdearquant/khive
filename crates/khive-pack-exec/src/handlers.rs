@@ -4,6 +4,7 @@
 //! receipt.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -505,7 +506,10 @@ fn materialize(
             .unwrap_or(&[]);
         std::fs::write(&target, data)?;
         let mode = if entry.mode == 755 { 0o755 } else { 0o644 };
+        #[cfg(unix)]
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
+        #[cfg(not(unix))]
+        let _ = mode;
     }
     Ok(())
 }
@@ -516,6 +520,31 @@ fn declared_covers(declared: &[String], path: &str) -> bool {
         .any(|d| d == path || path.starts_with(&format!("{d}/")))
 }
 
+/// The resource identifier `setrlimit` takes: an enum-typed integer on glibc,
+/// a plain `c_int` on every other unix libc.
+#[cfg(all(unix, target_os = "linux", target_env = "gnu"))]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
+type RlimitResource = libc::c_int;
+
+/// Launching a tool needs a process group, resource limits, a close-on-exec
+/// pipe for the limit report and the sandbox: unix facilities. On any other
+/// host `exec.run` refuses before touching the store or the filesystem.
+#[cfg(not(unix))]
+async fn execute(
+    _rt: &KhiveRuntime,
+    _ns: &str,
+    _cfg: &Resolved,
+    _req: &Request,
+    _ready: Ready,
+    _receipt: &mut Receipt,
+) -> Result<(), RuntimeError> {
+    Err(RuntimeError::Unconfigured(
+        "exec.run launches tools on unix hosts only; this host provides none of the process-group, resource-limit and sandbox facilities the run contract requires".into(),
+    ))
+}
+
+#[cfg(unix)]
 async fn execute(
     rt: &KhiveRuntime,
     ns: &str,
@@ -615,7 +644,7 @@ async fn execute(
             let mut report = String::from("{");
             let mut first = true;
             let mut apply =
-                |name: &str, resource: libc::c_int, value: u64| -> std::io::Result<()> {
+                |name: &str, resource: RlimitResource, value: u64| -> std::io::Result<()> {
                     let lim = libc::rlimit {
                         rlim_cur: value as libc::rlim_t,
                         rlim_max: value as libc::rlim_t,
@@ -838,6 +867,7 @@ fn cleanup(run_dir: &Path, profile_path: &Path, keep: bool) {
     }
 }
 
+#[cfg(unix)]
 fn kill_group(pid: i32) {
     if pid <= 0 {
         return;
@@ -847,6 +877,7 @@ fn kill_group(pid: i32) {
     }
 }
 
+#[cfg(unix)]
 fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: plain pipe creation; both ends are marked close-on-exec so the
@@ -866,6 +897,7 @@ fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
     Ok((fds[0], fds[1]))
 }
 
+#[cfg(unix)]
 fn read_limit_report(reader: libc::c_int) -> Value {
     use std::io::Read;
     use std::os::unix::io::FromRawFd;

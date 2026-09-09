@@ -278,6 +278,7 @@ mod tests {
         assert_eq!(a, digest_hex(br#"["/a"]"#));
     }
 
+    #[cfg(unix)]
     #[test]
     fn forbidden_basenames_refuse() {
         let dir = tempfile::tempdir().unwrap();
