@@ -1714,10 +1714,12 @@ impl VerbRegistry {
         ("exec", "exec.runs"),
         ("exec", "exec.events"),
         ("exec", "exec.identity"),
-        // git (receipt list and allowlist reads; checkout, diff and reconcile
-        // persist receipts and are excluded)
+        // git (receipt list, allowlist, working-tree and history reads;
+        // checkout, diff and reconcile persist receipts and are excluded)
         ("git", "git.receipts"),
         ("git", "git.gates"),
+        ("git", "git.status"),
+        ("git", "git.log"),
         // blob
         ("blob", "blob.get"),
         ("blob", "blob.stat"),

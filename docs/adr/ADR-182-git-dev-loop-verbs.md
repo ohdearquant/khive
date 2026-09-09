@@ -483,3 +483,13 @@ Two additions, from gating this amendment rather than from writing it.
    arm cannot pass on a healthy pack. Arm 49's control now runs first: the same repo and the same
    call shape succeed while the decision is allow, then the deny arm refuses, then the receipt count
    is compared across both.
+
+8. **A new public Assertive verb is unclassified until someone reviews its side effects.** The
+   runtime keeps a cross-pack census that scans every pack's live vocabulary for public Assertive
+   handlers and requires each one to appear exactly once either on the admission-degrade-safe
+   allowlist or on the known-incidental-writer denylist, so a verb added without that review fails
+   the census rather than inheriting a default. `git.status` and `git.log` take the same shape
+   `git.gates` established: allowlist match, policy decision, read, no credential and no receipt.
+   Both are therefore admission-degrade-safe and are listed under the `git` pack beside
+   `git.receipts` and `git.gates`. `git.init` is Commissive and writes a receipt, so the census
+   does not reach it.
