@@ -2729,7 +2729,24 @@ fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> V
         },
         _ => None,
     };
+    // The refusal text is the same Display string every consumer already
+    // matches on; the receipt fields ride beside it.
+    let denial_message =
+        matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
     let payload = match error {
+        RuntimeError::PermissionDenied {
+            verb,
+            reason,
+            receipt,
+        } => json!({
+            "kind": "runtime_error",
+            "code": "permission_denied",
+            "message": denial_message.unwrap_or_default(),
+            "verb": verb,
+            "reason": reason,
+            "audit_event_id": receipt.audit_event_id.map(|id| id.to_string()),
+            "audit_outcome": receipt.audit_outcome.wire_code(),
+        }),
         RuntimeError::AuditObligation {
             failure,
             domain_result,
@@ -2765,7 +2782,6 @@ fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> V
         | RuntimeError::PackRedeclared { .. }
         | RuntimeError::VerbCollision { .. }
         | RuntimeError::ReservedEnvelopeParam { .. }
-        | RuntimeError::PermissionDenied { .. }
         | RuntimeError::GateUnavailable { .. }
         | RuntimeError::NamespaceMismatch { .. }
         | RuntimeError::AmbiguousPrefix { .. }

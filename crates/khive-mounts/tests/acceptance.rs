@@ -174,7 +174,7 @@ async fn gate_denial_has_no_foreign_call_or_additional_process() {
     let starts = count(&path, ".starts");
     let mounted = registry.dispatch("demo.A", json!({})).await.unwrap_err();
     let native = registry.dispatch("stats", json!({})).await.unwrap_err();
-    let khive_runtime::RuntimeError::PermissionDenied { verb, reason } = mounted else {
+    let khive_runtime::RuntimeError::PermissionDenied { verb, reason, .. } = mounted else {
         panic!("mounted gate refusal")
     };
     let khive_runtime::RuntimeError::PermissionDenied {

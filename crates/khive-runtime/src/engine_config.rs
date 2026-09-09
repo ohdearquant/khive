@@ -2691,7 +2691,7 @@ grant_unattributed = false
         let runtime = crate::KhiveRuntime::new(denied).expect("runtime");
         assert!(matches!(
             runtime.authorize(Namespace::local()),
-            Err(crate::RuntimeError::PermissionDenied { ref verb, ref reason })
+            Err(crate::RuntimeError::PermissionDenied { ref verb, ref reason, .. })
                 if verb == "authorize" && reason == "actor is not enrolled"
         ));
     }

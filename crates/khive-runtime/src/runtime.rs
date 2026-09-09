@@ -1073,15 +1073,12 @@ impl KhiveRuntime {
                 Ok(NamespaceToken::mint_authorized(ns, actor))
             }
             Ok(khive_gate::GateDecision::Deny { reason }) => {
-                Err(crate::RuntimeError::PermissionDenied {
-                    verb: "authorize".to_string(),
-                    reason,
-                })
+                Err(crate::RuntimeError::permission_denied("authorize", reason))
             }
-            Ok(_) => Err(crate::RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason: "gate denied".to_string(),
-            }),
+            Ok(_) => Err(crate::RuntimeError::permission_denied(
+                "authorize",
+                "gate denied",
+            )),
             Err(e) => {
                 tracing::warn!(
                     namespace = %ns.as_str(),
@@ -1149,22 +1146,19 @@ impl KhiveRuntime {
                     match self.config.gate.check(&extra_req) {
                         Ok(ref extra_decision) if extra_decision.is_allow() => {}
                         Ok(khive_gate::GateDecision::Deny { reason }) => {
-                            return Err(crate::RuntimeError::PermissionDenied {
-                                verb: "authorize".to_string(),
-                                reason: format!(
+                            return Err(crate::RuntimeError::permission_denied(
+                                "authorize",
+                                format!(
                                     "visibility namespace {:?} denied: {reason}",
                                     extra.as_str()
                                 ),
-                            });
+                            ));
                         }
                         Ok(_) => {
-                            return Err(crate::RuntimeError::PermissionDenied {
-                                verb: "authorize".to_string(),
-                                reason: format!(
-                                    "visibility namespace {:?} denied by gate",
-                                    extra.as_str()
-                                ),
-                            });
+                            return Err(crate::RuntimeError::permission_denied(
+                                "authorize",
+                                format!("visibility namespace {:?} denied by gate", extra.as_str()),
+                            ));
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1186,15 +1180,12 @@ impl KhiveRuntime {
                 ))
             }
             Ok(khive_gate::GateDecision::Deny { reason }) => {
-                Err(crate::RuntimeError::PermissionDenied {
-                    verb: "authorize".to_string(),
-                    reason,
-                })
+                Err(crate::RuntimeError::permission_denied("authorize", reason))
             }
-            Ok(_) => Err(crate::RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason: "gate denied".to_string(),
-            }),
+            Ok(_) => Err(crate::RuntimeError::permission_denied(
+                "authorize",
+                "gate denied",
+            )),
             Err(e) => {
                 tracing::warn!(
                     namespace = %primary.as_str(),
