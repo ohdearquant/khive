@@ -48,6 +48,7 @@ impl Drop for EnvGuard {
 
 fn base_args(db: &str, actor: Option<&str>, ops: &str, save_file: &str) -> ExecArgs {
     ExecArgs {
+        plan: false,
         ops: Some(ops.to_string()),
         pending_events: false,
         db: Some(db.to_string()),

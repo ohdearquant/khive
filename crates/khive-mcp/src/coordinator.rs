@@ -531,6 +531,7 @@ pub(crate) mod tests {
         );
         let _result = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops,
                 presentation: None,
                 presentation_per_op: None,
@@ -560,6 +561,7 @@ pub(crate) mod tests {
 
         let _result = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"search(kind="entity", query="anything")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -598,6 +600,7 @@ pub(crate) mod tests {
         ] {
             server
                 .dispatch_request_local(RequestParams {
+                    plan: None,
                     ops: ops.to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -656,6 +659,7 @@ pub(crate) mod tests {
                 .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
             let raw = server
                 .dispatch_request_local(RequestParams {
+                    plan: None,
                     ops: ops.to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -702,6 +706,7 @@ pub(crate) mod tests {
                 .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
             let raw = server
                 .dispatch_request_local(RequestParams {
+                    plan: None,
                     ops: ops.to_string(),
                     presentation: presentation.map(str::to_string),
                     presentation_per_op: None,
@@ -758,6 +763,7 @@ pub(crate) mod tests {
 
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"search(kind="entity", query="nothing matches")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -800,6 +806,7 @@ pub(crate) mod tests {
 
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"search(kind="entity", query="LoRA")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -859,6 +866,7 @@ pub(crate) mod tests {
 
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"search(kind="entity", query="degraded")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -912,6 +920,7 @@ pub(crate) mod tests {
 
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"search(kind="entity", query="degraded", min_score=0.5)"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -949,6 +958,7 @@ pub(crate) mod tests {
 
             let raw = server
                 .dispatch_request_local(RequestParams {
+                    plan: None,
                     ops: format!(r#"search(kind="{kind}", query="anything")"#),
                     presentation: None,
                     presentation_per_op: None,
@@ -1009,6 +1019,7 @@ pub(crate) mod tests {
             for server in [&direct_server, &coordinator_server] {
                 server
                     .dispatch_request_local(RequestParams {
+                        plan: None,
                         ops: ops.clone(),
                         presentation: None,
                         presentation_per_op: None,
@@ -1071,6 +1082,7 @@ pub(crate) mod tests {
 
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 // `note_kind` is invalid for an entity search. Denial must win
                 // before the intercepted handler validates that filter.
                 ops: r#"search(kind="entity", query="gate parity", note_kind="observation", namespace="tenant-a")"#.to_string(),
@@ -1121,6 +1133,7 @@ pub(crate) mod tests {
 
             let raw = server
                 .dispatch_request_local(RequestParams {
+                    plan: None,
                     ops: format!(r#"search(kind="{kind}", query="anything")"#),
                     presentation: None,
                     presentation_per_op: None,
@@ -1169,6 +1182,7 @@ pub(crate) mod tests {
         // Pass a non-string entry in the tags array; the strict parser must reject this.
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"search(kind="entity", query="anything", tags=[42])"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -1225,6 +1239,7 @@ pub(crate) mod tests {
             let ops = format!(r#"search(kind="entity", query="anything", namespace={ns_literal})"#);
             let raw = server
                 .dispatch_request_local(RequestParams {
+                    plan: None,
                     ops,
                     presentation: None,
                     presentation_per_op: None,
@@ -1288,6 +1303,7 @@ pub(crate) mod tests {
             );
             let raw = server
                 .dispatch_request_local(RequestParams {
+                    plan: None,
                     ops,
                     presentation: None,
                     presentation_per_op: None,
@@ -1345,6 +1361,7 @@ pub(crate) mod tests {
 
         let _result = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"search(kind="entity", query="T6cEntity")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -1381,6 +1398,7 @@ pub(crate) mod tests {
         let too_large: u64 = u64::from(u32::MAX) + 2;
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(r#"search(kind="entity", query="anything", limit={too_large})"#),
                 presentation: None,
                 presentation_per_op: None,
@@ -1427,6 +1445,7 @@ pub(crate) mod tests {
 
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(
                     r#"search(kind="entity", query="anything", limit={})"#,
                     u32::MAX

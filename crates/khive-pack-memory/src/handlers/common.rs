@@ -346,6 +346,7 @@ pub(super) fn balanced_recall_state_from_profile_response(
 #[serde(deny_unknown_fields)]
 pub(super) struct RememberParams {
     pub(super) content: String,
+    pub(super) key: Option<String>,
     pub(super) memory_type: Option<String>,
     pub(super) salience: Option<f64>,
     #[serde(alias = "decay")]
@@ -1727,9 +1728,10 @@ async fn collect_model_ann_hits_inner(
         }
 
         // Widen until enough visible hits survive or ANN reports corpus exhaustion.
+        let operation = "memory.recall.note_store";
         let note_result = khive_storage::await_request_read_phase(
-            "memory.recall.note_store",
-            crate::store_access::acquire_store("memory.recall.note_store", {
+            operation,
+            crate::store_access::acquire_store(operation, {
                 let runtime = runtime.clone();
                 let token = token.clone();
                 move || runtime.notes(&token)

@@ -277,3 +277,181 @@ Stated before implementation, checked at the PR that lands the code; every arm n
 
 - ADR-007 (namespaces), ADR-088 (note kinds), ADR-172 (`version`, `key`, `fence`, durability), migration
   V7 (`notes_seq`) and V13 (list cursor ledgers).
+
+## Amendment 1 (2026-09-08): `stream.batch`, one request over several streams, all-or-nothing under a fence
+
+**Status**: Proposed.
+
+### The gap
+
+§5 says a request array of appends is dense but unordered, and that a caller wanting order on one
+stream sends a chain or carries `expected_seq`. A state layer built on streams needs a third shape
+that neither the array nor the chain gives: one request that appends to several streams in the
+order written, writes a keyed document beside them, checks the caller's authority once, and either
+commits every member or writes nothing. A chain aborts the remainder after a failure but keeps what
+already committed; an array commits siblings but assigns numbers in admission order and returns
+nothing about a member's place in the caller's list. Neither form can be composed into the third by
+the caller, because the fence is per transaction and checking authority once is the point.
+
+The consumer's own state layer carries two batch forms, and its suite proves both. Its fenced form
+takes an allow-listed member set, opens one transaction, checks every version the caller observed
+before the first write, and rolls the whole batch back on any member's failure, raising to the
+caller; its executed tests assert that after a foreign or stale fence neither the head nor the
+stream record landed, and that every observation check precedes every insert. Its production caller
+issues an expiry batch and ignores the return list, which is only sound because a conflict cannot
+leave a partial commit. Its unfenced form is the opposite: each member owns its connection, a
+failing member returns as that member's value, and its siblings stand. The conformance case for the
+unfenced form (two appends to one stream, a read of an unknown object, an unknown verb and a head
+write):
+
+```text
+res = store.batch([
+  ("append", {"stream": "b", "record": {"n": 1}}),
+  ("append", {"stream": "b", "record": {"n": 2}}),
+  ("get", {"ref": "0" * 64}),
+  ("nope", {}),
+  ("write_head", {"key": "h", "kind": "job", "doc": {}}),
+])
+assert [r.seq for r in res[:2]] == [1, 2]
+assert isinstance(res[2], NotFound) and isinstance(res[3], Refused) and res[4].version == 1
+assert [e.record["n"] for e in store.read("b")] == [1, 2]
+```
+
+Both forms are load-bearing, so the verb carries both and names which one it is running.
+
+### A1.1 `stream.batch`
+
+`stream.batch(ops, fence=None, observed=None, atomic=None, namespace=None)` takes a list of member
+operations, each `{"op": "append", "stream": S, "record": R, "expected_seq": N | null}` or
+`{"op": "write", "key": K, "kind": <note kind>, "doc": D, "expected_version": V | null}` (the
+keyed document write of ADR-172 §2 and §3). Common to both modes:
+
+- Members are validated for shape before anything is written: a member that is not an object, a
+  member without an `op` string, or a record over the note content limit refuses the whole batch
+  with `KhiveError::invalid_input` and writes nothing. An op string that names no member operation
+  is not a shape error: it is that member's refusal, `unknown_op`, and the mode below decides
+  whether it stops the batch or returns as the member's value.
+- A member refusal, wherever it surfaces, carries the ADR-172 §2 error shape plus
+  `domain_disposition: not_committed` (ADR-133 Amendment 3), and a `key_conflict` names the holder
+  as `existing_id` (ADR-179 D5), so the consumer rule of ADR-133 Amendment 3 reads it without a
+  special case.
+- Authority is checked once for the batch, on the caller's namespace, before the first write.
+- Appends to one stream are numbered in list order, so a batch's numbers on one stream increase
+  with list position; appends to different streams are independent. Adjacency is a property of
+  the mode: an atomic batch's appends to one stream take consecutive numbers, because they are one
+  transaction; a per-member batch's appends may have another process's append between them, and
+  only the union is dense (§3).
+- Reads (`get`, `stream.read`, `stream.head`) are not members: a batch is a write primitive. The
+  consumer's case reads an unknown object inside its batch; on khive that read is issued beside
+  the batch by the adapter, and the assertion on its value is unchanged.
+- The result is `{"results": [<member result>...], "committed": true}` in list order; a member
+  result is the append's `{"seq", "id", "created_at"}` or the write's `{"id", "version"}`.
+
+`atomic` selects the mode. It defaults to whether `fence` is present, so a fenced batch is atomic
+unless the caller says otherwise, and the caller may not say otherwise: `atomic=false` with a
+`fence` is refused as `invalid_input`, because a fence that admits partial commits is the failure
+the consumer's production caller cannot detect. `atomic=true` without a fence is allowed.
+
+**Atomic (fenced) mode.** The whole list runs inside one writer transaction. The `fence` is
+ADR-172 §2b, evaluated once inside that transaction before the first write. `observed`, when
+present, is a list of `{"key": K, "version": V}` the caller read before composing the batch; every
+entry is checked inside the transaction before the first write, and a mismatch refuses the batch
+with `version_conflict` naming the key. A member's own refusal (`unknown_op`, `seq_conflict`,
+`version_conflict`, `key_conflict`) refuses the whole batch: the transaction rolls back, nothing
+is written, and the error carries that member's refusal plus `member` (the list index); the
+disposition is the `domain_disposition: not_committed` every member refusal already carries, and
+no parallel boolean rides beside it. The caller may ignore the result list on success, because
+success means every member committed.
+
+**Per-member (unfenced) mode.** Each member runs in its own writer transaction, in list order, so
+one stream's numbers increase with list position but need not be adjacent. A member's own refusal (`unknown_op`, `seq_conflict`,
+`version_conflict`, `key_conflict`) is returned as that member's value and its siblings stand; the result is still
+`{"results": [...], "committed": true}`, where `committed` says the request as a whole ran to the
+end, and each member's outcome is its own entry. `observed` is refused in this mode
+(`invalid_input`): an observation set is a precondition for a transaction, and there is none here.
+
+The consumer's allow-list admits reads inside its fenced form. khive does not, and the two
+observation needs it serves are covered without them: a version precondition is `observed`, and a
+read-your-write inside one fence has no consumer today. If one appears, the members widen by a
+further amendment; the adapter carries the divergence until then.
+
+### A1.2 What does not change
+
+§5 stands for the request array and the chain. `stream.append` alone is unchanged. The `write`
+member depends on ADR-172's keyed create and versioned write (§2, §3) landing; the append-only
+form of the batch does not, and implementation lands appends first and the `write` member with the
+keyed write. The density
+invariant (§3) holds inside an atomic batch by construction and across a per-member batch by
+serial execution under the writer lock.
+
+### Acceptance
+
+1. **Per-member order and values.** The conformance case above, unfenced, with the read issued
+   beside the batch: `results[0].seq == 1`, `results[1].seq == 2`, the unknown-op member refused
+   as a value (`unknown_op`, `domain_disposition: not_committed`), the document write at version 1, and `stream.read("b")` returning records 1 then 2.
+2. **Atomic refusal writes nothing.** Under a fence, a batch of three appends where the second
+   carries a stale `expected_seq` is refused as a whole with `seq_conflict` and `member: 1`; the
+   note count, the ledger count and every named stream's head are unchanged; the audit population
+   is read as domain events only. The same for a stale fence and for a missing fence row.
+3. **Observed before the first write.** A fenced batch carrying `observed` with one stale version
+   is refused with `version_conflict` naming that key and writes nothing; a control with current
+   versions commits every member. The statement trace shows every observation check before the
+   first insert.
+4. **Per-member refusal keeps siblings.** Unfenced, the same three appends return `seq_conflict`
+   as the second member's value and commit the first and the third with consecutive numbers; the
+   stream reads two records.
+5. **Authority once.** A batch whose caller lacks write authority on the namespace is refused as a
+   whole before any member runs, in both modes; a control with authority and the same members
+   commits.
+6. **Two processes, atomic.** Two processes issue atomic batches to one stream concurrently; each
+   batch's appends are consecutive within the batch, and the union of numbers is dense.
+7. **Two processes, per-member.** Two processes issue per-member batches to one stream concurrently
+   across repeats; the union is dense and each batch's numbers increase in list order, and the test
+   does not assert adjacency. A control counts the repeats in which another process's number fell
+   between two members of one batch and requires at least one, so the arm is known to exercise the
+   interleaving it permits.
+8. **Mode arguments.** `atomic=false` with a `fence`, and `observed` without atomic mode, are each
+   refused as `invalid_input` and write nothing; `atomic=true` without a fence behaves as arm 2.
+9. **Mutation.** With atomic refusals demoted to member values, arm 2 goes red; with `observed`
+   checked after the first write, arm 3's unchanged-count assertion goes red; with per-member
+   refusals promoted to whole-batch refusals, arm 4 goes red; with per-stream numbering assigned
+   outside the transaction, arm 6 goes red; with per-member mode run as one transaction, arm 7's
+   interleaving control goes red.
+
+## Amendment 2 (2026-09-08): the ledger refuses updates, an isolating fixture for the check constraint
+
+Adopted on the source audit that preceded the first implementation of Amendment 1. Nothing above is
+withdrawn; item 1 adds a guard the Decision claimed by implication, item 2 corrects an acceptance
+arm that could not fail.
+
+1. **No update on the ledger.** The schema guards `note_streams` against inserts that break order or
+   membership and against deletes, and says nothing about updates, so a direct `UPDATE note_streams`
+   could move a `seq` or rebind a `note_id` past every invariant claimed above. A sixth trigger
+   closes it, in the same migration as the rest of the streams schema:
+
+```sql
+CREATE TRIGGER IF NOT EXISTS refuse_stream_ledger_update
+BEFORE UPDATE ON note_streams
+BEGIN
+    SELECT RAISE(ABORT, 'stream_member');
+END;
+```
+
+A ledger row is immutable once written; the only write to `note_streams` is an append. The
+membership trigger `refuse_stream_foreign_note` also refuses an insert naming a `note_id` already in
+the ledger (`OR EXISTS (SELECT 1 FROM note_streams WHERE note_id = NEW.note_id)` in its `WHEN`),
+because `INSERT OR REPLACE` resolves the `UNIQUE (note_id)` conflict by deleting the old row without
+firing the delete trigger while recursive triggers are off, which would re-seat an entry at a new
+`seq` past every guard above. Acceptance 7 gains, in its direct-statement list, an
+`UPDATE note_streams` that changes `seq` or `note_id` and an `INSERT OR REPLACE` naming a member's
+`note_id` at the next `seq`, each leaving count and head unchanged; acceptance 8 counts six triggers.
+2. **The check constraint is overdetermined for `seq = 0`.** `refuse_stream_gap` refuses `seq = 0`
+on its own, because zero is never one more than the head, so dropping `CHECK (seq > 0)` alone
+leaves acceptance 7's `seq = 0` arm green and proves nothing about the check. The mutation arm for
+the check drops `refuse_stream_gap` as well: with both removed the `seq = 0` insert succeeds
+(red); with only the trigger removed it still refuses through the check (control). Acceptance 8
+reads accordingly. The check stays in the schema as the one guard that does not depend on a head
+read.
+3. **Count and head are read from one snapshot.** `stream.stat` reads `COUNT(*)` and `MAX(seq)` in
+one statement over the same rows, so the equality acceptance 7 asserts compares two readings of
+one snapshot, and a divergence between them is a ledger defect, never a race between two reads.

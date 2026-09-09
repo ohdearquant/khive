@@ -452,6 +452,9 @@ appears in either source. When neither source contributes a non-`'local'` namesp
 default read scope is exactly `['local']`, identical to Rev 3. The widening is therefore
 opt-in: a deployment that configures neither `[actor] id` nor `[actor] visible_namespaces`
 keeps Rev 3 behavior verbatim.
+Daemon request ingress applies the same fold once to forwarded visibility, adding the
+unmodified actor id only when it parses as a non-`'local'` namespace and is not already
+present, without changing explicit `namespace=` scope or replayed token identities.
 
 The scope applies to all multi-record reads for all packs: list, search, recall, neighbors,
 traverse, query. The runtime supplies the set to the store as a `WHERE namespace IN (...)`

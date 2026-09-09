@@ -2429,6 +2429,7 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
     );
     let raw = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops,
             presentation: None,
             presentation_per_op: None,
@@ -2450,18 +2451,19 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
         Some(false),
         "T2c: link op must fail closed on the wire: {response}"
     );
-    let wire_err = op["error"]
+    let wire_error_object = op["error"].to_string();
+    let wire_err = op["error"]["message"]
         .as_str()
-        .unwrap_or_else(|| panic!("T2c: MCP-visible error must be a string: {response}"))
+        .unwrap_or_else(|| panic!("T2c: MCP-visible error.message must be a string: {response}"))
         .to_string();
 
     assert!(
-        !wire_err.contains(CANARY),
-        "T2c: MCP-visible link error must not embed backend error text: {wire_err:?}"
+        !wire_error_object.contains(CANARY),
+        "T2c: MCP-visible link error must not embed backend error text: {wire_error_object:?}"
     );
     assert!(
-        !wire_err.contains("svc") && !wire_err.contains("internal-host"),
-        "T2c: MCP-visible link error must not embed backend error fragments: {wire_err:?}"
+        !wire_error_object.contains("svc") && !wire_error_object.contains("internal-host"),
+        "T2c: MCP-visible link error must not embed backend error fragments: {wire_error_object:?}"
     );
     assert!(
         wire_err.contains("gate backend unavailable"),
@@ -2546,6 +2548,7 @@ async fn t2d_rego_gate_evaluator_failure_omits_canary_from_wire_and_logs() {
     let ops = format!(r#"list(kind="entity", canary="{CANARY}")"#);
     let raw = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops,
             presentation: None,
             presentation_per_op: None,
@@ -2567,14 +2570,15 @@ async fn t2d_rego_gate_evaluator_failure_omits_canary_from_wire_and_logs() {
         Some(false),
         "T2d: list op must fail closed on the wire: {response}"
     );
-    let wire_err = op["error"]
+    let wire_error_object = op["error"].to_string();
+    let wire_err = op["error"]["message"]
         .as_str()
-        .unwrap_or_else(|| panic!("T2d: MCP-visible error must be a string: {response}"))
+        .unwrap_or_else(|| panic!("T2d: MCP-visible error.message must be a string: {response}"))
         .to_string();
 
     assert!(
-        !wire_err.contains(CANARY),
-        "T2d: MCP-visible error must not embed the evaluator's raw error text: {wire_err:?}"
+        !wire_error_object.contains(CANARY),
+        "T2d: MCP-visible error must not embed the evaluator's raw error text: {wire_error_object:?}"
     );
     assert!(
         wire_err.contains("policy evaluation failed"),
@@ -3303,6 +3307,7 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="T7aConcept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3362,6 +3367,7 @@ async fn multi_backend_and_direct_search_rows_have_exact_key_set_parity() {
     ) -> BTreeSet<String> {
         let raw = server
             .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+                plan: None,
                 ops: ops.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -3477,6 +3483,7 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="T7bTarget")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3540,6 +3547,7 @@ async fn coordinator_service_search_reports_vector_arm_error_in_json_envelope() 
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="FlashAttention")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3614,6 +3622,7 @@ async fn t7c_multi_backend_search_min_score_applied() {
     // min_score=1.0 is always above any real RRF score → result must be empty.
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="T7cMinScoreProbe", min_score=1.0)"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3672,6 +3681,7 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="session", query="standup")"#.to_string(),
             presentation: None,
             presentation_per_op: None,

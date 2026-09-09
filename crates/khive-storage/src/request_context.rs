@@ -78,9 +78,41 @@ pub enum RequestReadStopReason {
 pub struct RequestReadContext {
     cancellations: Arc<[tokio::sync::watch::Receiver<bool>]>,
     deadline: Option<RequestReadDeadline>,
+    store_acquisition_operation: Option<&'static str>,
 }
 
 impl RequestReadContext {
+    /// Opt one blocking store-constructor call into request-aware admission.
+    /// Ordinary accessors under a read context remain outside this scope.
+    /// The previous context is restored even if the constructor panics.
+    pub fn scope_store_acquisition<T>(
+        mut self,
+        operation: &'static str,
+        work: impl FnOnce() -> T,
+    ) -> T {
+        self.store_acquisition_operation = Some(operation);
+        REQUEST_READ_CONTEXT.sync_scope(self, work)
+    }
+
+    /// The explicitly scoped constructor operation, absent for ordinary callers.
+    pub fn store_acquisition_operation(&self) -> Option<&'static str> {
+        self.store_acquisition_operation
+    }
+
+    /// Observe cancellation and the original wall-clock deadline in blocking work.
+    pub fn blocking_stop_reason(&self) -> Option<RequestReadStopReason> {
+        if self.cancellations.iter().any(receiver_cancelled) {
+            Some(RequestReadStopReason::Cancelled)
+        } else if self
+            .deadline
+            .is_some_and(|deadline| WallInstant::now() >= deadline.blocking_at)
+        {
+            Some(RequestReadStopReason::Deadline)
+        } else {
+            None
+        }
+    }
+
     /// Return the request's absolute deadline, when one is installed.
     pub fn deadline(&self) -> Option<RequestReadDeadline> {
         self.deadline
