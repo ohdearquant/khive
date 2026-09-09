@@ -198,6 +198,22 @@ pub fn note_replace_if_unchanged_statement(
     }
 }
 
+/// Metadata-only CAS for an immutable stream entry. Protected fields are
+/// predicates, never SET targets: SQLite UPDATE OF triggers fire even when a
+/// value is assigned to itself. Keep the full snapshot and revision guards.
+pub fn note_metadata_replace_if_unchanged_statement(
+    note: &Note,
+    expected_updated_at: i64,
+    expected_deleted_at: Option<i64>,
+) -> SqlStatement {
+    let mut statement = note_replace_if_unchanged_statement(note, expected_updated_at, expected_deleted_at);
+    statement.sql = "UPDATE notes SET status=?3, name=?4, salience=?6, decay_factor=?7, expires_at=?8, updated_at=?10 \
+                     WHERE id=?12 AND updated_at=?13 AND deleted_at IS ?14 AND ?10 > updated_at \
+                       AND namespace=?1 AND kind=?2 AND content=?5 AND properties IS ?9 AND deleted_at IS ?11".into();
+    statement.label = Some("stream-note-metadata-cas".into());
+    statement
+}
+
 /// The exact `properties`/`updated_at` `UPDATE` this store's
 /// `update_note_properties` issues. The row is patched in place without
 /// rewriting any other note column or its stable row identity (#780).

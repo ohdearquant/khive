@@ -212,10 +212,16 @@ fn drop_record(value: Value, scope: RedundancyScope) -> Value {
         map.insert("properties".to_string(), other);
     }
 
+    // A stream entry's record is opaque caller JSON, including arrays of
+    // objects whose fields happen to look like metadata.
+    let stream_entry = is_stream_entry(&map);
     // Recurse into array values so nested record arrays are also reduced.
     let out: Map<String, Value> = map
         .into_iter()
         .map(|(k, v)| {
+            if stream_entry && k == "record" {
+                return (k, v);
+            }
             let v = match v {
                 Value::Array(arr) => Value::Array(
                     arr.into_iter()
@@ -547,7 +553,7 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
 /// survive Agent-mode compaction. Dropping these turns an empty page into a
 /// different response type and leaves callers unable to distinguish an empty
 /// result from a missing/unsupported field.
-const EMPTY_ARRAY_PRESERVE: &[&str] = &["items", "entities", "notes", "edges", "results"];
+const EMPTY_ARRAY_PRESERVE: &[&str] = &["items", "entities", "notes", "edges", "results", "entries"];
 
 fn is_stable_list_envelope(map: &Map<String, Value>) -> bool {
     map.contains_key("requested_limit")
@@ -565,7 +571,17 @@ fn is_stable_list_envelope(map: &Map<String, Value>) -> bool {
 /// cannot see them cannot stop. A `results` array without a sibling
 /// `next_after` key is an ordinary response and gets the generic transform.
 fn is_keyset_cursor_envelope(map: &Map<String, Value>) -> bool {
-    map.contains_key("next_after") && map.get("results").is_some_and(Value::is_array)
+    map.contains_key("next_after")
+        && (map.get("results").is_some_and(Value::is_array)
+            || (map.get("head_seq").is_some_and(Value::is_number)
+                && map.get("entries").is_some_and(Value::is_array)))
+}
+
+fn is_stream_entry(map: &Map<String, Value>) -> bool {
+    map.get("seq").is_some_and(Value::is_number)
+        && map.contains_key("id")
+        && map.contains_key("created_at")
+        && map.contains_key("record")
 }
 
 /// Field names carrying caller-supplied payload timestamps that must never be
@@ -678,8 +694,13 @@ fn transform_agent(
         Value::Object(map) => {
             let preserve_list_envelope =
                 is_stable_list_envelope(&map) || is_keyset_cursor_envelope(&map);
+            let stream_entry = is_stream_entry(&map);
             let mut out = Map::new();
             for (k, v) in map {
+                if stream_entry && k == "record" {
+                    out.insert(k, v);
+                    continue;
+                }
                 // ADR-045 Amendment 3 scopes the empty-string carve-out to
                 // strings nested under an object-valued `properties`; a
                 // scalar or array `properties` value gets no carve-out.
@@ -2084,5 +2105,26 @@ mod tests {
         // falling back to truncated absolute form instead.
         let out = compact_timestamp("2025-05-23T20:05:00+04:00", NOW);
         assert_eq!(out, "3m ago");
+    }
+}
+
+
+#[cfg(test)]
+mod stream_presentation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stream_agent_json_preserves_opaque_record_and_empty_page() {
+        let record = json!([{"id": "aabbccdd-1234-4321-1234-abcdefabcdef", "score": 0.123456789, "created_at": "2026-09-08T00:00:00.123456Z", "empty": [], "null": null, "namespace": "local", "properties": {"namespace": "local"}}]);
+        for payload in [record, Value::Null, json!([]), json!({}), json!("")] {
+            let page = json!({"entries": [{"seq": 1, "id": "aabbccdd-1234-4321-1234-abcdefabcdef", "created_at": "2026-09-08T00:00:00.123456Z", "record": payload}], "head_seq": 1, "next_after": null});
+            let presented = present(page, PresentationMode::Agent, 0);
+            let out = prepare_format_value(presented, OutputFormat::Json, PresentationMode::Agent);
+            assert_eq!(out["entries"][0].get("record"), Some(&payload));
+            assert!(out.get("next_after").is_some_and(Value::is_null));
+        }
+        let empty = json!({"entries": [], "head_seq": 0, "next_after": null});
+        assert_eq!(present(empty.clone(), PresentationMode::Agent, 0), empty);
     }
 }

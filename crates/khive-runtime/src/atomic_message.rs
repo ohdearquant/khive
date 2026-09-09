@@ -265,6 +265,28 @@ pub async fn create_notes_atomic_with_report(
     runtime: &KhiveRuntime,
     specs: Vec<AtomicNoteSpec<'_>>,
 ) -> RuntimeResult<(Vec<Note>, crate::retrieval::EmbeddingTruncationReport)> {
+    let prepared = prepare_notes_atomic(runtime, specs).await?;
+    match run_atomic_unit(runtime.sql().as_ref(), prepared.plans).await {
+        Ok(AtomicRunOutcome::Committed { .. }) => Ok((prepared.notes, prepared.embedding_truncation)),
+        Ok(AtomicRunOutcome::RolledBack { failed_op_index, failure }) => Err(RuntimeError::Internal(format!(
+            "atomic multi-note write rolled back at op {failed_op_index}: {failure:?}"
+        ))),
+        Err(e) => Err(RuntimeError::Storage(e.0)),
+    }
+}
+
+/// Validated notes and their complete SQL/index plans, with embeddings prepared
+/// before a caller acquires the writer. Preparation does not commit note rows.
+pub(crate) struct PreparedNotes {
+    pub notes: Vec<Note>,
+    pub plans: Vec<AtomicOpPlan>,
+    pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
+}
+
+pub(crate) async fn prepare_notes_atomic(
+    runtime: &KhiveRuntime,
+    specs: Vec<AtomicNoteSpec<'_>>,
+) -> RuntimeResult<PreparedNotes> {
     // ---- 1. Validate + build Note objects (all pre-write checks, same as
     // create_note_inner, before any embedding or DML is attempted). ----
     let mut notes: Vec<Note> = Vec::with_capacity(specs.len());
@@ -491,17 +513,7 @@ pub async fn create_notes_atomic_with_report(
         }));
     }
 
-    // ---- 4. One writer acquisition for the whole set. ----
-    match run_atomic_unit(runtime.sql().as_ref(), plans).await {
-        Ok(AtomicRunOutcome::Committed { .. }) => Ok((notes, embedding_truncation)),
-        Ok(AtomicRunOutcome::RolledBack {
-            failed_op_index,
-            failure,
-        }) => Err(RuntimeError::Internal(format!(
-            "atomic multi-note write rolled back at op {failed_op_index}: {failure:?}"
-        ))),
-        Err(e) => Err(RuntimeError::Storage(e.0)),
-    }
+    Ok(PreparedNotes { notes, plans, embedding_truncation })
 }
 
 #[cfg(test)]

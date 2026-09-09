@@ -63,3 +63,6 @@ pub use read_cancellation::scope_test_read_progress;
 pub use read_cancellation::{sqlite_interrupt_grace_from_env, DEFAULT_SQLITE_INTERRUPT_GRACE_MS};
 pub use sql_bridge::SqlBridge;
 pub use writer_task::WriterTaskHandle;
+
+#[cfg(test)]
+mod stream_schema_tests;

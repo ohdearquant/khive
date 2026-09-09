@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (20 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (23 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,44 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
+    HandlerDef {
+        name: "stream.append",
+        description: "Append one immutable JSON record with a dense per-stream sequence; expected_seq is checked in the same transaction as note and ledger insertion.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "record", param_type: "JSON value", required: true, description: "Required JSON value, including scalar or null; stored as note content.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "expected_seq", param_type: "integer", required: false, description: "Append only if this entry would receive this sequence; conflict details include next_seq.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object", required: false, description: "Reserved: any supplied fence, including null, is refused until the later slice with versioned leases.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "note_kind", param_type: "string", required: false, description: "Registered note kind; defaults to observation.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "tags", param_type: "array of string", required: false, description: "Immutable entry tags stored in properties.tags.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.read",
+        description: "Read entries after an exclusive sequence in ascending order, with head_seq and next_after from the same snapshot. Unknown streams return an empty page.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "after", param_type: "integer", required: false, description: "Exclusive nonnegative sequence; defaults to 0.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "limit", param_type: "integer", required: false, description: "Positive page size; defaults to 1000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.stat",
+        description: "Read count and head_seq in one snapshot; divergence indicates a broken ledger density invariant.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",

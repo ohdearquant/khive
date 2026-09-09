@@ -4863,6 +4863,9 @@ impl KhiveRuntime {
                 None => return Ok(false),
             }
         };
+        if let Some(error) = self.stream_member_error(&note).await? {
+            return Err(error);
+        }
         let mode = if hard {
             DeleteMode::Hard
         } else {
