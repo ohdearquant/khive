@@ -242,7 +242,11 @@ pub enum NoteWriteConflict {
 
 impl NoteWriteConflict {
     pub fn into_error(self) -> KhiveError {
-        let (message, details) = match self {
+        self.into_error_at_member(None)
+    }
+
+    pub(crate) fn into_error_at_member(self, member: Option<usize>) -> KhiveError {
+        let (message, mut details) = match self {
             Self::Version { expected, current } => (
                 "note version precondition failed",
                 vec![
@@ -279,6 +283,9 @@ impl NoteWriteConflict {
                 ],
             ),
         };
+        if let Some(member) = member {
+            details.push(("member", member.to_string()));
+        }
         KhiveError::conflict(message).with_details(Details::new_owned(details))
     }
 }

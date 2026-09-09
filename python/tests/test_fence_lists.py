@@ -89,6 +89,29 @@ def test_ordered_fences_two_daemons_stale_and_missing(scratch_daemon):
         renewed = one(first, "update", id=leases[1]["id"], expected_version=1,
                       content='{"renewed":true}')
         assert renewed["version"] == 2
+        for atomic in [True, False]:
+            stream = f"{prefix}/batch/{atomic}"
+            response = request(second, "stream.batch", atomic=atomic, ops=[
+                {"op": "append", "stream": stream, "record": "before"},
+                {"op": "append", "stream": stream, "record": "refused", "fence": fences},
+                {"op": "append", "stream": stream, "record": "after"},
+            ])
+            expected = {"reason": "fence_conflict", "key": fences[1]["key"],
+                        "expected_version": "1", "current_version": "2", "index": "1"}
+            if atomic:
+                expected["member"] = "1"
+                assert not response["ok"], response
+                error = response["error"]
+            else:
+                assert response["ok"], response
+                result = response["result"]
+                assert result["committed"] is True
+                assert result["results"][0]["seq"] == 1
+                assert result["results"][2]["seq"] == 2
+                error = result["results"][1]
+            assert error["details"] == expected
+            assert error["domain_disposition"] == "not_committed"
+            assert one(second, "stream.stat", stream=stream)["head_seq"] == (0 if atomic else 2)
         for key, current in [(fences[1]["key"], "2"), (f"{prefix}/missing", None)]:
             stale = [fences[0], {**fences[1], "key": key}]
             for verb, args in [

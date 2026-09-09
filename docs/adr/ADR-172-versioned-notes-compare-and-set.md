@@ -472,3 +472,17 @@ refusal, unchanged lease rows, and malformed-input domain-population controls. T
 must distinguish a check before transaction admission from one inside the admitted writer transaction,
 including another process renewing a lease at that boundary. Checking only the first entry or omitting
 `index` must each fail their corresponding list control.
+
+Append members of `stream.batch` accept the same optional object or non-empty
+list in their own `fence` field. In atomic mode, every member fence is checked in
+member order, then fence order, inside the batch writer transaction before any
+member writes. A stale or missing fence refuses the entire batch. Its error adds
+`member`, the member position as a string, alongside `index` when the supplied
+fence was a list. In per-member mode, the failed member carries the same fence
+error and `domain_disposition: not_committed`; successful sibling appends remain
+committed. The result's list position identifies the member. All members' fence
+shapes and kinds are validated before any member transaction starts.
+
+This amendment enables append-member fences only. The batch-wide `fence` and
+`observed` fields, their mode defaults, and the `write` member retain their
+existing availability rules.

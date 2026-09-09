@@ -93,3 +93,102 @@ def test_stream_python_cli_same_result_and_error_objects(scratch_daemon):
         field = "result" if expected["ok"] else "error"
         assert actual[field] == expected[field]
     assert one(client, "stream.read", stream=stream)["entries"][0]["record"] is None
+
+
+BATCH_WORKER = r'''
+import json, os, sys
+from khive.ops import encode, op
+from khive.transport import Session, SocketTransport
+client = Session(SocketTransport(sys.argv[1]), timeout=30)
+client.handshake()
+sys.stdin.readline()
+atomic = sys.argv[4] == "atomic"
+batches = []
+for n in range(int(sys.argv[5])):
+    ops = [{"op": "append", "stream": sys.argv[2], "record": {"writer": sys.argv[3], "batch": n, "i": i}} for i in range(3)]
+    result = client.request(encode([op("stream.batch", ops=ops, atomic=atomic)]))[0]
+    assert result["ok"], result
+    batches.append([m["seq"] for m in result["result"]["results"]])
+print(json.dumps({"pid": os.getpid(), "batches": batches}))
+'''
+
+
+def _two_processes_batching(scratch_daemon, stream, mode, repeats):
+    procs = [subprocess.Popen([sys.executable, "-c", BATCH_WORKER, str(scratch_daemon["socket"]), stream, str(index), mode, str(repeats)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for index in range(2)]
+    outputs = []
+    try:
+        for proc in procs:
+            proc.stdin.write("go\n")
+            proc.stdin.flush()
+        for proc in procs:
+            stdout, stderr = proc.communicate(timeout=240)
+            assert proc.returncode == 0, stderr
+            outputs.append(json.loads(stdout))
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    assert len({item["pid"] for item in outputs}) == 2
+    return outputs
+
+
+def test_stream_batch_two_processes_atomic_members_are_consecutive(scratch_daemon):
+    # Amendment 1 acceptance 6: each batch's appends are consecutive within
+    # the batch and the union of numbers is dense.
+    stream = f"batch-atomic-{uuid.uuid4()}"
+    outputs = _two_processes_batching(scratch_daemon, stream, "atomic", 20)
+    all_seqs = []
+    for item in outputs:
+        for batch in item["batches"]:
+            assert batch == list(range(batch[0], batch[0] + 3)), batch
+            all_seqs.extend(batch)
+    assert sorted(all_seqs) == list(range(1, 121))
+    assert one(session(scratch_daemon), "stream.stat", stream=stream) == {"count": 120, "head_seq": 120}
+
+
+def test_stream_batch_two_processes_per_member_increase_and_interleave(scratch_daemon):
+    # Amendment 1 acceptance 7: numbers increase in list order, the union is
+    # dense, adjacency is not asserted, and the control requires at least one
+    # repeat in which the other process's number fell between two members.
+    stream = f"batch-member-{uuid.uuid4()}"
+    outputs = _two_processes_batching(scratch_daemon, stream, "per_member", 40)
+    all_seqs, interleaved = [], 0
+    for item in outputs:
+        for batch in item["batches"]:
+            assert batch == sorted(batch) and len(set(batch)) == 3, batch
+            interleaved += batch[2] - batch[0] > 2
+            all_seqs.extend(batch)
+    assert sorted(all_seqs) == list(range(1, 241))
+    assert interleaved >= 1, "control: no repeat interleaved, so the arm did not exercise what per-member mode permits"
+    print(f"interleaved batches: {interleaved} of {len(all_seqs) // 3}")
+
+
+def _without_per_call_fields(result):
+    return [{k: v for k, v in member.items() if k not in {"seq", "id", "created_at"}} for member in result["results"]]
+
+
+def test_stream_batch_python_cli_same_result_and_error_objects(scratch_daemon):
+    binary = os.environ.get("KKERNEL")
+    assert binary, "set KKERNEL to this checkout's freshly built binary"
+    client = session(scratch_daemon)
+    stream = f"batch-transport-{uuid.uuid4()}"
+    env = os.environ.copy()
+    env["KHIVE_SOCKET"] = str(scratch_daemon["socket"])
+    env["KHIVE_PID"] = str(scratch_daemon["root"] / "khived.pid")
+    env.pop("KHIVE_NO_DAEMON", None)
+    for args in [
+        {"ops": [{"op": "append", "stream": stream, "record": None}, {"op": "nope"}, {"op": "write", "key": "h", "kind": "head", "doc": {}}]},
+        {"ops": [{"op": "append", "stream": stream, "record": None, "expected_seq": 99}], "atomic": True},
+        {"ops": [{"op": "append", "stream": stream, "record": None}], "fence": {"key": "k", "kind": "head", "expected_version": 1}},
+    ]:
+        ops = encode([op("stream.batch", **args)])
+        expected = client.request(ops)[0]
+        proc = subprocess.run([binary, "exec", ops, "--config", str(scratch_daemon["root"] / "khive.toml"), "--db", str(scratch_daemon["root"] / "scratch.db"), "--presentation", "verbose", "--output-format", "json"], env=env, cwd=scratch_daemon["root"], capture_output=True, text=True, timeout=60)
+        actual = json.loads(proc.stdout)["results"][0]
+        assert actual["ok"] == expected["ok"], (actual, expected, proc.stderr)
+        if expected["ok"]:
+            assert actual["result"]["committed"] is True and expected["result"]["committed"] is True
+            assert _without_per_call_fields(actual["result"]) == _without_per_call_fields(expected["result"])
+        else:
+            assert actual["error"] == expected["error"]

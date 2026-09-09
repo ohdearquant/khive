@@ -417,7 +417,11 @@ pub(crate) async fn prepare_atomic_notes(
             .collect();
     let mut embedding_truncation = crate::retrieval::EmbeddingTruncationReport::default();
 
-    if !embed_model_names.is_empty() {
+    // `specs` is empty when a caller prepares a note set every member of
+    // which was refused before preparation: there is nothing to embed, no
+    // token to read, and the lazy vector-table create belongs to a write
+    // that is not going to happen.
+    if !embed_model_names.is_empty() && !specs.is_empty() {
         // Ensure every model's vector table exists before the commit pass —
         // the same lazy-create side effect `vectors_for_model` performs on
         // the non-atomic path, done once per model rather than per note.

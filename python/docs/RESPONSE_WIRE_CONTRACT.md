@@ -287,3 +287,10 @@ review those changes and use behavioral fixtures for the client obligations.
 Note and stream fence refusals also carry `domain_disposition: not_committed`. An object
 fence retains its existing details; an ordered list adds a zero-based string `index`, even
 for one entry. The first missing or stale fence prevents the guarded write.
+
+For append members of `stream.batch`, an atomic fence refusal also names the
+zero-based string `member` and leaves the whole batch uncommitted. In per-member
+mode, the refusal appears at its result position with `not_committed`, while
+successful sibling appends remain committed. The inner fence-list `index` retains
+the same meaning in both modes. Batch-wide fence and observation fields retain
+their separate availability rules.
