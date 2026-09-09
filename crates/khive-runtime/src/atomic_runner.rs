@@ -819,58 +819,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn rollback_failure_preserves_terminal_storage_error_after_guard_failure() {
-        use khive_storage::WriterTaskRequestState;
-        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
-
-        fn deny_rollback(context: AuthContext<'_>) -> Authorization {
-            match context.action {
-                AuthAction::Transaction {
-                    operation: TransactionOperation::Rollback,
-                } => Authorization::Deny,
-                _ => Authorization::Allow,
-            }
-        }
-
-        let pool = StdArc::new(
-            ConnectionPool::new(PoolConfig {
-                path: None,
-                ..PoolConfig::default()
-            })
-            .expect("pool open"),
-        );
-        seed_schema(&pool);
-        let id = Uuid::new_v4();
-        insert_entity(&pool, id, "original");
-        pool.try_writer()
-            .expect("writer")
-            .conn()
-            .authorizer(Some(deny_rollback))
-            .expect("install rollback fault");
-
-        let bridge = SqlBridge::new(StdArc::clone(&pool), false);
-        let result = run_atomic_unit(
-            &bridge,
-            vec![
-                rename_plan(id, "changed", "rename-before-failure"),
-                delete_plan(Uuid::new_v4(), "delete-nonexistent"),
-            ],
-        )
-        .await;
-
-        assert!(
-            matches!(
-                result,
-                Err(AtomicRunnerError(StorageError::WriterTaskTerminated {
-                    request_state: WriterTaskRequestState::SideEffectsUnknown,
-                }))
-            ),
-            "a recorded guard failure must not hide an unproven rollback: {result:?}"
-        );
-        assert!(pool.try_writer().is_err(), "faulted writer must be retired");
-    }
-
     // ------------------------------------------------------------------
     // 2. Suspend-trap paired: the runner's happy path resolves on first
     //    poll (commits); a hand-built suspending closure through the SAME

@@ -12,6 +12,7 @@ const GTD: &str = "khive-pack-gtd/src/handlers.rs";
 const SCHEDULE: &str = "khive-pack-schedule/src/handlers.rs";
 const CURATION: &str = "khive-runtime/src/curation.rs";
 const CREATE: &str = "khive-runtime/src/note_create.rs";
+const MESSAGE: &str = "khive-runtime/src/keyed_message.rs";
 const FAULT: &str = "khive-runtime/src/atomic_message.rs";
 const ID: &str = "00000000-0000-4000-8000-000000000001";
 
@@ -308,6 +309,10 @@ fn census() -> BTreeMap<(String, String), String> {
         (SCHEDULE, "cancel_pending_event"),
         (CURATION, "merge_note_sql"),
         (CREATE, "prepare_note_create"),
+        // Keyed message pairs stamp the caller key onto the outbound note in a
+        // second statement, so a freshly created pair settles at version 2. The
+        // writer never assigns the column itself; the trigger does.
+        (MESSAGE, "create_keyed_message_pair"),
         // This feature can compile outside tests; keep its zero-row writer visible.
         (FAULT, "injected_failure_statement"),
     ]
