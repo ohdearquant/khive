@@ -8,8 +8,9 @@
 #                   crates/khive-db/sql/ form a forward chain: schema.sql is the
 #                   V1 baseline and later NNN-<name>.sql migrations ALTER/extend
 #                   it, so they are replayed cumulatively in version order on one
-#                   database. Any other *.sql file is an independent fragment and
-#                   loads into its own fresh database.
+#                   database. Other directories each load their fragments in sorted
+#                   filename order into one fresh database, so indexes see tables
+#                   declared by earlier fragments. One-file directories stand alone.
 #   2. hygiene    — no trailing whitespace, no tabs.
 #   3. format     — multi-column CREATE TABLE must be one column per line
 #                   (catches comma-jammed single-line tables).
@@ -58,7 +59,7 @@ for path in files:
             failed += 1
 
 # ── Execution ──────────────────────────────────────────────────────────────
-# khive-db migration files replay as a chain; everything else loads standalone.
+# khive-db migrations replay as a chain; other directories own independent schemas.
 def in_db_chain(path):
     return "/khive-db/sql/" in path.replace(os.sep, "/")
 
@@ -87,16 +88,23 @@ try:
 finally:
     con.close()
 
-# Independent fragments load into a fresh database each.
+# Related fragments share a database only within their own directory. A pack's
+# sorted table/index fragments see prior DDL; unrelated packs never see each other.
+# A directory with one file preserves standalone validation.
+fragment_groups = {}
 for path in others:
-    with open(path) as fh:
-        sql = fh.read()
+    fragment_groups.setdefault(os.path.dirname(path), []).append(path)
+for directory in sorted(fragment_groups):
     con = sqlite3.connect(":memory:")
     try:
-        con.executescript(sql)
-    except sqlite3.Error as e:
-        print(f"{path}: FAILED to load: {e}")
-        failed += 1
+        for path in sorted(fragment_groups[directory]):
+            with open(path) as fh:
+                sql = fh.read()
+            try:
+                con.executescript(sql)
+            except sqlite3.Error as e:
+                print(f"{path}: FAILED to load: {e}")
+                failed += 1
     finally:
         con.close()
 
