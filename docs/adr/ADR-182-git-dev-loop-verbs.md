@@ -319,7 +319,11 @@ Decision left open.
    retried. The administrator bypass is not requested by this slice even where a `git.pr_merge.admin`
    row allows it; a later slice that needs the bypass re-states the arm. Self-approval is refused
    before the platform call both for the actor that opened the pull request and for a different actor
-   whose credential row resolves to the same platform login, read from the platform.
+   whose credential row resolves to the same platform login, read from the platform. The same pre-check,
+   on `git.pr_review(approve)` and on `git.pr_merge`'s required-review read, also refuses when the
+   reviewer's platform login equals the login that performed the last push to `expected_head` (the
+   platform's triggering actor for that head), because the platform's last-push rule disqualifies
+   exactly that approval and a merge that relies on it strands.
 4. **Grant scope is recorded, not evaluated.** The tool policy decision matches actor, tool pattern and
    expiry; a grant's `scope` is free text and is carried on the receipt as data. A grant whose tool
    pattern does not match the verb refuses in the same receipt shape as no grant; no repository-scoped
@@ -343,7 +347,8 @@ second actor whose credential resolves to the author's platform login is refused
 platform call; 38 a merge whose head moved between the check and the platform call is refused by the
 platform as `not_committed` and not retried; 39 a repository key absent from the allow-list refuses at
 call time; 40 `help` on every git verb returns the schema table and a pack without one keeps its
-parameter rendering. Mutation controls stated before they ran and both failed at their effects:
+parameter rendering; 41 an approval by the login that last pushed `expected_head` is refused before
+the platform call, and an approval by a third login proceeds (control). Mutation controls stated before they ran and both failed at their effects:
 removing the preflight together with the remote comparison overwrote a rival bare ref with the
 candidate; removing only the platform-login check let an alias actor submit an approval as the author
 account.
