@@ -293,7 +293,7 @@ mod tests {
         std::fs::write(&other, b"x").unwrap();
         let canonical = std::fs::canonicalize(&other).unwrap();
         assert!(matches!(
-            check_binary(other.to_str().unwrap(), &[canonical.clone()]),
+            check_binary(other.to_str().unwrap(), std::slice::from_ref(&canonical)),
             Err(BinaryRefusal::Never { .. })
         ));
         assert_eq!(

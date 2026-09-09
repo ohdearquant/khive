@@ -28,6 +28,7 @@ blake3 = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+khive-db = { version = "0.8.0", path = "../khive-db" }
 khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
 khive-pack-blob = { version = "0.8.0", path = "../khive-pack-blob" }
 tempfile = { workspace = true }

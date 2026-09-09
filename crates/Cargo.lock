@@ -2147,6 +2147,7 @@ dependencies = [
  "blake3",
  "chrono",
  "inventory",
+ "khive-db",
  "khive-pack-blob",
  "khive-pack-kg",
  "khive-pack-tool",

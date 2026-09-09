@@ -37,6 +37,12 @@ fn fixture() -> Fixture {
         ..RuntimeConfig::default()
     };
     let rt = KhiveRuntime::new(cfg).expect("file runtime");
+    // A file-backed runtime installs no blob store on its own; the pack under
+    // test materializes trees from blob refs, so give it a real one.
+    let blobs = khive_db::stores::blob::FsBlobStore::new(dir.path().join("blobs"), 0)
+        .expect("fs blob store");
+    rt.install_blob_store(std::sync::Arc::new(blobs))
+        .expect("install blob store");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(BlobPack::new(rt.clone()));
@@ -477,13 +483,19 @@ async fn concurrent_runs_in_one_session_get_distinct_seq() {
     seqs.sort_unstable();
     assert_eq!(seqs, vec![1, 2]);
     let runs = f
-        .call("exec.runs", json!({ "actor": "local", "session_id": "s-seq" }))
+        .call(
+            "exec.runs",
+            json!({ "actor": "local", "session_id": "s-seq" }),
+        )
         .await;
     assert_eq!(runs["count"], 2);
     let stored = f
         .call("exec.receipt", json!({ "id": a["receipt"]["id"] }))
         .await;
-    assert_eq!(stored["seq"], a["receipt"]["seq"], "readers report the column");
+    assert_eq!(
+        stored["seq"], a["receipt"]["seq"],
+        "readers report the column"
+    );
 }
 
 #[cfg(target_os = "macos")]
