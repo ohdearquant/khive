@@ -276,9 +276,10 @@ that can POST is a verb that can act on the world and this one is a read.
 The reply is `{final_url, status, headers, content_ref, bytes, truncated, redirects, receipt_id}`.
 The body goes to the blob store and the reply carries its reference, never the bytes: a page is
 routinely larger than a response envelope should be, and a caller that wants the text reads it with
-`blob.get` like any other stored object. `headers` is an allow-listed subset (content type, content
+`blob.get` like any other stored object. The reply's `headers` is an allow-listed subset (content type, content
 length, last modified, etag); a response header set is attacker-controlled and echoing it whole puts
-attacker text in a place callers read structurally.
+attacker text in a place callers read structurally. The request `headers` argument is allow-listed
+too, for the reason in A1.2.7.
 
 ### A1.2 What the fetch refuses, and where
 
@@ -286,7 +287,12 @@ attacker text in a place callers read structurally.
 2. **Address, after resolution.** The host is resolved and every returned address is checked; a
    loopback, link-local, private, unique-local, or unspecified address refuses. The check is on the
    resolved address rather than on the hostname, because a name that resolves into private space is
-   the whole shape of the attack, and it is re-applied on every redirect hop rather than once.
+   the whole shape of the attack, and it is re-applied on every redirect hop rather than once. The
+   connection is then made to an address that passed, never to a fresh resolution of the name: a
+   resolver that answers differently on the second call walks straight through a check that passed,
+   because the name is the same and the check is the same and only the address is different. Either
+   pin the connection to the checked address, or read the peer address after connect and refuse on
+   mismatch.
 3. **Operator allowlist, when set.** With no allowlist configured, the public internet is reachable
    and only the address rule above applies, because a verb that reaches nothing by default is a verb
    nobody enables. When an allowlist is configured it becomes exclusive, and a host outside it
@@ -295,10 +301,21 @@ attacker text in a place callers read structurally.
    into private address space refuses at the hop that proposes it.
 5. **Size and time.** Both bounded, both configurable, both with defaults. A response exceeding the
    byte bound is stored truncated with `truncated: true` rather than discarded, so a caller sees what
-   was read; a response exceeding the time bound refuses and stores nothing.
+   was read; a response exceeding the time bound refuses and stores nothing. The byte bound is on
+   decompressed bytes, because a small compressed response can expand without limit and a bound on
+   the encoded stream bounds nothing the caller ever sees; decoding stops at the bound and the
+   result is stored truncated like any other over-long response.
 6. **Credentials are never arguments.** `credential` names an entry the operator has configured; the
    value is read from the process environment at request time. A secret in the verb's arguments would
    be in the receipt, the audit event, and every log that carries either.
+7. **Request headers, allow-listed, with the credential-bearing ones refused by name.** `headers`
+   accepts `Accept`, `Accept-Language`, `If-None-Match`, `If-Modified-Since` and `User-Agent`; any
+   other header refuses with the header named. `Authorization`, `Cookie` and `Proxy-Authorization`
+   refuse with their own reason, which names `credential` as the only path a secret takes. Without
+   this rule refusal 6 protects one parameter while the one beside it is open: a caller passing
+   `Authorization: Bearer <secret>` puts that secret in the receipt, the audit event and every log
+   that carries either, which is the exact harm 6 exists to prevent, with the credential mechanism
+   routed around rather than defeated.
 
 ### A1.3 `web.search(query, limit, provider, namespace)`
 
@@ -340,4 +357,9 @@ test; 18 a `credential` name that is not configured refuses without the request 
 by a request counter that does not move; 19 `web.search` with no provider configured refuses with
 its own reason rather than an empty result list; 20 a fetch receipt records the requested URL, the
 final URL after redirects, the status and the content digest, and the digest matches what `blob.get`
-returns for the reference in the reply.
+returns for the reference in the reply; 21 a fetch whose `headers` carries `Authorization` refuses
+naming `credential` without the request being made, proved by a request counter that does not move,
+with an allow-listed header succeeding in the same test as the control; 22 a host whose resolution
+changes between the check and the connect refuses, with a stable-resolution host as the positive
+control in the same test; 23 a compressed response whose decompressed size exceeds the byte bound is
+stored truncated with `truncated: true`, and the stored object is no larger than the bound.
