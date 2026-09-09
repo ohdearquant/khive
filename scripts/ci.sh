@@ -30,6 +30,7 @@ phase_lint() {
 
     echo "=== SQL Lint ==="
     sh "$SCRIPT_DIR/lint-sql.sh"
+    python3 "$SCRIPT_DIR/tests/test_lint_sql.py"
 
     echo "=== ADR Reference Lint ==="
     sh "$SCRIPT_DIR/lint-adr-refs.sh"
