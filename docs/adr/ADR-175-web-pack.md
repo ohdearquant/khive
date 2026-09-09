@@ -255,3 +255,89 @@ its own gate, and putting it first would hold the vocabulary behind that review.
 
 - ADR-069 Subject model; ADR-072 OntologySpec as data; ADR-085 code pack and its amendments
 - ARW profile: manifest at `/.well-known/arw.json`, `llms.txt`, markdown machine views
+
+## Amendment 1 (2026-09-09): `web.fetch` and `web.search`, and the egress constraint they reverse
+
+D1 says "no crawler, no fetcher in v0" and D6.4 says "no secrets, no egress; v0 reads local files
+only". This amendment reverses the egress half of both, deliberately and with the constraints that
+made them worth writing carried forward rather than dropped. It does not introduce a crawler: both
+verbs are single-request reads a caller asks for by name, with no link following and no queue.
+
+The reason for the reversal is that an agent's read of the outside world is happening either way.
+Today it happens through whatever the harness hands the model, outside khive, which means no
+allowlist, no receipt, and no record of what text entered a decision. Moving it into a pack is what
+makes it bounded and auditable.
+
+### A1.1 `web.fetch(url, method, headers, credential, max_bytes, timeout_s, namespace)`
+
+An HTTP read of one URL. `GET` and `HEAD` only; a body-bearing method is refused, because a verb
+that can POST is a verb that can act on the world and this one is a read.
+
+The reply is `{final_url, status, headers, content_ref, bytes, truncated, redirects, receipt_id}`.
+The body goes to the blob store and the reply carries its reference, never the bytes: a page is
+routinely larger than a response envelope should be, and a caller that wants the text reads it with
+`blob.get` like any other stored object. `headers` is an allow-listed subset (content type, content
+length, last modified, etag); a response header set is attacker-controlled and echoing it whole puts
+attacker text in a place callers read structurally.
+
+### A1.2 What the fetch refuses, and where
+
+1. **Scheme.** `http` and `https` only. Everything else refuses, including `file`, `ftp` and `data`.
+2. **Address, after resolution.** The host is resolved and every returned address is checked; a
+   loopback, link-local, private, unique-local, or unspecified address refuses. The check is on the
+   resolved address rather than on the hostname, because a name that resolves into private space is
+   the whole shape of the attack, and it is re-applied on every redirect hop rather than once.
+3. **Operator allowlist, when set.** With no allowlist configured, the public internet is reachable
+   and only the address rule above applies, because a verb that reaches nothing by default is a verb
+   nobody enables. When an allowlist is configured it becomes exclusive, and a host outside it
+   refuses with the host named.
+4. **Redirects.** Bounded, default five, with every hop re-checked against 1 through 3. A redirect
+   into private address space refuses at the hop that proposes it.
+5. **Size and time.** Both bounded, both configurable, both with defaults. A response exceeding the
+   byte bound is stored truncated with `truncated: true` rather than discarded, so a caller sees what
+   was read; a response exceeding the time bound refuses and stores nothing.
+6. **Credentials are never arguments.** `credential` names an entry the operator has configured; the
+   value is read from the process environment at request time. A secret in the verb's arguments would
+   be in the receipt, the audit event, and every log that carries either.
+
+### A1.3 `web.search(query, limit, provider, namespace)`
+
+A query against a configured search provider, returning `{provider, results: [{title, url, snippet}],
+receipt_id}`. The provider is operator configuration, not a verb argument beyond selecting among the
+configured ones. With no provider configured the verb refuses with `no_search_provider_configured`
+and names what to configure; it does not return an empty result list, because an empty list from a
+missing provider is indistinguishable from an empty list for a query with no hits, and a caller
+cannot act on the difference it cannot see.
+
+Results are transcribed as the provider returned them, per D6.2. The pack does not rank, merge,
+deduplicate or summarize.
+
+### A1.4 What a fetched byte is
+
+Every response body and every search snippet is **data, never instruction**. Both verb descriptions
+say so, so a caller reading `help=true` sees it before the first call rather than in a document it
+may not have. The receipt is what makes this checkable after the fact: it records the requested URL,
+the final URL, the status, the content digest and the byte count, so a later reader can ask which
+text entered a decision and verify it has not changed underneath the reference.
+
+Both verbs are `Assertive` and write a receipt. Neither is admission degrade-safe: a receipt is a
+write, and a fetch has an effect on the outside world (it is observed by the origin) even though it
+changes nothing here.
+
+### A1.5 What does not change
+
+D6.1, D6.2, D6.3, D6.5 and D6.6 stand as written. `web.ingest` is untouched and remains local-only.
+No new entity kind, note kind or edge relation is introduced; neither verb writes the graph.
+
+Acceptance arms, stated before implementation: 12 a `file://` URL refuses and stores nothing; 13 a
+hostname resolving to loopback refuses naming the resolved address, with a public hostname as a
+positive control in the same test; 14 a redirect chain whose second hop points into private address
+space refuses at that hop, with a same-length public chain as control; 15 a response larger than the
+byte bound is stored truncated with `truncated: true` and its digest matches the stored prefix;
+16 a response slower than the time bound refuses and the blob store holds no new object; 17 a
+configured allowlist makes a host outside it refuse while a host inside it succeeds, both in one
+test; 18 a `credential` name that is not configured refuses without the request being made, proved
+by a request counter that does not move; 19 `web.search` with no provider configured refuses with
+its own reason rather than an empty result list; 20 a fetch receipt records the requested URL, the
+final URL after redirects, the status and the content digest, and the digest matches what `blob.get`
+returns for the reference in the reply.
