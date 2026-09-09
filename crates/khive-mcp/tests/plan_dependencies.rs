@@ -120,10 +120,18 @@ fn assert_adapter_dependencies(method: &syn::ImplItemFn) {
         match method.sig.ident.to_string().as_str() {
             "plan_ops" => (
                 &["khive_request::plan_request"],
+                // The mounted tool catalog is a second read of the registry
+                // (a pinned snapshot, no subprocess call); merging it into the
+                // plan catalog adds iterator and JSON accessor methods only.
                 &[
                     "all_verbs_with_names",
+                    "mounted_verb_snapshot",
                     "into_iter",
                     "map",
+                    "chain",
+                    "as_str",
+                    "unwrap_or_default",
+                    "to_owned",
                     "collect",
                     "to_string",
                 ],
