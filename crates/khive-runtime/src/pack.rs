@@ -6248,6 +6248,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn denied_dispatch_returns_the_id_of_its_committed_gate_denied_row() {
         let gate = Arc::new(CountingGate {
             calls: AtomicUsize::new(0),
@@ -6282,6 +6283,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn denied_dispatch_without_an_event_store_reports_no_store() {
         let gate = Arc::new(CountingGate {
             calls: AtomicUsize::new(0),
