@@ -242,6 +242,11 @@ pub trait PackRuntime: Send + Sync {
     /// Handlers this pack registers — must equal `<Self as Pack>::HANDLERS`.
     fn handlers(&self) -> &'static [HandlerDef];
 
+    /// Optional canonical input schema owned by the pack; ParamDefs remain available.
+    fn input_schema(&self, _verb: &str) -> Option<Value> {
+        None
+    }
+
     /// Pack-extensible edge endpoint rules — must equal `<Self as Pack>::EDGE_RULES`.
     /// Defaults to empty so existing packs that don't extend the edge contract
     /// can ignore it.
@@ -1828,6 +1833,9 @@ impl VerbRegistry {
                         "params": params_arr,
                         "identifier_resolution": identifier_resolution_help(),
                     });
+                    if let Some(schema) = pack.input_schema(verb) {
+                        envelope["input_schema"] = schema;
+                    }
                     if verb == "link" {
                         envelope["endpoint_rules"] = Value::Array(edge_endpoint_table(&self.packs));
                     }
