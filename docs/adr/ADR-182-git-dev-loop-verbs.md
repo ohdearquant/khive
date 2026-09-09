@@ -369,3 +369,33 @@ source of the last pusher (the pack's push receipts, and the platform's own revi
 where the first text named a workflow's triggering actor, which is not the pusher; item 4 places the
 scope on the grant row the receipt cites, where the first text said the receipt carried it; arm 41
 follows item 3.
+
+## Amendment 7 (2026-09-09): merge dispatch refusals per repository
+
+Adopted from a caller's reading of the `git.pr_merge` help against the rule its operators hold for
+merges: the account that opened a pull request and the account that last pushed its head do not
+perform the merge. Amendment 6 item 5 stands; this adds one optional field to the repository row.
+
+1. **`merge_refusals` on the repository row.** `[git_write.repositories."<path>"]` may list
+   `merge_refusals = ["opener", "last_pusher"]`, each entry at most once; any other entry or a
+   repeated one fails configuration validation. The list is empty by default, and an empty list
+   changes nothing.
+2. **`opener`.** `git.pr_merge` is refused with reason `merge_by_opener` when the dispatching actor's
+   platform login equals the pull request author's login (evidence `platform_login`), or when this
+   namespace holds a committed `git.pr_open` receipt for that number by the dispatching actor or by
+   its credential reference (evidence `pr_open_receipt`): the same two readings that refuse a
+   self-approval on `git.pr_review`.
+3. **`last_pusher`.** `git.pr_merge` is refused with reason `merge_by_last_pusher` when the
+   dispatching actor's platform login equals the login on the newest `git.push` receipt whose
+   acknowledged head equals `expected_head` (Amendment 6 item 3); with no such receipt the entry
+   refuses nothing and `last_pusher` stays unknown on the receipt.
+4. **Order and receipt.** Both refusals run after the fork policy and the last-pusher read and before
+   the review-decision read and the merge call, so a refused merge writes nothing to the platform.
+   The receipt carries `result.merge_refusal: {name, source: "git_write.repositories.merge_refusals",
+   evidence}` beside `last_pusher`; a permitted merge carries no `merge_refusal`.
+
+Acceptance arm added: 42 with both entries listed, a merge dispatched by the opening actor, by a
+second actor on the opener's platform account, and by the last pusher of `expected_head` each refuse
+before any platform write with the named reason and evidence on the receipt, and a merge dispatched by
+the approving login that is neither the opener nor the last pusher proceeds (control). Mutation
+controls, stated before they ran: removing either entry's check alone lets its refusal arm merge.

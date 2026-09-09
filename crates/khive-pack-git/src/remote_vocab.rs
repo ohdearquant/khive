@@ -77,7 +77,7 @@ pub(crate) const PR_REVIEW: HandlerDef = HandlerDef {
 
 pub(crate) const PR_MERGE: HandlerDef = HandlerDef {
     name: "git.pr_merge",
-    description: "Merge with a platform head comparison after caller policy and current-head approval by another account. The merge presents as the dispatching actor credential, resolved the same way as git.pr_open. The approval precondition is an approving review at expected_head from a platform account other than the LAST PUSHER of that head, not other than the author; a merge dispatched by the opener is not refused by this verb. Forks require git.pr_merge.fork; no administrator bypass is requested. Returns merged_head_sha, merged_sha and receipt_id.",
+    description: "Merge with a platform head comparison after caller policy and current-head approval by another account. The merge presents as the dispatching actor credential, resolved the same way as git.pr_open. The approval precondition is an approving review at expected_head from a platform account other than the LAST PUSHER of that head, not other than the author. A repository row may list merge_refusals: opener refuses a merge dispatched by the account or actor that opened the pull request (merge_by_opener) and last_pusher refuses one dispatched by the login on the newest push receipt for expected_head (merge_by_last_pusher), both before any platform write and named on the receipt; with no list a merge dispatched by the opener is not refused. Forks require git.pr_merge.fork; no administrator bypass is requested. Returns merged_head_sha, merged_sha and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
