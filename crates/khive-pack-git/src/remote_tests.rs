@@ -250,6 +250,13 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(allowed: bool, fault: Option<&str>) -> Self {
+        Self::with_merge_refusals(allowed, fault, &[]).await
+    }
+    async fn with_merge_refusals(
+        allowed: bool,
+        fault: Option<&str>,
+        merge_refusals: &[&str],
+    ) -> Self {
         let env_guard = crate::cache::ENV_MUTEX.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -332,6 +339,7 @@ impl Fixture {
                         remote: REMOTE.into(),
                         slug: SLUG.into(),
                         visibility: "private".into(),
+                        merge_refusals: merge_refusals.iter().map(|e| e.to_string()).collect(),
                     },
                 )]),
                 credential_resolver: vec![resolver.display().to_string(), "{ref}".into()],
@@ -1249,4 +1257,58 @@ async fn remote_stale_or_dismissed_approvals_do_not_authorize_merge() {
         .push(json!({"id":2,"commit_id":f.head,"state":"DISMISSED","user":{"login":"reviewer"}}));
     f.refusal(&f.actor, "git.pr_merge", f.merge(n), "missing_review")
         .await;
+}
+
+#[tokio::test]
+async fn remote_merge_refusals_name_opener_and_last_pusher_then_the_approving_login_merges() {
+    let f = Fixture::with_merge_refusals(true, None, &["opener", "last_pusher"]).await;
+    f.call(&f.reviewer, "git.push", f.push()).await.unwrap();
+    let push = f.last(&f.reviewer).await;
+    let n = f.open().await;
+    f.review(&f.third, n).await.unwrap();
+    // The opening actor, read at the platform login.
+    let refused = f
+        .refusal(&f.actor, "git.pr_merge", f.merge(n), "merge_by_opener")
+        .await;
+    assert_eq!(refused.result["merge_refusal"]["name"], "merge_by_opener");
+    assert_eq!(
+        refused.result["merge_refusal"]["evidence"],
+        "platform_login"
+    );
+    // A second actor on the opener's platform account never opened through the pack.
+    let refused = f
+        .refusal(&f.alias, "git.pr_merge", f.merge(n), "merge_by_opener")
+        .await;
+    assert_eq!(
+        refused.result["merge_refusal"]["evidence"],
+        "platform_login"
+    );
+    // The last pusher of expected_head, cited by its push receipt.
+    let refused = f
+        .refusal(
+            &f.reviewer,
+            "git.pr_merge",
+            f.merge(n),
+            "merge_by_last_pusher",
+        )
+        .await;
+    assert_eq!(
+        refused.result["merge_refusal"]["name"],
+        "merge_by_last_pusher"
+    );
+    assert_eq!(refused.result["last_pusher"]["push_receipt_id"], push.id);
+    assert!(!f
+        .remote
+        .state
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .any(|call| call["method"] == "PUT"));
+    // Permit arm: the approving login is neither the opener nor the last pusher.
+    let result = f.call(&f.third, "git.pr_merge", f.merge(n)).await.unwrap();
+    assert_eq!(f.remote.pr(n)["merged"], true);
+    assert_eq!(result["merged_head_sha"], f.head);
+    assert_eq!(result["last_pusher"]["push_receipt_id"], push.id);
+    assert_eq!(f.last(&f.third).await.result["merge_refusal"], Value::Null);
 }

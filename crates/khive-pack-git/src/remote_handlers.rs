@@ -509,6 +509,34 @@ impl GitPack {
             receipt.result = result.clone();
             return Ok(result);
         }
+        // Repository merge dispatch refusals (ADR-182 Amendment 7), named on
+        // the receipt and decided before any platform write.
+        if target.refuses_merge_by("opener") {
+            let evidence = if login.eq_ignore_ascii_case(author) {
+                Some("platform_login")
+            } else if self
+                .opened_by_actor_or_reference(receipt, n, &identity.credential_ref)
+                .await?
+            {
+                Some("pr_open_receipt")
+            } else {
+                None
+            };
+            if let Some(evidence) = evidence {
+                receipt.result["merge_refusal"] = json!({"name":"merge_by_opener",
+                    "source":"git_write.repositories.merge_refusals", "evidence":evidence});
+                return Err(Failure::refused("merge_by_opener"));
+            }
+        }
+        if target.refuses_merge_by("last_pusher")
+            && last_pusher["platform_identity"]
+                .as_str()
+                .is_some_and(|pusher| login.eq_ignore_ascii_case(pusher))
+        {
+            receipt.result["merge_refusal"] = json!({"name":"merge_by_last_pusher",
+                "source":"git_write.repositories.merge_refusals", "evidence":"git.push.receipt"});
+            return Err(Failure::refused("merge_by_last_pusher"));
+        }
         let review = self
             .remote_transport()
             .review_decision(secret, &target.slug, n)
