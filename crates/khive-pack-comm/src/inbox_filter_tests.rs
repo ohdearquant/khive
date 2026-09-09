@@ -162,9 +162,15 @@ async fn inbox_tags_are_exact_all_of_in_both_boxes_and_preserve_id_pair() {
             json!({"tags": ["mail_id:abc", "mail_id:abc", "scope:release"]}),
         )
         .await;
-        assert_eq!(content_set(&duplicate), BTreeSet::from(["matching message"]));
+        assert_eq!(
+            content_set(&duplicate),
+            BTreeSet::from(["matching message"])
+        );
 
-        for tags in [json!(["mail_id:missing"]), json!(["mail_id:abc", "scope:RELEASE"])] {
+        for tags in [
+            json!(["mail_id:missing"]),
+            json!(["mail_id:abc", "scope:RELEASE"]),
+        ] {
             let absent = inbox(registry, mailbox, json!({"tags": tags})).await;
             assert_eq!(absent["count"], 0, "exact absent-tag control: {absent}");
         }
@@ -188,7 +194,10 @@ async fn inbox_tags_are_exact_all_of_in_both_boxes_and_preserve_id_pair() {
         .expect_err("outbound UUID cannot mark an inbound message read");
     assert!(outbound_error.to_string().contains("outbound"));
     let read = recipient
-        .dispatch("comm.read", json!({"id": inbound["messages"][0]["full_id"]}))
+        .dispatch(
+            "comm.read",
+            json!({"id": inbound["messages"][0]["full_id"]}),
+        )
         .await
         .expect("recipient reads the inbound UUID");
     assert_eq!(read["read"], true);
@@ -206,7 +215,13 @@ async fn inbox_kind_and_thread_filters_intersect_with_tags_in_both_boxes() {
         Some(thread_id),
     )
     .await;
-    send(&sender, "untagged continuation", Value::Null, Some(thread_id)).await;
+    send(
+        &sender,
+        "untagged continuation",
+        Value::Null,
+        Some(thread_id),
+    )
+    .await;
     let other = send(&sender, "other thread", json!(["selected"]), None).await;
 
     for (registry, mailbox) in [(&sender, "sent"), (&recipient, "inbox")] {
@@ -218,7 +233,11 @@ async fn inbox_kind_and_thread_filters_intersect_with_tags_in_both_boxes() {
         let thread = inbox(registry, mailbox, json!({"thread_id": thread_id})).await;
         assert_eq!(
             content_set(&thread),
-            BTreeSet::from(["thread root", "selected continuation", "untagged continuation"])
+            BTreeSet::from([
+                "thread root",
+                "selected continuation",
+                "untagged continuation"
+            ])
         );
         let combined = inbox(
             registry,
@@ -276,7 +295,10 @@ async fn inbox_tag_filters_precede_limit_and_offset_across_store_pages_in_both_b
                 }));
             note.created_at = base + i64::from(sequence) * 1_000_000;
             note.updated_at = note.created_at;
-            store.upsert_note(note).await.expect("insert ordered message");
+            store
+                .upsert_note(note)
+                .await
+                .expect("insert ordered message");
         }
     }
     drop(store);
@@ -349,7 +371,12 @@ async fn inbox_tag_filters_precede_limit_and_offset_across_store_pages_in_both_b
         .await;
         assert_eq!(wrong_subject["count"], 0);
 
-        let zero_limit = inbox(registry, mailbox, json!({"tags": ["mail_id:page"], "limit": 0})).await;
+        let zero_limit = inbox(
+            registry,
+            mailbox,
+            json!({"tags": ["mail_id:page"], "limit": 0}),
+        )
+        .await;
         assert_eq!(zero_limit["count"], 0);
         assert_eq!(zero_limit["next_offset"], Value::Null);
         assert_eq!(zero_limit["has_more"], false);
