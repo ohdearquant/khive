@@ -226,6 +226,16 @@ impl Fixture {
             ..Default::default()
         };
         let rt = KhiveRuntime::new(config).expect("file runtime");
+        // File runtimes require explicit blob-store installation, as at boot.
+        // Keep the fixture independent of the host's blob-root environment.
+        let blob_store = {
+            let _env = EnvGuard::remove(&["KHIVE_BLOB_ROOT"]);
+            rt.backend()
+                .blob_store(Some(&dir.path().join("blobs")), Some(0))
+                .expect("fixture blob store")
+        };
+        rt.install_blob_store(blob_store)
+            .expect("install fixture blobs");
         let mut builder = VerbRegistryBuilder::new();
         builder.with_actor_id(Some(ACTOR.into()));
         builder.register(KgPack::new(rt.clone()));

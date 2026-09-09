@@ -949,6 +949,87 @@ pub(crate) async fn diff(
     })
 }
 
+pub(crate) async fn is_ancestor(repo: &Path, base: &str, head: &str) -> Result<bool> {
+    validate_oid(base, "base")?;
+    validate_oid(head, "head")?;
+    let (repo, base, head) = (repo.to_path_buf(), base.to_string(), head.to_string());
+    blocking("merge-base", false, move || {
+        Ok(run_git_output(
+            &repo,
+            &["merge-base", "--is-ancestor", &base, &head],
+            None,
+            None,
+            false,
+            Some(1),
+        )?
+        .exit_code
+            == 0)
+    })
+    .await
+}
+
+pub(crate) async fn object_directory(repo: &Path) -> Result<std::path::PathBuf> {
+    let repo = repo.to_path_buf();
+    blocking("rev-parse", false, move || {
+        let bytes = run_git(
+            &repo,
+            &["rev-parse", "--git-path", "objects"],
+            None,
+            None,
+            false,
+        )?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| LocalGitError::new("git_output", "invalid object path"))?
+            .trim();
+        let path = repo.join(text);
+        std::fs::canonicalize(path)
+            .map_err(|_| LocalGitError::new("git_output", "object directory unavailable"))
+    })
+    .await
+}
+
+pub(crate) async fn record_push_marker(
+    repo: &Path,
+    branch: &str,
+    sha: &str,
+    receipt_id: &str,
+) -> Result<()> {
+    validate_oid(sha, "pushed head")?;
+    let reference = branch_ref(branch)?;
+    let marker = receipt_marker(receipt_id)?;
+    let repo = repo.to_path_buf();
+    let sha = sha.to_string();
+    blocking("reflog", false, move || {
+        require_direct_ref(&repo, &reference)?;
+        // update-ref suppresses reflog writes for an unchanged SHA. An explicit
+        // reflog write records acknowledgement without changing any source ref.
+        run_git(
+            &repo,
+            &["reflog", "write", &reference, &sha, &sha, &marker],
+            None,
+            None,
+            false,
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+pub(crate) async fn push_marker_support(repo: &Path) -> Result<(String, bool)> {
+    let repo = repo.to_path_buf();
+    blocking("reflog", false, move || {
+        let version = run_git(&repo, &["--version"], None, None, false)?;
+        let version = String::from_utf8(version)
+            .map_err(|_| LocalGitError::new("git_output", "invalid Git version"))?;
+        let help = run_git_output(&repo, &["reflog", "-h"], None, None, false, Some(129))?;
+        Ok((
+            version.trim().to_owned(),
+            String::from_utf8_lossy(&help.stdout).contains("git reflog write "),
+        ))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

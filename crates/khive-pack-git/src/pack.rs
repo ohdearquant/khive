@@ -25,6 +25,7 @@ use crate::vocab::{GIT_ENTITY_TYPES, GIT_NOTE_KIND_SPECS, GIT_SCHEMA_PLAN_STMTS}
 /// pack contributes; everything else uses the base `annotates` contract.
 pub struct GitPack {
     runtime: KhiveRuntime,
+    remote: Arc<dyn crate::remote_transport::RemoteTransport>,
 }
 
 impl Pack for GitPack {
@@ -45,7 +46,21 @@ impl Pack for GitPack {
 impl GitPack {
     /// Create a new `GitPack` bound to the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            remote: Arc::new(crate::remote_transport::GhTransport),
+        }
+    }
+
+    pub fn with_remote_transport(
+        runtime: KhiveRuntime,
+        remote: Arc<dyn crate::remote_transport::RemoteTransport>,
+    ) -> Self {
+        Self { runtime, remote }
+    }
+
+    pub(crate) fn remote_transport(&self) -> &dyn crate::remote_transport::RemoteTransport {
+        self.remote.as_ref()
     }
 
     /// Accessor for `src/handlers.rs`, which lives in a sibling module and
@@ -92,6 +107,10 @@ impl PackRuntime for GitPack {
 
     fn handlers(&self) -> &'static [HandlerDef] {
         <GitPack as Pack>::HANDLERS
+    }
+
+    fn input_schema(&self, verb: &str) -> Option<Value> {
+        crate::input_schema::for_verb(verb)
     }
 
     fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
@@ -142,7 +161,9 @@ impl PackRuntime for GitPack {
             }
             "git.commit" => self.handle_commit(token, params).await,
             "git.branch" => self.handle_local(token, registry, verb, params).await,
-            "git.push" => self.handle_push(token, params).await,
+            "git.push" | "git.pr_open" | "git.pr_review" | "git.pr_merge" => {
+                self.handle_remote(token, registry, verb, params).await
+            }
             "git.checkout" | "git.diff" | "git.reconcile" => {
                 self.handle_local(token, registry, verb, params).await
             }

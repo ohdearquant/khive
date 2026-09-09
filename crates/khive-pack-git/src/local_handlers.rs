@@ -15,14 +15,14 @@ use crate::write_handlers::repo_write_lock;
 use crate::write_policy::{GitWritePolicy, GitWritePolicyError};
 use crate::GitPack;
 
-struct Failure {
-    reason: &'static str,
-    ambiguous: bool,
-    detail: Option<String>,
+pub(crate) struct Failure {
+    pub(crate) reason: &'static str,
+    pub(crate) ambiguous: bool,
+    pub(crate) detail: Option<String>,
 }
 
 impl Failure {
-    fn invalid(detail: impl Into<String>) -> Self {
+    pub(crate) fn invalid(detail: impl Into<String>) -> Self {
         Self {
             reason: "invalid_params",
             ambiguous: false,
@@ -30,7 +30,7 @@ impl Failure {
         }
     }
 
-    fn refused(reason: &'static str) -> Self {
+    pub(crate) fn refused(reason: &'static str) -> Self {
         Self {
             reason,
             ambiguous: false,
@@ -59,7 +59,7 @@ impl From<RuntimeError> for Failure {
     }
 }
 
-fn required<'a>(params: &'a Value, key: &str) -> Result<&'a str, Failure> {
+pub(crate) fn required<'a>(params: &'a Value, key: &str) -> Result<&'a str, Failure> {
     match params.get(key) {
         None => Err(Failure::invalid(format!("{key} is required"))),
         Some(value) => value.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
@@ -68,7 +68,7 @@ fn required<'a>(params: &'a Value, key: &str) -> Result<&'a str, Failure> {
     }
 }
 
-fn optional<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, Failure> {
+pub(crate) fn optional<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, Failure> {
     if params.get(key).is_none() {
         Ok(None)
     } else {
@@ -76,7 +76,7 @@ fn optional<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, Failure
     }
 }
 
-fn validate_keys(params: &Value, allowed: &[&str]) -> Result<(), Failure> {
+pub(crate) fn validate_keys(params: &Value, allowed: &[&str]) -> Result<(), Failure> {
     let map = params
         .as_object()
         .ok_or_else(|| Failure::refused("invalid_params"))?;
@@ -86,7 +86,7 @@ fn validate_keys(params: &Value, allowed: &[&str]) -> Result<(), Failure> {
     Ok(())
 }
 
-fn oid(value: &str) -> Result<(), Failure> {
+pub(crate) fn oid(value: &str) -> Result<(), Failure> {
     if value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(())
     } else {
@@ -168,11 +168,11 @@ fn safe_inputs(verb: &str, params: &Value) -> Value {
     Value::Object(inputs)
 }
 
-fn denied(reason: &str) -> Value {
+pub(crate) fn denied(reason: &str) -> Value {
     json!({"decision":"deny", "source":"git_write.allowed", "id":format!("deny:{reason}")})
 }
 
-fn gate_reason(error: &GitWritePolicyError) -> &'static str {
+pub(crate) fn gate_reason(error: &GitWritePolicyError) -> &'static str {
     match error {
         GitWritePolicyError::NotConfigured => "not_configured",
         GitWritePolicyError::RepoNotAllowlisted(_) => "repo_not_allowlisted",
@@ -190,7 +190,7 @@ fn wire_error(receipt: &Receipt) -> RuntimeError {
     }
 }
 
-async fn checked_policy(
+pub(crate) async fn checked_policy(
     registry: &VerbRegistry,
     token: &NamespaceToken,
     verb: &str,
@@ -358,7 +358,7 @@ impl GitPack {
         self.finish_local(token, receipt, outcome).await
     }
 
-    async fn require_receipt_storage(
+    pub(crate) async fn require_receipt_storage(
         &self,
         token: &NamespaceToken,
         receipt: &Receipt,
@@ -472,6 +472,10 @@ impl GitPack {
                     &prior.id,
                 )
                 .await?;
+                if matches!(prior.verb.as_str(), "git.push" | "git.pr_merge") {
+                    self.reconcile_remote(repo, &mut prior).await?;
+                    return Ok(json!({"receipt":prior.to_value()}));
+                }
                 if !matches!(prior.verb.as_str(), "git.branch" | "git.commit") {
                     return Err(Failure::refused("local_receipt_required"));
                 }
@@ -502,7 +506,7 @@ impl GitPack {
         }
     }
 
-    async fn finish_local(
+    pub(crate) async fn finish_local(
         &self,
         token: &NamespaceToken,
         mut receipt: Receipt,
@@ -530,7 +534,15 @@ impl GitPack {
         };
         receipt.finished_at = Some(chrono::Utc::now().timestamp_micros());
         let settled = receipts::persist(self.runtime(), &receipt).await.is_ok();
-        if matches!(receipt.verb.as_str(), "git.branch" | "git.commit") {
+        if matches!(
+            receipt.verb.as_str(),
+            "git.branch"
+                | "git.commit"
+                | "git.push"
+                | "git.pr_open"
+                | "git.pr_review"
+                | "git.pr_merge"
+        ) {
             self.emit_write_audit(
                 token,
                 &receipt.verb,
@@ -556,6 +568,16 @@ impl GitPack {
             // The independent audit attempt above must not depend on receipt storage health.
             return Err(RuntimeError::Internal(format!(
                 "receipt settlement unknown; receipt_id={}",
+                receipt.id
+            )));
+        }
+        if outcome.is_ok()
+            && self.runtime().config().git_write.contract_faults
+            && self.runtime().config().git_write.fault.as_deref()
+                == Some(&format!("{}:audit-fails-after-effect", receipt.verb))
+        {
+            return Err(RuntimeError::Internal(format!(
+                "audit append fault after committed effect; receipt_id={}",
                 receipt.id
             )));
         }

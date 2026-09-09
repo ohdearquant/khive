@@ -40,10 +40,7 @@ use khive_runtime::{NamespaceToken, RuntimeError};
 use khive_storage::event::Event;
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
-use crate::write_argv::{
-    build_add_argv, build_commit_argv, build_push_argv, reject_force, validate_repo_path,
-    GitArgError,
-};
+use crate::write_argv::{build_add_argv, build_commit_argv, validate_repo_path, GitArgError};
 use crate::write_policy::{GitWritePolicy, GitWritePolicyError};
 use crate::GitPack;
 
@@ -109,21 +106,6 @@ fn parse_paths_param(params: &Value) -> Result<Vec<String>, RuntimeError> {
             .collect(),
         Some(other) => Err(RuntimeError::InvalidInput(format!(
             "paths must be an array of strings, got {other:?}"
-        ))),
-    }
-}
-
-/// Parses the `force` argument. `true` is caught by [`reject_force`]
-/// downstream; any non-boolean value (a string, number, array, object) is
-/// rejected loudly here rather than silently coerced to `false` — an
-/// explicit but malformed `force` argument must never be interpreted as "no
-/// force requested" (ADR-108: "an explicit force arg is rejected loudly").
-fn parse_force_param(params: &Value) -> Result<Option<bool>, RuntimeError> {
-    match params.get("force") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Bool(b)) => Ok(Some(*b)),
-        Some(other) => Err(RuntimeError::InvalidInput(format!(
-            "force must be a boolean, got {other:?}; force-push is never permitted through this verb"
         ))),
     }
 }
@@ -248,39 +230,6 @@ fn prepare_commit(repo: &Path, params: &Value) -> Result<CommitPreflight, WriteP
         branch,
         add_argv,
         commit_argv,
-    })
-}
-
-struct PushPreflight {
-    branch: String,
-    remote: String,
-    argv: Vec<String>,
-}
-
-fn prepare_push(repo: &Path, params: &Value) -> Result<PushPreflight, WritePreflightError> {
-    validate_repo_path(repo)
-        .map_err(to_invalid_input)
-        .map_err(|e| WritePreflightError::denied(e, None))?;
-    let branch = params
-        .get("branch")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::InvalidInput("git.push requires branch".into()))
-        .map_err(|e| WritePreflightError::denied(e, None))?;
-    let remote = parse_optional_string(params, "remote")
-        .map_err(|e| WritePreflightError::denied(e, Some(branch)))?
-        .unwrap_or("origin");
-    let force =
-        parse_force_param(params).map_err(|e| WritePreflightError::denied(e, Some(branch)))?;
-    reject_force(force)
-        .map_err(to_invalid_input)
-        .map_err(|e| WritePreflightError::denied(e, Some(branch)))?;
-    let argv = build_push_argv(remote, branch)
-        .map_err(to_invalid_input)
-        .map_err(|e| WritePreflightError::denied(e, Some(branch)))?;
-    Ok(PushPreflight {
-        branch: branch.to_string(),
-        remote: remote.to_string(),
-        argv,
     })
 }
 
@@ -456,85 +405,6 @@ impl GitPack {
             .await
     }
 
-    pub(crate) async fn handle_push(
-        &self,
-        token: &NamespaceToken,
-        params: Value,
-    ) -> Result<Value, RuntimeError> {
-        let repo = self.parse_audited_repo(token, "git.push", &params).await?;
-        let lock = repo_write_lock(&repo);
-        let _guard = lock.lock().await;
-        let PushPreflight {
-            branch,
-            remote,
-            argv,
-        } = match prepare_push(&repo, &params) {
-            Ok(preflight) => preflight,
-            Err(failure) => {
-                return Err(self
-                    .audit_early_failure(
-                        token,
-                        "git.push",
-                        &repo,
-                        failure.branch.as_deref(),
-                        failure.outcome,
-                        failure.error,
-                    )
-                    .await)
-            }
-        };
-
-        let canonical_repo = match self.enforce_write_policy(&repo, &branch) {
-            Ok(p) => p,
-            Err(e) => {
-                self.emit_write_audit(
-                    token,
-                    "git.push",
-                    &repo,
-                    Some(&branch),
-                    "deny",
-                    EventOutcome::Denied,
-                    None,
-                )
-                .await;
-                return Err(e);
-            }
-        };
-
-        match run_git(&canonical_repo, &argv) {
-            Ok(_) => {
-                self.emit_write_audit(
-                    token,
-                    "git.push",
-                    &canonical_repo,
-                    Some(&branch),
-                    "allow",
-                    EventOutcome::Success,
-                    None,
-                )
-                .await;
-                Ok(json!({
-                    "repo": canonical_repo.display().to_string(),
-                    "remote": remote,
-                    "branch": branch,
-                }))
-            }
-            Err(e) => {
-                self.emit_write_audit(
-                    token,
-                    "git.push",
-                    &canonical_repo,
-                    Some(&branch),
-                    "allow",
-                    EventOutcome::Error,
-                    None,
-                )
-                .await;
-                Err(e)
-            }
-        }
-    }
-
     /// Appends exactly one supplementary audit `Event` (ADR-108 rule 2) per
     /// write attempt, on every exit path — handler-allowlist-denied,
     /// git-failed, and success alike — carrying `repo`/`branch`/`decision`
@@ -562,6 +432,14 @@ impl GitPack {
         outcome: EventOutcome,
         sha: Option<&str>,
     ) {
+        if outcome == EventOutcome::Success
+            && self.runtime().config().git_write.contract_faults
+            && self.runtime().config().git_write.fault.as_deref()
+                == Some(&format!("{verb}:audit-fails-after-effect"))
+        {
+            tracing::warn!(target: "khive.git", verb, "contract fault: audit append unavailable after effect");
+            return;
+        }
         let Ok(store) = self.runtime().events(token) else {
             return;
         };
