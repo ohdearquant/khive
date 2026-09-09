@@ -78,7 +78,7 @@ before editing this table):
 | **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search                                                                                                         |
 | **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export)                                                                                              |
 | **tool**      | `tool.`      | 13    | Capability registry, discovery by capability, and use policy: check/request/grant (ADR-180)                                                        |
-| **exec**      | `exec.`      | 8     | One declared command in a sandbox over a materialized tree, receipts for every run (ADR-181)                                                       |
+| **exec**      | `exec.`      | 9     | One declared command in a sandbox over a materialized tree, receipts for every run (ADR-181)                                                       |
 | **git**       | `git.`       | 12    | Provenance ingest, branch/commit/push writes (ADR-108), dev-loop verbs: checkout, diff, gates, receipts, reconcile, PR open/review/merge (ADR-182) |
 | **code**      | _(none)_     | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)                                                                  |
 | **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)                                                       |
@@ -157,7 +157,7 @@ records what's connected, in which direction, and why.
 │  khive-pack-tool:      tool/skill/plugin registry, capability │
 │                        discovery, use policy (13 verbs)       │
 │  khive-pack-exec:      sandboxed run over a materialized tree │
-│                        (8 verbs)                              │
+│                        (9 verbs)                              │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐

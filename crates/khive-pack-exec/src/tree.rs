@@ -66,7 +66,10 @@ pub fn validate_cwd(cwd: &str) -> Result<String, RuntimeError> {
     validate_relative_path(cwd, "cwd")
 }
 
-fn parse_entries(value: &Value) -> Result<Vec<TreeEntry>, RuntimeError> {
+/// The one entry validator: paths, modes, duplicates, ref format, and the rule that a file
+/// cannot also be a directory prefix of another entry. Exposed so `exec.tree_put` validates
+/// a whole candidate manifest through this function rather than reimplementing its rules.
+pub(crate) fn parse_entries(value: &Value) -> Result<Vec<TreeEntry>, RuntimeError> {
     let items = value.as_array().ok_or_else(|| {
         RuntimeError::InvalidInput("entries must be an array of {path, ref, mode}".into())
     })?;

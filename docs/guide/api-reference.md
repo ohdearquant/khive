@@ -32,7 +32,7 @@ An always-machine-readable copy of this page is at
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 | `tool`      | 13    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
-| `exec`      | 8     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
+| `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
