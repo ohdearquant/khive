@@ -291,15 +291,16 @@ def main():
         # over the `BlobStore` CAS trait, unconfigured (erroring at dispatch)
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
         # The kg pack also carries its one documented sub-namespace,
-        # stream.append / stream.read / stream.stat (ADR-174 §2); git grew
+        # stream.append / stream.batch / stream.read / stream.stat (ADR-174
+        # §2); git grew
         # from four verbs to twelve with the dev-loop surface (checkout, diff,
         # gates, receipts, reconcile, pr_open, pr_review, pr_merge; ADR-182);
         # tool contributes thirteen verbs and exec eight (the tool registry
         # with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 123, (
-            f"expected 123 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 124, (
+            f"expected 124 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
@@ -316,7 +317,8 @@ def main():
             f"comm.unread lists unread inbound messages; comm.mark_read is the "
             f"named atomic-capable mark-read surface; comm.delivered confirms "
             f"the internal inbound sibling after an ambiguous atomic write), "
-            f"kg also carries stream.append/stream.read/stream.stat (ADR-174); "
+            f"kg also carries stream.append/stream.batch/stream.read/stream.stat "
+            f"(ADR-174); "
             f"git contributes twelve verbs with the ADR-182 dev-loop surface; "
             f"tool contributes thirteen verbs and exec eight; "
             f"got {verbs_result['total']}: {verbs_result}"

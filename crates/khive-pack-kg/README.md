@@ -7,7 +7,7 @@ workspace declares it as a dependency.
 
 ## Verbs
 
-23 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
+24 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
 
 | Verb             | What it does                                                                                                                                                                                                                                                                                                                                                                                          |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -35,6 +35,7 @@ workspace declares it as a dependency.
 | `stream.append` | Append immutable JSON with a dense sequence and optional expected_seq precondition |
 | `stream.read` | Read an ordered page, head_seq and next_after from one snapshot |
 | `stream.stat` | Count entries and read head_seq from one snapshot |
+| `stream.batch` | Append over several streams in one request, atomic under a fence or per member |
 
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
 [ADR-046](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-046-event-sourced-proposals.md).

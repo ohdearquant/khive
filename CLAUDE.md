@@ -65,7 +65,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  14 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
 │  tool, exec, git, code, workspace, blob — together exposing   │
-│  123 public verbs (see the verb-catalog paragraph below       │
+│  124 public verbs (see the verb-catalog paragraph below       │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039, forward-deployed,  │
@@ -109,7 +109,7 @@ not shipped.
 | `crates/khive-query`            | GQL + SPARQL parsers, AST validation, SQL compiler                                                                                                                                                                                                                                                                                                                                |
 | `crates/khive-runtime`          | Service API + VerbRegistry + PackRuntime trait                                                                                                                                                                                                                                                                                                                                    |
 | `crates/khive-request`          | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                                                                                                                                                                                                                                                                                      |
-| `crates/khive-pack-kg`          | KG pack: vocabulary, 23 verb handlers, kind validation                                                                                                                                                                                                                                                                                                                            |
+| `crates/khive-pack-kg`          | KG pack: vocabulary, 24 verb handlers, kind validation                                                                                                                                                                                                                                                                                                                            |
 | `crates/khive-pack-gtd`         | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                                                                                                                                                                                                                                                                                      |
 | `crates/khive-pack-memory`      | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))                                                                                                                                                                                                                                                             |
 | `crates/khive-pack-brain`       | Brain pack: profile management registry, Bayesian routing/feedback verbs                                                                                                                                                                                                                                                                                                          |
@@ -221,7 +221,7 @@ beside the database file with no config needed, and the verbs stay unconfigured 
 against an in-memory backend;
 regenerate via `request(ops="verbs()")` before editing this line).
 
-### KG pack verbs (23 — ADR-017, ADR-046, ADR-089, ADR-174)
+### KG pack verbs (24 — ADR-017, ADR-046, ADR-089, ADR-174)
 
 `create`, `list`, and `search` take a `kind` discriminant. It accepts either the substrate-level
 name (`entity`, `note`, `edge`) **or** a pack-registered granular kind (`concept`, `document`,

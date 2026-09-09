@@ -93,12 +93,12 @@ fn list_items(response: &Value) -> &[Value] {
 // (unified-verb draft ADR Slice 1), then 19 with whoami, then 20 with
 // db_diagnostics (ADR-091 operator surface).
 #[test]
-fn pack_verbs_returns_twenty_three() {
+fn pack_verbs_returns_twenty_four() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        23,
-        "KgPack must expose exactly 23 verbs including ordered streams"
+        24,
+        "KgPack must expose exactly 24 verbs including ordered streams"
     );
 }
 
@@ -128,6 +128,7 @@ fn pack_verbs_names_are_correct() {
         "whoami",
         "db_diagnostics",
         "stream.append",
+        "stream.batch",
         "stream.read",
         "stream.stat",
     ] {

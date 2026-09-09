@@ -65,3 +65,43 @@ async fn stream_mcp_default_presentation_keeps_exact_record_and_cursor() -> anyh
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn stream_batch_atomic_refusal_carries_not_committed_on_the_wire() -> anyhow::Result<()> {
+    // ADR-174 A1.1: a member refusal carries `domain_disposition:
+    // not_committed` wherever it surfaces. Per-member mode returns it as the
+    // member's own value; atomic mode raises it as the call's error, and the
+    // dispatch boundary's own answer for any handler error is `unknown`, so
+    // without the refusal naming its own disposition the caller cannot tell a
+    // batch that wrote nothing from one whose outcome is unestablished.
+    let client = connect().await?;
+    let stale = json!([{"tool": "stream.batch", "args": {"ops": [
+        {"op": "append", "stream": "atomic", "record": 1},
+        {"op": "append", "stream": "atomic", "record": 2, "expected_seq": 9},
+    ], "atomic": true}}])
+    .to_string();
+    let unknown_op =
+        json!([{"tool": "stream.batch", "args": {"ops": [{"op": "nope"}], "atomic": true}}])
+            .to_string();
+    for (ops, reason, member) in [
+        (stale, "seq_conflict", "1"),
+        (unknown_op, "unknown_op", "0"),
+    ] {
+        let refused = call(
+            &client,
+            "request",
+            json!({"presentation": "verbose", "ops": ops}),
+        )
+        .await?;
+        let refused: Value = serde_json::from_str(&first_text(&refused))?;
+        assert_eq!(refused["results"][0]["ok"], false, "{refused}");
+        let error = &refused["results"][0]["error"];
+        assert_eq!(error["details"]["reason"], reason, "{refused}");
+        assert_eq!(error["details"]["member"], member, "{refused}");
+        assert_eq!(error["domain_disposition"], "not_committed", "{refused}");
+    }
+    // The refusal's claim, read back: the whole batch wrote nothing.
+    let page = agent_one(&client, "stream.read(stream=\"atomic\")").await?;
+    assert_eq!(page["head_seq"], 0, "{page}");
+    Ok(())
+}
