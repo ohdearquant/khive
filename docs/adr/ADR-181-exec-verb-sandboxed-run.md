@@ -1,6 +1,6 @@
 # ADR-181: Exec Verb: One Declared Command in a Sandbox over a Materialized Tree
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-09, implemented by the exec pack)
 - **Date**: 2026-09-08
 - **Extends**: [ADR-111](ADR-111-blob-store.md) (content-addressed objects; this record adds a tree
   manifest over them), [ADR-180](ADR-180-tool-pack.md) (the policy vocabulary every run is checked
