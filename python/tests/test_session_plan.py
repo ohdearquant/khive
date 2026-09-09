@@ -50,7 +50,7 @@ PARSE_ERROR = {"parsed": False, "error": "unexpected end of input", "limits": LI
 
 
 class DaemonStub(Transport):
-    def __init__(self, payload=PLAN, *, encoded=True, version=5, mismatches=0, rejection=None):
+    def __init__(self, payload=PLAN, *, encoded=True, version=6, mismatches=0, rejection=None):
         self.payload = payload
         self.encoded = encoded
         self.version = version
@@ -185,7 +185,7 @@ def test_previous_protocol_rejects_plan_without_dispatch(handshaken):
         session._config_id = "catalog-config"
     with pytest.raises(ProtocolMismatch) as raised:
         session.plan(OPS)
-    assert raised.value.client_version == 5
+    assert raised.value.client_version == 6
     assert raised.value.daemon_version == 4
     assert len(transport.frames) == 1
     assert transport.frames[0].get("plan", False) is handshaken
