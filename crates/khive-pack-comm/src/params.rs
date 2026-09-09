@@ -36,6 +36,12 @@ pub(crate) struct DeliveredParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboxParams {
     #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
     pub limit: Option<u32>,
     /// `"inbox"` (default) or `"sent"`.
     #[serde(default, rename = "box")]

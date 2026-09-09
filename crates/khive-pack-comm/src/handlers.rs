@@ -187,6 +187,19 @@ fn inbox_note_matches(
     content_needle: Option<&str>,
 ) -> bool {
     let props = note.properties.as_ref();
+    if params.kind.as_deref().is_some_and(|kind| note.kind != kind) {
+        return false;
+    }
+    if params.tags.as_ref().is_some_and(|tags| {
+        tags.iter().any(|tag| {
+            !props
+                .and_then(|properties| properties.get("tags"))
+                .and_then(Value::as_array)
+                .is_some_and(|stored| stored.iter().any(|value| value.as_str() == Some(tag)))
+        })
+    }) {
+        return false;
+    }
     let sender = props
         .and_then(|properties| properties.get("from_actor"))
         .and_then(Value::as_str);
@@ -466,6 +479,11 @@ pub(crate) async fn handle_inbox(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: InboxParams = deser(params)?;
+    let thread_id = p
+        .thread_id
+        .as_deref()
+        .map(|raw| canonicalize_thread_id("inbox", raw))
+        .transpose()?;
     validate_message_projection_fields("inbox", p.fields.as_deref())?;
     let wait_ms = p.wait_ms.unwrap_or(0);
     if wait_ms > MAX_INBOX_WAIT_MS {
@@ -648,6 +666,14 @@ pub(crate) async fn handle_inbox(
         }
     }
 
+    if let Some(thread_id) = thread_id {
+        property_filters.push(PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(thread_id),
+        });
+    }
+
     let filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters,
@@ -749,7 +775,9 @@ async fn query_inbox_response(
     offset: u64,
     limit: usize,
 ) -> Result<Value, RuntimeError> {
-    let has_post_filter = params.from_prefix.is_some()
+    let has_post_filter = params.kind.is_some()
+        || params.tags.as_ref().is_some_and(|tags| !tags.is_empty())
+        || params.from_prefix.is_some()
         || params.exclude_from_actor.is_some()
         || before_micros.is_some()
         || subject_needle.is_some()

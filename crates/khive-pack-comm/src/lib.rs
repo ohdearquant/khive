@@ -9,6 +9,9 @@ pub(crate) mod vocab;
 
 pub use pack::CommPack;
 
+#[cfg(test)]
+mod inbox_filter_tests;
+
 /// The namespace the local single-tenant channel poll loop passes explicitly
 /// when it writes heartbeat rows. `comm.heartbeat` no longer pins every write
 /// to this constant (khive #917): it persists under `token.namespace()`, the
