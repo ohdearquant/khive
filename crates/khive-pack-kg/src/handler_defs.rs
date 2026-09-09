@@ -59,6 +59,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
+            ParamDef { name: "key", param_type: "string", required: false, description: "Singleton notes only: immutable live namespace/kind identity, at most 512 UTF-8 bytes without U+0000. An occupied key fails with key_conflict; existing_id is disclosed only when list is allowed.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embed", param_type: "bool", required: false, description: "Singleton notes only: defaults false for head and true otherwise. False skips inference and vector insertion while retaining lexical indexing.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object", required: false, description: "Singleton notes only: {key, kind, expected_version}; the primary-namespace fence must exist at that positive version inside the writer transaction or the whole write fails with fence_conflict.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "kind",
                 param_type: "string",
@@ -89,7 +92,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
                 name: "note_kind",
                 param_type: "string",
                 required: false,
-                description: "Fine-grained note kind when kind=\"note\" (observation | insight | question | decision | reference).",
+                description: "Registered note kind when kind=\"note\", including head for nameless JSON documents. Head document kinds use properties.tags entries kind:<value> (at most 64 UTF-8 bytes without U+0000).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -180,13 +183,16 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef { name: "key", param_type: "string", required: false, description: "Live note key in the caller's primary namespace; excludes id and include_deleted=true. With no note_kind, multiple holders fail with key_ambiguous, never a guessed match.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "kind", param_type: "string", required: false, description: "Optional note substrate or registered note-kind hint for key lookup only.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "note_kind", param_type: "string", required: false, description: "Optional registered note kind for key lookup, disambiguating the same key across note kinds.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
                 param_type: "uuid",
-                required: true,
+                required: false,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity, \
                               note, edge, event, or proposal to fetch. Entity-name fallback \
-                              uses the primary namespace.",
+                              uses the primary namespace. Required when key is absent; id and key are mutually exclusive.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
@@ -215,6 +221,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef { name: "key_prefix", param_type: "string", required: false, description: "Notes only, primary namespace: literal prefix over non-null keys; empty selects all keyed notes. Order is updated_at DESC, key DESC, id ASC. Cursor pages return notes and an opaque next_after; explicit offset retains the items envelope.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "after_key", param_type: "string", required: false, description: "Keyed notes only: resume after this live key's current position even when its row fails other filters. Excludes after and offset. Missing fails with after_key_missing; ambiguous kind fails with key_ambiguous.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "created_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 created_at lower bound; does not require keys or change ordinary insertion-order cursor semantics.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "updated_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 updated_at lower bound; without key_prefix it includes keyed and unkeyed notes.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "tag_mode", param_type: "string", required: false, description: "Notes only: any (default) or all requested tags, ASCII case-insensitive, applied before pagination. Empty tags impose no constraint.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "kind",
                 param_type: "string",
@@ -245,7 +256,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
                 name: "after",
                 param_type: "string",
                 required: false,
-                description: "Insertion-sequence cursor for entity, note, and edge lists: the full UUID from \
+                description: "With key_prefix, round-trip the opaque keyed-note next_after cursor (updated_at, key, id), or use an empty string to begin. Otherwise insertion-sequence cursor for entity, note, and edge lists: the full UUID from \
                               the prior page's next_after, or \"\" to start cursor mode. A new id is \
                               assigned a durable database sequence, so later inserts cannot fall behind \
                               an issued boundary even when timestamps tie. This is a live walk, not an \
@@ -276,15 +287,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
                 name: "note_kind",
                 param_type: "string",
                 required: false,
-                description: "Fine-grained note kind filter when kind=\"note\" (observation | insight | question | decision | reference).",
+                description: "Fine-grained note kind filter when kind=\"note\" (observation | insight | question | decision | reference | head).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "tags",
                 param_type: "array of string",
                 required: false,
-                description: "Case-insensitive OR-filter over entity tags or note \
-                              properties.tags (kind=\"entity\" or kind=\"note\").",
+                description: "Case-insensitive OR-filter over entity tags or note properties.tags. For notes, tag_mode=all requires every requested tag.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -436,6 +446,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 23] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
+            ParamDef { name: "expected_version", param_type: "integer", required: false, description: "Notes only: positive persisted version required inside the writer transaction. A stale version fails without mutation, with reason=version_conflict and expected_version/current_version details. Omission preserves unconditional caller semantics.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object", required: false, description: "Notes only: {key, kind, expected_version}; primary-namespace fence checked in the same writer transaction. Missing or stale fails with fence_conflict and neither note changes.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embed", param_type: "bool", required: false, description: "Notes only: omission retains embedding state. True enables reindexing; false performs no inference, removes existing vector rows transactionally and retains lexical indexing. Delayed reindex work cannot restore a stale revision.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
                 param_type: "uuid",
