@@ -111,12 +111,17 @@ pub fn walk(root: &Path) -> std::io::Result<(BTreeMap<String, Found>, Vec<String
                 skipped.push(child_rel);
                 continue;
             }
-            use std::os::unix::fs::PermissionsExt;
-            let mode = if meta.permissions().mode() & 0o111 != 0 {
-                755
-            } else {
-                644
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o111 != 0 {
+                    755
+                } else {
+                    644
+                }
             };
+            #[cfg(not(unix))]
+            let mode = 644;
             files.insert(child_rel, Found { abs, mode });
         }
     }
@@ -143,6 +148,7 @@ mod tests {
         assert_eq!(small.retained(), b"ok\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn walk_skips_symlinks() {
         let dir = tempfile::tempdir().unwrap();
