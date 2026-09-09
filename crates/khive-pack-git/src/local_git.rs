@@ -1030,6 +1030,265 @@ pub(crate) async fn push_marker_support(repo: &Path) -> Result<(String, bool)> {
     .await
 }
 
+/// One entry of `git status --porcelain=v2 -z`, classified by its leading token.
+#[derive(Serialize)]
+pub(crate) struct StatusEntry {
+    pub kind: &'static str,
+    pub xy: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct StatusBranch {
+    pub oid: Option<String>,
+    pub head: Option<String>,
+    pub upstream: Option<String>,
+    pub ahead: Option<i64>,
+    pub behind: Option<i64>,
+}
+
+pub(crate) struct StatusResult {
+    pub branch: StatusBranch,
+    pub entries: Vec<StatusEntry>,
+    pub total: usize,
+}
+
+/// `git status --porcelain=v2 -z` over an allow-listed repository. `GIT_OPTIONAL_LOCKS=0` is
+/// already in the hardened environment, so this refreshes nothing and takes no index lock: the
+/// working tree and the index are byte-identical before and after. `total` counts every entry git
+/// reported, so `total == 0` is a whole-repository claim even when `entries` was capped by `limit`.
+pub(crate) async fn status(repo: &Path, untracked: &str, limit: usize) -> Result<StatusResult> {
+    let untracked_arg = match untracked {
+        "no" | "normal" | "all" => format!("--untracked-files={untracked}"),
+        _ => {
+            return Err(LocalGitError::new(
+                "invalid_params",
+                "untracked must be no, normal or all",
+            ))
+        }
+    };
+    let bytes = run_async(
+        repo,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--no-renames",
+            &untracked_arg,
+            "-z",
+        ],
+        None,
+    )
+    .await?;
+    parse_status(&bytes, limit)
+}
+
+/// Porcelain v2 is NUL-terminated per record, so a path holding a newline, a quote or invalid
+/// UTF-8 stays one record. `--no-renames` is passed above, which removes the `2` form whose
+/// original path is a second NUL-terminated field; the arm below still refuses it rather than
+/// silently attributing the following record's path to it, so a future caller that drops the flag
+/// gets an error instead of a wrong answer.
+fn parse_status(bytes: &[u8], limit: usize) -> Result<StatusResult> {
+    let mut branch = StatusBranch {
+        oid: None,
+        head: None,
+        upstream: None,
+        ahead: None,
+        behind: None,
+    };
+    let mut entries = Vec::new();
+    let mut total = 0_usize;
+    for record in bytes.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let text = std::str::from_utf8(record).map_err(|_| {
+            LocalGitError::new("git_failed", "git status emitted a non-UTF-8 record")
+        })?;
+        if let Some(header) = text.strip_prefix("# ") {
+            let (key, value) = header.split_once(' ').unwrap_or((header, ""));
+            match key {
+                // Porcelain v2 spells "no sha yet" and "no branch" as the literal sentinels
+                // `(initial)` and `(detached)`. They are reported as null rather than passed
+                // through, so a caller reading `branch.head` never has to know the sentinel and a
+                // detached head is an absent name rather than a name that looks real.
+                "branch.oid" => branch.oid = (value != "(initial)").then(|| value.to_string()),
+                "branch.head" => branch.head = (value != "(detached)").then(|| value.to_string()),
+                "branch.upstream" => branch.upstream = Some(value.to_string()),
+                "branch.ab" => {
+                    for part in value.split_whitespace() {
+                        match part.as_bytes().first() {
+                            Some(b'+') => branch.ahead = part[1..].parse().ok(),
+                            Some(b'-') => branch.behind = part[1..].parse().ok(),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let (token, rest) = text.split_once(' ').unwrap_or((text, ""));
+        let entry = match token {
+            "1" => {
+                let mut fields = rest.splitn(8, ' ');
+                let xy = fields.next().unwrap_or_default().to_string();
+                let path = fields.nth(6).unwrap_or_default().to_string();
+                StatusEntry {
+                    kind: "ordinary",
+                    xy,
+                    path,
+                    original_path: None,
+                    score: None,
+                }
+            }
+            "u" => {
+                // `u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>`: ten fields after
+                // the token, so the path is the ninth item left once XY is consumed.
+                let mut fields = rest.splitn(10, ' ');
+                let xy = fields.next().unwrap_or_default().to_string();
+                let path = fields.nth(8).unwrap_or_default().to_string();
+                StatusEntry {
+                    kind: "unmerged",
+                    xy,
+                    path,
+                    original_path: None,
+                    score: None,
+                }
+            }
+            "?" => StatusEntry {
+                kind: "untracked",
+                xy: "??".into(),
+                path: rest.to_string(),
+                original_path: None,
+                score: None,
+            },
+            "!" => StatusEntry {
+                kind: "ignored",
+                xy: "!!".into(),
+                path: rest.to_string(),
+                original_path: None,
+                score: None,
+            },
+            "2" => {
+                return Err(LocalGitError::new(
+                    "git_failed",
+                    "git status reported a rename entry although --no-renames was passed",
+                ))
+            }
+            _ => {
+                return Err(LocalGitError::new(
+                    "git_failed",
+                    "git status emitted an unrecognized porcelain v2 record",
+                ))
+            }
+        };
+        total += 1;
+        if entries.len() < limit {
+            entries.push(entry);
+        }
+    }
+    Ok(StatusResult {
+        branch,
+        entries,
+        total,
+    })
+}
+
+/// `git init` on a directory the operator already allow-listed. The path must exist and must not
+/// already hold a repository: re-running `init` over a live repository is refused rather than
+/// performed, because git would rewrite configuration in place and the caller would read success.
+/// `--template=` is passed so the new repository inherits no sample hooks, which keeps ADR-182
+/// Amendment 2 item 4 true of a repository this pack created.
+pub(crate) async fn init(repo: &Path, branch: &str) -> Result<String> {
+    validate_ref_name("branch", branch)
+        .map_err(|error| LocalGitError::new("invalid_params", error.to_string()))?;
+    if !repo.is_dir() {
+        return Err(LocalGitError::new(
+            "repo_not_a_directory",
+            "init target must be an existing directory",
+        ));
+    }
+    if repo.join(".git").exists() {
+        return Err(LocalGitError::new(
+            "already_initialized",
+            "init target already holds a repository",
+        ));
+    }
+    run_async(repo, &["init", "-q", "--template=", "-b", branch], None).await?;
+    resolve_head_branch(repo).await
+}
+
+async fn resolve_head_branch(repo: &Path) -> Result<String> {
+    let bytes = run_async(repo, &["symbolic-ref", "--short", "HEAD"], None).await?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+#[derive(Serialize)]
+pub(crate) struct LogEntry {
+    pub sha: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub authored_at: String,
+    pub committed_at: String,
+    pub subject: String,
+}
+
+/// A bounded page of `git log`. Fields are newline-separated inside a NUL-separated record: `%s`
+/// is the subject line and can hold no newline, and neither can an author name or an ISO date, so
+/// the split is unambiguous for every path and message git can store. `--literal-pathspecs` is a
+/// main-command option and so precedes the subcommand; it stops a caller-supplied path from being
+/// read as a glob or a magic pathspec.
+pub(crate) async fn log(
+    repo: &Path,
+    reference: &str,
+    limit: usize,
+    path: Option<&str>,
+) -> Result<Vec<LogEntry>> {
+    let resolved = checked_ref(reference)?;
+    let count = limit.to_string();
+    let mut argv = vec![
+        "--literal-pathspecs",
+        "log",
+        "-z",
+        "--no-color",
+        "--format=%H%n%an%n%ae%n%aI%n%cI%n%s",
+        "-n",
+        &count,
+        "--end-of-options",
+        &resolved,
+    ];
+    if let Some(path) = path {
+        argv.push("--");
+        argv.push(path);
+    }
+    let bytes = run_async(repo, &argv, None).await?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| LocalGitError::new("git_failed", "git log emitted a non-UTF-8 record"))?;
+    let mut entries = Vec::new();
+    for record in text.split('\0') {
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.splitn(6, '\n');
+        let sha = fields.next().unwrap_or_default().to_string();
+        validate_oid(&sha, "sha")?;
+        entries.push(LogEntry {
+            sha,
+            author_name: fields.next().unwrap_or_default().to_string(),
+            author_email: fields.next().unwrap_or_default().to_string(),
+            authored_at: fields.next().unwrap_or_default().to_string(),
+            committed_at: fields.next().unwrap_or_default().to_string(),
+            subject: fields.next().unwrap_or_default().to_string(),
+        });
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

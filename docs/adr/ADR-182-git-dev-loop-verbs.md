@@ -399,3 +399,87 @@ second actor on the opener's platform account, and by the last pusher of `expect
 before any platform write with the named reason and evidence on the receipt, and a merge dispatched by
 the approving login that is neither the opener nor the last pusher proceeds (control). Mutation
 controls, stated before they ran: removing either entry's check alone lets its refusal arm merge.
+
+## Amendment 8 (2026-09-09): reading a repository, and creating one the operator already listed
+
+Adopted from a reading of a real caller rather than from the ADR alone. A client with no filesystem
+hands can commit, branch, push and open a pull request through this pack, but it still shells out to
+git for the four things it needs before any of that: what changed, what happened, where the head is,
+and, once, making the repository at all. Those four are the whole remaining shell dependency, so
+they enter here. Nothing above is withdrawn.
+
+1. **`git.status(repo, untracked?, limit?)`.** Porcelain v2, NUL-separated, renames off. Returns
+   `branch`, a bounded `entries` page, `total`, `truncated` and `clean`. `untracked` is `no`,
+   `normal` (default) or `all`; `limit` is 1 through 5000, default 1000. `total` counts every entry
+   git reported and is never capped, so `clean` is a claim about the whole repository even when the
+   page was truncated; a capped page that reported `clean` would be a fabricated negative, which is
+   the reason the two fields are separate. The record separator is NUL because a path may hold a
+   space, a newline or a non-ASCII character, and whitespace splitting silently produces a wrong
+   answer rather than an error. Renames are disabled, and a `2` record refuses rather than
+   attributing the following record's path to it, so re-enabling detection later cannot fail quietly.
+2. **The head read is a field, not a verb.** Porcelain v2's `--branch` headers already carry the
+   commit and the branch, so `git.status` answers the head read and no `git.head` is minted. The two
+   sentinels are normalized: `branch.head` is `null` on a detached head and `branch.oid` is `null` on
+   an unborn branch, rather than the literal `(detached)` and `(initial)`. A caller therefore reads
+   an absent branch as absent instead of having to know the sentinel, and a detached head is not an
+   error, because the underlying `symbolic-ref` fails there by design.
+3. **`git.log(repo, ref?, limit?, path?)`.** A bounded page from one resolved ref, newest first;
+   `ref` defaults to `HEAD`, `limit` is 1 through 500 default 100. Per commit: `sha`, `author_name`,
+   `author_email`, `authored_at`, `committed_at`, `subject`. Fields are newline-separated inside a
+   NUL-separated record, which is unambiguous because none of them can contain a newline. `path` is
+   passed under `--literal-pathspecs`, so a caller-supplied path is never read as a glob or as a
+   magic pathspec; a file actually named `*.txt` filters to itself.
+4. **Both reads are gated, and neither writes a receipt.** They take the repo-only allowlist match
+   and `tool.check` in that order, with `gate.id` the lowest matching entry index, exactly as
+   `git.gates` does under Amendment 4 item 4. They take no credential and no actor row. The
+   allowlist is consulted first, so a call against a repository outside it refuses without any
+   policy row existing. `git.status` inherits `GIT_OPTIONAL_LOCKS=0` from the hardened environment,
+   so it refreshes nothing and takes no index lock: the index is byte-identical across the call, and
+   Amendment 1's arm 12 stays usable as a control.
+5. **`git.init(repo, branch?)` initializes; it never creates the path.** The target must exist, must
+   be a directory, and must not already hold a repository. It is subject to the same allowlist as
+   every write, which is what decides where a repository may appear: the operator creates the
+   directory and lists it, and this verb turns it into a repository. It is not given a
+   non-canonicalizing matcher, so it cannot reach a path the allowlist could not already name.
+   `--template=` is passed, so a repository this pack creates inherits no sample hooks and item 4 of
+   Amendment 2 is true of it from birth. A target that already holds a repository refuses
+   `already_initialized` rather than reinitializing, because git would rewrite configuration in
+   place and the caller would read success. `branch` defaults to `main` and is validated as a ref
+   name. Being a write, it takes a receipt; the two reads do not.
+
+Acceptance arms added: 43 `git.status` entries equal the native porcelain v2 records for the same
+repository, and the index file is byte-identical before and after; 44 with the page capped below the
+number of changes, `entries` is the cap, `total` is the full count, `truncated` is true and `clean`
+is false; 45 a path holding a space, a newline and a non-ASCII character round-trips as one entry
+with its exact name; 46 a detached head reports `branch.head` null beside a real `branch.oid`, and
+an attached head reports its name (control); 47 `git.log` shas equal `git rev-list -n <limit>` for
+the same ref, a `limit` of 0, 501, a string or null refuses `invalid_params`, and a `path` of
+`*.txt` returns only the commit touching the file literally so named; 48 both reads refuse
+`repo_not_allowlisted` off the allowlist with no policy row present and `policy_denied` under a deny
+decision, the receipt count is unchanged across all four refusals, and the same calls succeed under
+an allow decision (control); 49 `git.init` on an allowlisted empty directory creates the repository
+with the named initial branch, leaves no sample hooks, and writes exactly one receipt, while the
+same call against a live repository refuses `already_initialized` with HEAD and `.git/config`
+byte-identical afterwards, and against an unlisted directory refuses `repo_not_allowlisted` with no
+repository created.
+
+Recorded with the arms: the pack's schema census test enumerated its verbs from a list typed in the
+test, under a name promising it covered all of them, so it would have passed while two verbs behind.
+It now derives the population from the handler table and asserts that table is non-empty, which is
+the shape any census here should take.
+
+Two additions, from gating this amendment rather than from writing it.
+
+6. **A verb's input schema is part of registering it.** `input_schema.json` is what the request
+   surface validates against, and a verb absent from it dispatches with no boundary check and no
+   `additionalProperties: false`. The schema census therefore derives its verb list from
+   `GIT_HANDLERS` rather than from a list typed in the test: the hand-kept list of twelve passed
+   while three verbs shipped with no schema at all, which is exactly the failure the census's name
+   promises to catch. Arm 50: every name in `GIT_HANDLERS` has a schema whose type is `object` and
+   whose `additionalProperties` is false, with the table asserted non-empty in the same pass.
+
+7. **A policy control runs before the deny, never after.** Tool policies are append-only rows and a
+   deny is not reversible by a later allow, so a refusal arm whose positive control follows its deny
+   arm cannot pass on a healthy pack. Arm 49's control now runs first: the same repo and the same
+   call shape succeed while the decision is allow, then the deny arm refuses, then the receipt count
+   is compared across both.

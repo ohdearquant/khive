@@ -1114,23 +1114,26 @@ async fn remote_post_effect_faults_reconcile_without_repeating_native_write() {
 #[tokio::test]
 async fn remote_pack_schema_covers_all_verbs_with_required_nullable_compare() {
     let f = Fixture::new(true, None).await;
-    for verb in [
-        "git.digest",
-        "git.branch",
-        "git.commit",
-        "git.push",
-        "git.checkout",
-        "git.diff",
-        "git.receipts",
-        "git.gates",
-        "git.reconcile",
-        "git.pr_open",
-        "git.pr_review",
-        "git.pr_merge",
-    ] {
-        let help = f.registry.describe_verb(verb).unwrap();
-        assert_eq!(help["input_schema"]["type"], "object");
-        assert_eq!(help["input_schema"]["additionalProperties"], false);
+    // Derived from the pack's own handler table, never a list typed here: a hand-kept copy passes
+    // while it is two verbs behind, which is the failure this test's name promises to catch.
+    let verbs: Vec<&str> = crate::vocab::GIT_HANDLERS
+        .iter()
+        .map(|handler| handler.name)
+        .collect();
+    assert!(
+        verbs.len() >= 15,
+        "the handler table is the population under test: {verbs:?}"
+    );
+    for verb in verbs {
+        let help = f
+            .registry
+            .describe_verb(verb)
+            .unwrap_or_else(|_| panic!("{verb} is declared in GIT_HANDLERS but not registered"));
+        assert_eq!(help["input_schema"]["type"], "object", "{verb}");
+        assert_eq!(
+            help["input_schema"]["additionalProperties"], false,
+            "{verb}"
+        );
     }
     let help = f.registry.describe_verb("git.push").unwrap();
     let schema = &help["input_schema"];
