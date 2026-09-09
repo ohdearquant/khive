@@ -46,7 +46,7 @@ pub(crate) const PUSH: HandlerDef = HandlerDef {
 
 pub(crate) const PR_OPEN: HandlerDef = HandlerDef {
     name: "git.pr_open",
-    description: "Open a pull request after checking configured slug, visibility and exact platform head. Uses the actor credential and returns number, url, head_sha and receipt_id.",
+    description: "Open a pull request after checking configured slug, visibility and exact platform head. Uses the dispatching actor credential: [git_write] actors.<actor>.credential_ref is resolved through credential_resolver (by default the login keychain item with that service name), never stored, and an unmapped actor or a failed resolver refuses actor_unmapped before any network call. The resolved token must belong to the actor configured platform_identity or the act refuses platform_identity_mismatch. Returns number, url, head_sha and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
@@ -77,7 +77,7 @@ pub(crate) const PR_REVIEW: HandlerDef = HandlerDef {
 
 pub(crate) const PR_MERGE: HandlerDef = HandlerDef {
     name: "git.pr_merge",
-    description: "Merge with a platform head comparison after caller policy and current-head approval by another account. Forks require git.pr_merge.fork; no administrator bypass is requested. Returns merged_head_sha, merged_sha and receipt_id.",
+    description: "Merge with a platform head comparison after caller policy and current-head approval by another account. The merge presents as the dispatching actor credential, resolved the same way as git.pr_open. The approval precondition is an approving review at expected_head from a platform account other than the LAST PUSHER of that head, not other than the author; a merge dispatched by the opener is not refused by this verb. Forks require git.pr_merge.fork; no administrator bypass is requested. Returns merged_head_sha, merged_sha and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
