@@ -1072,15 +1072,12 @@ impl KhiveRuntime {
                 Ok(NamespaceToken::mint_authorized(ns, actor))
             }
             Ok(khive_gate::GateDecision::Deny { reason }) => {
-                Err(crate::RuntimeError::PermissionDenied {
-                    verb: "authorize".to_string(),
-                    reason,
-                })
+                Err(crate::RuntimeError::permission_denied("authorize", reason))
             }
-            Ok(_) => Err(crate::RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason: "gate denied".to_string(),
-            }),
+            Ok(_) => Err(crate::RuntimeError::permission_denied(
+                "authorize",
+                "gate denied",
+            )),
             Err(e) => {
                 tracing::warn!(
                     namespace = %ns.as_str(),
@@ -1148,22 +1145,19 @@ impl KhiveRuntime {
                     match self.config.gate.check(&extra_req) {
                         Ok(ref extra_decision) if extra_decision.is_allow() => {}
                         Ok(khive_gate::GateDecision::Deny { reason }) => {
-                            return Err(crate::RuntimeError::PermissionDenied {
-                                verb: "authorize".to_string(),
-                                reason: format!(
+                            return Err(crate::RuntimeError::permission_denied(
+                                "authorize",
+                                format!(
                                     "visibility namespace {:?} denied: {reason}",
                                     extra.as_str()
                                 ),
-                            });
+                            ));
                         }
                         Ok(_) => {
-                            return Err(crate::RuntimeError::PermissionDenied {
-                                verb: "authorize".to_string(),
-                                reason: format!(
-                                    "visibility namespace {:?} denied by gate",
-                                    extra.as_str()
-                                ),
-                            });
+                            return Err(crate::RuntimeError::permission_denied(
+                                "authorize",
+                                format!("visibility namespace {:?} denied by gate", extra.as_str()),
+                            ));
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1185,15 +1179,12 @@ impl KhiveRuntime {
                 ))
             }
             Ok(khive_gate::GateDecision::Deny { reason }) => {
-                Err(crate::RuntimeError::PermissionDenied {
-                    verb: "authorize".to_string(),
-                    reason,
-                })
+                Err(crate::RuntimeError::permission_denied("authorize", reason))
             }
-            Ok(_) => Err(crate::RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason: "gate denied".to_string(),
-            }),
+            Ok(_) => Err(crate::RuntimeError::permission_denied(
+                "authorize",
+                "gate denied",
+            )),
             Err(e) => {
                 tracing::warn!(
                     namespace = %primary.as_str(),
@@ -2116,6 +2107,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2150,6 +2142,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sidecar_path = dir.path().join("main.db.events.db");
         let config = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: Some(crate::events_split::EventsSplitConfig {
@@ -2209,6 +2202,7 @@ mod tests {
     fn backend_data_dir_returns_none_for_from_backend_with_memory() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2235,6 +2229,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2265,6 +2260,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read_only_runtime.db");
         let base = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2326,6 +2322,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("explicit_read_only_runtime.db");
         let config = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2474,6 +2471,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read_only_blob_seam.db");
         let config = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             db_path: Some(path.clone()),
@@ -2709,6 +2707,7 @@ mod tests {
             );
 
             let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
+                mounts: Vec::new(),
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
                 events_split: None,
@@ -2758,6 +2757,7 @@ mod tests {
     fn from_backend_uses_provided_backend() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3013,6 +3013,7 @@ mod tests {
         // visible-set, but that does not change default_namespace. This test
         // asserts the write-routing invariant only.
         let base = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3042,6 +3043,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_empty_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3079,6 +3081,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_absent_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3108,6 +3111,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_actor_id_with_engines() {
         let base = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3155,6 +3159,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_display_timezone_overrides_base() {
         let base = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3189,6 +3194,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_absent_display_timezone_keeps_base() {
         let base = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: "Asia/Tokyo".parse().unwrap(),
             events_split: None,
@@ -3337,6 +3343,7 @@ mod tests {
 
     fn secondary_config() -> RuntimeConfig {
         RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             exec: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
@@ -3418,6 +3425,7 @@ mod tests {
         let secondary_arc = migrated_memory_backend();
 
         let main_config = RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3559,6 +3567,7 @@ mod tests {
         let rt_from = KhiveRuntime::from_backend(
             backend,
             RuntimeConfig {
+                mounts: Vec::new(),
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
                 events_split: None,

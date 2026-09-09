@@ -993,7 +993,8 @@ async fn sch_aud_002_malformed_five_field_cron_rejected() {
 async fn sch_aud_002_out_of_range_cron_minute_rejected() {
     let (registry, _rt) = build_registry();
 
-    // Minute field 99 is out of range (0–59).
+    // Minute field 99 is out of range (0-59): the parser the executor uses refuses it,
+    // so creation refuses it too.
     let err = registry
         .dispatch(
             "schedule.remind",
@@ -1007,45 +1008,32 @@ async fn sch_aud_002_out_of_range_cron_minute_rejected() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("cron") && msg.contains("not executable"),
-        "SCH-AUD-002: every unsupported cron form must be rejected; got: {msg}"
+        msg.contains("invalid repeat expression") && msg.contains("cron"),
+        "SCH-AUD-002: every cron form the executor cannot advance must be rejected; got: {msg}"
     );
 }
 
 #[tokio::test]
-async fn sch_aud_002_wildcard_cron_rejected_as_unexecutable() {
-    let (registry, _rt) = build_registry();
-
-    let error = registry
-        .dispatch(
-            "schedule.remind",
-            serde_json::json!({
-                "content": "wildcard cron",
-                "at": "2099-06-01T09:00:00Z",
-                "repeat": "* * * * *"
-            }),
-        )
-        .await
-        .expect_err("SCH-AUD-002: an unadvanceable wildcard cron must be rejected");
-    assert!(error.to_string().contains("not executable"));
-}
-
-#[tokio::test]
-async fn sch_aud_002_numeric_cron_rejected_as_unexecutable() {
-    let (registry, _rt) = build_registry();
-
-    let error = registry
-        .dispatch(
-            "schedule.remind",
-            serde_json::json!({
-                "content": "monday morning",
-                "at": "2099-06-01T09:00:00Z",
-                "repeat": "0 9 * * 1"
-            }),
-        )
-        .await
-        .expect_err("SCH-AUD-002: an unadvanceable numeric cron must be rejected");
-    assert!(error.to_string().contains("not executable"));
+async fn sch_aud_002_cron_the_executor_advances_is_accepted() {
+    // SCH-AUD-002 once required these forms to be refused because the executor could
+    // not advance them. Creation and the executor now share one parser, so a cron
+    // expression the executor advances is accepted, and only unadvanceable forms remain
+    // refused (see the out-of-range and malformed arms above).
+    for repeat in ["0 9 * * 1", "* * * * *"] {
+        let (registry, _rt) = build_registry();
+        let result = registry
+            .dispatch(
+                "schedule.remind",
+                serde_json::json!({
+                    "content": "monday morning",
+                    "at": "2099-06-01T09:00:00Z",
+                    "repeat": repeat
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("SCH-AUD-002: cron {repeat:?} must be accepted; got: {e}"));
+        assert_eq!(result["status"], "pending");
+    }
 }
 
 // ── SCH-AUD-003 regression: agenda limit=0 and limit>200 rejected ────────────

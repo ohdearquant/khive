@@ -512,7 +512,7 @@ fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
         found,
         [
             "khive-db/sql/005-unique-comm-external-id.sql",
-            "khive-db/sql/030-note-versions.sql",
+            "khive-db/sql/031-note-versions.sql",
             "khive-db/sql/notes-ddl.sql"
         ]
         .into_iter()
@@ -541,7 +541,7 @@ fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
         conn.execute_batch(if direct {
             include_str!("../../khive-db/sql/notes-ddl.sql")
         } else {
-            include_str!("../../khive-db/sql/030-note-versions.sql")
+            include_str!("../../khive-db/sql/031-note-versions.sql")
         })
         .unwrap();
         conn.execute("INSERT INTO notes (id,namespace,kind,created_at,updated_at) VALUES (?1,'local','memory',1,1)", [ID]).unwrap();

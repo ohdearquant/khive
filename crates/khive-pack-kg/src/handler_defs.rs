@@ -1342,7 +1342,10 @@ fn compact_signature(handler: &HandlerDef) -> String {
 }
 
 /// Handle the `verbs` introspection verb — returns all public verbs, with optional category/pack filters.
-pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Value, RuntimeError> {
+pub(crate) async fn handle_verbs(
+    params: Value,
+    registry: &VerbRegistry,
+) -> Result<Value, RuntimeError> {
     #[derive(serde::Deserialize, Default)]
     struct VerbsParams {
         category: Option<String>,
@@ -1350,49 +1353,36 @@ pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Val
     }
     let p: VerbsParams =
         serde_json::from_value(params).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-
-    let all_verbs = registry.all_verbs_with_names();
+    let mut verbs: Vec<Value> = registry.all_verbs_with_names().into_iter().map(|(pack, handler)| serde_json::json!({
+        "verb": handler.name, "pack": pack, "description": handler.description,
+        "category": format!("{:?}", handler.category), "signature": compact_signature(handler),
+    })).collect();
+    verbs.extend(registry.mounted_verb_catalog().await?);
     let pack_counts: serde_json::Map<String, Value> = registry
         .pack_names()
         .into_iter()
-        .map(|pack_name| {
-            let count = all_verbs
-                .iter()
-                .filter(|(owner, _)| *owner == pack_name)
-                .count();
-            (pack_name.to_string(), serde_json::json!(count))
+        .map(|pack| {
+            (
+                pack.to_string(),
+                serde_json::json!(verbs
+                    .iter()
+                    .filter(|verb| verb["pack"].as_str() == Some(pack))
+                    .count()),
+            )
         })
         .collect();
-    let verbs: Vec<Value> = all_verbs
-        .into_iter()
-        .filter(|(pack_name, handler)| {
-            let cat_ok = p
-                .category
-                .as_deref()
-                .is_none_or(|c| format!("{:?}", handler.category).eq_ignore_ascii_case(c));
-            let pack_ok = p
-                .pack
-                .as_deref()
-                .is_none_or(|pk| pack_name.eq_ignore_ascii_case(pk));
-            cat_ok && pack_ok
+    verbs.retain(|verb| {
+        p.category.as_deref().is_none_or(|filter| {
+            verb["category"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(filter))
+        }) && p.pack.as_deref().is_none_or(|filter| {
+            verb["pack"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(filter))
         })
-        .map(|(pack_name, handler)| {
-            serde_json::json!({
-                "verb": handler.name,
-                "pack": pack_name,
-                "description": handler.description,
-                "category": format!("{:?}", handler.category),
-                "signature": compact_signature(handler),
-            })
-        })
-        .collect();
-
-    let total = verbs.len();
-    Ok(serde_json::json!({
-        "verbs": verbs,
-        "total": total,
-        "pack_counts": pack_counts,
-    }))
+    });
+    Ok(serde_json::json!({"total": verbs.len(), "verbs": verbs, "pack_counts": pack_counts}))
 }
 
 #[cfg(test)]

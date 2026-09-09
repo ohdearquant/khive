@@ -14,6 +14,8 @@ description = "khive MCP server library — served via the kkernel binary"
 exclude = ["tests/plan_conformance.rs"]
 
 [dependencies]
+khive-mounts = { version = "0.8.0", path = "../khive-mounts" }
+khive-pack-agent = { version = "0.8.0", path = "../khive-pack-agent" }
 khive-db = { version = "0.8.0", path = "../khive-db" }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
 khive-storage = { version = "0.8.0", path = "../khive-storage" }
@@ -94,3 +96,8 @@ serial_test = { workspace = true }
 khive-pack-knowledge = { version = "0.8.0", path = "../khive-pack-knowledge" }
 rusqlite = { workspace = true, features = ["bundled", "hooks"] }
 syn = { workspace = true, features = ["visit"] }
+
+[[test]]
+name = "mcp_mount_fixture"
+path = "../khive-mounts/tests/fixture.rs"
+harness = false

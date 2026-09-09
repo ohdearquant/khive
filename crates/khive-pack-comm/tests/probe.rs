@@ -1015,6 +1015,7 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
     // Reopen through the normal runtime boot path -- this runs
     // `run_migrations` to latest, including V7's backfill.
     let config = RuntimeConfig {
+        mounts: Vec::new(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -1202,6 +1203,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
     // `run_migrations` to latest (including V8's forward repair) and the
     // fixed anti-join lazy bootstrap.
     let config = RuntimeConfig {
+        mounts: Vec::new(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,

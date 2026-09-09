@@ -1155,6 +1155,22 @@ async fn acquire_reader_handle_slot(
     result
 }
 
+/// Serialize whole units on the one shared in-memory connection. Event-store
+/// transactions participate in the same budget as raw SQL atomic units.
+/// The permit must outlive the unit's final COMMIT or ROLLBACK.
+pub(crate) async fn acquire_in_memory_write_unit(
+    pool: &ConnectionPool,
+    operation: &'static str,
+) -> Result<OwnedSemaphorePermit, StorageError> {
+    acquire_handle_slot(
+        pool.sql_bridge_writer_slots(),
+        pool.config().checkout_timeout,
+        operation,
+        SlotTimeoutClass::Admission,
+    )
+    .await
+}
+
 async fn acquire_handle_slot(
     slots: Arc<Semaphore>,
     timeout: std::time::Duration,
@@ -3467,51 +3483,15 @@ impl khive_storage::SqlAccess for SqlBridge {
             };
             run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
         } else {
-            // Every statement shares one connection. Keep its guard through
-            // commit/rollback so other units and ordinary writes cannot join it.
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.try_writer().map_err(|error: SqliteError| {
-                    StorageError::driver(StorageCapability::Sql, "atomic_unit", error)
-                })?;
-                let conn = guard.conn();
-                if !conn.is_autocommit() {
-                    pool.retire_pooled_writer(conn);
-                    return Err(StorageError::WriterTaskTerminated {
-                        request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-                    });
-                }
-                if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
-                    if !conn.is_autocommit() {
-                        pool.retire_pooled_writer(conn);
-                        return Err(StorageError::WriterTaskTerminated {
-                            request_state:
-                                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-                        });
-                    }
-                    return Err(map_rusqlite_err(error, "atomic_unit.begin"));
-                }
-                let _tx_handle = khive_storage::tx_registry::register_scoped(
-                    Some("atomic_unit".to_string()),
-                    pool.origin(),
-                );
-                let (result, terminal_state) = crate::writer_task::execute_wrapped_transaction(
-                    conn,
-                    "atomic_unit.commit",
-                    |conn| {
-                        let mut inline = InlineWriter {
-                            conn: conn as *const rusqlite::Connection,
-                        };
-                        block_on_sync(op(&mut inline)).and_then(|result| result)
-                    },
-                );
-                if terminal_state.is_some() {
-                    pool.retire_pooled_writer(conn);
-                }
-                result
-            })
-            .await
-            .map_err(|error| StorageError::driver(StorageCapability::Sql, "atomic_unit", error))?
+            // In-memory units share one SQLite connection. Keep the pool-wide
+            // unit slot across BEGIN, awaited statements, and COMMIT/ROLLBACK;
+            // PoolBackedWriter's per-statement writer guard is a separate lock.
+            let _unit_slot =
+                acquire_in_memory_write_unit(&self.pool, "sql_bridge.atomic_unit_handle").await?;
+            let mut writer = PoolBackedWriter {
+                pool: Arc::clone(&self.pool),
+            };
+            run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
         }
     }
 }
@@ -3522,6 +3502,180 @@ mod tests {
     use crate::pool::PoolConfig;
     use khive_storage::types::{SqlStatement, SqlValue};
     use khive_storage::{SqlAccess as _, SqlReader as _};
+
+    #[tokio::test]
+    async fn in_memory_atomic_units_serialize_across_bridges() {
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: Some(false),
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch("CREATE TABLE atomic_in_memory (id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let ready = Arc::new(tokio::sync::Barrier::new(8));
+        let mut jobs = Vec::new();
+        for unit in 0..8_i64 {
+            let pool = Arc::clone(&pool);
+            let ready = Arc::clone(&ready);
+            jobs.push(tokio::spawn(async move {
+                // Separate bridges must share the pool's transaction budget.
+                let bridge = SqlBridge::new(pool, false);
+                ready.wait().await;
+                let op: AtomicUnitOp = Box::new(move |writer| {
+                    Box::pin(async move {
+                        for row in 0..2 {
+                            writer
+                                .execute(SqlStatement {
+                                    sql: "INSERT INTO atomic_in_memory (id) VALUES (?1)".into(),
+                                    params: vec![SqlValue::Integer(unit * 2 + row)],
+                                    label: None,
+                                })
+                                .await?;
+                            if row == 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                        }
+                        Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+                    })
+                });
+                bridge.atomic_unit(op).await.map(|_| ())
+            }));
+        }
+        let mut errors = Vec::new();
+        for job in jobs {
+            if let Err(error) = job.await.unwrap() {
+                errors.push(error.to_string());
+            }
+        }
+        assert!(
+            errors.is_empty(),
+            "atomic units failed: {}",
+            errors.join("; ")
+        );
+        let count: i64 = pool
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM atomic_in_memory", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 16, "all eight two-row units must commit");
+    }
+
+    #[tokio::test]
+    async fn in_memory_atomic_unit_serializes_with_event_writes() {
+        use khive_storage::EventStore as _;
+
+        // Each ordinary event entry point opens a transaction through with_writer.
+        for mode in 0..3 {
+            let pool = Arc::new(
+                ConnectionPool::new(PoolConfig {
+                    path: None,
+                    write_queue_enabled: Some(false),
+                    ..PoolConfig::default()
+                })
+                .unwrap(),
+            );
+            {
+                let writer = pool.writer().unwrap();
+                crate::stores::event::ensure_events_schema(writer.conn()).unwrap();
+                writer
+                    .conn()
+                    .execute_batch("CREATE TABLE atomic_event_overlap (id INTEGER PRIMARY KEY)")
+                    .unwrap();
+            }
+            let (entered, in_unit) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let bridge = SqlBridge::new(Arc::clone(&pool), false);
+            let unit = tokio::spawn(async move {
+                let op: AtomicUnitOp = Box::new(move |writer| {
+                    Box::pin(async move {
+                        writer
+                            .execute(SqlStatement {
+                                sql: "INSERT INTO atomic_event_overlap VALUES (1)".into(),
+                                params: vec![],
+                                label: None,
+                            })
+                            .await?;
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        writer
+                            .execute(SqlStatement {
+                                sql: "INSERT INTO atomic_event_overlap VALUES (2)".into(),
+                                params: vec![],
+                                label: None,
+                            })
+                            .await?;
+                        Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+                    })
+                });
+                bridge.atomic_unit(op).await.map(|_| ())
+            });
+            in_unit.await.unwrap();
+            let store = Arc::new(crate::stores::event::SqlEventStore::new_scoped(
+                Arc::clone(&pool),
+                false,
+                "atomic-event",
+            ));
+            let event = khive_storage::event::Event::new(
+                "atomic-event",
+                "search",
+                khive_types::EventKind::SearchExecuted,
+                khive_types::SubstrateKind::Note,
+                "agent:test",
+            )
+            .with_payload(serde_json::json!({"result_kind": "note"}));
+            let event_id = event.id;
+            let event_store = Arc::clone(&store);
+            let mut event_job = tokio::spawn(async move {
+                match mode {
+                    0 => event_store.append_event(event).await,
+                    1 => event_store.append_events(vec![event]).await.map(|_| ()),
+                    _ => event_store
+                        .append_events_idempotent(vec![event])
+                        .await
+                        .map(|_| ()),
+                }
+            });
+            let early =
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut event_job).await;
+            let finished_inside_unit = early.is_ok();
+            // Release and join both tasks before asserting, including in the RED control.
+            release.send(()).unwrap();
+            unit.await.unwrap().expect("atomic unit commits both rows");
+            let event_result = match early {
+                Ok(joined) => joined,
+                Err(_) => event_job.await,
+            }
+            .expect("event task joins");
+            assert!(
+                event_result.is_ok(),
+                "event write mode {mode} overlapped the atomic transaction: {event_result:?}"
+            );
+            assert!(
+                !finished_inside_unit,
+                "event write mode {mode} must wait until the atomic unit ends"
+            );
+            assert!(store.get_event(event_id).await.unwrap().is_some());
+            let rows: i64 = pool
+                .writer()
+                .unwrap()
+                .conn()
+                .query_row("SELECT COUNT(*) FROM atomic_event_overlap", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 2);
+        }
+    }
 
     fn database_tx_view(pool: &ConnectionPool) -> khive_storage::tx_registry::TxOriginFilter {
         match pool.origin() {

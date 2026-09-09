@@ -92,6 +92,32 @@ no known parent Message-ID (mirrors `in_reply_to_message_id`).
 
 ## `handlers.rs::handle_send`
 
+### Caller-keyed pairs
+
+`idempotency_key` selects `dual_write_message_with_identity`'s keyed path.
+`MessageIdentity` validates the logical key with `validate_memory_key` and
+encodes `[write_namespace, sending_actor, client_key]` as compact JSON after
+`comm-v1:`. The outbound copy alone holds this physical `notes.key`; both
+copies carry the logical key in properties, with reciprocal pair UUIDs.
+
+`khive_runtime::keyed_message::create_keyed_message_pair` uses the existing
+atomic-note preparation, preserving validation, secret checks, FTS and vector
+writes. It appends the outbound key claim as the final statement guarded by
+exactly one affected row. Losing the unique constraint rolls back both notes
+and their indexes before resolving the committed holder. A missing holder
+returns `key_holder_unresolved`, mapped to unknown domain disposition.
+
+Replay compares the versioned normalized request and re-reads both notes in
+one batch. It requires the live reciprocal pair, expected actors, namespace,
+content, subject, tags, logical key and canonical thread. Ordinary read and
+delivery metadata may change. A mismatch or incomplete pair is `key_conflict`
+with the holder's `existing_id` and no domain write. Matching replay returns
+the original pair receipt and skips inbox signaling and reply parent mutation.
+No internal retry repairs a broken pair; deleting the outbound releases the
+live claim. Unkeyed writes still use `create_notes_atomic_with_report`.
+
+### Actor-addressed creation
+
 Creates a message note in the caller's namespace (outbound) AND delivers an
 inbound copy addressed to the actor label supplied in `to` (ADR-057).
 

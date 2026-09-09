@@ -52,6 +52,7 @@ pub(crate) const MESSAGE_PROJECTION_FIELDS: &[&str] = &[
     "sent_at",
     "outbound_ref",
     "sent_by_process",
+    "idempotency_key",
 ];
 
 pub(crate) fn validate_message_projection_fields(
@@ -254,6 +255,7 @@ fn build_preview(content: &str) -> String {
 // two context args (runtime, token). Grouping them into a struct would not reduce overall
 // complexity and would require an extra allocation on the hot path; the flat signature is
 // intentional.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dual_write_message(
     runtime: &KhiveRuntime,
@@ -271,6 +273,51 @@ pub(crate) async fn dual_write_message(
     references_chain: Option<&str>,
     tags: Option<&[String]>,
 ) -> Result<(Note, khive_runtime::retrieval::EmbeddingTruncationReport), RuntimeError> {
+    let result = dual_write_message_with_identity(
+        runtime,
+        caller_token,
+        from,
+        to,
+        subject,
+        content,
+        thread_id,
+        sent_at,
+        sent_by_process,
+        from_actor,
+        to_actor,
+        in_reply_to_message_id,
+        references_chain,
+        tags,
+        None,
+    )
+    .await?;
+    Ok((result.outbound, result.embedding_truncation))
+}
+
+pub(crate) struct MessageWrite {
+    pub outbound: Note,
+    pub embedding_truncation: khive_runtime::retrieval::EmbeddingTruncationReport,
+    pub replayed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dual_write_message_with_identity(
+    runtime: &KhiveRuntime,
+    caller_token: &NamespaceToken,
+    from: &str,
+    to: &str,
+    subject: Option<&str>,
+    content: &str,
+    thread_id: Option<&str>,
+    sent_at: &str,
+    sent_by_process: Option<&str>,
+    from_actor: Option<&str>,
+    to_actor: Option<&str>,
+    in_reply_to_message_id: Option<&str>,
+    references_chain: Option<&str>,
+    tags: Option<&[String]>,
+    identity: Option<&crate::idempotency::MessageIdentity>,
+) -> Result<MessageWrite, RuntimeError> {
     let recipient_ns_str = to.trim();
     if from != recipient_ns_str {
         // When actor labels are provided this is an actor-addressed local send;
@@ -298,6 +345,7 @@ pub(crate) async fn dual_write_message(
             if !allowed {
                 return Err(RuntimeError::PermissionDenied {
                     verb: "comm.send".to_string(),
+                    receipt: Box::new(khive_runtime::DenialReceipt::not_audited()),
                     reason: format!(
                         "cross-namespace delivery to {recipient_ns_str:?} is not permitted; \
                          add {recipient_ns_str:?} to actor.allowed_outbound_namespaces in \
@@ -314,6 +362,7 @@ pub(crate) async fn dual_write_message(
     // eliminating the separate thread_id-patch transaction the two-call
     // version needed for root sends.
     let outbound_id = Uuid::new_v4();
+    let inbound_id = Uuid::new_v4();
     let canonical_thread_id: String = match thread_id {
         Some(tid) => tid.to_string(),
         None => outbound_id.as_hyphenated().to_string(),
@@ -400,33 +449,61 @@ pub(crate) async fn dual_write_message(
         }
     }
 
-    let (mut notes, embedding_truncation) = khive_runtime::create_notes_atomic_with_report(
-        runtime,
-        vec![
-            khive_runtime::AtomicNoteSpec {
-                token: caller_token,
-                id: Some(outbound_id),
-                kind: "message",
-                name: subject,
-                content,
-                properties: Some(outbound_props),
-            },
-            khive_runtime::AtomicNoteSpec {
-                token: inbound_tok,
-                id: None,
-                kind: "message",
-                name: subject,
-                content,
-                properties: Some(inbound_props),
-            },
-        ],
-    )
-    .await
-    .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?;
-
-    // create_notes_atomic_with_report returns notes in the same order as the
-    // specs above: [outbound, inbound].
-    Ok((notes.remove(0), embedding_truncation))
+    if let Some(identity) = identity {
+        outbound_props["idempotency_key"] = json!(identity.key);
+        inbound_props["idempotency_key"] = json!(identity.key);
+        outbound_props["inbound_ref"] = json!(inbound_id);
+        outbound_props["idempotency_request"] = identity.request.clone();
+    }
+    let specs = [
+        khive_runtime::AtomicNoteSpec {
+            token: caller_token,
+            id: Some(outbound_id),
+            kind: "message",
+            name: subject,
+            content,
+            properties: Some(outbound_props),
+        },
+        khive_runtime::AtomicNoteSpec {
+            token: inbound_tok,
+            id: Some(inbound_id),
+            kind: "message",
+            name: subject,
+            content,
+            properties: Some(inbound_props),
+        },
+    ];
+    let (mut notes, embedding_truncation) = if let Some(identity) = identity {
+        match khive_runtime::keyed_message::create_keyed_message_pair(
+            runtime,
+            specs,
+            &identity.physical_key(caller_token),
+        )
+        .await
+        .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?
+        {
+            khive_runtime::keyed_message::KeyedMessageWrite::Created {
+                notes,
+                embedding_truncation,
+            } => (notes, embedding_truncation),
+            khive_runtime::keyed_message::KeyedMessageWrite::Existing(holder) => {
+                return Ok(MessageWrite {
+                    outbound: identity.replay(runtime, caller_token, holder).await?,
+                    embedding_truncation: Default::default(),
+                    replayed: true,
+                });
+            }
+        }
+    } else {
+        khive_runtime::create_notes_atomic_with_report(runtime, specs.into())
+            .await
+            .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?
+    };
+    Ok(MessageWrite {
+        outbound: notes.remove(0),
+        embedding_truncation,
+        replayed: false,
+    })
 }
 
 #[cfg(test)]
@@ -452,6 +529,7 @@ mod tests {
         let recipient_ns = format!("t460-recipient-{}", Uuid::new_v4().simple());
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -532,6 +610,7 @@ mod tests {
         use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -677,6 +756,7 @@ mod tests {
         let recipient_ns = format!("vecfail-recipient-{}", Uuid::new_v4().simple());
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -841,6 +921,7 @@ mod tests {
         use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
